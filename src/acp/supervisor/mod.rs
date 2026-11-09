@@ -62,7 +62,8 @@ pub(crate) type Launcher = Arc<
 
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Per-session seq counter; outlives workers so every publisher shares one sequence.
-type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
+/// Each session's last allocated seq, under its own lock so sessions publish independently.
+type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
@@ -608,7 +609,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Seed seq counters from the event store's stored maxima.
     pub fn hydrate_seqs(&self, pairs: impl IntoIterator<Item = (String, u64)>) {
         if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.extend(pairs);
+            guard.extend(
+                pairs
+                    .into_iter()
+                    .map(|(id, seq)| (id, Arc::new(std::sync::Mutex::new(seq)))),
+            );
         }
     }
 
@@ -856,11 +861,29 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
-    let mut guard = next_seqs.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = guard.entry(session_id.to_string()).or_insert(0);
-    *entry = entry.saturating_add(1);
-    *entry
+fn session_seq(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<u64>> {
+    Arc::clone(
+        lock_recover(next_seqs)
+            .entry(session_id.to_string())
+            .or_default(),
+    )
+}
+
+/// Allocate the session's next seq and publish with it under that session's
+/// counter lock, so subscribers receive each session's events in seq order.
+/// `publish` must not allocate a seq for the same session.
+fn publish_with_next_seq<R>(
+    next_seqs: &SeqMap,
+    session_id: &str,
+    publish: impl FnOnce(u64) -> R,
+) -> R {
+    let counter = session_seq(next_seqs, session_id);
+    // A holder blocks on store I/O, so waiters and the holder both run off the async worker.
+    sink::blocking_io(|| {
+        let mut last = lock_recover(&counter);
+        *last = last.saturating_add(1);
+        publish(*last)
+    })
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

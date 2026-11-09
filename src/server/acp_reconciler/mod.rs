@@ -19,7 +19,6 @@ use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
 pub(crate) use rate_limit::install_rate_limit_continuation;
-#[cfg(test)]
 pub(crate) use rate_limit::ContinuationOutcome;
 pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
 

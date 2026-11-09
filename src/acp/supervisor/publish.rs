@@ -3,7 +3,8 @@
 use tracing::info;
 
 use super::{
-    next_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor, WorkerKind,
+    publish_with_next_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor,
+    WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
@@ -12,9 +13,10 @@ use crate::acp::state::{BackgroundAgentStatus, Event};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(session_id, seq, event);
-        seq
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            self.sink.publish(session_id, seq, event);
+            seq
+        })
     }
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
@@ -31,24 +33,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
-        let seq = {
-            let mut guard = super::lock_recover(&self.next_seqs);
-            let current = guard.get(session_id).copied().unwrap_or(0);
-            if current != expected_seq {
+        let counter = super::session_seq(&self.next_seqs, session_id);
+        super::sink::blocking_io(|| {
+            let mut last = super::lock_recover(&counter);
+            if *last != expected_seq {
                 return false;
             }
-            let seq = current.saturating_add(1);
-            guard.insert(session_id.to_string(), seq);
-            seq
-        };
-        self.sink.publish(
-            session_id,
-            seq,
-            &Event::Stopped {
-                reason: reason.to_string(),
-            },
-        );
-        true
+            *last = last.saturating_add(1);
+            self.sink.publish(
+                session_id,
+                *last,
+                &Event::Stopped {
+                    reason: reason.to_string(),
+                },
+            );
+            true
+        })
     }
 
     pub fn publish_agent_switched(
@@ -125,6 +125,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         synthesized: bool,
         origin_plugin: Option<String>,
     ) -> PublishedPrompt {
+        // Before any await or store, so an idle stop cannot claim the worker in between.
+        super::lock_recover(&self.lifecycle).note_admission(session_id);
         let profile = self.profile_for_session(session_id, &text).await;
         let is_clear = profile.is_clear_command(&text);
         let disposition = if is_clear && profile.clear_requires_driven_reset {
@@ -136,33 +138,38 @@ impl<S: BroadcastSink> Supervisor<S> {
             disposition,
             seq: None,
         };
-        let seq = next_seq(&self.next_seqs, session_id);
-        let mut refs = Vec::with_capacity(attachments.len());
-        for blob in attachments {
-            if !self.sink.record_attachment(session_id, seq, blob) {
-                self.sink.delete_attachments_for_seq(session_id, seq);
-                return unrecorded;
+        let published = publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            let mut refs = Vec::with_capacity(attachments.len());
+            for blob in attachments {
+                if !self.sink.record_attachment(session_id, seq, blob) {
+                    self.sink.delete_attachments_for_seq(session_id, seq);
+                    return None;
+                }
+                refs.push(crate::daemon::PromptAttachmentRef {
+                    id: blob.id.clone(),
+                    kind: blob.kind,
+                    mime_type: blob.mime_type.clone(),
+                    name: blob.name.clone(),
+                    size: blob.data.len() as u64,
+                });
             }
-            refs.push(crate::daemon::PromptAttachmentRef {
-                id: blob.id.clone(),
-                kind: blob.kind,
-                mime_type: blob.mime_type.clone(),
-                name: blob.name.clone(),
-                size: blob.data.len() as u64,
-            });
-        }
-        let event = Event::UserPromptSent {
-            text,
-            attachments: refs,
-            prompt_id,
-            synthesized,
-            origin_plugin,
-        };
-        if !self.sink.publish_persisted(session_id, seq, &event) {
-            // Roll back so refs never point at blobs that were not published.
-            self.sink.delete_attachments_for_seq(session_id, seq);
+            let event = Event::UserPromptSent {
+                text,
+                attachments: refs,
+                prompt_id,
+                synthesized,
+                origin_plugin,
+            };
+            if !self.sink.publish_persisted(session_id, seq, &event) {
+                // Roll back so refs never point at blobs that were not published.
+                self.sink.delete_attachments_for_seq(session_id, seq);
+                return None;
+            }
+            Some(seq)
+        });
+        let Some(seq) = published else {
             return unrecorded;
-        }
+        };
         if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, &Event::SessionCleared);
         }
@@ -182,6 +189,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
+        super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             &Event::UserDiffCommentsPrompt {
@@ -283,14 +291,16 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     warning: &str,
 ) {
     for task_id in sink.unresolved_background_task_ids(session_id) {
-        sink.publish(
-            session_id,
-            next_seq(next_seqs, session_id),
-            &Event::BackgroundTaskFinished {
-                task_id,
-                ended_at: Some(chrono::Utc::now()),
-            },
-        );
+        publish_with_next_seq(next_seqs, session_id, |seq| {
+            sink.publish(
+                session_id,
+                seq,
+                &Event::BackgroundTaskFinished {
+                    task_id,
+                    ended_at: Some(chrono::Utc::now()),
+                },
+            )
+        });
     }
     let stale_ids = sink.unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
@@ -314,18 +324,20 @@ fn publish_background_agent_detached<S: BroadcastSink>(
     agent_id: String,
     warning: &str,
 ) {
-    sink.publish(
-        session_id,
-        next_seq(next_seqs, session_id),
-        &Event::BackgroundAgentCompleted {
-            agent_id,
-            status: BackgroundAgentStatus::Detached,
-            tools: Vec::new(),
-            result: None,
-            warning: Some(warning.to_string()),
-            ended_at: chrono::Utc::now(),
-        },
-    );
+    publish_with_next_seq(next_seqs, session_id, |seq| {
+        sink.publish(
+            session_id,
+            seq,
+            &Event::BackgroundAgentCompleted {
+                agent_id,
+                status: BackgroundAgentStatus::Detached,
+                tools: Vec::new(),
+                result: None,
+                warning: Some(warning.to_string()),
+                ended_at: chrono::Utc::now(),
+            },
+        )
+    });
 }
 
 /// The attach-path counterpart of [`detach_orphaned_background_agents_on`]:
@@ -362,7 +374,11 @@ pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     next_seqs: &SeqMap,
     session_id: &str,
 ) {
-    let publish = |event: Event| sink.publish(session_id, next_seq(next_seqs, session_id), &event);
+    let publish = |event: Event| {
+        publish_with_next_seq(next_seqs, session_id, |seq| {
+            sink.publish(session_id, seq, &event)
+        })
+    };
     let approvals = sink.unresolved_approval_nonces(session_id);
     if !approvals.is_empty() {
         info!(
@@ -420,7 +436,7 @@ mod tests {
             3
         );
         assert_eq!(
-            next_seq(&sup.next_seqs, "s-2"),
+            publish_with_next_seq(&sup.next_seqs, "s-2", |seq| seq),
             1,
             "sessions count separately"
         );
@@ -446,7 +462,7 @@ mod tests {
         ));
 
         sup.forget_session("s-1").unwrap();
-        assert_eq!(next_seq(&sup.next_seqs, "s-1"), 1);
+        assert_eq!(publish_with_next_seq(&sup.next_seqs, "s-1", |seq| seq), 1);
     }
 
     #[tokio::test]
@@ -773,6 +789,84 @@ inherits-claude = "claude"
                 disposition: PromptDisposition::Forward,
                 seq: None,
             }
+        );
+    }
+
+    /// Records, for each broadcast, whether its session's seq counter was held.
+    #[derive(Default)]
+    struct LockProbeSink {
+        seqs: std::sync::OnceLock<std::sync::Arc<SeqMap>>,
+        held: std::sync::Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl BroadcastSink for LockProbeSink {
+        fn publish(&self, session_id: &str, seq: u64, _event: &Event) {
+            let counter = super::super::session_seq(self.seqs.get().unwrap(), session_id);
+            let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            self.held.lock().unwrap().push((seq, held));
+        }
+    }
+
+    /// Records the running epoch's admission count as each prompt event is stored.
+    #[derive(Default)]
+    struct AdmissionProbeSink {
+        lease: std::sync::OnceLock<crate::acp::runner_lifecycle::Lease>,
+        seen: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl BroadcastSink for AdmissionProbeSink {
+        fn publish(&self, _: &str, _: u64, event: &Event) {
+            if matches!(
+                event,
+                Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
+            ) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(self.lease.get().unwrap().admissions());
+            }
+        }
+    }
+
+    /// An idle stop claimed between a prompt's persistence and its admission
+    /// count would stop the worker the prompt was just recorded for (#5048), so
+    /// the count must already stand when the event is stored.
+    #[tokio::test]
+    async fn prompts_are_admitted_before_they_are_stored() {
+        let sink = std::sync::Arc::new(AdmissionProbeSink::default());
+        let sup = Supervisor::new(std::sync::Arc::clone(&sink));
+        sup.test_insert_worker("s-1").await;
+        sink.lease.set(sup.running_lease("s-1").unwrap()).unwrap();
+
+        sup.publish_user_prompt("s-1", "typed".into()).await;
+        sup.publish_user_diff_comments_prompt(
+            "s-1",
+            String::new(),
+            String::new(),
+            false,
+            Vec::new(),
+            "review".into(),
+        )
+        .await;
+
+        assert_eq!(*sink.seen.lock().unwrap(), [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn each_publish_runs_under_its_sessions_seq_lock() {
+        let sink = std::sync::Arc::new(LockProbeSink::default());
+        let sup = Supervisor::new(std::sync::Arc::clone(&sink));
+        sink.seqs
+            .set(std::sync::Arc::clone(&sup.next_seqs))
+            .unwrap();
+
+        sup.publish_startup_error("s-1", "boom".into());
+        sup.publish_user_prompt("s-1", "prompt".into()).await;
+        assert!(sup.publish_stopped_if_seq("s-1", "user_stopped", 2));
+
+        assert_eq!(
+            *sink.held.lock().unwrap(),
+            [(1, true), (2, true), (3, true)]
         );
     }
 }

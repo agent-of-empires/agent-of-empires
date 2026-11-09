@@ -139,6 +139,7 @@ impl HomeView {
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
+            session_dialog_target: None,
             worktree_name_dialog: None,
             restart_dialog: None,
             context_menu: None,
@@ -223,6 +224,9 @@ impl HomeView {
             pending_switch_view_session: None,
             structured_preview: None,
             structured_preview_pending: false,
+            retained_preview: None,
+            retained_focus: None,
+            retained_scroll_offset: 0,
             pending_force_remove_session: None,
             pending_trash_session: None,
             pending_dialog_click_action: None,
@@ -271,6 +275,7 @@ impl HomeView {
             container_terminal_preview_cache: PreviewCache::default(),
             tool_preview_cache: PreviewCache::default(),
             preview_scroll_offset: 0,
+            preview_explicit_tail: false,
             preview_text_view: PreviewTextView::default(),
             preview_area: Rect::default(),
             preview_pane_area: Rect::default(),
@@ -318,6 +323,7 @@ impl HomeView {
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,
+            preview_click_seed: None,
             preview_copy_pending: false,
             preview_copy_text: None,
             show_preview_info: user_config
@@ -328,6 +334,9 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.home_split_terminal)
                 .unwrap_or(false),
+            split_terminal_height_percent: resolved.session.split_terminal_height_percent,
+            split_terminal_min_width: resolved.session.split_terminal_min_width,
+            split_terminal_min_height: resolved.session.split_terminal_min_height,
             split_capture_worker: None,
             split_capture_target: None,
             archived_section_collapsed: user_config

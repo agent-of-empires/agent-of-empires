@@ -106,11 +106,11 @@ export function useSidebarSelection({
     [],
   );
 
-  // Escape clears the selection unless typing.
+  // Escape clears the selection unless typing, or unless a popup already used it to close itself.
   useEffect(() => {
     if (selection.selectedIds.size === 0) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
+      if (e.key !== "Escape" || e.defaultPrevented) return;
       const t = e.target as HTMLElement | null;
       if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
       dispatch({ type: "clear" });

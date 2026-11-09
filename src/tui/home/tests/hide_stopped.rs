@@ -670,18 +670,7 @@ async fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         if trash {
             let state = native_state(&["test"]).await;
             apply_published(&mut env.view, &state).await;
-            super::pickers_groups_sort::settle_row_command(
-                &state,
-                &mut env.view,
-                &id,
-                SessionRequest::Trash(Default::default()),
-                |view| {
-                    view.trash_session_by_id(&id);
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
+            super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
             press_y(&mut env);
             select_session(&mut env, "util-stopped-a");
             super::pickers_groups_sort::settle_row_command(
