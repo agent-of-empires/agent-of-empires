@@ -76,6 +76,7 @@ impl CaptureStorage<'_> {
         &self,
         instance: &mut Instance,
         observation: &SessionIdObservation,
+        mut selection: Option<&mut [u8; 32]>,
     ) -> anyhow::Result<bool> {
         let SessionIdGuard::InstanceSidecar {
             transcript: Some(path),
@@ -89,6 +90,7 @@ impl CaptureStorage<'_> {
         if instance.pi_session_path.as_deref() == Some(path.as_str()) {
             return Ok(true);
         }
+        let mut next_selection = None;
         let result = self.with_store(&instance.effective_profile(), |storage| {
             storage.update(|instances, _| {
                 #[cfg(test)]
@@ -96,6 +98,14 @@ impl CaptureStorage<'_> {
                     !crate::session::instance::Instance::pi_path_write_fails_for_test(),
                     "injected transcript path write failure"
                 );
+                if let Some(expected) = selection.as_deref() {
+                    let Some(row) = instances.iter().find(|row| row.id == instance.id) else {
+                        return Ok(false);
+                    };
+                    if row.native_preparation_selection()? != *expected {
+                        return Ok(false);
+                    }
+                }
                 let row = instances.iter_mut().find(|row| {
                     row.id == instance.id
                         && row.agent_session_id.as_deref() == Some(observation.sid.as_str())
@@ -116,13 +126,22 @@ impl CaptureStorage<'_> {
                             ResumeIntent::Default => true,
                         }
                 });
-                Ok(row
-                    .map(|row| row.pi_session_path = Some(path.clone()))
-                    .is_some())
+                if let Some(row) = row {
+                    row.pi_session_path = Some(path.clone());
+                    if selection.is_some() {
+                        next_selection = Some(row.native_preparation_selection()?);
+                    }
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             })
         });
         match result {
             Ok(true) => {
+                if let (Some(selection), Some(next)) = (selection.as_deref_mut(), next_selection) {
+                    *selection = next;
+                }
                 instance.pi_session_path = Some(path.clone());
                 Ok(true)
             }
@@ -143,7 +162,7 @@ pub(crate) fn drain_and_persist_session_ids(
     instances: &mut [Instance],
     file_watch: &Arc<FileWatchService>,
 ) -> SessionIdSyncOutcome {
-    drain_and_persist_session_ids_inner(instances, CaptureStorage::Profiles(file_watch))
+    drain_and_persist_session_ids_inner(instances, CaptureStorage::Profiles(file_watch), None)
         .unwrap_or_else(|error| {
             tracing::warn!(target: "session.sync", %error, "capture drain failed");
             SessionIdSyncOutcome::default()
@@ -154,14 +173,16 @@ pub(crate) fn drain_and_persist_session_ids(
 pub(crate) fn drain_and_persist_session_ids_lifecycle_locked(
     instances: &mut [Instance],
     storage: &dyn SessionStore,
+    selection: Option<&mut [u8; 32]>,
 ) -> anyhow::Result<SessionIdSyncOutcome> {
     assert_eq!(instances.len(), 1);
-    drain_and_persist_session_ids_inner(instances, CaptureStorage::Scoped(storage))
+    drain_and_persist_session_ids_inner(instances, CaptureStorage::Scoped(storage), selection)
 }
 
 fn drain_and_persist_session_ids_inner(
     instances: &mut [Instance],
     stores: CaptureStorage<'_>,
+    mut selection: Option<&mut [u8; 32]>,
 ) -> anyhow::Result<SessionIdSyncOutcome> {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
@@ -383,7 +404,7 @@ fn drain_and_persist_session_ids_inner(
             };
             let path_changed =
                 observed_path.is_some_and(|path| inst.pi_session_path.as_deref() != Some(path));
-            if stores.persist_pi_observation(inst, observation)? {
+            if stores.persist_pi_observation(inst, observation, selection.as_deref_mut())? {
                 if path_changed && inst.pi_session_path.as_deref() == observed_path {
                     path_only_applied.push(id.clone());
                 }
@@ -431,13 +452,20 @@ fn drain_and_persist_session_ids_inner(
                 let SessionIdGuard::OmpGeneration(generation) = &update.observation.guard else {
                     unreachable!("OMP pin confirmations require a generation guard");
                 };
-                Instance::persist_omp_pin_confirmation(storage, &update.id, &update.sid, generation)
+                Instance::persist_omp_pin_confirmation(
+                    storage,
+                    &update.id,
+                    &update.sid,
+                    generation,
+                    selection.as_deref_mut(),
+                )
             } else {
                 persist_conversation_observation_to_store(
                     storage,
                     &update.id,
                     &update.observation,
                     &update.expected_prior,
+                    selection.as_deref_mut(),
                 )
             };
             if let Some((_lock, generation)) = ownership {
@@ -541,7 +569,11 @@ fn drain_and_persist_session_ids_inner(
                 } if update.observation.pi_session_path.as_deref() == Some(path.as_str())
             );
             if path_committed_with_sid
-                || stores.persist_pi_observation(inst, &update.observation)?
+                || stores.persist_pi_observation(
+                    inst,
+                    &update.observation,
+                    selection.as_deref_mut(),
+                )?
             {
                 acknowledge_poller_observation(inst, &update.observation);
             }
@@ -563,7 +595,13 @@ fn drain_and_persist_session_ids_inner(
             inst.resume_probe_failed_sid = rb.disk_failed_sid.clone();
             inst.omp_capture_generation = rb.disk_omp_capture_generation.clone();
             if let Some(update) = update {
-                if !stale_same_sid && stores.persist_pi_observation(inst, &update.observation)? {
+                if !stale_same_sid
+                    && stores.persist_pi_observation(
+                        inst,
+                        &update.observation,
+                        selection.as_deref_mut(),
+                    )?
+                {
                     acknowledge_poller_observation(inst, &update.observation);
                 }
             }
@@ -819,6 +857,7 @@ fn persist_conversation_observation_to_store(
     instance_id: &str,
     observation: &SessionIdObservation,
     expected: &ConversationState,
+    selection: Option<&mut [u8; 32]>,
 ) -> anyhow::Result<CaptureCommit> {
     use crate::session::poller::SessionIdGuard;
 
@@ -830,7 +869,8 @@ fn persist_conversation_observation_to_store(
         return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
     }
     let binding = observation.conversation_binding();
-    storage.update(|instances, _| {
+    let mut next_selection = None;
+    let committed = storage.update(|instances, _| {
         let Some(index) = instances
             .iter()
             .position(|instance| instance.id == instance_id)
@@ -838,6 +878,11 @@ fn persist_conversation_observation_to_store(
             return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         };
         let instance = &instances[index];
+        if let Some(expected) = selection.as_deref() {
+            if instance.native_preparation_selection()? != *expected {
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
+            }
+        }
         if !expected.matches(instance)
             || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
         {
@@ -909,11 +954,20 @@ fn persist_conversation_observation_to_store(
             instance.resume_intent = ResumeIntent::Default;
             instance.resume_binding = None;
         }
+        if selection.is_some() {
+            next_selection = Some(instance.native_preparation_selection()?);
+        }
         Ok(CaptureCommit {
             outcome: SidWrite::Applied,
             failed_sid: instance.resume_probe_failed_sid.clone(),
         })
-    })
+    })?;
+    if committed.outcome == SidWrite::Applied {
+        if let (Some(selection), Some(next)) = (selection, next_selection) {
+            *selection = next;
+        }
+    }
+    Ok(committed)
 }
 
 fn reload_skipped_from_disk(storage: &dyn SessionStore, id: &str) -> anyhow::Result<Rollback> {

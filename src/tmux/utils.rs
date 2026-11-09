@@ -324,6 +324,178 @@ pub(crate) mod owned_probe_test_support {
     }
 }
 
+/// A complete physical census used only to refuse an unrecorded birth.
+/// This is not a birth receipt and cannot authorize adoption or cleanup.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PaneBirthInventory {
+    socket: String,
+    server: Option<crate::session::TmuxServerIdentity>,
+    panes: Vec<InventoriedPane>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct InventoriedPane {
+    identity: crate::session::LegacyToolIdentity,
+    birth: Option<crate::process::ProcessBirthIdentity>,
+}
+
+impl PaneBirthInventory {
+    pub(crate) fn socket(&self) -> &str {
+        &self.socket
+    }
+
+    pub(crate) fn receipt_present(
+        &self,
+        receipt: &crate::session::LegacyToolObservation,
+    ) -> Result<bool> {
+        if self.server.as_ref() == Some(receipt.server.as_ref()) {
+            return Ok(self
+                .panes
+                .iter()
+                .any(|pane| pane.identity.pane_id == receipt.identity.pane_id));
+        }
+        anyhow::ensure!(
+            !crate::process::process_birth_is_live(receipt.server.pid, &receipt.server.birth,)?,
+            "cannot prove the original terminal handoff server absent"
+        );
+        Ok(false)
+    }
+
+    pub(crate) fn ensure_only_preexisting_live_panes(&self, prior: &Self) -> Result<()> {
+        anyhow::ensure!(
+            self.socket == prior.socket,
+            "terminal handoff socket changed"
+        );
+        if self.panes.is_empty() {
+            if let Some(server) = &prior.server {
+                anyhow::ensure!(!crate::process::process_birth_is_live(server.pid, &server.birth)?,
+                    "original terminal handoff server remains live but its inventory is unavailable");
+            }
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.server == prior.server,
+            "terminal handoff server changed; cannot prove an unrecorded birth absent"
+        );
+        for pane in &self.panes {
+            let old = prior
+                .panes
+                .binary_search_by(|old| old.identity.pane_id.cmp(&pane.identity.pane_id))
+                .ok()
+                .map(|index| &prior.panes[index]);
+            anyhow::ensure!(pane.birth.is_some() && old.is_some_and(|old|
+                old.identity.pane_pid == pane.identity.pane_pid && old.birth == pane.birth),
+                "unrecorded terminal birth may still exist; close its exact pane explicitly in tmux before selecting a target");
+        }
+        Ok(())
+    }
+}
+
+/// No name, kind, pane-index or first-window filtering is permitted here.
+pub(crate) fn capture_pane_birth_inventory(
+    socket: Option<&str>,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<PaneBirthInventory> {
+    let socket = match socket {
+        Some(socket) => socket.to_owned(),
+        None => crate::tmux::native_socket_locator()
+            .and_then(|path| path.into_os_string().into_string().ok())
+            .ok_or_else(|| anyhow::anyhow!("terminal handoff socket is unavailable"))?,
+    };
+    let mut command = crate::tmux::tmux_query_command_for_socket(&socket);
+    command.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pid}|#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}",
+    ]);
+    let output = deadline.run(&mut command)?;
+    let mut inventory = PaneBirthInventory {
+        socket,
+        server: None,
+        panes: Vec::new(),
+    };
+    if !output.status.success() {
+        if crate::tmux::tmux_no_server_running(&output.stderr) {
+            return Ok(inventory);
+        }
+        let no_target = std::str::from_utf8(&output.stderr)?.trim() == "no current target";
+        anyhow::ensure!(no_target, "complete terminal handoff inventory failed");
+        let mut command = crate::tmux::tmux_query_command_for_socket(&inventory.socket);
+        command.args(["list-sessions", "-F", "#{session_id}"]);
+        let empty = deadline.run(&mut command)?;
+        anyhow::ensure!(
+            empty.status.success() && empty.stdout.is_empty(),
+            "complete terminal handoff inventory is unavailable"
+        );
+        return Ok(inventory);
+    }
+    for line in std::str::from_utf8(&output.stdout)?.lines() {
+        let mut parts = line.split('|');
+        let fields: [Option<&str>; 5] = std::array::from_fn(|_| parts.next());
+        let [Some(server_pid), Some(session_id), Some(pane_id), Some(pane_pid), Some(dead)] =
+            fields
+        else {
+            bail!("malformed complete terminal handoff inventory")
+        };
+        anyhow::ensure!(
+            parts.next().is_none(),
+            "extra terminal handoff inventory fields"
+        );
+        let identity = crate::session::LegacyToolIdentity {
+            session_id: session_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            pane_pid: if pane_pid.is_empty() {
+                None
+            } else {
+                Some(pane_pid.parse()?)
+            },
+        };
+        anyhow::ensure!(
+            crate::tmux::ToolSession::valid_identity(&identity),
+            "invalid complete terminal handoff identity"
+        );
+        let pid = server_pid.parse()?;
+        if let Some(expected) = &inventory.server {
+            anyhow::ensure!(
+                expected.pid == pid,
+                "terminal handoff inventory server changed"
+            );
+        } else {
+            let birth = crate::process::process_birth_identity(pid)?
+                .ok_or_else(|| anyhow::anyhow!("terminal handoff server birth unavailable"))?;
+            inventory.server = Some(crate::session::TmuxServerIdentity {
+                socket: inventory.socket.clone(),
+                pid,
+                birth,
+            });
+        }
+        let birth = match dead {
+            "1" => None,
+            "0" => Some(
+                crate::process::process_birth_identity(
+                    identity
+                        .pane_pid
+                        .ok_or_else(|| anyhow::anyhow!("live pane PID unavailable"))?,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("live pane birth unavailable"))?,
+            ),
+            _ => bail!("invalid complete terminal handoff pane state"),
+        };
+        inventory.panes.push(InventoriedPane { identity, birth });
+    }
+    if let Some(server) = &inventory.server {
+        anyhow::ensure!(
+            crate::process::process_birth_is_live(server.pid, &server.birth)?,
+            "terminal handoff server changed during complete inventory"
+        );
+    }
+    inventory
+        .panes
+        .sort_unstable_by(|left, right| left.identity.pane_id.cmp(&right.identity.pane_id));
+    Ok(inventory)
+}
+
 /// Identity printed by `new-session`, not a later name-based lookup.
 pub(crate) fn created_pane_observation(
     stdout: &[u8],
@@ -361,7 +533,6 @@ pub(crate) struct OwnedPaneProbe {
     pub(crate) state: PaneProbe,
     pub(crate) shell: bool,
     pub(crate) exclusive: bool,
-    pub(crate) pane_pid: Option<u32>,
 }
 
 /// Capture the physical first pane without turning failed inspection into absence.
@@ -452,47 +623,12 @@ pub(crate) fn observe_pane(
     Ok(Some((observation, state, shell)))
 }
 
-/// Fresh observation of the pane this launch created. None means ownership changed.
-pub(crate) fn probe_owned_pane(
-    session_name: &str,
-    expected: &crate::session::LegacyToolObservation,
-    deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Result<Option<OwnedPaneProbe>> {
-    Ok(probe_owned_pane_with(
-        Some(session_name),
-        expected,
-        deadline,
-        is_pane_running_shell_command,
-    )?
-    .map(|(state, shell, pane_pid, exclusive)| OwnedPaneProbe {
-        state,
-        shell,
-        pane_pid,
-        exclusive,
-    }))
-}
-
-pub(crate) fn probe_owned_pane_readiness(
-    expected: &crate::session::LegacyToolObservation,
-    deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Result<Option<(PaneProbe, bool, String)>> {
-    Ok(
-        probe_owned_pane_with(None, expected, deadline, |command, protected| {
-            (
-                is_pane_running_shell_command(command, protected),
-                command.to_owned(),
-            )
-        })?
-        .map(|(probe, (shell, command), _, _)| (probe, shell, command)),
-    )
-}
-
 fn probe_owned_pane_with<T>(
     session_name: Option<&str>,
     expected: &crate::session::LegacyToolObservation,
     deadline: &crate::tmux::TmuxCommandDeadline,
     inspect: impl FnOnce(&str, bool) -> T,
-) -> Result<Option<(PaneProbe, T, Option<u32>, bool)>> {
+) -> Result<Option<(PaneProbe, T, bool)>> {
     anyhow::ensure!(
         crate::process::process_birth_is_live(expected.server.pid, &expected.server.birth)?,
         "original tmux server is unavailable"
@@ -559,7 +695,7 @@ fn probe_owned_pane_with<T>(
             if owned_identity_present {
                 return Ok(None);
             }
-            return Ok(Some((PaneProbe::Missing, inspect("", false), None, true)));
+            return Ok(Some((PaneProbe::Missing, inspect("", false), true)));
         }
     };
     if ids.first() != Some(&expected.identity.pane_id) {
@@ -633,7 +769,6 @@ fn probe_owned_pane_with<T>(
     Ok(Some((
         probe,
         inspect(command, start_command.contains(PANE_ENV_FILE_PREFIX)),
-        pane_pid,
         exclusive,
     )))
 }
@@ -643,13 +778,6 @@ pub(crate) fn remove_owned_dead_pane(
     expected: &crate::session::LegacyToolObservation,
 ) -> Result<()> {
     remove_owned_pane(expected, true)
-}
-
-/// Remove a positively identified live birth, without targeting a mutable name.
-pub(crate) fn remove_owned_live_pane(
-    expected: &crate::session::LegacyToolObservation,
-) -> Result<()> {
-    remove_owned_pane(expected, false)
 }
 
 pub(crate) fn remove_owned_pane(
@@ -757,6 +885,47 @@ enum PaneListLookup {
     Panes(Vec<String>),
     Missing,
     Unknown(anyhow::Error),
+}
+
+/// Fresh observation of the pane this launch created. None means ownership changed.
+pub(crate) fn probe_owned_pane(
+    session_name: &str,
+    expected: &crate::session::LegacyToolObservation,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<Option<OwnedPaneProbe>> {
+    Ok(probe_owned_pane_with(
+        Some(session_name),
+        expected,
+        deadline,
+        is_pane_running_shell_command,
+    )?
+    .map(|(state, shell, exclusive)| OwnedPaneProbe {
+        state,
+        shell,
+        exclusive,
+    }))
+}
+
+pub(crate) fn probe_owned_pane_readiness(
+    expected: &crate::session::LegacyToolObservation,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<Option<(PaneProbe, bool, String)>> {
+    Ok(
+        probe_owned_pane_with(None, expected, deadline, |command, protected| {
+            (
+                is_pane_running_shell_command(command, protected),
+                command.to_owned(),
+            )
+        })?
+        .map(|(probe, (shell, command), _)| (probe, shell, command)),
+    )
+}
+
+/// Remove a positively identified live birth, without targeting a mutable name.
+pub(crate) fn remove_owned_live_pane(
+    expected: &crate::session::LegacyToolObservation,
+) -> Result<()> {
+    remove_owned_pane(expected, false)
 }
 
 fn first_window_pane_ids_classified(
@@ -1610,7 +1779,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn dead_probe_transports_the_current_pid_snapshot_from_the_owned_birth() {
+    fn dead_probe_removes_the_original_owned_birth_without_repinning() {
         use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
         if !tmux_available() {
             return;
@@ -1642,9 +1811,7 @@ mod tests {
             .unwrap();
         wait_for_pane_dead(&pane);
         let OwnedPaneProbe {
-            state,
-            pane_pid: current_pid,
-            ..
+            state, exclusive, ..
         } = probe_owned_pane(
             guard.name(),
             &born,
@@ -1653,18 +1820,16 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(state, PaneProbe::Dead);
+        assert!(exclusive);
         let (actual, state, _) =
             observe_pane(guard.name(), &crate::tmux::TmuxCommandDeadline::new())
                 .unwrap()
                 .unwrap();
         assert_eq!(state, PaneProbe::Dead);
-        assert_eq!(current_pid, actual.identity.pane_pid);
         assert_eq!(born.identity.session_id, actual.identity.session_id);
         assert_eq!(born.identity.pane_id, actual.identity.pane_id);
         assert_eq!(born.server, actual.server);
-        let mut corpse = born;
-        corpse.identity.pane_pid = current_pid;
-        remove_owned_dead_pane(&corpse).unwrap();
+        remove_owned_dead_pane(&born).unwrap();
         assert!(!crate::tmux::tmux_command()
             .args(["has-session", "-t", guard.name()])
             .status()

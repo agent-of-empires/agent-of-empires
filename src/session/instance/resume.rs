@@ -141,8 +141,29 @@ pub(crate) enum ResumeAttemptPolicy {
 
 pub(crate) struct LaunchReservation {
     pub(crate) generation: u64,
+    pub(crate) revival: Option<RevivalTarget>,
+    pub(crate) start_admission: Option<NativeStartAdmission>,
     pub(crate) title_lock: crate::session::storage::StorageFlock,
     pub(crate) lifecycle_lock: crate::session::storage::StorageFlock,
+}
+
+#[derive(Clone)]
+pub(crate) struct RevivalTarget {
+    pub(super) pane: std::sync::Arc<LegacyToolObservation>,
+    pub(crate) state: crate::tmux::utils::PaneProbe,
+}
+
+pub(crate) struct PreparedLaunchReservation {
+    pub(crate) generation: u64,
+    pub(super) revival: Option<RevivalTarget>,
+    pub(crate) start_admission: Option<NativeStartAdmission>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Indeterminate launch is pending durable finalization: {cause}")]
+pub(crate) struct LaunchFinalizationPending {
+    pub(crate) generation: u64,
+    pub(crate) cause: LaunchIndeterminateCause,
 }
 /// Finite launch observations safe to expose without tmux diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,7 +205,7 @@ impl std::error::Error for LaunchIndeterminateCause {}
 /// Physical admission and selected context retained across pre-launch hooks.
 pub(crate) struct NativeStartAdmission {
     pub(super) tmux_session: String,
-    pub(super) corpse: Option<LegacyToolObservation>,
+    pub(super) revival: Option<RevivalTarget>,
     created_at: chrono::DateTime<chrono::Utc>,
     selection: [u8; 32],
 }
@@ -197,10 +218,17 @@ impl NativeStartAdmission {
     ) -> Result<Self> {
         Ok(Self {
             tmux_session,
-            corpse,
+            revival: corpse.map(|pane| RevivalTarget {
+                pane: std::sync::Arc::new(pane),
+                state: crate::tmux::utils::PaneProbe::Dead,
+            }),
             created_at: instance.created_at,
             selection: instance.native_preparation_selection()?,
         })
+    }
+
+    pub(crate) fn revival_target(&self) -> Option<RevivalTarget> {
+        self.revival.clone()
     }
 
     pub(crate) fn selection(&self) -> &[u8; 32] {
@@ -216,11 +244,25 @@ impl NativeStartAdmission {
         Ok(())
     }
 
+    fn verify_store_context(
+        &self,
+        instance: &Instance,
+        storage: &dyn crate::session::SessionStore,
+    ) -> Result<()> {
+        self.verify_context(instance)?;
+        let row = storage
+            .load()?
+            .into_iter()
+            .find(|row| row.id == instance.id)
+            .ok_or(LifecycleReservationError::Superseded)?;
+        self.verify_context(&row)
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        let unchanged = match self.corpse.as_ref() {
-            Some(pane) => matches!(
-                crate::tmux::utils::probe_owned_pane(&self.tmux_session, pane, &deadline)
+        let unchanged = match self.revival.as_ref() {
+            Some(target) => matches!(
+                crate::tmux::utils::probe_owned_pane(&self.tmux_session, &target.pane, &deadline)
                     .map_err(|error| error.context(LaunchIndeterminateCause::ObservationFailed))?,
                 Some(crate::tmux::utils::OwnedPaneProbe {
                     state: crate::tmux::utils::PaneProbe::Dead
@@ -234,37 +276,6 @@ impl NativeStartAdmission {
                 .is_none(),
         };
         anyhow::ensure!(unchanged, LaunchIndeterminateCause::OwnershipUnproven);
-        Ok(())
-    }
-
-    pub(crate) fn remove_corpse(&self) -> Result<()> {
-        if let Some(pane) = self.corpse.as_ref() {
-            let deadline = crate::tmux::TmuxCommandDeadline::new();
-            match crate::tmux::utils::probe_owned_pane(&self.tmux_session, pane, &deadline)
-                .map_err(|error| error.context(LaunchIndeterminateCause::ObservationFailed))?
-            {
-                Some(crate::tmux::utils::OwnedPaneProbe {
-                    state: crate::tmux::utils::PaneProbe::Dead,
-                    pane_pid: current_pid,
-                    exclusive: true,
-                    ..
-                }) => {
-                    let mut corpse = pane.clone();
-                    corpse.identity.pane_pid = current_pid;
-                    crate::tmux::utils::remove_owned_dead_pane(&corpse).map_err(|error| {
-                        error.context(LaunchIndeterminateCause::OwnershipUnproven)
-                    })?;
-                }
-                Some(crate::tmux::utils::OwnedPaneProbe {
-                    state: crate::tmux::utils::PaneProbe::Missing,
-                    exclusive: true,
-                    ..
-                }) => {}
-                _ => return Err(LaunchIndeterminateCause::OwnershipUnproven.into()),
-            }
-        } else {
-            self.verify()?;
-        }
         Ok(())
     }
 }
@@ -283,6 +294,11 @@ pub(super) struct LaunchProbe {
     pub(super) expected: ConversationState,
 }
 
+pub(super) struct LaunchFailure {
+    pub(super) error: anyhow::Error,
+    pub(super) born: Option<(LaunchProbe, ConversationState)>,
+}
+
 pub(super) struct LaunchSandboxSnapshot {
     pub(super) container_name: String,
     pub(super) container_id: Option<String>,
@@ -293,7 +309,6 @@ pub(crate) struct ResumeLaunchOptions {
     pub(crate) resume_policy: ResumeAttemptPolicy,
     pub(crate) restart: bool,
     pub(crate) conversation_carry: Option<ConversationCarry>,
-    pub(crate) start_admission: Option<NativeStartAdmission>,
 }
 
 const RESUME_PROBE_MAX: std::time::Duration = std::time::Duration::from_millis(3000);
@@ -320,17 +335,25 @@ impl Instance {
         crate::tmux::utils::PaneProbe,
     )> {
         let observed = (|| -> Result<_> {
-            let panes = crate::tmux::batch_pane_metadata()?;
-            let name = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
-                .map(|(name, _)| name.to_owned())
-                .unwrap_or_else(|| crate::tmux::Session::generate_name(&self.id, &self.title));
+            let Some(name) = crate::tmux::unique_agent_session_name(&self.id)? else {
+                return Ok((
+                    crate::tmux::Session::generate_name(&self.id, &self.title),
+                    None,
+                    crate::tmux::utils::PaneProbe::Missing,
+                ));
+            };
             let deadline = crate::tmux::TmuxCommandDeadline::new();
-            match crate::tmux::utils::observe_pane(&name, &deadline)? {
-                Some((pane, state, _)) => Ok((name, Some(pane), state)),
-                None => Ok((name, None, crate::tmux::utils::PaneProbe::Missing)),
-            }
+            let (pane, state, _) = crate::tmux::utils::observe_pane(&name, &deadline)?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+            Ok((name, Some(pane), state))
         })();
-        observed.map_err(|error| anyhow::Error::new(self.probe_failure_cause(error)))
+        observed.map_err(|error: anyhow::Error| {
+            if error.is::<LaunchIndeterminateCause>() {
+                error
+            } else {
+                anyhow::Error::new(self.probe_failure_cause(error))
+            }
+        })
     }
 
     /// Alive includes shells and Error/Stopped projections; none authorizes replacement.
@@ -385,7 +408,6 @@ impl Instance {
                 resume_policy,
                 restart: true,
                 conversation_carry: None,
-                start_admission: None,
             },
         )
     }
@@ -410,7 +432,6 @@ impl Instance {
                 resume_policy: ResumeAttemptPolicy::HonorAutoResumeSetting,
                 restart: true,
                 conversation_carry,
-                start_admission: None,
             },
         )
     }
@@ -522,7 +543,7 @@ impl Instance {
         ProbeResult::Indeterminate(self.probe_failure_cause(error))
     }
 
-    fn probe_failure_cause(&self, error: anyhow::Error) -> LaunchIndeterminateCause {
+    pub(super) fn probe_failure_cause(&self, error: anyhow::Error) -> LaunchIndeterminateCause {
         let cause = if error.chain().any(|source| {
             source
                 .downcast_ref::<std::io::Error>()
@@ -579,7 +600,6 @@ impl Instance {
                 resume_policy,
                 restart: false,
                 conversation_carry: None,
-                start_admission: None,
             },
         )
     }
@@ -629,19 +649,53 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         self.ensure_startable()?;
-        if !options.restart {
-            let Some(admission) = self.admit_native_start()? else {
-                return Ok(match self.positive_pane_readiness() {
-                    Ok(true) => StartOutcome::Fresh,
-                    Ok(false) => StartOutcome::Indeterminate {
-                        cause: LaunchIndeterminateCause::StabilizationExpired,
-                    },
-                    Err(_) => StartOutcome::Indeterminate {
-                        cause: LaunchIndeterminateCause::ObservationFailed,
-                    },
-                });
-            };
-            options.start_admission = Some(admission);
+        let mut live_observed = false;
+        let mut start_admission = None;
+        let captured = if options.restart {
+            self.capture_revival_target()
+        } else {
+            self.admit_native_start().map(|admission| match admission {
+                Some(admission) => {
+                    let revival = admission.revival_target();
+                    start_admission = Some(admission);
+                    revival
+                }
+                None => {
+                    live_observed = true;
+                    None
+                }
+            })
+        };
+        let revival = match captured {
+            Ok(revival) => revival,
+            Err(error) => {
+                return match error.downcast_ref::<LaunchIndeterminateCause>() {
+                    Some(&cause) => Ok(StartOutcome::Indeterminate { cause }),
+                    None => Err(error),
+                };
+            }
+        };
+        if !options.restart
+            && (live_observed
+                || revival
+                    .as_ref()
+                    .is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Alive))
+        {
+            return Ok(match self.positive_pane_readiness() {
+                Ok(true) => StartOutcome::Fresh,
+                Ok(false) => StartOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                Err(_) => StartOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::ObservationFailed,
+                },
+            });
+        }
+        if revival
+            .as_ref()
+            .is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Dead)
+        {
+            options.restart = true;
         }
         if options.restart && self.status == Status::Error {
             self.status = Status::Idle;
@@ -656,7 +710,7 @@ impl Instance {
         )?;
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         }
@@ -666,6 +720,8 @@ impl Instance {
             skip_on_launch,
             LaunchReservation {
                 generation,
+                revival,
+                start_admission,
                 title_lock,
                 lifecycle_lock,
             },
@@ -681,18 +737,71 @@ impl Instance {
         reservation: LaunchReservation,
         options: ResumeLaunchOptions,
     ) -> Result<StartOutcome> {
-        let generation =
-            self.prepare_reserved_launch_hooks(storage, options.restart, reservation)?;
+        let generation = reservation.generation;
+        let reservation =
+            match self.prepare_reserved_launch_hooks(storage, options.restart, reservation) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                        let probe = LaunchProbe {
+                            tmux_session: self.tmux_session()?.name().to_owned(),
+                            pane: None,
+                            expected: self.conversation_state(),
+                        };
+                        return self.preserve_indeterminate_launch(
+                            storage, generation, &probe, None, cause,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
         let hook_result =
             self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
-        self.finish_reserved_launch(storage, size, options, generation, hook_result)
+        self.finish_reserved_launch(storage, size, options, reservation, hook_result)
+    }
+
+    pub(crate) fn capture_revival_target(&self) -> Result<Option<RevivalTarget>> {
+        let Some(name) = crate::tmux::unique_agent_session_name(&self.id)? else {
+            return Ok(None);
+        };
+        let (pane, state, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())
+                .map_err(|error| anyhow::Error::from(self.probe_failure_cause(error)))?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+        Ok(Some(RevivalTarget {
+            pane: std::sync::Arc::new(pane),
+            state,
+        }))
+    }
+
+    fn preserve_indeterminate_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        probe: &LaunchProbe,
+        sandbox_prior: Option<&LaunchSandboxSnapshot>,
+        cause: LaunchIndeterminateCause,
+    ) -> Result<StartOutcome> {
+        self.last_error = Some(cause.message().to_owned());
+        if self.lifecycle_generation == generation {
+            self.record_terminal_error(
+                ErrorEvidenceSource::TmuxObservation,
+                RuntimeEvidence::Unknown,
+            );
+        } else {
+            self.last_error_evidence = None;
+        }
+        self.last_error_check = Some(std::time::Instant::now());
+        self.release_indeterminate_launch(storage, generation, probe, sandbox_prior)
+            .map_err(|error| error.context(LaunchFinalizationPending { generation, cause }))?;
+        Ok(StartOutcome::Indeterminate { cause })
     }
     pub(crate) fn capture_before_restart_in(
         &mut self,
         storage: &dyn crate::session::SessionStore,
     ) -> Result<()> {
-        self.stop_and_flush_poller_lifecycle_locked(storage)?;
-        self.capture_omp_before_restart(storage)
+        self.stop_and_flush_poller_lifecycle_locked(storage, None)?;
+        self.capture_omp_before_restart(storage, None)
     }
 
     pub(crate) fn discard_reserved_restart_container(
@@ -701,7 +810,7 @@ impl Instance {
         generation: u64,
     ) -> Result<()> {
         if let Err(error) = self.discard_stale_sandbox_container() {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         Ok(())
@@ -712,25 +821,49 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         restart: bool,
         reservation: LaunchReservation,
-    ) -> Result<u64> {
+    ) -> Result<PreparedLaunchReservation> {
         let LaunchReservation {
             generation,
+            revival,
+            mut start_admission,
             title_lock,
             lifecycle_lock,
         } = reservation;
-        if restart {
-            let capture = self
-                .stop_and_flush_poller_lifecycle_locked(storage)
-                .and_then(|()| self.capture_omp_before_restart(storage));
-            if let Err(error) = capture {
-                self.fail_reserved_launch(storage, generation, &error, false);
-                return Err(error);
+        let captured = (|| -> Result<()> {
+            if let Some(admission) = start_admission.as_ref() {
+                admission.verify_store_context(self, storage)?;
             }
+            if restart || revival.is_some() {
+                self.stop_and_flush_poller_lifecycle_locked(
+                    storage,
+                    start_admission
+                        .as_mut()
+                        .map(|admission| &mut admission.selection),
+                )?;
+                self.capture_omp_before_restart(
+                    storage,
+                    start_admission
+                        .as_mut()
+                        .map(|admission| &mut admission.selection),
+                )?;
+            }
+            if let Some(admission) = start_admission.as_ref() {
+                admission.verify_store_context(self, storage)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = captured {
+            self.fail_reserved_launch(storage, generation, &error, None, None);
+            return Err(error);
         }
 
         drop(lifecycle_lock);
         drop(title_lock);
-        Ok(generation)
+        Ok(PreparedLaunchReservation {
+            generation,
+            revival,
+            start_admission,
+        })
     }
 
     pub(super) fn capture_resume_launch_target_in(&mut self, stores: CaptureStorage<'_>) {
@@ -766,27 +899,28 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         size: Option<(u16, u16)>,
         options: ResumeLaunchOptions,
-        generation: u64,
+        reservation: PreparedLaunchReservation,
         hook_result: Result<()>,
     ) -> Result<StartOutcome> {
+        let PreparedLaunchReservation {
+            generation,
+            revival,
+            start_admission,
+        } = reservation;
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         let ResumeLaunchOptions {
             resume_policy,
             restart,
             conversation_carry,
-            start_admission,
         } = options;
-        if !restart {
+        if !restart || start_admission.is_some() {
             let admitted = start_admission
                 .as_ref()
                 .ok_or_else(|| anyhow::Error::new(LaunchIndeterminateCause::OwnershipUnproven))
-                .and_then(|admission| {
-                    admission.verify_context(self)?;
-                    admission.verify()
-                });
+                .and_then(|admission| admission.verify_context(self));
             if let Err(error) = admitted {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         }
@@ -796,7 +930,7 @@ impl Instance {
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         if let Err(error) = self.preflight_resume_launch() {
             self.adopt_conversation_state(prior);
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         if std::mem::take(&mut self.force_fresh_next_launch) {
@@ -812,44 +946,41 @@ impl Instance {
                 workdir: sandbox.container_workdir.clone(),
             });
         let spawned = (|| {
-            let mut prepared = self.stop_carry_and_prepare_in(
-                storage,
-                restart,
-                start_admission.as_ref(),
-                conversation_carry,
-                prior,
-            )?;
+            let mut prepared = self
+                .stop_carry_and_prepare_in(
+                    storage,
+                    restart,
+                    conversation_carry,
+                    prior,
+                    revival.as_ref(),
+                )
+                .map_err(|error| Box::new(LaunchFailure { error, born: None }))?;
             prepared.require_conversation_publication |= skipped_failed_resume_sid.is_some();
             self.spawn_prepared_launch(size, storage, prepared)
         })();
         let (launch_outcome, probe) = match spawned {
             Ok(spawned) => spawned,
-            Err(error) => {
+            Err(failure) => {
+                let LaunchFailure { error, born } = *failure;
                 if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
                     let probe = LaunchProbe {
                         tmux_session: self.tmux_session()?.name().to_owned(),
                         pane: None,
                         expected: self.conversation_state(),
                     };
-                    if let Err(release) = self.release_indeterminate_launch(
+                    return self.preserve_indeterminate_launch(
                         storage,
                         generation,
                         &probe,
                         sandbox_prior.as_ref(),
-                    ) {
-                        tracing::warn!(target: "session.store", session = %self.id, %release,
-                            "indeterminate revival reservation release failed; runtime retained");
-                    }
-                    return Ok(StartOutcome::Indeterminate { cause });
+                        cause,
+                    );
                 }
-                self.fail_reserved_launch(
-                    storage,
-                    generation,
-                    &error,
-                    restart
-                        && !error.is::<LaunchIndeterminateCause>()
-                        && !error.is::<super::start::LaunchPublicationFailure>(),
-                );
+                let (probe, prior) = born
+                    .as_ref()
+                    .map(|(probe, prior)| (Some(probe), Some(prior)))
+                    .unwrap_or((None, None));
+                self.fail_reserved_launch(storage, generation, &error, probe, prior);
                 return Err(error);
             }
         };
@@ -864,34 +995,21 @@ impl Instance {
             Ok(outcome) => outcome,
             Err(error) => {
                 // Probe cleanup addresses only the captured pane, never a new name owner.
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         };
         if let StartOutcome::Indeterminate { cause } = outcome {
-            self.last_error = Some(cause.message().to_owned());
-            if self.lifecycle_generation == generation {
-                self.record_terminal_error(
-                    ErrorEvidenceSource::TmuxObservation,
-                    RuntimeEvidence::Unknown,
-                );
-            } else {
-                self.last_error_evidence = None;
-            }
-            self.last_error_check = Some(std::time::Instant::now());
-            // A failed release cannot turn missing evidence into teardown authority.
-            if let Err(error) = self.release_indeterminate_launch(
+            return self.preserve_indeterminate_launch(
                 storage,
                 generation,
                 &probe,
                 sandbox_prior.as_ref(),
-            ) {
-                tracing::warn!(target: "session.store", session = %self.id, error = %format_args!("{error:#}"), "indeterminate launch reservation release failed; runtime retained");
-            }
-            return Ok(outcome);
+                cause,
+            );
         }
         if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart) {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         Ok(outcome)
@@ -913,25 +1031,37 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         restart: bool,
-        start_admission: Option<&NativeStartAdmission>,
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
+        revival: Option<&RevivalTarget>,
     ) -> Result<PreparedLaunch> {
-        let publication = if restart {
+        let retiring = restart || revival.is_some();
+        let publication = if retiring {
             self.prime_root_publication(true)
         } else {
             None
         };
-        if restart {
-            self.kill_for_revival_locked()?;
-        } else {
-            start_admission
-                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?
-                .remove_corpse()?;
-            if start_admission.is_some_and(|admission| admission.corpse.is_some()) {
-                self.release_scope()
-                    .map_err(|error| error.context(LaunchIndeterminateCause::OwnershipUnproven))?;
+        if retiring {
+            let generation = self.lifecycle_generation;
+            if let Err(error) = self.kill_for_revival_locked(revival) {
+                if error.is::<LaunchIndeterminateCause>() {
+                    match self.restore_capture_after_refused_revival(storage, generation, expected)
+                    {
+                        Ok(PollerStart::Started) => {}
+                        Ok(outcome) => tracing::warn!(target: "session.store", session = %self.id,
+                            ?outcome, "retained runtime capture is not yet running after revival refusal"),
+                        Err(restore) => tracing::warn!(target: "session.store", session = %self.id,
+                            error = %format_args!("{restore:#}"), "retained runtime capture could not be restored"),
+                    }
+                }
+                return Err(error);
             }
+        } else {
+            anyhow::ensure!(
+                crate::tmux::unique_agent_session_presence(&self.id)?
+                    == crate::tmux::SessionExistence::Absent,
+                LaunchIndeterminateCause::OwnershipUnproven
+            );
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -966,7 +1096,7 @@ impl Instance {
         }
         let stores = CaptureStorage::Scoped(storage);
         let prepared = self.prepare_launch_command_in(stores, expected)?;
-        if restart {
+        if retiring {
             return self.refresh_prepared_prime_launch_after_pane_stop_in(
                 stores,
                 prepared,
@@ -974,6 +1104,29 @@ impl Instance {
             );
         }
         Ok(prepared)
+    }
+
+    /// A pre-removal refusal may restore only its still-current captured producer.
+    fn restore_capture_after_refused_revival(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        expected: ConversationState,
+    ) -> Result<PollerStart> {
+        let rows = storage.load()?;
+        anyhow::ensure!(
+            self.lifecycle_generation == generation
+                && rows.iter().any(|row| {
+                    row.id == self.id
+                        && row
+                            .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
+                        && expected.matches(row)
+                        && row.omp_capture_generation == self.omp_capture_generation
+                }),
+            LaunchIndeterminateCause::OwnershipUnproven
+        );
+        self.adopt_conversation_state(expected);
+        self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))
     }
 
     #[cfg(test)]
@@ -985,17 +1138,19 @@ impl Instance {
     ) -> Result<PreparedLaunch> {
         let storage =
             crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
-        let admission = if restart {
-            None
+        let revival = if restart {
+            self.capture_revival_target()?
         } else {
             self.admit_native_start()?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?
+                .revival_target()
         };
         self.stop_carry_and_prepare_in(
             &storage,
             restart,
-            admission.as_ref(),
             conversation_carry,
             expected,
+            revival.as_ref(),
         )
     }
 
@@ -1095,23 +1250,22 @@ impl Instance {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         #[cfg(test)]
         let deadline = tests::probe_deadline(deadline);
-        let (state, current_pid) =
-            match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline) {
-                Ok(Some(crate::tmux::utils::OwnedPaneProbe {
-                    state:
-                        state @ (crate::tmux::utils::PaneProbe::Dead
-                        | crate::tmux::utils::PaneProbe::Missing),
-                    pane_pid: current_pid,
-                    exclusive: true,
-                    ..
-                })) => (state, current_pid),
-                Ok(_) => {
-                    return Ok(ProbeResult::Indeterminate(
-                        LaunchIndeterminateCause::OwnershipUnproven,
-                    ))
-                }
-                Err(error) => return Ok(self.indeterminate_probe(error)),
-            };
+        let state = match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline)
+        {
+            Ok(Some(crate::tmux::utils::OwnedPaneProbe {
+                state:
+                    state @ (crate::tmux::utils::PaneProbe::Dead
+                    | crate::tmux::utils::PaneProbe::Missing),
+                exclusive: true,
+                ..
+            })) => state,
+            Ok(_) => {
+                return Ok(ProbeResult::Indeterminate(
+                    LaunchIndeterminateCause::OwnershipUnproven,
+                ))
+            }
+            Err(error) => return Ok(self.indeterminate_probe(error)),
+        };
         if let Err(cause) = self.fence_launch_probe(storage, generation, probe) {
             return Ok(ProbeResult::Indeterminate(cause));
         }
@@ -1130,9 +1284,7 @@ impl Instance {
             }
         }
         if state == crate::tmux::utils::PaneProbe::Dead {
-            let mut corpse = pane.as_ref().clone();
-            corpse.identity.pane_pid = current_pid;
-            if let Err(error) = crate::tmux::utils::remove_owned_dead_pane(&corpse) {
+            if let Err(error) = crate::tmux::utils::remove_owned_dead_pane(pane) {
                 return Ok(self.indeterminate_probe(error));
             }
         }
@@ -1261,6 +1413,180 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn first_pi_ensure_accepts_own_final_capture_but_not_a_hook_selection_change(
+    ) -> Result<()> {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let python = which::which("python3")?;
+        let (_hooks, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir()?;
+        let _app = crate::session::test_support::isolate_app_dir_at(home.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.agent_status_hooks = false;
+        })?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        const BEFORE: &str = "22f13307-461c-4161-908e-95a247fac750";
+        const FINAL: &str = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        const FOREIGN: &str = "53c04d61-6476-4d29-a6aa-f4b254d2b0b4";
+        for (same_sid, foreign_hook) in [(true, false), (false, false), (false, true)] {
+            let label = format!("pi-first-ensure-{same_sid}-{foreign_hook}");
+            let argv = home.path().join(format!("{label}.argv"));
+            let pid_file = home.path().join(format!("{label}.pid"));
+            let input = home.path().join(format!("{label}.input"));
+            let hook_log = home.path().join(format!("{label}.hooks"));
+            let native = format!(
+                "#!{}\nimport json,os,sys\nif '--help' in sys.argv: print('--session --session-id --fork');sys.exit(0)\nif '--version' in sys.argv: print('0.59.1');sys.exit(0)\nopen({},'w').write(str(os.getpid()))\np={}\nopen(p+'.tmp','w').write(json.dumps(sys.argv[1:]))\nos.replace(p+'.tmp',p)\nwhile True:\n data=os.read(0,4096)\n if not data: break\n with open({},'ab') as log: log.write(data)\n",
+                python.display(), serde_json::to_string(&pid_file.to_string_lossy())?,
+                serde_json::to_string(&argv.to_string_lossy())?,
+                serde_json::to_string(&input.to_string_lossy())?,
+            );
+            let _path = crate::session::test_support::install_login_shell_path_command(
+                home.path(),
+                "pi",
+                &native,
+            );
+            let mut row = Instance::new(&label, home.path().to_str().unwrap());
+            row.source_profile = label.clone();
+            row.tool = "pi".into();
+            row.agent_session_id = Some(if same_sid { FINAL } else { BEFORE }.into());
+            let storage = crate::session::Storage::new_unwatched(&label)?;
+            storage.update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })?;
+            let transcript = crate::session::instance::test_helpers::publish_host_pi_transcript(
+                &row.id,
+                FINAL,
+                home.path(),
+            );
+            let sessions = crate::session::get_profile_dir(&label)?.join("sessions.json");
+            let hook_path = home.path().join(format!("{label}.hook.py"));
+            let mutation = if foreign_hook {
+                format!(
+                    "p={}\nrows=json.load(open(p))\nfor row in rows:\n if row['id']=={}:\n  row['resume_intent']=json.loads({})\n  row['resume_binding']=None\nopen(p+'.peer','w').write(json.dumps(rows))\nos.replace(p+'.peer',p)\n",
+                    serde_json::to_string(&sessions.to_string_lossy())?,
+                    serde_json::to_string(&row.id)?,
+                    serde_json::to_string(&serde_json::to_string(&ResumeIntent::Use(FOREIGN.into()))?)?,
+                )
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &hook_path,
+                format!(
+                    "import json,os\nwith open({},'a') as log: log.write('hook\\n')\n{}",
+                    serde_json::to_string(&hook_log.to_string_lossy())?,
+                    mutation,
+                ),
+            )?;
+            let hook = format!(
+                "{} {}",
+                crate::session::environment::shell_escape_script_word(&python.to_string_lossy()),
+                crate::session::environment::shell_escape_script_word(&hook_path.to_string_lossy())
+            );
+            let config = crate::session::config::profile_config::get_profile_config_path(&label)?;
+            std::fs::write(
+                config,
+                format!("[hooks]\non_launch={}\n", serde_json::to_string(&[hook])?),
+            )?;
+            let name = row.tmux_session()?.name().to_owned();
+            let _pane = TmuxTestSession::from_name(&name);
+            anyhow::ensure!(crate::tmux::tmux_command()
+                .args([
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &name,
+                    "sleep 60"
+                ])
+                .output()?
+                .status
+                .success());
+            // Keep a real dead pane, not an absent name or prepared marker.
+            // remain-on-exit must be configured before the terminating command.
+            let pane = only_pane_id(&name);
+            anyhow::ensure!(crate::tmux::tmux_command()
+                .args(["set-option", "-t", &name, "remain-on-exit", "on"])
+                .output()?
+                .status
+                .success());
+            anyhow::ensure!(crate::tmux::tmux_command()
+                .args(["respawn-pane", "-k", "-t", &pane, "exit 17"])
+                .output()?
+                .status
+                .success());
+            wait_for_pane_dead(&pane);
+            let original =
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?
+                    .0;
+            let result = row.orchestrate_resume_launch_in(
+                &storage,
+                None,
+                false,
+                false,
+                ResumeLaunchOptions {
+                    resume_policy: ResumeAttemptPolicy::Allow,
+                    restart: false,
+                    conversation_carry: None,
+                },
+            );
+            assert_eq!(std::fs::read_to_string(&hook_log)?, "hook\n");
+            let durable = storage.load_instances_complete()?.remove(0);
+            assert_eq!(durable.agent_session_id.as_deref(), Some(FINAL));
+            assert_eq!(durable.pi_session_path.as_deref(), transcript.to_str());
+            assert_eq!(durable.lifecycle_generation, 1);
+            if foreign_hook {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(|error| error.is::<LifecycleReservationError>()),
+                    "{result:?}"
+                );
+                assert_eq!(durable.resume_intent, ResumeIntent::Use(FOREIGN.into()));
+                assert!(!argv.exists() && !pid_file.exists() && !input.exists());
+                let retained = crate::tmux::utils::observe_pane(
+                    &name,
+                    &crate::tmux::TmuxCommandDeadline::new(),
+                )?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                assert_eq!(retained.0, original);
+                assert_eq!(retained.1, crate::tmux::utils::PaneProbe::Dead);
+            } else {
+                assert_eq!(result?, StartOutcome::Resumed);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !argv.exists() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "actual Pi child has not published argv"
+                    );
+                    std::thread::yield_now();
+                }
+                let args: Vec<String> = serde_json::from_slice(&std::fs::read(&argv)?)?;
+                assert!(args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--session" && pair[1] == transcript.to_string_lossy()));
+                let pid = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
+                let birth = crate::process::process_birth_identity(pid)?
+                    .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                assert!(crate::process::process_birth_is_live(pid, &birth)?);
+                assert!(!input.exists());
+                row.kill_clean_in(&storage)?;
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn native_start_context_rejects_changed_selection_and_row_reuse() -> Result<()> {
         let original = Instance::new("preparation context", "/tmp/preparation-context");
@@ -1312,7 +1638,7 @@ mod tests {
         let (_pane, observation) = observed_dead_resume_fixture(&instance);
         let probe = LaunchProbe {
             tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-            pane: Some(std::sync::Arc::new(observation)),
+            pane: Some(observation.into()),
             expected: instance.conversation_state(),
         };
         storage
@@ -1415,9 +1741,12 @@ mod tests {
                     resume_policy: ResumeAttemptPolicy::Allow,
                     restart: true,
                     conversation_carry: None,
+                },
+                PreparedLaunchReservation {
+                    generation,
+                    revival: None,
                     start_admission: None,
                 },
-                generation,
                 Ok(()),
             )
             .unwrap();
@@ -1949,7 +2278,6 @@ mod tests {
                 "failed",
                 "malformed",
                 "expiry",
-                "release_failure",
                 "cached_absence",
                 "superseded",
                 "same_sid_assertion",
@@ -1974,6 +2302,7 @@ mod tests {
                 let _case = CaseContext { resumed, fault };
                 let logs = crate::session::test_support::LogCapture::start();
                 let dead_first = fault == "dead" || fault.starts_with("dead_");
+                let expects_peer_publication = matches!(fault, "superseded" | "dead_recheck_owner");
                 let root = tempdir().unwrap();
                 let _app = crate::session::test_support::isolate_app_dir_at(root.path());
                 let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
@@ -2018,6 +2347,7 @@ mod tests {
                     std::fs::create_dir_all(root.path().join(".claude")).unwrap();
                     instance.agent_session_id = Some(SID.into());
                 }
+                let owned_generation = instance.lifecycle_generation + 1;
                 let storage =
                     crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
                 storage
@@ -2041,6 +2371,8 @@ mod tests {
                 }
                 let snapshot = Rc::new(RefCell::new(None));
                 let seen = snapshot.clone();
+                let canonical_snapshot = Rc::new(RefCell::new(None));
+                let canonical_seen = canonical_snapshot.clone();
                 let cache = Rc::new(RefCell::new(None));
                 let force_cache = cache.clone();
                 let old_pane = Rc::new(RefCell::new(None));
@@ -2095,6 +2427,15 @@ mod tests {
                             args.windows(2).any(|pair| pair == [selector, SID]),
                             "{args:?}"
                         );
+                        let canonical = crate::session::Storage::new_unwatched(&row.source_profile)
+                            .unwrap()
+                            .load()
+                            .unwrap()
+                            .into_iter()
+                            .find(|stored| stored.id == row.id)
+                            .unwrap();
+                        assert_eq!(canonical.lifecycle_generation, owned_generation);
+                        *canonical_seen.borrow_mut() = Some(canonical);
                         if fault == "cached_absence" {
                             let guard = crate::tmux::SessionCacheGuard::capture();
                             guard.force_present(&[]);
@@ -2154,10 +2495,10 @@ mod tests {
                 );
                 let observed = Rc::new(Cell::new(0usize));
                 let observed_query = observed.clone();
-                let writes = Rc::new(RefCell::new(None));
-                let fail_writes = writes.clone();
                 let profile = instance.source_profile.clone();
                 let id = instance.id.clone();
+                let peer_publication = Rc::new(RefCell::new(None));
+                let injected_peer = peer_publication.clone();
                 let _observation = Observer::install(move |output| {
                     let sample = observed_query.get() + 1;
                     observed_query.set(sample);
@@ -2208,8 +2549,15 @@ mod tests {
                                     let row = rows.iter_mut().find(|row| row.id == id).unwrap();
                                     row.status = Status::Running;
                                     if fault == "dead_recheck_owner" {
-                                        row.lifecycle_generation += 1;
+                                        assert_eq!(row.lifecycle_generation, owned_generation);
+                                        row.lifecycle_generation = owned_generation + 1;
                                         row.lifecycle_reservation = None;
+                                        *injected_peer.borrow_mut() = Some((
+                                            row.lifecycle_generation,
+                                            row.lifecycle_reservation.clone(),
+                                            row.conversation_state(),
+                                            row.resume_probe_failed_sid.clone(),
+                                        ));
                                     }
                                     Ok(())
                                 })
@@ -2242,9 +2590,16 @@ mod tests {
                                     let row = rows.iter_mut().find(|row| row.id == id).unwrap();
                                     row.status = Status::Running;
                                     if fault == "superseded" {
-                                        row.lifecycle_generation += 1;
+                                        assert_eq!(row.lifecycle_generation, owned_generation);
+                                        row.lifecycle_generation = owned_generation + 1;
                                         row.lifecycle_reservation = None;
                                         row.resume_probe_failed_sid = Some(SID.into());
+                                        *injected_peer.borrow_mut() = Some((
+                                            row.lifecycle_generation,
+                                            row.lifecycle_reservation.clone(),
+                                            row.conversation_state(),
+                                            row.resume_probe_failed_sid.clone(),
+                                        ));
                                     } else if fault == "same_sid_assertion" {
                                         row.resume_intent = ResumeIntent::Use(SID.into());
                                         row.resume_binding = row.agent_session_binding.clone();
@@ -2256,14 +2611,6 @@ mod tests {
                             if fault == "concurrent_status" {
                                 output.stdout = b"not a pane observation\n".to_vec();
                             }
-                        }
-                        "release_failure" => {
-                            *fail_writes.borrow_mut() = Some(
-                                crate::session::Storage::new_unwatched(&profile)
-                                    .unwrap()
-                                    .fail_writes_for_test(),
-                            );
-                            output.stdout = b"not a pane observation\n".to_vec();
                         }
                         _ => {}
                     }
@@ -2353,38 +2700,11 @@ mod tests {
                     assert_eq!(released.get(), 1);
                     continue;
                 }
-                let outcome = result.unwrap();
-                if fault == "cached_absence" {
-                    assert_eq!(
-                        outcome,
-                        if resumed {
-                            StartOutcome::Resumed
-                        } else {
-                            StartOutcome::Fresh
-                        }
-                    );
-                } else {
-                    let cause = match fault {
-                        "lookup_timeout"
-                        | "pane_timeout"
-                        | "dead_recheck_timeout"
-                        | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
-                        "expiry" => LaunchIndeterminateCause::StabilizationExpired,
-                        "superseded" | "same_sid_assertion" | "replacement" | "rename_only"
-                        | "server_changed" | "dead_recheck_owner" | "pane_pid_missing"
-                        | "dead_pid_changed" => LaunchIndeterminateCause::OwnershipUnproven,
-                        _ => LaunchIndeterminateCause::ObservationFailed,
-                    };
-                    assert_eq!(
-                        outcome,
-                        StartOutcome::Indeterminate { cause },
-                        "private launch diagnostics:\n{}",
-                        logs.contents()
-                    );
-                    assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
-                }
-                writes.borrow_mut().take();
                 let stored = storage.load().unwrap().remove(0);
+                let canonical_before = canonical_snapshot
+                    .borrow_mut()
+                    .take()
+                    .expect("real canonical publication observed before fault injection");
                 assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
                 if let Some(birth) = native_birth.as_ref() {
                     assert!(
@@ -2401,7 +2721,10 @@ mod tests {
                     assert_eq!(stored.resume_intent, ResumeIntent::Use(SID.into()));
                     assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(SID));
                 } else {
-                    assert_eq!(stored.conversation_state(), before.conversation_state());
+                    assert_eq!(
+                        stored.conversation_state(),
+                        canonical_before.conversation_state()
+                    );
                     assert_eq!(
                         stored.resume_probe_failed_sid.as_deref(),
                         if fault == "superseded"
@@ -2410,25 +2733,17 @@ mod tests {
                         {
                             Some(SID)
                         } else {
-                            before.resume_probe_failed_sid.as_deref()
+                            canonical_before.resume_probe_failed_sid.as_deref()
                         }
                     );
                 }
-                assert_eq!(stored.active_execution, before.active_execution);
-                assert_eq!(stored.terminal_scopes, before.terminal_scopes);
+                assert_eq!(stored.active_execution, canonical_before.active_execution);
+                assert_eq!(stored.terminal_scopes, canonical_before.terminal_scopes);
                 assert_eq!(
                     stored.lifecycle_generation,
-                    before.lifecycle_generation
-                        + if matches!(fault, "superseded" | "dead_recheck_owner") {
-                            1
-                        } else {
-                            0
-                        }
+                    canonical_before.lifecycle_generation + u64::from(expects_peer_publication)
                 );
-                assert_eq!(
-                    stored.lifecycle_reservation.is_some(),
-                    fault == "release_failure"
-                );
+                assert!(stored.lifecycle_reservation.is_none());
                 assert_eq!(instance.capture_started_at, before.capture_started_at);
                 assert_eq!(instance.started_at, before.started_at);
                 assert_eq!(released.get(), 0);
@@ -2480,6 +2795,61 @@ mod tests {
                 if !dead_first {
                     assert!(instance.capture_poller.is_running());
                 }
+                // The independently executed fixture write, not the subject's result or its
+                // final generation alone, determines whether publication authority was lost.
+                let peer_publication = peer_publication.borrow_mut().take();
+                assert_eq!(peer_publication.is_some(), expects_peer_publication);
+                if let Some((generation, reservation, conversation, marker)) = peer_publication {
+                    assert_eq!(stored.lifecycle_generation, generation);
+                    assert_eq!(stored.lifecycle_reservation, reservation);
+                    assert_eq!(stored.conversation_state(), conversation);
+                    assert_eq!(stored.resume_probe_failed_sid, marker);
+                    let error = result.expect_err("the foreign publication forbids finalization");
+                    let pending = error
+                        .downcast_ref::<LaunchFinalizationPending>()
+                        .expect("lost ownership retains explicit finalization debt");
+                    assert_eq!(pending.generation, canonical_before.lifecycle_generation);
+                    assert_eq!(pending.cause, LaunchIndeterminateCause::OwnershipUnproven);
+                    assert!(
+                        matches!(
+                            error.downcast_ref::<LifecycleReservationError>(),
+                            Some(LifecycleReservationError::Superseded)
+                        ),
+                        "{error:#}"
+                    );
+                } else {
+                    let outcome = result.unwrap();
+                    if fault == "cached_absence" {
+                        assert_eq!(
+                            outcome,
+                            if resumed {
+                                StartOutcome::Resumed
+                            } else {
+                                StartOutcome::Fresh
+                            }
+                        );
+                    } else {
+                        let cause = match fault {
+                            "lookup_timeout"
+                            | "pane_timeout"
+                            | "dead_recheck_timeout"
+                            | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
+                            "expiry" => LaunchIndeterminateCause::StabilizationExpired,
+                            "same_sid_assertion" | "replacement" | "rename_only"
+                            | "server_changed" | "pane_pid_missing" | "dead_pid_changed" => {
+                                LaunchIndeterminateCause::OwnershipUnproven
+                            }
+                            _ => LaunchIndeterminateCause::ObservationFailed,
+                        };
+                        assert_eq!(
+                            outcome,
+                            StartOutcome::Indeterminate { cause },
+                            "private launch diagnostics:\n{}",
+                            logs.contents()
+                        );
+                        assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
+                    }
+                }
                 instance.capture_poller.clear();
             }
         }
@@ -2498,6 +2868,115 @@ mod tests {
             POST_SHELL_OBSERVER.with(|slot| {
                 slot.borrow_mut().take();
             });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn public_ensure_refuses_unknown_observation_after_a_real_launch() {
+        use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
+        use crate::tmux::test_helpers::{only_pane_id, pane_field};
+        use std::cell::RefCell;
+        use std::os::unix::fs::PermissionsExt;
+        use std::rc::Rc;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        for dead in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            let agent_pid_file = root.path().join("actual-host-agent.pid");
+            let _agent = install_fake_claude(root.path(), &format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
+                crate::session::environment::shell_escape_script_word(&agent_pid_file.to_string_lossy()),
+            ));
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.agent_status_hooks = false;
+                config.session.smart_rename = false;
+            })
+            .unwrap();
+            let mut instance = Instance::new("post-launch-unknown", root.path().to_str().unwrap());
+            instance.tool = "claude".into();
+            instance.command = "claude".into();
+            instance.source_profile = "post-launch-unknown".into();
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+            let _corpse = dead.then(|| observed_dead_resume_fixture(&instance));
+            let blocked = root.path().join("post-finalization-query-failure");
+            let bin = root.path().join("tmux-bin");
+            std::fs::create_dir(&bin).unwrap();
+            let shim = bin.join("tmux");
+            let quote = crate::session::environment::shell_escape_script_word;
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nif [ -e {} ]; then\nfor arg do\ncase \"$arg\" in display-message|list-panes|list-sessions|has-session) printf '%s\\n' 'post-finalization tmux unavailable' >&2; exit 1;; esac\ndone\nfi\nexec {} \"$@\"\n",
+                quote(&blocked.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            )).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let seen = Rc::new(RefCell::new(None));
+            let observed = seen.clone();
+            let cache = Rc::new(RefCell::new(None));
+            let forced = cache.clone();
+            let block_after_finalize = blocked.clone();
+            let launched_name = name.clone();
+            let _finalize = FinalizeObserver::install(instance.id.clone(), move |_, phase| {
+                if !matches!(phase, FinalizePhase::After) {
+                    return;
+                }
+                assert!(
+                    observed.borrow().is_none(),
+                    "one actual launch, not a replay"
+                );
+                let pane = only_pane_id(&launched_name);
+                crate::tmux::test_helpers::wait_for_pane_agent_command(
+                    &pane,
+                    &agent_pid_file,
+                    "sleep",
+                );
+                assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+                let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
+                let birth = crate::process::process_birth_identity(pid)
+                    .unwrap()
+                    .expect("the finalized birth must be physically live");
+                *observed.borrow_mut() = Some((pane, pid, birth));
+                let guard = crate::tmux::SessionCacheGuard::capture();
+                guard.force_present(&[&launched_name]);
+                *forced.borrow_mut() = Some(guard);
+                std::fs::write(&block_after_finalize, b"after actual launch finalization").unwrap();
+            });
+            let outcome = instance.ensure_pane_ready();
+            std::fs::remove_file(&blocked).expect("post-finalization observation boundary reached");
+            drop(cache.borrow_mut().take());
+            let (pane, pid, birth) = seen.borrow_mut().take().expect("real birth observed");
+            assert_eq!(
+                only_pane_id(&name),
+                pane,
+                "no cleanup or replay after observation loss"
+            );
+            assert_eq!(
+                crate::process::process_birth_identity(pid).unwrap(),
+                Some(birth)
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(crate::session::EnsureReadyOutcome::Indeterminate {
+                        cause: LaunchIndeterminateCause::ObservationFailed
+                    })
+                ),
+                "cached presence cannot authorize a newly launched pane after observation fails \
+                 (dead={dead}): {outcome:?}"
+            );
         }
     }
 
@@ -3158,6 +3637,557 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn stale_shared_hook_status_cannot_authorize_a_new_execution_boot_shell() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        real_native_hook_case(
+            false,
+            concat!(
+                module_path!(),
+                "::stale_shared_hook_status_cannot_authorize_a_new_execution_boot_shell"
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    #[serial(hook_base)]
+    fn refused_revival_restores_capture_before_the_next_native_publication() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        real_native_hook_case(
+            true,
+            concat!(
+                module_path!(),
+                "::refused_revival_restores_capture_before_the_next_native_publication"
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    fn real_native_hook_case(capture_after_refusal: bool, test_name: &str) {
+        use crate::tmux::test_helpers::{only_pane_id, pane_field};
+        use std::io::Write;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _native_helper =
+            crate::session::instance::test_helpers::frozen_test_helper(root.path(), test_name);
+        let _env = isolate_resume_environment(root.path());
+        let (_hooks, _base, _hook_temp) = crate::hooks::test_support::BaseGuard::ready();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = true;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let mut instance = Instance::new("qualified-hook-owner", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "qualified-hook-owner".into();
+        let directory = crate::hooks::dir_guard::hook_base_path().join(&instance.id);
+        let command = root.path().join("actual-installed-status-command");
+        let status_command = crate::hooks::status_command_for_event(
+            crate::agents::HookStatus::Running,
+            &[],
+            crate::hooks::HookInstallTarget::Host,
+            true,
+        );
+        std::fs::write(&command, &status_command).unwrap();
+        let mode = root.path().join("producer-mode");
+        let ready = root.path().join("producer-ready");
+        let request = root.path().join("publish-next-id");
+        let published = root.path().join("producer-publication");
+        let births = root.path().join("native-births");
+        std::fs::write(&mode, b"A").unwrap();
+        let _agent = install_fake_claude(
+            root.path(),
+            &format!(
+                r#"#!/bin/sh
+case "$1" in --help|--version) exit 1 ;; esac
+SID=
+while [ "$#" -gt 0 ]; do
+case "$1" in --resume|--session-id) shift; SID="$1" ;; esac
+shift
+done
+[ -n "$SID" ] || exit 92
+SOURCE="${{AOE_SESSION_SOURCE:?missing actual launch source}}"
+D={directory}
+mkdir -p "$D"; chmod 700 "$D"
+printf %s "$SID" > "$D/session_id.$SOURCE"
+MODE=$(cat {mode})
+if [ "$MODE" = A ]; then
+printf '{{"session_id":"%s"}}' "$SID" | sh {command}
+fi
+printf x >> {births}
+printf '%s|%s|%s\n' "$$" "$SOURCE" "$SID" > {ready}.tmp
+mv {ready}.tmp {ready}."$MODE"
+while [ ! -e {request} ]; do sleep 0.01; done
+NEXT=$(cat {request})
+printf %s "$NEXT" > "$D/session_id.$SOURCE"
+printf '%s|%s|%s\n' "$$" "$SOURCE" "$NEXT" > {published}.tmp
+mv {published}.tmp {published}
+exec sleep 60
+"#,
+                directory = shell_escape(&directory.to_string_lossy()),
+                mode = shell_escape(&mode.to_string_lossy()),
+                command = shell_escape(&command.to_string_lossy()),
+                births = shell_escape(&births.to_string_lossy()),
+                ready = shell_escape(&ready.to_string_lossy()),
+                request = shell_escape(&request.to_string_lossy()),
+                published = shell_escape(&published.to_string_lossy()),
+            ),
+        );
+        const SID: &str = "11111111-2222-4333-8444-555555555555";
+        const NEXT: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        seed_claude_transcript(&mut instance, SID);
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert_eq!(
+            instance.start_with_size_opts(None, true).unwrap(),
+            LaunchSidOutcome::Existing { sid: SID.into() },
+            "the real outgoing Native launch must resume the attested conversation"
+        );
+        let wait_publication = |path: &std::path::Path| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the real Agent did not publish {}",
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let text = std::fs::read_to_string(path).unwrap();
+            let fields: Vec<_> = text.trim().split('|').map(str::to_owned).collect();
+            assert_eq!(fields.len(), 3);
+            fields
+        };
+        let first = wait_publication(&ready.with_extension("A"));
+        assert_eq!(first[2], SID);
+        assert_eq!(
+            first[1],
+            instance.active_execution.as_ref().unwrap().launch_id
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("status")).unwrap(),
+            "running"
+        );
+        let original_pane = only_pane_id(&name);
+        if capture_after_refusal {
+            assert!(
+                instance.capture_poller.is_running(),
+                "the outgoing watcher must actually run"
+            );
+            let (peer, peer_pid, peer_birth) = add_live_probe_peer(&original_pane);
+            let outcome = instance
+                .restart_with_resume_policy(None, false, ResumeAttemptPolicy::Allow)
+                .unwrap();
+            assert!(matches!(outcome, StartOutcome::Indeterminate { .. }));
+            assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
+            assert_eq!(pane_field(&peer, "#{pane_dead}"), "0");
+            let mut next_history: Instance =
+                serde_json::from_value(serde_json::to_value(&instance).unwrap()).unwrap();
+            next_history.source_profile = instance.source_profile.clone();
+            seed_claude_transcript(&mut next_history, NEXT);
+            std::fs::write(&request, NEXT).unwrap();
+            let publication = wait_publication(&published);
+            assert_eq!(
+                publication[0], first[0],
+                "the same preserved Native producer publishes"
+            );
+            assert_eq!(publication[1], first[1]);
+            assert_eq!(publication[2], NEXT);
+            assert!(instance.capture_poller.is_running(),
+                "the refused public revival must restore the watcher before this real Native publication");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let _runtime = runtime.enter();
+            let watch = crate::file_watch::FileWatchService::new().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                crate::session::sync::drain_and_persist_session_ids(
+                    std::slice::from_mut(&mut instance),
+                    &watch,
+                );
+                if storage.load().unwrap()[0].agent_session_id.as_deref() == Some(NEXT) {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline,
+                    "the next real Native publication was lost after refusal; no maintenance/reload was run");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(instance.capture_poller.is_running());
+            assert_eq!(std::fs::read(&births).unwrap(), b"x");
+            assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
+            instance.capture_poller.stop();
+        } else {
+            std::fs::write(&mode, b"B").unwrap();
+            instance.restart_with_size_opts(None, true).unwrap();
+            let second = wait_publication(&ready.with_extension("B"));
+            assert_eq!(
+                second[2], SID,
+                "even reusing the same conversation cannot reuse A's status"
+            );
+            assert_ne!(
+                first[1], second[1],
+                "the actual second launch has a new source"
+            );
+            assert_eq!(
+                second[1],
+                instance.active_execution.as_ref().unwrap().launch_id
+            );
+            let pane = only_pane_id(&name);
+            // Represent the supported unprotected/legacy boot-shell state with a real tmux
+            // process, not by forging metadata or weakening the protected-wrapper exemption.
+            assert!(crate::tmux::tmux_command()
+                .args(["respawn-pane", "-k", "-t", &pane, "/bin/sh"])
+                .status()
+                .unwrap()
+                .success());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let panes = crate::tmux::batch_pane_metadata().unwrap();
+                let (_, observed) =
+                    crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)
+                        .unwrap()
+                        .unwrap();
+                if !observed.pane_dead
+                    && observed
+                        .pane_current_command
+                        .as_deref()
+                        .is_some_and(|command| {
+                            crate::tmux::utils::is_pane_running_shell_command(
+                                command,
+                                observed.pane_start_command_is_protected,
+                            )
+                        })
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the real unprotected boot shell is not observable"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
+            let birth = crate::process::process_birth_identity(pid)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(
+                    instance.ensure_pane_ready().unwrap(),
+                    crate::session::EnsureReadyOutcome::Indeterminate { .. }
+                ),
+                "A's shared status must not authorize B's unprotected boot shell"
+            );
+            let mut hook = std::process::Command::new("sh")
+                .args(["-c", &status_command])
+                .env("AOE_INSTANCE_ID", &instance.id)
+                .env(crate::hooks::SESSION_SOURCE_ENV, &second[1])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            hook.stdin
+                .take()
+                .unwrap()
+                .write_all(format!(r#"{{"session_id":"{SID}"}}"#).as_bytes())
+                .unwrap();
+            assert!(hook.wait().unwrap().success());
+            assert_eq!(
+                instance.ensure_pane_ready().unwrap(),
+                crate::session::EnsureReadyOutcome::AlreadyAlive
+            );
+            assert_eq!(only_pane_id(&name), pane);
+            assert_eq!(
+                crate::process::process_birth_identity(pid).unwrap(),
+                Some(birth)
+            );
+            assert_eq!(std::fs::read(&births).unwrap(), b"xx");
+            instance.capture_poller.stop();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn ensure_rechecks_a_corpse_that_appears_after_the_initial_missing_probe() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use crate::tmux::test_helpers::{only_pane_id, TmuxTestSession};
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        for shared in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+                root.path(),
+                concat!(
+                    module_path!(),
+                    "::ensure_rechecks_a_corpse_that_appears_after_the_initial_missing_probe"
+                ),
+            );
+            let _env = isolate_resume_environment(root.path());
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.agent_status_hooks = false;
+                config.session.smart_rename = false;
+            })
+            .unwrap();
+            let argv = root.path().join("actual-resume-argv");
+            let _agent = install_fake_claude(root.path(), &format!(
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$@\" > {}\nexec sleep 60\n",
+                shell_escape(&argv.to_string_lossy()),
+            ));
+            let mut instance = Instance::new("missing-then-corpse", root.path().to_str().unwrap());
+            instance.tool = "claude".into();
+            instance.command = "claude".into();
+            instance.source_profile = "missing-then-corpse".into();
+            const SID: &str = "77777777-7777-4777-8777-777777777777";
+            seed_claude_transcript(&mut instance, SID);
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let sentinel = TmuxTestSession::new("missing-corpse-server-sentinel");
+            crate::tmux::Session::from_name(sentinel.name())
+                .create(
+                    root.path().to_str().unwrap(),
+                    Some("exec sleep 60"),
+                    &instance.source_profile,
+                )
+                .unwrap();
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let _pane = TmuxTestSession::from_name(&name);
+            assert_eq!(
+                crate::tmux::utils::probe_pane(&name),
+                crate::tmux::utils::PaneProbe::Missing
+            );
+            let requested = root.path().join("actual-missing-query-finished");
+            let ready = root.path().join("second-actor-corpse-ready");
+            let actor_request = requested.clone();
+            let actor_ready = ready.clone();
+            let actor_row = instance.clone();
+            let actor = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !actor_request.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the initial real Missing query was not observed"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let (guard, observation) = observed_dead_resume_fixture(&actor_row);
+                let peer = shared.then(|| add_live_probe_peer(&observation.identity.pane_id));
+                std::fs::write(
+                    &actor_ready,
+                    b"real managed corpse created by the second actor",
+                )
+                .unwrap();
+                (guard, observation, peer)
+            });
+            let bin = root.path().join("tmux-race");
+            std::fs::create_dir(&bin).unwrap();
+            let shim = bin.join("tmux");
+            let quote = crate::session::environment::shell_escape_script_word;
+            let target = format!("={name}:");
+            let stdout = root.path().join("original-query.stdout");
+            let stderr = root.path().join("original-query.stderr");
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nMATCH=; for arg do [ \"$arg\" != {} ] || MATCH=1; done\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" >{} 2>{}; R=$?\nif [ \"$R\" -ne 0 ]; then\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\nfi\ncat {}; cat {} >&2; exit \"$R\"\nfi\nexec {} \"$@\"\n",
+                quote(&target), quote(&requested.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()), quote(&stdout.to_string_lossy()), quote(&stderr.to_string_lossy()),
+                quote(&requested.to_string_lossy()), quote(&ready.to_string_lossy()),
+                quote(&stdout.to_string_lossy()), quote(&stderr.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            )).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let result = instance.ensure_pane_ready();
+            let (_corpse_guard, old, peer) = actor.join().expect("the real corpse actor completed");
+            assert!(
+                ready.exists(),
+                "the actual corpse predates the second public probe"
+            );
+            assert_eq!(std::fs::read(&stdout).unwrap(), b"");
+            assert!(std::fs::read_to_string(&stderr)
+                .unwrap()
+                .contains("can't find session:"));
+            if let Some((peer_pane, pid, birth)) = peer {
+                assert!(
+                    crate::process::process_birth_is_live(pid, &birth).unwrap(),
+                    "a shared replacement must not be torn down: {result:?}"
+                );
+                assert_eq!(
+                    crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_dead}"),
+                    "0"
+                );
+                assert!(
+                    matches!(
+                        result,
+                        Ok(crate::session::EnsureReadyOutcome::Indeterminate { .. })
+                    ),
+                    "{result:?}"
+                );
+                assert!(
+                    !argv.exists(),
+                    "a refused shared corpse must not launch or replay"
+                );
+            } else {
+                assert!(matches!(result, Ok(crate::session::EnsureReadyOutcome::Started | crate::session::EnsureReadyOutcome::Respawned)),
+                    "the same public ensure must revive a newly observed exclusive corpse: {result:?}");
+                assert_ne!(only_pane_id(&name), old.identity.pane_id);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !argv.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the resumed real Agent did not start"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                let args = std::fs::read_to_string(&argv).unwrap();
+                assert!(
+                    args.lines()
+                        .collect::<Vec<_>>()
+                        .windows(2)
+                        .any(|pair| pair == ["--resume", SID]),
+                    "{args}"
+                );
+                assert_eq!(
+                    storage.load().unwrap()[0].agent_session_id.as_deref(),
+                    Some(SID)
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn direct_start_without_a_birth_receipt_does_not_publish_the_prepared_conversation() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use crate::tmux::test_helpers::{only_pane_id, pane_field};
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+            root.path(),
+            concat!(
+                module_path!(),
+                "::direct_start_without_a_birth_receipt_does_not_publish_the_prepared_conversation"
+            ),
+        );
+        let _env = isolate_resume_environment(root.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let births = root.path().join("actual-native-births");
+        let _agent = install_fake_claude(root.path(), &format!(
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf x >> {}\nexec sleep 60\n",
+            shell_escape(&births.to_string_lossy()),
+        ));
+        let mut instance =
+            Instance::new("no-receipt-no-publication", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "no-receipt-no-publication".into();
+        seed_claude_transcript(&mut instance, "77777777-7777-4777-8777-777777777777");
+        instance.resume_intent = ResumeIntent::Cleared;
+        let prior = instance.conversation_state();
+        let execution = serde_json::to_value(&instance.active_execution).unwrap();
+        let prior_start = instance.last_start_time;
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = instance.tmux_session().unwrap().name().to_owned();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        let bin = root.path().join("tmux-shim");
+        std::fs::create_dir(&bin).unwrap();
+        let shim = bin.join("tmux");
+        let quote = crate::session::environment::shell_escape_script_word;
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\nif [ \"$arg\" = new-session ]; then {} \"$@\" >/dev/null; exit $?; fi\ndone\nexec {} \"$@\"\n",
+            quote(&real_tmux.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let result = instance.start_with_size_opts(None, true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !births.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real Native program did not start: {result:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read(&births).unwrap(),
+            b"x",
+            "one actual birth, no replay"
+        );
+        let pane = only_pane_id(&name);
+        assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
+        let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
+        assert!(crate::process::process_birth_identity(pid)
+            .unwrap()
+            .is_some());
+        let error =
+            result.expect_err("a missing birth receipt cannot publish prepared Native state");
+        assert_eq!(
+            error.downcast_ref::<LaunchIndeterminateCause>(),
+            Some(&LaunchIndeterminateCause::OwnershipUnproven),
+            "{error:#}"
+        );
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.conversation_state(), prior);
+        assert_eq!(
+            serde_json::to_value(&stored.active_execution).unwrap(),
+            execution
+        );
+        assert_eq!(stored.last_start_time, prior_start);
+        assert_eq!(instance.conversation_state(), prior);
+    }
+
     #[test]
     #[serial]
     fn fresh_after_failed_resume_requires_durable_conversation_publication() {
@@ -3168,15 +4198,20 @@ mod tests {
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _env = isolate_resume_environment(temp.path());
         let sid = "77777777-7777-4777-8777-777777777777";
-        for tool in ["claude", "copilot"] {
+        for (tool, with_peer) in [
+            ("claude", false),
+            ("claude", true),
+            ("copilot", false),
+            ("copilot", true),
+        ] {
             let _agent = crate::session::test_support::install_login_shell_path_command(
                 temp.path(),
                 tool,
                 "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec /bin/sleep 60\n",
             );
-            let project = temp.path().join(tool);
+            let project = temp.path().join(format!("{tool}-shared-{with_peer}"));
             std::fs::create_dir(&project).unwrap();
-            let profile = format!("fresh-publication-{tool}");
+            let profile = format!("fresh-publication-{tool}-shared-{with_peer}");
             let mut instance = Instance::new(tool, project.to_str().unwrap());
             instance.tool = tool.into();
             instance.command = tool.into();
@@ -3195,6 +4230,26 @@ mod tests {
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
                 instance.tmux_session().unwrap().name(),
             );
+            let peer = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let captured_peer = peer.clone();
+            let _finalize = super::super::start::test_support::FinalizeObserver::install(
+                instance.id.clone(),
+                move |row, phase| {
+                    if with_peer
+                        && matches!(
+                            phase,
+                            super::super::start::test_support::FinalizePhase::Before
+                        )
+                    {
+                        assert!(captured_peer.borrow().is_none());
+                        let name = row.tmux_session().unwrap().name().to_owned();
+                        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+                        let actual_peer = add_live_probe_peer(&pane);
+                        *captured_peer.borrow_mut() =
+                            Some((actual_peer, row.terminal_scopes.clone()));
+                    }
+                },
+            );
             {
                 let _fault = super::super::sid_persist::test_support::WriteFailures::install(
                     instance.id.clone(),
@@ -3208,6 +4263,24 @@ mod tests {
                     error.to_string().contains("durable publication"),
                     "{tool}: {error:#}"
                 );
+                if with_peer {
+                    let ((peer_pane, peer_pid, peer_birth), prior_scopes) = peer
+                        .borrow_mut()
+                        .take()
+                        .expect("real peer added after birth capture");
+                    assert!(
+                        crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap(),
+                        "finalization cleanup must preserve the unrelated real peer {peer_pid}: {error:#}"
+                    );
+                    assert_eq!(
+                        crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_dead}"),
+                        "0"
+                    );
+                    let stored = storage.load().unwrap().remove(0);
+                    assert_eq!(stored.conversation_state(), before);
+                    assert_eq!(stored.terminal_scopes, prior_scopes);
+                    continue;
+                }
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(stored.conversation_state(), before);
                 assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(sid));
@@ -3481,6 +4554,132 @@ mod tests {
         (guard, observation)
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn revival_retains_replacement_between_dead_observation_and_capture_return() {
+        use crate::tmux::test_helpers::{only_pane_id, pane_field, TmuxTestSession};
+        use std::os::unix::fs::PermissionsExt;
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        for replacement_dead in [false, true] {
+            let root = tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = isolate_resume_environment(root.path());
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.agent_status_hooks = false;
+                config.session.smart_rename = false;
+            })
+            .unwrap();
+            let mut instance =
+                Instance::new("dead-observation-replaced", root.path().to_str().unwrap());
+            instance.source_profile = "dead-observation-replaced".into();
+            instance.command = "sleep 60".into();
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let sentinel = TmuxTestSession::new("dead-observation-server-sentinel");
+            crate::tmux::Session::from_name(sentinel.name())
+                .create(
+                    root.path().to_str().unwrap(),
+                    Some("exec sleep 60"),
+                    &instance.source_profile,
+                )
+                .unwrap();
+            let (_old_guard, old) = observed_dead_resume_fixture(&instance);
+            let name = instance.tmux_session().unwrap().name().to_owned();
+            let requested = root.path().join("real-dead-observation-finished");
+            let ready = root.path().join("replacement-ready");
+            let actor_request = requested.clone();
+            let actor_ready = ready.clone();
+            let actor_row = instance.clone();
+            let old_pane = old.identity.pane_id.clone();
+            let actor = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !actor_request.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "physical dead observation must complete"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(crate::tmux::tmux_command()
+                    .args(["kill-pane", "-t", &old_pane])
+                    .status()
+                    .unwrap()
+                    .success());
+                let (guard, replacement) = if replacement_dead {
+                    observed_dead_resume_fixture(&actor_row)
+                } else {
+                    let session = actor_row.tmux_session().unwrap();
+                    let guard = TmuxTestSession::from_name(session.name());
+                    let replacement = session
+                        .create_with_size_env_and_container_env(
+                            &actor_row.project_path,
+                            Some("exec sleep 60"),
+                            None,
+                            &actor_row.source_profile,
+                            &[],
+                            &[],
+                            None,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    crate::tmux::test_helpers::wait_for_pane_command(
+                        &replacement.identity.pane_id,
+                        "sleep",
+                    );
+                    (guard, replacement)
+                };
+                std::fs::write(&actor_ready, b"replacement physically installed").unwrap();
+                (guard, replacement)
+            });
+            let bin = root.path().join("tmux-race");
+            std::fs::create_dir(&bin).unwrap();
+            let shim = bin.join("tmux");
+            let stdout = root.path().join("real-dead-observation.stdout");
+            let quote = crate::session::environment::shell_escape_script_word;
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nMATCH=; for arg do case \"$arg\" in '#{{n:socket_path}}|'*) MATCH=1 ;; esac; done\nif [ -n \"$MATCH\" ] && [ ! -e {} ]; then\n{} \"$@\" > {}; R=$?\n[ \"$R\" -eq 0 ] || exit \"$R\"\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\ncat {}; exit \"$R\"\nfi\nexec {} \"$@\"\n",
+                quote(&requested.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+                quote(&stdout.to_string_lossy()), quote(&requested.to_string_lossy()),
+                quote(&ready.to_string_lossy()), quote(&stdout.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()),
+            )).unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let result = instance.ensure_pane_ready();
+            let (_replacement_guard, replacement) = actor.join().unwrap();
+            assert!(
+                matches!(
+                    result,
+                    Ok(crate::session::EnsureReadyOutcome::Indeterminate { .. })
+                ),
+                "{result:?}"
+            );
+            assert_ne!(replacement.identity.pane_id, old.identity.pane_id);
+            assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
+            assert_eq!(
+                pane_field(&replacement.identity.pane_id, "#{pane_dead}"),
+                if replacement_dead { "1" } else { "0" }
+            );
+            assert!(std::fs::read_to_string(stdout)
+                .unwrap()
+                .contains(&old.identity.pane_id));
+            if !replacement_dead {
+                let pid = replacement.identity.pane_pid.unwrap();
+                assert!(crate::process::process_birth_identity(pid)
+                    .unwrap()
+                    .is_some());
+            }
+        }
+    }
+
     fn add_live_probe_peer(pane: &str) -> (String, u32, crate::process::ProcessBirthIdentity) {
         let output = crate::tmux::tmux_command()
             .args([
@@ -3534,7 +4733,7 @@ mod tests {
         let (_pane, observation) = observed_dead_resume_fixture(&instance);
         let probe = LaunchProbe {
             tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-            pane: Some(std::sync::Arc::new(observation)),
+            pane: Some(observation.into()),
             expected: instance.conversation_state(),
         };
         let releases = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -3656,7 +4855,7 @@ mod tests {
             let (_pane, observation) = observed_dead_resume_fixture(&instance);
             let probe = LaunchProbe {
                 tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-                pane: Some(std::sync::Arc::new(observation)),
+                pane: Some(observation.into()),
                 expected: instance.conversation_state(),
             };
             let peer = std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -3820,6 +5019,7 @@ mod tests {
                         &row.id,
                         SID,
                         &metadata.launch_id,
+                        None,
                     )
                     .unwrap();
                     assert_eq!(

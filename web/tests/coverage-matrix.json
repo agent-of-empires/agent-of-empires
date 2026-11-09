@@ -60,6 +60,14 @@
       "notes": "Real hooks establish an active prompt and echo, then a Host layout consumes same-frontier Unknown-to-Ready and Ready-to-Unknown snapshots before passive effects; exact cancel HTTP and force-after-acceptance follow the committed authority. A separate real Runtime/Composer/StopButton/installed-SDK consumer clicks once from an outer Profiler after layouts but before SDK passive publication, then verifies that the previous turn callback issues neither cancel nor force against the new turn. Only transport and browser APIs are faked; SDK, admission, reducer and cancellation identities remain real."
     },
     {
+      "id": "acp.operation-error-native-continuity",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/agent-status.spec.ts"],
+      "components": ["web/src/components/acp/SessionBanners.tsx"],
+      "notes": "A controlled Native fixture uses the real daemon and runner. A provider request refusal retains its typed operation-only diagnostic through browser reload, preserves the recorded physical PID/birth and exact worker epoch, does not become a startup or stopped-worker failure, and accepts only a second explicit prompt on the same assigned native conversation. The case attaches its actual retained-error surface."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -2331,6 +2339,17 @@
       ]
     },
     {
+      "id": "sidebar.popup-escape-keeps-selection",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSortPicker.test.tsx"],
+      "components": [
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/useOutsideDismiss.ts",
+        "web/src/components/sidebar/useSidebarSelection.ts"
+      ]
+    },
+    {
       "id": "sidebar.sort-live",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -3017,6 +3036,7 @@
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
+      "description": "Kept views stay attached across session switches, so each keeps its scroll position.",
       "specs": [
         "src/components/__tests__/StructuredSessionStack.test.tsx",
         "src/lib/__tests__/persistentStructuredViews.test.ts",
@@ -3863,8 +3883,7 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"],
-      "notes": "The existing five mobile stories preserve reader escape, streaming follow, reload and collapse behavior. Composer growth waits for its real final textarea and grid heights, observes the pin beyond the chrome-follow window and captures the grown pinned surface. Hook consumers distinguish a coarse viewport resize from an actual reader gesture while retaining the unchanged coarse fold-movement contract."
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
     },
     {
       "id": "acp.tool-stopped-sweep",

@@ -447,16 +447,21 @@ pub(crate) fn write_atomic(dir: BorrowedFd<'_>, name: &str, bytes: &[u8]) -> Res
     Ok(())
 }
 
-pub(crate) fn session_id_leaf(source: Option<&str>) -> Result<std::borrow::Cow<'static, str>> {
-    let Some(source) = source else {
-        return Ok(std::borrow::Cow::Borrowed("session_id"));
-    };
+pub(super) fn validate_session_source(source: &str) -> Result<()> {
     let uuid = uuid::Uuid::parse_str(source).context("invalid session source UUID")?;
     let mut canonical = [0; 36];
     anyhow::ensure!(
         uuid.hyphenated().encode_lower(&mut canonical) == source,
         "session source UUID is not canonical"
     );
+    Ok(())
+}
+
+pub(crate) fn session_id_leaf(source: Option<&str>) -> Result<std::borrow::Cow<'static, str>> {
+    let Some(source) = source else {
+        return Ok(std::borrow::Cow::Borrowed("session_id"));
+    };
+    validate_session_source(source)?;
     Ok(std::borrow::Cow::Owned(format!("session_id.{source}")))
 }
 
