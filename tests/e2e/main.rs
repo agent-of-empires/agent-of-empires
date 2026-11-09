@@ -25,6 +25,7 @@ mod autostart;
 mod claude_shared_project_correlation_e2e;
 mod cli;
 mod cli_session_id_capture;
+mod clipboard;
 mod custom_order_tui;
 mod daemon_config;
 mod diagnostics_strip;

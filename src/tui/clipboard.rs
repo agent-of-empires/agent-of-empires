@@ -20,7 +20,7 @@ pub fn copy_to_clipboard(text: &str) -> usize {
     let result = (|| {
         let mut file = tempfile::tempfile()?;
         file.write_all(text.as_bytes())?;
-        copy_file(file)
+        copy_file_with_timeout(file, std::time::Duration::from_millis(500))
     })();
     match result {
         Ok(report) => usize::try_from(report.bytes).unwrap_or(usize::MAX),
@@ -31,9 +31,13 @@ pub fn copy_to_clipboard(text: &str) -> usize {
     }
 }
 
-pub(crate) fn copy_file(mut file: File) -> io::Result<CopyReport> {
+pub(crate) fn copy_file(file: File) -> io::Result<CopyReport> {
+    copy_file_with_timeout(file, std::time::Duration::from_secs(30))
+}
+
+fn copy_file_with_timeout(mut file: File, timeout: std::time::Duration) -> io::Result<CopyReport> {
     let bytes = file.metadata()?.len();
-    let desktop = try_subprocess(&mut file);
+    let desktop = try_subprocess(&mut file, timeout);
     file.rewind()?;
     let osc52 = write_osc52(
         &mut file,
@@ -51,10 +55,10 @@ pub(crate) fn copy_file(mut file: File) -> io::Result<CopyReport> {
     })
 }
 
-fn try_subprocess(file: &mut File) -> Result<&'static str, String> {
+fn try_subprocess(file: &mut File, timeout: std::time::Duration) -> Result<&'static str, String> {
     let mut errors = String::new();
     for (command, arguments) in crate::process::clipboard_commands() {
-        match run_subprocess(command, arguments, file) {
+        match run_subprocess(command, arguments, file, timeout) {
             Ok(()) => return Ok(command),
             Err(error) => {
                 if !errors.is_empty() {
@@ -70,7 +74,12 @@ fn try_subprocess(file: &mut File) -> Result<&'static str, String> {
         errors
     })
 }
-fn run_subprocess(command: &str, arguments: &[&str], file: &mut File) -> io::Result<()> {
+fn run_subprocess(
+    command: &str,
+    arguments: &[&str],
+    file: &mut File,
+    timeout: std::time::Duration,
+) -> io::Result<()> {
     file.rewind()?;
     let mut child = Command::new(command)
         .args(arguments)
@@ -78,12 +87,12 @@ fn run_subprocess(command: &str, arguments: &[&str], file: &mut File) -> io::Res
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    match crate::process::wait_with_timeout(&mut child, std::time::Duration::from_secs(30))? {
+    match crate::process::wait_with_timeout(&mut child, timeout)? {
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(io::Error::other(format!("exit {status}"))),
         None => Err(io::Error::new(
             io::ErrorKind::TimedOut,
-            "clipboard helper exceeded 30 seconds",
+            format!("clipboard helper exceeded {timeout:?}"),
         )),
     }
 }
