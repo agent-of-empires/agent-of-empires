@@ -1234,8 +1234,8 @@ fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_vi
             d.handle_key(key(KeyCode::BackTab));
             assert_eq!(
                 d.focused_field,
-                d.field_indices().group,
-                "BackTab wraps to Group"
+                d.field_indices().prompt,
+                "BackTab wraps to Prompt"
             );
         }),
         ("scratch", |d, _| {
