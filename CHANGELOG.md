@@ -12,7 +12,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **session:** Keep OMP confirmation bindings identical in memory and storage while advancing only the matching launch's capture witness.
 - **session:** Reject stale capture snapshots before they reserve a restarted or replaced session, preserving its lifecycle generation and newly selected conversation.
 - **session:** Publish daemon capture commits through the canonical store before releasing Capture ownership; retain the existing global fail-closed metadata-health policy when a profile cannot open.
-
+- **session:** Accept unchanged preexisting dead panes in a complete handoff inventory while retaining strict socket, server, pane, PID, and live-birth fencing.
 ### Security
 
 - **sqlite:** Upgrade rusqlite to 0.41 so vendored builds use SQLite 3.54 or newer, fixing uninitialized-memory disclosure from crafted database/WAL pairs ([RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459)). Builds using system SQLite require a patched system library.
