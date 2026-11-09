@@ -7693,7 +7693,9 @@ pub(super) mod terminal_custody {
             let replacement_pid: u32 = replacement_entry
                 .lines()
                 .find_map(|line| line.strip_prefix("PID "))
-                .ok_or_else(|| anyhow::anyhow!("replacement final process did not publish its pid"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("replacement final process did not publish its pid")
+                })?
                 .parse()?;
             let replacement_birth = crate::process::process_birth_identity(replacement_pid)?
                 .ok_or_else(|| anyhow::anyhow!("replacement final process birth unavailable"))?;
@@ -7741,11 +7743,23 @@ pub(super) mod terminal_custody {
                 )
                 .await?
             };
-            assert!(probe_seen.exists(), "the real physical query was not intercepted");
+            assert!(
+                probe_seen.exists(),
+                "the real physical query was not intercepted"
+            );
             assert_eq!(unknown_status, StatusCode::CONFLICT, "{unknown_body}");
-            assert_eq!(unknown_body["error"], "launch_indeterminate", "{unknown_body}");
-            assert_eq!(std::fs::read_to_string(&replacement_received)?, replacement_entry);
-            assert!(crate::process::process_birth_is_live(replacement_pid, &replacement_birth)?);
+            assert_eq!(
+                unknown_body["error"], "launch_indeterminate",
+                "{unknown_body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&replacement_received)?,
+                replacement_entry
+            );
+            assert!(crate::process::process_birth_is_live(
+                replacement_pid,
+                &replacement_birth
+            )?);
             let (fresh_status, fresh_body) = response_json(
                 send_message(
                     State(state.clone()),
@@ -7768,17 +7782,31 @@ pub(super) mod terminal_custody {
                 .find(|stored| stored.id == row.id)
                 .unwrap();
             assert_eq!(stored.conversation_state(), conversation);
-            assert_eq!(stored.lifecycle_generation, replacement.lifecycle_generation);
             assert_eq!(
-                state.instances.read().await.iter().find(|live| live.id == row.id)
-                    .unwrap().lifecycle_generation,
+                stored.lifecycle_generation,
+                replacement.lifecycle_generation
+            );
+            assert_eq!(
+                state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|live| live.id == row.id)
+                    .unwrap()
+                    .lifecycle_generation,
                 stored.lifecycle_generation,
             );
-            assert!(crate::process::process_birth_is_live(replacement_pid, &replacement_birth)?);
+            assert!(crate::process::process_birth_is_live(
+                replacement_pid,
+                &replacement_birth
+            )?);
             let (after_status, after) = response_json(
                 ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
-                    .await.into_response(),
-            ).await?;
+                    .await
+                    .into_response(),
+            )
+            .await?;
             assert_eq!(after_status, StatusCode::OK, "{after}");
             assert_eq!(after["physical"], target["physical"]);
             assert_eq!(
