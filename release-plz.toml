@@ -9,8 +9,8 @@ release = false
 git_tag_name = "v{{ version }}"
 # release.yml creates the GitHub release once the tag builds.
 git_release_enable = false
-# Tag only when a release PR merges, not on every push to main.
-release_always = false
+# release-plz.yml only runs `release` on a merged release PR.
+release_always = true
 dependencies_update = false
 semver_check = false
 pr_labels = ["release"]

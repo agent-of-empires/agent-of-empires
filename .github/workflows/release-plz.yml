@@ -1,12 +1,18 @@
 name: Release-plz
 
-# Keeps the release PR current and tags `vX.Y.Z` when it merges; release.yml takes it
-# from there. Config: release-plz.toml. RELEASE_TOKEN is required because pushes and PRs
-# made with GITHUB_TOKEN start no workflows (neither CI on the PR nor release.yml on the tag).
+# Tags `vX.Y.Z` when the release PR merges, and refreshes that PR daily or on dispatch;
+# release.yml takes it from the tag. Config: release-plz.toml. RELEASE_TOKEN is required
+# because pushes and PRs made with GITHUB_TOKEN start no workflows (neither CI on the PR
+# nor release.yml on the tag).
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches: [main]
+  # Not on push: every refresh force-pushes the release PR and dismisses its approvals.
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,11 +20,19 @@ permissions:
 jobs:
   release:
     name: Tag release
-    if: github.repository == 'agent-of-empires/agent-of-empires'
+    # The merge queue can land the release PR mid-batch, so tag its own squash commit
+    # rather than main's HEAD.
+    if: >-
+      github.repository == 'agent-of-empires/agent-of-empires' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -34,7 +48,10 @@ jobs:
 
   release-pr:
     name: Update release PR
-    if: github.repository == 'agent-of-empires/agent-of-empires'
+    if: >-
+      github.repository == 'agent-of-empires/agent-of-empires' &&
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # Never cancel: a cancelled run can leave the release PR half-updated.
     concurrency:
