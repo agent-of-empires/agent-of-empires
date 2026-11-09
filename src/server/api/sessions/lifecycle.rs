@@ -3048,12 +3048,15 @@ pub(super) async fn continue_interrupted_prompt(
     if !current {
         return Ok(false);
     }
+    // Published while this task still owns the submission authority, so a newer limit and its
+    // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
+    state
+        .acp_supervisor
+        .publish_rate_limit_auto_resumed(id, resets_at, true)?;
     if explicit_wake {
         // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
         // now newer work may have been installed, and it must survive.
-        state
-            .acp_supervisor
-            .publish_rate_limit_auto_resumed(id, resets_at, true)?;
+        drop(submission);
         return Ok(false);
     }
     // A continuation already pending is work too, even when the interrupted prompt is gone.
@@ -3071,9 +3074,6 @@ pub(super) async fn continue_interrupted_prompt(
         prepared,
     )
     .await?;
-    state
-        .acp_supervisor
-        .publish_rate_limit_auto_resumed(id, resets_at, true)?;
     Ok(pending_before
         || matches!(
             outcome,

@@ -13900,6 +13900,126 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     .await;
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "quota-write-refused")
+                    .await;
+            live.park("finish the migration").await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .clone();
+            let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                .await
+                .unwrap();
+            assert!(
+                prepared.is_some(),
+                "the actual interrupted request must be recoverable"
+            );
+            let budget = state
+                .acp_event_store
+                .rate_limit_redelivery_streak(&id)
+                .unwrap();
+            state
+                .acp_event_store
+                .test_conn()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_quota_breadcrumb BEFORE INSERT ON acp_events
+                 WHEN NEW.discriminant = 'RateLimitAutoResumed'
+                 BEGIN SELECT RAISE(ABORT, 'forced quota breadcrumb write failure'); END;",
+                )
+                .unwrap();
+            let result = lifecycle::continue_interrupted_prompt(
+                &state,
+                &id,
+                row.lifecycle_generation,
+                chrono::Utc::now(),
+                false,
+                prepared,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(crate::acp::supervisor::SupervisorError::NativeStoreUnavailable)
+            ));
+            assert_eq!(
+                state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .pending_initial_turn,
+                None,
+                "a failed publication must not install input in memory",
+            );
+            let durable = crate::session::Storage::open_unwatched(&row.source_profile)
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(
+                durable.pending_initial_turn, None,
+                "a failed publication must not persist input for a later drain"
+            );
+            assert_eq!(
+                state
+                    .acp_event_store
+                    .rate_limit_redelivery_streak(&id)
+                    .unwrap(),
+                budget
+            );
+            assert!(!state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .unwrap()
+                .iter()
+                .any(|stored| {
+                    matches!(
+                        stored.event.as_ref(),
+                        crate::acp::Event::RateLimitAutoResumed { .. }
+                    )
+                }));
+            let methods = live.native.requests();
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| *method == "session/prompt")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| *method == "session/new")
+                    .count(),
+                1
+            );
+            state
+                .acp_event_store
+                .test_conn()
+                .execute_batch("DROP TRIGGER fail_quota_breadcrumb")
+                .unwrap();
+            live.client.shutdown().await.unwrap();
+        })
+    })
+    .await;
+}
+
 /// A Claude row on account `a` with a recorded conversation, swappable to account `b`. `b` has
 /// its own config root unless `shared_root`; `bound` records the conversation's execution, which
 /// a legacy row lacks. Returns the guards that keep the isolated home (which holds the stub
