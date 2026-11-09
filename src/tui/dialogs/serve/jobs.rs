@@ -1,10 +1,11 @@
 //! Bounded execution owned by Home, independent of a dialog's lifetime.
 
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::{Job, JobResult};
@@ -33,11 +34,13 @@ impl Control {
             .is_ok()
     }
 
-    fn cancel(&self) {
+    fn cancel(&self) -> bool {
         let previous = self.admission.fetch_or(CANCEL_REQUESTED, Ordering::AcqRel);
-        if previous & !CANCEL_REQUESTED != ADMITTED {
+        let phase = previous & !CANCEL_REQUESTED;
+        if phase != ADMITTED {
             self.cancel.cancel();
         }
+        phase == PENDING
     }
 
     pub(super) fn finish_mutation(&self) {
@@ -52,7 +55,7 @@ struct Request {
     attempt: u64,
     job: Job,
     control: Arc<Control>,
-    result: SyncSender<(u64, JobResult)>,
+    result: oneshot::Sender<(u64, JobResult)>,
 }
 
 #[derive(Default)]
@@ -93,12 +96,25 @@ impl Drop for ExitGuard {
 /// Dropping a ticket never waits for execution. Admitted mutations keep their owner.
 pub(super) struct Ticket {
     control: Arc<Control>,
-    result: Receiver<(u64, JobResult)>,
+    result: oneshot::Receiver<(u64, JobResult)>,
 }
 
 impl Ticket {
-    pub(super) fn try_recv(&self) -> Result<(u64, JobResult), TryRecvError> {
-        self.result.try_recv()
+    pub(super) fn try_recv(&mut self) -> Result<(u64, JobResult), TryRecvError> {
+        self.result.try_recv().map_err(|error| match error {
+            oneshot::error::TryRecvError::Empty => TryRecvError::Empty,
+            oneshot::error::TryRecvError::Closed => TryRecvError::Disconnected,
+        })
+    }
+
+    pub(super) fn cancel_before_admission(&self) -> bool {
+        self.control.cancel()
+    }
+
+    pub(super) async fn finish(mut self, expected: u64) -> anyhow::Result<JobResult> {
+        let (attempt, result) = (&mut self.result).await?;
+        anyhow::ensure!(attempt == expected, "Serve completion attempt changed");
+        Ok(result)
     }
 }
 
@@ -120,7 +136,7 @@ impl Submitter {
     }
 
     pub(super) fn request(&self, attempt: u64, job: Job) -> Ticket {
-        let (result, receiver) = mpsc::sync_channel(1);
+        let (result, receiver) = oneshot::channel();
         let control = Arc::new(Control::new());
         let mut mailbox = self.0.mailbox.lock().unwrap_or_else(|e| e.into_inner());
         if !mailbox.closed {
@@ -218,7 +234,7 @@ impl ServeJobs {
                     };
                     if !request.control.cancel.is_cancelled() {
                         let result = handler(request.job, &request.control, &runtime);
-                        let _ = request.result.try_send((request.attempt, result));
+                        let _ = request.result.send((request.attempt, result));
                     }
                     worker_shared
                         .mailbox
@@ -287,8 +303,8 @@ mod tests {
                     control.finish_mutation();
                     assert!(!control.cancel.is_cancelled());
                 }
-                control.cancel();
-                control.cancel();
+                assert_eq!(control.cancel(), !admitted && !observing);
+                assert_eq!(control.cancel(), !admitted && !observing);
                 assert_eq!(
                     control.cancel.is_cancelled(),
                     !admitted || observing,

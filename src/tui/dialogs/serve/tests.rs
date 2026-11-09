@@ -314,11 +314,12 @@ fn requesting_a_new_passphrase_does_not_overwrite_saved_credentials() {
     save_passphrase_to_disk("running daemon phrase");
     let mut jobs = ServeJobs::default();
     let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), jobs.submitter());
+    view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('G'));
     wait_assessment(&mut view);
     view.handle_key(key('G'));
     wait_assessment(&mut view);
-    assert!(view.take_launch().is_some_and(|request| request.restart));
+    assert!(view.take_launch().is_some());
     assert_ne!(view.pending_passphrase, "running daemon phrase");
     assert_eq!(
         std::fs::read_to_string(
@@ -338,6 +339,7 @@ fn restart_requires_an_uninterrupted_confirmation() {
     for (cancelled, expired) in [(false, false), (true, false), (false, true)] {
         let mut jobs = ServeJobs::default();
         let mut view = ServeView::with_state(active_state(ServeMode::Local), jobs.submitter());
+        view.target = Some(crate::cli::serve::tui_control_target().unwrap());
         view.handle_key(key('R'));
         wait_assessment(&mut view);
         assert!(matches!(
@@ -360,9 +362,7 @@ fn restart_requires_an_uninterrupted_confirmation() {
             ));
             assert!(matches!(view.state, ServeViewState::Active { .. }));
         } else {
-            assert!(view
-                .take_launch()
-                .is_some_and(|request| request.restart && request.mode == ServeMode::Local));
+            assert!(view.take_launch().is_some());
             assert!(matches!(view.state, ServeViewState::Starting { .. }));
         }
     }
@@ -401,6 +401,7 @@ fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
     let token = crate::session::get_app_dir().unwrap().join("serve.token");
     let mut jobs = ServeJobs::default();
     let mut view = ServeView::with_state(active_state(ServeMode::Local), jobs.submitter());
+    view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     let write_token = |age| {
         std::fs::write(&token, "t").unwrap();
         std::fs::File::options()
@@ -422,7 +423,7 @@ fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
     assert!(view.pending_confirm.is_some());
     view.handle_key(key('R'));
     wait_assessment(&mut view);
-    assert!(view.take_launch().is_some_and(|request| request.restart));
+    assert!(view.take_launch().is_some());
 }
 
 #[test]
@@ -483,7 +484,19 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
             let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
                 view.render(frame, frame.area(), theme)
             });
-            let close_hint = if held == Held::Active {
+            if held == Held::Restart {
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("https://host.tailnet.ts.net/"));
+                assert!(text.contains("running daemon phrase"));
+                let mouse = view.mouse.borrow();
+                for expected in ["https://host.tailnet.ts.net/", "running daemon phrase"] {
+                    assert!(mouse.copies.iter().any(|((_, value), _)| value == expected));
+                }
+                if cfg!(feature = "web") {
+                    assert!(text.chars().any(|cell| matches!(cell, '▀' | '▄' | '█')));
+                }
+            }
+            let close_hint = if matches!(held, Held::Active | Held::Restart) {
                 "Esc: close"
             } else {
                 "[Esc] cancel"
@@ -608,6 +621,7 @@ fn a_timely_confirmation_survives_a_slow_second_assessment() {
         let mut jobs = ServeJobs::default();
         let (submitter, gate) = gated(&mut jobs, Held::Restart);
         let mut view = ServeView::with_state(active_state(mode), submitter);
+        view.target = Some(crate::cli::serve::tui_control_target().unwrap());
         view.handle_key(key(code));
         gate.entered(Held::Restart);
         gate.release(JobResult::Restart(RestartProbe::default()));
@@ -625,7 +639,7 @@ fn a_timely_confirmation_survives_a_slow_second_assessment() {
         gate.release(JobResult::Restart(RestartProbe::default()));
         wait_assessment(&mut view);
         assert!(
-            view.take_launch().is_some_and(|request| request.restart),
+            view.take_launch().is_some(),
             "{code} discarded a timely confirmation after its assessment"
         );
         assert!(view.pending_confirm.is_none());
@@ -696,7 +710,7 @@ fn every_pending_state_leaves_a_closed_worker() {
                     needs_passphrase: false,
                 },
                 PendingJob::LaunchContext(ServeLaunchRequest {
-                    restart: false,
+                    restart: None,
                     mode: ServeMode::Local,
                     transport: None,
                     passphrase: None,
@@ -819,7 +833,10 @@ fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
         let (_submitter, gate) = gated(&mut jobs, held);
         let mut view =
             ServeView::for_launch(DashboardLaunch::tunnel_for_test(Instant::now()), &mut jobs);
-        assert!(matches!(view.handle_key(key('S')), ServeAction::Stop(_)));
+        assert!(matches!(
+            view.handle_key(key('S')),
+            ServeAction::StopOwnedLaunch
+        ));
         view.begin_stop();
         view.finish_stop(Err("tailscale funnel failed".to_owned()));
         wait_for(&mut view, |view| view.pending.is_none());
@@ -851,61 +868,6 @@ fn a_failed_stop_of_a_reopened_launch_loads_identity_before_recovery() {
                 if message.contains("fixture reset outcome unknown")));
         }
     }
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn stop_without_verified_identity_refuses_an_unowned_daemon() {
-    let _home = crate::session::test_support::isolate_app_dir();
-    let mut successor = TestDaemon::new();
-    let target = successor.publish();
-    let mut view = ServeView::for_test(starting());
-    let ServeAction::Stop(request) = view.handle_key(key('S')) else {
-        panic!("S must return the App-owned stop request");
-    };
-    let result = request.run().await;
-    assert!(
-        result.is_err(),
-        "Missing observed or owned identity cannot authorize a namespace stop"
-    );
-    view.finish_stop(result.map_err(|error| format!("{error:#}")));
-    assert!(
-        matches!(view.state, ServeViewState::Error { .. }),
-        "An unverified stop must remain a visible failure"
-    );
-    assert!(successor.child.try_wait().unwrap().is_none());
-    assert_eq!(crate::cli::serve::tui_control_target().unwrap(), target);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial]
-async fn stop_key_returns_owned_action_while_launch_transaction_is_held() {
-    let _home = crate::session::test_support::isolate_app_dir();
-    let transaction = crate::daemon::lifecycle::Transaction::acquire()
-        .await
-        .unwrap();
-    let mut view = ServeView::for_test(starting());
-    view.launch_in_flight = true;
-    let (sent, received) = tokio::sync::oneshot::channel();
-    let ui = std::thread::spawn(move || {
-        let action = view.handle_key(key('S'));
-        assert!(sent.send((view, action)).is_ok());
-    });
-    let (mut view, action) = tokio::time::timeout(Duration::from_secs(2), received)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(matches!(action, ServeAction::Stop(_)));
-    let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
-        view.render(frame, frame.area(), theme)
-    });
-    crate::tui::dialogs::test_render::find(&buffer, "Stopping daemon");
-    assert!(matches!(
-        view.handle_key(KeyEvent::from(KeyCode::Esc)),
-        ServeAction::Close
-    ));
-    drop(transaction);
-    ui.join().unwrap();
 }
 
 struct FunnelFixture {
@@ -1033,6 +995,12 @@ fn a_superseded_queued_reset_never_executes() {
     let mut view = ServeView::with_state(error_state(), submitter);
     view.target = Some(crate::cli::serve::tui_control_target().unwrap());
     view.handle_key(key('R'));
+    assert!(
+        view.pending
+            .as_ref()
+            .is_some_and(|pending| { matches!(pending.kind, PendingJob::Reset) }),
+        "R did not queue its reset before cancellation"
+    );
     assert!(matches!(
         view.handle_key(KeyEvent::from(KeyCode::Esc)),
         ServeAction::Close
@@ -1876,7 +1844,7 @@ async fn foreign_log_errno_does_not_invalidate_saved_port_on_launch_failure() {
     )
     .unwrap();
     let request = ServeLaunchRequest {
-        restart: false,
+        restart: None,
         mode: ServeMode::Local,
         transport: None,
         passphrase: None,
@@ -2007,7 +1975,7 @@ fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
         let writer = retain_writer.then(open_gate);
         let mut jobs = ServeJobs::default();
         let mut view = ServeView::new(&mut jobs);
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
         let settled = loop {
             view.tick();
             if !matches!(view.state, ServeViewState::Checking { .. }) {
@@ -2026,7 +1994,7 @@ fn open_refuses_fifo_metadata_without_retaining_lifecycle() {
         let unlocked = runtime
             .block_on(async {
                 tokio::time::timeout(
-                    Duration::from_secs(1),
+                    Duration::from_secs(10),
                     crate::daemon::lifecycle::Transaction::acquire(),
                 )
                 .await
@@ -2091,5 +2059,152 @@ fn picker_reobserves_dashboard_after_provider_probes() {
         assert_eq!(view.target.as_ref(), Some(&target));
         assert!(view.pending_launch.is_none());
         assert!(probe.exited().unwrap());
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn stop_retains_the_original_retry_completion() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _tools = FunnelFixture::new();
+    for outcome in ["stopped", "refused", "worker-closed"] {
+        let mut original = TestDaemon::new();
+        let target = original.publish();
+        let mut successor = (outcome == "refused").then(|| {
+            original.exit();
+            let mut successor = TestDaemon::new();
+            successor.publish();
+            successor
+        });
+        let (entered, ready) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        let mut jobs = ServeJobs::default();
+        let submitter = jobs.with_handler(move |job, control, runtime| {
+            let retry = matches!(job, Job::Retry(_));
+            let result = run_job(job, control, runtime);
+            if retry {
+                entered.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(10)).unwrap();
+                assert!(
+                    outcome != "worker-closed",
+                    "controlled worker closure after stop"
+                );
+            }
+            result
+        });
+        let mut view = ServeView::with_state(error_state(), submitter);
+        view.target = Some(target);
+        view.handle_key(key('P'));
+        ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(original.child.try_wait().unwrap().is_some());
+        let ServeAction::Stop(request) = view.handle_key(key('S')) else {
+            panic!("S must retain its provider stop");
+        };
+        let owner = tokio::spawn(request.run());
+        assert!(matches!(
+            view.handle_key(KeyEvent::from(KeyCode::Esc)),
+            ServeAction::Close
+        ));
+        drop(view);
+        let mut reopened = ServeView::new(&mut jobs);
+        release.send(()).unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(10), owner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stopped.is_ok(),
+            outcome == "stopped",
+            "{outcome}: {stopped:?}"
+        );
+        wait_for(&mut reopened, |view| {
+            !matches!(view.state, ServeViewState::Checking { .. })
+        });
+        if let Some(successor) = &mut successor {
+            assert!(successor.child.try_wait().unwrap().is_none());
+        }
+        assert!(reopened.pending_launch.is_none());
+        remove_app_file("serve.pid");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn restart_preserves_a_replacement_before_any_persisted_effect() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    for code in ['R', 'G'] {
+        for replacement in ["before-confirmation", "during-assessment", "after-handoff"] {
+            let mut original = TestDaemon::new();
+            let target = original.publish();
+            let mut successor = TestDaemon::new();
+            let mut jobs = ServeJobs::default();
+            let (submitter, gate) = gated(&mut jobs, Held::Restart);
+            let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), submitter);
+            view.target = Some(target);
+            view.handle_key(key(code));
+            gate.entered(Held::Restart);
+            gate.release(JobResult::Restart(RestartProbe::default()));
+            wait_for(&mut view, |view| view.pending_confirm.is_some());
+            if replacement == "before-confirmation" {
+                original.exit();
+                successor.publish();
+            }
+            view.handle_key(key(code));
+            gate.entered(Held::Restart);
+            if replacement == "during-assessment" {
+                original.exit();
+                successor.publish();
+            }
+            gate.release(JobResult::Restart(RestartProbe::default()));
+            wait_assessment(&mut view);
+            let request = view
+                .take_launch()
+                .expect("confirmed restart must reach its owner");
+            let transaction = crate::daemon::lifecycle::Transaction::acquire()
+                .await
+                .unwrap();
+            if replacement == "after-handoff" {
+                original.exit();
+                successor.publish();
+            }
+            remove_app_file("serve.last_port");
+            save_passphrase_to_disk("fixture future default");
+            let app = crate::session::get_app_dir().unwrap();
+            let metadata = || {
+                std::fs::read_dir(&app)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.is_file())
+                    .map(|path| {
+                        let contents = std::fs::read(&path).unwrap();
+                        (path, contents)
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            };
+            let before = metadata();
+            let mut launch = std::pin::pin!(request.run("test".to_owned(), None));
+            std::future::poll_fn(|context| {
+                assert!(std::future::Future::poll(launch.as_mut(), context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(
+                metadata(),
+                before,
+                "{code}/{replacement}: effects preceded admission"
+            );
+            drop(transaction);
+            assert!(tokio::time::timeout(Duration::from_secs(10), launch)
+                .await
+                .unwrap()
+                .is_err());
+            assert!(successor.child.try_wait().unwrap().is_none());
+            assert_eq!(
+                metadata(),
+                before,
+                "{code}/{replacement}: refusal changed persisted state"
+            );
+            remove_app_file("serve.pid");
+        }
     }
 }

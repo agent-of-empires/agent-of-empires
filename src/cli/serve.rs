@@ -1677,11 +1677,11 @@ pub(crate) async fn start_dashboard_for_tui(
     profile: &str,
     mut args: ServeArgs,
     predecessor_epoch: Option<&str>,
-    restart: bool,
+    restart: Option<TuiControlLease>,
 ) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
     let launch = async {
-        let launch = if restart {
-            restart_daemon_with_receipt(Some(args), false).await?
+        let launch = if let Some(lease) = restart {
+            lease.restart(args).await?
         } else {
             let startup = lock_for_startup(profile, &mut args)
                 .await?
@@ -2085,6 +2085,14 @@ pub(crate) async fn restart_daemon_with_receipt(
     announce: bool,
 ) -> Result<ServeLaunch> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    restart_under_transaction(transaction, override_args, announce).await
+}
+
+async fn restart_under_transaction(
+    transaction: crate::daemon::lifecycle::Transaction,
+    override_args: Option<ServeArgs>,
+    announce: bool,
+) -> Result<ServeLaunch> {
     let Some(pid) = daemon_pid() else {
         bail!(
             "No running aoe serve daemon to restart.\n\
@@ -2239,6 +2247,10 @@ impl TuiControlLease {
             return Ok(());
         }
         stop_daemon_locked(&self.transaction, false).await
+    }
+
+    async fn restart(self, args: ServeArgs) -> Result<ServeLaunch> {
+        restart_under_transaction(self.transaction, Some(args), false).await
     }
 }
 

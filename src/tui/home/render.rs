@@ -1025,8 +1025,9 @@ impl HomeView {
                 .render(frame, area, theme);
                 return;
             }
-            // A dashboard start hidden with Esc is still running behind this screen.
-            let message = if self.dashboard_launch.is_some() {
+            let message = if self.dashboard_stop.is_some() {
+                "Connecting to runtime…\n\nEnter: back to the Web dashboard stop   q: Quit"
+            } else if self.dashboard_launch.is_some() {
                 "Connecting to runtime…\n\nEnter: back to the Web dashboard start   q: Quit"
             } else {
                 "Connecting to runtime…\n\nq: Quit"

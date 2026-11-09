@@ -73,7 +73,7 @@ pub use send_message::SendMessageDialog;
 pub use serve::{
     served_via, DashboardLaunch, ServeAction, ServeLaunchRequest, ServeStopRequest, ServeView,
 };
-pub(crate) use serve::{ServeJobs, ServeLaunchFailure};
+pub(crate) use serve::{DashboardStop, ServeJobs, ServeLaunchFailure};
 pub use skills_manager::SkillsManagerDialog;
 pub use snooze_duration::SnoozeDurationDialog;
 pub use telemetry_consent::TelemetryConsentDialog;

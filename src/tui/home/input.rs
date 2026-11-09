@@ -1893,10 +1893,25 @@ impl HomeView {
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
-                ServeAction::Stop(request) => return Some(Action::StopDashboard(request)),
-                ServeAction::Launch(request) => {
-                    self.pending_dashboard_launch = Some(request);
-                    return Some(Action::StartDashboard);
+                ServeAction::Stop(request) => {
+                    if self.pending_dashboard_stop.is_none() {
+                        self.pending_dashboard_stop =
+                            Some(crate::tui::app::DashboardStopRequest::Operation(request));
+                        return Some(Action::StopDashboard);
+                    }
+                    return None;
+                }
+                ServeAction::StopOwnedLaunch => {
+                    if !matches!(self.dashboard_launch, Some(DashboardLaunch::Running { .. })) {
+                        serve.refuse_stop();
+                        return None;
+                    }
+                    if self.pending_dashboard_stop.is_none() {
+                        self.pending_dashboard_stop =
+                            Some(crate::tui::app::DashboardStopRequest::OwnedLaunch);
+                        return Some(Action::StopDashboard);
+                    }
+                    return None;
                 }
                 ServeAction::Close => {
                     self.serve_view = None;
@@ -3828,6 +3843,10 @@ impl HomeView {
     }
 
     pub(crate) fn open_serve(&mut self) {
+        if let Some(stop) = &self.dashboard_stop {
+            self.serve_view = Some(ServeView::for_stop(stop.clone(), &mut self.serve_jobs));
+            return;
+        }
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",

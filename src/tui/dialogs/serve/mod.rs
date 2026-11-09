@@ -26,59 +26,55 @@ const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
 
 pub enum ServeAction {
-    Launch(ServeLaunchRequest),
     Stop(ServeStopRequest),
+    StopOwnedLaunch,
     Continue,
     Close,
 }
-#[derive(Debug, Clone, PartialEq)]
 pub struct ServeStopRequest {
-    intent: ServeStopIntent,
+    context: DashboardStop,
+    retry: Option<(u64, Ticket)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum ServeStopIntent {
-    Observed(TuiControlTarget),
-    Dashboard(TuiControlTarget),
-    OwnedLaunch,
+#[derive(Clone)]
+pub(crate) struct DashboardStop {
+    target: TuiControlTarget,
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
 }
 
 impl ServeStopRequest {
-    pub(crate) fn after_launch() -> Self {
+    fn new(target: TuiControlTarget, mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
         Self {
-            intent: ServeStopIntent::OwnedLaunch,
+            context: DashboardStop {
+                target,
+                mode,
+                transport,
+            },
+            retry: None,
         }
     }
 
-    pub(crate) fn settle_launch(
-        &mut self,
-        target: Option<TuiControlTarget>,
-    ) -> Option<&TuiControlTarget> {
-        if matches!(&self.intent, ServeStopIntent::Observed(_)) {
-            return None;
-        }
-        self.intent = target.map_or(ServeStopIntent::OwnedLaunch, ServeStopIntent::Observed);
-        match &self.intent {
-            ServeStopIntent::Observed(target) => Some(target),
-            _ => None,
-        }
+    pub(crate) fn presentation(&self) -> DashboardStop {
+        self.context.clone()
     }
 
     pub(crate) async fn run(self) -> anyhow::Result<()> {
-        let target = match self.intent {
-            ServeStopIntent::Observed(target) | ServeStopIntent::Dashboard(target) => target,
-            ServeStopIntent::OwnedLaunch => anyhow::bail!(
-                "The owned dashboard launch has no verified Daemon identity; stop was not performed. Inspect `aoe serve --status` before retrying."
-            ),
-        };
+        if let Some((attempt, ticket)) = self.retry {
+            return match ticket.finish(attempt).await? {
+                JobResult::Retried { .. } => Ok(()),
+                JobResult::Failed(message) => Err(anyhow::anyhow!(message)),
+                _ => anyhow::bail!("The retained provider stop returned an unrelated result"),
+            };
+        }
         let cancel = tokio_util::sync::CancellationToken::new();
-        let lease = TuiControlLease::prepare(target, &cancel).await?;
+        let lease = TuiControlLease::prepare(self.context.target, &cancel).await?;
         lease.stop().await
     }
 }
 
 pub struct ServeLaunchRequest {
-    restart: bool,
+    restart: Option<TuiControlTarget>,
     mode: ServeMode,
     transport: Option<TunnelTransport>,
     passphrase: Option<String>,
@@ -102,6 +98,25 @@ impl ServeLaunchFailure {
     }
 }
 
+impl From<crate::cli::serve::TuiDashboardLaunchFailure> for ServeLaunchFailure {
+    fn from(failure: crate::cli::serve::TuiDashboardLaunchFailure) -> Self {
+        let error = failure.error;
+        let message = if error.downcast_ref::<crate::session::LoadSource>().is_some()
+            || matches!(
+                error.downcast_ref::<crate::daemon::RuntimeConnectionError>(),
+                Some(crate::daemon::RuntimeConnectionError::Protocol)
+            ) {
+            crate::session::sanitized_load_failure(&error)
+        } else {
+            tracing::warn!(target: "tui.home", %error, "dashboard launch failed");
+            "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
+        };
+        let mut captured = Self::capture(message);
+        captured.target = failure.target;
+        captured
+    }
+}
+
 /// A dashboard launch the App runs, kept on Home so a view opened meanwhile shows it.
 #[derive(Clone)]
 pub enum DashboardLaunch {
@@ -114,6 +129,15 @@ pub enum DashboardLaunch {
         target: LaunchTarget,
         failure: ServeLaunchFailure,
     },
+}
+
+impl DashboardLaunch {
+    pub(crate) fn stop_request(self, control: TuiControlTarget) -> ServeStopRequest {
+        let target = match self {
+            Self::Running { target, .. } | Self::Failed { target, .. } => target,
+        };
+        ServeStopRequest::new(control, target.mode, target.transport)
+    }
 }
 
 #[cfg(test)]
@@ -152,6 +176,19 @@ impl ServeLaunchRequest {
         predecessor_epoch: Option<String>,
     ) -> Result<crate::cli::serve::TuiDashboardLaunch, ServeLaunchFailure> {
         use clap::Parser;
+        let restart = match self.restart {
+            Some(target) => Some(
+                TuiControlLease::prepare(target, &tokio_util::sync::CancellationToken::new())
+                    .await
+                    .map_err(|error| {
+                        ServeLaunchFailure::from(crate::cli::serve::TuiDashboardLaunchFailure {
+                            error,
+                            target: None,
+                        })
+                    })?,
+            ),
+            None => None,
+        };
         let port = crate::acp::client::autostart::load_or_generate_port().to_string();
         let mut argv = vec!["aoe", "serve", "--daemon", "--port", port.as_str()];
         match self.mode {
@@ -172,21 +209,14 @@ impl ServeLaunchRequest {
             unreachable!();
         };
         args.passphrase = self.passphrase.clone();
-        let result = crate::cli::serve::start_dashboard_for_tui(&profile, args, predecessor_epoch.as_deref(), self.restart).await
-            .map_err(|failure| {
-                let error = failure.error;
-                let message = if error.downcast_ref::<crate::session::LoadSource>().is_some()
-                    || matches!(error.downcast_ref::<crate::daemon::RuntimeConnectionError>(), Some(crate::daemon::RuntimeConnectionError::Protocol))
-                {
-                    crate::session::sanitized_load_failure(&error)
-                } else {
-                    tracing::warn!(target: "tui.home", %error, "dashboard launch failed");
-                    "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
-                };
-                let mut captured = ServeLaunchFailure::capture(message);
-                captured.target = failure.target;
-                captured
-            });
+        let result = crate::cli::serve::start_dashboard_for_tui(
+            &profile,
+            args,
+            predecessor_epoch.as_deref(),
+            restart,
+        )
+        .await
+        .map_err(ServeLaunchFailure::from);
         if result.is_ok() {
             remember_last_mode(self.mode);
         }
@@ -701,7 +731,6 @@ impl PendingJob {
             Self::Providers { .. } => Some("Checking tunnel providers"),
             Self::Retry { .. } => Some("Stopping the observed daemon before provider retry"),
             Self::Reset => Some("Resetting Funnel; closing does not undo an admitted reset"),
-            Self::Restart { .. } => Some("Checking restart effects"),
             _ => None,
         }
     }
@@ -790,6 +819,22 @@ impl ServeView {
         } else if view.target.is_none() {
             view.request(Job::ErrorContext, PendingJob::ErrorContext);
         }
+        view
+    }
+
+    pub(crate) fn for_stop(stop: DashboardStop, jobs: &mut ServeJobs) -> Self {
+        let mut view = Self::with_state(
+            ServeViewState::Starting {
+                mode: stop.mode,
+                transport: stop.transport,
+                passphrase: None,
+                started_at: Instant::now(),
+                log_offset: 0,
+            },
+            jobs.submitter(),
+        );
+        view.target = Some(stop.target);
+        view.begin_stop();
         view
     }
 
@@ -901,22 +946,28 @@ impl ServeView {
             if self.stop_requested {
                 return ServeAction::Continue;
             }
+            let (mode, transport) = self.context();
             let request = match self.pending.take() {
                 Some(PendingWork {
+                    attempt,
                     kind: PendingJob::Retry { target, .. },
+                    ticket,
                     ..
                 }) => {
                     self.target = Some(target.clone());
-                    ServeStopRequest {
-                        intent: ServeStopIntent::Observed(target),
-                    }
+                    let mut request = ServeStopRequest::new(target, mode, transport);
+                    request.retry =
+                        (!ticket.cancel_before_admission()).then_some((attempt, ticket));
+                    request
                 }
-                _ => self
-                    .target
-                    .clone()
-                    .map_or_else(ServeStopRequest::after_launch, |target| ServeStopRequest {
-                        intent: ServeStopIntent::Dashboard(target),
-                    }),
+                _ if self.launch_in_flight || self.target.is_none() => {
+                    return ServeAction::StopOwnedLaunch;
+                }
+                _ => ServeStopRequest::new(
+                    self.target.clone().expect("observed stop target"),
+                    mode,
+                    transport,
+                ),
             };
             self.begin_stop();
             return ServeAction::Stop(request);
@@ -931,7 +982,7 @@ impl ServeView {
         if self.handle_pending_key(key.code) {
             return ServeAction::Continue;
         }
-        let action = match self.state {
+        match self.state {
             ServeViewState::Checking { .. } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
                 _ => ServeAction::Continue,
@@ -944,10 +995,7 @@ impl ServeView {
             },
             ServeViewState::Active { .. } => self.active_key(key.code),
             ServeViewState::Error { .. } => self.error_key(key.code),
-        };
-        self.pending_launch
-            .take()
-            .map_or(action, ServeAction::Launch)
+        }
     }
 
     fn handle_pending_key(&mut self, code: KeyCode) -> bool {
@@ -1163,7 +1211,7 @@ impl ServeView {
     fn spawn(&mut self, mode: ServeMode, transport: Option<TunnelTransport>) {
         let passphrase = (mode == ServeMode::Tunnel).then(|| self.pending_passphrase.clone());
         self.prepare_launch(ServeLaunchRequest {
-            restart: false,
+            restart: None,
             mode,
             transport,
             passphrase,
@@ -1234,6 +1282,17 @@ impl ServeView {
                 }
             }
         }
+    }
+
+    pub(crate) fn refuse_stop(&mut self) {
+        self.pending = None;
+        self.stop_requested = false;
+        let (mode, transport) = self.context();
+        self.fail_work(
+            mode,
+            transport,
+            "No verified Daemon identity or App-owned launch is available; Stop was not performed. Inspect `aoe serve --status` before retrying.".to_owned(),
+        );
     }
 
     pub(crate) fn begin_stop(&mut self) {
@@ -1394,6 +1453,14 @@ impl ServeView {
             || RestartEffect::of(mode, urls, &fresh, self.running_persists)
                 == RestartEffect::of(mode, urls, &self.restart_probe, self.running_persists);
         if repeated && unchanged {
+            let Some(target) = self.target.clone() else {
+                self.fail_work(
+                    mode,
+                    transport,
+                    "Restart requires a verified Daemon identity. Reopen the dashboard before retrying.".to_owned(),
+                );
+                return;
+            };
             let passphrase = if action == PendingConfirm::NewPassphrase {
                 self.pending_passphrase = generate_passphrase();
                 Some(self.pending_passphrase.clone())
@@ -1405,7 +1472,7 @@ impl ServeView {
                 })
             };
             self.prepare_launch(ServeLaunchRequest {
-                restart: true,
+                restart: Some(target),
                 mode,
                 transport,
                 passphrase,
@@ -1420,7 +1487,7 @@ impl ServeView {
     pub fn tick(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
         let mut changed = false;
-        if let Some(pending) = &self.pending {
+        if let Some(pending) = &mut self.pending {
             let result = pending.ticket.try_recv();
             match result {
                 Ok((attempt, result)) if attempt == pending.attempt => {
