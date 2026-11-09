@@ -132,6 +132,8 @@ A live-pane teardown authorization requires the pane to remain live with the exa
 
 Revival takes the pane state, PID, physical IDs and server birth from one captured observation before acquiring process handles; it does not combine separate name-based and cached batch lookups.
 
+Some tmux versions display a corpse's previous PID, while others hide it. Revival preserves that observed value for its dead-pane guard without capturing or signalling it as a live process.
+
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. A matching OMP confirmation can consume an explicit pin during stabilization without changing the captured launch owner. Capturing a different ID clears the marker; an explicit `set-session-id` assertion or a successful launch can also clear it.
 
 An accepted OMP pin confirmation also converges the local launch intent, so the first subsequent capture can record a different conversation. An empty outgoing launch poller does not erase a compatible canonical poller installed during adoption.
