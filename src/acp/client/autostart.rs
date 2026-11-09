@@ -131,13 +131,16 @@ fn scan_log_file(
     } else {
         0
     };
+    let mut continuation = false;
     if start != 0 {
-        file.seek(SeekFrom::Start(start))?;
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut previous = [0_u8];
+        file.read_exact(&mut previous)?;
+        continuation = previous[0] != b'\n';
     }
     let mut reader = BufReader::new(file.take(length - start));
     let mut bytes = Vec::with_capacity(LOG_LINE_BYTES);
     let mut tail = VecDeque::with_capacity(if limit == 0 { 0 } else { LOG_TAIL_LINES });
-    let mut continuation = start != 0;
     let mut found = false;
     loop {
         if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -351,5 +354,36 @@ mod tests {
         let cancelled = startup_log_tail(17, &birth, &cancel);
         assert!(cancelled.lines.is_empty());
         assert!(!cancelled.has_process_marker);
+
+        let entries = [
+            "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "last",
+        ];
+        for (case, prefix, delta, first) in [
+            ("untrimmed", "", 0_isize, 0),
+            ("after newline", "earlier\n", 0, 0),
+            ("on newline", "earlier\n", -1, 0),
+            ("inside line", "earlier\n", 1, 1),
+        ] {
+            let mut contents = prefix.to_owned();
+            for (index, entry) in entries.iter().enumerate() {
+                let physical_length = (LOG_TAIL_LINES * LOG_LINE_BYTES / entries.len())
+                    .checked_add_signed(if index == 0 { delta } else { 0 })
+                    .unwrap();
+                contents.push_str(entry);
+                contents.push(' ');
+                contents.extend(std::iter::repeat_n('x', physical_length - entry.len() - 2));
+                contents.push('\n');
+            }
+            std::fs::write(crate::cli::serve::stdio_redirect_path().unwrap(), contents).unwrap();
+            let context = initial_log_tail();
+            assert!(
+                context
+                    .lines
+                    .iter()
+                    .map(|line| line.split_once(' ').unwrap().0)
+                    .eq(entries[first..].iter().copied()),
+                "{case}: missing or shifted log entry"
+            );
+        }
     }
 }
