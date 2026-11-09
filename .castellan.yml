@@ -56,3 +56,5 @@ prompt:
     - New dependencies pin the latest stable release unless the PR justifies the older pin.
     - Tmux tests use aoe_test_ or aoe_e2e_ session names and serial where they touch shared state; tests clean up and never read or write real user state.
     - Flag features that belong in a plugin rather than core, and PRs that mix unrelated areas.
+    - Report review findings without a severity label, prefixing only nits with `nit:`.
+    - Anchor each finding to the line it concerns, and use a top-level comment only when it cannot be anchored.
