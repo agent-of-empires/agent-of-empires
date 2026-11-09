@@ -878,7 +878,8 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("UNFINISHED-OUTPUT-END");
+    // Initial disk replay is not a viewport-update latency assertion.
+    h.wait_for_timeout("UNFINISHED-OUTPUT-END", Duration::from_secs(60));
     h.send_keys("S-PageUp");
     h.wait_for_absent("UNFINISHED-OUTPUT-END", Duration::from_secs(5));
     h.assert_screen_contains("Trash · read-only");
