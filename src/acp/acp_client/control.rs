@@ -226,7 +226,10 @@ async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
         return true;
     }
     settle_unreachable_sdk_route(
-        settled, state, AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
+        settled,
+        state,
+        AcpConnectionSource::Control,
+        AcpConnectionCause::ForwardPumpEnded,
     );
     false
 }
@@ -1117,14 +1120,16 @@ pub(super) async fn connect_runner_control_v5(
             match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
                 Ok(0) => {
                     pump_control.close_sdk_route(
-                        AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::ForwardPumpEnded,
                     );
                     return;
                 }
                 Ok(_) => {}
                 Err(error) => {
                     pump_control.close_sdk_route(
-                        AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::ForwardPumpEnded,
                     );
                     debug!(
                         target: "acp.protocol",
@@ -2012,10 +2017,15 @@ mod tests {
         drop(closed_crate);
         let (_, write) = tokio::io::split(shim);
         let failed_relay = Mutex::new(write);
-        assert!(!shim_write_line_releasing(
-            &failed_relay, &PromptCompletedMarker::default(), &peer.client.settled,
-            &peer.client.connection_state,
-        ).await);
+        assert!(
+            !shim_write_line_releasing(
+                &failed_relay,
+                &PromptCompletedMarker::default(),
+                &peer.client.settled,
+                &peer.client.connection_state,
+            )
+            .await
+        );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), completion)
                 .await

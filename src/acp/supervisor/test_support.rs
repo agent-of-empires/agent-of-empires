@@ -896,18 +896,22 @@ for attempt in range(2):
                 (HeldChild::Retained(child), pid, completion, stdout)
             };
         let mut lines = BufReader::new(stdout).lines();
-        let ready = tokio::time::timeout(
-            std::time::Duration::from_secs(10), lines.next_line(),
-        ).await;
+        let ready =
+            tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line()).await;
         if !matches!(&ready, Ok(Ok(Some(line))) if line == "ready") {
             match &mut child {
                 HeldChild::Retained(child) => {
                     let _ = child.kill();
-                    child.wait().expect("reap original child before publication");
+                    child
+                        .wait()
+                        .expect("reap original child before publication");
                 }
                 HeldChild::Constructor(Some(child)) => {
                     let _ = child.kill().await;
-                    child.wait().await.expect("reap original constructor before publication");
+                    child
+                        .wait()
+                        .await
+                        .expect("reap original constructor before publication");
                 }
                 HeldChild::Constructor(None) => unreachable!("original child has not transferred"),
             }
@@ -1147,8 +1151,7 @@ impl Drop for HeldAttachRunner {
     fn drop(&mut self) {
         self.peer.abort();
         if let HeldChild::Constructor(None) = &self.child {
-            crate::acp::runner_lifecycle::SystemProcessControl::default()
-                .kill_group(self.identity);
+            crate::acp::runner_lifecycle::SystemProcessControl::default().kill_group(self.identity);
         }
     }
 }
