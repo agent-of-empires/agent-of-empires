@@ -4297,7 +4297,15 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.repo_config_path().to_string_lossy().into_owned());
+            .map(|inst| {
+                if inst.workspace_info.is_some() {
+                    repo_config::repo_config_source_path(inst.repo_config_path())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    inst.project_path.clone()
+                }
+            });
         match SettingsView::new(&self.config_profile(), project_path) {
             Ok(view) => self.settings_view = Some(view),
             Err(e) => {

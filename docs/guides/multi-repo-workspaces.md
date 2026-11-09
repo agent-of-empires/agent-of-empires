@@ -124,6 +124,7 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 - **No agent-driven repo pull-in**: the agent cannot add a repo to its own session; attaching may restart the agent without resuming its conversation.
 - **No saved workspace templates**: each session picks the repo set fresh.
 - **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
+- **First repo's settings only**: a workspace uses repo config, hooks and project MCP servers from its first repo. Other repos' settings are ignored.
 
 ## Related
 
