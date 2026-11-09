@@ -1251,10 +1251,55 @@ pub(crate) fn recorded_launch() -> Option<ServeLaunch> {
     managed_launch(daemon_pid()?).ok()
 }
 
-/// Whether the TUI may restart the local Daemon in place: the rule that gates
-/// the startup migration offer, for a Daemon with a replayable launch record.
-pub(crate) fn local_daemon_restartable() -> bool {
-    crate::cli::migrate::offer_allowed(true, recorded_launch().is_some())
+/// Whether `serve.launch` proves aoe launched `pid` and replay can use it. Replay
+/// reconciles older schemas first, so judge the record in that upgraded shape.
+fn launch_is_replayable(pid: u32) -> Result<bool> {
+    let raw = launch_file("serve.launch")?
+        .read()?
+        .context("Missing daemon launch record")?;
+    let mut record: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw)?;
+    crate::migrations::validate_serve_launch_schema(&record)?;
+    record
+        .entry("has_passphrase")
+        .or_insert_with(|| false.into());
+    let launch: ServeLaunch = serde_json::from_value(record.into())?;
+    Ok(launch_authorizes(
+        &launch,
+        pid,
+        instance_is_live(&launch, pid),
+    ))
+}
+
+/// Who can restart the outdated Daemon at `pid`. A restart offer follows the
+/// startup migration offer's rule, so `--no-autostart` only ever gets the command.
+fn outdated_daemon_remedy(pid: u32) -> crate::daemon::OutdatedDaemonRemedy {
+    use crate::daemon::{DaemonIncarnation, OutdatedDaemonRemedy};
+    if !launch_is_replayable(pid).unwrap_or(false) {
+        return OutdatedDaemonRemedy::External;
+    }
+    match DaemonIncarnation::of(pid) {
+        Ok(Some(daemon)) if crate::cli::migrate::offer_allowed(true, true) => {
+            OutdatedDaemonRemedy::Restart(daemon)
+        }
+        _ => OutdatedDaemonRemedy::Command,
+    }
+}
+
+/// Call with the lifecycle transaction held, so `pid` is the Daemon that reported `error`.
+fn pin_protocol_skew(error: crate::daemon::LocalRuntimeError, pid: Option<u32>) -> anyhow::Error {
+    use crate::daemon::{OutdatedDaemonRemedy, PinnedProtocolSkew};
+    let Some(skew) = error.protocol_skew() else {
+        return error.into();
+    };
+    let remedy = skew
+        .daemon_older
+        .then(|| pid.map_or(OutdatedDaemonRemedy::External, outdated_daemon_remedy));
+    PinnedProtocolSkew {
+        message: error.to_string(),
+        summary: skew.summary,
+        remedy,
+    }
+    .into()
 }
 
 /// Whether the verified daemon already runs `passphrase`.
@@ -1628,7 +1673,10 @@ pub(crate) async fn ensure_local_daemon(
     let existing = match daemon_status() {
         DaemonStatus::Verified(pid) => {
             if transaction.try_lifetime()?.is_some() {
-                return Err(crate::daemon::LocalRuntimeError::PredatesTransport { pid }.into());
+                return Err(pin_protocol_skew(
+                    crate::daemon::LocalRuntimeError::PredatesTransport { pid },
+                    Some(pid),
+                ));
             }
             Some(pid)
         }
@@ -1680,7 +1728,8 @@ pub(crate) async fn ensure_local_daemon(
     if let Some(profile) = native_profile {
         client
             .local_runtime_ready((!profile.is_empty()).then_some(profile))
-            .await?;
+            .await
+            .map_err(|error| pin_protocol_skew(error, existing))?;
     } else {
         let pid = existing
             .or(started)
@@ -2064,19 +2113,45 @@ pub(crate) async fn restart_daemon_with_receipt(
     override_args: Option<ServeArgs>,
     announce: bool,
 ) -> Result<ServeLaunch> {
-    replay_managed_launch(override_args, announce, None).await
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    replay_managed_launch(transaction, override_args, announce, None).await
 }
 
-/// `aoe serve --restart` for the TUI, which must not write to the terminal it owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TuiRestart {
+    Restarted,
+    /// The Daemon the offer was made for is gone; nothing was touched.
+    DaemonChanged,
+}
+
+/// `aoe serve --restart` for the TUI, which must not write to the terminal it
+/// owns, limited to the Daemon `expected` that the offer was made for.
 pub(crate) async fn restart_daemon_for_tui(
+    expected: crate::daemon::DaemonIncarnation,
     progress: crate::migrations::progress::Reporter,
-) -> Result<()> {
-    replay_managed_launch(None, false, Some(progress))
-        .await
-        .map(|_| ())
+) -> Result<TuiRestart> {
+    restart_daemon_if_current(expected, daemon_status, progress).await
+}
+
+async fn restart_daemon_if_current(
+    expected: crate::daemon::DaemonIncarnation,
+    status: impl FnOnce() -> DaemonStatus,
+    progress: crate::migrations::progress::Reporter,
+) -> Result<TuiRestart> {
+    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+    let current = match status() {
+        DaemonStatus::Verified(pid) => crate::daemon::DaemonIncarnation::of(pid)?,
+        DaemonStatus::Absent | DaemonStatus::Unverified => None,
+    };
+    if current != Some(expected) {
+        return Ok(TuiRestart::DaemonChanged);
+    }
+    replay_managed_launch(transaction, None, false, Some(progress)).await?;
+    Ok(TuiRestart::Restarted)
 }
 
 async fn replay_managed_launch(
+    transaction: crate::daemon::lifecycle::Transaction,
     override_args: Option<ServeArgs>,
     announce: bool,
     progress: Option<crate::migrations::progress::Reporter>,
@@ -2086,7 +2161,6 @@ async fn replay_managed_launch(
             progress(crate::migrations::progress::Event::Step(message.to_owned()));
         }
     };
-    let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
     let Some(pid) = daemon_pid() else {
         bail!(
             "No running aoe serve daemon to restart.\n\
@@ -3398,6 +3472,159 @@ mod tests {
                 "a known profile must reach the next validation, got: {msg}"
             );
         }
+    }
+
+    fn launch_record(schema: u32, pid: u32, instance_id: Option<&str>) -> serde_json::Value {
+        let launch = ServeLaunch {
+            schema,
+            pid,
+            instance_id: instance_id.map(str::to_owned),
+            profile: "default".into(),
+            core_only: true,
+            host: "127.0.0.1".into(),
+            port: 0,
+            auth_mode: AuthMode::None,
+            has_passphrase: false,
+            behind_proxy: false,
+            allow_plaintext_remote: false,
+            read_only: false,
+            cityhall: false,
+            remote: false,
+            tunnel_name: None,
+            tunnel_url: None,
+            no_tailscale: false,
+            allowed_host: Vec::new(),
+            allowed_origin: Vec::new(),
+            additional_fields: serde_json::Map::new(),
+        };
+        let mut record = serde_json::to_value(launch).unwrap();
+        if schema < SERVE_LAUNCH_SCHEMA {
+            record.as_object_mut().unwrap().remove("has_passphrase");
+        }
+        record
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn outdated_remedy_recognizes_replayable_history_and_keeps_identity_checks() -> Result<()>
+    {
+        use crate::daemon::{DaemonIncarnation, OutdatedDaemonRemedy as R};
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let app = crate::session::get_app_dir()?;
+        std::fs::write(
+            app.join(".schema_version"),
+            crate::migrations::current_schema_version().to_string(),
+        )?;
+        let me = std::process::id();
+        let daemon = DaemonIncarnation::of(me)?.unwrap();
+        let write = |record: &serde_json::Value| -> Result<()> {
+            launch_file("serve.launch")?.replace(record.to_string().as_bytes())
+        };
+
+        let incomplete = serde_json::json!({"schema": 1, "pid": me});
+        let cases = [
+            (launch_record(1, me, None), R::Restart(daemon)),
+            (launch_record(2, me, None), R::Restart(daemon)),
+            (launch_record(3, me, None), R::Restart(daemon)),
+            (
+                launch_record(SERVE_LAUNCH_SCHEMA, me, None),
+                R::Restart(daemon),
+            ),
+            // The identity checks still apply to a historical record.
+            (launch_record(3, me, Some("not-this-process")), R::External),
+            (launch_record(1, me + 1, None), R::External),
+            // Replay could not use these.
+            (
+                launch_record(SERVE_LAUNCH_SCHEMA + 1, me, None),
+                R::External,
+            ),
+            (incomplete, R::External),
+        ];
+        for (record, expected) in &cases {
+            write(record)?;
+            assert_eq!(outdated_daemon_remedy(me), *expected, "{record}");
+        }
+        launch_file("serve.launch")?.remove()?;
+        assert_eq!(outdated_daemon_remedy(me), R::External);
+
+        // The record classified as restartable is one the replay path then accepts.
+        write(&launch_record(1, me, None))?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+        assert!(managed_launch(me).is_err(), "not yet reconciled");
+        drop(migrate_managed_launch(transaction, false).await?);
+        assert_eq!(managed_launch(me)?.schema, SERVE_LAUNCH_SCHEMA);
+
+        // --no-autostart keeps its opt-out but still names the working command.
+        crate::acp::client::daemon_manager::set_autostart_disabled(true);
+        let opted_out = outdated_daemon_remedy(me);
+        crate::acp::client::daemon_manager::set_autostart_disabled(false);
+        assert_eq!(opted_out, R::Command);
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_pinned_older_daemon_is_judged() {
+        use crate::daemon::{LocalRuntimeError as E, OutdatedDaemonRemedy, PinnedProtocolSkew};
+        let remedy = |error: E, pid| {
+            pin_protocol_skew(error, pid)
+                .downcast_ref::<PinnedProtocolSkew>()
+                .map(|pinned| pinned.remedy)
+        };
+        let protocol = |actual| E::Protocol {
+            expected: 4,
+            actual,
+        };
+        // A newer Daemon is never offered a restart, so ownership isn't probed.
+        assert_eq!(remedy(protocol(5), Some(std::process::id())), Some(None));
+        assert_eq!(
+            remedy(protocol(3), None),
+            Some(Some(OutdatedDaemonRemedy::External))
+        );
+        assert_eq!(remedy(E::Identity, None), None);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_restart_leaves_a_changed_daemon_alone() -> Result<()> {
+        use crate::daemon::DaemonIncarnation;
+        let home = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let me = std::process::id();
+        let record = launch_record(1, me, None).to_string();
+        launch_file("serve.launch")?.replace(record.as_bytes())?;
+        let progress = || -> crate::migrations::progress::Reporter { std::sync::Arc::new(|_| {}) };
+        let classified = DaemonIncarnation::of(me)?.unwrap();
+        // The same PID with another birth is a successor, not the classified Daemon.
+        let successor = DaemonIncarnation {
+            birth: DaemonIncarnation::sample("successor").birth,
+            ..classified
+        };
+
+        for (expected, status) in [
+            (successor, DaemonStatus::Verified(me)),
+            (classified, DaemonStatus::Absent),
+            (classified, DaemonStatus::Unverified),
+        ] {
+            let outcome = restart_daemon_if_current(expected, || status, progress()).await?;
+            assert_eq!(outcome, TuiRestart::DaemonChanged, "{status:?}");
+            assert_eq!(
+                launch_file("serve.launch")?.read()?.unwrap(),
+                record,
+                "revalidation precedes every mutation"
+            );
+        }
+
+        // The classified Daemon proceeds to replay, which stops at the real (absent) PID file.
+        let replay =
+            restart_daemon_if_current(classified, || DaemonStatus::Verified(me), progress())
+                .await
+                .unwrap_err();
+        assert!(
+            replay.to_string().contains("No running aoe serve daemon"),
+            "{replay}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

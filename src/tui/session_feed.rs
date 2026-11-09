@@ -28,28 +28,21 @@ pub(crate) enum SessionFeedResult {
     },
 }
 
-/// `restartable` is probed only for an older Daemon: it spawns `ps`.
-fn classify_connect_failure(
-    error: &anyhow::Error,
-    restartable: impl FnOnce() -> bool,
-) -> SessionFeedResult {
+fn classify_connect_failure(error: &anyhow::Error) -> SessionFeedResult {
+    use crate::daemon::OutdatedDaemonRemedy as Remedy;
     use crate::tui::dialogs::DaemonAttention;
-    let skew = error
-        .downcast_ref::<crate::daemon::LocalRuntimeError>()
-        .and_then(crate::daemon::LocalRuntimeError::protocol_skew);
-    let Some(skew) = skew else {
+    let Some(skew) = error.downcast_ref::<crate::daemon::PinnedProtocolSkew>() else {
         return SessionFeedResult::Unavailable(error.to_string());
     };
-    let attention = if !skew.daemon_older {
-        DaemonAttention::DaemonNewer
-    } else if restartable() {
-        DaemonAttention::Outdated
-    } else {
-        DaemonAttention::OutdatedManual
+    let attention = match skew.remedy {
+        None => DaemonAttention::DaemonNewer,
+        Some(Remedy::Restart(daemon)) => DaemonAttention::Outdated(daemon),
+        Some(Remedy::Command) => DaemonAttention::OutdatedCommand,
+        Some(Remedy::External) => DaemonAttention::OutdatedManual,
     };
     SessionFeedResult::Mismatched {
         attention,
-        summary: skew.summary,
+        summary: skew.summary.clone(),
     }
 }
 
@@ -865,13 +858,7 @@ impl SessionFeed {
             quit_control.send_replace(None);
             sandbox_progress.send_replace(Vec::new());
             if let Err(error) = result {
-                let reason = error.to_string();
-                let failure = tokio::task::spawn_blocking(move || {
-                    classify_connect_failure(&error, crate::cli::serve::local_daemon_restartable)
-                })
-                .await
-                .unwrap_or(SessionFeedResult::Unavailable(reason));
-                sender.send_replace(Some(failure));
+                sender.send_replace(Some(classify_connect_failure(&error)));
             }
         }));
     }
@@ -4103,51 +4090,41 @@ mod tests {
 
     #[test]
     fn connect_failures_classify_by_what_can_fix_them() {
-        use crate::daemon::{LocalRuntimeError as E, RuntimeConnectionError};
-        use crate::tui::dialogs::DaemonAttention as A;
-        let protocol = |actual| E::Protocol {
-            expected: 4,
-            actual,
+        use crate::daemon::{
+            DaemonIncarnation, LocalRuntimeError as E, OutdatedDaemonRemedy as R,
+            PinnedProtocolSkew, RuntimeConnectionError,
         };
-        let older = "Daemon protocol 3, this aoe 4";
-        // (error, restartable, classification)
-        let cases: Vec<(anyhow::Error, bool, Option<(A, &str)>)> = vec![
-            (protocol(3).into(), true, Some((A::Outdated, older))),
-            (protocol(3).into(), false, Some((A::OutdatedManual, older))),
-            (
-                E::PredatesTransport { pid: 1 }.into(),
-                true,
-                Some((A::Outdated, "Daemon predates this aoe's local connection")),
-            ),
+        use crate::tui::dialogs::DaemonAttention as A;
+        let daemon = DaemonIncarnation::sample("old");
+        let skew = |remedy| -> anyhow::Error {
+            PinnedProtocolSkew {
+                message: "full message".into(),
+                summary: "Daemon protocol 3, this aoe 4".into(),
+                remedy,
+            }
+            .into()
+        };
+        let cases: Vec<(anyhow::Error, Option<A>)> = vec![
+            (skew(Some(R::Restart(daemon))), Some(A::Outdated(daemon))),
+            (skew(Some(R::Command)), Some(A::OutdatedCommand)),
+            (skew(Some(R::External)), Some(A::OutdatedManual)),
             // Restarting a newer Daemon with this binary would be a downgrade.
-            (
-                protocol(5).into(),
-                true,
-                Some((A::DaemonNewer, "Daemon protocol 5, this aoe 4")),
-            ),
-            (E::Identity.into(), true, None),
-            (RuntimeConnectionError::Protocol.into(), true, None),
-            (anyhow::anyhow!("connection refused"), true, None),
+            (skew(None), Some(A::DaemonNewer)),
+            (E::Identity.into(), None),
+            (RuntimeConnectionError::Protocol.into(), None),
+            (anyhow::anyhow!("connection refused"), None),
         ];
-        for (error, restartable, expected) in cases {
+        for (error, expected) in cases {
             let label = error.to_string();
-            let got = classify_connect_failure(&error, || restartable);
-            match (got, expected) {
-                (
-                    SessionFeedResult::Mismatched { attention, summary },
-                    Some((want_attention, want_summary)),
-                ) => {
-                    assert_eq!(attention, want_attention, "{label}");
-                    assert_eq!(summary, want_summary, "{label}");
+            match (classify_connect_failure(&error), expected) {
+                (SessionFeedResult::Mismatched { attention, summary }, Some(want)) => {
+                    assert_eq!(attention, want, "{label}");
+                    assert_eq!(summary, "Daemon protocol 3, this aoe 4", "{label}");
                 }
                 (SessionFeedResult::Unavailable(reason), None) => assert_eq!(reason, label),
                 (other, expected) => panic!("{label}: {other:?}, expected {expected:?}"),
             }
         }
-
-        // A newer Daemon is never offered a restart, so ownership isn't probed.
-        let newer: anyhow::Error = protocol(5).into();
-        classify_connect_failure(&newer, || panic!("probed a newer Daemon"));
     }
 
     #[tokio::test(flavor = "current_thread")]

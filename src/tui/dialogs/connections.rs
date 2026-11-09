@@ -12,8 +12,10 @@ use crate::tui::styles::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonAttention {
     Offline,
-    /// An older local Daemon this aoe can restart in place.
-    Outdated,
+    /// An older local Daemon this aoe can restart in place: this incarnation only.
+    Outdated(crate::daemon::DaemonIncarnation),
+    /// An older Daemon aoe launched, under `--no-autostart`: the user runs the restart.
+    OutdatedCommand,
     /// An older Daemon that something other than this aoe has to restart.
     OutdatedManual,
     DaemonNewer,
@@ -29,7 +31,9 @@ impl DaemonAttention {
     pub fn footer_label(self) -> &'static str {
         match self {
             DaemonAttention::Offline => "Daemon offline",
-            DaemonAttention::Outdated | DaemonAttention::OutdatedManual => "Daemon outdated",
+            DaemonAttention::Outdated(_)
+            | DaemonAttention::OutdatedCommand
+            | DaemonAttention::OutdatedManual => "Daemon outdated",
             DaemonAttention::DaemonNewer => "Daemon newer",
             DaemonAttention::Restarting => "Daemon restarting",
             DaemonAttention::RestartFailed => "Restart failed",
@@ -44,7 +48,8 @@ impl DaemonAttention {
         matches!(
             self,
             DaemonAttention::Offline
-                | DaemonAttention::Outdated
+                | DaemonAttention::Outdated(_)
+                | DaemonAttention::OutdatedCommand
                 | DaemonAttention::OutdatedManual
                 | DaemonAttention::DaemonNewer
                 | DaemonAttention::RestartFailed
@@ -65,10 +70,10 @@ impl DaemonAttention {
     /// The r key's button and footer hint; `None` while a restart is running.
     fn action(self) -> Option<(&'static str, &'static str)> {
         match self {
-            DaemonAttention::Outdated => Some(("Restart Daemon", " restart  ")),
-            DaemonAttention::OutdatedManual | DaemonAttention::DaemonNewer => {
-                Some(("Check again", " check again  "))
-            }
+            DaemonAttention::Outdated(_) => Some(("Restart Daemon", " restart  ")),
+            DaemonAttention::OutdatedCommand
+            | DaemonAttention::OutdatedManual
+            | DaemonAttention::DaemonNewer => Some(("Check again", " check again  ")),
             DaemonAttention::Restarting => None,
             _ => Some(("Reconnect", " reconnect  ")),
         }
@@ -77,7 +82,9 @@ impl DaemonAttention {
     fn status(self) -> &'static str {
         match self {
             DaemonAttention::Offline => "Not responding",
-            DaemonAttention::Outdated | DaemonAttention::OutdatedManual => "Outdated",
+            DaemonAttention::Outdated(_)
+            | DaemonAttention::OutdatedCommand
+            | DaemonAttention::OutdatedManual => "Outdated",
             DaemonAttention::DaemonNewer => "Newer than this aoe",
             DaemonAttention::Restarting => "Restarting",
             DaemonAttention::RestartFailed => "Restart failed",
@@ -92,8 +99,11 @@ impl DaemonAttention {
             DaemonAttention::Offline => {
                 "Your Sessions keep running in tmux, but the list can't update until it's back."
             }
-            DaemonAttention::Outdated => {
+            DaemonAttention::Outdated(_) => {
                 "It's from before your last aoe upgrade and must restart to match. Your Sessions keep running in tmux."
+            }
+            DaemonAttention::OutdatedCommand => {
+                "Run `aoe serve --restart`, then check again."
             }
             DaemonAttention::OutdatedManual => {
                 "aoe didn't start this Daemon, so restart it from its terminal or service manager, then check again."
@@ -453,10 +463,13 @@ mod tests {
         };
         // (view, text shown, text absent)
         let takeover = |attention, reason| ConnectionsView::offline(attention, Some(reason), false);
-        let cases: [(ConnectionsView, &[&str], &[&str]); 13] = [
+        let cases: [(ConnectionsView, &[&str], &[&str]); 14] = [
             // A reachable older Daemon is not "not responding", and the fix is a restart.
             (
-                takeover(DaemonAttention::Outdated, "Daemon protocol 3, this aoe 4"),
+                takeover(
+                    DaemonAttention::Outdated(crate::daemon::DaemonIncarnation::sample("old")),
+                    "Daemon protocol 3, this aoe 4",
+                ),
                 &[
                     "Outdated",
                     "Daemon protocol 3, this aoe 4",
@@ -467,6 +480,19 @@ mod tests {
                 &["Not responding", "Reconnect", "Check again"],
             ),
             // Nothing this aoe may restart: instructions, and r only re-checks.
+            (
+                takeover(
+                    DaemonAttention::OutdatedCommand,
+                    "Daemon protocol 3, this aoe 4",
+                ),
+                &["Outdated", "aoe serve --restart", "[ r Check again ]"],
+                &[
+                    "Not responding",
+                    "Restart Daemon",
+                    "service manager",
+                    "didn't start",
+                ],
+            ),
             (
                 takeover(
                     DaemonAttention::OutdatedManual,

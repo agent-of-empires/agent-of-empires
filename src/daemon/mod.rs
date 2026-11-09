@@ -160,6 +160,57 @@ pub(crate) struct ProtocolSkew {
     pub(crate) summary: String,
 }
 
+/// One process incarnation of the local Daemon; a PID alone can be reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonIncarnation {
+    pub(crate) pid: u32,
+    pub(crate) birth: crate::process::ProcessBirthFingerprint,
+}
+
+impl DaemonIncarnation {
+    pub(crate) fn of(pid: u32) -> anyhow::Result<Option<Self>> {
+        Ok(
+            crate::process::process_birth_identity(pid)?.map(|birth| Self {
+                pid,
+                birth: birth.fingerprint(),
+            }),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sample(start_id: &str) -> Self {
+        let birth = crate::process::ProcessBirthIdentity {
+            boot_id: "boot".into(),
+            start_id: start_id.into(),
+        };
+        Self {
+            pid: 1,
+            birth: birth.fingerprint(),
+        }
+    }
+}
+
+/// What can bring an older local Daemon back in step with this aoe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutdatedDaemonRemedy {
+    /// This aoe may restart this incarnation in place.
+    Restart(DaemonIncarnation),
+    /// aoe launched it, but restarting is left to `aoe serve --restart`.
+    Command,
+    /// Only its own terminal or service manager can restart it.
+    External,
+}
+
+/// A protocol skew, judged while the lifecycle transaction pinned the Daemon
+/// that reported it. `remedy` is `None` for a Daemon newer than this aoe.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct PinnedProtocolSkew {
+    pub(crate) message: String,
+    pub(crate) summary: String,
+    pub(crate) remedy: Option<OutdatedDaemonRemedy>,
+}
+
 impl LocalRuntimeError {
     pub(crate) fn protocol_skew(&self) -> Option<ProtocolSkew> {
         match *self {

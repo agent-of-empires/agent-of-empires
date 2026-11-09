@@ -381,6 +381,13 @@ pub(crate) fn reconcile_serve_launch_under_transaction(
     v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)
 }
 
+/// Whether reconciliation accepts this `serve.launch` schema and shape.
+pub(crate) fn validate_serve_launch_schema(
+    record: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    v044_reconcile_serve_passphrase_policy::validate_record_schema(record)
+}
+
 pub(crate) fn run_migrations_under_exclusion(
     reporter: Option<progress::Reporter>,
     announce: bool,
