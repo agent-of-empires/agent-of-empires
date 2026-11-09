@@ -1873,8 +1873,9 @@ export async function removeServerQueuedPrompt(sessionId: string, promptId: stri
   return fetchOk(queuePath(sessionId, promptId), { method: "DELETE" });
 }
 
-/** Drop the whole server queue for a session (DELETE /queue). */
-export async function clearServerQueue(sessionId: string): Promise<boolean> {
+/** Atomically remove captured ids, or the whole server queue when ids are omitted. */
+export async function clearServerQueue(sessionId: string, ids?: string[]): Promise<boolean> {
+  if (ids) return fetchOk(queuePath(sessionId), jsonInit("DELETE", { ids }));
   return fetchOk(queuePath(sessionId), { method: "DELETE" });
 }
 

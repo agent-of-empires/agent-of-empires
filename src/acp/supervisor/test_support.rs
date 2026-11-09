@@ -135,13 +135,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         cmds
     }
 
+    pub(crate) async fn test_hold_workers(&self) -> impl Drop + '_ {
+        self.workers.lock().await
+    }
+
     pub(crate) async fn test_insert_worker_queued_prompt(
         &self,
         session_id: &str,
-    ) -> mpsc::UnboundedReceiver<(
-        Vec<agent_client_protocol::v1::schema::ContentBlock>,
-        Option<tokio::sync::oneshot::Sender<Option<crate::acp::acp_client::QueuedPromptPermit>>>,
-    )> {
+    ) -> mpsc::UnboundedReceiver<crate::acp::acp_client::QueuedPromptCommandForTest> {
         let (client, received) =
             AcpClient::fake_for_test_queued_prompt(AcpSessionId(session_id.into()));
         self.test_install_handle(session_id, client, WorkerKind::Stdio, None)

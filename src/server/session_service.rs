@@ -1014,17 +1014,22 @@ impl SessionService {
                 .map_err(SendTurnError::Send)?;
         }
         // Persist the admitted turn before forwarding it to the agent.
-        let published = self
-            .acp_supervisor
-            .publish_user_prompt_with_attachments(
-                id,
-                text.to_string(),
-                attachments,
-                prompt_id,
-                synthesized,
-                caller.message_origin().map(str::to_string),
-            )
-            .await;
+        let publish = self.acp_supervisor.publish_user_prompt_with_attachments(
+            id,
+            text.to_string(),
+            attachments,
+            prompt_id,
+            synthesized,
+            caller.message_origin().map(str::to_string),
+        );
+        let published = if let Some(permit) = admission.as_mut() {
+            permit
+                .publish(publish)
+                .await
+                .map_err(|error| SendTurnError::Send(error.into()))?
+        } else {
+            publish.await
+        };
         if admission.is_some() && published.seq.is_none() {
             return Err(SendTurnError::Send(
                 crate::acp::acp_client::AcpError::Protocol(
@@ -1607,22 +1612,36 @@ impl SessionService {
         taken
     }
 
-    /// Drop every queued prompt for a session, plus every attachment blob
-    /// buffered for those prompts.
+    /// Drop the captured queue rows, or the whole queue when no ids are given,
+    /// with their buffered attachments under one delivery exclusion.
     ///
     /// Serialized against delivery like the other queue mutations: clearing
     /// inside the drain's snapshot-to-send window empties the durable rows
     /// while the batch the drain already copied still goes to the agent, so
     /// the user watches the queue empty and then sees it sent anyway.
-    pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
+    pub(crate) async fn clear_queued_prompts(
+        self: &Arc<Self>,
+        id: &str,
+        captured_ids: Option<Vec<String>>,
+    ) {
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
             return;
         };
+        let captured_ids =
+            captured_ids.map(|ids| ids.into_iter().collect::<std::collections::HashSet<_>>());
         let cleared_ids = self
             .mutate_instance_persisted(id, move |inst| {
-                let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
-                inst.queued_prompts.clear();
-                ids
+                let mut cleared = Vec::new();
+                inst.queued_prompts.retain(|row| {
+                    let remove = captured_ids
+                        .as_ref()
+                        .is_none_or(|ids| ids.contains(&row.id));
+                    if remove {
+                        cleared.push(row.id.clone());
+                    }
+                    !remove
+                });
+                cleared
             })
             .await
             .unwrap_or_default();
@@ -3171,7 +3190,8 @@ mod tests {
             )
             .await
             .unwrap();
-        for accepted in [false, true] {
+        for outcome in ["refused", "revoked", "accepted"] {
+            let accepted = outcome == "accepted";
             let delivery = tokio::spawn({
                 let service = service.clone();
                 async move { service.drain_queued_prompts_once(id).await }
@@ -3200,6 +3220,30 @@ mod tests {
                     .send(Some(crate::acp::acp_client::QueuedPromptPermit(commit)))
                     .unwrap();
                 committed.await.unwrap();
+            } else if outcome == "revoked" {
+                let workers = service.acp_supervisor.test_hold_workers().await;
+                let (commit, revoked) = tokio::sync::oneshot::channel();
+                reply
+                    .send(Some(crate::acp::acp_client::QueuedPromptPermit(commit)))
+                    .unwrap();
+                drop(revoked);
+                tokio::time::timeout(Duration::from_secs(5), delivery)
+                    .await
+                    .expect("revocation must cancel publication while its worker lock is held")
+                    .unwrap();
+                drop(workers);
+                assert_eq!(service.queued_prompts_snapshot(id).await.len(), 1);
+                assert!(!state.acp_event_store.replay_from(id, 2).iter().any(|(_, event)| {
+                    matches!(event, Event::UserPromptSent { text, .. } if text == "inspect this screenshot")
+                }));
+                assert_eq!(
+                    state
+                        .acp_event_store
+                        .load_pending_attachments_for_ref(id, "queued")[0]
+                        .data,
+                    blob.data,
+                );
+                continue;
             } else {
                 reply.send(None).unwrap();
             }
@@ -3661,7 +3705,7 @@ mod tests {
         assert_eq!(claims.try_recv().expect("holder claim"), "sess-mut");
         let clear = {
             let service = Arc::clone(&service);
-            async move { service.clear_queued_prompts("sess-mut").await }
+            async move { service.clear_queued_prompts("sess-mut", None).await }
         };
         tokio::pin!(clear);
         assert!(
@@ -4572,7 +4616,7 @@ mod tests {
         let snap = service.queued_prompts_snapshot("sess-q").await;
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].text, "second edited");
-        service.clear_queued_prompts("sess-q").await;
+        service.clear_queued_prompts("sess-q", None).await;
         assert!(service.queued_prompts_snapshot("sess-q").await.is_empty());
 
         // A gone session is a None/no-op, never a panic.

@@ -726,7 +726,10 @@ describe("server queue", () => {
         if (method === "DELETE" && item && !serverQueue.delete(decodeURIComponent(item))) {
           return new Response("queued prompt not found", { status: 404 });
         }
-        if (method === "DELETE" && !item) serverQueue.clear();
+        if (method === "DELETE" && !item) {
+          if (body) for (const id of JSON.parse(body).ids as string[]) serverQueue.delete(id);
+          else serverQueue.clear();
+        }
         return new Response(null, { status: 204 });
       }
       if (url.includes("/acp/prompt") && workerDown) return new Response("worker_not_ready", { status: 503 });
@@ -765,50 +768,60 @@ describe("server queue", () => {
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
   });
 
-  it("refreshes a compaction-deferred row after the server drains it without ending the turn", async () => {
-    vi.useFakeTimers();
-    const sid = "sess-compaction-drain";
-    serverQueue.set("deferred", row("deferred", "first explain the archive plan", { resume_after_compaction: true }));
-    const { result, unmount } = await openSession(sid);
-    lastSocket().message({
-      session_id: sid,
-      seq: 1,
-      event: { PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true } },
-    });
-    lastSocket().message({ session_id: sid, seq: 2, event: { UserPromptSent: { text: "original task" } } });
-    lastSocket().message({ kind: "reduced_state", seq: 3, state: reduced({ turn_active: true, compacting: true }) });
-    await flushAsync();
-    expect(result.current.state.compacting).toBe(true);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    const postsBefore = posts("/acp/prompt").length;
+  it.each([false, true])(
+    "refreshes a deferred row after daemon retirement (ordinary head=%s)",
+    async (ordinaryHead) => {
+      vi.useFakeTimers();
+      const sid = `sess-compaction-drain-${ordinaryHead}`;
+      let count = 1;
+      if (ordinaryHead) {
+        serverQueue.set("ordinary", row("ordinary", "wait until the next turn"));
+        count = 2;
+      }
+      serverQueue.set("deferred", row("deferred", "first explain the archive plan", { resume_after_compaction: true }));
+      const { result, unmount } = await openSession(sid);
+      lastSocket().message({
+        session_id: sid,
+        seq: 1,
+        event: { PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true } },
+      });
+      lastSocket().message({ session_id: sid, seq: 2, event: { UserPromptSent: { text: "original task" } } });
+      lastSocket().message({ kind: "reduced_state", seq: 3, state: reduced({ turn_active: true, compacting: true }) });
+      await flushAsync();
+      expect(result.current.state.compacting).toBe(true);
+      expect(result.current.state.queuedPrompts).toHaveLength(count);
+      const postsBefore = posts("/acp/prompt").length;
 
-    lastSocket().message({ kind: "reduced_state", seq: 4, state: reduced({ turn_active: true, compacting: false }) });
-    await flushAsync();
-    expect(result.current.state.turnActive).toBe(true);
-    expect(result.current.state.compacting).toBe(false);
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    queueReadFails = true;
-    const readsBeforeFailure = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
-    await act(() => vi.advanceTimersByTimeAsync(1000));
-    await flushAsync();
-    expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(
-      readsBeforeFailure + 1,
-    );
-    expect(result.current.state.queuedPrompts).toHaveLength(1);
-    queueReadFails = false;
-    serverQueue.delete("deferred");
-    await act(() => vi.advanceTimersByTimeAsync(1000));
-    await flushAsync();
-    expect(result.current.state.queuedPrompts).toEqual([]);
-    expect(result.current.state.turnActive).toBe(true);
-    expect(posts("/acp/prompt")).toHaveLength(postsBefore);
-    expect(posts("/queue")).toHaveLength(0);
-    const reads = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
-    await act(() => vi.advanceTimersByTimeAsync(5000));
-    await flushAsync();
-    expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(reads);
-    unmount();
-  });
+      lastSocket().message({ kind: "reduced_state", seq: 4, state: reduced({ turn_active: true, compacting: false }) });
+      await flushAsync();
+      expect(result.current.state.turnActive).toBe(true);
+      expect(result.current.state.compacting).toBe(false);
+      expect(result.current.state.queuedPrompts).toHaveLength(count);
+      // Another tab removes the ordinary head without a lifecycle event.
+      serverQueue.delete("ordinary");
+      queueReadFails = true;
+      const readsBeforeFailure = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+      await flushAsync();
+      expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(
+        readsBeforeFailure + 1,
+      );
+      expect(result.current.state.queuedPrompts).toHaveLength(count);
+      queueReadFails = false;
+      serverQueue.delete("deferred");
+      await act(() => vi.advanceTimersByTimeAsync(1000));
+      await flushAsync();
+      expect(result.current.state.queuedPrompts).toEqual([]);
+      expect(result.current.state.turnActive).toBe(true);
+      expect(posts("/acp/prompt")).toHaveLength(postsBefore);
+      expect(posts("/queue")).toHaveLength(0);
+      const reads = calls.filter((call) => call.method === "GET" && call.url.includes("/queue")).length;
+      await act(() => vi.advanceTimersByTimeAsync(5000));
+      await flushAsync();
+      expect(calls.filter((call) => call.method === "GET" && call.url.includes("/queue"))).toHaveLength(reads);
+      unmount();
+    },
+  );
 
   it.each([
     ["edit", false],
@@ -880,6 +893,91 @@ describe("server queue", () => {
       timeout: 2000,
     });
     unmount();
+  });
+
+  it("clears only captured rows while a concurrent enqueue becomes visible", async () => {
+    const sid = "sess-clear-concurrent-enqueue";
+    serverQueue.set("old", row("old", "clear this row"));
+    serverQueue.set("old-next", row("old-next", "clear this one atomically too"));
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = false;
+    let reads = 0;
+    calls = installAcpFakes(async ({ url, method, body }) => {
+      if (!url.includes("/queue")) return undefined;
+      if (method === "GET") {
+        reads += 1;
+        return json([...serverQueue.values()]);
+      }
+      if (method === "DELETE") {
+        started = true;
+        await pending;
+        for (const id of JSON.parse(body!).ids as string[]) serverQueue.delete(id);
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    const hook = await openSession(sid);
+    expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["old", "old-next"]);
+    act(() => hook.result.current.clearQueue());
+    await waitFor(() => expect(started).toBe(true));
+    serverQueue.set("new", row("new", "keep this concurrent row"));
+    const before = reads;
+    lastSocket().message({ session_id: sid, seq: 1, event: { UserPromptSent: { text: "active" } } });
+    await waitFor(() => expect(reads).toBeGreaterThan(before));
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["new"]));
+    await act(async () => release());
+    await waitFor(() => expect(serverQueue.has("old")).toBe(false));
+    expect(serverQueue.has("new")).toBe(true);
+    await waitFor(() => expect(hook.result.current.state.queuedPrompts.map((entry) => entry.id)).toEqual(["new"]));
+    const deletes = calls.filter((call) => call.method === "DELETE");
+    expect(deletes.map((call) => call.url)).toEqual([expect.stringMatching(/\/queue$/)]);
+    expect(JSON.parse(deletes[0]!.body!)).toEqual({ ids: ["old", "old-next"] });
+    expect(serverQueue.has("old-next")).toBe(false);
+    hook.unmount();
+  });
+
+  it("waits for a captured pending enqueue before clearing it across remounts", async () => {
+    const sid = "sess-clear-pending-enqueue";
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let enqueuing = false;
+    let queuedId = "";
+    calls = installAcpFakes(async ({ url, method, body }) => {
+      if (url.includes("/acp/prompt")) return new Response("worker_not_ready", { status: 503 });
+      if (!url.includes("/queue")) return undefined;
+      if (method === "GET") return json([...serverQueue.values()]);
+      if (method === "POST") {
+        const prompt = JSON.parse(body!) as { id: string; text: string };
+        queuedId = prompt.id;
+        enqueuing = true;
+        await pending;
+        serverQueue.set(prompt.id, row(prompt.id, prompt.text));
+        return json(serverQueue.get(prompt.id));
+      }
+      if (method === "DELETE") {
+        for (const id of JSON.parse(body!).ids as string[]) serverQueue.delete(id);
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    const first = await openSession(sid);
+    await act(() => first.result.current.sendPrompt("cancel this pending enqueue"));
+    await waitFor(() => expect(enqueuing).toBe(true));
+    expect(first.result.current.state.queuedPrompts).toMatchObject([{ id: queuedId, pending: true }]);
+    act(() => first.result.current.clearQueue());
+    first.unmount();
+    const second = await openSession(sid);
+    await act(async () => release());
+    await waitFor(() => expect(calls.some((call) => call.method === "DELETE")).toBe(true));
+    await flushAsync();
+    expect(serverQueue.has(queuedId)).toBe(false);
+    expect(second.result.current.state.queuedPrompts).toEqual([]);
+    second.unmount();
   });
 
   it("does not let an old session mutation invalidate the new session's queue read", async () => {
@@ -1038,9 +1136,10 @@ describe("server queue", () => {
       "DELETE",
     ]);
     expect(result.current.state.queuedPrompts).toEqual([]);
+    const deletes = calls.filter((call) => call.method === "DELETE").length;
     act(() => result.current.clearQueue());
     await flushAsync();
-    expect(calls.some((c) => c.method === "DELETE" && /\/queue$/.test(c.url.split("?")[0]!))).toBe(true);
+    expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(deletes);
   });
 
   it("hydrates from the server snapshot on connect", async () => {
@@ -1057,13 +1156,14 @@ describe("server queue", () => {
       queuedPrompts: [
         { id: "drained", text: "already delivered", queuedAt, pending: false },
         { id: "unsent", text: "never reached server", queuedAt, pending: true },
+        { id: "unsent-next", text: "also never reached server", queuedAt, pending: true },
       ],
     };
     localStorage.setItem(`${STORAGE_KEY_PREFIX}sess-cached`, JSON.stringify({ savedAt: Date.now(), state }));
     const { result } = await openSession("sess-cached");
-    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["unsent"]);
+    expect(posts("/queue").map((c) => JSON.parse(c.body!).id)).toEqual(["unsent", "unsent-next"]);
     expect(serverQueue.has("drained")).toBe(false);
-    expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["unsent"]);
+    expect(result.current.state.queuedPrompts.map((q) => q.id)).toEqual(["unsent", "unsent-next"]);
   });
 
   describe("sendQueuedNow", () => {

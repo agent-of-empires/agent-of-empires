@@ -29,6 +29,7 @@ import {
   reconcileQueueSnapshot,
   serverQueueRevision,
   subscribeServerQueue,
+  trackServerQueueEnqueue,
   type QueueMutation,
 } from "./acpSession/serverQueueSync";
 import { useLatestRef } from "./useLatestRef";
@@ -253,7 +254,9 @@ export function useAcpSession(
       dispatch({ kind: "enqueue_prompt", id, text, attachments });
       reportAcpInteraction("prompt_queued");
       void (async () => {
-        const row = await enqueueServerPrompt(sessionId, { id, text, attachments });
+        const row = await trackServerQueueEnqueue(sessionId, id, () =>
+          enqueueServerPrompt(sessionId, { id, text, attachments }),
+        );
         if (row) confirmServerQueue(sessionId);
         dispatch(
           row
@@ -346,7 +349,7 @@ export function useAcpSession(
       if (cancelled || (rows && !reconciled)) return;
       if (reconciled) dispatch({ kind: "hydrate_server_queue", rows: reconciled });
       let deferred = hasQueuedPrompts;
-      if (rows) deferred = !!rows[0]?.resume_after_compaction;
+      if (rows) deferred = rows.some((row) => row.resume_after_compaction);
       // A steering delivery need not change turnActive. Wait for the daemon's retirement.
       let delay = 1000;
       if (!rows) {
@@ -361,11 +364,13 @@ export function useAcpSession(
         for (const q of queuedPromptsRef.current) {
           if (cancelled) return;
           if (!q.pending) continue;
-          await enqueueServerPrompt(sessionId, {
-            id: q.id,
-            text: q.text,
-            attachments: q.attachments,
-          });
+          await trackServerQueueEnqueue(sessionId, q.id, () =>
+            enqueueServerPrompt(sessionId, {
+              id: q.id,
+              text: q.text,
+              attachments: q.attachments,
+            }),
+          );
         }
       }
       if (!cancelled) await refresh();
@@ -396,7 +401,7 @@ export function useAcpSession(
   const clearQueue = useCallback(() => {
     const ids = queuedPromptsRef.current.map((row) => row.id);
     dispatch({ kind: "clear_queue" });
-    if (sessionId) void mutateQueue({ kind: "clear", ids }, () => clearServerQueue(sessionId));
+    if (sessionId && ids.length > 0) void mutateQueue({ kind: "clear", ids }, () => clearServerQueue(sessionId, ids));
   }, [sessionId, mutateQueue, queuedPromptsRef]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.

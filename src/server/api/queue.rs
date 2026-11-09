@@ -297,10 +297,16 @@ pub async fn queue_remove(
     }
 }
 
-/// `DELETE /api/sessions/{id}/queue`: drop every queued prompt.
+#[derive(Debug, Deserialize)]
+pub struct ClearRequest {
+    pub ids: Vec<String>,
+}
+
+/// `DELETE /api/sessions/{id}/queue`: atomically drop captured ids, or all rows without a body.
 pub async fn queue_clear(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: Result<Option<Json<ClearRequest>>, JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
@@ -308,7 +314,11 @@ pub async fn queue_clear(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    state.session_service.clear_queued_prompts(&id).await;
+    let ids = match body {
+        Ok(body) => body.map(|Json(request)| request.ids),
+        Err(rejection) => return rejection.into_response(),
+    };
+    state.session_service.clear_queued_prompts(&id, ids).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -369,6 +379,102 @@ mod tests {
             .await
             .expect("the enqueue lands once the delivery releases the session");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn captured_queue_clear_is_atomic_and_preserves_uncaptured_rows_and_bytes() {
+        use crate::acp::event_store::AttachmentBlob;
+        use crate::daemon::PromptAttachmentKind;
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("queue-clear-captured", "/tmp/aoe-queue-clear-captured");
+        inst.id = "queue-clear-captured".into();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        for key in ["old", "old-next", "concurrent"] {
+            let blob = AttachmentBlob {
+                id: key.into(),
+                kind: PromptAttachmentKind::Image,
+                mime_type: "image/png".into(),
+                name: None,
+                data: vec![1, 2, 3],
+            };
+            buffer_and_enqueue(
+                &state,
+                &id,
+                key,
+                key.into(),
+                &[blob],
+                QueuedPromptOptions::default(),
+            )
+            .await
+            .unwrap();
+        }
+        let delivering = state.session_service.prompt_submission(&id).await;
+        let mut claims = state.session_service.watch_submission_claims();
+        let clear = queue_clear(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Some(Json(ClearRequest {
+                ids: vec!["old".into(), "old-next".into()],
+            }))),
+        );
+        tokio::pin!(clear);
+        assert!(futures_util::poll!(&mut clear).is_pending());
+        assert_eq!(claims.try_recv().unwrap(), id);
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            3
+        );
+        drop(delivering);
+        let response = tokio::time::timeout(Duration::from_secs(5), clear)
+            .await
+            .unwrap()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let rows = state.session_service.queued_prompts_snapshot(&id).await;
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["concurrent"]
+        );
+        for key in ["old", "old-next"] {
+            assert!(state
+                .acp_event_store
+                .load_pending_attachments_for_ref(&id, key)
+                .is_empty());
+        }
+        assert_eq!(
+            state
+                .acp_event_store
+                .load_pending_attachments_for_ref(&id, "concurrent")[0]
+                .data,
+            vec![1, 2, 3]
+        );
+        queue_clear(
+            State(state.clone()),
+            Path(id.clone()),
+            Ok(Some(Json(ClearRequest { ids: Vec::new() }))),
+        )
+        .await;
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            1
+        );
+        queue_clear(State(state.clone()), Path(id.clone()), Ok(None)).await;
+        assert!(state
+            .session_service
+            .queued_prompts_snapshot(&id)
+            .await
+            .is_empty());
     }
 
     /// #4092: the resume admission orders queue rows against the rate-limit

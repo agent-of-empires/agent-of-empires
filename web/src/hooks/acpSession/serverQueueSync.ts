@@ -8,6 +8,7 @@ export type QueueMutation =
 type QueueSync = {
   revision: number;
   pending: Map<symbol, QueueMutation>;
+  enqueues: Map<string, Promise<ServerQueuedPrompt | null>>;
   latestEdit: Map<string, symbol>;
   listeners: Set<() => void>;
 };
@@ -17,7 +18,7 @@ const sessions = new Map<string, QueueSync>();
 function sessionQueue(id: string): QueueSync {
   let sync = sessions.get(id);
   if (!sync) {
-    sync = { revision: 0, pending: new Map(), latestEdit: new Map(), listeners: new Set() };
+    sync = { revision: 0, pending: new Map(), enqueues: new Map(), latestEdit: new Map(), listeners: new Set() };
     sessions.set(id, sync);
   }
   return sync;
@@ -34,7 +35,7 @@ export function subscribeServerQueue(id: string, listener: () => void): () => vo
   sync.listeners.add(listener);
   return () => {
     sync.listeners.delete(listener);
-    if (sync.listeners.size === 0 && sync.pending.size === 0) sessions.delete(id);
+    if (sync.listeners.size === 0 && sync.pending.size === 0 && sync.enqueues.size === 0) sessions.delete(id);
   };
 }
 
@@ -70,6 +71,25 @@ export function reconcileQueueSnapshot(
   return rows;
 }
 
+/** Retain enqueue ordering across remounts so a later removal cannot run ahead of its POST. */
+export async function trackServerQueueEnqueue(
+  id: string,
+  rowId: string,
+  request: () => Promise<ServerQueuedPrompt | null>,
+): Promise<ServerQueuedPrompt | null> {
+  const sync = sessionQueue(id);
+  const previous = sync.enqueues.get(rowId);
+  if (previous) return previous;
+  const pending = request();
+  sync.enqueues.set(rowId, pending);
+  try {
+    return await pending;
+  } finally {
+    if (sync.enqueues.get(rowId) === pending) sync.enqueues.delete(rowId);
+    if (sync.listeners.size === 0 && sync.pending.size === 0 && sync.enqueues.size === 0) sessions.delete(id);
+  }
+}
+
 /** Reserve an optimistic overlay until the request settles, even across unmounts. */
 export async function mutateServerQueue<T>(id: string, mutation: QueueMutation, request: () => Promise<T>): Promise<T> {
   const sync = sessionQueue(id);
@@ -77,12 +97,17 @@ export async function mutateServerQueue<T>(id: string, mutation: QueueMutation, 
   sync.pending.set(token, mutation);
   if (mutation.kind === "edit") sync.latestEdit.set(mutation.id, token);
   changed(sync);
+  let ids: string[];
+  if (mutation.kind === "clear") ids = mutation.ids;
+  else ids = [mutation.id];
+  const enqueues = ids.map((rowId) => sync.enqueues.get(rowId)).filter((pending) => pending !== undefined);
   try {
+    if (enqueues.length > 0) await Promise.allSettled(enqueues);
     return await request();
   } finally {
     sync.pending.delete(token);
     if (mutation.kind === "edit" && sync.latestEdit.get(mutation.id) === token) sync.latestEdit.delete(mutation.id);
     changed(sync);
-    if (sync.listeners.size === 0 && sync.pending.size === 0) sessions.delete(id);
+    if (sync.listeners.size === 0 && sync.pending.size === 0 && sync.enqueues.size === 0) sessions.delete(id);
   }
 }

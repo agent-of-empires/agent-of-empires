@@ -406,7 +406,11 @@ async fn spawn_fake_connection(
 
 async fn steering_connection(
     adopted: bool,
-) -> (FakeConnection, mpsc::UnboundedReceiver<serde_json::Value>) {
+) -> (
+    FakeConnection,
+    mpsc::UnboundedReceiver<serde_json::Value>,
+    mpsc::UnboundedReceiver<()>,
+) {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let agent_write = Arc::new(Mutex::new(agent_write));
@@ -454,7 +458,11 @@ async fn steering_connection(
         shutdown: tokio_util::sync::CancellationToken::new(),
     };
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
-    let connection = tokio::spawn(run_connection_task(transport, params));
+    let (result_probe, receipts) = mpsc::unbounded_channel();
+    let connection = tokio::spawn(
+        super::prompt::STEER_RESULT_PROBE
+            .scope(result_probe, run_connection_task(transport, params)),
+    );
     let reply_write = agent_write.clone();
     let (wire, requests) = mpsc::unbounded_channel();
     let agent = tokio::spawn(async move {
@@ -492,13 +500,14 @@ async fn steering_connection(
             _cwd: temp,
         },
         requests,
+        receipts,
     )
 }
 
 #[tokio::test]
 async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
     for outcome in ["promptRequired", "injected", "unknown", "noReply"] {
-        let (mut fake, mut requests) = steering_connection(false).await;
+        let (mut fake, mut requests, _) = steering_connection(false).await;
         let original = vec![ContentBlock::Text(TextContent::new("original"))];
         fake.cmd_tx.send(ClientCmd::Prompt(original)).await.unwrap();
         let first = tokio::time::timeout(Duration::from_secs(5), requests.recv())
@@ -569,6 +578,224 @@ async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
         } else {
             assert_eq!(next["params"]["prompt"][0]["text"], "later");
         }
+        let mut uncertainty = None;
+        while let Ok(event) = fake.event_rx.try_recv() {
+            if let Event::SessionNotice {
+                title,
+                description,
+                severity,
+                ..
+            } = event
+            {
+                if title == "Steering delivery is uncertain" {
+                    uncertainty = Some((severity, description.unwrap()));
+                }
+            }
+        }
+        if outcome == "unknown" || outcome == "noReply" {
+            let (severity, description) =
+                uncertainty.expect("unknown delivery needs a user-visible notice");
+            assert_eq!(severity, "error", "uncertainty must not auto-dismiss");
+            assert!(description.contains("deferred"));
+            assert!(description.contains("retrying manually"));
+        } else {
+            assert!(uncertainty.is_none());
+        }
+        fake.agent.abort();
+        fake.connection.abort();
+        let _ = tokio::join!(fake.agent, fake.connection);
+    }
+}
+
+#[tokio::test]
+async fn queued_fallback_preserves_order_and_cancellation_before_the_original_turn_ends() {
+    for cancelling in [false, true] {
+        let (mut fake, mut requests, mut receipts) = steering_connection(false).await;
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("original"),
+            )]))
+            .await
+            .unwrap();
+        let original = requests.recv().await.unwrap();
+        let blocks = vec![
+            ContentBlock::Text(TextContent::new("first fallback")),
+            ContentBlock::Image(agent_client_protocol::v1::schema::ImageContent::new(
+                "AQID",
+                "image/png",
+            )),
+        ];
+        let (ready, reserved) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::QueuedPrompt { blocks, ready })
+            .await
+            .unwrap();
+        reserved.await.unwrap().unwrap().commit().unwrap();
+        let steer = requests.recv().await.unwrap();
+        assert_eq!(steer["method"], "_session/steering");
+        write_line(
+        &fake.agent_write,
+        &serde_json::json!({"jsonrpc":"2.0","id":steer["id"],"result":{"outcome":"promptRequired"}}).to_string(),
+    )
+    .await;
+        tokio::time::timeout(Duration::from_secs(5), receipts.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (ready, reserved) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::QueuedPrompt {
+                blocks: vec![ContentBlock::Text(TextContent::new("later queued"))],
+                ready,
+            })
+            .await
+            .unwrap();
+        assert!(
+            reserved.await.unwrap().is_none(),
+            "earlier fallback retains priority"
+        );
+        if cancelling {
+            fake.cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+            let cancel = requests.recv().await.unwrap();
+            assert_eq!(cancel["method"], "session/cancel");
+        }
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("later direct"),
+            )]))
+            .await
+            .unwrap();
+        if cancelling {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Event::PromptRejected { text, reason } =
+                        fake.event_rx.recv().await.unwrap()
+                    {
+                        assert_eq!(text, "later direct");
+                        assert_eq!(reason, "agent_busy");
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("a new prompt during cancellation must retain its retry path");
+            fake.agent.abort();
+            fake.connection.abort();
+            let _ = tokio::join!(fake.agent, fake.connection);
+            continue;
+        }
+        let (done, flushed) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        flushed.await.unwrap();
+        write_line(
+        &fake.agent_write,
+        &serde_json::json!({"jsonrpc":"2.0","id":original["id"],"result":{"stopReason":"end_turn"}}).to_string(),
+    )
+    .await;
+        let fallback = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fallback["method"], "session/prompt");
+        assert_eq!(fallback["params"]["prompt"], steer["params"]["prompt"]);
+        write_line(
+        &fake.agent_write,
+        &serde_json::json!({"jsonrpc":"2.0","id":fallback["id"],"result":{"stopReason":"end_turn"}}).to_string(),
+    )
+    .await;
+        let later = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later["method"], "session/prompt");
+        assert_eq!(later["params"]["prompt"][0]["text"], "later direct");
+        fake.agent.abort();
+        fake.connection.abort();
+        let _ = tokio::join!(fake.agent, fake.connection);
+    }
+}
+
+#[tokio::test]
+async fn queued_publication_timeout_releases_pending_input_on_either_side_of_turn_end() {
+    for end_before_expiry in [false, true] {
+        let (mut fake, mut requests, _) = steering_connection(false).await;
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("original"),
+            )]))
+            .await
+            .unwrap();
+        let original = requests.recv().await.unwrap();
+        let (ready, reserved) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::QueuedPrompt {
+                blocks: vec![ContentBlock::Text(TextContent::new("unpublished"))],
+                ready,
+            })
+            .await
+            .unwrap();
+        let mut permit = reserved.await.unwrap().unwrap();
+        let (started, publishing) = oneshot::channel();
+        let publication = tokio::spawn(async move {
+            permit
+                .publish(async {
+                    let _ = started.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+        });
+        publishing.await.unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("later"),
+            )]))
+            .await
+            .unwrap();
+        let (done, flushed) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        flushed.await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "unpublished content must not reach the agent"
+        );
+        if end_before_expiry {
+            write_line(
+                &fake.agent_write,
+                &serde_json::json!({"jsonrpc":"2.0","id":original["id"],"result":{"stopReason":"end_turn"}}).to_string(),
+            )
+            .await;
+            while !matches!(fake.event_rx.recv().await.unwrap(), Event::Stopped { .. }) {}
+        }
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+        assert!(publication.await.unwrap().is_err());
+        let (done, flushed) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        flushed.await.unwrap();
+        if !end_before_expiry {
+            write_line(
+                &fake.agent_write,
+                &serde_json::json!({"jsonrpc":"2.0","id":original["id"],"result":{"stopReason":"end_turn"}}).to_string(),
+            )
+            .await;
+        }
+        let later = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(later["method"], "session/prompt");
+        assert_eq!(later["params"]["prompt"][0]["text"], "later");
         fake.agent.abort();
         fake.connection.abort();
         let _ = tokio::join!(fake.agent, fake.connection);
@@ -577,7 +804,7 @@ async fn queued_steer_survives_turn_end_and_preserves_fallback_order() {
 
 #[tokio::test]
 async fn queued_reservation_keeps_cancellation_responsive_before_publication() {
-    let (mut fake, mut requests) = steering_connection(false).await;
+    let (mut fake, mut requests, _) = steering_connection(false).await;
     fake.cmd_tx
         .send(ClientCmd::Prompt(vec![ContentBlock::Text(
             TextContent::new("original"),
@@ -638,7 +865,7 @@ async fn queued_reservation_keeps_cancellation_responsive_before_publication() {
 
 #[tokio::test]
 async fn queued_prompt_waits_for_an_adopted_turn_to_be_idle() {
-    let (fake, _) = steering_connection(true).await;
+    let (fake, _, _) = steering_connection(true).await;
     let (ready, reserved) = oneshot::channel();
     fake.cmd_tx
         .send(ClientCmd::QueuedPrompt {

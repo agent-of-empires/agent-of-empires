@@ -78,6 +78,12 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::Instrument;
 
+#[cfg(test)]
+pub(crate) type QueuedPromptCommandForTest = (
+    Vec<ContentBlock>,
+    Option<oneshot::Sender<Option<QueuedPromptPermit>>>,
+);
+
 use self::commands::{ClientCmd, ConnectMode};
 use self::connection::{run_connection_task, ConnectionParams, RunnerLink};
 use self::control::{connect_runner_control_v3, ShutdownControlOnDrop};
@@ -445,13 +451,7 @@ impl AcpClient {
     #[cfg(test)]
     pub(crate) fn fake_for_test_queued_prompt(
         session_id: AcpSessionId,
-    ) -> (
-        Self,
-        mpsc::UnboundedReceiver<(
-            Vec<ContentBlock>,
-            Option<oneshot::Sender<Option<QueuedPromptPermit>>>,
-        )>,
-    ) {
+    ) -> (Self, mpsc::UnboundedReceiver<QueuedPromptCommandForTest>) {
         let (sent, received) = mpsc::unbounded_channel();
         let (client, _) = Self::fake_with_consumer(session_id, move |cmd| match cmd {
             ClientCmd::QueuedPrompt { blocks, ready } => {

@@ -6,6 +6,7 @@ import {
   reconcileQueueSnapshot,
   serverQueueRevision,
   subscribeServerQueue,
+  trackServerQueueEnqueue,
 } from "./serverQueueSync";
 
 const row = (id: string, text = id): ServerQueuedPrompt => ({ id, text, seq: 1, created_at: "t" });
@@ -43,6 +44,28 @@ describe("shared queue reconciliation", () => {
     first.release();
     await a;
     unsubscribe();
+  });
+
+  it("shares an in-flight enqueue across remounts until captured removal settles", async () => {
+    const id = "enqueue-remount-clear";
+    const enqueue = held();
+    const events: string[] = [];
+    const pending = trackServerQueueEnqueue(id, "row", async () => {
+      events.push("enqueue");
+      await enqueue.promise;
+      return row("row");
+    });
+    const repeated = trackServerQueueEnqueue(id, "row", async () => {
+      events.push("duplicate enqueue");
+      return row("row");
+    });
+    const clear = mutateServerQueue(id, { kind: "clear", ids: ["row"] }, async () => {
+      events.push("clear");
+    });
+    expect(events).toEqual(["enqueue"]);
+    enqueue.release();
+    await Promise.all([pending, repeated, clear]);
+    expect(events).toEqual(["enqueue", "clear"]);
   });
 
   it("invalidates reads started before an enqueue confirmation", () => {

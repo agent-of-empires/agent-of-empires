@@ -68,8 +68,8 @@ pub(super) struct Session {
 }
 
 impl Session {
-    pub(super) fn receive_queue_commit(&mut self, result: Result<(), oneshot::error::RecvError>) {
-        if result.is_ok() {
+    pub(super) fn receive_queue_commit(&mut self, committed: bool) {
+        if committed {
             self.queued_reservation
                 .as_mut()
                 .expect("reservation exists")
@@ -153,7 +153,7 @@ impl Session {
                 Some(blocks) => Some(ClientCmd::Prompt(blocks)),
                 None => tokio::select! {
                     cmd = self.cmd_rx.recv() => cmd,
-                    committed = async { (&mut self.queued_reservation.as_mut().expect("guarded").commit).await },
+                    committed = async { self.queued_reservation.as_mut().expect("guarded").wait_for_commit().await },
                         if self.queued_reservation.as_ref().is_some_and(|reserved| !reserved.committed) => {
                         self.receive_queue_commit(committed);
                         continue;

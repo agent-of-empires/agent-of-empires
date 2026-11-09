@@ -3,6 +3,9 @@
 
 use agent_client_protocol::v1::schema::ContentBlock;
 use tokio::sync::oneshot;
+use tokio::time::Duration;
+
+const QUEUED_PROMPT_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
@@ -14,13 +17,33 @@ pub(crate) struct QueuedPromptPermit(pub(crate) oneshot::Sender<()>);
 
 impl QueuedPromptPermit {
     pub(crate) fn commit(self) -> Result<(), super::AcpError> {
-        self.0.send(()).map_err(|_| super::AcpError::AgentExited)
+        self.0.send(()).map_err(|_| {
+            super::AcpError::Protocol("queued prompt reservation expired or was cancelled".into())
+        })
+    }
+
+    pub(crate) async fn publish<T>(
+        &mut self,
+        publication: impl std::future::Future<Output = T>,
+    ) -> Result<T, super::AcpError> {
+        // The worker must not expire a reservation during a synchronous durable write.
+        tokio::select! {
+            biased;
+            _ = self.0.closed() => Err(super::AcpError::Protocol(
+                "queued prompt publication was cancelled".into(),
+            )),
+            result = tokio::time::timeout(QUEUED_PROMPT_PUBLICATION_TIMEOUT, publication) => {
+                result.map_err(|_| super::AcpError::Protocol(
+                    "queued prompt publication timed out".into(),
+                ))
+            }
+        }
     }
 }
 
 pub(super) struct QueuedPromptReservation {
     pub(super) blocks: Vec<ContentBlock>,
-    pub(super) commit: oneshot::Receiver<()>,
+    commit: oneshot::Receiver<()>,
     pub(super) committed: bool,
 }
 
@@ -37,16 +60,65 @@ impl QueuedPromptReservation {
             committed: false,
         })
     }
+
+    pub(super) async fn wait_for_commit(&mut self) -> bool {
+        (&mut self.commit).await.is_ok()
+    }
 }
 
 #[cfg(test)]
 pub(super) async fn reserve_queued_prompt(
     ready: oneshot::Sender<Option<QueuedPromptPermit>>,
 ) -> bool {
-    let Some(reservation) = QueuedPromptReservation::new(Vec::new(), ready) else {
+    let Some(mut reservation) = QueuedPromptReservation::new(Vec::new(), ready) else {
         return false;
     };
-    reservation.commit.await.is_ok()
+    reservation.wait_for_commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_publication_cannot_expire_during_a_durable_write() {
+        let (ready, reserved) = oneshot::channel();
+        let mut reservation = QueuedPromptReservation::new(Vec::new(), ready).unwrap();
+        let mut permit = reserved.await.unwrap().unwrap();
+        let (probe, observed_probe) = oneshot::channel();
+        let (polled, observed_poll) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                committed = reservation.wait_for_commit() => return committed,
+                _ = observed_probe => { let _ = polled.send(()); }
+            }
+            reservation.wait_for_commit().await
+        });
+        let (entered, entered_write) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        let publisher = tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                permit
+                    .publish(async {
+                        let _ = entered.send(());
+                        released.recv().expect("release synchronous publication");
+                    })
+                    .await?;
+                permit.commit()
+            })
+        });
+        entered_write.await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        probe.send(()).unwrap();
+        let worker_retained = observed_poll.await;
+        release.send(()).unwrap();
+        let published = publisher.await.unwrap();
+        worker_retained.expect("the worker must retain the publishing reservation");
+        published.unwrap();
+        assert!(worker.await.unwrap());
+    }
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.

@@ -6645,7 +6645,7 @@ async fn session_mutations_allocate_no_prompt_lock_for_an_unknown_id() {
             crate::server::session_service::EditQueuedOutcome::NotFound
         ));
         assert!(!service.remove_queued_prompt(&id, "q1".to_string()).await);
-        service.clear_queued_prompts(&id).await;
+        service.clear_queued_prompts(&id, None).await;
     }
 
     assert_eq!(

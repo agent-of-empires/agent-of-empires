@@ -52,6 +52,7 @@ pub(super) struct SelectProbe {
 tokio::task_local! {
     // Scoped to this connection future, not inherited by spawned tasks.
     pub(super) static SELECT_PROBE: std::cell::RefCell<SelectProbe>;
+    pub(super) static STEER_RESULT_PROBE: tokio::sync::mpsc::UnboundedSender<()>;
 }
 
 #[cfg(test)]
@@ -227,7 +228,7 @@ impl Session {
                     observe_select_win(true);
                     self.on_command(&mut turn, cmd).await?
                 }
-                committed = async { (&mut self.queued_reservation.as_mut().expect("guarded").commit).await },
+                committed = async { self.queued_reservation.as_mut().expect("guarded").wait_for_commit().await },
                     if self.queued_reservation.as_ref().is_some_and(|reserved| !reserved.committed) => {
                     self.receive_queue_commit(committed);
                     Flow::Continue
@@ -453,7 +454,9 @@ impl Session {
                     .await
             }
             Some(ClientCmd::Prompt(blocks)) => {
-                if self.queued_reservation.is_some() {
+                if !turn.flags.cancelling
+                    && (self.queued_reservation.is_some() || !self.pending_prompts.is_empty())
+                {
                     self.pending_prompts.push_back(blocks);
                 } else {
                     return Ok(self.on_follow_up(turn, blocks).await);
@@ -478,7 +481,8 @@ impl Session {
                     && !turn.flags.cancelling
                     && !compacting
                     && self.steer_fut.is_none()
-                    && self.queued_reservation.is_none();
+                    && self.queued_reservation.is_none()
+                    && self.pending_prompts.is_empty();
                 if !admitted {
                     let _ = ready.send(None);
                 } else {
@@ -650,14 +654,22 @@ impl Session {
                 fallback.append(&mut self.pending_prompts);
                 self.pending_prompts = fallback;
             }
-            Ok(outcome @ (SteerOutcome::StartedNewTurn | SteerOutcome::Unknown)) => {
-                // Consumed into a detached turn: resending would duplicate it.
-                warn!(
-                    target: "acp.protocol",
-                    session = %label,
-                    ?outcome,
-                    "_session/steering returned an outcome that consumed the message without an owning request; the between-prompt watchdog will close the detached turn"
-                );
+            Ok(SteerOutcome::StartedNewTurn) => {
+                warn!(target: "acp.protocol", session = %label, "steering started a detached turn; not resending");
+            }
+            Ok(SteerOutcome::Unknown) => {
+                warn!(target: "acp.protocol", session = %label, "steering delivery is uncertain; not resending");
+                self.shared
+                    .emit(Event::SessionNotice {
+                        severity: "error".into(),
+                        title: "Steering delivery is uncertain".into(),
+                        description: Some(format!(
+                            "The agent did not confirm this follow-up. It may have been received. Check the response before retrying manually; it was not resent automatically. The sent prompt and its attachments remain in the transcript.\n\n{}",
+                            first_text_block(&blocks),
+                        )),
+                        key: None,
+                    })
+                    .await;
             }
             Err(e) => {
                 warn!(
@@ -672,6 +684,8 @@ impl Session {
         if let Some(next) = self.steer_backlog.pop_front() {
             self.steer_or_backlog(next);
         }
+        #[cfg(test)]
+        let _ = STEER_RESULT_PROBE.try_with(|probe| probe.send(()));
     }
 
     async fn finish_turn(&mut self, mut turn: Turn, prompt_started_at_ms: i64) {
