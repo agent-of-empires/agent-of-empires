@@ -477,13 +477,15 @@ pub struct AcpConfig {
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue.
+    /// additional sessions queue. Applies across every profile on the Daemon
+    /// and takes effect when the Daemon starts.
     #[serde(default = "default_max_workers")]
     #[setting(
         label = "Max concurrent workers",
         widget = "number",
         min = 1,
         validate = "range:1",
+        global_only,
         advanced
     )]
     pub max_concurrent_workers: u32,

@@ -8,7 +8,7 @@ use tracing::info;
 use crate::session::{
     acquire_storage_flock, atomic_write,
     config::{
-        settings_schema::{merge_json, schema_ref},
+        settings_schema::{merge_json, schema_ref, FieldDescriptor},
         CONFIG_LOCK_FILENAME,
     },
     list_profile_names_in, Config,
@@ -24,13 +24,23 @@ fn read_config(path: &Path) -> Result<Option<toml::Table>> {
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
     };
-    content
-        .parse()
-        .map(Some)
-        .with_context(|| format!("Parse {} during v030 migration", path.display()))
+    content.parse().map(Some).with_context(|| {
+        format!(
+            "Parse {} during global-only settings migration",
+            path.display()
+        )
+    })
 }
 
-fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> Result<()> {
+fn run_in(app_dir: &Path, write: impl FnMut(&Path, &[u8]) -> Result<()>) -> Result<()> {
+    promote_fields(app_dir, write, |field| !field.profile_overridable)
+}
+
+pub(super) fn promote_fields(
+    app_dir: &Path,
+    mut write: impl FnMut(&Path, &[u8]) -> Result<()>,
+    selected: impl Fn(&FieldDescriptor) -> bool,
+) -> Result<()> {
     let _lock = acquire_storage_flock(app_dir, CONFIG_LOCK_FILENAME)?;
     let global_path = app_dir.join("config.toml");
     let mut global = read_config(&global_path)?.unwrap_or_default();
@@ -81,10 +91,7 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
             continue;
         };
         let mut moved = Vec::new();
-        for field in schema_ref()
-            .iter()
-            .filter(|field| !field.profile_overridable)
-        {
+        for field in schema_ref().iter().filter(|field| selected(field)) {
             let Some(section) = profile
                 .get_mut(&field.section)
                 .and_then(toml::Value::as_table_mut)
@@ -134,9 +141,9 @@ fn run_in(app_dir: &Path, mut write: impl FnMut(&Path, &[u8]) -> Result<()>) -> 
     for (path, is_default, fields, content) in profiles {
         write(&path, content.as_bytes())?;
         if is_default {
-            info!(path = %path.display(), ?fields, "v030: moved default profile's global-only settings to global config");
+            info!(path = %path.display(), ?fields, "moved default profile's global-only settings to global config");
         } else {
-            info!(path = %path.display(), ?fields, "v030: dropped global-only settings from non-default profile");
+            info!(path = %path.display(), ?fields, "dropped global-only settings from non-default profile");
         }
     }
     Ok(())

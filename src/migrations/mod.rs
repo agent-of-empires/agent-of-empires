@@ -62,6 +62,7 @@ mod v050_sound_volume_split;
 mod v051_structured_view;
 mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
+mod v054_global_max_concurrent_workers;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -102,7 +103,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 53;
+const CURRENT_VERSION: u32 = 54;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -278,6 +279,11 @@ const MIGRATIONS: &[Migration] = &[
         v052_runtime_filter_acp_target::run,
     ),
     (53, "runtime_filter_reset", v053_runtime_filter_reset::run),
+    (
+        54,
+        "global_max_concurrent_workers",
+        v054_global_max_concurrent_workers::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
