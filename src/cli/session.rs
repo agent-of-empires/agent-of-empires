@@ -1679,9 +1679,10 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 age: crate::hooks::read_hook_status_age(&inst.id),
             }
         });
-        let integration_configured = crate::plugin::agent_integration::configured(inst);
+        let integration_configured =
+            crate::plugin::agent_integration::status_configured(inst, &rules_tool);
         let integration_snapshot = integration_configured
-            .then(|| crate::plugin::agent_integration::snapshot(inst))
+            .then(|| crate::plugin::agent_integration::status_snapshot(inst, &rules_tool))
             .flatten();
         let status = if let Some(status) = crate::plugin::agent_integration::session_status_override(
             integration_configured,
