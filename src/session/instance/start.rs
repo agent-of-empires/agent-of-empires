@@ -1537,38 +1537,66 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let foreign = std::rc::Rc::new(std::cell::Cell::new(None));
+            let observed = std::rc::Rc::new(std::cell::Cell::new(None));
             let captured_foreign = foreign.clone();
+            let captured_observed = observed.clone();
             let profile = instance.source_profile.clone();
-            let _boundary =
-                crate::tmux::utils::owned_probe_test_support::BeforeRemoval::install(move |_| {
-                    if superseded {
-                        let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
-                        let generation = storage
-                            .update(|rows, _| {
-                                let row = &mut rows[0];
-                                let generation = row.lifecycle_generation;
+            let boundary =
+                crate::tmux::utils::owned_probe_test_support::Observer::install(move |output| {
+                    if captured_observed.get().is_some() {
+                        return;
+                    }
+                    assert!(
+                        output.status.success(),
+                        "the actual owned-pane query must succeed"
+                    );
+                    let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
+                    let (owned, replacement) = storage
+                        .update(|rows, _| {
+                            let row = &mut rows[0];
+                            let generation = row.lifecycle_generation;
+                            assert!(
+                                row.lifecycle_reservation_is_owned(
+                                    LifecycleOperation::Launch,
+                                    generation,
+                                ),
+                                "the concurrent boundary must follow the real Launch reservation",
+                            );
+                            let replacement = if superseded {
                                 assert!(row.release_lifecycle_reservation_if_owned(
                                     LifecycleOperation::Launch,
-                                    generation
+                                    generation,
                                 ));
-                                Ok(row.try_acquire_lifecycle_reservation(
+                                Some(row.try_acquire_lifecycle_reservation(
                                     LifecycleOperation::Launch,
                                     Instance::LIFECYCLE_RESERVATION_TTL,
                                     chrono::Utc::now(),
                                 )?)
-                            })
-                            .unwrap();
-                        captured_foreign.set(Some(generation));
-                    }
+                            } else {
+                                None
+                            };
+                            Ok((generation, replacement))
+                        })
+                        .unwrap();
+                    captured_observed.set(Some(owned));
+                    captured_foreign.set(replacement);
                 });
             let refusal = instance.start_with_size_opts(None, true).unwrap_err();
             assert!(refusal.is::<LaunchIndeterminateCause>(), "{refusal:#}");
+            drop(boundary);
+            let owned = observed
+                .get()
+                .expect("the refusal must cross the post-reservation probe boundary");
             assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
             assert_eq!(pane_field(&corpse, "#{pane_dead}"), "1");
             if superseded {
                 let generation = foreign
                     .get()
                     .expect("foreign launch must supersede this call");
+                assert_ne!(
+                    generation, owned,
+                    "the fixture must really supersede this launch"
+                );
                 let row = storage.load().unwrap().remove(0);
                 assert!(
                     row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
