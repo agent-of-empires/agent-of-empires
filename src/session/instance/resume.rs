@@ -1456,6 +1456,7 @@ mod tests {
             let mut row = Instance::new(&label, home.path().to_str().unwrap());
             row.source_profile = label.clone();
             row.tool = "pi".into();
+            row.extra_args = format!("--session-dir {}", shell_escape(home.path().to_str().unwrap()));
             row.agent_session_id = Some(if same_sid { FINAL } else { BEFORE }.into());
             let storage = crate::session::Storage::new_unwatched(&label)?;
             storage.update(|rows, _| {
@@ -1573,9 +1574,11 @@ mod tests {
                     std::thread::yield_now();
                 }
                 let args: Vec<String> = serde_json::from_slice(&std::fs::read(&argv)?)?;
-                assert!(args
-                    .windows(2)
-                    .any(|pair| pair[0] == "--session" && pair[1] == transcript.to_string_lossy()));
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair[0] == "--session" && pair[1] == transcript.to_string_lossy()),
+                    "{args:?}"
+                );
                 let pid = std::fs::read_to_string(&pid_file)?.parse::<u32>()?;
                 let birth = crate::process::process_birth_identity(pid)?
                     .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
