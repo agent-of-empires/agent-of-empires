@@ -70,6 +70,29 @@ describe("StructuredSessionStack", () => {
     expect(mounts).toEqual({ s1: 1, s2: 1 });
   });
 
+  it("never detaches a kept view when switching, which would reset its scroll position", async () => {
+    const { show } = setup({ id: "s1", persistent: true, limit: 3 });
+    await show({ id: "s2", persistent: true, limit: 3 });
+    await waitFor(() => expect(screen.getByTestId("view-s1")).toBeDefined());
+    await show({ id: "s3", persistent: true, limit: 3 });
+    await waitFor(() => expect(screen.getByTestId("view-s2")).toBeDefined());
+
+    const stack = screen.getByTestId("view-s1").parentElement!.parentElement!;
+    const detached: Node[] = [];
+    const record = (records: MutationRecord[]) => detached.push(...records.flatMap((r) => [...r.removedNodes]));
+    const observer = new MutationObserver(record);
+    observer.observe(stack, { childList: true });
+    for (const id of ["s1", "s2", "s3", "s1"]) {
+      await show({ id, persistent: true, limit: 3 });
+      await waitFor(() => expect(screen.getByTestId(`view-${id}`).dataset.active).toBe("true"));
+      await act(async () => {});
+    }
+
+    record(observer.takeRecords());
+    observer.disconnect();
+    expect(detached).toEqual([]);
+  });
+
   it("never mounts more than the limit, evicting the least recent", async () => {
     const { show, maxLive } = setup({ id: "s1", persistent: true, limit: 2 });
     await show({ id: "s2", persistent: true, limit: 2 });

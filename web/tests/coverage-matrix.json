@@ -2959,6 +2959,7 @@
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
+      "description": "Kept views stay attached across session switches, so each keeps its scroll position.",
       "specs": [
         "src/components/__tests__/StructuredSessionStack.test.tsx",
         "src/lib/__tests__/persistentStructuredViews.test.ts",
