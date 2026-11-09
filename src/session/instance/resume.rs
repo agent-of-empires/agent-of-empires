@@ -288,7 +288,7 @@ enum ProbeResult {
 }
 
 /// Transient proof captured at physical launch, before publication can adopt peer state.
-pub(super) struct LaunchProbe {
+pub(crate) struct LaunchProbe {
     pub(super) tmux_session: String,
     pub(super) pane: Option<std::sync::Arc<LegacyToolObservation>>,
     pub(super) expected: ConversationState,
