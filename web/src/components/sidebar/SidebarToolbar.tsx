@@ -1,8 +1,9 @@
-import { Layers, ListFilter } from "lucide-react";
+import { ListFilter } from "lucide-react";
 import type { SidebarAxis } from "../../lib/sidebarAxis";
 import type { SidebarSortMode } from "../../lib/sidebarSort";
 import { toneTextClass, type PluginFacetSpec, type PluginSortSpec } from "../../lib/pluginUi";
 import { OFFLINE_TITLE } from "../../lib/connectionState";
+import { SidebarAxisPicker } from "../SidebarAxisPicker";
 import { SidebarSortPicker } from "../SidebarSortPicker";
 import { Tooltip } from "../Tooltip";
 import { DISABLED_ICON_BUTTON, TOOLBAR_BUTTON, TOOLBAR_TINT } from "./styles";
@@ -11,27 +12,13 @@ import { SidebarLegend } from "./SidebarLegend";
 
 type PluginSortRef = { pluginId: string; entryId: string };
 
-/** Each click moves to the next grouping axis. */
-const AXES: Record<SidebarAxis, { next: SidebarAxis; heading: string; tooltip: string; aria: string }> = {
-  repo: { next: "org", heading: "Sessions", tooltip: "Grouping: by repository", aria: "Group sessions by repository" },
-  org: {
-    next: "group",
-    heading: "Sessions",
-    tooltip: "Grouping: by organization",
-    aria: "Group sessions by organization",
-  },
-  group: {
-    next: "repo+group",
-    heading: "Groups",
-    tooltip: "Grouping: by user group",
-    aria: "Group sessions by user group",
-  },
-  "repo+group": {
-    next: "repo",
-    heading: "Sessions",
-    tooltip: "Grouping: by repository, then user group",
-    aria: "Group sessions by repository, then user group",
-  },
+/** Heading above the list; the picker labels its axes itself. */
+const AXIS_HEADING: Record<SidebarAxis, string> = {
+  repo: "Sessions",
+  org: "Sessions",
+  group: "Groups",
+  "repo+group": "Sessions",
+  status: "Status",
 };
 
 export function SidebarToolbar({
@@ -73,7 +60,7 @@ export function SidebarToolbar({
   onToggleCompact: () => void;
   onClose: () => void;
 }) {
-  const axisSpec = AXES[axis];
+  const axisHeading = AXIS_HEADING[axis];
   return (
     <div className={`${compact ? "px-1" : "px-3"} pt-3 pb-1 flex items-center`}>
       {compact ? (
@@ -81,20 +68,9 @@ export function SidebarToolbar({
       ) : (
         <>
           <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
-            {axisSpec.heading}
+            {axisHeading}
           </span>
-          <Tooltip text={axisSpec.tooltip}>
-            <button
-              onClick={() => onAxisChange(axisSpec.next)}
-              aria-pressed={axis !== "repo"}
-              aria-label={axis === "repo" ? axisSpec.aria : `${axisSpec.aria}, currently pressed`}
-              data-testid="sidebar-axis-toggle"
-              data-axis={axis}
-              className={`${TOOLBAR_BUTTON} ${TOOLBAR_TINT(axis !== "repo")}`}
-            >
-              <Layers className="h-3.5 w-3.5" />
-            </button>
-          </Tooltip>
+          <SidebarAxisPicker axis={axis} onAxisChange={onAxisChange} />
           <SidebarSortPicker
             sortMode={sortMode}
             onSortModeChange={onSortModeChange}

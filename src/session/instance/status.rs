@@ -53,6 +53,27 @@ impl Status {
             .map(|(status, _, _)| *status)
     }
 
+    /// Sidebar attention rank for a bare status. The Attention sort and the status
+    /// grouping axis both read it, so they can never disagree.
+    pub(crate) fn attention_tier(self) -> u8 {
+        match self {
+            Status::Waiting => 0, // agent paused, needs human input, TOP priority
+            Status::Error => 1,   // broken, needs attention
+            Status::Idle => 2,    // turn complete, ready for next prompt
+            Status::Unknown => 3, // status undetermined, glance warranted
+            Status::Running => 4, // actively working, leave alone
+            Status::Stopped => 5, // dormant, sinks below running so live sessions show first
+            Status::Starting | Status::Creating | Status::Deleting => 6, // transient, sink to bottom
+        }
+    }
+
+    /// Every status in [`Self::attention_tier`] order, ties broken by the API spelling.
+    pub(crate) fn attention_order() -> Vec<Status> {
+        let mut all: Vec<Status> = Self::ALL.iter().map(|(status, _, _)| *status).collect();
+        all.sort_by_key(|status| (status.attention_tier(), status.wire_str()));
+        all
+    }
+
     /// Whether the worktree may be mid-use, so an in-place worktree edit must wait.
     pub fn blocks_worktree_edit(self) -> bool {
         matches!(
