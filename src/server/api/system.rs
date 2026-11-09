@@ -219,7 +219,7 @@ fn build_custom_agent_infos(
 pub struct AgentsQuery {
     profile: Option<String>,
     /// The create's project `path`, whose repository config and hooks `acp_create_ready`
-    /// then counts as that create would.
+    /// then counts as that create would. CityHall uses the operator's project instead.
     path: Option<String>,
     /// A scratch create has no repository, so `path` is ignored.
     #[serde(default)]
@@ -253,11 +253,21 @@ pub async fn list_agents(
         }
         None => state.served_profile().to_string(),
     };
-    let project = query
-        .path
-        .filter(|path| !path.is_empty() && !query.scratch)
-        .map(std::path::PathBuf::from);
+    let (path, scratch) = (query.path, query.scratch);
+    let cityhall = state.cityhall_mode;
+    let served = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
+        // CityHall's create launches in the operator's first registered project, whatever the
+        // caller sends, so the caller's path and scratch don't apply there.
+        let project = if cityhall {
+            crate::session::projects::load_merged(&served)
+                .ok()
+                .and_then(|projects| projects.into_iter().next())
+                .map(|project| std::path::PathBuf::from(project.path))
+        } else {
+            path.filter(|path| !path.is_empty() && !scratch)
+                .map(std::path::PathBuf::from)
+        };
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = &config.session.custom_agents;
         let agent_acp_cmd = &config.session.agent_acp_cmd;
@@ -3850,13 +3860,26 @@ mod tests {
             ..Default::default()
         };
         trust_repo(trusted.path(), Some(&compute_hooks_hash(&on_launch)), None).unwrap();
-        // (label, profile on_create hook, project, scratch, `missing` create-ready). The
-        // profile hook persists once set, so its case comes last.
+        // CityHall's create uses the operator's first registered project.
+        crate::session::projects::add(
+            "default",
+            crate::session::ProjectScope::Global,
+            crate::session::Project::new(
+                "hooked",
+                trusted.path().to_string_lossy(),
+                crate::session::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        // (label, profile on_create hook, CityHall, project, scratch, `missing` create-ready).
+        // The profile hook persists once set, so its case comes last.
         let cases = [
-            ("no project", false, None, false, false),
-            ("no hooks", false, Some(plain.path()), false, false),
+            ("no project", false, false, None, false, false),
+            ("no hooks", false, false, Some(plain.path()), false, false),
             (
                 "trusted repo hook",
+                false,
                 false,
                 Some(trusted.path()),
                 false,
@@ -3865,6 +3888,7 @@ mod tests {
             (
                 "repo hook awaiting trust",
                 false,
+                false,
                 Some(awaiting.path()),
                 false,
                 true,
@@ -3872,20 +3896,41 @@ mod tests {
             (
                 "scratch with a repo hook",
                 false,
+                false,
                 Some(trusted.path()),
                 true,
                 false,
             ),
-            ("profile hook", true, None, false, true),
+            (
+                "CityHall ignores the caller's path",
+                false,
+                true,
+                Some(plain.path()),
+                false,
+                true,
+            ),
+            (
+                "CityHall ignores scratch",
+                false,
+                true,
+                Some(plain.path()),
+                true,
+                true,
+            ),
+            ("profile hook", true, false, None, false, true),
         ];
-        for (label, profile_hook, project, scratch, missing_ready) in cases {
+        for (label, profile_hook, cityhall, project, scratch, missing_ready) in cases {
             if profile_hook {
                 crate::session::config::update_config(|config| {
                     config.hooks.on_create = vec!["npm install".into()];
                 })
                 .unwrap();
             }
-            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let state = if cityhall {
+                crate::server::test_support::build_test_app_state_cityhall(Vec::new())
+            } else {
+                crate::server::test_support::build_test_app_state(Vec::new())
+            };
             let query = AgentsQuery {
                 path: project.map(|path: &std::path::Path| path.display().to_string()),
                 scratch,
