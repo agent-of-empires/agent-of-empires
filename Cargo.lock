@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "agent-of-empires"
-version = "1.22.2"
+version = "1.22.3"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -103,6 +103,8 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "core-foundation",
+ "core-foundation-sys",
  "crossterm",
  "dirs",
  "dotenv-ng-core",
