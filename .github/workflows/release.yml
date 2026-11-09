@@ -129,8 +129,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install web frontend dependencies
+        working-directory: web
+        run: npm install
       - name: Build web frontend
-        run: cd web && npm install && npm run build
+        working-directory: web
+        run: npm run build
 
       - name: Read release toolchain
         id: toolchain

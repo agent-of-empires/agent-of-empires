@@ -37,6 +37,8 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Build xtask
+        run: cargo build -p xtask
       - name: Generate CLI documentation
         run: cargo xtask gen-docs
 
