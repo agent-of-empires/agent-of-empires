@@ -9,6 +9,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Bug Fixes
 
 - **session:** Preserve live restarts and applied-but-unconfirmed launches. Accept a final Pi or Prime capture only when its own durable compare-and-set advances the admitted selection; retain concurrent pins and hook changes.
+- **session:** Keep OMP confirmation bindings identical in memory and storage while advancing only the matching launch's capture witness.
 
 ### Security
 
