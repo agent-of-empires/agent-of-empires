@@ -588,10 +588,7 @@ function AppContent({
     toggleRepoCollapsed: toggleOrgRepoCollapsed,
   } = useOrgGroups(repoGroups);
 
-  // The sidebar render path consumes one honest model (SidebarGroup): the
-  // repo axis maps in via an adapter, the user-group and status axes are
-  // already in that shape. Collapse routing follows the active axis so each
-  // axis keeps independent collapse state. See #1234.
+  // Collapse state is independent for each grouping axis.
   const sidebarGroups = useMemo(() => {
     if (sidebarAxis === "status") return statusGroups;
     if (sidebarAxis === "group") return sessionGroups;

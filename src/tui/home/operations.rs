@@ -1068,17 +1068,14 @@ impl HomeView {
         }
     }
 
-    /// Queue the whole group's archive before submitting any row. The daemon
-    /// tears down each pane and publishes its committed state.
+    /// Queue the group's archive before submitting any row.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        // Prefer the set captured when the prompt opened: a status bucket can gain
-        // members that its count never included.
+        // Preserve the membership counted by the prompt.
         let ids = match self.pending_archive_group_ids.take() {
             Some(ids) => ids,
             None => self.active_sessions_in_selected_group(),
         };
-        // Trash wins over archive, and a member removed while the prompt was up has no
-        // row left, so skip both.
+        // Removed and trashed sessions are no longer eligible.
         let ids: Vec<String> = ids
             .into_iter()
             .filter(|id| self.instances.get(id).is_some_and(|i| !i.is_trashed()))

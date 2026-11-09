@@ -41,7 +41,6 @@ function persistedChoiceCases<T extends string>(
   });
 }
 
-// "org" (#3283), "repo+group" (#1720) and "status" must survive a reload.
 describe("useSidebarAxis", () =>
   persistedChoiceCases(SIDEBAR_AXIS_KEY, useSidebarAxis, "repo", ["org", "group", "repo+group", "status"]));
 

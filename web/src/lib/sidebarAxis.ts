@@ -1,13 +1,6 @@
 import { safeGetItem, safeSetItem } from "./safeStorage";
 
-/** Which organisation axis the sidebar groups sessions by: the auto-derived
- *  repository axis (default, the original behavior), the org axis derived
- *  from each repo's remote owner (any hosted git remote, not just GitHub),
- *  the user-defined group axis backed by each session's `group_path`,
- *  the nested `repo+group` axis that keeps repository headers and nests
- *  user groups inside each one, or the status axis backed by each session's
- *  execution status. Per-browser, like the sort mode. See
- *  #1234, #1720, #3283. */
+/** Sidebar grouping axis, persisted per browser. */
 export type SidebarAxis = "repo" | "org" | "group" | "repo+group" | "status";
 
 // Keyed by axis, so a new axis must say whether its headers are repositories.
@@ -19,8 +12,7 @@ const DRAWS_REPO_HEADERS: Record<SidebarAxis, boolean> = {
   status: false,
 };
 
-/** Whether the axis draws repository headers, which is where a Project with live Sessions, or a pinned one,
- *  appears. Without them, the Projects section lists every registered Project (#5065). */
+/** Registered projects appear separately when the axis has no repository headers. */
 export function axisDrawsRepoHeaders(axis: SidebarAxis): boolean {
   return DRAWS_REPO_HEADERS[axis];
 }

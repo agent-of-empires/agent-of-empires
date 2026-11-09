@@ -75,7 +75,7 @@ A grouping picker (layers icon) next to the sort picker opens a menu of axes, so
 
 - **By repo** (default): groups by git repository.
 - **By organization**: groups repositories by the owner in their git remote (any hosted remote, not only GitHub), with each repository's header inside its owner. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
-- **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
+- **By group** (**Group** in the picker): groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 - **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
 

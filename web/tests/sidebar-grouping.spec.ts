@@ -89,6 +89,26 @@ async function gotoDesktop(page: Page) {
   await page.goto("/");
 }
 
+async function recordArchives(page: Page, ids: string[], sessions?: MockSessionInput[]) {
+  await page.route("**/api/sessions/*/archive", async (route) => {
+    const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
+    const input = sessions?.find((session) => session.id === id);
+    ids.push(id);
+    await route.fulfill({
+      json: input
+        ? sessionResponse({
+            id,
+            title: input.title,
+            project_path: input.project_path,
+            branch: input.branch,
+            group_path: input.group ?? "",
+            ...input.fields,
+          })
+        : sessionResponse({ id }),
+    });
+  });
+}
+
 // The axis picker sets any axis directly, so status is one pick from the default.
 async function pickAxis(page: Page, toggle: Locator, target: string) {
   await toggle.click();
@@ -247,21 +267,7 @@ test.describe("sidebar nested repo+group axis (#1720)", () => {
     }));
     const archived: string[] = [];
     await installSidebarMocks(page, { sessions });
-    await page.route("**/api/sessions/*/archive", async (route) => {
-      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
-      const input = sessions.find((s) => s.id === id);
-      archived.push(id);
-      await route.fulfill({
-        json: sessionResponse({
-          id,
-          title: input?.title,
-          project_path: input?.project_path,
-          branch: input?.branch,
-          group_path: input?.group ?? "",
-          ...input?.fields,
-        }),
-      });
-    });
+    await recordArchives(page, archived, sessions);
     await gotoDesktop(page);
     await pickAxis(page, page.locator(AXIS_TOGGLE), "repo+group");
 
@@ -333,6 +339,7 @@ test.describe("sidebar status axis (#4867)", () => {
     await page.keyboard.press("Enter");
 
     await expect(menu).toBeVisible();
+    await expect(option("group")).toHaveText("Group");
     // Same single-select menu semantics as the sort picker beside it.
     await expect(menu).toHaveAttribute("role", "menu");
     await expect(option("repo")).toHaveAttribute("role", "menuitemradio");
@@ -403,21 +410,7 @@ test.describe("sidebar status axis (#4867)", () => {
     ];
     const archived: string[] = [];
     await installSidebarMocks(page, { sessions });
-    await page.route("**/api/sessions/*/archive", async (route) => {
-      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
-      const input = sessions.find((s) => s.id === id);
-      archived.push(id);
-      await route.fulfill({
-        json: sessionResponse({
-          id,
-          title: input?.title,
-          project_path: input?.project_path,
-          branch: input?.branch,
-          group_path: input?.group ?? "",
-          ...input?.fields,
-        }),
-      });
-    });
+    await recordArchives(page, archived, sessions);
     await gotoDesktop(page);
     await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
 
@@ -491,11 +484,7 @@ test.describe("sidebar status axis (#4867)", () => {
     ];
     const unarchived: string[] = [];
     await installSidebarMocks(page, { sessions });
-    await page.route("**/api/sessions/*/archive", async (route) => {
-      const id = decodeURIComponent(new URL(route.request().url()).pathname.split("/").at(-2)!);
-      unarchived.push(id);
-      await route.fulfill({ json: sessionResponse({ id }) });
-    });
+    await recordArchives(page, unarchived);
     await gotoDesktop(page);
     await pickAxis(page, page.locator(AXIS_TOGGLE), "status");
     await page.getByTestId("sidebar-sunk-toggle").click();

@@ -14,7 +14,7 @@ interface AxisSpec {
 const AXES: readonly AxisSpec[] = [
   { axis: "repo", label: "Repository", Icon: Folder },
   { axis: "org", label: "Organization", Icon: Building2 },
-  { axis: "group", label: "User group", Icon: Layers },
+  { axis: "group", label: "Group", Icon: Layers },
   { axis: "repo+group", label: "Repository, then group", Icon: FolderTree },
   { axis: "status", label: "Session status", Icon: Activity },
 ];
@@ -22,12 +22,12 @@ const AXES: readonly AxisSpec[] = [
 const TOOLTIP: Record<SidebarAxis, string> = {
   repo: "Grouping: by repository",
   org: "Grouping: by organization",
-  group: "Grouping: by user group",
-  "repo+group": "Grouping: by repository, then user group",
+  group: "Grouping: by group",
+  "repo+group": "Grouping: by repository, then group",
   status: "Grouping: by session status",
 };
 
-/** Grouping axis dropdown; every axis is one pick away instead of a trip through a cycle. */
+/** Single-select sidebar grouping menu. */
 export function SidebarAxisPicker({
   axis,
   onAxisChange,
@@ -39,7 +39,7 @@ export function SidebarAxisPicker({
   const ref = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
-  // Set when the menu closes with focus still inside it, so the trigger gets the focus back.
+  // Restore focus only when it has not moved outside the menu.
   const restoreFocus = useRef(false);
 
   useOutsideDismiss(open, [ref], () => setOpen(false));
@@ -49,14 +49,12 @@ export function SidebarAxisPicker({
     AXES.findIndex((a) => a.axis === axis),
   );
 
-  // Menu-button pattern: an option takes focus on open, so arrows and Escape reach the menu
-  // instead of only Tab. The checked one, since picking is what a reader came for.
+  // Focus the checked option so the menu receives keyboard navigation.
   useLayoutEffect(() => {
     if (open) optionRefs.current[activeIndex]?.focus({ preventScroll: true });
   }, [open, activeIndex]);
 
-  // A picked option unmounts with the menu, taking the focus with it; hand it back to the
-  // trigger once the menu is gone, after the axis change has re-rendered.
+  // Restore focus after the selected option unmounts.
   useLayoutEffect(() => {
     if (open || !restoreFocus.current) return;
     restoreFocus.current = false;

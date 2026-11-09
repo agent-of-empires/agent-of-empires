@@ -1177,252 +1177,92 @@ fn test_prompt_archive_selected_group() {
     assert!(env.view.confirm_dialog.is_none());
 }
 
-/// A status bucket gains members while its archive prompt is up, the same way a running
-/// session flips to Waiting mid-confirm. The confirm archives the set the prompt counted.
 #[test]
 #[serial]
-fn status_group_archive_keeps_the_members_the_prompt_counted() {
+fn status_group_archive_preserves_prompt_membership_and_eligibility() {
     use crate::session::config::GroupByMode;
     use crate::session::Status;
 
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
+    for scenario in ["joins", "trashed", "removed"] {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
 
-    let mut counted = Instance::new("counted", "/tmp/counted");
-    counted.status = Status::Running;
-    let mut late = Instance::new("late", "/tmp/late");
-    late.status = Status::Idle;
-    let instances = vec![counted, late];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
+        let mut kept = Instance::new("kept", "/tmp/kept");
+        kept.status = Status::Running;
+        let mut changed = Instance::new("changed", "/tmp/changed");
+        changed.status = if scenario == "joins" {
+            Status::Idle
+        } else {
+            Status::Running
+        };
+        let instances = vec![kept, changed];
+        storage
+            .update(|i, g| {
+                *i = instances.to_vec();
+                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let mut view = HomeView::new_for_test(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
         .unwrap();
+        view.group_by = GroupByMode::Status;
+        view.flat_items = view.build_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
+            .expect("Running header");
+        view.update_selected();
+        assert_eq!(view.selected_group.as_deref(), Some("Running"));
+        view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
+        assert_eq!(
+            view.confirm_dialog.as_ref().map(|d| d.action()),
+            Some("archive_group")
+        );
 
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Status;
-    view.flat_items = view.build_flat_items();
+        let id_of = |view: &HomeView, title: &str| {
+            view.instances()
+                .find(|i| i.title == title)
+                .map(|i| i.id.clone())
+                .expect("seeded instance")
+        };
+        let kept_id = id_of(&view, "kept");
+        let changed_id = id_of(&view, "changed");
+        match scenario {
+            "joins" => view.instances.get_mut(&changed_id).unwrap().status = Status::Running,
+            "trashed" => view.instances.get_mut(&changed_id).unwrap().trash(),
+            "removed" => {
+                view.instances.shift_remove(&changed_id);
+            }
+            _ => unreachable!(),
+        }
+        view.rebuild_flat_items();
 
-    let running = view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
-        .expect("Running header");
-    view.cursor = running;
-    view.update_selected();
-    assert_eq!(view.selected_group.as_deref(), Some("Running"));
-
-    // On a header, the archive hotkey prompts for the whole bucket instead of one row.
-    view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
-    assert_eq!(
-        view.confirm_dialog.as_ref().map(|d| d.action()),
-        Some("archive_group")
-    );
-
-    let id_of = |view: &HomeView, title: &str| {
-        view.instances()
-            .find(|i| i.title == title)
-            .map(|i| i.id.clone())
-            .expect("seeded instance")
-    };
-    let counted_id = id_of(&view, "counted");
-    let late_id = id_of(&view, "late");
-    view.instances.get_mut(&late_id).unwrap().status = Status::Running;
-    view.rebuild_flat_items();
-
-    let mut respond = view.session_feed.command_driver_for_test();
-    view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
-    assert!(view.confirm_dialog.is_none());
-
-    let (id, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
-        epoch: "test".into(),
-        revision: 2,
-    }))
-    .unwrap();
-    assert!(
-        matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane)
-    );
-    assert_eq!(id, counted_id);
-    assert!(
-        respond(Ok(crate::daemon::RuntimeCursor {
+        let mut respond = view.session_feed.command_driver_for_test();
+        view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
+        assert!(view.confirm_dialog.is_none());
+        let cursor = || crate::daemon::RuntimeCursor {
             epoch: "test".into(),
-            revision: 2
-        }))
-        .is_none(),
-        "a session the prompt never counted must not be torn down"
-    );
-}
-
-/// Trash keeps the flags a session was trashed with, so archiving a member that entered
-/// Trash while the prompt was up would only redirect where it restores to. Skip it.
-#[test]
-#[serial]
-fn status_group_archive_skips_members_trashed_while_the_prompt_was_up() {
-    use crate::session::config::GroupByMode;
-    use crate::session::Status;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut kept = Instance::new("kept", "/tmp/kept");
-    kept.status = Status::Running;
-    let mut trashed = Instance::new("trashed", "/tmp/trashed");
-    trashed.status = Status::Running;
-    let instances = vec![kept, trashed];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Status;
-    view.flat_items = view.build_flat_items();
-
-    let running = view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
-        .expect("Running header");
-    view.cursor = running;
-    view.update_selected();
-    view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
-    assert_eq!(
-        view.confirm_dialog.as_ref().map(|d| d.action()),
-        Some("archive_group")
-    );
-
-    let id_of = |view: &HomeView, title: &str| {
-        view.instances()
-            .find(|i| i.title == title)
-            .map(|i| i.id.clone())
-            .expect("seeded instance")
-    };
-    let kept_id = id_of(&view, "kept");
-    let trashed_id = id_of(&view, "trashed");
-    view.instances.get_mut(&trashed_id).unwrap().trash();
-    view.rebuild_flat_items();
-
-    let mut respond = view.session_feed.command_driver_for_test();
-    view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
-    assert!(view.confirm_dialog.is_none());
-
-    let (id, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
-        epoch: "test".into(),
-        revision: 2,
-    }))
-    .unwrap();
-    assert!(
-        matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane)
-    );
-    assert_eq!(id, kept_id);
-    assert!(
-        respond(Ok(crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision: 2
-        }))
-        .is_none(),
-        "a member in Trash must not be archived on confirm"
-    );
-    let trashed = view.instances.get(&trashed_id).expect("trashed instance");
-    assert!(trashed.is_trashed() && !trashed.is_archived());
-}
-
-/// A session removed while the prompt was up has no row left to archive; submitting it would
-/// only surface a runtime-change error for a session that is gone.
-#[test]
-#[serial]
-fn status_group_archive_skips_members_removed_while_the_prompt_was_up() {
-    use crate::session::config::GroupByMode;
-    use crate::session::Status;
-
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut kept = Instance::new("kept", "/tmp/kept");
-    kept.status = Status::Running;
-    let mut gone = Instance::new("gone", "/tmp/gone");
-    gone.status = Status::Running;
-    let instances = vec![kept, gone];
-    storage
-        .update(|i, g| {
-            *i = instances.to_vec();
-            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
-            Ok(())
-        })
-        .unwrap();
-
-    let mut view = HomeView::new_for_test(
-        Some("test".to_string()),
-        AvailableTools::with_tools(&["claude"]),
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Status;
-    view.flat_items = view.build_flat_items();
-
-    let running = view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Group { path, .. } if path == "Running"))
-        .expect("Running header");
-    view.cursor = running;
-    view.update_selected();
-    view.handle_key(key(crossterm::event::KeyCode::Char('z')), None);
-    assert_eq!(
-        view.confirm_dialog.as_ref().map(|d| d.action()),
-        Some("archive_group")
-    );
-
-    let id_of = |view: &HomeView, title: &str| {
-        view.instances()
-            .find(|i| i.title == title)
-            .map(|i| i.id.clone())
-            .expect("seeded instance")
-    };
-    let kept_id = id_of(&view, "kept");
-    let gone_id = id_of(&view, "gone");
-    view.instances.shift_remove(&gone_id);
-    view.rebuild_flat_items();
-
-    let mut respond = view.session_feed.command_driver_for_test();
-    view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
-    assert!(view.confirm_dialog.is_none());
-
-    let (id, mutation) = respond(Ok(crate::daemon::RuntimeCursor {
-        epoch: "test".into(),
-        revision: 2,
-    }))
-    .unwrap();
-    assert!(
-        matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane)
-    );
-    assert_eq!(id, kept_id);
-    assert!(
-        respond(Ok(crate::daemon::RuntimeCursor {
-            epoch: "test".into(),
-            revision: 2
-        }))
-        .is_none(),
-        "a session removed while the prompt was up must not be archived"
-    );
+            revision: 2,
+        };
+        let (id, mutation) = respond(Ok(cursor())).unwrap();
+        assert!(
+            matches!(mutation, crate::daemon::SessionMutation::Archive(body) if body.archived && body.kill_pane),
+            "{scenario}"
+        );
+        assert_eq!(id, kept_id, "{scenario}");
+        assert!(respond(Ok(cursor())).is_none(), "{scenario}");
+        if scenario == "trashed" {
+            let trashed = view.instances.get(&changed_id).expect("trashed instance");
+            assert!(trashed.is_trashed() && !trashed.is_archived());
+        }
+    }
 }
 
 #[tokio::test]
