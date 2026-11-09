@@ -9,9 +9,14 @@ fn setup_panes(env: &mut TestEnv) {
     env.view.preview_area = Rect::new(30, 0, 100, 40);
 }
 
+type PreviewFixture = (
+    TestEnv,
+    Box<dyn FnMut(Result<crate::daemon::MutationReceipt<crate::daemon::TerminalTarget>, String>)>,
+);
+
 /// A live-send env whose preview-capture worker reports the given cursor, so the
 /// alternate-screen wheel-forwarding branch runs without a real full-screen pane.
-fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> PreviewFixture {
     use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
@@ -34,6 +39,7 @@ fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
     ));
     env.view
         .sync_preview_capture_worker(Some("fake".to_string()));
+    env.view.preview_cache.session_id = env.view.selected_session.clone();
     env.view.preview_cache.dimensions = (80, 24);
     env.view.preview_cache.captured_lines = 200;
     env.view.preview_scroll_offset = 10;
@@ -45,19 +51,21 @@ fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
         .as_ref()
         .expect("capture worker")
         .current_generation_for_test();
-    env
+    let native_driver = Box::new(env.view.session_feed.terminal_driver_for_test());
+    (env, native_driver)
 }
 
 /// Like `live_env_with_cursor` but without entering live-send: the session is merely
 /// previewed, with the capture worker and target set so `forward_wheel_to_preview` takes
 /// the passive one-shot path.
-fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> PreviewFixture {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
     env.view.cursor = 1;
     env.view.update_selected();
     env.view
         .sync_preview_capture_worker(Some("fake".to_string()));
+    env.view.preview_cache.session_id = env.view.selected_session.clone();
     env.view.preview_cache.dimensions = (80, 24);
     env.view.preview_cache.captured_lines = 200;
     env.view.preview_scroll_offset = 10;
@@ -70,7 +78,8 @@ fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
         .as_ref()
         .expect("capture worker")
         .current_generation_for_test();
-    env
+    let native_driver = Box::new(env.view.session_feed.terminal_driver_for_test());
+    (env, native_driver)
 }
 
 fn alt_screen_cursor(
@@ -100,7 +109,7 @@ fn alt_screen_cursor(
 #[test]
 #[serial]
 fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+    let (mut env, _native_driver) = live_env_with_cursor(alt_screen_cursor(true, true, true));
 
     let up = env.view.handle_scroll_up(50, 10);
     assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
@@ -121,7 +130,7 @@ fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
 #[test]
 #[serial]
 fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
-    let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+    let (mut env, _native_driver) = live_env_with_cursor(alt_screen_cursor(true, false, false));
 
     let up = env.view.handle_scroll_up(50, 10);
     assert!(up, "wheel over a full-screen no-mouse pane is handled");
@@ -164,7 +173,7 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
         ),
     ];
     for (label, passive, cursor, forwards) in cases {
-        let mut env = if passive {
+        let (mut env, _native_driver) = if passive {
             passive_env_with_cursor(cursor)
         } else {
             live_env_with_cursor(cursor)
@@ -193,7 +202,7 @@ fn forward_mouse_to_preview_tracks_press_through_release() {
     // (label, passive preview, drag/release point)
     for (label, passive, (x, y)) in [("live", false, (1, 1)), ("passive", true, (55, 12))] {
         let cursor = alt_screen_cursor(true, true, true);
-        let mut env = if passive {
+        let (mut env, _native_driver) = if passive {
             passive_env_with_cursor(cursor)
         } else {
             live_env_with_cursor(cursor)
@@ -250,7 +259,7 @@ fn forward_mouse_to_preview_falls_through_without_a_forwardable_press() {
         ),
     ];
     for (label, cursor, kind, modifiers) in cases {
-        let mut env = live_env_with_cursor(cursor);
+        let (mut env, _native_driver) = live_env_with_cursor(cursor);
         assert!(
             !env.view.forward_mouse_to_preview(kind, modifiers, 50, 10),
             "{label}"
@@ -268,7 +277,7 @@ fn forward_mouse_to_preview_falls_through_without_a_forwardable_press() {
 fn forward_hover_to_preview_reports_once_per_cell() {
     let mut cursor = alt_screen_cursor(true, true, true);
     cursor.mouse_all = true;
-    let mut env = live_env_with_cursor(cursor);
+    let (mut env, _native_driver) = live_env_with_cursor(cursor);
     // The forward maps cells against the previewed pane's rect; give it
     // the preview area like a rendered frame would.
     env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
@@ -290,11 +299,109 @@ fn forward_hover_to_preview_reports_once_per_cell() {
         alt_screen_cursor(true, true, true),
         alt_screen_cursor(true, false, false),
     ] {
-        let mut env = live_env_with_cursor(cursor);
+        let (mut env, _native_driver) = live_env_with_cursor(cursor);
         env.view.preview_text_view.pane = Rect::new(30, 0, 100, 40);
         assert!(!env.view.forward_hover_to_preview(50, 10));
         assert_eq!(env.view.hover_forward_cell, None);
     }
+}
+
+#[test]
+#[serial]
+fn hover_never_reaches_a_stale_preview_before_repaint() {
+    for change in ["selection", "trash", "grant"] {
+        let mut cursor = alt_screen_cursor(true, true, true);
+        cursor.mouse_all = true;
+        let (mut env, _native_driver) = passive_env_with_cursor(cursor);
+        let id = env.view.selected_session.clone().unwrap();
+        env.view.preview_cache.session_id = Some(id.clone());
+        env.view.preview_text_view.pane = env.view.preview_area;
+        assert!(env.view.forward_hover_to_preview(50, 10));
+        match change {
+            "trash" => {
+                env.view
+                    .mutate_instance(&id, |row| row.trashed_at = Some(chrono::Utc::now()));
+                env.view.enforce_trash_read_only();
+            }
+            "selection" => {
+                env.view.cursor += 1;
+                env.view.update_selected();
+                assert_ne!(env.view.selected_session.as_deref(), Some(id.as_str()));
+            }
+            "grant" => env.view.session_feed.set_native_permission_for_test(false),
+            _ => unreachable!(),
+        }
+        assert!(
+            !env.view.forward_hover_to_preview(51, 10),
+            "change={change}"
+        );
+        assert!(env.view.hover_forward_cell.is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn preview_mouse_gestures_never_retarget_after_a_rejected_press() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    for forwarded_press in [false, true] {
+        let cursor = alt_screen_cursor(true, true, true);
+        let (mut env, _native_driver) = passive_env_with_cursor(cursor);
+        env.view.preview_text_view.pane = env.view.preview_area;
+        if forwarded_press {
+            assert!(env.view.forward_mouse_to_preview(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10,
+            ));
+        }
+        env.view.cursor += 1;
+        env.view.update_selected();
+        if !forwarded_press {
+            assert!(!env.view.forward_mouse_to_preview(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10,
+            ));
+            assert!(env.view.mouse_forward_btn.is_none());
+        }
+        let target = format!("aoe_absent_gesture_{}", uuid::Uuid::new_v4());
+        env.view.sync_preview_capture_worker(Some(target.clone()));
+        assert!(env.view.mouse_forward_btn.is_none());
+        env.view.preview_cache.session_id = env.view.selected_session.clone();
+        env.view.preview_cache.capture_target = Some(target);
+        env.view.preview_cache.capture_generation = env
+            .view
+            .preview_capture_worker
+            .as_ref()
+            .unwrap()
+            .current_generation_for_test();
+        env.view.preview_cache.cursor = Some(cursor);
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(!env
+                .view
+                .forward_mouse_to_preview(kind, KeyModifiers::NONE, 51, 10));
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn queued_preview_input_cannot_inherit_a_regranted_native_capability() {
+    let (env, _native_driver) = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+    let lease = env.view.session_feed.native_input_lease().unwrap();
+    env.view.session_feed.set_native_permission_for_test(false);
+    env.view.session_feed.set_native_permission_for_test(true);
+    assert!(env.view.session_feed.native_interaction_available());
+    assert!(!crate::tui::home::live_send::send_key_oneshot(
+        &format!("aoe_absent_grant_probe_{}", uuid::Uuid::new_v4()),
+        crate::tui::home::live_send::TmuxKey::Named("Enter".into()),
+        lease,
+    ));
 }
 
 /// Stage an in-flight Shift-selection drag held at the preview's top or bottom edge, plus a
@@ -357,7 +464,7 @@ fn autoscroll_forwards_edge_drag_only_to_alternate_screen_agents() {
         ),
     ];
     for (label, cursor, at_top, forwards) in cases {
-        let mut env = live_env_with_cursor(cursor);
+        let (mut env, _native_driver) = live_env_with_cursor(cursor);
         stage_edge_drag_no_scrollback(&mut env, at_top);
         assert_eq!(env.view.tick_preview_autoscroll(), forwards, "{label}");
         assert_eq!(env.view.preview_scroll_offset, 0, "{label}");

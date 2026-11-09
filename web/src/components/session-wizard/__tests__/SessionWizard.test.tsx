@@ -1441,7 +1441,7 @@ describe("SessionWizard create failures", () => {
     sandboxed();
     await launch();
     await screen.findByTestId("create-failure");
-    expect(document.activeElement).toBe(box());
+    await waitFor(() => expect(document.activeElement).toBe(box()));
     expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain("couldn't start");
     vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: false, runtime: "docker", runtime_name: "Docker" });
     const checks = vi.mocked(fetchDockerStatus).mock.calls.length;

@@ -486,9 +486,12 @@ async fn delete_selected_refused_during_restart() {
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
+    disable_delete_to_trash();
+    env.view.view_mode = ViewMode::Structured;
+    env.view.open_delete_for_selected();
 
     let before = payload_bytes("test");
-    let result = env.view.delete_selected(&DeleteOptions::default());
+    let result = env.view.submit_session_delete(&DeleteOptions::default());
     assert!(result.is_ok());
     assert_ne!(
         env.view.instance_at(0).status,
@@ -2868,10 +2871,7 @@ fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
     );
 }
 
-/// #3611: trashed-row healing must not run before the first frame. `HomeView::new`
-/// hands it to `ReconcilePoller`, so the repair lands through
-/// `apply_reconcile_results` instead. This row needs only a pointer repair, so
-/// the sweep reaches durable state without git.
+/// Pointer repair reaches storage and Home through the canonical snapshot.
 #[tokio::test]
 #[serial]
 async fn trashed_row_healing_lands_through_the_native_daemon_snapshot() {
@@ -2880,11 +2880,22 @@ async fn trashed_row_healing_lands_through_the_native_daemon_snapshot() {
     let project = TempDir::new().unwrap();
     let storage = Storage::new_unwatched("test").unwrap();
 
+    let main_repo = project.path().join("main");
+    let repo = git2::Repository::init(&main_repo).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    let tree = repo
+        .find_tree(repo.index().unwrap().write_tree().unwrap())
+        .unwrap();
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+        .unwrap();
+    let git = crate::git::GitWorktree::new(main_repo.clone()).unwrap();
     let recorded = project.path().join("feat");
+    git.create_worktree("feat", &recorded, true, None).unwrap();
+    std::fs::write(recorded.join("payload"), b"retained").unwrap();
     let mut instance = Instance::new("trashed", recorded.to_str().unwrap());
     instance.worktree_info = Some(crate::session::WorktreeInfo {
         branch: "feat".to_string(),
-        main_repo_path: project.path().to_string_lossy().into_owned(),
+        main_repo_path: main_repo.to_string_lossy().into_owned(),
         managed_by_aoe: true,
         created_at: chrono::Utc::now(),
         base_branch: None,
@@ -2892,7 +2903,8 @@ async fn trashed_row_healing_lands_through_the_native_daemon_snapshot() {
     instance.trash();
     let id = instance.id.clone();
     let holding = crate::session::trash::trash_holding_path(&recorded, &id).unwrap();
-    std::fs::create_dir_all(&holding).unwrap();
+    std::fs::create_dir_all(holding.parent().unwrap()).unwrap();
+    git.move_worktree(&recorded, &holding).unwrap();
     storage
         .update(|instances, _groups| {
             instances.push(instance);
@@ -2931,6 +2943,7 @@ async fn trashed_row_healing_lands_through_the_native_daemon_snapshot() {
         holding.to_string_lossy(),
         "the reload must publish the healed path"
     );
+    assert_eq!(std::fs::read(holding.join("payload")).unwrap(), b"retained");
 }
 
 /// The send dialog and live-send entry refuse an archived or trashed agent, even with its
@@ -3008,3 +3021,115 @@ fn tui_send_refuses_a_shelved_live_pane() {
 // side, which owns the archive write: `sessions::tests::archive_persists_under_the_lifecycle_lock`
 // and `sessions::tests::group_archive_gates_each_member_on_its_own_lifecycle_lock`
 // (`src/server/api/sessions/tests.rs`).
+
+/// Status grouping (#4867): headers keep the fixed attention order under any sort,
+/// bulk archive scopes to the selected status, and collapse persists per status.
+#[test]
+#[serial]
+fn status_grouping_orders_headers_and_persists_collapse() {
+    use crate::session::config::{AppStateConfig, GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut idle = Instance::new("idle", "/tmp/idle");
+    idle.status = Status::Idle;
+    let mut waiting = Instance::new("waiting", "/tmp/waiting");
+    waiting.status = Status::Waiting;
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let instances = vec![idle, waiting, running];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Status;
+    // The status order is fixed, so a timestamp sort must not reorder the headers.
+    view.sort_order = SortOrder::Newest;
+    view.flat_items = view.build_flat_items();
+
+    let layout: Vec<String> = view
+        .flat_items
+        .iter()
+        .map(|item| match item {
+            Item::Group { name, .. } => format!("group:{name}"),
+            Item::Session { id, .. } => format!(
+                "session:{}",
+                view.get_instance(id)
+                    .map_or("?", |inst| inst.title.as_str())
+            ),
+        })
+        .collect();
+    assert_eq!(
+        layout,
+        [
+            "group:Waiting",
+            "session:waiting",
+            "group:Idle",
+            "session:idle",
+            "group:Running",
+            "session:running",
+        ]
+    );
+
+    let waiting_id = view
+        .instances()
+        .find(|i| i.title == "waiting")
+        .map(|i| i.id.clone())
+        .expect("waiting instance");
+    view.selected_group = Some("Waiting".to_string());
+    assert_eq!(view.active_sessions_in_selected_group(), vec![waiting_id]);
+
+    view.status_group_collapsed
+        .insert("Waiting".to_string(), true);
+    view.flat_items = view.build_flat_items();
+    assert!(
+        view.flat_items.iter().any(|item| matches!(
+            item,
+            Item::Group {
+                name,
+                collapsed: true,
+                ..
+            } if name == "Waiting"
+        )),
+        "the Waiting header must render collapsed"
+    );
+    let session_rows = view
+        .flat_items
+        .iter()
+        .filter(|item| matches!(item, Item::Session { .. }))
+        .count();
+    assert_eq!(
+        session_rows, 2,
+        "only the Waiting row is hidden, got {:?}",
+        view.flat_items
+    );
+
+    view.save_status_group_collapsed();
+    let state = AppStateConfig::load().unwrap();
+    assert_eq!(state.status_group_collapsed, vec!["Waiting".to_string()]);
+
+    let fresh = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.status_group_collapsed.get("Waiting"),
+        Some(&true),
+        "a relaunched HomeView should restore the collapsed Waiting group"
+    );
+}

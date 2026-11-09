@@ -33,6 +33,7 @@ import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useStatusGroups } from "./hooks/useStatusGroups";
 import { useAttentionJump } from "./hooks/useAttentionJump";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
@@ -42,6 +43,7 @@ import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
 import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
+import { axisDrawsRepoHeaders } from "./lib/sidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
 import { useProjects } from "./hooks/useProjects";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -136,6 +138,7 @@ import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
 import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
+import { TrashReadFailed } from "./components/TrashReadFailed";
 import { ContentSplit } from "./components/ContentSplit";
 import { StructuredSessionStack } from "./components/StructuredSessionStack";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
@@ -415,6 +418,7 @@ function AppContent({
     loaded: sessionsLoaded,
     trashedCount,
     trashLoaded,
+    trashError,
     loadTrash,
     injectSession,
     setSessionStatus,
@@ -460,6 +464,8 @@ function AppContent({
   // An opened session missing from the list is neither gone nor trashed until the trash read has landed.
   const openedSessionSettled =
     sessionsLoaded && (trashLoaded || error || !openedSessionId || sessions.some((s) => s.id === openedSessionId));
+  // A failed Trash read leaves the opened session unread: not settled, and not gone either.
+  const openedSessionUnread = !openedSessionSettled && trashError;
 
   // What this window notices: a focus-mode window ignores every other session's attention and sounds.
   const windowSessions = useMemo(() => noticedSessions(sessions, focusSessionId), [sessions, focusSessionId]);
@@ -539,8 +545,24 @@ function AppContent({
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort, pluginAttention);
+  } = useRepoGroups(
+    workspaces,
+    workspaceOrdering,
+    sidebarSortMode,
+    projects,
+    pluginSort,
+    pluginAttention,
+    axisDrawsRepoHeaders(sidebarAxis),
+  );
   const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(
+    workspaces,
+    sidebarSortMode,
+    pluginSort,
+    pluginAttention,
+  );
+  // The status axis groups by execution status instead of by where a session
+  // lives, so it owns its own grouping and collapse state.
+  const { groups: statusGroups, toggleGroupCollapsed: toggleStatusGroupCollapsed } = useStatusGroups(
     workspaces,
     sidebarSortMode,
     pluginSort,
@@ -566,15 +588,18 @@ function AppContent({
     toggleRepoCollapsed: toggleOrgRepoCollapsed,
   } = useOrgGroups(repoGroups);
 
-  // The sidebar render path consumes one honest model (SidebarGroup): the
-  // repo axis maps in via an adapter, the user-group axis is already in
-  // that shape. Collapse routing follows the active axis so the two
-  // axes keep independent collapse state. See #1234.
-  const sidebarGroups = useMemo(
-    () => (sidebarAxis === "group" ? sessionGroups : repoGroups.map(repoGroupToSidebarGroup)),
-    [sidebarAxis, sessionGroups, repoGroups],
-  );
-  const toggleSidebarGroup = sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
+  // Collapse state is independent for each grouping axis.
+  const sidebarGroups = useMemo(() => {
+    if (sidebarAxis === "status") return statusGroups;
+    if (sidebarAxis === "group") return sessionGroups;
+    return repoGroups.map(repoGroupToSidebarGroup);
+  }, [sidebarAxis, statusGroups, sessionGroups, repoGroups]);
+  const toggleSidebarGroup =
+    sidebarAxis === "status"
+      ? toggleStatusGroupCollapsed
+      : sidebarAxis === "group"
+        ? toggleGroupCollapsed
+        : toggleRepoCollapsed;
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the
@@ -2204,6 +2229,7 @@ function AppContent({
           onSelectSession={selectPluginPageSession}
           renderSession={() => {
             if (!sessionsLoaded) return { title: "", view: <MainPaneSkeleton /> };
+            if (openedSessionUnread) return { title: "", view: <TrashReadFailed onRetry={loadTrash} /> };
             return activeSession ? { title: activeSession.title, view: renderSessionLayout() } : null;
           }}
           renderSessionMenu={(request) => (
@@ -2270,6 +2296,9 @@ function AppContent({
     // reappears once the fetch lands. Hold the minimal pre-auth shell
     // until the first fetch settles, then let the real fallback decide.
     // See #1351.
+    if (activeSessionId && openedSessionUnread) {
+      return <TrashReadFailed onRetry={loadTrash} />;
+    }
     if (activeSessionId && !openedSessionSettled) {
       // The shell (TopBar + sidebar) already renders around this; fill the main
       // pane with a skeleton rather than blanking it until the first fetch lands.
@@ -2623,6 +2652,7 @@ function AppContent({
                 onReorderWorkspaces={handleReorderWorkspaces}
                 onReorderGroups={reorderRepoGroups}
                 activeId={activeWorkspace?.id ?? null}
+                activeSessionId={activeSessionId}
                 open={sidebarOpen}
                 onToggle={() => setSidebarOpen(false)}
                 onSelect={handleSelectWorkspace}

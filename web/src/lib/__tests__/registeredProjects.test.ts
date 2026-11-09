@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { mergeRegisteredProjects, normalizeProjectPathKey, unpinnedSavedProjects } from "../registeredProjects";
 import { repoGroupToSidebarGroup, sidebarGroupShouldRender } from "../sidebarGroups";
 import { MULTI_REPO_GROUP_ID } from "../../hooks/useRepoGroups";
+import { axisDrawsRepoHeaders, type SidebarAxis } from "../sidebarAxis";
 import type { ProjectInfo, RepoGroup, Workspace } from "../types";
 
 function workspace(repoPath: string): Workspace {
@@ -155,6 +156,27 @@ describe("unpinnedSavedProjects (#2212)", () => {
     ],
   ])("%s", (_name, groups, projects, expected) => {
     expect(summary(unpinnedSavedProjects(groups, projects))).toEqual(expected);
+  });
+
+  // #5065: By group draws no repository headers, so a Project with live Sessions, or a pinned one, has nowhere
+  // else to appear; it lists every registered Project, each once.
+  it.each<[SidebarAxis, string[]]>([
+    ["repo", ["/work/saved"]],
+    ["org", ["/work/saved"]],
+    ["repo+group", ["/work/saved"]],
+    ["group", ["/work/alpha", "/work/pinned", "/work/saved"]],
+  ])("on the %s axis lists %j", (axis, expected) => {
+    const projects = [
+      unpinned("/work/alpha"),
+      project("/work/pinned"),
+      // A pinned Project registered in two scopes is still one row.
+      project("/work/pinned", { scope: "profile" }),
+      unpinned("/work/saved"),
+    ];
+    const listed = unpinnedSavedProjects([repoGroup("/work/alpha")], projects, undefined, {
+      drawsRepoHeaders: axisDrawsRepoHeaders(axis),
+    });
+    expect(listed.map((g) => g.repoPath)).toEqual(expected);
   });
 
   it("applies resolved alias/color", () => {

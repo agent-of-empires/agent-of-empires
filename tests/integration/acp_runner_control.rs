@@ -69,6 +69,24 @@ fn wait_for(path: &Path, what: &str) {
     }
 }
 
+fn connect_ready(path: &Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => return stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("control socket {} not ready: {error}", path.display()),
+        }
+    }
+}
+
 fn wait_for_u32(path: &Path, what: &str) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1377,8 +1395,9 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
-    wait_for(&control, "control socket");
-    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    let first = connect_ready(&control);
+    first.set_nonblocking(true).unwrap();
+    let mut first = tokio::net::UnixStream::from_std(first).unwrap();
     assert!(matches!(
         control_protocol::read_frame(&mut first).await.unwrap(),
         Some(ControlBody::Hello { .. })
@@ -1552,10 +1571,11 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
-    wait_for(&control, "control socket");
 
     // First daemon: establish the native session, then detach.
-    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    let first = connect_ready(&control);
+    first.set_nonblocking(true).unwrap();
+    let mut first = tokio::net::UnixStream::from_std(first).unwrap();
     assert!(matches!(
         control_protocol::read_frame(&mut first).await.unwrap(),
         Some(ControlBody::Hello { .. })
@@ -1849,9 +1869,15 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn native-identity runner"),
     );
-    wait_for(&control, "native-identity control socket");
+    let attach_count = std::cell::Cell::new(0);
     let attach = || {
-        let mut stream = UnixStream::connect(&control).unwrap();
+        attach_count.set(attach_count.get() + 1);
+        let mut stream = if attach_count.get() == 1 {
+            connect_ready(&control)
+        } else {
+            UnixStream::connect(&control)
+                .unwrap_or_else(|error| panic!("attach {} failed: {error}", attach_count.get()))
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -2321,6 +2347,8 @@ async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
     assert!(identity.birth_fingerprint.is_some());
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let detaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy_detaching = detaching.clone();
     let mut proxy = tokio::task::JoinSet::new();
     proxy.spawn(async move {
         let mut held_tx = Some(held_tx);
@@ -2331,7 +2359,13 @@ async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
                 .await
                 .unwrap();
             if attempt == 1 {
-                assert_proxy_copy(tokio::io::copy_bidirectional(&mut daemon, &mut producer).await);
+                let copied = tokio::io::copy_bidirectional(&mut daemon, &mut producer).await;
+                // Detach may close the daemon end mid-copy; any other failure is the proxy's.
+                if !matches!(&copied, Err(error) if error.kind() == std::io::ErrorKind::NotConnected
+                    && proxy_detaching.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    assert_proxy_copy(copied);
+                }
                 continue;
             }
             let hello = control_protocol::read_frame(&mut producer)
@@ -2409,7 +2443,11 @@ async fn borrowed_attach_timeout_preserves_real_runner_and_native_turn() {
     assert_eq!(supervisor.running_identity(id), Some(identity));
     held.release_turn().await;
     assert_original_turn_completed(&mut held, &store, &mut rx).await;
+    detaching.store(true, std::sync::atomic::Ordering::Release);
     supervisor.detach_all().await;
+    held.assert_runtime_alive();
+    let retained = worker_registry::load(id).unwrap().unwrap();
+    assert_eq!(RunnerIdentity::from_record(&retained), identity);
     proxy.join_next().await.unwrap().unwrap();
 }
 

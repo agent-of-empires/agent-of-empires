@@ -1,4 +1,4 @@
-import { memo, useId, useRef, useState } from "react";
+import { memo, useCallback, useId, useMemo, useRef, useState } from "react";
 import { Pin } from "lucide-react";
 import type { Workspace } from "../../lib/types";
 import { renameSession, type RuntimeCursor, type SessionMutation } from "../../lib/api";
@@ -7,21 +7,28 @@ import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { sessionRowChromeClass } from "../../lib/sessionRowChrome";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
-import type { OptimisticTriage } from "../../lib/sidebarOptimistic";
+import { EMPTY_OPTIMISTIC, type OptimisticTriage, type RowOptimistic } from "../../lib/sidebarOptimistic";
+import { sessionWorkspace } from "../../lib/sessionWorkspace";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
 import { statusMeaning } from "../../lib/statusLegend";
 import { StatusGlyph } from "../StatusGlyph";
 import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
-import { RowSubRows, RowTrailingBadges } from "./RowBadges";
+import { GroupExpandToggle, RowSubRows, RowTrailingBadges } from "./RowBadges";
 import { NAV_ITEM, onSidebarArrowKey } from "./keyboardNav";
 import { SessionActionsMenu, type SessionActionHandlers, type SessionMenuState } from "./SessionActions";
 import { useSessionRowModel } from "./useSessionRowModel";
-import type { RowActivate, RowBulkApi } from "./types";
+import type { ClickModifiers, RowActivate, RowBulkApi, RowContextScope } from "./types";
 import { useLongPress } from "./useLongPress";
 
+// A sibling row always navigates and never consults the group's selection.
+const NAVIGATE_ONLY: ClickModifiers = { metaKey: false, ctrlKey: false, shiftKey: false };
+const SINGLE_SCOPE: RowContextScope = { kind: "single" };
+
 export interface SessionRowProps extends SessionActionHandlers {
+  /** Identity of this rendered row; a workspace split across buckets has one per bucket. */
+  rowKey: string;
   workspace: Workspace;
   observedById: Record<string, RuntimeCursor>;
   runtimeEpoch: string | null;
@@ -33,15 +40,25 @@ export interface SessionRowProps extends SessionActionHandlers {
   indented?: boolean;
   optimistic: OptimisticTriage;
   bulkApi: RowBulkApi;
+  /** Only passed to rows that can expand, so a navigation does not re-render every other row. */
+  activeSessionId?: string | null;
+  /** Looks up an expanded sibling's own optimistic triage; only passed to rows that can expand. */
+  optimisticFor?: (workspace: Workspace) => RowOptimistic;
 }
 
 export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
-  const { workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
+  const { rowKey, workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
   const { model, setNotify, setColor } = useSessionRowModel(workspace, props.optimistic, isActive, props);
   const { label, sessionId, isDeleting, navigationSession } = model;
+  const [expanded, setExpanded] = useState(false);
+  const siblingBulkApi = useMemo<RowBulkApi>(() => ({ ...bulkApi, prepareScope: () => SINGLE_SCOPE }), [bulkApi]);
+  const activateSibling = useCallback<RowActivate>(
+    (_siblingId, _e, siblingSessionId) => onActivate(workspace.id, NAVIGATE_ONLY, siblingSessionId),
+    [onActivate, workspace.id],
+  );
 
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(label);
@@ -54,7 +71,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<SessionMenuState>(openedAtRef);
-  const openMenuAt = (x: number, y: number) => openMenu({ x, y, scope: bulkApi.prepareScope(workspace) });
+  const openMenuAt = (x: number, y: number) => openMenu({ x, y, scope: bulkApi.prepareScope(rowKey) });
   const longPress = useLongPress(!!sessionId && !isDeleting, (x, y) => {
     openedAtRef.current = Date.now();
     openMenuAt(x, y);
@@ -143,7 +160,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           if (e.button !== 0 || e.altKey) return;
           e.preventDefault();
           if (isDeleting || longPress.fired.current) return;
-          onActivate(workspace.id, e, navigationSessionId);
+          onActivate(rowKey, e, navigationSessionId);
         }}
         onContextMenu={(e) => {
           if (isDeleting) return;
@@ -237,6 +254,13 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 {label}
               </span>
               {!compact && <RowTrailingBadges workspace={workspace} model={model} />}
+              {!compact && (
+                <GroupExpandToggle
+                  count={workspace.sessions.length}
+                  expanded={expanded}
+                  onToggle={() => setExpanded((e) => !e)}
+                />
+              )}
             </span>
             {!compact && <RowSubRows first={model.firstSession} />}
           </div>
@@ -256,6 +280,28 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         onRename={startRename}
         bulkApi={bulkApi}
       />
+      {expanded && !compact && workspace.sessions.length > 1 && (
+        // The guide line is what reads as "these rows belong to the header above"; indentation
+        // alone is too subtle a shift to carry that on its own.
+        <div className="ml-4 border-l border-surface-700/50" data-testid="sidebar-expanded-sessions">
+          {workspace.sessions.map((session) => {
+            const sibling = sessionWorkspace(workspace, session);
+            return (
+              <SessionRow
+                key={session.id}
+                {...props}
+                workspace={sibling}
+                indented
+                isActive={session.id === (props.activeSessionId ?? null)}
+                isSelected={false}
+                onActivate={activateSibling}
+                bulkApi={siblingBulkApi}
+                optimistic={props.optimisticFor?.(sibling) ?? EMPTY_OPTIMISTIC}
+              />
+            );
+          })}
+        </div>
+      )}
     </>
   );
 });

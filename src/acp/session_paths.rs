@@ -1,6 +1,6 @@
 //! Display helpers for session-scoped file paths.
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPathRoots {
     pub id: String,
     pub project_path: String,
@@ -48,7 +48,7 @@ impl From<crate::daemon::SessionResponse> for SessionViewInfo {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceRepoRoot {
     pub name: String,
     pub source_path: String,

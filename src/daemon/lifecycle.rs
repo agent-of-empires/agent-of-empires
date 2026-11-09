@@ -8,6 +8,10 @@ use fs2::FileExt;
 
 pub(crate) struct Transaction(File);
 
+#[derive(Debug, thiserror::Error)]
+#[error("Daemon lifecycle is busy; retry after the current transition finishes")]
+pub(crate) struct TransactionBusy;
+
 pub(crate) struct Lifetime {
     _file: File,
 }
@@ -40,12 +44,20 @@ fn open_lock(name: &str) -> Result<File> {
 }
 
 impl Transaction {
-    /// Acquire the transaction, giving up after `wait`.
-    ///
-    /// The only blocking acquisition: a daemon transition holds the lock for as
-    /// long as it takes to start or stop, so a caller needs a bound and a message
-    /// naming the transition that is in the way. Its only caller is the TUI key
-    /// handler, where an unbounded wait would freeze the whole UI.
+    /// Daemon mutations must not wait here: the transition may be waiting for
+    /// that same daemon to exit.
+    pub(crate) fn try_acquire() -> Result<Self> {
+        let file = open_lock("transaction.lock")?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self(file)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(TransactionBusy.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Bound synchronous TUI actions so lifecycle transitions cannot freeze the UI.
     pub(crate) fn acquire_blocking_for(wait: Duration) -> Result<Self> {
         let file = open_lock("transaction.lock")?;
         let deadline = Instant::now() + wait;

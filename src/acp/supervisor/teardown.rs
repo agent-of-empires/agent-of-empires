@@ -193,14 +193,16 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
     {
         let id = lease.session_id();
         for task_id in sink.unresolved_background_task_ids(id) {
-            if !sink.publish_persisted(
-                id,
-                super::next_seq(seqs, id),
-                &Event::BackgroundTaskFinished {
-                    task_id,
-                    ended_at: Some(chrono::Utc::now()),
-                },
-            ) {
+            if !super::publish_with_next_seq(seqs, id, |seq| {
+                sink.publish_persisted(
+                    id,
+                    seq,
+                    &Event::BackgroundTaskFinished {
+                        task_id,
+                        ended_at: Some(chrono::Utc::now()),
+                    },
+                )
+            }) {
                 return false;
             }
         }
@@ -213,12 +215,16 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 warning: None,
                 ended_at: chrono::Utc::now(),
             };
-            if !sink.publish_persisted(id, super::next_seq(seqs, id), &event) {
+            if !super::publish_with_next_seq(seqs, id, |seq| {
+                sink.publish_persisted(id, seq, &event)
+            }) {
                 return false;
             }
         }
         if let Some(reason) = debt.reason {
-            if !sink.publish_persisted(id, super::next_seq(seqs, id), &Event::Stopped { reason }) {
+            if !super::publish_with_next_seq(seqs, id, |seq| {
+                sink.publish_persisted(id, seq, &Event::Stopped { reason })
+            }) {
                 return false;
             }
         }
@@ -353,41 +359,47 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
         for task_id in self.sink.unresolved_background_task_ids(session_id) {
-            if !self.sink.publish_persisted(
-                session_id,
-                super::next_seq(&self.next_seqs, session_id),
-                &Event::BackgroundTaskFinished {
-                    task_id,
-                    ended_at: Some(chrono::Utc::now()),
-                },
-            ) {
+            if !super::publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+                self.sink.publish_persisted(
+                    session_id,
+                    seq,
+                    &Event::BackgroundTaskFinished {
+                        task_id,
+                        ended_at: Some(chrono::Utc::now()),
+                    },
+                )
+            }) {
                 return Err(SupervisorError::TeardownPending(session_id.to_owned()));
             }
         }
         for agent_id in self.sink.unresolved_background_agent_ids(session_id) {
-            if !self.sink.publish_persisted(
-                session_id,
-                super::next_seq(&self.next_seqs, session_id),
-                &Event::BackgroundAgentCompleted {
-                    agent_id,
-                    status: BackgroundAgentStatus::Detached,
-                    tools: Vec::new(),
-                    result: None,
-                    warning: None,
-                    ended_at: chrono::Utc::now(),
-                },
-            ) {
+            if !super::publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+                self.sink.publish_persisted(
+                    session_id,
+                    seq,
+                    &Event::BackgroundAgentCompleted {
+                        agent_id,
+                        status: BackgroundAgentStatus::Detached,
+                        tools: Vec::new(),
+                        result: None,
+                        warning: None,
+                        ended_at: chrono::Utc::now(),
+                    },
+                )
+            }) {
                 return Err(SupervisorError::TeardownPending(session_id.to_owned()));
             }
         }
         if !stopped_already_persisted
-            && !self.sink.publish_persisted(
-                session_id,
-                super::next_seq(&self.next_seqs, session_id),
-                &Event::Stopped {
-                    reason: "user_stopped".to_owned(),
-                },
-            )
+            && !super::publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+                self.sink.publish_persisted(
+                    session_id,
+                    seq,
+                    &Event::Stopped {
+                        reason: "user_stopped".to_owned(),
+                    },
+                )
+            })
         {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
@@ -513,12 +525,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
     }
 
-    /// Stop a worker reclaimed for inactivity; with `observed`, only while
-    /// that epoch is still the running one.
+    /// Stop a worker reclaimed for inactivity; with `observed` (the epoch and
+    /// its admission count when seen idle), only while that epoch is still
+    /// running and has admitted no prompt since.
     pub(crate) async fn shutdown_idle(
         &self,
         session_id: &str,
-        observed: Option<&Lease>,
+        observed: Option<(&Lease, u64)>,
     ) -> Result<(), SupervisorError> {
         if observed.is_none() {
             self.cancel_restart_request(session_id).await;
@@ -685,7 +698,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         stop_reason: &str,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
-        observed: Option<&Lease>,
+        observed: Option<(&Lease, u64)>,
     ) -> Result<(), SupervisorError> {
         self.shutdown_with_reason_and_pending_cancellation(
             session_id,
@@ -704,7 +717,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         stop_reason: &str,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
-        observed: Option<&Lease>,
+        observed: Option<(&Lease, u64)>,
         cancel_pending: bool,
     ) -> Result<(), SupervisorError> {
         // Close the request lane before inspecting lifecycle state. Pending
@@ -736,12 +749,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut workers = self.workers.lock().await;
         let decision = {
             let mut lifecycle = lock_recover(&self.lifecycle);
-            if observed.is_some_and(|observed| {
+            if observed.is_some_and(|(observed, admissions)| {
                 lifecycle
                     .running(session_id)
-                    .map(|(lease, _)| lease)
-                    .as_ref()
-                    != Some(observed)
+                    .is_none_or(|(lease, _)| &lease != observed || lease.admissions() != admissions)
             }) {
                 return Err(SupervisorError::Superseded(session_id.into()));
             }
@@ -1856,16 +1867,18 @@ mod tests {
             id,
             &crate::acp::state::test_support::prompt("replacement turn"),
         );
-        p.sup.sink.inner.publish(
-            id,
-            super::super::next_seq(&p.sup.next_seqs, id),
-            &Event::BackgroundTaskStarted {
-                task_id: "replacement-task".into(),
-                tool_call_id: None,
-                description: "new work".into(),
-                workflow: None,
-            },
-        );
+        super::super::publish_with_next_seq(&p.sup.next_seqs, id, |seq| {
+            p.sup.sink.inner.publish(
+                id,
+                seq,
+                &Event::BackgroundTaskStarted {
+                    task_id: "replacement-task".into(),
+                    tool_call_id: None,
+                    description: "new work".into(),
+                    workflow: None,
+                },
+            )
+        });
         let record_path = worker_registry::record_path(id).unwrap();
         let replacement_record = std::fs::read(&record_path).unwrap();
         p.sup

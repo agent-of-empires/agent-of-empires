@@ -17,9 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap, SharedSet,
-    Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
-    RESTART_WINDOW,
+    lock_recover, publish_with_next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap,
+    SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
+    RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpClient, AcpError, ControlLoss, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -126,8 +126,9 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        let seq = next_seq(&self.next_seqs, &self.session_id);
-        self.sink.publish(&self.session_id, seq, &event);
+        publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+            self.sink.publish(&self.session_id, seq, &event)
+        });
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
@@ -211,14 +212,16 @@ impl<S: BroadcastSink> Drain<S> {
                 }
                 Event::AcpSessionAssigned { acp_session_id } => {
                     if let Some(pending) = self.context_reset.take() {
-                        self.sink.publish_from_worker(
-                            &self.session_id,
-                            next_seq(&self.next_seqs, &self.session_id),
-                            &Event::SessionContextReset {
-                                reason: pending.reason,
-                            },
-                            generation,
-                        );
+                        publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                            self.sink.publish_from_worker(
+                                &self.session_id,
+                                seq,
+                                &Event::SessionContextReset {
+                                    reason: pending.reason,
+                                },
+                                generation,
+                            )
+                        });
                         let id = self.session_id.clone();
                         let assigned = acp_session_id.clone();
                         let acknowledged = tokio::task::spawn_blocking(move || {
@@ -238,16 +241,18 @@ impl<S: BroadcastSink> Drain<S> {
                         };
                         if let Some(error) = failure {
                             end.startup_failed = true;
-                            self.sink.publish_from_worker(
-                                &self.session_id,
-                                next_seq(&self.next_seqs, &self.session_id),
-                                &Event::AgentStartupError {
-                                    message: format!(
-                                        "Could not commit the isolated native context: {error}"
-                                    ),
-                                },
-                                generation,
-                            );
+                            publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                                self.sink.publish_from_worker(
+                                    &self.session_id,
+                                    seq,
+                                    &Event::AgentStartupError {
+                                        message: format!(
+                                            "Could not commit the isolated native context: {error}"
+                                        ),
+                                    },
+                                    generation,
+                                )
+                            });
                             let client = self
                                 .workers
                                 .lock()
@@ -305,10 +310,11 @@ impl<S: BroadcastSink> Drain<S> {
                 }
                 _ => {}
             }
-            let seq = next_seq(&self.next_seqs, &self.session_id);
             // Tagged so a frame queued by a replaced worker cannot mutate runtime state.
-            self.sink
-                .publish_from_worker(&self.session_id, seq, &event, generation);
+            publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                self.sink
+                    .publish_from_worker(&self.session_id, seq, &event, generation)
+            });
         }
         end.established = established;
         end
