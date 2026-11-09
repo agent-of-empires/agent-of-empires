@@ -319,6 +319,12 @@ pub enum UpdatePreview {
     },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{id} is already installed; run `aoe plugin update {id}` or uninstall it first")]
+pub(crate) struct PluginAlreadyInstalled {
+    id: String,
+}
+
 struct PreparedInstall {
     persisted_source: String,
     unverified: bool,
@@ -368,7 +374,7 @@ async fn prepare_install(
         reject_incompatible_host(&fetched.manifest)?;
 
         if super::plugins_dir()?.join(&id).exists() {
-            bail!("{id} is already installed; run `aoe plugin update {id}` or uninstall it first");
+            return Err(PluginAlreadyInstalled { id }.into());
         }
 
         let capabilities = capability_strings(fetched)?;

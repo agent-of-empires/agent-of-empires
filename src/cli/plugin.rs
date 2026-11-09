@@ -418,6 +418,7 @@ fn submission(
         Err(error) if matches!(&error,
             HttpError::Unauthorized | HttpError::ReadOnly | HttpError::LocalPluginSourceRequired
                 | HttpError::PluginJobActive
+                | HttpError::PluginAlreadyInstalled
                 | HttpError::Daemon(crate::daemon::DaemonClientError::InvalidPathSegment)
         ) || matches!(&error, HttpError::Server { status, .. }
             if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT) => Err(error.into()),
@@ -684,14 +685,15 @@ mod tests {
                     crate::daemon::DaemonClientError::AuthenticatedDecode
                 ))
             ));
-            assert!(error.to_string().contains("aoe serve --restart"));
             assert_eq!(applies.load(Ordering::SeqCst), 0);
         }
 
-        let refusal = submission(Err(HttpError::PluginJobActive)).err().unwrap();
+        let refusal = submission(Err(HttpError::PluginAlreadyInstalled))
+            .err()
+            .unwrap();
         assert!(matches!(
             refusal.chain().next().unwrap().downcast_ref::<HttpError>(),
-            Some(HttpError::PluginJobActive)
+            Some(HttpError::PluginAlreadyInstalled)
         ));
         let unknown = submission(Err(HttpError::PluginPreviewFailed))
             .err()

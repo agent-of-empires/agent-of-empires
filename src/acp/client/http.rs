@@ -122,6 +122,8 @@ pub enum HttpError {
     PluginPreviewFailed,
     #[error("another plugin operation is running; wait for its outcome and inspect the plugin state before submitting again")]
     PluginJobActive,
+    #[error("plugin is already installed; run `aoe plugin update <id>` or `aoe plugin uninstall <id>` on the same Daemon endpoint")]
+    PluginAlreadyInstalled,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
     RevivalRequired,
     #[error("Auto-name skipped: the session changed or no title could be applied")]
@@ -1237,6 +1239,7 @@ fn classify_code(
         (_, Some(ApiErrorCode::LocalPluginSourceRequired)) => HttpError::LocalPluginSourceRequired,
         (_, Some(ApiErrorCode::PluginPreviewFailed)) => HttpError::PluginPreviewFailed,
         (_, Some(ApiErrorCode::PluginJobActive)) => HttpError::PluginJobActive,
+        (_, Some(ApiErrorCode::PluginAlreadyInstalled)) => HttpError::PluginAlreadyInstalled,
         (_, Some(ApiErrorCode::NoRevive)) => HttpError::RevivalRequired,
         (_, Some(ApiErrorCode::PendingTargetGone)) => HttpError::ApprovalGone,
         (_, Some(ApiErrorCode::SmartRenameSkipped)) => HttpError::SmartRenameSkipped,
@@ -2108,7 +2111,12 @@ mod tests {
     #[tokio::test]
     async fn plugin_failures_use_fixed_headers_without_waiting_for_sensitive_bodies() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        for (status, code) in [(502, "preview_failed"), (409, "plugin_job_active")] {
+        for (status, code) in [
+            (502, "preview_failed"),
+            (409, "plugin_job_active"),
+            (409, "plugin_already_installed"),
+            (502, "plugin_already_installed"),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -2126,7 +2134,9 @@ mod tests {
             let client =
                 HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
             let error = tokio::time::timeout(Duration::from_secs(2), async {
-                if status == 502 {
+                if code == "plugin_job_active" {
+                    client.uninstall_plugin("acme.fixture").await.err().unwrap()
+                } else {
                     client
                         .preview_plugin_install(&crate::daemon::InstallPreviewBody {
                             source: "gh:acme/fixture".into(),
@@ -2135,18 +2145,21 @@ mod tests {
                         .await
                         .err()
                         .unwrap()
-                } else {
-                    client.uninstall_plugin("acme.fixture").await.err().unwrap()
                 }
             })
             .await;
             server.abort();
             let _ = server.await;
             let error = error.unwrap();
-            assert!(matches!(
-                (status, &error),
-                (502, HttpError::PluginPreviewFailed) | (409, HttpError::PluginJobActive)
-            ));
+            match (status, code, &error) {
+                (502, "preview_failed", HttpError::PluginPreviewFailed)
+                | (409, "plugin_job_active", HttpError::PluginJobActive)
+                | (409, "plugin_already_installed", HttpError::PluginAlreadyInstalled) => {}
+                (502, "plugin_already_installed", HttpError::Server { body, .. }) => {
+                    assert!(body.is_empty());
+                }
+                other => panic!("unexpected refusal classification: {other:?}"),
+            }
             assert!(!error.to_string().contains("secret-daemon-credential"));
         }
     }

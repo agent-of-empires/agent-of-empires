@@ -1035,9 +1035,14 @@ pub async fn preview_plugin_install(
 }
 
 fn preview_failure(error: anyhow::Error) -> Response {
+    let code = if error.is::<plugin::install::PluginAlreadyInstalled>() {
+        crate::daemon::ApiErrorCode::PluginAlreadyInstalled
+    } else {
+        crate::daemon::ApiErrorCode::PluginPreviewFailed
+    };
     let cause = super::logs::redact(&format!("{error:#}"));
     tracing::warn!(target: "plugin.install", error = %cause, "plugin preview failed");
-    super::api_error_with_code_header(crate::daemon::ApiErrorCode::PluginPreviewFailed, cause)
+    super::api_error_with_code_header(code, cause)
 }
 
 /// `POST /api/plugins/install`: apply a fingerprint-approved candidate.
@@ -1366,6 +1371,16 @@ mod tests {
         ));
         assert!(built.exists());
         assert!(node_calls.exists());
+        let before = Config::load().unwrap().plugins["aoe.dev-fixture"].clone();
+        let calls = std::fs::read(&node_calls).unwrap();
+        let response = preview(state.clone()).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            crate::daemon::ApiErrorCode::from_headers(response.status(), response.headers(), false,),
+            Some(crate::daemon::ApiErrorCode::PluginAlreadyInstalled),
+        );
+        assert_eq!(Config::load().unwrap().plugins["aoe.dev-fixture"], before);
+        assert_eq!(std::fs::read(&node_calls).unwrap(), calls);
         let entry = Config::load().unwrap().plugins["aoe.dev-fixture"].clone();
         assert!(entry.dev);
         assert!(entry.grant.is_some());

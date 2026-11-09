@@ -4,24 +4,6 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
-## Unreleased
-
-### Bug Fixes
-
-- **plugin:** Reject special-file staging races, retain release-asset staging and
-  exclusion through blocking preparation, and supervise Git/build commands with
-  a shared two-hour budget and exit-before-rollback ownership.
-- **tui:** Discard stale plugin settings edits after lifecycle replacement or
-  removal, and keep update apply/restart in a pinned local Daemon job after TUI exit.
-- **plugin:** Keep direct command groups reserved until physical settlement, fence
-  external worker recovery, and roll back installation trees with target metadata.
-  Validate local release executables and log redacted preview causes.
-- **tui:** Coalesce update observation, stop polling when its dialog is destroyed,
-  preserve source notices, and invalidate editors whose plugin lifecycle changed.
-- **plugin:** Expose full Daemon-host job log paths and allow long-running previews
-  without extending normal request deadlines.
-
-
 ## [1.22.3](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.3) - 2026-11-08
 
 

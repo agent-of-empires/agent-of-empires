@@ -230,9 +230,11 @@ Apply returns `202` with `job_id`; observe it through
 The response's existing `log` object contains `path` (the actual Daemon-host
 filename), `exists`, `tail`, `lines_returned` and `truncated`. A bounded tail may
 omit the original diagnostic; recover the full file on that host using `path`.
-Preview failures return `502` with `AoE-Error-Code: preview_failed`; conflicting
-Daemon jobs return `409` with `AoE-Error-Code: plugin_job_active`. Native clients
-show fixed recovery guidance from these codes without reflecting response bodies.
+Generic preview failures return `502` with `AoE-Error-Code: preview_failed`.
+An already-installed install preview returns `409` with
+`AoE-Error-Code: plugin_already_installed`; conflicting Daemon jobs return `409`
+with `AoE-Error-Code: plugin_job_active`. Native clients show fixed recovery
+guidance from these codes without reflecting response bodies.
 The Daemon warns with the redacted chained preview cause under `plugin.install`.
 Native install/update preview transport deadlines are two hours plus ten minutes;
 mutation submission, job polling and general send deadlines are unchanged.

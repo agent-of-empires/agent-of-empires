@@ -15,6 +15,7 @@ pub enum ApiErrorCode {
     LocalPluginSourceRequired,
     PluginPreviewFailed,
     PluginJobActive,
+    PluginAlreadyInstalled,
     LifecycleLocked,
     TrashIncomplete,
     LifecycleSuperseded,
@@ -54,6 +55,7 @@ impl ApiErrorCode {
             Self::LocalPluginSourceRequired => "local_plugin_source_required",
             Self::PluginPreviewFailed => "preview_failed",
             Self::PluginJobActive => "plugin_job_active",
+            Self::PluginAlreadyInstalled => "plugin_already_installed",
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
@@ -106,6 +108,7 @@ impl ApiErrorCode {
             | Self::CreateOutcomeUnknown
             | Self::AgentHooksNotApproved
             | Self::PluginJobActive
+            | Self::PluginAlreadyInstalled
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
@@ -156,6 +159,7 @@ impl ApiErrorCode {
             b"local_plugin_source_required" => Self::LocalPluginSourceRequired,
             b"preview_failed" => Self::PluginPreviewFailed,
             b"plugin_job_active" => Self::PluginJobActive,
+            b"plugin_already_installed" => Self::PluginAlreadyInstalled,
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,

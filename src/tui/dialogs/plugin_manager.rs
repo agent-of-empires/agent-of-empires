@@ -129,6 +129,7 @@ async fn observe_update(
                     | HttpError::ReadOnly
                     | HttpError::LocalPluginSourceRequired
                     | HttpError::PluginJobActive
+                    | HttpError::PluginAlreadyInstalled
                     | HttpError::Daemon(crate::daemon::DaemonClientError::InvalidPathSegment)
             ) || matches!(&error, HttpError::Server { status, .. }
                 if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT);
