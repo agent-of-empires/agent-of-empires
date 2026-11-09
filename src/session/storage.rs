@@ -1437,6 +1437,8 @@ impl LaunchConfig {
 pub(crate) enum CaptureStorage<'a> {
     Profiles(&'a Arc<FileWatchService>),
     Scoped(&'a dyn SessionStore),
+    /// Caller-provided profile stores; Capture still acquires lifecycle ownership.
+    Provided(&'a dyn Fn(&str) -> Result<&'a dyn SessionStore>),
 }
 
 impl CaptureStorage<'_> {
@@ -1447,12 +1449,8 @@ impl CaptureStorage<'_> {
     ) -> Result<LaunchConfig> {
         match self {
             Self::Profiles(_) => Ok(local_launch_configuration(profile, project)),
-            Self::Scoped(storage) => {
-                anyhow::ensure!(
-                    storage.storage().profile() == profile,
-                    "capture profile changed during launch"
-                );
-                storage.launch_configuration(project)
+            Self::Scoped(_) | Self::Provided(_) => {
+                self.with_store(profile, |storage| storage.launch_configuration(project))
             }
         }
     }
@@ -1462,19 +1460,19 @@ impl CaptureStorage<'_> {
         profile: &str,
         action: impl FnOnce(&dyn SessionStore) -> Result<R>,
     ) -> Result<R> {
-        match self {
+        let storage = match self {
             Self::Profiles(file_watch) => {
                 let storage = Storage::new(profile, (*file_watch).clone())?;
-                action(&storage)
+                return action(&storage);
             }
-            Self::Scoped(storage) => {
-                anyhow::ensure!(
-                    storage.storage().profile() == profile,
-                    "capture profile changed during launch"
-                );
-                action(*storage)
-            }
-        }
+            Self::Scoped(storage) => *storage,
+            Self::Provided(provider) => provider(profile)?,
+        };
+        anyhow::ensure!(
+            storage.storage().profile() == profile,
+            "capture profile changed during launch"
+        );
+        action(storage)
     }
 }
 

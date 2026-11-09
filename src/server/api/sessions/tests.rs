@@ -7172,7 +7172,7 @@ pub(super) mod terminal_custody {
     fn producer_command(received: &std::path::Path) -> String {
         let received = crate::session::environment::shell_escape(received.to_str().unwrap());
         let script = format!(
-            "printf 'READY\\n' >> {received}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {received}; done"
+            "printf 'PID %s\\nREADY\\n' \"$$\" >> {received}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {received}; done"
         );
         format!(
             "/bin/sh -c {}",
@@ -7510,7 +7510,14 @@ pub(super) mod terminal_custody {
             let session = row.tmux_session()?;
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
             session.create(&row.project_path, Some(&row.command), &row.source_profile)?;
-            await_line(&original_received, "READY").await;
+            let original_entry = await_line(&original_received, "READY").await;
+            let original_pid: u32 = original_entry
+                .lines()
+                .find_map(|line| line.strip_prefix("PID "))
+                .ok_or_else(|| anyhow::anyhow!("original final process did not publish its pid"))?
+                .parse()?;
+            let original_birth = crate::process::process_birth_identity(original_pid)?
+                .ok_or_else(|| anyhow::anyhow!("original final process birth unavailable"))?;
             crate::server::test_support::seed_instances_on_disk_for_test(
                 &row.source_profile,
                 vec![row.clone()],
@@ -7545,6 +7552,19 @@ pub(super) mod terminal_custody {
             let replacement_received = root.path().join("replacement-received");
             let replacement = replace_runtime(&state, &row.id, &replacement_received).await?;
             assert!(replacement.lifecycle_generation > row.lifecycle_generation);
+            let replacement_entry = await_line(&replacement_received, "READY").await;
+            let replacement_pid: u32 = replacement_entry
+                .lines()
+                .find_map(|line| line.strip_prefix("PID "))
+                .ok_or_else(|| anyhow::anyhow!("replacement final process did not publish its pid"))?
+                .parse()?;
+            let replacement_birth = crate::process::process_birth_identity(replacement_pid)?
+                .ok_or_else(|| anyhow::anyhow!("replacement final process birth unavailable"))?;
+            assert_ne!(
+                (replacement_pid, &replacement_birth),
+                (original_pid, &original_birth),
+                "the replacement must have its own acknowledged final-process birth"
+            );
             let (status, target) = response_json(
                 ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
                     .await
@@ -7556,6 +7576,39 @@ pub(super) mod terminal_custody {
             gate.release();
             let (old_status, old_body) =
                 response_json(tokio::time::timeout(Duration::from_secs(10), old).await??).await?;
+            assert_eq!(old_status, StatusCode::CONFLICT, "{old_body}");
+            assert_eq!(old_body["error"], "lifecycle_superseded", "{old_body}");
+            assert_eq!(std::fs::read_to_string(&original_received)?, original_entry);
+
+            // A fresh operation on that replacement refuses an unknown physical
+            // observation without changing it or permanently fencing later input.
+            let real_tmux = which::which("tmux")?;
+            let probe_bin = root.path().join("unknown-probe");
+            std::fs::create_dir(&probe_bin)?;
+            let probe_seen = root.path().join("unknown-probe-seen");
+            let shim = probe_bin.join("tmux");
+            let quote = crate::session::environment::shell_escape_script_word;
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nfor arg do\nif [ \"$arg\" = '#{{n:socket_path}}|#{{socket_path}}|#{{session_id}}|#{{pane_id}}|#{{pane_pid}}|#{{pid}}|#{{pane_dead}}|#{{pane_current_command}}|#{{pane_start_command}}' ]; then\n: > {}\nprintf 'malformed\\n'\nexit 0\nfi\ndone\nexec {} \"$@\"\n",
+                quote(&probe_seen.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()),
+            ))?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
+            let (unknown_status, unknown_body) = {
+                let _path = crate::session::test_support::path_prepended(&probe_bin);
+                response_json(
+                    ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                        .await
+                        .into_response(),
+                )
+                .await?
+            };
+            assert!(probe_seen.exists(), "the real physical query was not intercepted");
+            assert_eq!(unknown_status, StatusCode::CONFLICT, "{unknown_body}");
+            assert_eq!(unknown_body["error"], "launch_indeterminate", "{unknown_body}");
+            assert_eq!(std::fs::read_to_string(&replacement_received)?, replacement_entry);
+            assert!(crate::process::process_birth_is_live(replacement_pid, &replacement_birth)?);
             let (fresh_status, fresh_body) = response_json(
                 send_message(
                     State(state.clone()),
@@ -7571,12 +7624,26 @@ pub(super) mod terminal_custody {
             .await?;
             assert_eq!(fresh_status, StatusCode::OK, "{fresh_body}");
             let received = await_line(&replacement_received, "FRESH").await;
+            assert_eq!(received.lines().filter(|line| *line == "FRESH").count(), 1);
             let stored = Storage::open_unwatched(&row.source_profile)?
                 .load()?
                 .into_iter()
                 .find(|stored| stored.id == row.id)
                 .unwrap();
             assert_eq!(stored.conversation_state(), conversation);
+            assert_eq!(stored.lifecycle_generation, replacement.lifecycle_generation);
+            assert_eq!(
+                state.instances.read().await.iter().find(|live| live.id == row.id)
+                    .unwrap().lifecycle_generation,
+                stored.lifecycle_generation,
+            );
+            assert!(crate::process::process_birth_is_live(replacement_pid, &replacement_birth)?);
+            let (after_status, after) = response_json(
+                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                    .await.into_response(),
+            ).await?;
+            assert_eq!(after_status, StatusCode::OK, "{after}");
+            assert_eq!(after["physical"], target["physical"]);
             assert_eq!(
                 std::fs::read_to_string(&transcript)?,
                 "preserved conversation\n"
