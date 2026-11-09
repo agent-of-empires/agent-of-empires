@@ -132,6 +132,14 @@ impl ConnectionState {
             && !self.driver_finished()
     }
 
+    pub(super) fn initial_prompt_intent_available(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == 1
+            && !self.usable.load(Ordering::Acquire)
+            && self.loss().is_none()
+            && !self.is_stopping()
+            && !self.driver_finished()
+    }
+
     pub(super) fn driver_finished(&self) -> bool {
         self.foreground_finished.load(Ordering::Acquire)
     }
@@ -396,12 +404,13 @@ pub(super) async fn run_connection_task<W, R>(
                     .connection_state
                     .sdk_closing
                     .store(true, Ordering::Release);
-                shared
-                    .connection_state
-                    .observe(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
-                shared.connection_state.mark_ordered_loss();
                 if let Some(control) = control {
-                    control.shutdown();
+                    control.close_sdk_route(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
+                } else {
+                    shared.connection_state.observe(
+                        AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded,
+                    );
+                    shared.connection_state.mark_ordered_loss();
                 }
                 // Preserve an earlier correlated response's diagnostic and
                 // terminal before this actual SDK close cancels foreground.

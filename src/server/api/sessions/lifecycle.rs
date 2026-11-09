@@ -199,7 +199,7 @@ impl Drop for ArchiveReservationRelease {
             crate::session::SessionStore::defer_lifecycle_release(
                 native,
                 std::mem::take(&mut self.id),
-                LifecycleOperation::Stop,
+                crate::session::LifecycleRelease::Reservation(LifecycleOperation::Stop),
                 generation,
                 None,
             );
@@ -1824,7 +1824,7 @@ async fn finish_structured_user_stop(
                 });
             let released = native.release_lifecycle_reservation(
                 &release_id,
-                LifecycleOperation::Stop,
+                crate::session::LifecycleRelease::Reservation(LifecycleOperation::Stop),
                 generation,
                 Some(lifecycle),
             );
@@ -2818,13 +2818,14 @@ pub(super) async fn discard_stale_continuation(
 /// A restart that was superseded meanwhile (a stop or a newer launch) installs nothing. An explicit
 /// wake message takes precedence over the interrupted prompt, but the manual breadcrumb still
 /// disarms the auto-resume budget exactly once.
+/// A failed durable breadcrumb aborts the restart rather than authorizing its default wake.
 pub(super) async fn continue_interrupted_prompt(
     state: &Arc<AppState>,
     id: &str,
     generation: u64,
     resets_at: chrono::DateTime<chrono::Utc>,
     explicit_wake: bool,
-) -> bool {
+) -> anyhow::Result<bool> {
     let submission = state.session_service.prompt_submission(id).await;
     let current = state.instances.read().await.iter().any(|row| {
         row.id == id
@@ -2833,18 +2834,18 @@ pub(super) async fn continue_interrupted_prompt(
             && row.ensure_startable().is_ok()
     });
     if !current {
-        return false;
+        return Ok(false);
     }
     // Published while this task still owns the submission authority, so a newer limit and its
     // automatic resume cannot slip in between and be disarmed by an older breadcrumb.
     state
         .acp_supervisor
-        .publish_rate_limit_auto_resumed(id, resets_at, true);
+        .publish_rate_limit_auto_resumed(id, resets_at, true)?;
     if explicit_wake {
         // The stale-continuation clear belongs before the spawn (`discard_stale_continuation`); by
         // now newer work may have been installed, and it must survive.
         drop(submission);
-        return false;
+        return Ok(false);
     }
     // A continuation already pending is work too, even when the interrupted prompt is gone.
     let pending_before = state
@@ -2855,12 +2856,13 @@ pub(super) async fn continue_interrupted_prompt(
         .any(|row| row.id == id && row.pending_initial_turn.is_some());
     use crate::server::acp_reconciler::ContinuationOutcome;
     let outcome =
-        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, &submission).await;
-    pending_before
+        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, &submission)
+            .await;
+    Ok(pending_before
         || matches!(
             outcome,
             ContinuationOutcome::Installed | ContinuationOutcome::SupersededByQueue
-        )
+        ))
 }
 
 async fn finish_structured_restart(
@@ -2997,7 +2999,7 @@ async fn finish_structured_restart(
         .await?;
         let continued = match resumes_rate_limit {
             Some(resets_at) => {
-                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await
+                continue_interrupted_prompt(state, id, generation, resets_at, wake_requested).await?
             }
             None => false,
         };
@@ -3449,6 +3451,11 @@ async fn prepare_agent_session_inner(
                 );
             }
         }
+        let mut revival = if worker_restart.is_some() && !outgoing.is_structured() {
+            outgoing.capture_revival_target()?
+        } else {
+            None
+        };
         if let Some(body) = &worker_restart {
             account_swap_precondition(&outgoing, body)
                 .map_err(LifecycleTargetError::AccountSwapRefused)?;
@@ -3614,6 +3621,7 @@ async fn prepare_agent_session_inner(
                         }),
                         crate::session::LifecycleReservationError::Superseded
                     );
+                    revival = admission.revival_target();
                     start_admission = Some(admission);
                 }
                 let generation = row.try_acquire_lifecycle_reservation(
@@ -3681,11 +3689,13 @@ async fn prepare_agent_session_inner(
         }) {
             started.discard_reserved_restart_container(store, started.lifecycle_generation)?;
         }
-        let generation = started.prepare_reserved_launch_hooks(
+        let reservation = started.prepare_reserved_launch_hooks(
             store,
             preparation == AgentPreparation::Restart && worker_restart.is_none(),
             crate::session::LaunchReservation {
                 generation: started.lifecycle_generation,
+                revival,
+                start_admission,
                 title_lock,
                 lifecycle_lock,
             },
@@ -3693,11 +3703,10 @@ async fn prepare_agent_session_inner(
         drop(identity);
         Ok((
             Some((
-                generation,
+                reservation,
                 started,
                 native,
                 (account_swap, conversation_carry),
-                start_admission,
             )),
             None,
         ))
@@ -3716,8 +3725,9 @@ async fn prepare_agent_session_inner(
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
-        Ok(Ok(Some((generation, mut started, native, conversation_carry, start_admission)))) => {
+        Ok(Ok(Some((reservation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
+                let generation = reservation.generation;
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
                     crate::session::recovery::HookTimeoutScope::new(
                         crate::session::recovery::recovery_hook_timeout(),
@@ -3730,12 +3740,11 @@ async fn prepare_agent_session_inner(
                     Some(generation),
                 );
                 Ok(Some((
-                    generation,
+                    reservation,
                     started,
                     native,
                     hooks,
                     conversation_carry,
-                    start_admission,
                 )))
             })
             .await
@@ -3745,12 +3754,12 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((generation, started, native, hooks, carry, _)))) if started.is_structured() => {
+        Ok(Ok(Some((reservation, started, native, hooks, carry)))) if started.is_structured() => {
             return finish_structured_restart(
                 &state,
                 &id,
                 StructuredRestartLaunch {
-                    generation,
+                    generation: reservation.generation,
                     started,
                     native,
                     hooks,
@@ -3774,16 +3783,10 @@ async fn prepare_agent_session_inner(
     let mut restart_identity = None;
     let adoption_state = state.clone();
     let result = match hooked {
-        Ok(Ok(Some((
-            generation,
-            mut started,
-            native,
-            hooks,
-            conversation_carry,
-            start_admission,
-        )))) => {
+        Ok(Ok(Some((reservation, mut started, native, hooks, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
+                let generation = reservation.generation;
                 let outcome = started.finish_reserved_launch(
                     &native,
                     size,
@@ -3795,9 +3798,8 @@ async fn prepare_agent_session_inner(
                         },
                         restart: preparation == AgentPreparation::Restart,
                         conversation_carry: conversation_carry.1,
-                        start_admission,
                     },
-                    generation,
+                    reservation,
                     hooks,
                 );
                 let born_at = started.created_at;
@@ -3812,6 +3814,11 @@ async fn prepare_agent_session_inner(
                 tokio::runtime::Handle::current().block_on(
                     durable_stop_tests::pause_before_adoption(&started.id),
                 );
+                let pending_release = outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is::<crate::session::LaunchFinalizationPending>())
+                    .then(|| started.id.clone());
                 let adoption = (|| -> anyhow::Result<_> {
                 let _title = crate::session::acquire_session_title_lock(&started.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&started.id)?;
@@ -3855,26 +3862,41 @@ async fn prepare_agent_session_inner(
                 crate::server::pane::sample_panes(
                     row, tools, panes.as_ref(), legacy_scope.as_ref(), None,
                 );
-                // Current observations may update the view, but cannot mint an
-                // old operation's Created receipt for a different physical owner.
-                let prepared = super::ensure::PreparedAgentTarget::captured(
-                    born_at, generation, profile.clone(), born_pane,
-                    if preparation == AgentPreparation::Restart {
-                        crate::daemon::TerminalTargetStatus::Restarted
-                    } else {
-                        crate::daemon::TerminalTargetStatus::Created
-                    },
-                    native,
-                );
                 adoption_state.mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 adoption_state.runtime.request_publish();
-                    Ok((profile, prepared))
+                    Ok(profile)
                 })();
+                if let Some(id) = pending_release {
+                    native.defer_lifecycle_release(
+                        id,
+                        crate::session::LifecycleRelease::IndeterminateLaunch,
+                        generation,
+                        None,
+                    );
+                    return Err(outcome.expect_err("pending release retains the launch error"));
+                }
                 match adoption {
-                    Ok((profile, prepared)) => Ok(Some((generation, profile, outcome, prepared))),
+                    Ok(profile) => {
+                        // Only this operation's captured birth can authorize its target.
+                        let prepared = super::ensure::PreparedAgentTarget::captured(
+                            born_at, generation, profile.clone(), born_pane,
+                            if preparation == AgentPreparation::Restart {
+                                crate::daemon::TerminalTargetStatus::Restarted
+                            } else {
+                                crate::daemon::TerminalTargetStatus::Created
+                            },
+                            native,
+                        );
+                        Ok(Some((generation, profile, outcome, prepared)))
+                    }
                     Err(adoption_error) => match outcome {
-                        // Adoption must not replace the original migration failure.
-                        Err(error) if error.is::<crate::migrations::SandboxMigrationError>() => Err(error),
+                        // Adoption cannot replace migration failure or retained finalization debt.
+                        Err(error)
+                            if error.is::<crate::migrations::SandboxMigrationError>()
+                                || error.is::<crate::session::LaunchFinalizationPending>() =>
+                        {
+                            Err(error)
+                        }
                         _ => Err(adoption_error),
                     },
                 }
@@ -3901,9 +3923,15 @@ async fn prepare_agent_session_inner(
         .is_some_and(|error| error.is::<crate::migrations::SandboxMigrationError>());
     let outcome = match outcome {
         Err(error) => {
-            let response = if let Some(response) = lifecycle_rejection(&state, &error) {
+            let response = if let Some(&cause) =
+                error.downcast_ref::<crate::session::LaunchIndeterminateCause>()
+            {
+                super::ensure::indeterminate_launch_response(cause)
+            } else if let Some(response) = lifecycle_rejection(&state, &error) {
                 response
-            } else if error.is::<crate::session::NativeStoreUnavailable>() {
+            } else if error.is::<crate::session::NativeStoreUnavailable>()
+                || error.is::<crate::session::LaunchFinalizationPending>()
+            {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             } else if error.is::<crate::session::HostHookApprovalRequired>() {
                 crate::server::api::api_error_with_code_header(

@@ -331,7 +331,7 @@ pub(super) fn channel_sink() -> (
 
 /// Isolate HOME under a short `/tmp` path so runner socket paths stay valid.
 pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, tempfile::TempDir) {
-    let tmp = tempfile::TempDir::with_prefix_in("aoe-lease-", "/tmp").unwrap();
+    let tmp = tempfile::TempDir::with_prefix_in("aoe-", "/tmp").unwrap();
     let home = crate::session::test_support::isolate_app_dir_at(tmp.path());
     (home, tmp)
 }
@@ -667,6 +667,21 @@ enum HeldChild {
     Constructor(Option<tokio::process::Child>),
 }
 
+impl Drop for HeldChild {
+    fn drop(&mut self) {
+        match self {
+            Self::Retained(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Self::Constructor(Some(child)) => {
+                let _ = child.start_kill();
+            }
+            Self::Constructor(None) => {}
+        }
+    }
+}
+
 /// A real child-owned control peer with causal handshake, replay and prompt gates.
 pub(crate) struct HeldAttachRunner {
     pub(crate) record: WorkerRecord,
@@ -946,7 +961,7 @@ for attempt in range(2):
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .process_group(0);
-        let (child, pid, completion, stdout) =
+        let (mut child, pid, completion, stdout) =
             if matches!(&mode, AttachPeerMode::IncompatibleHello(_)) {
                 let mut child = tokio::process::Command::from(command)
                     .kill_on_drop(true)
@@ -963,6 +978,26 @@ for attempt in range(2):
                     tokio::process::ChildStdout::from_std(child.stdout.take().unwrap()).unwrap();
                 (HeldChild::Retained(child), pid, completion, stdout)
             };
+        let mut lines = BufReader::new(stdout).lines();
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(10), lines.next_line(),
+        ).await;
+        if !matches!(&ready, Ok(Ok(Some(line))) if line == "ready") {
+            match &mut child {
+                HeldChild::Retained(child) => {
+                    let _ = child.kill();
+                    child.wait().expect("reap original child before publication");
+                }
+                HeldChild::Constructor(Some(child)) => {
+                    let _ = child.kill().await;
+                    child.wait().await.expect("reap original constructor before publication");
+                }
+                HeldChild::Constructor(None) => unreachable!("original child has not transferred"),
+            }
+            panic!("fixture did not bind its actual child-owned socket: {ready:?}");
+        }
+        // Read kernel identity only after final startup, while retaining the original Child.
+        // Ready is a scheduling barrier, not an ownership attestation.
         let mut record = WorkerRecord::new(
             session_id.into(),
             pid,
@@ -983,21 +1018,15 @@ for attempt in range(2):
             unit: format!("aoe-attach-{session_id}-{generation}.scope"),
         };
         let identity = RunnerIdentity::from_record(&record);
-        let (ready_tx, ready) = tokio::sync::oneshot::channel();
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
         let (resumed_tx, resumed) = mpsc::channel(2);
         let (prompt_tx, prompts) = mpsc::channel(2);
         let peer = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            let mut ready_tx = Some(ready_tx);
             let mut entered_tx = Some(entered_tx);
             let mut disconnected_tx = Some(disconnected_tx);
             while let Some(line) = lines.next_line().await.unwrap() {
                 match line.as_str() {
-                    "ready" => {
-                        ready_tx.take().unwrap().send(()).unwrap();
-                    }
                     "entered" => {
                         entered_tx.take().unwrap().send(()).unwrap();
                     }
@@ -1038,10 +1067,6 @@ for attempt in range(2):
                 };
                 lease.record_spawned_child(child.take().unwrap(), identity);
             }
-            tokio::time::timeout(std::time::Duration::from_secs(10), ready)
-                .await
-                .expect("fixture bound its actual child-owned socket")
-                .unwrap();
             worker_registry::save(&runner.record).unwrap();
         })
         .catch_unwind()
@@ -1204,18 +1229,9 @@ pub(crate) async fn refused_owned_constructor<S: BroadcastSink>(
 impl Drop for HeldAttachRunner {
     fn drop(&mut self) {
         self.peer.abort();
-        match &mut self.child {
-            HeldChild::Retained(child) => {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            HeldChild::Constructor(Some(child)) => {
-                let _ = child.start_kill();
-            }
-            HeldChild::Constructor(None) => {
-                crate::acp::runner_lifecycle::SystemProcessControl::default()
-                    .kill_group(self.identity);
-            }
+        if let HeldChild::Constructor(None) = &self.child {
+            crate::acp::runner_lifecycle::SystemProcessControl::default()
+                .kill_group(self.identity);
         }
     }
 }

@@ -2167,10 +2167,10 @@ impl SessionService {
         })
         .await;
         let (projection, wait) = match result {
-            Ok(Ok(projection)) => (
-                projection.with_prompt_wake_eligibility(prompt_wake_eligible),
-                None,
-            ),
+            Ok(Ok(projection)) => {
+                let eligible = projection.prompt_wake_eligible || prompt_wake_eligible;
+                (projection.with_prompt_wake_eligibility(eligible), None)
+            }
             Ok(Err(wait)) => (Default::default(), Some(wait)),
             Err(_) => (Default::default(), None),
         };

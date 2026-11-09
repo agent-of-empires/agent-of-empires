@@ -949,6 +949,10 @@ impl AcpClient {
         self.connection_state.ready()
     }
 
+    pub(crate) fn initial_prompt_intent_available(&self) -> bool {
+        self.connection_state.initial_prompt_intent_available()
+    }
+
     pub(crate) fn connected_runner(&self) -> Option<crate::acp::runner_lifecycle::RunnerIdentity> {
         self.connected_runner
     }

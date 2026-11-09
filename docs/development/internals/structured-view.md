@@ -205,6 +205,7 @@ teardown; this is not permission for new native I/O or callback effects.
 An already correlated completion remains its genuine outcome even if its SDK
 relay marker, or a later relay, fails. The separate connection loss fences
 further native controls; it cannot rewrite a completed result as `NativeLost`.
+An unreachable SDK output route releases only an outcome already correlated by the control reader, before waking ordered-loss foreground cancellation. SDK output EOF and actual SDK close share that retirement path. Ordinary runner EOF does not release a marker still readable by the SDK; its earlier ordered completion remains deliverable.
 An idle established command loop observes the ordered loss boundary so SDK
 close cannot wait forever for that foreground to finish. Pending-ingress
 overflow fails closed, discards its uncommitted replay and establishes its own
@@ -238,6 +239,9 @@ publishing worker epoch. Unknown origin or recoverability stays unknown.
 Terminal observations use the separate instance lifecycle-generation namespace.
 Publication rejects superseded workers before allocating a sequence, persisting
 or folding. Snapshot metadata is a diagnostic hint, never effect authority.
+Admission-refusal and quota-resume producers use the same per-session
+sequence-and-publication critical section; a separately allocated sequence must
+not escape that fence.
 The exact original drain may still publish its tagged tail while its current
 lease retains retirement custody, including a late native session ID needed for
 Keep handoff. This does not authorize an absent uncaptured publisher, a replaced
@@ -359,6 +363,7 @@ The runtime-only `prompt_wake_eligible` snapshot field separately represents the
 existing explicit WorkerDown queue/wake and initial-start governor, including ordinary known
 absence, dormancy, snooze and rate-limit parks. It is not native health, generic
 unreadable/ambiguous-owner admission, automatic replay or fresh-conversation permission.
+An installed, current owned connection that completed Initialize but still awaits its initial session result retains only explicit initial-start intent eligibility. The producer qualifies its lifecycle lease, Native context and connected owner under the existing observation fence. It does not claim Native readiness or admit generic phase-zero Unknown. Stop, loss, replacement and completed-driver observations revoke the claim; the daemon still rechecks submission under its existing governor before any Native input.
 TUI consumers accept the live wrapper at sequence zero and same-sequence
 refreshes too. They retain wake eligibility separately from native readiness;
 the optional wake field is deserializable live metadata but is omitted from
@@ -403,7 +408,7 @@ or resurrect an already-claimed row.
 
 Terminal handoff persists intent before retiring the original runner. It retains that intent through proven retirement, the exact Terminal commit, required terminal launch and projection cleanup. Cancellation or a committed-write adoption failure leaves recoverable debt, not a successful receipt. Recovery selects the matching intent and original authority; reservation age never permits another driver to steal it.
 
-A CLI-resumable handoff preserves the final native conversation and its exact execution/store binding, including newer identity from that recorded execution. Missing custody remains pending rather than launching a fresh conversation. Restore the original native store or explicitly bind a verified target with `aoe session set-session-id SESSION ID --store /absolute/store`. Explicitly clearing the ID with `aoe session set-session-id SESSION ""` authorizes a fresh terminal conversation. Target changes require completed original retirement, no active launch and no live pane; they retain handoff identity and invalidate older generation results. A marker-proven owned dead pane may remain for the ordinary start path to remove. A live, unowned or mismatched pane is retained. Retry disable to adopt an already-live matching pane without another launch.
+A CLI-resumable handoff preserves the final native conversation and its exact execution/store binding, including newer identity from that recorded execution. Missing custody remains pending rather than launching a fresh conversation. Restore the original native store or explicitly bind a verified target with `aoe session set-session-id SESSION ID --store /absolute/store`. Explicitly clearing the ID with `aoe session set-session-id SESSION ""` authorizes a fresh terminal conversation. Target changes require completed original retirement, no active launch and proof that the captured target cannot still execute; they retain handoff identity and invalidate older generation results. The physical census includes renamed sessions and nonzero pane indexes on the captured server. Names, launch markers and a missing receipt alone never prove absence. A receipted dead pane may remain for the ordinary start path to remove. A live, unowned or mismatched pane is retained. Unknown scoped Native ownership also retains debt; an Unscoped observation does not attest arbitrary detached Native processes. See [session resume](../../guides/session-resume.md) for operator prerequisites and recovery limits. Retry disable to adopt an already-live matching pane without another launch.
 
 Enabling Structured view commits its eligible selected load target and replay
 intent before starting the adapter, under the same full conversation/store and

@@ -107,14 +107,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             phase: observed.phase,
             native_subject: Some(subject),
         };
-        let seq = next_seq(&self.next_seqs, session_id);
-        match epoch {
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| match epoch {
             Some(epoch) => {
                 self.sink
                     .publish_from_worker(session_id, seq, &event, epoch, Some(subject))
             }
             None => self.sink.publish(session_id, seq, &event),
-        }
+        });
         Some(true)
     }
 
@@ -177,15 +176,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         resets_at: chrono::DateTime<chrono::Utc>,
         manual: bool,
     ) -> Result<u64, super::SupervisorError> {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink
-            .publish_persisted(
-                session_id,
-                seq,
-                &Event::RateLimitAutoResumed { resets_at, manual },
-            )
-            .then_some(seq)
-            .ok_or(super::SupervisorError::NativeStoreUnavailable)
+        publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            self.sink
+                .publish_persisted(
+                    session_id,
+                    seq,
+                    &Event::RateLimitAutoResumed { resets_at, manual },
+                )
+                .then_some(seq)
+                .ok_or(super::SupervisorError::NativeStoreUnavailable)
+        })
     }
 
     /// Close a turn that was in flight when the previous daemon died.

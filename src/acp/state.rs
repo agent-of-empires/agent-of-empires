@@ -661,7 +661,7 @@ impl CurrentNativeAvailability {
         self.ready = self.client.connection_ready();
         self.unavailable = self.client.connection_unavailable();
         self.ready &= self.unavailable.is_none();
-        Ok(self.ready || self.unavailable.is_some())
+        Ok(self.ready || self.unavailable.is_some() || self.client.initial_prompt_intent_available())
     }
 }
 
@@ -744,7 +744,9 @@ impl NativeAvailabilityProjection {
                 ready: current.ready && current.unavailable.is_none(),
                 unavailable: current.unavailable,
                 control_failure: None,
-                prompt_wake_eligible: false,
+                prompt_wake_eligible: !current.ready
+                    && current.unavailable.is_none()
+                    && current.client.initial_prompt_intent_available(),
                 context: Some(context),
                 owner: current.owner,
             };

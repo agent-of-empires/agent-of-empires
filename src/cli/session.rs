@@ -509,23 +509,16 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
         inst.kill_all_tmux_sessions_locked()?;
     }
 
-    let landed = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
-            anyhow::ensure!(
-                !stored.has_pending_trash(),
-                crate::session::LifecycleReservationError::Busy(
-                    crate::session::LifecycleOperation::Trash
-                )
-            );
-            stored.archive();
-            stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    })?;
-    if landed {
+    let archived_structured = archive_row(&storage, &id)?;
+    if let Some(structured) = archived_structured {
         println!("Archived: {}", title);
+        if structured {
+            super::acp::stop_runner(&id).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "{title} is archived, but its agent runner could not be stopped: {error:#}"
+                )
+            })?;
+        }
         Ok(())
     } else {
         bail!(
@@ -533,6 +526,25 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
             title
         );
     }
+}
+
+/// Archives the stored row; `Some(structured)` is that row's view at the moment it was
+/// archived, so a view switch between the caller's snapshot and the lock is not missed.
+fn archive_row(storage: &Storage, id: &str) -> Result<Option<bool>> {
+    storage.update(|instances, _groups| {
+        let Some(stored) = instances.iter_mut().find(|i| i.id == id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            !stored.has_pending_trash(),
+            crate::session::LifecycleReservationError::Busy(
+                crate::session::LifecycleOperation::Trash
+            )
+        );
+        stored.archive();
+        stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
+        Ok(Some(stored.is_structured()))
+    })
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -2837,7 +2849,8 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             if let Some((_, stage)) = pending_recovery {
                 anyhow::ensure!(matches!(stage,
                     crate::session::TerminalHandoffStage::TerminalCommitOwed
-                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed
+                        | crate::session::TerminalHandoffStage::ProjectionCleanupOwed),
                     "terminal handoff must finish original retirement before its native target can change");
                 let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
                 anyhow::ensure!(pending.final_event_seq.is_some(),
@@ -2847,14 +2860,35 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     && pending.generation == inst.lifecycle_generation,
                     crate::session::LifecycleReservationError::Superseded);
                 pending.ensure_original_stopped(&inst.id)?;
-                let pane = inst.tmux_session()?;
-                if pane.exists_live() {
-                    anyhow::ensure!(pane.is_pane_dead(),
-                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
-                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
-                        "existing dead pane has no handoff receipt; pane retained"))?;
-                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
-                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                // The target launch may own newer units than the retired Native Original.
+                // Observe those exact obligations without stopping or adopting a new peer.
+                let target_scopes = crate::process::systemd::resolve_unknown_scopes(
+                    &inst.id, inst.terminal_scopes.as_deref(),
+                ).context("terminal target scope ownership remains unresolved")?;
+                for scope in &target_scopes {
+                    anyhow::ensure!(crate::process::systemd::scope_stopped(&inst.id, scope)?,
+                        "terminal target scope remains live; complete its explicit shutdown before selecting a target");
+                }
+                let launch = pending.launch.as_ref().context(
+                    "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent")?;
+                let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
+                    .or_else(|| launch.birth_inventory.as_ref().map(|inventory| inventory.socket()))
+                    .context("terminal handoff has no captured physical socket; restore its original ownership evidence")?;
+                let complete = crate::tmux::utils::capture_pane_birth_inventory(
+                    Some(socket), &crate::tmux::TmuxCommandDeadline::new(),
+                ).context("cannot prove terminal pane absence from its complete physical inventory")?;
+                if let Some(receipt) = launch.receipt.as_deref() {
+                    if complete.receipt_present(receipt)? {
+                        let actual = inst.tmux_session()?;
+                        let probe = crate::session::Instance::ensure_terminal_handoff_pane_matches(actual.name(),
+                            crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                        anyhow::ensure!(probe == crate::tmux::utils::PaneProbe::Dead,
+                            "terminal handoff pane is live; close it explicitly in tmux before selecting a target");
+                    }
+                } else {
+                    complete.ensure_only_preexisting_live_panes(
+                        launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
+                    )?;
                 }
             }
             inst.source_profile = storage.profile().to_string();
@@ -2871,7 +2905,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            if let Some((intent_id, _)) = pending_recovery {
+            if let Some((intent_id, stage)) = pending_recovery {
                 let context = match &new_intent {
                     crate::session::ResumeIntent::Use(_) => {
                         let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
@@ -2897,7 +2931,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.source_acp_session_id = source_acp_session_id;
                 pending.terminal = Some(target);
                 pending.launch_started = false;
-                // Retain the original checkpoint solely as the owned dead-pane receipt.
+                if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
+                    pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
+                }
+                // Retain the prior attempt as evidence, never as proof of an unrecorded birth.
             }
             Ok(inst.title.clone())
         })
@@ -4168,5 +4205,41 @@ mod account_swap_tests {
         let message = error.to_string();
         assert!(message.contains("nothing changed"), "{message}");
         assert!(message.contains("agent_config_dir"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod archive_row_tests {
+    use super::archive_row;
+    use crate::session::{Instance, Storage, View};
+
+    #[test]
+    #[serial_test::serial]
+    fn archive_row_reports_the_view_of_the_row_it_archives() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("archive-row").unwrap();
+        let mut row = Instance::new("switching", "/tmp/archive-row");
+        row.source_profile = "archive-row".into();
+        let id = row.id.clone();
+        storage
+            .update(|rows, _| {
+                rows.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = storage.load().unwrap().remove(0);
+        assert!(!snapshot.is_structured());
+
+        // A completed Terminal to Structured switch lands after the caller's snapshot.
+        storage
+            .update(|rows, _| {
+                rows[0].view = View::Structured;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(archive_row(&storage, &id).unwrap(), Some(true));
+        assert!(storage.load().unwrap()[0].is_archived());
+        assert_eq!(archive_row(&storage, "no-such-row").unwrap(), None);
     }
 }

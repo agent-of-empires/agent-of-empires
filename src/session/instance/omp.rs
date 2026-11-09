@@ -460,6 +460,7 @@ impl Instance {
     pub(super) fn capture_omp_before_restart(
         &mut self,
         storage: &dyn crate::session::SessionStore,
+        selection: Option<&mut [u8; 32]>,
     ) -> Result<()> {
         if self.source_capture_backend() != Some(crate::agents::SessionCaptureBackend::Omp)
             || (self.is_sandboxed() && self.omp_capture_generation.is_none())
@@ -475,6 +476,7 @@ impl Instance {
             &self.id,
             &observation,
             &self.conversation_state(),
+            selection,
         );
         match commit.outcome {
             SidWrite::Applied => {

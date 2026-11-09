@@ -13655,7 +13655,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
 
     let g = generation("parked");
     assert!(
-        lifecycle::continue_interrupted_prompt(&state, "parked", g, resets_at, false).await,
+        lifecycle::continue_interrupted_prompt(&state, "parked", g, resets_at, false)
+            .await
+            .unwrap(),
         "the interrupted prompt is the next turn, so no wake message"
     );
     assert_eq!(pending("parked").as_deref(), Some("finish the migration"));
@@ -13667,7 +13669,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
         .await;
     let g = generation("explicit");
     assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "explicit", g, resets_at, true).await,
+        !lifecycle::continue_interrupted_prompt(&state, "explicit", g, resets_at, true)
+            .await
+            .unwrap(),
         "an explicit wake message is sent by the restart itself"
     );
     assert_eq!(
@@ -13679,7 +13683,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
 
     let g = generation("superseded") + 1;
     assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "superseded", g, resets_at, false).await
+        !lifecycle::continue_interrupted_prompt(&state, "superseded", g, resets_at, false)
+            .await
+            .unwrap()
     );
     assert_eq!(
         pending("superseded"),
@@ -13691,14 +13697,17 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     let g = generation("nothing-to-replay");
     assert!(
         !lifecycle::continue_interrupted_prompt(&state, "nothing-to-replay", g, resets_at, false)
-            .await,
+            .await
+            .unwrap(),
         "no turn to deliver: the default wake message must still go out"
     );
     assert_eq!(breadcrumbs("nothing-to-replay"), 1);
 
     let g = generation("pending-only");
     assert!(
-        lifecycle::continue_interrupted_prompt(&state, "pending-only", g, resets_at, false).await,
+        lifecycle::continue_interrupted_prompt(&state, "pending-only", g, resets_at, false)
+            .await
+            .unwrap(),
         "a continuation already pending is work, so the default wake message must not go out"
     );
     assert_eq!(
@@ -13782,7 +13791,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     };
     release.send(()).unwrap();
     assert!(
-        helper.await.unwrap(),
+        helper.await.unwrap().unwrap(),
         "a continuation drained right after the install still counts as selected work"
     );
     drain.await.unwrap();

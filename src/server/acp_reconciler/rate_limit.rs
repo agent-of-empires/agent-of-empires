@@ -335,7 +335,13 @@ pub(crate) async fn resume_rate_limited(
         install_rate_limit_continuation(state, id, &submission).await
     };
     let manual = matches!(kind, QuotaResume::Manual);
-    if manual || matches!(outcome, ContinuationOutcome::Stands) {
+    // Both admitted continuation outcomes arm the budget before Native input.
+    if manual
+        || matches!(
+            outcome,
+            ContinuationOutcome::Stands | ContinuationOutcome::Installed
+        )
+    {
         if manual && park.cap_reached {
             resume_at = Utc::now();
         }

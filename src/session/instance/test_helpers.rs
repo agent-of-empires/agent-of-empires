@@ -4,7 +4,7 @@ use super::*;
 
 /// Re-enter one libtest entry to execute the real frozen-environment helper.
 #[cfg(unix)]
-pub(super) fn frozen_test_helper(
+pub(crate) fn frozen_test_helper(
     root: &std::path::Path,
     entry: &str,
 ) -> crate::process::test_support::NativeLaunchExecutable {
@@ -333,7 +333,7 @@ pub(super) fn write_reserved_claude_transcript(instance: &Instance, sid: &str) {
 }
 
 /// Seed a resumable Claude conversation in the isolated native store.
-pub(super) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
+pub(crate) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
     let home = std::env::var("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));

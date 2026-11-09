@@ -1411,6 +1411,27 @@ pub(crate) struct NativeStoreUnavailable;
 #[error("session metadata was committed but canonical adoption failed")]
 pub(crate) struct SessionCommitApplied;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LifecycleRelease {
+    Reservation(super::LifecycleOperation),
+    IndeterminateLaunch,
+}
+
+impl LifecycleRelease {
+    pub(crate) fn apply(self, row: &mut Instance, generation: u64) {
+        let operation = match self {
+            Self::Reservation(operation) => operation,
+            Self::IndeterminateLaunch => super::LifecycleOperation::Launch,
+        };
+        if row.release_lifecycle_reservation_if_owned(operation, generation)
+            && matches!(self, Self::IndeterminateLaunch)
+            && row.status == super::Status::Creating
+        {
+            row.status = super::Status::Starting;
+        }
+    }
+}
+
 pub(crate) trait SessionStore: Send + Sync {
     fn storage(&self) -> &Storage;
     fn load(&self) -> Result<Vec<Instance>>;
@@ -1440,7 +1461,7 @@ pub(crate) trait SessionStore: Send + Sync {
     fn release_lifecycle_reservation(
         &self,
         id: &str,
-        operation: super::LifecycleOperation,
+        release: LifecycleRelease,
         generation: u64,
         lifecycle: Option<StorageFlock>,
     ) -> Result<()> {
@@ -1451,7 +1472,7 @@ pub(crate) trait SessionStore: Send + Sync {
         };
         self.commit(&mut |rows, _| {
             if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                row.release_lifecycle_reservation_if_owned(operation, generation);
+                release.apply(row, generation);
             }
             Ok(())
         })
@@ -1459,7 +1480,7 @@ pub(crate) trait SessionStore: Send + Sync {
     fn defer_lifecycle_release(
         self,
         id: String,
-        operation: super::LifecycleOperation,
+        release: LifecycleRelease,
         generation: u64,
         lifecycle: Option<StorageFlock>,
     ) where
@@ -1469,7 +1490,7 @@ pub(crate) trait SessionStore: Send + Sync {
         if let Err(error) = std::thread::Builder::new()
             .name("aoe-lifecycle-reservation-release".into())
             .spawn(move || {
-                if let Err(error) = self.release_lifecycle_reservation(&id, operation, generation, lifecycle) {
+                if let Err(error) = self.release_lifecycle_reservation(&id, release, generation, lifecycle) {
                     tracing::warn!(target: "session.lifecycle", session = %id, %error, "deferred reservation release failed");
                 }
             })

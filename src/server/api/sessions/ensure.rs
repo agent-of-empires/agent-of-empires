@@ -208,7 +208,7 @@ pub(super) fn physical_agent_target(
     else {
         return Ok(None);
     };
-    if pane.pane_dead {
+    if !instance.pane_is_ready(pane)? {
         return Ok(None);
     }
     let physical = pane
@@ -286,6 +286,18 @@ pub(super) async fn agent_target_response(
     };
     if instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if outcome.is_some() {
+        instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            instance.wait_for_pane_ready()?;
+            Ok(instance)
+        })
+        .await
+        {
+            Ok(Ok(instance)) => instance,
+            Ok(Err(error)) => return agent_target_error(state, error),
+            Err(error) => return agent_target_error(state, error.into()),
+        };
     }
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(id).await;
@@ -415,10 +427,15 @@ pub(super) async fn prepared_agent_target_response(
 }
 
 fn agent_target_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if let Some(cause) = error.downcast_ref::<crate::session::LaunchIndeterminateCause>() {
+        return indeterminate_launch_response(*cause);
+    }
     if let Some(response) = lifecycle_rejection(state, &error) {
         return response;
     }
-    if error.is::<crate::session::NativeStoreUnavailable>() {
+    if error.is::<crate::session::NativeStoreUnavailable>()
+        || error.is::<crate::session::LaunchFinalizationPending>()
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if error.is::<AgentTargetUnavailable>() {

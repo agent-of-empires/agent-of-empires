@@ -1235,6 +1235,57 @@ pub(crate) fn agent_pane_metadata_in<'a>(
     pane_metadata_for_shape(panes, &derived, &NameShape::agent(&id_suffix(id)))
 }
 
+/// Launch admission never treats multiple marked candidates as an absent
+/// title-derived name. Keep this stricter view separate from display resolution.
+fn with_unique_agent_session_name<T>(
+    id: &str,
+    read: impl FnOnce(Option<&str>) -> T,
+) -> anyhow::Result<T> {
+    use crate::session::LaunchIndeterminateCause;
+    match refresh_session_cache() {
+        SessionCacheRefresh::NoServer => return Ok(read(None)),
+        SessionCacheRefresh::Unknown => {
+            return Err(LaunchIndeterminateCause::ObservationFailed.into());
+        }
+        SessionCacheRefresh::Populated => {}
+    }
+    let cache = SESSION_CACHE
+        .read()
+        .map_err(|_| LaunchIndeterminateCause::ObservationFailed)?;
+    let sessions = cache
+        .data
+        .as_ref()
+        .ok_or(LaunchIndeterminateCause::ObservationFailed)?;
+    let suffix = id_suffix(id);
+    let shape = NameShape::agent(&suffix);
+    let mut candidates = sessions.iter().filter(|(name, session)| {
+        shape.matches_marked(name, session.kind.map(SessionKind::as_marker))
+    });
+    let selected = candidates.next();
+    anyhow::ensure!(
+        candidates.next().is_none(),
+        LaunchIndeterminateCause::OwnershipUnproven
+    );
+    Ok(read(selected.map(|(name, _)| name.as_str())))
+}
+
+/// Select a fresh, unique Agent candidate, including corpses; unknown or
+/// ambiguous inventory is an error, not absence or a readiness observation.
+pub(crate) fn unique_agent_session_name(id: &str) -> anyhow::Result<Option<String>> {
+    with_unique_agent_session_name(id, |name| name.map(str::to_owned))
+}
+
+/// Check the same launch-only uniqueness contract without copying a name.
+pub(crate) fn unique_agent_session_presence(id: &str) -> anyhow::Result<SessionExistence> {
+    with_unique_agent_session_name(id, |name| {
+        if name.is_some() {
+            SessionExistence::Present
+        } else {
+            SessionExistence::Absent
+        }
+    })
+}
+
 /// `resolve_session_name` for the agent pane, against names alone: with no
 /// kind marker every name falls back to its shape, which cannot separate an
 /// agent titled `term Foo` from a paired terminal. Callers reading the shared
