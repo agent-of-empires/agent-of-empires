@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8"><title>Suggested sessions — QA</title>
+<style>
+body{background:#12100e;color:#e8e2d9;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;padding:32px}
+main{max-width:1000px;margin:0 auto}
+h1{font-size:26px;margin:0 0 4px}h2{margin-top:34px;color:#f0b429}h3{margin-top:28px}
+p{margin:10px 0}li{margin:4px 0 4px 18px}
+figure{margin:14px 0;background:#1a1613;border:1px solid #2c2620;border-radius:10px;padding:10px}
+img{max-width:100%;display:block;border-radius:6px}
+figcaption{color:#9c948a;font-size:12px;margin-top:8px;font-family:ui-monospace,monospace}
+</style>
+<main>
+<h1>Suggested sessions — QA report</h1>
+<ul>
+<li>Date: 2026-11-09</li>
+<li>Build: debug binary of `feat/suggested-sessions` at `36884c4` (reports `1.22.3`, plugin API 21)</li>
+<li>Plugin: `agent-of-empires.github 2.4.0` from plugin-github#135, dev install</li>
+<li>Dashboard: the branch&#x27;s own `web/` app, driven with Playwright</li>
+<li>Data: synthetic — twelve suggestions across `acme/widgets`, `acme/api` and `example-org/docs`, so nothing from a real account appears in these images</li>
+</ul>
+<h2>🧪 QA — PASS ✅</h2>
+<h3>1. Home dashboard suggests sessions</h3>
+<figure><img src="001-home-dashboard-suggestions.png" alt="Home dashboard"><figcaption>Home dashboard</figcaption></figure>
+<p>`/`. Observed: a `SUGGESTED SESSIONS` section with `View all (12)` and three rows, each with the project breadcrumb (`acme/widgets#412`), title, `GitHub · GitHub requested your review · acme-widgets`, and `Start` / `Dismiss`.</p>
+<h3>2. Full view lists every active item</h3>
+<figure><img src="002-suggestions-view-all.png" alt="Suggestions view"><figcaption>Suggestions view</figcaption></figure>
+<p>`/suggestions`. Observed: `All 12`, provider chip `GitHub 12`, provider status `GitHub: updated just now`, org/repo chips with counts (`acme/ 9`, `acme/widgets 5`, `acme/api 4`, `example-org/docs 3`), rows grouped by project (`acme-widgets`, `acme-api`).</p>
+<h3>3. Source filter narrows the list</h3>
+<figure><img src="003-source-filter-org.png" alt="Org filter"><figcaption>Org filter</figcaption></figure>
+<p>Clicked the `acme/` org chip. Observed: `Clear filters` appears and the list drops to the 9 items under that org.</p>
+<h3>4. Search narrows the list</h3>
+<figure><img src="004-search-pagination.png" alt="Search"><figcaption>Search</figcaption></figure>
+<p>Typed `pagination` in `Search title, reference, reason or source`. Observed: 2 matching rows.</p>
+<h3>5. Dismiss and undo</h3>
+<figure><img src="005-dismiss-undo-bar.png" alt="Dismiss"><figcaption>Dismiss</figcaption></figure>
+<p>Clicked `Dismiss` on the first row. Observed: chips become `All 11` / `GitHub 11` / `Dismissed 1`, the row leaves the list, and an undo bar offers to restore it. Clicking `Undo` returned the list to `All 12`.</p>
+<h3>6. Settings › Suggestions</h3>
+<figure><img src="006-settings-suggestions.png" alt="Settings"><figcaption>Settings</figcaption></figure>
+<p>`/settings/suggestions`. Observed: homepage / sidebar / source-reference switches, the GitHub provider with nine per-criterion toggles (`Changes requested on your PRs`, `Review requests`, `Re-reviews`, `Review threads awaiting your reply`, `Merge conflicts on your PRs`, `Failing checks on your PRs`, `Mentions`, `Issues assigned to you`, `New issues`), the provider enable switch, and the repository / organization / ignore allowlists.</p>
+<h3>7. Turning a criterion off hides its items</h3>
+<figure><img src="007-settings-source-off.png" alt="Criterion off"><figcaption>Criterion off</figcaption></figure>
+<figure><img src="008-view-after-source-off.png" alt="View after criterion off"><figcaption>View after criterion off</figcaption></figure>
+<p>Unticked `New issues` and opened `/suggestions`. Observed: provider chip drops from `GitHub 12` to `GitHub 10`, no refresh needed. Re-ticking restored `GitHub 12`.</p>
+<h3>8. Start opens the wizard prefilled</h3>
+<figure><img src="009-start-wizard-prefill.png" alt="Start wizard"><figcaption>Start wizard</figcaption></figure>
+<p>Clicked `Start` on the first row. Observed: the `New session` wizard opens with a GitHub source banner, the resolved project (`acme-widgets`), the title filled in, and the prompt rendered from the saved template with `From template: new_issues · Edit template`, plus `Launch session (⌘+Enter)`.</p>
+<h3>9. TUI — Home group, `S` view, dismiss</h3>
+<figure><img src="010-tui-home-suggested-group.png" alt="TUI home suggested group"><figcaption>TUI home suggested group</figcaption></figure>
+<figure><img src="011-tui-suggested-view.png" alt="TUI suggested sessions view"><figcaption>TUI suggested sessions view</figcaption></figure>
+<figure><img src="012-tui-dismiss-item.png" alt="TUI dismiss"><figcaption>TUI dismiss</figcaption></figure>
+<p>The TUI at 170x46 against the same profile. Home shows a `Suggested (12)` group; `Enter` expands it in place to the individual rows (`GitHub acme/widgets#412 Add …`). `S` opens the `Suggested sessions` view with project groups (`acme-widgets 5`), a selection marker, each row&#x27;s source ref and reason, the provider status line (`GitHub: updated just now`), and the footer keymap (`j/k select · Enter review/start/open · N start another · x dismiss/restore · d dismissed · r refresh · l reload · PgUp/PgDn prompt · Esc back`). `x` on the selected row marks it `[dismissed, x to undo]`, and `x` again restores it. `Esc` returns to Home with the group still expanded.</p>
+<p>**Could not verify:** pressing `Launch` (session creation and first-turn delivery), the TUI wizard&#x27;s launch step, and read-only / CityHall refusal paths.</p>
+<p>**Console:** no console errors or page errors in any step.</p>
+<p>**Note:** these flows ran against mocked suggestion payloads served to the dashboard (the same approach `web/tests/dashboard-suggestions.spec.ts` takes); the provider, store and API were verified separately against a live account.</p>
+</main>
