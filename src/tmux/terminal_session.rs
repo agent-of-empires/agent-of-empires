@@ -849,8 +849,13 @@ mod tests {
             eprintln!("Skipping test: tmux not available");
             return;
         }
-        // Already running without the sentinel, so only the script can deliver it.
-        let _server = aoe_test_running_server();
+        // Already running without the sentinels, so only the script can deliver them.
+        let server = aoe_test_running_server();
+        let status = crate::tmux::tmux_command()
+            .args(["set-environment", "-g", "-u", "COLORTERM"])
+            .status()
+            .expect("clear the server's COLORTERM");
+        assert!(status.success(), "{}", server.name());
         let tmp = tempfile::tempdir().unwrap();
         let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
 
@@ -871,6 +876,7 @@ mod tests {
 
         let key = "PASSTHROUGH_TEST_5499";
         let secret = "argv-leak-sentinel-5499";
+        let colorterm = "host-truecolor-5499";
         let path = format!(
             "{}:{}",
             bin.display(),
@@ -878,6 +884,7 @@ mod tests {
         );
         let _env = crate::session::test_support::EnvGuard::set(&[
             (key, secret),
+            ("COLORTERM", colorterm),
             ("PATH", path.as_str()),
             ("SHELL", "/bin/sh"),
         ]);
@@ -908,15 +915,15 @@ mod tests {
             let output = tmp.path().join(name);
             std::fs::write(&argv_log, "").unwrap();
             let command = format!(
-                "printf '%s' \"${key}\" > {output}; exec sleep 30",
+                "printf '%s\\n%s' \"${key}\" \"$COLORTERM\" > {output}; exec sleep 30",
                 output = shell_escape(&output.to_string_lossy()),
             );
             create(guard.name(), &command).expect("create session");
 
             assert_eq!(
-                read_when_written(&output).as_deref(),
-                Some(secret),
-                "{name}: the pane must receive the inherited value"
+                read_when_written(&output),
+                Some(format!("{secret}\n{colorterm}")),
+                "{name}: the pane must receive the inherited values"
             );
 
             let argv = std::fs::read_to_string(&argv_log).unwrap();

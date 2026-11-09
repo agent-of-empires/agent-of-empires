@@ -2428,7 +2428,6 @@ const _: () = assert!(
 /// identity names under zsh, calling `setuid`.
 const PANE_OWNED_ENV_KEYS: &[&str] = &[
     "_",
-    "COLORTERM",
     "EGID",
     "EUID",
     "GID",
@@ -5323,10 +5322,8 @@ mod tests {
                 pair("TERM_PROGRAM"),
                 pair("COLORTERM"),
             ]),
-            [PaneEnvMutation::set(
-                "DISPLAY".to_string(),
-                "host-value".to_string()
-            )]
+            ["DISPLAY", "COLORTERM"]
+                .map(|key| PaneEnvMutation::set(key.to_string(), "host-value".to_string()))
         );
     }
 
