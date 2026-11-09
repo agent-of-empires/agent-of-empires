@@ -206,6 +206,7 @@ test("account swap refuses a failed durable quota breadcrumb without replaying N
         join(app, "config.toml"),
         '\n[session]\nrestart_wake_message = "FORBIDDEN_DEFAULT_QUOTA_WAKE"\n' +
           '[session.agent_detect_as]\nquota-other-claude = "claude"\n' +
+          '[session.agent_execution_as]\nquota-other-claude = "claude"\n' +
           '[session.agent_config_dir]\nclaude = "~/.claude"\nquota-other-claude = "~/.claude"\n',
       );
       seedSessionViaAoeAdd({ title })(seed);
