@@ -458,6 +458,12 @@ pub(super) async fn spawn_runner_detached(
         }
     }
 
+    // Outlives the runner's exec, so the `docker` it spawns inherits it too.
+    if let Some(file) = sandbox_argv.as_ref().and_then(|s| s.target_env.as_ref()) {
+        file.attach(cmd.as_std_mut())
+            .map_err(|e| AcpError::Spawn(e.to_string()))?;
+    }
+
     // The runner writes its own log file. Inheriting our stdio would put
     // per-session noise in debug.log and leave the runner reading EOF on its
     // own stdin once the daemon dies. A scoped start sends stderr to that log

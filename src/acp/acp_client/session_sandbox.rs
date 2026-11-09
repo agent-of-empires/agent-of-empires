@@ -104,6 +104,8 @@ pub(super) struct SandboxArgv {
     pub(super) docker_args: Vec<String>,
     pub(super) exec_prefix_len: usize,
     pub(super) inherit_env: Vec<(String, String)>,
+    /// Attach to whatever launches `docker_args`, which name it as an env-file.
+    pub(super) target_env: Option<crate::containers::container_interface::TargetEnvFile>,
 }
 
 /// Docker proxies the agent's stdio across the container boundary. Mirrors the
@@ -115,7 +117,7 @@ pub(super) fn build_sandbox_docker_argv(
     sandbox: &SandboxInfo,
     container_workdir: &str,
 ) -> Result<SandboxArgv, AcpError> {
-    use crate::containers::container_interface::docker_env_args;
+    use crate::containers::container_interface::{docker_env_args, TargetEnvFile};
 
     let runtime = crate::containers::get_container_runtime();
     let docker_binary = runtime.base.binary.to_string();
@@ -142,9 +144,11 @@ pub(super) fn build_sandbox_docker_argv(
     // First claim wins, so the sandbox config below outranks both auth sources.
     let mut seen_keys: std::collections::HashSet<String> =
         env_entries.iter().map(|e| e.key().to_string()).collect();
-    let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
-    docker_args.extend(env_argv);
-    let mut inherit_env: Vec<(String, String)> = inherit_pairs;
+    let environment = docker_env_args(&env_entries);
+    docker_args.extend(environment.argv);
+    let target_env = TargetEnvFile::create(&environment.target_env)
+        .map_err(|error| AcpError::Spawn(error.to_string()))?;
+    let mut inherit_env: Vec<(String, String)> = environment.inherit;
 
     // The request's auth payload (`provider_env`) is claimed ahead of the
     // per-adapter allowlist (#3238), mirroring the non-sandboxed paths where
@@ -199,6 +203,7 @@ pub(super) fn build_sandbox_docker_argv(
         docker_args,
         exec_prefix_len,
         inherit_env,
+        target_env,
     })
 }
 
@@ -345,6 +350,39 @@ mod tests {
                 .find(|(k, _)| k == key)
                 .map(|(_, v)| v.as_str()),
             Some(value),
+        );
+    }
+
+    /// The value is read back through the descriptor a real launch inherits.
+    #[cfg(unix)]
+    #[test]
+    fn build_sandbox_docker_argv_delivers_target_proxy_through_the_env_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "http://proxy.container.internal:3128";
+        let mut info = sandbox("aoe-sandbox-abc12345", None);
+        info.extra_env = Some(vec![format!("HTTP_PROXY={target}")]);
+
+        let argv =
+            build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
+                .unwrap();
+
+        let env_file = argv
+            .docker_args
+            .iter()
+            .position(|a| a == "--env-file")
+            .expect("env-file named in argv");
+        assert_eq!(argv.docker_args[env_file + 1], "/dev/fd/9");
+        assert!(env_file + 1 < argv.exec_prefix_len);
+        assert!(!argv.docker_args.iter().any(|a| a.contains("HTTP_PROXY")));
+        assert!(!argv.inherit_env.iter().any(|(k, _)| k == "HTTP_PROXY"));
+
+        let mut reader = std::process::Command::new("cat");
+        reader.arg("/dev/fd/9");
+        argv.target_env.unwrap().attach(&mut reader).unwrap();
+        let output = String::from_utf8(reader.output().unwrap().stdout).unwrap();
+        assert!(
+            output.lines().any(|l| l == format!("HTTP_PROXY={target}")),
+            "{output}"
         );
     }
 
