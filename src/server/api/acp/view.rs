@@ -3098,17 +3098,41 @@ mod tests {
                 row.terminal_handoff.as_mut().unwrap().stage = HandoffStage::ProjectionCleanupOwed;
                 Ok(())
             })?;
-            let select_fresh = || {
-                SessionCli::try_parse_from([
-                    "aoe-session",
-                    "set-session-id",
-                    source.id.as_str(),
-                    "",
-                ])
+            let select_fresh = || async {
+                if let Some(binary) = std::env::var_os("AOE_S1_OPERATOR_BINARY") {
+                    let output = tokio::process::Command::new(binary)
+                        .args([
+                            "--profile",
+                            "default",
+                            "session",
+                            "set-session-id",
+                            source.id.as_str(),
+                            "",
+                        ])
+                        .env(crate::tmux::TMUX_SOCKET_ENV, &old_physical.server.socket)
+                        .output()
+                        .await?;
+                    anyhow::ensure!(
+                        output.status.success(),
+                        "matching normal CLI refused: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    Ok(())
+                } else {
+                    crate::cli::session::run(
+                        "default",
+                        SessionCli::try_parse_from([
+                            "aoe-session",
+                            "set-session-id",
+                            source.id.as_str(),
+                            "",
+                        ])?
+                        .command,
+                    )
+                    .await
+                }
             };
-            assert!(crate::cli::session::run("default", select_fresh()?.command)
-                .await
-                .is_err());
+            assert!(select_fresh().await.is_err());
             assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
             let refused = storage
                 .load()?
@@ -3131,9 +3155,7 @@ mod tests {
                 "rename the real unproven birth outside the AoE name prefix"
             );
             assert!(
-                crate::cli::session::run("default", select_fresh()?.command)
-                    .await
-                    .is_err(),
+                select_fresh().await.is_err(),
                 "renaming a living unproven pane must not grant new target authority"
             );
             let unchanged = storage
@@ -3164,9 +3186,7 @@ mod tests {
                 "move the real unproven pane outside pane zero"
             );
             assert!(
-                crate::cli::session::run("default", select_fresh()?.command)
-                    .await
-                    .is_err(),
+                select_fresh().await.is_err(),
                 "moving a living unproven pane must not grant new target authority"
             );
             let unmoved_target = storage
@@ -3191,7 +3211,7 @@ mod tests {
                 &source.title
             )?
             .is_none());
-            crate::cli::session::run("default", select_fresh()?.command).await?;
+            select_fresh().await?;
             let selected = storage
                 .load()?
                 .into_iter()
