@@ -14,9 +14,24 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 
 /// POST one JSON-RPC message to `url` with `headers`; returns the status and the parsed body.
 async fn rpc(url: &str, headers: &[(String, String)], body: Value) -> (StatusCode, Value) {
+    rpc_within(url, headers, body, std::time::Duration::from_secs(5)).await
+}
+
+/// [`rpc`] for a terminal `create_session` with a prompt, which waits (up to 30 s) for the agent's
+/// input prompt before it answers.
+async fn rpc_create(url: &str, body: Value) -> (StatusCode, Value) {
+    rpc_within(url, &[], body, std::time::Duration::from_secs(60)).await
+}
+
+async fn rpc_within(
+    url: &str,
+    headers: &[(String, String)],
+    body: Value,
+    timeout: std::time::Duration,
+) -> (StatusCode, Value) {
     let mut req = Client::builder()
         .no_proxy()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(timeout)
         .build()
         .unwrap()
         .post(url)
@@ -664,7 +679,7 @@ fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
                 "prompt": "typed-into\u{1b}[201~-the-agent",
             }),
         );
-        let (status, body) = rpc(&url, &[], create).await;
+        let (status, body) = rpc_create(&url, create).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let created = &body["result"]["structuredContent"];
         assert_eq!(created["prompt_delivery"], "sent", "{body}");
@@ -731,7 +746,7 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
                 "prompt": "summarize the repository",
             }},
         });
-        let (status, body) = rpc(&url, &[], create).await;
+        let (status, body) = rpc_create(&url, create).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let created = &body["result"]["structuredContent"];
         assert_eq!(created["prompt_delivery"], "blocked_waiting", "{body}");
