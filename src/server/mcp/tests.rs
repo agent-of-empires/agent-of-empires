@@ -776,3 +776,128 @@ async fn terminal_sessions_send_and_read_through_their_pane() {
     assert!(sent.get("seq").is_none(), "{sent}");
     pane_shows("typed-by-mcp").await;
 }
+
+/// A retried `idempotency_key` answers with the first create's session and delivers nothing:
+/// a terminal pane is not typed into again, and a structured session stores no prompt.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_keyed_retry_returns_the_first_session_and_delivers_nothing() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let mut terminal = Instance::new("keyed-terminal", "/tmp/aoe-mcp-keyed-terminal");
+    terminal.source_profile = "default".into();
+    terminal.idempotency_key = Some("k-terminal".into());
+    let mut structured = structured_session("keyed-structured");
+    structured.idempotency_key = Some("k-structured".into());
+    let (terminal_id, structured_id) = (terminal.id.clone(), structured.id.clone());
+    let (app, state) = seeded_app(vec![terminal, structured], false).await;
+
+    // (view, key, the session the first create made)
+    let retries = [
+        ("terminal", "k-terminal", terminal_id.as_str()),
+        ("structured", "k-structured", structured_id.as_str()),
+    ];
+    for (view, key, id) in retries {
+        let created = call(
+            &app,
+            "create_session",
+            json!({
+                "path": "/tmp/aoe-mcp-keyed", "tool": "claude", "view": view,
+                "prompt": "do it again", "idempotency_key": key,
+            }),
+        )
+        .await;
+        assert_eq!(created["session"]["id"], id, "{view}: {created}");
+        assert_eq!(created["fresh"], false, "{view}");
+        assert_eq!(created["prompt_delivery"], "replayed", "{view}");
+        assert_eq!(created["prompt_sent"], false, "{view}");
+        assert_eq!(state.instances.read().await.len(), 2, "{view}");
+    }
+    let rows = state.instances.read().await;
+    let stored = rows.iter().find(|row| row.id == structured_id).unwrap();
+    assert!(stored.pending_initial_turn.is_none());
+}
+
+/// Text pages stop at the last event that fits whole, so following `next_since` reads every
+/// event once; one event that alone is too big comes back truncated, and the cursor moves on.
+#[tokio::test]
+#[serial_test::serial]
+async fn read_output_pages_text_by_rendered_size_without_skipping() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (long, huge) = ("mcp-long", "mcp-huge");
+    let (app, state) = seeded_app(
+        vec![structured_session(long), structured_session(huge)],
+        false,
+    )
+    .await;
+    let filler = "x".repeat(1_500);
+    let prompts: Vec<crate::acp::Event> = (0..60)
+        .map(|i| user_prompt(&format!("marker-{i:03} {filler}")))
+        .collect();
+    seed_events(&state, long, &prompts);
+
+    let (mut since, mut pages, mut text) = (0u64, 0, String::new());
+    loop {
+        let page = call(
+            &app,
+            "read_output",
+            json!({"session_id": long, "since": since}),
+        )
+        .await;
+        let chunk = page["text"].as_str().unwrap();
+        assert!(chunk.len() <= 48_000, "page {pages}: {} bytes", chunk.len());
+        assert!(!chunk.contains("truncated"), "page {pages} dropped text");
+        assert!(page.get("truncated").is_none(), "{page}");
+        text.push_str(chunk);
+        pages += 1;
+        since = page["next_since"].as_u64().unwrap();
+        if page["has_more"] == false {
+            break;
+        }
+        assert!(pages < 10, "the cursor never reached the end");
+    }
+    assert!(pages > 1, "a ~90 KB transcript fits no single page");
+    let found: Vec<usize> = (0..60)
+        .filter_map(|i| text.find(&format!("marker-{i:03}")))
+        .collect();
+    assert_eq!(found.len(), 60, "an event was skipped");
+    assert!(found.windows(2).all(|w| w[0] < w[1]), "out of order");
+    assert_eq!(since, 60);
+
+    seed_events(
+        &state,
+        huge,
+        &[user_prompt(&"y".repeat(60_000)), user_prompt("after")],
+    );
+    let first = call(&app, "read_output", json!({"session_id": huge})).await;
+    assert_eq!(first["truncated"], true, "{}", first["next_since"]);
+    assert_eq!(first["next_since"], 1);
+    assert_eq!(first["has_more"], true);
+    let next = call(&app, "read_output", json!({"session_id": huge, "since": 1})).await;
+    assert!(next["text"].as_str().unwrap().contains("after"), "{next}");
+}
+
+/// A prompt that strips to nothing is refused before a session is created, as `send` refuses it.
+#[tokio::test]
+#[serial_test::serial]
+async fn create_session_refuses_an_empty_prompt() {
+    let _guard = crate::session::test_support::isolate_app_dir();
+    let (app, state) = seeded_app(Vec::new(), false).await;
+    for (view, prompt) in [
+        ("terminal", "\n"),
+        ("terminal", "\u{1b}[201~"),
+        ("structured", "  "),
+    ] {
+        let refused = call_result(
+            &app,
+            "create_session",
+            json!({"path": "/tmp/aoe-mcp-empty", "tool": "claude", "view": view, "prompt": prompt}),
+        )
+        .await;
+        assert_eq!(
+            error_code(&refused),
+            Some("invalid_request"),
+            "{view} {prompt:?}: {refused}"
+        );
+    }
+    assert!(state.instances.read().await.is_empty());
+}

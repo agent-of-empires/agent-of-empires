@@ -635,11 +635,15 @@ fn configured_mcp_respects_disabled_web_across_acquisition_and_reconnect() {
 fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
     crate::harness::require_tmux!();
     let mut h = TuiTestHarness::new("mcp_terminal_prompt");
-    // Stands in for `claude`: prints what it is typed, with control bytes made visible
+    // Stands in for `claude`: draws its input prompt (a bare `❯` line, which Claude's status
+    // rules read as Idle), then prints what it is typed, with control bytes made visible
     // (`cat -v` shows ESC as `^[`). The tty's own echo is off, so the pane holds only that.
     let bin = h.home_path().join("fake-agent-bin");
     std::fs::create_dir_all(&bin).unwrap();
-    crate::harness::write_executable(&bin.join("claude"), "#!/bin/sh\nstty -echo\nexec cat -v\n");
+    crate::harness::write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nstty -echo\nprintf '\\n\\342\\235\\257\\n'\nexec cat -v\n",
+    );
     h.add_path_dir(&bin);
     h.append_config("[web]\nmcp_enabled = true");
     h.stop_daemon_on_drop();
@@ -691,4 +695,61 @@ fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     });
+}
+
+/// A terminal `create_session` never types its prompt into a dialog: with Claude's folder-trust
+/// question on screen it reports `blocked_waiting`, and the agent receives no keystroke at all,
+/// so no Enter can accept trust for the folder.
+#[test]
+#[parallel]
+fn mcp_create_session_leaves_a_prompt_unsent_while_claude_asks_to_trust_the_folder() {
+    crate::harness::require_tmux!();
+    let mut h = TuiTestHarness::new("mcp_trust_dialog");
+    // Stands in for `claude` on a folder it has never seen: it shows the trust dialog, then
+    // writes every byte it is sent to a file. Raw mode delivers a keystroke without Enter too.
+    let typed = h.home_path().join("typed-into-the-dialog");
+    let bin = h.home_path().join("fake-agent-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::harness::write_executable(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\nprintf 'Do you trust the files in this folder?\\n\\nIs this a project you created or one you trust?\\n\\n\\342\\235\\257 1. Yes, I trust this folder\\n  2. No, exit\\n'\nstty raw -echo\nexec cat > '{}'\n",
+            typed.display()
+        ),
+    );
+    h.add_path_dir(&bin);
+    h.append_config("[web]\nmcp_enabled = true");
+    h.stop_daemon_on_drop();
+    let port = h.start_daemon();
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    block_on(async {
+        let create = json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "create_session", "arguments": {
+                "path": h.project_path(), "tool": "claude", "title": "mcp-trust",
+                "prompt": "summarize the repository",
+            }},
+        });
+        let (status, body) = rpc(&url, &[], create).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created = &body["result"]["structuredContent"];
+        assert_eq!(created["prompt_delivery"], "blocked_waiting", "{body}");
+        assert_eq!(created["prompt_sent"], false, "{body}");
+        assert!(
+            created["prompt_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("dialog"),
+            "{body}"
+        );
+        // A late keystroke would still land within this window.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    });
+    let received = std::fs::read(&typed).unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "the dialog received keystrokes: {:?}",
+        String::from_utf8_lossy(&received)
+    );
 }

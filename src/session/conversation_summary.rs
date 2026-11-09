@@ -13,7 +13,7 @@ pub const MAX_CONCURRENT: usize = 1;
 /// Hard cap on the transcript text handed to the one-shot.
 // ponytail: argv transport with a 48 KiB cap; switch to piping the prompt via
 // stdin only if a future change needs a materially larger single call.
-const MAX_INPUT_BYTES: usize = 48_000;
+pub(crate) const MAX_INPUT_BYTES: usize = 48_000;
 
 /// Per-tool-call cap so a single noisy `args_preview` (a pasted file, a long
 /// shell line) cannot dominate the summary input.

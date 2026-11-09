@@ -17,10 +17,18 @@ use crate::server::api::sessions::{
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
-use crate::session::View;
+use crate::session::{Instance, Status, View};
 
 /// Transcript events read per `read_output` call; the caller pages on with `next_since`.
 const READ_PAGE: usize = 2000;
+
+/// Most rendered text one `read_output` page returns, the transcript renderer's own cap. A page
+/// stops at the last event that fits whole, so following `next_since` skips nothing.
+const TEXT_PAGE_BYTES: usize = crate::session::conversation_summary::MAX_INPUT_BYTES;
+
+/// How long a terminal `create_session` waits for its agent's input prompt before typing the
+/// first prompt. A dialog (such as Claude's folder-trust question) stops it at once instead.
+const PROMPT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Pane lines `read_output` captures when the caller names none, as `GET /output` does.
 const DEFAULT_LINES: u32 = 200;
@@ -63,7 +71,8 @@ pub(super) struct CreateSessionParams {
     prompt: Option<String>,
     /// Make the session a sub-session of this top-level session, in the same profile.
     parent_session_id: Option<String>,
-    /// Retry key: a repeated create with the same key answers with the first one's session.
+    /// Retry key: a repeated create with the same key answers with the first one's session, and
+    /// does nothing else (the prompt is not delivered again).
     idempotency_key: Option<String>,
 }
 
@@ -75,10 +84,18 @@ enum PromptDelivery {
     None,
     /// Stored with the structured session; delivered once its worker runs.
     PendingInitialTurn,
-    /// Typed into the terminal session's pane.
+    /// Typed into the terminal session's pane, once its agent was at its input prompt.
     Sent,
     /// The terminal session was not running, so nothing was typed.
     NotRunning,
+    /// The terminal agent is waiting on a dialog (such as Claude's folder-trust question), so
+    /// nothing was typed; a person answers it in the terminal, then `send` the prompt.
+    BlockedWaiting,
+    /// The terminal agent did not reach its input prompt in time, so nothing was typed.
+    NotReady,
+    /// The create was a retry of an earlier one with the same `idempotency_key`; the first
+    /// create handled the prompt, so nothing was done again.
+    Replayed,
     /// Typing it failed; see `prompt_error`.
     Failed,
 }
@@ -86,9 +103,12 @@ enum PromptDelivery {
 #[derive(Debug, Serialize, JsonSchema)]
 pub(super) struct CreatedSession {
     session: SessionResponse,
+    /// False when `idempotency_key` matched an earlier create, whose session this is.
+    fresh: bool,
     /// Whether the prompt was sent or stored for delivery.
     prompt_sent: bool,
     prompt_delivery: PromptDelivery,
+    /// Why the prompt was not delivered, for `failed`, `blocked_waiting` and `not_ready`.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_error: Option<String>,
 }
@@ -151,14 +171,19 @@ pub(super) struct Output {
     next_since: Option<u64>,
     /// Structured view: more events follow `next_since` already.
     has_more: bool,
+    /// Structured view text: one event alone rendered past the page limit, so `text` holds only
+    /// its tail; `next_since` still moves past it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    truncated: bool,
 }
 
 #[rmcp::tool_router(router = control_router, vis = "pub(super)")]
 impl McpServer {
     #[rmcp::tool(
         description = "Create a session, optionally with a first prompt. A structured session \
-            stores the prompt and delivers it once its worker runs; a terminal session waits \
-            for its agent and types it. Repository hooks that need trust are refused with \
+            stores the prompt and delivers it once its worker runs; a terminal session types it \
+            once its agent is at its input prompt, and never into a dialog (`blocked_waiting`: \
+            a person answers the dialog, then `send` the prompt). Repository hooks that need trust are refused with \
             `hooks_need_trust`: a human must approve them in the AoE dashboard."
     )]
     async fn create_session(
@@ -176,6 +201,10 @@ impl McpServer {
         } else {
             params.prompt.clone().and_then(terminal_text)
         };
+        // `send` refuses the same input, so a create does not quietly drop it.
+        if params.prompt.is_some() && prompt.is_none() {
+            return Err(tool_error("invalid_request", "The prompt is empty"));
+        }
         let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
         let initial_turn = if structured { prompt.clone() } else { None };
         let wait_ready = !structured && prompt.is_some();
@@ -190,16 +219,44 @@ impl McpServer {
             initial_turn,
         )
         .await;
-        let session: SessionResponse = success_body(response).await.map_err(|e| *e)?;
+        let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
         let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
             None => (false, PromptDelivery::None, None),
+            // A retry's first create already stored or typed the prompt.
+            Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
             Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None),
-            // A session that just failed to start is not restarted behind the caller's back.
-            Some(text) => {
-                match send_terminal_message(&self.state.session_service, &session.id, text, false)
-                    .await
+            Some(text) => match wait_for_input_prompt(&self.state, &session.id).await {
+                PaneReadiness::Waiting => (
+                    false,
+                    PromptDelivery::BlockedWaiting,
+                    Some(
+                        "The agent is waiting on a dialog in its terminal, such as a folder-trust \
+                         question. Nothing was typed: a person answers it there, then `send` the \
+                         prompt."
+                            .to_string(),
+                    ),
+                ),
+                PaneReadiness::NotYet => (
+                    false,
+                    PromptDelivery::NotReady,
+                    Some(format!(
+                        "The agent did not reach its input prompt within {} s, so nothing was \
+                         typed. `send` the prompt once it is ready.",
+                        PROMPT_READY_TIMEOUT.as_secs()
+                    )),
+                ),
+                PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None),
+                // A session that just failed to start is not restarted behind the caller's back.
+                PaneReadiness::AtPrompt => match send_terminal_message(
+                    &self.state.session_service,
+                    &session.id,
+                    text.clone(),
+                    false,
+                )
+                .await
                 {
                     Ok(_) => {
+                        log_terminal_message_sent(&session.id, &text);
                         self.publish().await;
                         (true, PromptDelivery::Sent, None)
                     }
@@ -215,11 +272,12 @@ impl McpServer {
                             (false, PromptDelivery::Failed, message)
                         }
                     },
-                }
-            }
+                },
+            },
         };
         Ok(Json(CreatedSession {
             session,
+            fresh,
             prompt_sent,
             prompt_delivery,
             prompt_error,
@@ -258,10 +316,12 @@ impl McpServer {
         let Some(message) = terminal_text(params.message) else {
             return Err(tool_error("invalid_request", "The message is empty"));
         };
-        if let Err(e) = send_terminal_message(&self.state.session_service, &id, message, true).await
+        if let Err(e) =
+            send_terminal_message(&self.state.session_service, &id, message.clone(), true).await
         {
             return Err(terminal_refusal(&id, e.error).await);
         }
+        log_terminal_message_sent(&id, &message);
         self.publish().await;
         Ok(Json(SendOutcome {
             disposition: Disposition::Sent,
@@ -273,8 +333,8 @@ impl McpServer {
 
     #[rmcp::tool(
         description = "Read a session's output. A structured session returns its transcript \
-            since an event seq as text (the last 48 KB of a page), or the raw events, with \
-            `next_since` to read on from. A terminal session returns a capture of its pane."
+            since an event seq as text (up to 48 KB, ending at a whole event), or the raw \
+            events, with `next_since` to read on from without skipping anything. A terminal session returns a capture of its pane."
     )]
     async fn read_output(
         &self,
@@ -298,27 +358,34 @@ impl McpServer {
                 .state
                 .acp_event_store
                 .replay_page(&id, since, Some(READ_PAGE));
-            let next_since = Some(page.last_scanned_seq.unwrap_or(since));
-            let (text, events) = if params.raw {
+            if params.raw {
                 let events = page
                     .events
                     .iter()
                     .map(|(seq, event)| json!({"seq": seq, "event": event}))
                     .collect();
-                (None, Some(events))
-            } else {
-                let (text, _, _) = crate::session::conversation_summary::extract_transcript_delta(
-                    &page.events,
-                    since,
-                );
-                (Some(text), None)
+                return Ok(Json(Output {
+                    view: View::Structured,
+                    text: None,
+                    events: Some(events),
+                    next_since: Some(page.last_scanned_seq.unwrap_or(since)),
+                    has_more: page.has_more,
+                    truncated: false,
+                }));
+            }
+            let text_page = text_page(&page.events, since);
+            // A page cut short leaves events for the next call, whatever the store says.
+            let next_since = match text_page.last_seq {
+                Some(seq) if text_page.cut => seq,
+                _ => page.last_scanned_seq.unwrap_or(since),
             };
             return Ok(Json(Output {
                 view: View::Structured,
-                text,
-                events,
-                next_since,
-                has_more: page.has_more,
+                text: Some(text_page.text),
+                events: None,
+                next_since: Some(next_since),
+                has_more: page.has_more || text_page.cut,
+                truncated: text_page.truncated,
             }));
         }
         let lines = params.lines.unwrap_or(DEFAULT_LINES).clamp(1, 2000) as usize;
@@ -328,7 +395,10 @@ impl McpServer {
                 CaptureError::NotRunning => {
                     tool_error("not_running", "The terminal session is not running")
                 }
-                CaptureError::Tmux(e) => tool_error("internal", format!("tmux: {e:#}")),
+                CaptureError::Tmux(e) => {
+                    tracing::error!(target: "http.api.sessions", session = %id, error = %e, "read_output: tmux error");
+                    tool_error("internal", "Terminal capture failed")
+                }
                 CaptureError::Panicked(e) => tool_error("internal", e),
             })?;
         Ok(Json(Output {
@@ -337,6 +407,7 @@ impl McpServer {
             events: None,
             next_since: None,
             has_more: false,
+            truncated: false,
         }))
     }
 }
@@ -385,9 +456,11 @@ fn create_body(params: &CreateSessionParams) -> Result<CreateSessionBody, String
 }
 
 /// The created session from a create response, or the refusal it carries.
+/// The created session, and whether this call created it: `201` is a fresh create, `200` the
+/// answer to a retried `idempotency_key`.
 async fn success_body(
     response: axum::response::Response,
-) -> Result<SessionResponse, Box<CallToolResult>> {
+) -> Result<(SessionResponse, bool), Box<CallToolResult>> {
     let status = response.status();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -395,7 +468,154 @@ async fn success_body(
     if !status.is_success() {
         return Err(Box::new(refusal(status, &bytes)));
     }
-    serde_json::from_slice(&bytes).map_err(|e| Box::new(tool_error("internal", e.to_string())))
+    let session = serde_json::from_slice(&bytes)
+        .map_err(|e| Box::new(tool_error("internal", e.to_string())))?;
+    Ok((session, status == StatusCode::CREATED))
+}
+
+/// What a terminal agent's pane shows, read with the rules the status poller uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneReadiness {
+    /// An idle rule matched the agent's own input prompt.
+    AtPrompt,
+    /// A rule matched a dialog or question waiting for a person.
+    Waiting,
+    /// Neither yet: still starting, working, or nothing recognizable (an unmatched screen reads
+    /// as Idle by default, which is not evidence of the input prompt).
+    NotYet,
+    /// The session is gone, stopped or failed.
+    Gone,
+}
+
+/// Waits up to [`PROMPT_READY_TIMEOUT`] for a terminal session's agent to reach its input
+/// prompt, so a first prompt is never typed into a dialog. Returns at once on a dialog.
+async fn wait_for_input_prompt(
+    state: &std::sync::Arc<crate::server::AppState>,
+    id: &str,
+) -> PaneReadiness {
+    let deadline = tokio::time::Instant::now() + PROMPT_READY_TIMEOUT;
+    loop {
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return PaneReadiness::Gone;
+        };
+        if matches!(
+            instance.status,
+            Status::Error | Status::Stopped | Status::Deleting
+        ) {
+            return PaneReadiness::Gone;
+        }
+        let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
+            .await
+            .unwrap_or(PaneReadiness::NotYet);
+        if readiness != PaneReadiness::NotYet || tokio::time::Instant::now() >= deadline {
+            return readiness;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// One fresh capture of the agent's pane, decided by its detection manifest (as `aoe session
+/// show` does). Agents without a manifest have no prompt rule to trust, so they never read as
+/// at their prompt.
+fn pane_readiness(instance: &Instance) -> PaneReadiness {
+    let profile = instance.source_profile.as_str();
+    let Ok(session) = instance.tmux_session() else {
+        return PaneReadiness::Gone;
+    };
+    if !session.exists() || session.is_pane_dead() {
+        return PaneReadiness::Gone;
+    }
+    let alias = crate::tmux::status_rules::effective_detect_as(
+        profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let manifest_tool = if alias.is_empty() {
+        instance.tool.as_str()
+    } else {
+        alias.as_ref()
+    };
+    let rules_tool =
+        crate::tmux::status_rules::detection_tool(profile, &instance.tool, &instance.detect_as);
+    let Some(plan) = crate::tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
+    else {
+        return PaneReadiness::NotYet;
+    };
+    let Ok(content) = session.capture_pane(plan.capture_policy().scope.lines()) else {
+        return PaneReadiness::NotYet;
+    };
+    let hook = crate::hooks::read_hook_status(&instance.id).map(|status| {
+        crate::tmux::detect::HookObservation {
+            status,
+            age: crate::hooks::read_hook_status_age(&instance.id),
+        }
+    });
+    let title = crate::tmux::utils::pane_title(session.name()).unwrap_or_default();
+    let owned = !plan.capture_policy().observe_ownership
+        || instance.live_pane_owned(&session, None, session.is_pane_dead());
+    let observation = crate::tmux::Observation::new(&title, hook, owned);
+    let detection = plan.detect(&crate::tmux::utils::strip_ansi(&content), &observation);
+    match detection.status {
+        Some(Status::Waiting) => PaneReadiness::Waiting,
+        Some(Status::Idle) if detection.rule != "no_rule" => PaneReadiness::AtPrompt,
+        _ => PaneReadiness::NotYet,
+    }
+}
+
+/// The audit line HTTP `POST /send` writes for keystrokes typed into a pane.
+fn log_terminal_message_sent(id: &str, message: &str) {
+    tracing::info!(target: "session.lifecycle", session = %id, len = message.len(), via = "mcp", "terminal message sent");
+}
+
+/// One `read_output` text page: the longest run of events, from `since`, whose rendering fits
+/// in [`TEXT_PAGE_BYTES`].
+struct TextPage {
+    text: String,
+    /// The last event rendered, when the page stops short of the events read.
+    last_seq: Option<u64>,
+    /// Fewer events were rendered than were read.
+    cut: bool,
+    /// The first event alone rendered past the limit, so its text was cut to the tail.
+    truncated: bool,
+}
+
+fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage {
+    use crate::session::conversation_summary::extract_transcript_delta;
+    let render = |n: usize| extract_transcript_delta(&events[..n], since).0;
+    let whole = render(events.len());
+    if whole.len() <= TEXT_PAGE_BYTES {
+        return TextPage {
+            text: whole,
+            last_seq: None,
+            cut: false,
+            truncated: false,
+        };
+    }
+    // The rendering only grows with the prefix, so the longest prefix that fits is found by
+    // bisection; at least one event is always returned so the cursor moves.
+    let (mut fits, mut over) = (0usize, events.len());
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if render(mid).len() <= TEXT_PAGE_BYTES {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    let (n, truncated) = if fits == 0 { (1, true) } else { (fits, false) };
+    TextPage {
+        text: render(n),
+        last_seq: Some(events[n - 1].0),
+        cut: n < events.len(),
+        truncated,
+    }
 }
 
 /// A refused HTTP response as a tool error: the codes a caller can act on pass through, and
@@ -536,7 +756,10 @@ async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
             "The session no longer has a terminal agent",
         ),
         SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
-        SendKeysError::Tmux(e) => tool_error("send_failed", format!("tmux: {e:#}")),
+        SendKeysError::Tmux(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal send failed");
+            tool_error("send_failed", "Terminal send failed")
+        }
         SendKeysError::Internal => tool_error("internal", "Internal error"),
     }
 }
