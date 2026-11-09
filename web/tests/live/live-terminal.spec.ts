@@ -465,6 +465,12 @@ while true; do sleep 1; done
         await loser.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
         await expect.poll(() => promptAlignment(winner), { timeout: 10_000 }).toEqual(ON_PROMPT);
       }
+      const capture = test.info().outputPath("native-ownership-ping-pong.png");
+      await b.screenshot({ path: capture, fullPage: true });
+      await test.info().attach("native-ownership-ping-pong", {
+        path: capture,
+        contentType: "image/png",
+      });
     } finally {
       await ctxA.close();
       await ctxB.close();
