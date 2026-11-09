@@ -8,7 +8,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
 ### Bug Fixes
 
-- **session:** Accept unchanged preexisting dead panes in a complete handoff inventory while retaining strict socket, server, pane, PID, and live-birth fencing.
+- **session:** Accept unchanged preexisting dead panes in a complete handoff inventory, including tmux's empty dead-pane PID, while retaining strict structural IDs, socket, server, PID, and live-birth fencing.
 
 ### Security
 
