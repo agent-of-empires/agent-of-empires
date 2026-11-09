@@ -2605,7 +2605,7 @@ pub(super) async fn continue_interrupted_prompt(
         .any(|row| row.id == id && row.pending_initial_turn.is_some());
     use crate::server::acp_reconciler::ContinuationOutcome;
     let outcome =
-        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, submission).await;
+        crate::server::acp_reconciler::install_rate_limit_continuation(state, id, &submission).await;
     pending_before
         || matches!(
             outcome,
