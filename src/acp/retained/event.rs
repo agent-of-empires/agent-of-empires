@@ -1,11 +1,7 @@
-use std::{cell::Cell, fmt, io};
+use std::io;
 
 use chrono::{DateTime, Utc};
 use pulldown_cmark::disk::TextRef;
-use serde::{
-    de::{self, Visitor},
-    Deserialize,
-};
 
 use super::json::{Kind, ValueRef};
 use super::{invalid, Context, Disk, List};
@@ -248,12 +244,19 @@ impl Context {
         }
         if is("ElicitationRequested")? {
             let elicitation = Object::new(self, object()?.required("elicitation")?)?;
+            self.check_elicitation(&elicitation)?;
             return Ok(View::ElicitationRequested {
                 tool_call_id: elicitation.optional_text("tool_call_id")?,
             });
         }
         if is("ElicitationResolved")? {
             let object = object()?;
+            if !known::<crate::acp::elicitations::ElicitationOutcome>(
+                self,
+                object.text("outcome")?,
+            )? {
+                return Err(invalid("invalid elicitation outcome"));
+            }
             let answers = object.list("answers")?;
             self.each(answers, |value| {
                 let answer = Object::new(self, value)?;
@@ -350,7 +353,7 @@ impl Context {
                 return Ok(view);
             }
         }
-        if known(self, name)? {
+        if known::<Event>(self, name)? {
             Ok(View::Other)
         } else {
             Err(invalid("unknown retained event variant"))
@@ -369,6 +372,48 @@ impl Context {
         }
         Ok(())
     }
+    fn check_elicitation(&self, elicitation: &Object<'_>) -> io::Result<()> {
+        elicitation.text("nonce")?;
+        elicitation.text("message")?;
+        elicitation.date("requested_at")?;
+        for field in ["title", "description", "tool_call_id"] {
+            elicitation.optional_text(field)?;
+        }
+        self.each(self.list(elicitation.required("questions")?)?, |value| {
+            let question = Object::new(self, value)?;
+            question.text("field_key")?;
+            question.boolean("required", None)?;
+            if !known::<crate::acp::elicitations::ElicitationFieldKind>(
+                self,
+                question.text("kind")?,
+            )? {
+                return Err(invalid("invalid elicitation field kind"));
+            }
+            for field in ["title", "description", "pattern", "format"] {
+                question.optional_text(field)?;
+            }
+            self.each(self.list(question.required("options")?)?, |value| {
+                let option = Object::new(self, value)?;
+                option.text("value")?;
+                option.text("label")?;
+                option.optional_text("description")?;
+                option.optional_text("preview")?;
+                Ok(())
+            })
+        })?;
+        if let Some(value) = elicitation.optional("resolved")? {
+            let resolved = Object::new(self, value)?;
+            resolved.date("resolved_at")?;
+            if !known::<crate::acp::elicitations::ElicitationOutcome>(
+                self,
+                resolved.text("outcome")?,
+            )? {
+                return Err(invalid("invalid elicitation outcome"));
+            }
+        }
+        Ok(())
+    }
+
     fn check_diffs(&self, diffs: List) -> io::Result<()> {
         self.each(diffs, |value| {
             let diff = Object::new(self, value)?;
@@ -409,61 +454,13 @@ impl Context {
     }
 }
 
-#[derive(Debug)]
-enum ProbeError {
-    Io(io::Error),
-    Done,
-}
-impl fmt::Display for ProbeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(error) => error.fmt(formatter),
-            Self::Done => formatter.write_str("event variant probe"),
-        }
-    }
-}
-impl std::error::Error for ProbeError {}
-impl de::Error for ProbeError {
-    fn custom<T: fmt::Display>(_: T) -> Self {
-        Self::Done
-    }
-}
-struct Probe<'a> {
-    context: &'a Context,
-    name: TextRef,
-    found: &'a Cell<bool>,
-}
-impl<'de> de::Deserializer<'de> for Probe<'_> {
-    type Error = ProbeError;
-    fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
-        Err(ProbeError::Done)
-    }
-    fn deserialize_enum<V: Visitor<'de>>(
-        self,
-        _: &'static str,
-        variants: &'static [&'static str],
-        _: V,
-    ) -> Result<V::Value, Self::Error> {
+fn known<T: serde::de::DeserializeOwned>(context: &Context, name: TextRef) -> io::Result<bool> {
+    crate::acp::transcript::event::matches_variant::<T>(|variants| {
         for variant in variants {
-            if super::json::text_is(&self.context.spool, self.name, variant)
-                .map_err(ProbeError::Io)?
-            {
-                self.found.set(true);
-                break;
+            if super::json::text_is(&context.spool, name, variant)? {
+                return Ok(true);
             }
         }
-        Err(ProbeError::Done)
-    }
-    serde::forward_to_deserialize_any! { bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier ignored_any }
-}
-fn known(context: &Context, name: TextRef) -> io::Result<bool> {
-    let found = Cell::new(false);
-    match Event::deserialize(Probe {
-        context,
-        name,
-        found: &found,
-    }) {
-        Err(ProbeError::Io(error)) => Err(error),
-        _ => Ok(found.get()),
-    }
+        Ok(false)
+    })
 }

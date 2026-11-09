@@ -110,7 +110,11 @@ impl EventStore {
         }
         let table = self.schema.events_table();
         let (highest, lowest): (Option<i64>, Option<i64>) = tx.query_row(
-            &format!("SELECT MAX(seq), MIN(seq) FROM {table} WHERE session_id = ?1"),
+            &format!(
+                "SELECT
+                   (SELECT seq FROM {table} WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1),
+                   (SELECT seq FROM {table} WHERE session_id = ?1 ORDER BY seq ASC LIMIT 1)"
+            ),
             [session_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;

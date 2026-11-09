@@ -46,6 +46,30 @@ event_view! { 'a, B;
 pub(crate) fn has_retained_payload<S: pulldown_cmark::disk::ByteSource + ?Sized>(
     source: &S,
 ) -> std::io::Result<bool> {
+    if matches_header(source, PAYLOAD_KINDS)? {
+        return Ok(true);
+    }
+    if matches_variant::<Event>(|variants| {
+        for kinds in variants.chunks(127) {
+            if matches_header(source, kinds)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })? {
+        Ok(false)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unknown retained event variant",
+        ))
+    }
+}
+
+fn matches_header<S: pulldown_cmark::disk::ByteSource + ?Sized>(
+    source: &S,
+    kinds: &[&str],
+) -> std::io::Result<bool> {
     use pulldown_cmark::disk::Cursor;
     use std::io::{self, ErrorKind};
     let invalid = || io::Error::new(ErrorKind::InvalidData, "invalid retained event header");
@@ -70,12 +94,12 @@ pub(crate) fn has_retained_payload<S: pulldown_cmark::disk::ByteSource + ?Sized>
         Some(b'"') => {}
         _ => return Err(invalid()),
     }
-    let mut candidates = u128::MAX >> (128 - PAYLOAD_KINDS.len());
+    let mut candidates = u128::MAX >> (128 - kinds.len());
     let mut position = 0;
     loop {
         let mut byte = cursor.next_byte()?.ok_or_else(invalid)?;
         if byte == b'"' {
-            return Ok(PAYLOAD_KINDS.iter().enumerate().any(|(index, kind)| {
+            return Ok(kinds.iter().enumerate().any(|(index, kind)| {
                 candidates & (1u128 << index) != 0 && kind.len() == position
             }));
         }
@@ -105,7 +129,7 @@ pub(crate) fn has_retained_payload<S: pulldown_cmark::disk::ByteSource + ?Sized>
         } else if byte < 32 {
             return Err(invalid());
         }
-        for (index, kind) in PAYLOAD_KINDS.iter().enumerate() {
+        for (index, kind) in kinds.iter().enumerate() {
             if kind.as_bytes().get(position) != Some(&byte) {
                 candidates &= !(1u128 << index);
             }
@@ -114,6 +138,65 @@ pub(crate) fn has_retained_payload<S: pulldown_cmark::disk::ByteSource + ?Sized>
             return Ok(false);
         }
         position += 1;
+    }
+}
+
+pub(crate) fn matches_variant<T: serde::de::DeserializeOwned>(
+    matches: impl FnOnce(&'static [&'static str]) -> std::io::Result<bool>,
+) -> std::io::Result<bool> {
+    use serde::de::{self, Visitor};
+    use std::{cell::Cell, fmt, io};
+
+    #[derive(Debug)]
+    enum ProbeError {
+        Io(io::Error),
+        Done,
+    }
+    impl fmt::Display for ProbeError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Io(error) => error.fmt(formatter),
+                Self::Done => formatter.write_str("event variant probe"),
+            }
+        }
+    }
+    impl std::error::Error for ProbeError {}
+    impl de::Error for ProbeError {
+        fn custom<D: fmt::Display>(_: D) -> Self {
+            Self::Done
+        }
+    }
+    struct Probe<'a, F> {
+        matches: F,
+        found: &'a Cell<bool>,
+    }
+    impl<'de, F> de::Deserializer<'de> for Probe<'_, F>
+    where
+        F: FnOnce(&'static [&'static str]) -> io::Result<bool>,
+    {
+        type Error = ProbeError;
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(ProbeError::Done)
+        }
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            variants: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.found
+                .set((self.matches)(variants).map_err(ProbeError::Io)?);
+            Err(ProbeError::Done)
+        }
+        serde::forward_to_deserialize_any! { bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier ignored_any }
+    }
+    let found = Cell::new(false);
+    match T::deserialize(Probe {
+        matches,
+        found: &found,
+    }) {
+        Err(ProbeError::Io(error)) => Err(error),
+        _ => Ok(found.get()),
     }
 }
 

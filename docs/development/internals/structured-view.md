@@ -110,8 +110,9 @@ that output into subsequent tool invocations.
 The native retained reader has no interactive view state. Its authenticated
 `GET /api/sessions/{id}/acp/retained-source` reads at most 64 KiB from one
 persisted event per response, with byte offsets pinned to the event-store
-incarnation and session revision. Non-timeline metadata is withheld. Identity
-probes do not refold unchanged histories.
+incarnation and session revision. Non-timeline metadata is withheld; unknown
+variants mark the history incomplete. Bounds use indexed endpoint lookups.
+Identity probes do not refold unchanged histories.
 
 The shared reducer stores retained payloads and indexes on disk. Markdown,
 ANSI, grapheme widths, and wrapping share their semantics with the live renderer.

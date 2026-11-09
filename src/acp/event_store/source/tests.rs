@@ -154,3 +154,204 @@ fn retained_source_preserves_byte_offsets_identity_and_private_metadata() {
     assert_eq!((meta.seq, meta.omitted), (Some(2), true));
     assert_eq!(bytes, b"");
 }
+
+#[tokio::test]
+async fn malformed_retained_events_preserve_valid_output_and_report_incompleteness() {
+    use crate::acp::{
+        client::HttpClient,
+        retained::load::{self, Cancellation},
+        state::ToolCall,
+        transcript::storage::Rows,
+    };
+
+    let mut instance = crate::session::Instance::new("invalid retained events", "/tmp");
+    instance.trash();
+    let session = instance.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![instance]);
+    let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+    let events = [
+        Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: "question".into(),
+                name: "Ask".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: at,
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        },
+        Event::ToolCallContent {
+            tool_call_id: "question".into(),
+            content: "KEEP-TOOL-OUTPUT".into(),
+        },
+        Event::ThinkingEnded,
+        Event::Stopped {
+            reason: "end_turn".into(),
+        },
+        Event::AgentMessageChunk {
+            text: "LATER-CONTENT".into(),
+            message_id: None,
+        },
+    ];
+    for (index, event) in events.iter().enumerate() {
+        state
+            .acp_event_store
+            .record(&session, index as u64 + 1, event)
+            .unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = crate::daemon::DaemonEndpoint::new(
+        format!("http://{}", listener.local_addr().unwrap()),
+        None,
+        crate::daemon::Source::Env,
+    );
+    let router = axum::Router::new()
+        .route(
+            "/api/sessions/{id}/acp/retained-source",
+            axum::routing::get(crate::server::api::acp_retained_source),
+        )
+        .with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let client = HttpClient::new(endpoint).unwrap();
+    let mut observations = Vec::new();
+    for malformed in [
+        r#"{"Bogus":{}}"#,
+        r#"{"ElicitationRequested":{"elicitation":{"tool_call_id":"question"}}}"#,
+        r#"{"ElicitationRequested":{"elicitation":{"nonce":"n","message":"Pick","tool_call_id":"question","questions":[{"field_key":"q","required":true,"kind":"free_text"}],"requested_at":"1970-01-01T00:01:40Z"}}}"#,
+        r#"{"ElicitationResolved":{"nonce":"n","answers":[{"question":"FORGED","answer":"FORGED"}]}}"#,
+    ] {
+        assert!(serde_json::from_str::<Event>(malformed).is_err());
+        state
+            .acp_event_store
+            .conn()
+            .execute(
+                "UPDATE acp_events SET event_json = ?1 WHERE session_id = ?2 AND seq = 3",
+                rusqlite::params![malformed, session],
+            )
+            .unwrap();
+        let client = client.clone();
+        let session = session.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let (incomplete, text) = tokio::task::spawn_blocking(move || {
+            let loaded = load::read(&client, &session, &runtime, &Cancellation::default())?;
+            let mut bytes = Vec::new();
+            for index in 0..loaded.projection.rows.len() {
+                let row = loaded.projection.rows.read(index)?;
+                loaded.context.spool.copy_to(row.text, &mut bytes)?;
+            }
+            for output in loaded.projection.unfinished.iter() {
+                loaded.context.spool.copy_to(output?.text, &mut bytes)?;
+            }
+            anyhow::Ok((loaded.incomplete, String::from_utf8(bytes)?))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        observations.push((
+            malformed,
+            incomplete,
+            text.contains("KEEP-TOOL-OUTPUT"),
+            text.contains("LATER-CONTENT"),
+            !text.contains("FORGED"),
+        ));
+    }
+    server.abort();
+    let _ = server.await;
+    assert!(
+        observations
+            .iter()
+            .all(|(_, incomplete, tool, later, no_forged)| *incomplete
+                && *tool
+                && *later
+                && *no_forged),
+        "{observations:?}"
+    );
+}
+
+#[test]
+fn complete_retained_reads_have_subquadratic_sqlite_work() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn steps(count: u64, replay: bool) -> usize {
+        let directory = tempfile::tempdir().unwrap();
+        let store = EventStore::open(&directory.path().join("events.db"), 1024).unwrap();
+        for sequence in 1..=count {
+            store
+                .record(
+                    "s",
+                    sequence,
+                    &Event::AgentMessageChunk {
+                        text: format!("part-{sequence}"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let steps = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&steps);
+        store
+            .conn()
+            .progress_handler(
+                1,
+                Some(move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            )
+            .unwrap();
+        let mut after = 0;
+        let mut identity = None;
+        loop {
+            let next = if replay {
+                let (mut page, current) = store
+                    .retained_page("s", after, None, 1, identity.as_deref())
+                    .unwrap()
+                    .unwrap();
+                identity = Some(current);
+                page.events.pop()
+            } else {
+                let query = RetainedSourceQuery {
+                    after,
+                    history_identity: identity.clone(),
+                    ..Default::default()
+                };
+                let RetainedSourceRead::Block { meta, bytes } =
+                    store.retained_source("s", &query).unwrap()
+                else {
+                    panic!("pinned source block expected")
+                };
+                identity = Some(meta.history_identity);
+                meta.seq
+                    .map(|sequence| (sequence, serde_json::from_slice::<Event>(&bytes).unwrap()))
+            };
+            let Some((sequence, event)) = next else { break };
+            assert_eq!(sequence, after + 1);
+            let Event::AgentMessageChunk { text, .. } = event else {
+                panic!("message expected")
+            };
+            assert_eq!(text, format!("part-{sequence}"));
+            after = sequence;
+        }
+        assert_eq!(after, count);
+        store
+            .conn()
+            .progress_handler(0, None::<fn() -> bool>)
+            .unwrap();
+        steps.load(Ordering::Relaxed)
+    }
+
+    for replay in [false, true] {
+        let small = steps(128, replay);
+        let large = steps(256, replay);
+        println!("retained replay={replay}: 128 events={small} VM steps, 256 events={large}");
+        assert!(
+            large < 3 * small,
+            "quadratic retained read: {small} -> {large}"
+        );
+    }
+}
