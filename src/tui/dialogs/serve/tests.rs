@@ -101,6 +101,7 @@ enum Held {
     Picker,
     Providers,
     Retry,
+    Stop,
     Reset,
     Restart,
     LaunchContext,
@@ -118,6 +119,7 @@ fn operation(job: &Job) -> Held {
         Job::Picker => Held::Picker,
         Job::Providers => Held::Providers,
         Job::Retry(_) => Held::Retry,
+        Job::Stop(_) => Held::Stop,
         Job::Reset(_) => Held::Reset,
         Job::Restart(..) => Held::Restart,
         Job::LaunchContext { .. } => Held::LaunchContext,
@@ -738,6 +740,7 @@ fn every_pending_state_leaves_a_closed_worker() {
             ),
             Held::Active => (Job::ObserveActive(Some(target)), PendingJob::Active),
             Held::Copy => (Job::Copy("URL", "fixture".to_owned()), PendingJob::Copy),
+            Held::Stop => panic!("App-owned stop has no view pending state"),
         };
         view.request(job, pending);
         view.tick();
@@ -1336,7 +1339,7 @@ fn launch_observations_never_mix_a_replacement_with_prior_credentials() {
                 submitter,
             );
             view.launch_in_flight = true;
-            view.finish_launch(Ok(target));
+            view.finish_launch(Ok(target), None);
             if hold_starting {
                 wait_for(&mut view, |view| !view.launch_in_flight);
                 if let ServeViewState::Error { message, .. } = &view.state {
@@ -1761,7 +1764,7 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
         });
         let mut view = ServeView::with_state(starting(), submitter);
         view.launch_in_flight = true;
-        view.finish_launch(Ok(target));
+        view.finish_launch(Ok(target), None);
         if hold_starting {
             wait_for(&mut view, |view| !view.launch_in_flight);
         }
@@ -2100,7 +2103,7 @@ async fn stop_retains_the_original_retry_completion() {
         let ServeAction::Stop(request) = view.handle_key(key('S')) else {
             panic!("S must retain its provider stop");
         };
-        let owner = tokio::spawn(request.run());
+        let owner = tokio::spawn(request.run(&mut jobs));
         assert!(matches!(
             view.handle_key(KeyEvent::from(KeyCode::Esc)),
             ServeAction::Close
@@ -2132,6 +2135,7 @@ async fn stop_retains_the_original_retry_completion() {
 #[serial_test::serial]
 async fn restart_preserves_a_replacement_before_any_persisted_effect() {
     let _home = crate::session::test_support::isolate_app_dir();
+    let tools = FunnelFixture::new();
     for code in ['R', 'G'] {
         for replacement in ["before-confirmation", "during-assessment", "after-handoff"] {
             let mut original = TestDaemon::new();
@@ -2139,7 +2143,11 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
             let mut successor = TestDaemon::new();
             let mut jobs = ServeJobs::default();
             let (submitter, gate) = gated(&mut jobs, Held::Restart);
-            let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), submitter);
+            let mut state = active_state(ServeMode::Tunnel);
+            if let ServeViewState::Active { transport, .. } = &mut state {
+                *transport = Some(TunnelTransport::Tailscale);
+            }
+            let mut view = ServeView::with_state(state, submitter);
             view.target = Some(target);
             view.handle_key(key(code));
             gate.entered(Held::Restart);
@@ -2181,6 +2189,17 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
                     })
                     .collect::<std::collections::BTreeMap<_, _>>()
             };
+            let context = request.target();
+            if replacement == "during-assessment" {
+                drop(view);
+                view = ServeView::for_launch(
+                    DashboardLaunch::Running {
+                        target: context.clone(),
+                        started_at: Instant::now(),
+                    },
+                    &mut jobs,
+                );
+            }
             let before = metadata();
             let mut launch = std::pin::pin!(request.run("test".to_owned(), None));
             std::future::poll_fn(|context| {
@@ -2194,10 +2213,45 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
                 "{code}/{replacement}: effects preceded admission"
             );
             drop(transaction);
-            assert!(tokio::time::timeout(Duration::from_secs(10), launch)
+            let failure = match tokio::time::timeout(Duration::from_secs(10), launch)
                 .await
                 .unwrap()
-                .is_err());
+            {
+                Err(failure) => failure,
+                Ok(_) => panic!("stale restart unexpectedly succeeded"),
+            };
+            if replacement == "after-handoff" {
+                drop(view);
+                view = ServeView::for_launch(
+                    DashboardLaunch::Failed {
+                        target: context,
+                        failure,
+                    },
+                    &mut jobs,
+                );
+            } else {
+                view.finish_launch(Err(failure), context.predecessor);
+            }
+            wait_for(&mut view, |view| view.pending.is_none());
+            let recovery = match replacement {
+                "before-confirmation" => 'P',
+                "during-assessment" => 'S',
+                _ => 'R',
+            };
+            match view.handle_key(key(recovery)) {
+                ServeAction::Stop(request) => {
+                    assert!(request.run(&mut jobs).await.is_err());
+                }
+                ServeAction::Continue => {
+                    assert!(view.pending.as_ref().is_some_and(|pending| matches!(
+                        pending.kind,
+                        PendingJob::Retry { .. } | PendingJob::Reset
+                    )));
+                    wait_for(&mut view, |view| view.pending.is_none());
+                }
+                _ => panic!("recovery did not reach its control owner"),
+            }
+            assert!(!tools.root.path().join("calls").exists());
             assert!(successor.child.try_wait().unwrap().is_none());
             assert_eq!(
                 metadata(),
@@ -2207,4 +2261,70 @@ async fn restart_preserves_a_replacement_before_any_persisted_effect() {
             remove_app_file("serve.pid");
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[serial_test::serial]
+fn quitting_retains_an_admitted_direct_stop_until_physical_retirement() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _tools = FunnelFixture::new();
+    let mut daemon = TestDaemon::new();
+    let target = daemon.publish();
+    let pid = daemon.child.id();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .unwrap();
+    let status_path = format!("/proc/{pid}/status");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::fs::read_to_string(&status_path)
+        .unwrap()
+        .lines()
+        .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("T"))
+    {
+        assert!(Instant::now() < deadline, "fixture Daemon did not stop");
+        std::thread::yield_now();
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut jobs = ServeJobs::default();
+        let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), jobs.submitter());
+        view.target = Some(target);
+        let ServeAction::Stop(request) = view.handle_key(key('S')) else {
+            panic!("S did not request a direct stop");
+        };
+        tokio::spawn(request.run(&mut jobs));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = std::fs::read_to_string(&status_path).unwrap();
+            let pending =
+                status
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .any(|(name, value)| {
+                        matches!(name, "SigPnd" | "ShdPnd")
+                            && u64::from_str_radix(value.trim(), 16).unwrap()
+                                & (1 << (nix::libc::SIGTERM - 1))
+                                != 0
+                    });
+            if pending {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Stop never sent SIGTERM");
+            tokio::task::yield_now().await;
+        }
+        drop(view);
+        jobs.shutdown();
+    });
+    drop(runtime);
+    assert!(daemon.child.try_wait().unwrap().is_some());
+    assert!(!crate::session::get_app_dir()
+        .unwrap()
+        .join("serve.pid")
+        .exists());
 }

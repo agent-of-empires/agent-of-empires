@@ -7,6 +7,7 @@ mod words;
 mod work;
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -59,17 +60,23 @@ impl ServeStopRequest {
         self.context.clone()
     }
 
-    pub(crate) async fn run(self) -> anyhow::Result<()> {
-        if let Some((attempt, ticket)) = self.retry {
-            return match ticket.finish(attempt).await? {
-                JobResult::Retried { .. } => Ok(()),
+    pub(crate) fn run(
+        self,
+        jobs: &mut ServeJobs,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        let (attempt, ticket) = self.retry.unwrap_or_else(|| {
+            (
+                0,
+                jobs.submitter().request(0, Job::Stop(self.context.target)),
+            )
+        });
+        async move {
+            match ticket.finish(attempt).await? {
+                JobResult::Stopped | JobResult::Retried { .. } => Ok(()),
                 JobResult::Failed(message) => Err(anyhow::anyhow!(message)),
-                _ => anyhow::bail!("The retained provider stop returned an unrelated result"),
-            };
+                _ => anyhow::bail!("The dashboard stop returned an unrelated result"),
+            }
         }
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let lease = TuiControlLease::prepare(self.context.target, &cancel).await?;
-        lease.stop().await
     }
 }
 
@@ -132,6 +139,12 @@ pub enum DashboardLaunch {
 }
 
 impl DashboardLaunch {
+    pub(crate) fn predecessor(self) -> Option<TuiControlTarget> {
+        match self {
+            Self::Running { target, .. } | Self::Failed { target, .. } => target.predecessor,
+        }
+    }
+
     pub(crate) fn stop_request(self, control: TuiControlTarget) -> ServeStopRequest {
         let target = match self {
             Self::Running { target, .. } | Self::Failed { target, .. } => target,
@@ -148,6 +161,7 @@ impl DashboardLaunch {
                 mode: ServeMode::Tunnel,
                 transport: Some(TunnelTransport::Tailscale),
                 passphrase: None,
+                predecessor: None,
             },
             started_at,
         }
@@ -159,6 +173,7 @@ pub struct LaunchTarget {
     mode: ServeMode,
     transport: Option<TunnelTransport>,
     passphrase: Option<String>,
+    predecessor: Option<TuiControlTarget>,
 }
 
 impl ServeLaunchRequest {
@@ -167,6 +182,7 @@ impl ServeLaunchRequest {
             mode: self.mode,
             transport: self.transport,
             passphrase: self.passphrase.clone(),
+            predecessor: self.restart.clone(),
         }
     }
 
@@ -798,7 +814,7 @@ impl ServeView {
                     log_offset: 0,
                 },
                 true,
-                None,
+                target.predecessor,
             ),
             DashboardLaunch::Failed { target, failure } => (
                 ServeViewState::start_failed_with(
@@ -808,7 +824,7 @@ impl ServeView {
                     failure.log_tail,
                 ),
                 false,
-                failure.target,
+                failure.target.or(target.predecessor),
             ),
         };
         let mut view = Self::with_state(state, jobs.submitter());
@@ -1229,7 +1245,8 @@ impl ServeView {
             started_at: Instant::now(),
             log_offset: 0,
         };
-        let needs_passphrase = request.mode == ServeMode::Tunnel
+        let needs_passphrase = request.restart.is_none()
+            && request.mode == ServeMode::Tunnel
             && request.passphrase.as_ref().is_none_or(String::is_empty);
         self.request(
             Job::LaunchContext { needs_passphrase },
@@ -1241,7 +1258,11 @@ impl ServeView {
         self.pending_launch.take()
     }
 
-    pub(crate) fn finish_launch(&mut self, result: Result<TuiControlTarget, ServeLaunchFailure>) {
+    pub(crate) fn finish_launch(
+        &mut self,
+        result: Result<TuiControlTarget, ServeLaunchFailure>,
+        predecessor: Option<TuiControlTarget>,
+    ) {
         if self.stop_requested || !self.launch_in_flight {
             return;
         }
@@ -1270,7 +1291,7 @@ impl ServeView {
             }
             Err(failure) => {
                 self.launch_in_flight = false;
-                self.target = failure.target;
+                self.target = failure.target.or(predecessor);
                 self.state = ServeViewState::start_failed_with(
                     mode,
                     transport,
@@ -1436,7 +1457,6 @@ impl ServeView {
             mode,
             transport,
             urls,
-            passphrase,
             ..
         } = &self.state
         else {
@@ -1465,11 +1485,7 @@ impl ServeView {
                 self.pending_passphrase = generate_passphrase();
                 Some(self.pending_passphrase.clone())
             } else {
-                (mode == ServeMode::Tunnel).then(|| {
-                    passphrase
-                        .clone()
-                        .unwrap_or_else(|| self.pending_passphrase.clone())
-                })
+                None
             };
             self.prepare_launch(ServeLaunchRequest {
                 restart: Some(target),

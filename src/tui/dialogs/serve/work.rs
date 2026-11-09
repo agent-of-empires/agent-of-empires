@@ -19,6 +19,7 @@ pub(super) enum Job {
     Picker,
     Providers,
     Retry(TuiControlTarget),
+    Stop(TuiControlTarget),
     Reset(TuiControlTarget),
     Restart(ServeMode, Option<TunnelTransport>),
     LaunchContext {
@@ -62,6 +63,7 @@ pub(super) enum JobResult {
         cloudflare: TransportStatus,
         target: TuiControlTarget,
     },
+    Stopped,
     Reset(Result<(), String>),
     Restart(RestartProbe),
     LaunchContext {
@@ -195,6 +197,23 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
         Job::Providers => {
             let (tailscale, cloudflare) = assess_transports(cancel);
             JobResult::Providers(tailscale, cloudflare)
+        }
+        Job::Stop(target) => {
+            let stopped = runtime.block_on(async {
+                let lease = TuiControlLease::prepare(target, cancel).await?;
+                anyhow::ensure!(control.admit(), "Serve stop cancelled before admission");
+                lease.stop().await
+            });
+            control.finish_mutation();
+            match stopped {
+                Ok(()) => JobResult::Stopped,
+                Err(error) => {
+                    tracing::warn!(target: "tui.dialog", %error, "Serve stop did not complete");
+                    JobResult::Failed(format!(
+                        "Stop did not complete: {error}. Inspect `aoe serve --status` before retrying."
+                    ))
+                }
+            }
         }
         Job::Retry(target) => {
             let stopped = runtime.block_on(async {

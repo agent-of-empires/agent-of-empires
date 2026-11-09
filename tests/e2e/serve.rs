@@ -4329,3 +4329,103 @@ exit 0
         }
     }
 }
+
+#[test]
+#[parallel]
+fn tui_restart_preserves_an_unavailable_runtime_credential_without_using_the_saved_default() {
+    use std::os::unix::fs::PermissionsExt;
+
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("serve_preserved_credential");
+    h.remove_env("AOE_DAEMON_URL");
+    h.remove_env("AOE_SERVE_PASSPHRASE");
+    h.stop_daemon_on_drop();
+    let bin = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    crate::harness::write_executable(
+        &bin.join("tailscale"),
+        r#"#!/bin/sh
+case "$*" in
+  "status --json")
+    printf '%s\n' '{"Self":{"DNSName":"fixture.tailnet.ts.net.","CapMap":{"https://tailscale.com/cap/funnel-ports?ports=443":null}}}'
+    ;;
+  "funnel status --json")
+    if test -f "$AOE_TEST_FUNNEL_STATE"; then
+      cat "$AOE_TEST_FUNNEL_STATE"
+    else
+      printf '{}\n'
+    fi
+    ;;
+  "funnel --bg --yes "*)
+    printf '%s\n' '{"Web":{"fixture.tailnet.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:'"$4"'"}}}},"AllowFunnel":{"fixture.tailnet.ts.net:443":true}}' > "$AOE_TEST_FUNNEL_STATE"
+    ;;
+  "funnel "*off)
+    printf '{}\n' > "$AOE_TEST_FUNNEL_STATE"
+    ;;
+esac
+exit 0
+"#,
+    );
+    crate::harness::write_executable(&bin.join("cloudflared"), "#!/bin/sh\nexit 1\n");
+    h.add_path_dir(&bin);
+    h.set_env("AOE_TEST_FUNNEL_STATE", h.home_path().join("funnel.json"));
+    let original = "original runtime credential";
+    let future = "unrelated saved future default";
+    h.run_cli_ok(&[
+        "serve",
+        "--remote",
+        "--daemon",
+        "--auth",
+        "token",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &pick_free_port().to_string(),
+        "--passphrase",
+        original,
+    ]);
+    let predecessor = daemon_pid(&h).unwrap();
+    let app = app_dir_in(h.home_path());
+    let saved = app.join("serve.saved_passphrase");
+    std::fs::write(&saved, future).unwrap();
+    std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let running = app.join("serve.passphrase");
+    let hidden = h.home_path().join("hidden-running-passphrase");
+    std::fs::rename(&running, &hidden).unwrap();
+    h.spawn_tui_sized(120, 40);
+    h.wait_for_ready();
+    h.send_keys("R");
+    h.wait_for("Connections");
+    h.send_keys("Enter");
+    h.wait_for("R: restart");
+    let transaction = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(app.join("daemon/transaction.lock"))
+        .unwrap();
+    wait_until(Duration::from_secs(10), Duration::from_millis(25), || {
+        fs2::FileExt::try_lock_exclusive(&transaction).map_err(|error| error.to_string())
+    });
+    h.send_keys_unfenced("R");
+    h.wait_for("Press R again to restart.");
+    h.send_keys_unfenced("R");
+    h.wait_for("Elapsed:");
+    assert!(!running.exists());
+    std::fs::rename(&hidden, &running).unwrap();
+    drop(transaction);
+    wait_until(Duration::from_secs(30), Duration::from_millis(50), || {
+        let successor = daemon_pid(&h).ok_or("successor not published")?;
+        if successor != predecessor && pid_alive(successor as i32) {
+            Ok(())
+        } else {
+            Err("successor not ready".to_owned())
+        }
+    });
+    h.wait_for("R: restart");
+    assert_original_passphrase_login(&h, original);
+    assert_eq!(std::fs::read_to_string(running).unwrap().trim(), original);
+    assert_eq!(std::fs::read_to_string(saved).unwrap(), future);
+}

@@ -2616,7 +2616,7 @@ impl App {
             }
             Ok(prepared) => {
                 if let Some(serve) = &mut self.home.serve_view {
-                    serve.finish_launch(Ok(prepared.target));
+                    serve.finish_launch(Ok(prepared.target), None);
                 }
                 self.home.session_feed.connect_prepared(
                     self.home.active_profile.clone().unwrap_or_default(),
@@ -2629,7 +2629,8 @@ impl App {
             Err(failure) => {
                 let message = failure.message.clone();
                 if let Some(serve) = &mut self.home.serve_view {
-                    serve.finish_launch(Err(failure));
+                    let predecessor = launch.and_then(|launch| launch.predecessor());
+                    serve.finish_launch(Err(failure), predecessor);
                 } else if let Some(crate::tui::dialogs::DashboardLaunch::Running {
                     target, ..
                 }) = launch
@@ -2704,8 +2705,9 @@ impl App {
         self.home.dashboard_stop = Some(request.presentation());
         let (result, receiver) = tokio::sync::oneshot::channel();
         self.dashboard_stop = Some(receiver);
+        let stop = request.run(&mut self.home.serve_jobs);
         tokio::spawn(async move {
-            let stopped = request.run().await.map_err(|error| {
+            let stopped = stop.await.map_err(|error| {
                 tracing::warn!(target: "tui.home", %error, "dashboard stop failed");
                 "Stop did not complete. Inspect `aoe serve --status` before reconnecting or retrying.".to_owned()
             });
