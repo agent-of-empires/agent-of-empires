@@ -494,7 +494,7 @@ pub(crate) fn probe_owned_pane(
     } else {
         Some(pane_pid.parse::<u32>()?)
     };
-    // tmux clears pane_pid after exit; immutable pane/server identity still fences a corpse.
+    // Some tmux versions hide the displayed corpse PID; the server may still retain it internally.
     let process_matches =
         pane_pid == expected.identity.pane_pid || (probe == PaneProbe::Dead && pane_pid.is_none());
     if session_id != expected.identity.session_id
