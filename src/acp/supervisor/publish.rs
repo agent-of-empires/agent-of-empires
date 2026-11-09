@@ -937,9 +937,7 @@ mod tests {
     async fn each_publish_runs_under_its_sessions_seq_lock() {
         let sink = std::sync::Arc::new(LockProbeSink::default());
         let sup = Supervisor::new(std::sync::Arc::clone(&sink));
-        sink.seqs
-            .set(std::sync::Arc::clone(&sup.next_seqs))
-            .unwrap();
+        assert!(sink.seqs.set(std::sync::Arc::clone(&sup.next_seqs)).is_ok());
 
         sup.publish_startup_error("s-1", "boom".into());
         sup.publish_user_prompt("s-1", "prompt".into()).await;

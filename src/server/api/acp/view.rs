@@ -2999,6 +2999,7 @@ mod tests {
             &crate::acp::Event::Stopped {
                 reason: "projection sentinel".into(),
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         )?;
         let response = terminal_handoff_request(state, source.id.clone()).await;
         let durable = crate::session::Storage::open_unwatched("default")?
@@ -3018,8 +3019,9 @@ mod tests {
         assert!(
             events
                 .replay_from(&source.id, 0)
+                .unwrap()
                 .iter()
-                .any(|(seq, _)| *seq == sentinel),
+                .any(|stored| stored.seq == sentinel),
             "unproven terminal ownership must not erase the retained projection"
         );
         Ok(())

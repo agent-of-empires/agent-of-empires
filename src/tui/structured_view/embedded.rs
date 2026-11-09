@@ -674,6 +674,7 @@ mod retained_tests {
                         }],
                     },
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         state
@@ -689,6 +690,7 @@ mod retained_tests {
                     completed_at: at,
                     async_subagent: false,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         inst.trash();
@@ -787,12 +789,13 @@ mod retained_tests {
             let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
             let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
             let mut model = crate::acp::transcript::TranscriptModel::new();
-            model.apply_event(
+            model.apply_scoped_event(
                 1,
                 &Event::AgentMessageChunk {
                     text: format!("{prefix} **tail**"),
                     message_id: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             );
             state.transcript.server_rows = model.into_rows();
             let mut view = RetainedView::new(None, &inst);
@@ -850,7 +853,7 @@ mod retained_tests {
         let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
         let mut model = crate::acp::transcript::TranscriptModel::new();
         let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
-        model.apply_event(
+        model.apply_scoped_event(
             1,
             &Event::ToolCallStarted {
                 tool_call: ToolCall {
@@ -869,8 +872,9 @@ mod retained_tests {
                     }],
                 },
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         );
-        model.apply_event(
+        model.apply_scoped_event(
             2,
             &Event::ToolCallCompleted {
                 tool_call_id: "projection".into(),
@@ -880,6 +884,7 @@ mod retained_tests {
                 completed_at: at,
                 async_subagent: false,
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         );
         state.transcript.server_rows = model.into_rows();
         let mut view = RetainedView::new(None, &inst);
@@ -939,7 +944,7 @@ mod retained_tests {
         let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
         let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
         let mut model = crate::acp::transcript::TranscriptModel::new();
-        model.apply_event(
+        model.apply_scoped_event(
             1,
             &crate::acp::state::Event::AgentMessageChunk {
                 text: format!(
@@ -948,6 +953,7 @@ mod retained_tests {
                 ),
                 message_id: None,
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         );
         state.transcript.merge_server_rows(model.rows().to_vec());
         let mut view = RetainedView::new(None, &inst);
@@ -981,7 +987,7 @@ mod retained_tests {
                 let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
                 let mut model = crate::acp::transcript::TranscriptModel::new();
                 let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
-                model.apply_event(
+                model.apply_scoped_event(
                     1,
                     &Event::ToolCallStarted {
                         tool_call: ToolCall {
@@ -1004,6 +1010,7 @@ mod retained_tests {
                             },
                         },
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 );
                 let output = (0..40)
                     .map(|i| format!("output-{i:02}\n"))
@@ -1023,7 +1030,7 @@ mod retained_tests {
                 } else {
                     Vec::new()
                 };
-                model.apply_event(
+                model.apply_scoped_event(
                     2,
                     &Event::ToolCallCompleted {
                         tool_call_id: "tool".into(),
@@ -1037,6 +1044,7 @@ mod retained_tests {
                         completed_at: at,
                         async_subagent: false,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 );
                 state.transcript.server_rows = model.into_rows();
                 let mut view = RetainedView::new(None, &inst);
@@ -1159,14 +1167,15 @@ mod retained_tests {
                 let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
                 let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
                 let mut model = crate::acp::transcript::TranscriptModel::new();
-                model.apply_event(
+                model.apply_scoped_event(
                     1,
                     &Event::ToolCallContent {
                         tool_call_id: "media".into(),
                         content: "BUFFER-TEXT".into(),
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 );
-                model.apply_event(
+                model.apply_scoped_event(
                     2,
                     &Event::ToolCallCompleted {
                         tool_call_id: "media".into(),
@@ -1176,6 +1185,7 @@ mod retained_tests {
                         completed_at: chrono::Utc::now(),
                         async_subagent: false,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 );
                 state.transcript.server_rows = model.into_rows();
                 let mut view = RetainedView::new(None, &inst);
@@ -1226,12 +1236,13 @@ mod retained_tests {
                 let inst = crate::session::Instance::new("retained state", "/tmp");
                 let mut model = crate::acp::transcript::TranscriptModel::new();
                 if !empty {
-                    model.apply_event(
+                    model.apply_scoped_event(
                         1,
                         &crate::acp::state::Event::AgentMessageChunk {
                             text: "retained message".into(),
                             message_id: None,
                         },
+                        &crate::acp::event_sender::EventMetadata::history(),
                     );
                 }
                 let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1307,6 +1318,7 @@ mod retained_tests {
                                 diffs: Vec::new(),
                             },
                         },
+                        &crate::acp::event_sender::EventMetadata::history(),
                     )
                     .unwrap();
             }
@@ -1323,6 +1335,7 @@ mod retained_tests {
                             tool_call_id: "unfinished".into(),
                             content: text.into(),
                         },
+                        &crate::acp::event_sender::EventMetadata::history(),
                     )
                     .unwrap();
             }
@@ -1399,6 +1412,7 @@ mod retained_tests {
                             diffs: Vec::new(),
                         },
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
             state
@@ -1410,6 +1424,7 @@ mod retained_tests {
                         tool_call_id: "pending".into(),
                         content: "BEFORE-TEARDOWN".into(),
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
             if summary_races {
@@ -1422,6 +1437,7 @@ mod retained_tests {
                             text: "CONCURRENT-SUMMARY".into(),
                             summarized_until_seq: 2,
                         },
+                        &crate::acp::event_sender::EventMetadata::history(),
                     )
                     .unwrap();
             }
@@ -1457,6 +1473,7 @@ mod retained_tests {
                             tool_call_id: "pending".into(),
                             content: "AFTER-TEARDOWN".into(),
                         },
+                        &crate::acp::event_sender::EventMetadata::history(),
                     )
                     .unwrap();
             }
@@ -1468,6 +1485,7 @@ mod retained_tests {
                     &Event::Stopped {
                         reason: "teardown complete".into(),
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
             let mut ticker = tokio::time::interval(Duration::from_millis(10));
@@ -1539,6 +1557,7 @@ mod retained_tests {
                         text: "KEEP-ON-ERROR\n\n".into(),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1629,6 +1648,7 @@ mod retained_tests {
                         text: "REPLACEMENT-CONTENT\n\n".into(),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1656,6 +1676,7 @@ mod retained_tests {
                     text: "RESET-RETAINED".into(),
                     message_id: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         assert!(refresh(&mut view).await);
@@ -1671,6 +1692,7 @@ mod retained_tests {
                     text: "AFTER-GAP".into(),
                     message_id: Some("after-gap".into()),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         assert!(refresh(&mut view).await);
@@ -1694,6 +1716,7 @@ mod retained_tests {
                     text: "BACKFILLED".into(),
                     message_id: Some("backfill".into()),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         view.next_recheck = Instant::now();

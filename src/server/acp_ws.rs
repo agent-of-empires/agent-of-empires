@@ -1022,7 +1022,13 @@ mod tests {
     fn web_projection_excludes_only_the_duplicate_background_field() {
         let mut reduced =
             AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        reduced.apply_event(1, background_launch()).unwrap();
+        reduced
+            .apply_scoped_event(
+                1,
+                &background_launch(),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let full = serde_json::to_value(&reduced).unwrap();
         assert_eq!(
             project_control_state(&reduced, SnapshotProjection::Full).unwrap(),
@@ -1598,7 +1604,12 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(Vec::new());
             state
                 .acp_event_store
-                .record("s-1", 1, &background_launch())
+                .record(
+                    "s-1",
+                    1,
+                    &background_launch(),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
             let (mut socket, server) =
                 connect_test_socket_query(state.clone(), "s-1", &format!("since=0{projection}"))
@@ -1646,16 +1657,22 @@ mod tests {
                 ),
             ] {
                 let expected = serde_json::to_value(&event).unwrap();
-                state.acp_event_store.record("s-1", seq, &event).unwrap();
+                let metadata = crate::acp::event_sender::EventMetadata::history();
+                state
+                    .acp_event_store
+                    .record("s-1", seq, &event, &metadata)
+                    .unwrap();
                 publish(
                     &state,
-                    AcpBroadcastFrame {
-                        session_id: "s-1".into(),
+                    AcpBroadcastFrame::from_qualified(
+                        "s-1".into(),
                         seq,
-                        event: Arc::new(event),
-                        worker_generation: None,
-                        sidebar_status: None,
-                    },
+                        Arc::new(event),
+                        &metadata,
+                        None,
+                        None,
+                        None,
+                    ),
                 );
                 let raw = receive_kind(&mut socket, kind).await;
                 assert_eq!(raw["event"], expected);
