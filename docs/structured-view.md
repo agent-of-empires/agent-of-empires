@@ -190,11 +190,12 @@ there is no transcript-size or application clipboard-size cutoff.
 Desktop clipboard helpers and terminal OSC 52 support can impose their own
 limits. An OSC 52 write confirms emission, not clipboard acceptance.
 
-
 The reader refreshes available content automatically, including replacements or
 backfills that leave sequence bounds unchanged, and preserves focus and scroll
-position. Read failures keep the last loaded content visible with an error.
-Content, size, or theme changes clear the previous text selection.
+position. Read failures keep the last readable window visible with an error,
+including failures while preparing replacement content. Dragging selects only
+painted retained rows. Content, wrapping width, or theme changes clear the
+previous selection.
 Missing ranges do not trigger repeated transcript reloads while retained content
 is unchanged.
 

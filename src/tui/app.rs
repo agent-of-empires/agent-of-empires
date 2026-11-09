@@ -3922,6 +3922,37 @@ mod tests {
             app.home.retained_scroll_offset == 7 && text.contains("OLD-RETAINED")
         })
         .await;
+        select(&mut app, &terminal);
+        let painted_view = app.home.preview_text_view;
+        let edge = (painted_view.pane.x + 8, painted_view.pane.y);
+        assert!(app.home.handle_drag_move(edge.0, edge.1));
+        assert!(app.home.tick_preview_autoscroll());
+        assert_eq!(
+            app.home.preview_selection.unwrap().extent,
+            painted_view.screen_to_content(edge.0, edge.1),
+            "pending autoscroll must not select an unpainted row"
+        );
+        terminal
+            .draw(|frame| {
+                app.home
+                    .render(frame, frame.area(), &theme, None, None, None);
+            })
+            .unwrap();
+        let pending_offset = app.home.retained_scroll_offset;
+        app.home.preview_autoscroll_at = None;
+        assert!(!app.home.tick_preview_autoscroll());
+        assert_eq!(app.home.retained_scroll_offset, pending_offset);
+        assert!(app.home.handle_drag_end());
+        assert_eq!(
+            app.home.preview_selection.unwrap().extent,
+            painted_view.screen_to_content(edge.0, edge.1)
+        );
+        app.home.clear_preview_selection();
+        app.home.retained_scroll_offset = 7;
+        settle(&mut app, &mut terminal, &theme, |_, text| {
+            text.contains("OLD-RETAINED")
+        })
+        .await;
         for resize in [false, true] {
             select(&mut app, &terminal);
             terminal

@@ -171,6 +171,52 @@ async fn retained_reader_recovers_discovery_and_uses_pre_trash_roots() {
         view.worker.is_some() && view.effective_offset().is_some() && !text.contains("503")
     })
     .await;
+    let mut collapsed = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 2)).unwrap();
+    collapsed
+        .draw(|frame| {
+            view.render(frame, frame.area(), &Theme::default(), 0, true);
+        })
+        .unwrap();
+    state
+        .acp_event_store
+        .record(
+            &inst.id,
+            3,
+            &Event::AgentMessageChunk {
+                text: "REPLACEMENT-CONTENT".into(),
+                message_id: None,
+            },
+        )
+        .unwrap();
+    let mut updates = view.worker.as_ref().unwrap().results.clone();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if updates.borrow().as_deref().is_some_and(|update| {
+                update
+                    .as_ref()
+                    .is_ok_and(|snapshot| snapshot.highest_seq == 3 && snapshot.window.is_none())
+            }) {
+                break;
+            }
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    view.tick();
+    failing.store(true, Ordering::SeqCst);
+    wait_for(&mut view, &mut collapsed, 0, |view, text| {
+        view.worker.is_none() && text.contains("503")
+    })
+    .await;
+    terminal
+        .draw(|frame| {
+            view.render(frame, frame.area(), &Theme::default(), 0, true);
+        })
+        .unwrap();
+    let preserved = painted(&terminal);
+    assert!(preserved.contains("READ-ONLY-CONTENT"), "{preserved}");
+    assert!(!preserved.contains("REPLACEMENT-CONTENT"));
     drop(view);
     server.abort();
     let _ = server.await;

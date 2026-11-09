@@ -1154,6 +1154,27 @@ impl HomeView {
             self.preview_autoscroll_at = None;
             return false;
         }
+        let retained = self.selected_is_trashed();
+        let mut selection_changed = false;
+        if retained {
+            let extent = view.screen_to_content(
+                col.clamp(pane.x, pane.right().saturating_sub(1)),
+                row.clamp(pane.y, pane.bottom().saturating_sub(1)),
+            );
+            if let Some(selection) = self.preview_selection.as_mut() {
+                selection_changed = selection.extent != extent;
+                selection.extent = extent;
+            }
+            // Only painted retained rows may extend a selection.
+            if self
+                .retained_preview
+                .as_ref()
+                .and_then(|view| view.effective_offset())
+                != Some(self.retained_scroll_offset)
+            {
+                return selection_changed;
+            }
+        }
         // Pace the scroll to a steady cadence regardless of how often the loop woke, so
         // the speed is even instead of racing capture-worker activity. Line scroll and the
         // wheel forward are fine-grained, so they run fast and read as smooth; the
@@ -1183,24 +1204,17 @@ impl HomeView {
             if scrolled {
                 self.preview_click_seed = None;
                 self.preview_autoscroll_at = Some(now);
-                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-                // Pin the extent to the revealed edge line in `from_bottom` terms, which
-                // the new offset gives directly: the bottom visible line sits `offset`
-                // lines up from the newest, the top `offset + height - 1`. Deriving it
-                // from the offset rather than the stale `total_lines` keeps it correct
-                // before the next capture.
-                let offset = if self.selected_is_trashed() {
-                    self.retained_scroll_offset
-                } else {
-                    self.preview_scroll_offset as usize
-                };
-                let from_bottom = if at_top {
-                    offset + (pane.height as usize).saturating_sub(1)
-                } else {
-                    offset
-                };
-                if let Some(sel) = self.preview_selection.as_mut() {
-                    sel.extent = (col_off, from_bottom);
+                if !retained {
+                    let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                    let offset = self.preview_scroll_offset as usize;
+                    let from_bottom = if at_top {
+                        offset + (pane.height as usize).saturating_sub(1)
+                    } else {
+                        offset
+                    };
+                    if let Some(sel) = self.preview_selection.as_mut() {
+                        sel.extent = (col_off, from_bottom);
+                    }
                 }
                 return true;
             }
@@ -1213,7 +1227,7 @@ impl HomeView {
             self.preview_autoscroll_at = Some(now);
             return true;
         }
-        false
+        selection_changed
     }
 
     /// Shift the preview scroll offset by `delta` lines (positive scrolls toward older

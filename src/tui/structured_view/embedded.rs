@@ -267,6 +267,11 @@ impl RetainedView {
             .result
             .as_deref()
             .and_then(|result| result.as_ref().ok());
+        let preserve_window = previous.is_some_and(|snapshot| snapshot.window.is_some())
+            && result
+                .as_ref()
+                .as_ref()
+                .is_ok_and(|snapshot| snapshot.window.is_none());
         match result.as_ref() {
             Ok(snapshot) => {
                 self.projection_changed |= previous.is_none_or(|old| {
@@ -278,6 +283,8 @@ impl RetainedView {
                     .is_some_and(|window| window.total == 0)
                 {
                     "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
+                } else if preserve_window {
+                    "Preparing replacement retained transcript; showing previous content…".into()
                 } else if snapshot.window.is_none() {
                     "Preparing retained transcript…".into()
                 } else {
@@ -297,7 +304,7 @@ impl RetainedView {
                 self.next_read = Instant::now() + std::time::Duration::from_secs(2);
             }
         }
-        if result.is_ok() {
+        if result.is_ok() && !preserve_window {
             self.result = Some(result);
         }
         true
@@ -443,7 +450,10 @@ impl RetainedView {
         }
         (
             render::TranscriptGeometry {
-                text_area,
+                text_area: Rect {
+                    height: window.map_or(0, |window| text_area.height.min(window.height)),
+                    ..text_area
+                },
                 first_line: window.map_or(0, |window| window.first),
                 total_lines: window.map_or(0, |window| window.total),
             },
