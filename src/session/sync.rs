@@ -1184,55 +1184,101 @@ mod tests {
     #[test]
     #[serial]
     fn exact_omp_generation_confirmation_consumes_pin_idempotently() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-exact";
-        let sid = "019342ab-1234-7def-8901-abcdef012340";
-        let generation = "launch-exact";
-        let mut inst = pinned_omp_instance(profile, sid, generation);
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_omp_update(&mut inst, sid, generation);
+        for with_witness in [false, true] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-omp-pin-exact";
+            let sid = "019342ab-1234-7def-8901-abcdef012340";
+            let generation = "launch-exact";
+            let mut inst = pinned_omp_instance(profile, sid, generation);
+            seed_instance_on_disk(profile, &inst);
+            attach_poller_with_omp_update(&mut inst, sid, generation);
 
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+            let mut selection = inst.native_preparation_selection().unwrap();
+            let original_selection = selection;
+            let file_watch = FileWatchService::noop();
+            let mut instances = vec![inst];
+            let outcome = if with_witness {
+                let storage = Storage::new_unwatched(profile).unwrap();
+                let _lifecycle = storage
+                    .acquire_instance_lifecycle_lock(&instances[0].id)
+                    .unwrap();
+                drain_and_persist_session_ids_lifecycle_locked(
+                    &mut instances,
+                    &storage,
+                    Some(&mut selection),
+                )
+                .unwrap()
+            } else {
+                drain_and_persist_session_ids(&mut instances, &file_watch)
+            };
 
-        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
-        assert_eq!(instances[0].resume_intent, ResumeIntent::Default);
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
-        let acknowledged = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert!(!acknowledged.touched());
+            assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+            assert_eq!(instances[0].resume_intent, ResumeIntent::Default);
+            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
+            if with_witness {
+                assert_ne!(selection, original_selection);
+                assert_eq!(selection, disk[0].native_preparation_selection().unwrap());
+                assert_eq!(
+                    selection,
+                    instances[0].native_preparation_selection().unwrap()
+                );
+            }
+            let acknowledged = drain_and_persist_session_ids(&mut instances, &file_watch);
+            assert!(!acknowledged.touched());
 
-        attach_poller_with_omp_update(&mut instances[0], sid, generation);
-        let repeated = drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert!(!repeated.touched());
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
+            attach_poller_with_omp_update(&mut instances[0], sid, generation);
+            let repeated = drain_and_persist_session_ids(&mut instances, &file_watch);
+            assert!(!repeated.touched());
+            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
+        }
     }
 
     #[test]
     #[serial]
     fn stale_omp_generation_does_not_consume_pin() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-omp-pin-stale";
-        let sid = "019342ab-1234-7def-8901-abcdef012341";
-        let mut inst = pinned_omp_instance(profile, sid, "launch-current");
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_omp_update(&mut inst, sid, "launch-stale");
+        for with_witness in [false, true] {
+            let temp = tempdir().unwrap();
+            let _guard = storage_home_guard(&temp);
+            let profile = "sync-omp-pin-stale";
+            let sid = "019342ab-1234-7def-8901-abcdef012341";
+            let mut inst = pinned_omp_instance(profile, sid, "launch-current");
+            seed_instance_on_disk(profile, &inst);
+            attach_poller_with_omp_update(&mut inst, sid, "launch-stale");
 
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![inst];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+            let mut selection = inst.native_preparation_selection().unwrap();
+            let original_selection = selection;
+            let file_watch = FileWatchService::noop();
+            let mut instances = vec![inst];
+            let outcome = if with_witness {
+                let storage = Storage::new_unwatched(profile).unwrap();
+                let _lifecycle = storage
+                    .acquire_instance_lifecycle_lock(&instances[0].id)
+                    .unwrap();
+                drain_and_persist_session_ids_lifecycle_locked(
+                    &mut instances,
+                    &storage,
+                    Some(&mut selection),
+                )
+                .unwrap()
+            } else {
+                drain_and_persist_session_ids(&mut instances, &file_watch)
+            };
 
-        assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
-        assert_eq!(
-            instances[0].resume_intent,
-            ResumeIntent::Use(sid.to_string())
-        );
-        let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(disk[0].resume_intent, ResumeIntent::Use(sid.to_string()));
+            assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()]);
+            assert_eq!(
+                instances[0].resume_intent,
+                ResumeIntent::Use(sid.to_string())
+            );
+            let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
+            assert_eq!(disk[0].resume_intent, ResumeIntent::Use(sid.to_string()));
+            if with_witness {
+                assert_eq!(selection, original_selection);
+                assert_eq!(selection, disk[0].native_preparation_selection().unwrap());
+            }
+        }
     }
 
     #[test]
