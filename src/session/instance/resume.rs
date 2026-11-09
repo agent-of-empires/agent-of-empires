@@ -4018,36 +4018,57 @@ exec sleep 60
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
                 let inventory = std::fs::read_to_string(&actor_stdout).unwrap();
-                assert!(inventory.lines().any(|line| {
-                    line.split('|').next() == Some(actor_sentinel.as_str())
-                }), "the successful real inventory must contain the sentinel: {inventory}");
-                assert!(!inventory.lines().any(|line| {
-                    line.split('|').next() == Some(actor_name.as_str())
-                }), "the saved real inventory must predate the new corpse: {inventory}");
+                assert!(
+                    inventory
+                        .lines()
+                        .any(|line| { line.split('|').next() == Some(actor_sentinel.as_str()) }),
+                    "the successful real inventory must contain the sentinel: {inventory}"
+                );
+                assert!(
+                    !inventory
+                        .lines()
+                        .any(|line| { line.split('|').next() == Some(actor_name.as_str()) }),
+                    "the saved real inventory must predate the new corpse: {inventory}"
+                );
                 let guard = TmuxTestSession::from_name(&actor_name);
                 let mut args = vec![
-                    "new-session".into(), "-d".into(), "-P".into(), "-F".into(),
+                    "new-session".into(),
+                    "-d".into(),
+                    "-P".into(),
+                    "-F".into(),
                     "#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{socket_path}".into(),
-                    "-s".into(), actor_name.clone(), "-c".into(),
-                    actor_row.project_path.clone(), "exec sleep 60".into(),
+                    "-s".into(),
+                    actor_name.clone(),
+                    "-c".into(),
+                    actor_row.project_path.clone(),
+                    "exec sleep 60".into(),
                 ];
                 let target = format!("={actor_name}:");
                 crate::tmux::utils::append_remain_on_exit_args(&mut args, &target);
                 crate::tmux::utils::append_pane_base_index_args(&mut args, &target);
                 crate::tmux::append_session_kind_args(
-                    &mut args, &target, crate::tmux::SessionKind::Agent,
+                    &mut args,
+                    &target,
+                    crate::tmux::SessionKind::Agent,
                 );
                 // Create a real marked pane without publishing a newer Rust inventory.
                 let output = crate::tmux::tmux_command().args(&args).output().unwrap();
-                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-                let observation = crate::tmux::utils::created_pane_observation(&output.stdout)
-                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let observation =
+                    crate::tmux::utils::created_pane_observation(&output.stdout).unwrap();
                 crate::tmux::test_helpers::wait_for_pane_command(
-                    &observation.identity.pane_id, "sleep",
+                    &observation.identity.pane_id,
+                    "sleep",
                 );
                 assert!(crate::tmux::tmux_command()
                     .args(["send-keys", "-t", &observation.identity.pane_id, "C-c"])
-                    .status().unwrap().success());
+                    .status()
+                    .unwrap()
+                    .success());
                 crate::tmux::test_helpers::wait_for_pane_dead(&observation.identity.pane_id);
                 let peer = shared.then(|| add_live_probe_peer(&observation.identity.pane_id));
                 std::fs::write(
@@ -4077,12 +4098,12 @@ exec sleep 60
                 "the actual corpse predates the second public probe"
             );
             let inventory = std::fs::read_to_string(&stdout).unwrap();
-            assert!(inventory.lines().any(|line| {
-                line.split('|').next() == Some(sentinel.name())
-            }));
-            assert!(!inventory.lines().any(|line| {
-                line.split('|').next() == Some(name.as_str())
-            }));
+            assert!(inventory
+                .lines()
+                .any(|line| { line.split('|').next() == Some(sentinel.name()) }));
+            assert!(!inventory
+                .lines()
+                .any(|line| { line.split('|').next() == Some(name.as_str()) }));
             assert!(std::fs::read(&stderr).unwrap().is_empty());
             if let Some((peer_pane, pid, birth)) = peer {
                 assert!(
@@ -4669,7 +4690,10 @@ exec sleep 60
                 let receipt = std::fs::read_to_string(&actor_stdout).unwrap();
                 let fields: Vec<_> = receipt.trim_end().splitn(9, '|').collect();
                 assert_eq!(fields[3], old_pane);
-                assert_eq!(fields[6], "1", "the held receipt must describe the old real corpse");
+                assert_eq!(
+                    fields[6], "1",
+                    "the held receipt must describe the old real corpse"
+                );
                 assert!(crate::tmux::tmux_command()
                     .args(["kill-pane", "-t", &old_pane])
                     .status()
@@ -4702,15 +4726,22 @@ exec sleep 60
                     None
                 } else {
                     let pid = replacement.identity.pane_pid.unwrap();
-                    let birth = crate::process::process_birth_identity(pid).unwrap().unwrap();
+                    let birth = crate::process::process_birth_identity(pid)
+                        .unwrap()
+                        .unwrap();
                     assert!(crate::process::process_birth_is_live(pid, &birth).unwrap());
                     Some((pid, birth))
                 };
                 assert!(crate::process::process_birth_is_live(
-                    replacement.server.pid, &replacement.server.birth,
-                ).unwrap());
-                std::fs::write(&actor_ready, b"replacement identity and kernel birth captured")
-                    .unwrap();
+                    replacement.server.pid,
+                    &replacement.server.birth,
+                )
+                .unwrap());
+                std::fs::write(
+                    &actor_ready,
+                    b"replacement identity and kernel birth captured",
+                )
+                .unwrap();
                 (guard, replacement, native_birth)
             });
             let bin = root.path().join("tmux-race");
@@ -4741,8 +4772,10 @@ exec sleep 60
             assert_eq!(std::fs::read_to_string(count).unwrap().trim(), "2");
             assert_ne!(replacement.identity.pane_id, old.identity.pane_id);
             assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
-            assert_eq!(pane_field(&replacement.identity.pane_id, "#{pane_pid}"),
-                replacement.identity.pane_pid.unwrap().to_string());
+            assert_eq!(
+                pane_field(&replacement.identity.pane_id, "#{pane_pid}"),
+                replacement.identity.pane_pid.unwrap().to_string()
+            );
             assert_eq!(
                 pane_field(&replacement.identity.pane_id, "#{pane_dead}"),
                 if replacement_dead { "1" } else { "0" }
@@ -4751,20 +4784,28 @@ exec sleep 60
                 .unwrap()
                 .contains(&old.identity.pane_id));
             assert!(crate::process::process_birth_is_live(
-                replacement.server.pid, &replacement.server.birth,
-            ).unwrap());
+                replacement.server.pid,
+                &replacement.server.birth,
+            )
+            .unwrap());
             if let Some((pid, birth)) = native_birth.as_ref() {
-                assert!(crate::process::process_birth_is_live(*pid, birth).unwrap(),
-                    "the actor-captured replacement birth must survive the refusal");
+                assert!(
+                    crate::process::process_birth_is_live(*pid, birth).unwrap(),
+                    "the actor-captured replacement birth must survive the refusal"
+                );
             }
             // A separate operation may observe the replacement; the refused operation may not.
             let generation = storage.load().unwrap()[0].lifecycle_generation;
             let positive = instance.ensure_pane_ready().unwrap();
             if replacement_dead {
-                assert!(matches!(positive,
-                    crate::session::EnsureReadyOutcome::Started
-                        | crate::session::EnsureReadyOutcome::Respawned
-                ), "{positive:?}");
+                assert!(
+                    matches!(
+                        positive,
+                        crate::session::EnsureReadyOutcome::Started
+                            | crate::session::EnsureReadyOutcome::Respawned
+                    ),
+                    "{positive:?}"
+                );
                 let pane = only_pane_id(&name);
                 assert_ne!(pane, replacement.identity.pane_id);
                 crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
@@ -5056,7 +5097,8 @@ exec sleep 60
         const PEER_SID: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
         let python = which::which("python3").unwrap();
         for (change, with_witness) in ["confirmed", "repinned", "generation", "execution"]
-            .into_iter().flat_map(|change| [false, true].map(|with_witness| (change, with_witness)))
+            .into_iter()
+            .flat_map(|change| [false, true].map(|with_witness| (change, with_witness)))
         {
             let root = tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
@@ -5127,11 +5169,18 @@ exec sleep 60
             let born = std::rc::Rc::new(std::cell::RefCell::new(None));
             let birth_observed = born.clone();
             let _birth_observer = super::super::start::test_support::FinalizeObserver::install(
-                instance.id.clone(), move |row, phase| {
-                    if matches!(phase, super::super::start::test_support::FinalizePhase::Before) {
+                instance.id.clone(),
+                move |row, phase| {
+                    if matches!(
+                        phase,
+                        super::super::start::test_support::FinalizePhase::Before
+                    ) {
                         assert!(birth_observed.borrow().is_none());
                         *birth_observed.borrow_mut() = Some(std::sync::Arc::clone(
-                            row.agent_pane.physical.as_ref().expect("the original birth receipt"),
+                            row.agent_pane
+                                .physical
+                                .as_ref()
+                                .expect("the original birth receipt"),
                         ));
                     }
                 },
@@ -5253,7 +5302,11 @@ exec sleep 60
             );
             assert!(crate::process::process_birth_is_live(*pid, birth).unwrap());
             assert!(std::sync::Arc::ptr_eq(
-                instance.agent_pane.physical.as_ref().expect("the original physical receipt remains"),
+                instance
+                    .agent_pane
+                    .physical
+                    .as_ref()
+                    .expect("the original physical receipt remains"),
                 original,
             ));
             assert_eq!(
@@ -5261,9 +5314,14 @@ exec sleep 60
                 original.identity.pane_pid.unwrap().to_string(),
             );
             assert!(crate::process::process_birth_is_live(
-                original.server.pid, &original.server.birth,
-            ).unwrap());
-            assert!(!input.exists(), "the grace result must not replay Native input");
+                original.server.pid,
+                &original.server.birth,
+            )
+            .unwrap());
+            assert!(
+                !input.exists(),
+                "the grace result must not replay Native input"
+            );
             let row = storage.load().unwrap().remove(0);
             assert_eq!(row.resume_probe_failed_sid, None);
             assert_eq!(
