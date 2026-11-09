@@ -182,7 +182,7 @@ impl Instance {
     }
 
     /// Revival may remove only its exact pane while it remains the sole occupant.
-    /// Capture process handles first, but signal and release scopes only after tmux's guard.
+    /// Capture process handles first, but signal them only after tmux's guard.
     pub(super) fn kill_for_revival_locked(&self) -> Result<()> {
         let removed = (|| -> Result<()> {
             use crate::tmux::utils::{probe_pane, PaneProbe};

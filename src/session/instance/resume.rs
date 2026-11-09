@@ -1670,11 +1670,11 @@ mod tests {
         }
     }
 
-    fn owned_probe_fields(output: &std::process::Output) -> (&str, [&str; 9]) {
+    fn owned_probe_fields(output: &std::process::Output) -> (&str, [&str; 10]) {
         let text = std::str::from_utf8(&output.stdout).unwrap().trim_end();
         let (length, data) = text.split_once('|').unwrap();
         let (socket, suffix) = data.split_at(length.parse().unwrap());
-        let mut parts = suffix.strip_prefix('|').unwrap().splitn(9, '|');
+        let mut parts = suffix.strip_prefix('|').unwrap().splitn(10, '|');
         (socket, std::array::from_fn(|_| parts.next().unwrap()))
     }
 
@@ -2017,7 +2017,7 @@ mod tests {
                             replace_owned_probe_fields(output, &[(3, &other_pid)]);
                         }
                         "expiry" => {
-                            replace_owned_probe_fields(output, &[(7, "sh"), (8, "")]);
+                            replace_owned_probe_fields(output, &[(8, "sh"), (9, "")]);
                         }
                         "superseded" | "same_sid_assertion" | "concurrent_status" => {
                             if sample != 1 {
