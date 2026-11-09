@@ -25,7 +25,7 @@ jobs:
     # branch ruleset requires every leg's context by name; keep it in sync if
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-cargo-{1}-{2}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, matrix.leg, github.run_attempt) }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -59,7 +59,7 @@ jobs:
       - uses: ./.github/actions/kache
         with:
           manifest-key: test-${{ matrix.leg }}
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         if: matrix.leg != 'web-e2e'
         with:
           tool: cargo-nextest
@@ -110,23 +110,17 @@ jobs:
         env:
           AOE_REQUIRE_LOCAL_NETWORK_TESTS: '1'
         run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
-      # The `web`-gated test code runs nowhere else: core-rest builds at
-      # default features and the step above names only the e2e target. Both
-      # halves need naming. The integration blocks are the dashboard-route half
-      # of daemon_core_web_optional and the aoe.web builtin assertion in
-      # plugin_install; the lib-level ones are src/server/assets.rs (the whole
-      # module is `web`-gated) and the QR seam in src/tui/dialogs/serve.rs,
-      # which would otherwise be neither compiled nor run on a PR. Keep
-      # `e2e-tests` on so the feature set matches the step above and cargo
-      # reuses its artifacts instead of rebuilding the crate; filter the lib run
-      # so it does not re-run the whole suite core-rest already covers.
+      # Run Web-only regressions omitted by core-rest. Keep e2e-tests to reuse
+      # this leg's artifacts, and filter library tests instead of rerunning
+      # the full suite.
       - name: Cargo test (web-gated test blocks)
         if: matrix.leg == 'web-e2e'
         run: |
           cargo test --features web,e2e-tests \
             --test integration -- daemon_core_web_optional plugin_install
           cargo test --features web,e2e-tests --lib -- \
-            server::assets:: tui::dialogs::serve::qr_seam
+            server::assets:: tui::dialogs::serve::qr_seam \
+            session::config::tests::web_plugin_changes_do_not_cross_lifecycle_transactions
       # macOS reaches its per-user temp root through a symlink, so a test that
       # compares `TempDir::path()` against a path that has been through
       # `canonicalize()` or a reported cwd passes on Linux and fails there.
@@ -340,7 +334,7 @@ jobs:
           manifest-key: test-macos
       - name: Install tmux
         run: brew install tmux
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-nextest
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -355,7 +349,7 @@ jobs:
 
   vitest:
     name: Vitest
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-vitest-{1}/runner=4cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 15
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
@@ -464,7 +458,7 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=4cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
@@ -558,7 +552,7 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=4cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=4cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     permissions:
       contents: read

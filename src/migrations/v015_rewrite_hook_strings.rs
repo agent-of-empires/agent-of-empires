@@ -221,6 +221,7 @@ mod tests {
                                 status,
                                 &waiting_tools,
                                 HookInstallTarget::Host,
+                                true,
                             ));
                         }
                     }
@@ -372,6 +373,7 @@ mod tests {
             crate::agents::HookStatus::Running,
             &["AskUserQuestion".to_string()],
             crate::hooks::HookInstallTarget::Host,
+            true,
         );
         let found_hardened = pre_tool.iter().skip(1).any(|m| {
             m["hooks"].as_array().is_some_and(|arr| {

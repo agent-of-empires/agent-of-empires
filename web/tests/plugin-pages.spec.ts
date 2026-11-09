@@ -314,6 +314,49 @@ test.describe("Plugin pages (#4460)", () => {
     await expect(page).toHaveURL("/session/sess-a");
   });
 
+  test("split pane offers Retry when the Trash read for the opened session fails", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    const trashed = sessionResponse({
+      id: "sess-trashed",
+      title: "story-trashed",
+      project_path: "/tmp/story",
+      group_path: "/tmp",
+      status: "Stopped",
+      trashed_at: new Date().toISOString(),
+    });
+    const headers = { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" };
+    let trashFails = true;
+    await page.route(/\/api\/sessions\?state=untrashed$/, (r) =>
+      r.fulfill({ headers, json: { sessions: [], workspace_ordering: [], trashed_count: 1 } }),
+    );
+    await page.route(/\/api\/sessions\?state=trashed$/, (r) =>
+      trashFails
+        ? r.fulfill({ status: 500, body: "boom" })
+        : r.fulfill({ headers, json: { sessions: [trashed], workspace_ordering: [], trashed_count: 1 } }),
+    );
+
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/plugins/acme.kit/sessions", (r) =>
+      r.fulfill({ json: { sessions: [{ id: "sess-trashed" }] } }),
+    );
+
+    await page.goto("/plugins/acme.kit/board");
+    await expect.poll(() => latestReport(page, "results")).toBeTruthy();
+    const frame = page.frames().find((f) => new URL(f.url()).pathname === PAGE.url)!;
+    await page.getByRole("button", { name: "Split view" }).click();
+    await frame.evaluate("call('openSession', { id: 'sess-trashed' })");
+    const pane = page.getByTestId("plugin-page-split-session");
+    const failed = pane.getByTestId("trash-read-failed");
+    await expect(failed).toBeVisible({ timeout: 10_000 });
+    await expect(pane).not.toContainText("Session not found");
+
+    trashFails = false;
+    await failed.getByRole("button", { name: "Retry" }).click();
+    await expect(failed).toHaveCount(0, { timeout: 10_000 });
+  });
+
   test("session.contextMenu opens the sidebar's session menu over the page", async ({ page }) => {
     await mockApis(page, [PAGE]);
     await page.route(`**${PAGE.url}`, (r) =>

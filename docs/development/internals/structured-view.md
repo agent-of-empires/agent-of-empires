@@ -102,6 +102,11 @@ only still-open tools once. Turn endings discard orphaned output; metadata
 alone does not reopen completed or elicited tools. After broadcast lag, both
 projections rebuild from retained history before processing queued frames.
 
+Trash inspection orders unfinished snapshots by their first content event rather
+than tool start order. Replacement snapshots keep that order. Turn endings move
+orphan snapshots into read-only history without inventing stopped rows or feeding
+that output into subsequent tool invocations.
+
 Raw event frames still stream for what the daemon does not model (worker lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts). A client reading only the projections passes `?frames=0`, as the native view does. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or an auto-resume; the native view renders it inline while the web shows the same information as a dismissible banner.
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.

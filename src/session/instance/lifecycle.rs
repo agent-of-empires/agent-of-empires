@@ -15,9 +15,8 @@ use super::*;
 /// without a whole-session reservation; its original cohort journal owns recovery.
 /// `status` is presentation state and never proves ownership.
 ///
-/// Ordinary crashed reservations expire after their TTL. Explicit terminal
-/// handoff debt requires matching-intent recovery, which advances generation
-/// before taking over so late results cannot mutate or clear its replacement.
+/// Ordinary crashed reservations expire after their TTL. Pending Trash teardown
+/// and terminal handoff require matching-intent recovery under a new generation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
@@ -31,10 +30,16 @@ pub enum LifecycleOperation {
 
 impl LifecycleOperation {
     pub(crate) fn busy_reason(self) -> String {
+        if self == Self::Trash {
+            return "in an unfinished Trash transition; retry Trash before another lifecycle action".into();
+        }
         format!("busy with lifecycle operation {self:?}")
     }
 
     pub(crate) fn already_in_progress_reason(self) -> String {
+        if self == Self::Trash {
+            return "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".into();
+        }
         format!("lifecycle operation {self:?} is already in progress")
     }
 }
@@ -115,6 +120,9 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
+        if operation != LifecycleOperation::Trash && self.has_pending_trash() {
+            return Err(LifecycleReservationError::Busy(LifecycleOperation::Trash));
+        }
         let generation = self.next_available_lifecycle_generation(ttl, now)?;
         self.lifecycle_generation = generation;
         self.failed_purge = None;
@@ -151,6 +159,31 @@ impl Instance {
                 .lifecycle_reservation
                 .as_ref()
                 .is_none_or(|reservation| reservation.generation == generation)
+    }
+
+    pub(crate) fn has_pending_trash(&self) -> bool {
+        self.is_trashed()
+            && self.lifecycle_reservation_is_owned(
+                LifecycleOperation::Trash,
+                self.lifecycle_generation,
+            )
+    }
+
+    /// A returned attempt no longer owns a live lease, but unconfirmed paths remain fenced.
+    pub(crate) fn retire_trash_reservation_if_owned(
+        &mut self,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if !self.has_pending_trash()
+            || !self.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
+        {
+            return false;
+        }
+        if let Some(reservation) = &mut self.lifecycle_reservation {
+            reservation.at = reservation.at.min(now - Self::LIFECYCLE_RESERVATION_TTL);
+        }
+        true
     }
 
     pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
@@ -227,7 +260,7 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> bool {
-        if self.terminal_handoff.is_some() {
+        if self.terminal_handoff.is_some() || self.has_pending_trash() {
             return false;
         }
         if matches!(
@@ -1752,6 +1785,64 @@ mod tests {
         assert!(
             instance.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation)
         );
+    }
+
+    #[test]
+    fn unfinished_trash_survives_expiry_and_blocks_other_lifecycles() {
+        let now = Utc::now();
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
+        for (trashed, current) in [(true, true), (true, false), (false, true)] {
+            let mut row = Instance::new("unfinished trash", "/tmp/unfinished-trash");
+            row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Trash,
+                ttl,
+                now - ttl - chrono::Duration::seconds(1),
+            )
+            .unwrap();
+            if trashed {
+                row.trash();
+            }
+            if !current {
+                row.lifecycle_generation += 1;
+            }
+            let pending = trashed && current;
+            for operation in [
+                LifecycleOperation::Launch,
+                LifecycleOperation::Capture,
+                LifecycleOperation::Stop,
+                LifecycleOperation::Restore,
+                LifecycleOperation::Purge,
+            ] {
+                let mut contender = row.clone();
+                let before = serde_json::to_value(&contender).unwrap();
+                let result = contender.try_acquire_lifecycle_reservation(operation, ttl, now);
+                if pending {
+                    assert_eq!(
+                        result,
+                        Err(LifecycleReservationError::Busy(LifecycleOperation::Trash))
+                    );
+                    assert_eq!(serde_json::to_value(&contender).unwrap(), before);
+                } else {
+                    assert_eq!(result, Ok(row.lifecycle_generation + 1));
+                }
+            }
+            let mut cleared = row.clone();
+            assert_eq!(
+                cleared.clear_expired_lifecycle_reservation(ttl, now),
+                current && !trashed
+            );
+            if pending {
+                assert_eq!(
+                    serde_json::to_value(&cleared).unwrap(),
+                    serde_json::to_value(&row).unwrap()
+                );
+            }
+            let generation = row.lifecycle_generation;
+            assert_eq!(
+                row.try_acquire_lifecycle_reservation(LifecycleOperation::Trash, ttl, now),
+                Ok(generation + 1)
+            );
+        }
     }
 
     #[test]

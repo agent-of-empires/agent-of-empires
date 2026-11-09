@@ -104,6 +104,50 @@ fn buttons_map_clicks_hover_and_yield_to_overlays() {
     );
 }
 
+#[test]
+#[serial]
+fn trash_footer_scroll_preserves_sidebar_selection() {
+    for strict in [false, true] {
+        let mut env = create_test_env_with_sessions(2);
+        let id = env.view.instance_at(0).id.clone();
+        env.view
+            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.trashed_section_collapsed = false;
+        env.view.rebuild_flat_items();
+        env.view.select_session_by_id(&id);
+        env.view.strict_hotkeys = strict;
+        render_at(&mut env, 200, 30);
+        env.view.preview_text_view = super::super::PreviewTextView {
+            pane: ratatui::layout::Rect::new(30, 1, 80, 10),
+            first_line: 190,
+            total_lines: 200,
+        };
+        let cursor = env.view.cursor;
+        for code in [KeyCode::PageUp, KeyCode::PageDown] {
+            let (_, rect) = env
+                .view
+                .footer_buttons
+                .iter()
+                .find(|(key, _)| key.code == code)
+                .copied()
+                .unwrap();
+            let key = env.view.footer_button_at(rect.x, rect.y).unwrap();
+            assert_eq!(env.view.handle_key(key, None), None);
+            assert_eq!(env.view.cursor, cursor);
+            assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+            assert!(!env.view.retained_reader_focused());
+            if code == KeyCode::PageUp {
+                assert!(
+                    env.view.retained_scroll_offset > 0,
+                    "Earlier must scroll retained content"
+                );
+            } else {
+                assert_eq!(env.view.retained_scroll_offset, 0);
+            }
+        }
+    }
+}
+
 /// Strict-hotkey mode shifts the chords: Diff becomes Ctrl+D and Delete
 /// becomes an uppercase 'D', and the buttons synthesize those exactly.
 /// Rendered wide enough that every hint fits beside the tips badge.
