@@ -31,8 +31,10 @@ Captured descendants retain escaped live custody but prune physically exited
 history with an active PID index. Recovered runner authority remains birth-bound.
 Tree and target metadata roll back together; the old tree remains until config
 and lock writes commit. Unproven settlement/restoration or post-commit backup
-cleanup retains exclusion and recovery evidence. Admission checks that evidence
-under the operation flock; every external worker launch checks it too.
+cleanup retains exclusion, evidence and an in-process recovery fence, including
+failed marker writes. Admission checks recovery under the operation flock;
+every external worker launch checks it too. See
+[manual recovery](../../plugins.md#installing-external-plugins).
 This is lifecycle supervision, not a malicious-code sandbox.
 
 Local staging retains directory descriptors, rejects unsupported entries before

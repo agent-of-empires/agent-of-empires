@@ -129,13 +129,16 @@ If command settlement or restoration cannot be proven, the host retains
 exclusion and installation/backup or staging evidence rather than rolling back
 against potentially live writers. It attempts to write
 `<app_dir>/.plugin-recovery-required`, logging any persistence failure.
-Further mutations and all external worker launches refuse while that marker
-exists or cannot be checked. Builtin workers remain available.
-The job reports an explicit recovery-required failure, not a completed rollback.
-Stop the Daemon without removing the marker. Verify the recorded commands and
-owned workers have physically exited, then restore the intended installation.
-Remove the marker only after recovery, then restart the Daemon to release any
-retained in-process ownership. Restart alone is not recovery.
+Further mutations and all external worker launches refuse for the remainder of
+that Daemon process, even if the marker cannot be written or is later removed.
+A saved marker also fences a new Daemon; an unreadable marker fails closed.
+Builtin workers remain available. The job reports an explicit recovery-required
+failure, not a completed rollback. Stop the Daemon, verify the recorded commands
+and owned workers have physically exited, then restore the intended installation.
+Remove any marker only after recovery, then restart the Daemon to release
+retained in-process ownership. If marker persistence failed, a new Daemon cannot
+reconstruct that memory fence: complete manual recovery before restarting.
+Restart alone is not recovery.
 Tree publication and target config/lock entries share one rollback boundary.
 The previous tree stays backed up until both metadata writes commit. Restoration
 preserves the prior enabled, source, dev, grant, dismissal and settings values

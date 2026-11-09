@@ -1657,12 +1657,65 @@ command = ["sleep", "600"]
         let _home = crate::session::test_support::isolate_app_dir();
         let id = "acme.fenced";
         install_sleeper(id);
-        let before = serde_json::to_value(crate::session::Config::load().unwrap().plugins).unwrap();
+        let before = crate::session::Config::load().unwrap().plugins;
         let registry = crate::plugin::reload_registry();
-        let marker = crate::session::get_app_dir()
-            .unwrap()
-            .join(".plugin-recovery-required");
-        std::fs::write(&marker, "unsettled installation").unwrap();
+        let root = crate::session::get_app_dir().unwrap();
+        let marker = root.join(".plugin-recovery-required");
+        for persistence_fails in [false, true] {
+            if persistence_fails {
+                std::fs::create_dir(&marker).unwrap();
+                let recovery: anyhow::Result<()> = Err(super::super::execution::RecoveryRequired(
+                    "unsettled installation".into(),
+                )
+                .into());
+                super::super::install::log_recovery(&recovery);
+                std::fs::remove_dir(&marker).unwrap();
+                assert_eq!(
+                    std::fs::symlink_metadata(&marker).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
+                assert!(super::super::install::begin_operation().is_err());
+            } else {
+                std::fs::write(&marker, "unsettled installation").unwrap();
+            }
+            let host = PluginHost::new(
+                &root,
+                "default",
+                None,
+                std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
+            )
+            .unwrap();
+            for restart in [false, true] {
+                if restart {
+                    host.restart_worker(id, &registry).await;
+                } else {
+                    host.start(&registry).await;
+                }
+                wait_until("recovery-fenced supervisor", || async {
+                    !host.state.lock().await.running.contains_key(id)
+                })
+                .await;
+                assert!(worker_pid(&host, id).await.is_none());
+                assert_eq!(crate::session::Config::load().unwrap().plugins, before);
+                assert!(
+                    registry.get(id).unwrap().active(),
+                    "fence must not revoke persisted intent"
+                );
+            }
+            if !persistence_fails {
+                std::fs::remove_file(&marker).unwrap();
+                host.restart_worker(id, &registry).await;
+                wait_until("worker after explicit recovery", || async {
+                    worker_pid(&host, id).await.is_some()
+                })
+                .await;
+            }
+            host.shutdown().await;
+        }
+        drop(_home);
+        let _home = crate::session::test_support::isolate_app_dir();
+        install_sleeper(id);
+        let registry = crate::plugin::reload_registry();
         let host = PluginHost::new(
             &crate::session::get_app_dir().unwrap(),
             "default",
@@ -1670,29 +1723,8 @@ command = ["sleep", "600"]
             std::sync::Arc::new(crate::server::runtime::RuntimeWork::default()),
         )
         .unwrap();
-        for restart in [false, true] {
-            if restart {
-                host.restart_worker(id, &registry).await;
-            } else {
-                host.start(&registry).await;
-            }
-            wait_until("recovery-fenced supervisor", || async {
-                !host.state.lock().await.running.contains_key(id)
-            })
-            .await;
-            assert!(worker_pid(&host, id).await.is_none());
-            assert_eq!(
-                serde_json::to_value(crate::session::Config::load().unwrap().plugins).unwrap(),
-                before
-            );
-            assert!(
-                registry.get(id).unwrap().active(),
-                "fence must not revoke persisted intent"
-            );
-        }
-        std::fs::remove_file(marker).unwrap();
-        host.restart_worker(id, &registry).await;
-        wait_until("worker after explicit recovery", || async {
+        host.start(&registry).await;
+        wait_until("worker in unrelated app root", || async {
             worker_pid(&host, id).await.is_some()
         })
         .await;

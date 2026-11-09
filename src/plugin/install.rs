@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -66,14 +66,34 @@ impl OperationLog {
     }
 }
 
+struct RecoveryState {
+    roots: BTreeSet<PathBuf>,
+    unknown_root: bool,
+}
+
+static RECOVERY_STATE: parking_lot::Mutex<RecoveryState> = parking_lot::Mutex::new(RecoveryState {
+    roots: BTreeSet::new(),
+    unknown_root: false,
+});
+
 pub(super) fn log_recovery<T>(result: &Result<T>) {
     if let Err(error) = result {
-        tracing::error!(error = %format!("{error:#}"), "plugin mutation ownership retained for recovery");
-        if let Ok(root) = crate::session::get_app_dir() {
-            if let Err(persist_error) = std::fs::write(
-                root.join(".plugin-recovery-required"),
-                format!("{error:#}\n"),
-            ) {
+        let marker = match crate::session::get_app_dir() {
+            Ok(root) => {
+                let marker = root.join(".plugin-recovery-required");
+                RECOVERY_STATE.lock().roots.insert(root);
+                Some(marker)
+            }
+            Err(path_error) => {
+                RECOVERY_STATE.lock().unknown_root = true;
+                tracing::error!(%path_error, "plugin recovery root unavailable; manual recovery is required before restarting");
+                None
+            }
+        };
+        let cause = format!("{error:#}\n");
+        tracing::error!(error = %cause.trim_end(), "plugin mutation ownership retained for recovery");
+        if let Some(marker) = marker {
+            if let Err(persist_error) = std::fs::write(marker, cause) {
                 tracing::error!(%persist_error, "plugin recovery marker could not be persisted; manual recovery is required before restarting");
             }
         }
@@ -83,7 +103,15 @@ pub(super) fn log_recovery<T>(result: &Result<T>) {
 const OPERATION_LOCK: &str = ".plugin-operation.lock";
 
 pub(crate) fn check_recovery_evidence() -> Result<()> {
-    let evidence = crate::session::get_app_dir()?.join(".plugin-recovery-required");
+    let root = crate::session::get_app_dir()?;
+    let required = {
+        let state = RECOVERY_STATE.lock();
+        state.unknown_root || state.roots.contains(&root)
+    };
+    if required {
+        bail!("plugin recovery is required in this Daemon process; stop the Daemon, verify owned commands have exited and restore the installation before restarting");
+    }
+    let evidence = root.join(".plugin-recovery-required");
     match std::fs::symlink_metadata(&evidence) {
         Ok(_) => bail!("plugin recovery evidence exists at {}; stop the Daemon, verify owned commands have exited and restore the installation before removing this file, then restart the Daemon", evidence.display()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
