@@ -38,41 +38,29 @@ pub enum EmbeddedEvent {
     SessionInfo(super::ViewSideInfo),
 }
 
-const RETAINED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-struct RetainedTextCache {
-    width: u16,
-    theme: Theme,
-    roots: Option<crate::acp::session_paths::SessionPathRoots>,
-    text: ratatui::text::Text<'static>,
-}
-
-/// Retained transcript reader. No WebSocket, composer dispatcher, or worker setup.
+/// Retained transcript reader, without interactive state or an agent connection.
 pub struct RetainedView {
     session_id: String,
     source_profile: String,
     generation: u64,
     session_info: crate::acp::session_paths::SessionViewInfo,
-    rediscover: bool,
-    state: Option<StructuredViewState>,
-    unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
-    text_cache: Option<RetainedTextCache>,
-    load: Option<tokio::task::JoinHandle<()>>,
-    result: tokio::sync::oneshot::Receiver<
-        Result<Option<crate::acp::client::http::RetainedReplay>, String>,
-    >,
-    known_highest: Option<u64>,
-    known_identity: Option<String>,
-    known_coverage: Vec<(u64, u64)>,
-    known_incomplete: bool,
+    worker: Option<super::retained::worker::Worker>,
+    result: Option<std::sync::Arc<super::retained::worker::Update>>,
+    request: Option<super::retained::worker::Request>,
+    epoch: u64,
+    document_epoch: u64,
     next_read: Instant,
     message: String,
+    projection_changed: bool,
+    copy_result: Option<tokio::sync::oneshot::Receiver<std::io::Result<std::fs::File>>>,
+    clipboard_result:
+        Option<tokio::sync::oneshot::Receiver<std::io::Result<crate::tui::clipboard::CopyReport>>>,
+    copy_message: Option<String>,
+    pending_copy: Option<(String, super::retained::worker::CopyRange)>,
 }
 
 impl RetainedView {
     pub fn new(endpoint: Option<DaemonEndpoint>, inst: &crate::session::Instance) -> Self {
-        let (_, result) = tokio::sync::oneshot::channel();
-        let now = Instant::now();
         let mut view = Self {
             session_id: inst.id.clone(),
             source_profile: inst.source_profile.clone(),
@@ -102,88 +90,43 @@ impl RetainedView {
                         .collect(),
                 },
             },
-            rediscover: true,
-            state: None,
-            unfinished_outputs: Vec::new(),
-            text_cache: None,
-            load: None,
-            result,
-            known_highest: None,
-            known_identity: None,
-            known_coverage: Vec::new(),
-            known_incomplete: false,
-            next_read: now,
+            worker: None,
+            result: None,
+            request: None,
+            epoch: 0,
+            document_epoch: 0,
+            next_read: Instant::now() + std::time::Duration::from_secs(2),
             message: "Daemon unavailable; retained transcript could not be read.".into(),
+            projection_changed: false,
+            copy_result: None,
+            clipboard_result: None,
+            copy_message: None,
+            pending_copy: None,
         };
-        let Some(endpoint) = endpoint else {
-            return view;
-        };
-        if let Err(error) = view.connect(endpoint) {
-            view.message = format!("Transcript read failed: {error}");
-            return view;
+        if let Some(endpoint) = endpoint {
+            if let Err(error) = view.connect(endpoint) {
+                view.message = format!("Transcript read failed: {error}");
+            }
         }
-        view.message = "Loading retained ACP transcript…".into();
-        view.start_read();
         view
     }
 
     fn connect(&mut self, endpoint: DaemonEndpoint) -> Result<()> {
-        let http = crate::acp::client::HttpClient::new(endpoint.clone())?;
-        if let Some(state) = self.state.as_mut() {
-            state.endpoint = endpoint;
-            state.http = http;
-        } else {
-            let mut state = StructuredViewState::new(self.session_id.clone(), endpoint, http, None);
-            super::apply_session_info(&mut state, self.session_info.clone());
-            self.state = Some(state);
+        let http = crate::acp::client::HttpClient::new(endpoint)?;
+        let worker = super::retained::worker::Worker::new(
+            http,
+            self.session_id.clone(),
+            self.session_info.paths.clone(),
+        );
+        if let Some(request) = &self.request {
+            worker
+                .epoch
+                .store(request.epoch, std::sync::atomic::Ordering::Relaxed);
+            worker.requests.send_replace(Some(request.clone()));
         }
-        self.known_highest = None;
-        self.known_identity = None;
-        self.rediscover = false;
+        self.worker = Some(worker);
+        self.message = "Loading retained ACP transcript…".into();
         Ok(())
-    }
-
-    fn start_read(&mut self) -> bool {
-        self.next_read = Instant::now() + RETAINED_REFRESH_INTERVAL;
-        if self.rediscover {
-            let connected = crate::acp::client::discover()
-                .map_err(anyhow::Error::from)
-                .and_then(|endpoint| self.connect(endpoint));
-            if let Err(error) = connected {
-                let message = format!("Transcript read failed: {error}");
-                let changed = self.message != message;
-                self.message = message;
-                return changed;
-            }
-        }
-        let Some(state) = self.state.as_ref() else {
-            return false;
-        };
-        let http = state.http.clone();
-        let id = self.session_id.clone();
-        let known_identity = self.known_identity.clone();
-        let (tx, result) = tokio::sync::oneshot::channel();
-        self.result = result;
-        self.load = Some(tokio::spawn(async move {
-            let read = async {
-                if let Some(identity) = known_identity {
-                    if http
-                        .replay_retained_page(&id, u64::MAX, 1, None)
-                        .await?
-                        .history_identity
-                        .as_deref()
-                        == Some(identity.as_str())
-                    {
-                        return Ok(None);
-                    }
-                }
-                http.replay_retained_paged(&id, 1000).await.map(Some)
-            }
-            .await
-            .map_err(|error: crate::acp::client::HttpError| error.to_string());
-            let _ = tx.send(read);
-        }));
-        false
     }
 
     pub fn matches(&self, inst: &crate::session::Instance) -> bool {
@@ -193,107 +136,191 @@ impl RetainedView {
             && self.generation == inst.lifecycle_generation
     }
 
-    pub fn tick(&mut self) -> bool {
-        if self.load.is_none() {
-            if Instant::now() >= self.next_read {
-                return self.start_read();
-            }
+    pub(crate) fn copy_selection(
+        &mut self,
+        width: u16,
+        selection: crate::tui::rich_text::window::Selection,
+    ) -> bool {
+        self.start_copy(super::retained::worker::CopyRange::Selection { width, selection })
+    }
+    pub(crate) fn copy_all(&mut self) -> bool {
+        self.start_copy(super::retained::worker::CopyRange::All)
+    }
+    fn start_copy(&mut self, range: super::retained::worker::CopyRange) -> bool {
+        let Some(snapshot) = self
+            .result
+            .as_deref()
+            .and_then(|result| result.as_ref().ok())
+        else {
+            return false;
+        };
+        if self.worker.is_none() {
             return false;
         }
-        let result = match self.result.try_recv() {
-            Ok(result) => result,
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return false,
-            Err(error) => Err(error.to_string()),
-        };
-        self.load = None;
-        let now = Instant::now();
-        self.next_read = now + RETAINED_REFRESH_INTERVAL;
-        match result {
-            Ok(Some(replay)) => {
-                let changed = self.known_identity.as_deref()
-                    != Some(replay.history_identity.as_str())
-                    || self.known_highest != Some(replay.highest_seq)
-                    || self.known_coverage != replay.coverage
-                    || self.known_incomplete != replay.incomplete;
-                self.known_highest = Some(replay.highest_seq);
-                self.known_identity = Some(replay.history_identity);
-                self.known_coverage = replay.coverage;
-                self.known_incomplete = replay.incomplete;
-                if !changed {
-                    return false;
+        if snapshot
+            .window
+            .as_ref()
+            .is_none_or(|window| window.total == 0)
+        {
+            return false;
+        }
+        self.pending_copy = Some((snapshot.identity.clone(), range));
+        self.copy_message = Some("Copy queued…".into());
+        self.poll_copy();
+        true
+    }
+    fn poll_copy(&mut self) -> bool {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let mut changed = false;
+        if let Some(mut receiver) = self.copy_result.take() {
+            match receiver.try_recv() {
+                Ok(Ok(file)) => {
+                    let (reply, result) = tokio::sync::oneshot::channel();
+                    self.clipboard_result = Some(result);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = reply.send(crate::tui::clipboard::copy_file(file));
+                    });
+                    self.copy_message = Some("Writing clipboard content…".into());
+                    changed = true;
                 }
-                self.text_cache = None;
-                let snapshot = replay.transcript;
-                let lost = replay.incomplete;
-                self.message = if snapshot.rows.is_empty() && snapshot.unfinished_outputs.is_empty()
-                {
-                    "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
-                } else {
-                    "Retained ACP transcript · scroll to read · drag to copy".into()
-                };
-                if lost {
-                    self.message = format!(
-                        "Retained ACP history is incomplete; some events are unavailable. {}",
-                        self.message,
-                    );
+                Ok(Err(error)) => {
+                    self.copy_message = Some(format!("Copy failed: {error}"));
+                    changed = true;
                 }
-                if let Some(state) = self.state.as_mut() {
-                    state.transcript.server_rows = snapshot.rows;
+                Err(TryRecvError::Empty) => self.copy_result = Some(receiver),
+                Err(TryRecvError::Closed) => {
+                    self.copy_message = Some("Copy cancelled.".into());
+                    changed = true;
                 }
-                self.unfinished_outputs = snapshot.unfinished_outputs;
             }
-            Ok(None) => return false,
-            Err(error) => {
-                self.known_highest = None;
-                self.known_identity = None;
-                self.rediscover = true;
+        }
+        if let Some(mut receiver) = self.clipboard_result.take() {
+            match receiver.try_recv() {
+                Ok(Ok(report)) => {
+                    self.copy_message = Some(if let Some(desktop) = report.desktop {
+                        format!("Copied {} bytes via {desktop}.", report.bytes)
+                    } else if report.osc52_emitted {
+                        format!(
+                            "Emitted {} bytes via OSC 52; terminal clipboard support required.",
+                            report.bytes
+                        )
+                    } else {
+                        "No clipboard output was accepted.".into()
+                    });
+                    changed = true;
+                }
+                Ok(Err(error)) => {
+                    self.copy_message = Some(format!("Copy failed: {error}"));
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => self.clipboard_result = Some(receiver),
+                Err(TryRecvError::Closed) => {
+                    self.copy_message = Some("Clipboard output ended unexpectedly.".into());
+                    changed = true;
+                }
+            }
+        }
+        if self.copy_result.is_none() && self.clipboard_result.is_none() {
+            if let Some((identity, range)) = self.pending_copy.take() {
+                let current = self
+                    .result
+                    .as_deref()
+                    .and_then(|result| result.as_ref().ok())
+                    .is_some_and(|snapshot| snapshot.identity == identity);
+                if let Some(worker) = self.worker.as_ref().filter(|_| current) {
+                    self.copy_result = Some(worker.copy(identity, range));
+                    self.copy_message = Some("Preparing clipboard content…".into());
+                } else {
+                    self.copy_message = Some("Copy cancelled: retained history changed.".into());
+                }
+                changed = true;
+            }
+        }
+        changed
+    }
+    pub fn tick(&mut self) -> bool {
+        let copy_changed = self.poll_copy();
+        if self.worker.is_none() {
+            if Instant::now() < self.next_read {
+                return copy_changed;
+            }
+            self.next_read = Instant::now() + std::time::Duration::from_secs(2);
+            let result = crate::acp::client::discover()
+                .map_err(anyhow::Error::from)
+                .and_then(|endpoint| self.connect(endpoint));
+            if let Err(error) = result {
                 let message = format!("Transcript read failed: {error}");
                 let changed = self.message != message;
                 self.message = message;
-                return changed;
+                return changed || copy_changed;
+            }
+            return true;
+        }
+        let worker = self.worker.as_mut().unwrap();
+        if !worker.results.has_changed().unwrap_or(true) {
+            return copy_changed;
+        }
+        let Some(result) = worker.results.borrow_and_update().clone() else {
+            return copy_changed;
+        };
+        let previous = self
+            .result
+            .as_deref()
+            .and_then(|result| result.as_ref().ok());
+        match result.as_ref() {
+            Ok(snapshot) => {
+                self.projection_changed |= previous.is_none_or(|old| {
+                    old.identity != snapshot.identity || old.highest_seq != snapshot.highest_seq
+                });
+                self.message = if snapshot
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.total == 0)
+                {
+                    "No readable retained ACP content. Native history is not available through this reader; destroyed tmux scrollback cannot be recovered.".into()
+                } else if snapshot.window.is_none() {
+                    "Preparing retained transcript…".into()
+                } else {
+                    "Retained ACP transcript · scroll to read · drag to copy".into()
+                };
+                if snapshot.incomplete {
+                    self.message = format!(
+                        "Retained ACP history is incomplete; some events are unavailable. {}",
+                        self.message
+                    );
+                }
+            }
+            Err(error) => {
+                self.projection_changed = true;
+                self.message = format!("Transcript read failed: {error}");
+                self.worker = None;
+                self.next_read = Instant::now() + std::time::Duration::from_secs(2);
             }
         }
-        true
-    }
-
-    fn prepare_text(&mut self, width: u16, theme: &Theme) -> bool {
-        let roots = self
-            .state
-            .as_ref()
-            .and_then(|state| state.path_roots.as_ref());
-        if self.text_cache.as_ref().is_some_and(|cache| {
-            cache.width == width && &cache.theme == theme && cache.roots.as_ref() == roots
-        }) {
-            return false;
+        if result.is_ok() {
+            self.result = Some(result);
         }
-        let text = self
-            .state
-            .as_ref()
-            .filter(|state| {
-                !state.transcript.server_rows.is_empty() || !self.unfinished_outputs.is_empty()
-            })
-            .map_or_else(Default::default, |state| {
-                render::wrapped_transcript(
-                    state,
-                    theme,
-                    width,
-                    render::ToolOutputMode::Retained(&self.unfinished_outputs),
-                )
-            });
-        self.text_cache = Some(RetainedTextCache {
-            width,
-            theme: theme.clone(),
-            roots: roots.cloned(),
-            text,
-        });
         true
     }
 
-    pub fn rendered_text(&self, width: u16) -> Option<&ratatui::text::Text<'static>> {
-        self.text_cache
-            .as_ref()
-            .filter(|cache| cache.width == width)
-            .map(|cache| &cache.text)
+    fn window(&self) -> Option<&super::retained::worker::Window> {
+        let request = self.request.as_ref()?;
+        let snapshot = self.result.as_deref()?.as_ref().ok()?;
+        snapshot.window.as_ref().filter(|window| {
+            window.width == request.width.max(1) && window.document_epoch == request.document_epoch
+        })
+    }
+
+    pub fn effective_offset(&self) -> Option<usize> {
+        self.window()
+            .filter(|window| {
+                Some(window.epoch) == self.request.as_ref().map(|request| request.epoch)
+            })
+            .map(|window| window.offset)
+    }
+    pub(crate) fn cancel_copy(&mut self) {
+        self.copy_result = None;
+        self.pending_copy = None;
     }
 
     pub fn render(
@@ -306,25 +333,43 @@ impl RetainedView {
     ) -> (render::TranscriptGeometry, bool) {
         use ratatui::{style::Style, widgets::Paragraph};
         let mut status = Vec::new();
+        let preparing = self.worker.is_some()
+            && self.result.is_some()
+            && (self
+                .window()
+                .is_none_or(|window| window.width != area.width)
+                || self
+                    .request
+                    .as_ref()
+                    .is_some_and(|request| request.theme != *theme));
+        let message = if preparing {
+            "Preparing retained transcript…"
+        } else {
+            &self.message
+        };
         render::wrap_line_into(
-            ratatui::text::Line::from(self.message.clone()),
+            ratatui::text::Line::from(message.to_owned()),
             area.width,
             &mut status,
         );
-        let status_rows = status.len().min(u16::MAX as usize) as u16;
         let chunks = ratatui::layout::Layout::vertical([
             ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Length(status_rows),
+            ratatui::layout::Constraint::Length(status.len().min(u16::MAX as usize) as u16),
             ratatui::layout::Constraint::Min(0),
         ])
         .split(area);
+        let base = if focused {
+            "Trash · read-only · Esc: sessions · y: copy all"
+        } else {
+            "Trash · read-only · Enter: read"
+        };
+        let header = self
+            .copy_message
+            .as_ref()
+            .map(|message| format!("{base} · {message}"));
         frame.render_widget(
-            Paragraph::new(if focused {
-                "Trash · read-only · Esc: sessions"
-            } else {
-                "Trash · read-only · Enter: read"
-            })
-            .style(Style::default().fg(theme.hint)),
+            Paragraph::new(header.as_deref().unwrap_or(base))
+                .style(Style::default().fg(theme.hint)),
             chunks[0],
         );
         frame.render_widget(
@@ -332,51 +377,78 @@ impl RetainedView {
             chunks[1],
         );
         let text_area = chunks[2];
-        if text_area.is_empty() {
-            return (
-                render::TranscriptGeometry {
-                    text_area,
-                    first_line: 0,
-                    total_lines: 0,
-                },
-                false,
-            );
+        let reflow = self
+            .request
+            .as_ref()
+            .is_none_or(|request| request.width != text_area.width || request.theme != *theme);
+        let changed = std::mem::take(&mut self.projection_changed) || reflow;
+        if self.request.as_ref().is_none_or(|request| {
+            request.width != text_area.width
+                || request.height != text_area.height
+                || request.theme != *theme
+                || request.offset != offset
+        }) {
+            self.epoch = self
+                .epoch
+                .checked_add(1)
+                .expect("retained viewport epoch exhausted");
+            let theme_changed = self
+                .request
+                .as_ref()
+                .is_none_or(|request| request.theme != *theme);
+            if theme_changed {
+                self.document_epoch = self
+                    .document_epoch
+                    .checked_add(1)
+                    .expect("retained document epoch exhausted");
+            }
+            let anchor = if reflow && offset != 0 {
+                self.window().and_then(|window| window.anchor)
+            } else {
+                None
+            };
+            let request = super::retained::worker::Request {
+                epoch: self.epoch,
+                document_epoch: self.document_epoch,
+                theme: theme.clone(),
+                width: text_area.width,
+                height: text_area.height,
+                offset,
+                anchor,
+            };
+            if let Some(worker) = &self.worker {
+                worker
+                    .epoch
+                    .store(request.epoch, std::sync::atomic::Ordering::Relaxed);
+                worker.requests.send_replace(Some(request.clone()));
+            }
+            self.request = Some(request);
         }
-        let changed = self.prepare_text(text_area.width, theme);
-        let text = self.rendered_text(text_area.width).unwrap();
-        let total = text.lines.len();
-        let max = total.saturating_sub(text_area.height as usize);
-        let first = max.saturating_sub(offset);
-        frame.buffer_mut().set_style(text_area, text.style);
-        for (row, line) in text.lines[first..]
-            .iter()
-            .take(text_area.height as usize)
-            .enumerate()
-        {
-            // Buffer advances spans with CellWidth, matching wrapping and selection.
-            frame.buffer_mut().set_line(
-                text_area.x,
-                text_area.y.saturating_add(row as u16),
-                line,
-                text_area.width,
-            );
+        let window = self.window();
+        if let Some(window) = window {
+            for (row, line) in window
+                .text
+                .lines
+                .iter()
+                .take(usize::from(text_area.height.min(window.height)))
+                .enumerate()
+            {
+                frame.buffer_mut().set_line(
+                    text_area.x,
+                    text_area.y.saturating_add(row as u16),
+                    line,
+                    text_area.width,
+                );
+            }
         }
         (
             render::TranscriptGeometry {
                 text_area,
-                first_line: first,
-                total_lines: total,
+                first_line: window.map_or(0, |window| window.first),
+                total_lines: window.map_or(0, |window| window.total),
             },
             changed,
         )
-    }
-}
-
-impl Drop for RetainedView {
-    fn drop(&mut self) {
-        if let Some(load) = self.load.take() {
-            load.abort();
-        }
     }
 }
 pub struct EmbeddedView {
@@ -585,12 +657,7 @@ impl EmbeddedView {
     /// `width` columns, so the home view's selection extraction slices match the
     /// on-screen geometry. Styles are irrelevant to extraction.
     pub fn selection_text(&self, width: u16) -> ratatui::text::Text<'static> {
-        render::wrapped_transcript(
-            &self.state,
-            &crate::tui::styles::Theme::default(),
-            width,
-            render::ToolOutputMode::Compact,
-        )
+        render::wrapped_transcript(&self.state, &crate::tui::styles::Theme::default(), width)
     }
 
     /// Paste text into the composer, focusing it if needed, then load the file
@@ -603,1225 +670,4 @@ impl EmbeddedView {
 }
 
 #[cfg(test)]
-mod retained_tests {
-    use super::*;
-    use axum::{
-        extract::{Path, State},
-        http::StatusCode,
-        routing::get,
-        Router,
-    };
-    use std::{sync::Arc, time::Duration};
-
-    fn prepared_text(view: &mut RetainedView, width: u16) -> &ratatui::text::Text<'static> {
-        view.prepare_text(width, &Theme::default());
-        view.rendered_text(width).unwrap()
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn retained_reader_recovers_initialization_and_uses_feed_path_roots() {
-        use crate::acp::state::{DiffPreview, Event, ToolCall};
-        let _app = crate::session::test_support::isolate_app_dir();
-        let _discovery = crate::session::test_support::EnvGuard::unset(&[
-            "AOE_DAEMON_URL",
-            "AOE_DAEMON_TOKEN",
-            "AOE_DAEMON_PASSPHRASE",
-        ]);
-        let root = tempfile::tempdir().unwrap();
-        let main = root.path().join("main");
-        let original = root.path().join("worktree");
-        let repo = git2::Repository::init(&main).unwrap();
-        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
-        let tree = repo
-            .find_tree(repo.index().unwrap().write_tree().unwrap())
-            .unwrap();
-        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
-            .unwrap();
-        crate::git::GitWorktree::new(main.clone())
-            .unwrap()
-            .create_worktree("retained-paths", &original, true, None)
-            .unwrap();
-        let mut inst = crate::session::Instance::new("retained paths", original.to_str().unwrap());
-        inst.worktree_info = Some(crate::session::WorktreeInfo {
-            branch: "retained-paths".into(),
-            main_repo_path: main.to_string_lossy().into_owned(),
-            managed_by_aoe: true,
-            created_at: chrono::Utc::now(),
-            base_branch: None,
-        });
-        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
-        state
-            .acp_event_store
-            .record(
-                &inst.id,
-                1,
-                &Event::ToolCallStarted {
-                    tool_call: ToolCall {
-                        id: "edit".into(),
-                        name: "Edit".into(),
-                        kind: "edit".into(),
-                        args_preview: "{}".into(),
-                        started_at: at,
-                        parent_tool_call_id: None,
-                        memory_recall: None,
-                        diffs: vec![DiffPreview {
-                            path: original.join("src/test.rs").to_string_lossy().into_owned(),
-                            old_text: Some("before".into()),
-                            new_text: Some("after".into()),
-                            created_at: at,
-                        }],
-                    },
-                },
-            )
-            .unwrap();
-        state
-            .acp_event_store
-            .record(
-                &inst.id,
-                2,
-                &Event::ToolCallCompleted {
-                    tool_call_id: "edit".into(),
-                    is_error: false,
-                    content: "READ-ONLY-CONTENT".into(),
-                    output: Vec::new(),
-                    completed_at: at,
-                    async_subagent: false,
-                },
-            )
-            .unwrap();
-        inst.trash();
-        assert!(matches!(
-            crate::session::trash::relocate_worktree_to_trash(&mut inst),
-            crate::session::trash::RelocateOutcome::Relocated { .. },
-        ));
-        assert!(!original.exists());
-        assert_eq!(inst.pre_trash_project_path.as_deref(), original.to_str());
-        *state.instances.write().await = vec![inst.clone()];
-        let app = Router::new()
-            .route(
-                "/api/sessions/{id}/acp/replay",
-                get(crate::server::api::acp_replay),
-            )
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        for endpoint in [
-            Some(DaemonEndpoint::new(
-                url.clone(),
-                None,
-                crate::daemon::Source::Env,
-            )),
-            None,
-            Some(DaemonEndpoint::new(
-                "not a URL".into(),
-                None,
-                crate::daemon::Source::Env,
-            )),
-        ] {
-            let mut view = RetainedView::new(endpoint, &inst);
-            if view.load.is_none() {
-                view.tick();
-                assert!(view.load.is_none());
-                assert!(view.next_read > Instant::now());
-                assert!(
-                    !view.tick(),
-                    "discovery failure must respect the retry deadline"
-                );
-            }
-            let _endpoint =
-                crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &url)]);
-            if view.load.is_none() {
-                view.next_read = Instant::now();
-                view.tick();
-            }
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                view.load
-                    .as_mut()
-                    .expect("reader must retry without remount"),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert!(view.tick());
-            let copied = prepared_text(&mut view, 80).to_string();
-            assert!(copied.contains("Before: src/test.rs"), "{copied}");
-            assert!(copied.contains("After: src/test.rs"), "{copied}");
-            assert!(!copied.contains(original.to_str().unwrap()), "{copied}");
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).unwrap();
-            terminal
-                .draw(|frame| {
-                    view.render(frame, frame.area(), &Theme::default(), usize::MAX, true);
-                })
-                .unwrap();
-            let painted: String = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect();
-            assert!(painted.contains("Before: src/test.rs"), "{painted}");
-            assert!(!painted.contains(original.to_str().unwrap()), "{painted}");
-        }
-        server.abort();
-        let _ = server.await;
-    }
-
-    #[test]
-    fn retained_painted_cells_match_copy_across_styled_graphemes() {
-        use crate::acp::state::Event;
-        use ratatui::style::Modifier;
-        use unicode_segmentation::UnicodeSegmentation;
-        for prefix in ["ﾊﾟ", "♥️", "e\u{301}"] {
-            let inst = crate::session::Instance::new("styled copy", "/tmp");
-            let endpoint = DaemonEndpoint::new(
-                "http://127.0.0.1:1".into(),
-                None,
-                crate::daemon::Source::Env,
-            );
-            let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
-            let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
-            let mut model = crate::acp::transcript::TranscriptModel::new();
-            model.apply_event(
-                1,
-                &Event::AgentMessageChunk {
-                    text: format!("{prefix} **tail**"),
-                    message_id: None,
-                },
-            );
-            state.transcript.server_rows = model.into_rows();
-            let mut view = RetainedView::new(None, &inst);
-            view.state = Some(state);
-            for width in [8, 32] {
-                let mut terminal =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
-                let mut geometry = None;
-                terminal
-                    .draw(|frame| {
-                        geometry = Some(
-                            view.render(frame, frame.area(), &Theme::default(), usize::MAX, true)
-                                .0,
-                        );
-                    })
-                    .unwrap();
-                let geometry = geometry.unwrap();
-                let text = view.rendered_text(width).unwrap();
-                let buffer = terminal.backend().buffer();
-                for (index, line) in text.lines.iter().enumerate() {
-                    let columns = crate::tui::components::text::line_columns(line, width);
-                    let y = geometry.text_area.y + index as u16;
-                    for (byte, grapheme) in columns.text.grapheme_indices(true) {
-                        let x = geometry.text_area.x + columns.column_at(byte);
-                        assert_eq!(
-                            buffer[(x, y)].symbol(),
-                            grapheme,
-                            "{prefix}, width={width}, x={x}"
-                        );
-                    }
-                    if let Some(byte) = columns.text.find("tail") {
-                        let x = geometry.text_area.x + columns.column_at(byte);
-                        assert_eq!(
-                            columns.slice(x - geometry.text_area.x, x - geometry.text_area.x + 4),
-                            "tail"
-                        );
-                        assert!(buffer[(x, y)].modifier.contains(Modifier::BOLD));
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn retained_projection_tracks_width_theme_and_path_roots() {
-        use crate::acp::state::{DiffPreview, Event, ToolCall};
-        use ratatui::style::Color;
-        let inst = crate::session::Instance::new("projection", "/repo");
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:1".into(),
-            None,
-            crate::daemon::Source::Env,
-        );
-        let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
-        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
-        let mut model = crate::acp::transcript::TranscriptModel::new();
-        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
-        model.apply_event(
-            1,
-            &Event::ToolCallStarted {
-                tool_call: ToolCall {
-                    id: "projection".into(),
-                    name: "ProjectionTool".into(),
-                    kind: "edit".into(),
-                    args_preview: "arguments ".repeat(12),
-                    started_at: at,
-                    parent_tool_call_id: None,
-                    memory_recall: None,
-                    diffs: vec![DiffPreview {
-                        path: "/repo/src/test.rs".into(),
-                        old_text: Some("before".into()),
-                        new_text: Some("after".into()),
-                        created_at: at,
-                    }],
-                },
-            },
-        );
-        model.apply_event(
-            2,
-            &Event::ToolCallCompleted {
-                tool_call_id: "projection".into(),
-                is_error: false,
-                content: "BODY-TEXT ♥️ e\u{301} 界 END".into(),
-                output: Vec::new(),
-                completed_at: at,
-                async_subagent: false,
-            },
-        );
-        state.transcript.server_rows = model.into_rows();
-        let mut view = RetainedView::new(None, &inst);
-        view.state = Some(state);
-        assert!(view.rendered_text(80).is_none());
-        for (width, color, relative) in [
-            (80, Color::Red, false),
-            (32, Color::Red, false),
-            (80, Color::Cyan, false),
-            (80, Color::Cyan, true),
-        ] {
-            view.state.as_mut().unwrap().path_roots =
-                relative.then(|| crate::acp::session_paths::SessionPathRoots {
-                    id: inst.id.clone(),
-                    project_path: "/repo".into(),
-                    main_repo_path: None,
-                    workspace_repos: Vec::new(),
-                });
-            let theme = Theme {
-                text: color,
-                ..Theme::default()
-            };
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40)).unwrap();
-            let mut geometry = None;
-            terminal
-                .draw(|frame| {
-                    geometry = Some(view.render(frame, frame.area(), &theme, usize::MAX, true).0);
-                })
-                .unwrap();
-            let geometry = geometry.unwrap();
-            let copied = view.rendered_text(width).unwrap().to_string();
-            assert!(copied.contains("BODY-TEXT ♥️ e\u{301} 界 END"));
-            let path = if relative {
-                "Before: src/test.rs"
-            } else {
-                "Before: /repo/src/test.rs"
-            };
-            assert!(copied.contains(path), "{copied}");
-            assert!(view.rendered_text(width - 1).is_none());
-            let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(0, geometry.text_area.y)].fg, color);
-            let painted: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-            assert!(painted.contains("ProjectionTool"));
-            assert!(painted.contains(path));
-        }
-    }
-
-    #[test]
-    fn trash_home_reaches_history_beyond_u16_lines() {
-        let inst = crate::session::Instance::new("large retained", "/tmp");
-        let endpoint = DaemonEndpoint::new(
-            "http://127.0.0.1:1".into(),
-            None,
-            crate::daemon::Source::Env,
-        );
-        let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
-        let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
-        let mut model = crate::acp::transcript::TranscriptModel::new();
-        model.apply_event(
-            1,
-            &crate::acp::state::Event::AgentMessageChunk {
-                text: format!(
-                    "oldest retained text\n\n{}newest retained text",
-                    "line\n\n".repeat(70_000)
-                ),
-                message_id: None,
-            },
-        );
-        state.transcript.merge_server_rows(model.rows().to_vec());
-        let mut view = RetainedView::new(None, &inst);
-        view.state = Some(state);
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
-        let mut first = usize::MAX;
-        terminal
-            .draw(|frame| {
-                first = view
-                    .render(frame, frame.area(), &Theme::default(), usize::MAX, false)
-                    .0
-                    .first_line;
-            })
-            .unwrap();
-        assert_eq!(first, 0, "Home must reach the oldest retained line");
-    }
-
-    #[test]
-    fn retained_tool_output_is_readable_and_copyable_without_preview_limits() {
-        use crate::acp::state::{Event, ToolCall};
-        for kind in ["execute", "read", "edit", "delete", "unknown"] {
-            for failed in [false, true] {
-                let inst = crate::session::Instance::new("retained output", "/tmp");
-                let endpoint = DaemonEndpoint::new(
-                    "http://127.0.0.1:1".into(),
-                    None,
-                    crate::daemon::Source::Env,
-                );
-                let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
-                let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
-                let mut model = crate::acp::transcript::TranscriptModel::new();
-                let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
-                model.apply_event(
-                    1,
-                    &Event::ToolCallStarted {
-                        tool_call: ToolCall {
-                            id: "tool".into(),
-                            name: "RetainedTool".into(),
-                            kind: kind.into(),
-                            args_preview: format!("{}\nARGUMENT-END", "argument ".repeat(40)),
-                            started_at: at,
-                            parent_tool_call_id: None,
-                            memory_recall: None,
-                            diffs: if kind == "edit" {
-                                vec![crate::acp::state::DiffPreview {
-                                    path: "/tmp/retained.txt".into(),
-                                    old_text: Some("before".into()),
-                                    new_text: Some("changed\n".repeat(30) + "DIFF-END"),
-                                    created_at: at,
-                                }]
-                            } else {
-                                Vec::new()
-                            },
-                        },
-                    },
-                );
-                let output = (0..40)
-                    .map(|i| format!("output-{i:02}\n"))
-                    .collect::<String>()
-                    + "OUTPUT-END";
-                let blocks = if kind == "unknown" {
-                    vec![
-                        crate::acp::state::ToolOutputBlock::Text {
-                            text: output.clone(),
-                        },
-                        crate::acp::state::ToolOutputBlock::Image {
-                            mime_type: "image/png".into(),
-                            data: Some("BINARY-NOT-TEXT".into()),
-                            uri: None,
-                        },
-                    ]
-                } else {
-                    Vec::new()
-                };
-                model.apply_event(
-                    2,
-                    &Event::ToolCallCompleted {
-                        tool_call_id: "tool".into(),
-                        is_error: failed,
-                        content: if kind == "unknown" {
-                            "FALLBACK-NOT-DISPLAYED".into()
-                        } else {
-                            output
-                        },
-                        output: blocks,
-                        completed_at: at,
-                        async_subagent: false,
-                    },
-                );
-                state.transcript.server_rows = model.into_rows();
-                let mut view = RetainedView::new(None, &inst);
-                view.state = Some(state);
-                for width in [32, 80] {
-                    let copied = prepared_text(&mut view, width)
-                        .lines
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    assert!(
-                        copied.contains("ARGUMENT-END"),
-                        "{kind}, failed={failed}: {copied}"
-                    );
-                    for i in 0..40 {
-                        assert!(
-                            copied.contains(&format!("output-{i:02}")),
-                            "{kind}, failed={failed}: missing output-{i:02}"
-                        );
-                    }
-                    assert!(copied.contains("OUTPUT-END"));
-                    assert!(!copied.contains("press `o`"));
-                    if kind == "edit" {
-                        assert!(copied.contains("DIFF-END"));
-                    }
-                    if kind == "unknown" {
-                        assert!(copied.contains("[image image/png]"));
-                        assert!(!copied.contains("BINARY-NOT-TEXT"));
-                        assert!(!copied.contains("FALLBACK-NOT-DISPLAYED"));
-                    }
-                    let mut terminal =
-                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 12))
-                            .unwrap();
-                    terminal
-                        .draw(|frame| {
-                            view.render(frame, frame.area(), &Theme::default(), 0, true);
-                        })
-                        .unwrap();
-                    let painted: String = terminal
-                        .backend()
-                        .buffer()
-                        .content()
-                        .iter()
-                        .map(|cell| cell.symbol())
-                        .collect();
-                    assert!(
-                        painted.contains("OUTPUT-END"),
-                        "{kind}, failed={failed}: {painted}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn retained_media_completion_preserves_text_fallback() {
-        use crate::acp::state::{Event, ToolOutputBlock};
-        let image = ToolOutputBlock::Image {
-            mime_type: "image/png".into(),
-            data: Some("BINARY-HIDDEN".into()),
-            uri: None,
-        };
-        let resource = |text: Option<&str>| ToolOutputBlock::Resource {
-            uri: "fixture-resource".into(),
-            mime_type: None,
-            text: text.map(str::to_owned),
-            data: Some("BINARY-HIDDEN".into()),
-        };
-        let cases = [
-            (vec![image.clone()], "", "BUFFER-TEXT"),
-            (
-                vec![
-                    image.clone(),
-                    ToolOutputBlock::Text {
-                        text: String::new(),
-                    },
-                ],
-                "",
-                "BUFFER-TEXT",
-            ),
-            (vec![resource(Some(""))], "", "BUFFER-TEXT"),
-            (
-                vec![
-                    resource(None),
-                    ToolOutputBlock::Audio {
-                        mime_type: "audio/wav".into(),
-                        data: Some("BINARY-HIDDEN".into()),
-                    },
-                    ToolOutputBlock::ResourceLink {
-                        uri: "fixture-link".into(),
-                        name: "link".into(),
-                        mime_type: None,
-                    },
-                ],
-                "",
-                "BUFFER-TEXT",
-            ),
-            (vec![image.clone()], "EXPLICIT-TEXT", "EXPLICIT-TEXT"),
-            (
-                vec![
-                    image,
-                    ToolOutputBlock::Text {
-                        text: "FINAL-TEXT".into(),
-                    },
-                ],
-                "FINAL-TEXT",
-                "FINAL-TEXT",
-            ),
-            (vec![resource(Some("RESOURCE-TEXT"))], "", "RESOURCE-TEXT"),
-        ];
-        for (blocks, final_text, expected) in cases {
-            for failed in [false, true] {
-                let inst = crate::session::Instance::new("retained media", "/tmp");
-                let endpoint = DaemonEndpoint::new(
-                    "http://127.0.0.1:1".into(),
-                    None,
-                    crate::daemon::Source::Env,
-                );
-                let http = crate::acp::client::HttpClient::new(endpoint.clone()).unwrap();
-                let mut state = StructuredViewState::new(inst.id.clone(), endpoint, http, None);
-                let mut model = crate::acp::transcript::TranscriptModel::new();
-                model.apply_event(
-                    1,
-                    &Event::ToolCallContent {
-                        tool_call_id: "media".into(),
-                        content: "BUFFER-TEXT".into(),
-                    },
-                );
-                model.apply_event(
-                    2,
-                    &Event::ToolCallCompleted {
-                        tool_call_id: "media".into(),
-                        is_error: failed,
-                        content: final_text.into(),
-                        output: blocks.clone(),
-                        completed_at: chrono::Utc::now(),
-                        async_subagent: false,
-                    },
-                );
-                state.transcript.server_rows = model.into_rows();
-                let mut view = RetainedView::new(None, &inst);
-                view.state = Some(state);
-                for width in [32, 80] {
-                    let copied = prepared_text(&mut view, width).to_string();
-                    let mut terminal =
-                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 20))
-                            .unwrap();
-                    terminal
-                        .draw(|frame| {
-                            view.render(frame, frame.area(), &Theme::default(), 0, true);
-                        })
-                        .unwrap();
-                    let painted: String = terminal
-                        .backend()
-                        .buffer()
-                        .content()
-                        .iter()
-                        .map(|cell| cell.symbol())
-                        .collect();
-                    for text in [&copied, &painted] {
-                        assert_eq!(
-                            text.matches(expected).count(),
-                            1,
-                            "failed={failed}, width={width}: {text}"
-                        );
-                        if expected != "BUFFER-TEXT" {
-                            assert!(!text.contains("BUFFER-TEXT"));
-                        }
-                        assert!(!text.contains("BINARY-HIDDEN"));
-                        if blocks
-                            .iter()
-                            .any(|block| matches!(block, ToolOutputBlock::Image { .. }))
-                        {
-                            assert_eq!(text.matches("[image image/png]").count(), 1);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn retained_empty_history_does_not_hide_known_loss() {
-        for empty in [false, true] {
-            for incomplete in [false, true] {
-                let inst = crate::session::Instance::new("retained state", "/tmp");
-                let mut model = crate::acp::transcript::TranscriptModel::new();
-                if !empty {
-                    model.apply_event(
-                        1,
-                        &crate::acp::state::Event::AgentMessageChunk {
-                            text: "retained message".into(),
-                            message_id: None,
-                        },
-                    );
-                }
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let mut view = RetainedView::new(None, &inst);
-                view.result = rx;
-                view.load = Some(tokio::spawn(async {}));
-                let highest_seq = model.last_seq();
-                tx.send(Ok(Some(crate::acp::client::http::RetainedReplay {
-                    transcript: model.into_retained(),
-                    highest_seq,
-                    coverage: if highest_seq == 0 {
-                        Vec::new()
-                    } else {
-                        vec![(1, highest_seq)]
-                    },
-                    incomplete,
-                    history_identity: "fixture".into(),
-                })))
-                .unwrap();
-                assert!(view.tick());
-                for width in [32, 100] {
-                    let mut terminal =
-                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
-                            .unwrap();
-                    terminal
-                        .draw(|frame| {
-                            view.render(frame, frame.area(), &Theme::default(), 0, false);
-                        })
-                        .unwrap();
-                    let painted: String = terminal
-                        .backend()
-                        .buffer()
-                        .content()
-                        .iter()
-                        .map(|cell| cell.symbol())
-                        .collect();
-                    assert_eq!(
-                        painted.contains("incomplete"),
-                        incomplete,
-                        "empty={empty}, width={width}: {painted}"
-                    );
-                    assert_eq!(
-                        painted.contains("No readable"),
-                        empty,
-                        "incomplete={incomplete}, width={width}: {painted}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn retained_snapshot_exposes_unfinished_and_orphan_output() {
-        use crate::acp::state::{Event, ToolCall};
-        for started in [false, true] {
-            let inst = crate::session::Instance::new("unfinished", "/tmp");
-            let id = inst.id.clone();
-            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-            if started {
-                state
-                    .acp_event_store
-                    .record(
-                        &id,
-                        1,
-                        &Event::ToolCallStarted {
-                            tool_call: ToolCall {
-                                id: "unfinished".into(),
-                                name: "RetainedTool".into(),
-                                kind: "execute".into(),
-                                args_preview: "{}".into(),
-                                started_at: chrono::Utc::now(),
-                                parent_tool_call_id: None,
-                                memory_recall: None,
-                                diffs: Vec::new(),
-                            },
-                        },
-                    )
-                    .unwrap();
-            }
-            for (seq, text) in [
-                (2, "superseded output"),
-                (3, "unfinished output\nUNFINISHED-TAIL"),
-            ] {
-                state
-                    .acp_event_store
-                    .record(
-                        &id,
-                        seq,
-                        &Event::ToolCallContent {
-                            tool_call_id: "unfinished".into(),
-                            content: text.into(),
-                        },
-                    )
-                    .unwrap();
-            }
-            let app = Router::new()
-                .route(
-                    "/api/sessions/{id}/acp/replay",
-                    get(crate::server::api::acp_replay),
-                )
-                .with_state(state);
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = DaemonEndpoint::new(
-                format!("http://{}", listener.local_addr().unwrap()),
-                None,
-                crate::daemon::Source::Env,
-            );
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let mut view = RetainedView::new(Some(endpoint), &inst);
-            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(view.tick());
-            let copied = prepared_text(&mut view, 80).to_string();
-            assert!(
-                copied.contains("UNFINISHED-TAIL"),
-                "started={started}: {copied}"
-            );
-            assert!(!copied.contains("superseded output"));
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
-            terminal
-                .draw(|frame| {
-                    view.render(frame, frame.area(), &Theme::default(), 0, true);
-                })
-                .unwrap();
-            let painted: String = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect();
-            assert!(painted.contains("UNFINISHED-TAIL"));
-            for marker in ['✓', '✗', '◼'] {
-                assert!(!painted.contains(marker));
-            }
-            server.abort();
-            let _ = server.await;
-        }
-    }
-
-    #[tokio::test]
-    async fn retained_reader_acquires_late_stop_without_remount() {
-        use crate::acp::state::{Event, ToolCall};
-        for summary_races in [false, true] {
-            let mut inst = crate::session::Instance::new("late retained output", "/tmp");
-            inst.trash();
-            let id = inst.id.clone();
-            let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    1,
-                    &Event::ToolCallStarted {
-                        tool_call: ToolCall {
-                            id: "pending".into(),
-                            name: "PendingTool".into(),
-                            kind: "execute".into(),
-                            args_preview: "{}".into(),
-                            started_at: chrono::Utc::now(),
-                            parent_tool_call_id: None,
-                            memory_recall: None,
-                            diffs: Vec::new(),
-                        },
-                    },
-                )
-                .unwrap();
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    2,
-                    &Event::ToolCallContent {
-                        tool_call_id: "pending".into(),
-                        content: "BEFORE-TEARDOWN".into(),
-                    },
-                )
-                .unwrap();
-            if summary_races {
-                state
-                    .acp_event_store
-                    .record(
-                        &id,
-                        4,
-                        &Event::ConversationSummary {
-                            text: "CONCURRENT-SUMMARY".into(),
-                            summarized_until_seq: 2,
-                        },
-                    )
-                    .unwrap();
-            }
-            let app = Router::new()
-                .route(
-                    "/api/sessions/{id}/acp/replay",
-                    get(crate::server::api::acp_replay),
-                )
-                .with_state(state.clone());
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let endpoint = DaemonEndpoint::new(
-                format!("http://{}", listener.local_addr().unwrap()),
-                None,
-                crate::daemon::Source::Env,
-            );
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let mut view = RetainedView::new(Some(endpoint), &inst);
-            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(view.tick());
-            let before = prepared_text(&mut view, 80).to_string();
-            assert!(before.contains("BEFORE-TEARDOWN"));
-            assert!(before.contains("completion unavailable"));
-            if !summary_races {
-                state
-                    .acp_event_store
-                    .record(
-                        &id,
-                        3,
-                        &Event::ToolCallContent {
-                            tool_call_id: "pending".into(),
-                            content: "AFTER-TEARDOWN".into(),
-                        },
-                    )
-                    .unwrap();
-            }
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    if summary_races { 3 } else { 4 },
-                    &Event::Stopped {
-                        reason: "teardown complete".into(),
-                    },
-                )
-                .unwrap();
-            let mut ticker = tokio::time::interval(Duration::from_millis(10));
-            tokio::time::timeout(Duration::from_secs(8), async {
-                loop {
-                    ticker.tick().await;
-                    view.tick();
-                    if prepared_text(&mut view, 80).to_string().contains('◼') {
-                        break;
-                    }
-                }
-            })
-            .await
-            .expect("mounted reader must acquire persisted final output without reselection");
-            let copied = prepared_text(&mut view, 80).to_string();
-            let expected = if summary_races {
-                "BEFORE-TEARDOWN"
-            } else {
-                "AFTER-TEARDOWN"
-            };
-            assert!(copied.contains(expected));
-            if summary_races {
-                assert!(copied.contains("CONCURRENT-SUMMARY"));
-                assert!(!view.message.contains("incomplete"));
-            }
-            assert!(!copied.contains("completion unavailable"));
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
-            terminal
-                .draw(|frame| {
-                    view.render(frame, frame.area(), &Theme::default(), 0, true);
-                })
-                .unwrap();
-            let painted: String = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect();
-            assert!(painted.contains(expected));
-            server.abort();
-            let _ = server.await;
-        }
-    }
-
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn retained_refresh_preserves_content_on_failure_and_replaces_reset_history() {
-        use crate::acp::state::Event;
-        use axum::{middleware, response::IntoResponse};
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let _app = crate::session::test_support::isolate_app_dir();
-        let _discovery = crate::session::test_support::EnvGuard::unset(&[
-            "AOE_DAEMON_URL",
-            "AOE_DAEMON_TOKEN",
-            "AOE_DAEMON_PASSPHRASE",
-        ]);
-        let inst = crate::session::Instance::new("refresh transitions", "/tmp");
-        let id = inst.id.clone();
-        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
-        for seq in 1..=2 {
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    seq,
-                    &Event::AgentMessageChunk {
-                        text: "ORIGINAL-RETAINED\n\n".into(),
-                        message_id: None,
-                    },
-                )
-                .unwrap();
-        }
-        let failing = Arc::new(AtomicBool::new(false));
-        let full_reads = Arc::new(AtomicUsize::new(0));
-        let app = Router::new()
-            .route(
-                "/api/sessions/{id}/acp/replay",
-                get(crate::server::api::acp_replay),
-            )
-            .with_state(state.clone())
-            .layer(middleware::from_fn_with_state(
-                (failing.clone(), full_reads.clone()),
-                |State((failing, full_reads)): State<(Arc<AtomicBool>, Arc<AtomicUsize>)>,
-                 request: axum::extract::Request,
-                 next: middleware::Next| async move {
-                    if failing.load(Ordering::SeqCst) {
-                        StatusCode::SERVICE_UNAVAILABLE.into_response()
-                    } else {
-                        let query = axum::extract::Query::<crate::acp::protocol::ReplayQuery>::try_from_uri(request.uri()).unwrap().0;
-                        if query.since != u64::MAX {
-                            full_reads.fetch_add(1, Ordering::SeqCst);
-                        }
-                        next.run(request).await
-                    }
-                },
-            ));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = DaemonEndpoint::new(
-            format!("http://{}", listener.local_addr().unwrap()),
-            None,
-            crate::daemon::Source::Env,
-        );
-        let _endpoint =
-            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &endpoint.base_url)]);
-        let replacement_app = app.clone();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut view = RetainedView::new(Some(endpoint), &inst);
-        async fn finish(view: &mut RetainedView) -> bool {
-            tokio::time::timeout(Duration::from_secs(5), view.load.as_mut().unwrap())
-                .await
-                .unwrap()
-                .unwrap();
-            view.tick()
-        }
-        async fn refresh(view: &mut RetainedView) -> bool {
-            view.next_read = Instant::now();
-            assert!(
-                !view.tick(),
-                "starting a read must not invalidate selection"
-            );
-            finish(view).await
-        }
-        assert!(finish(&mut view).await);
-        assert!(prepared_text(&mut view, 80)
-            .to_string()
-            .contains("ORIGINAL-RETAINED"));
-        assert!(!view.tick(), "not due");
-        assert!(
-            !refresh(&mut view).await,
-            "unchanged metadata must not invalidate selection"
-        );
-        state.acp_event_store.delete_session(&id);
-        for seq in 1..=2 {
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    seq,
-                    &Event::AgentMessageChunk {
-                        text: "KEEP-ON-ERROR\n\n".into(),
-                        message_id: None,
-                    },
-                )
-                .unwrap();
-        }
-        assert!(
-            refresh(&mut view).await,
-            "same sequence bounds must not hide replacement"
-        );
-        let changed = prepared_text(&mut view, 80).to_string();
-        assert!(changed.contains("KEEP-ON-ERROR"));
-        assert!(!changed.contains("ORIGINAL-RETAINED"));
-        failing.store(true, Ordering::SeqCst);
-        assert!(refresh(&mut view).await);
-        assert!(view.message.contains("503"));
-        assert!(view
-            .rendered_text(80)
-            .unwrap()
-            .to_string()
-            .contains("KEEP-ON-ERROR"));
-        assert!(
-            !refresh(&mut view).await,
-            "identical failure must not redraw"
-        );
-        failing.store(false, Ordering::SeqCst);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let replacement_url = format!("http://{}", listener.local_addr().unwrap());
-        let _replacement =
-            crate::session::test_support::EnvGuard::set(&[("AOE_DAEMON_URL", &replacement_url)]);
-        let replacement = tokio::spawn(async move {
-            axum::serve(listener, replacement_app).await.unwrap();
-        });
-        server.abort();
-        let _ = server.await;
-        state.acp_event_store.delete_session(&id);
-        for seq in 1..=2 {
-            state
-                .acp_event_store
-                .record(
-                    &id,
-                    seq,
-                    &Event::AgentMessageChunk {
-                        text: "REPLACEMENT-CONTENT\n\n".into(),
-                        message_id: None,
-                    },
-                )
-                .unwrap();
-        }
-        assert!(
-            refresh(&mut view).await,
-            "recovery at unchanged watermark must reload"
-        );
-        assert!(!view.message.contains("failed"));
-        assert!(prepared_text(&mut view, 80)
-            .to_string()
-            .contains("REPLACEMENT-CONTENT"));
-        assert!(!prepared_text(&mut view, 80)
-            .to_string()
-            .contains("KEEP-ON-ERROR"));
-        state.acp_event_store.delete_session(&id);
-        assert!(refresh(&mut view).await);
-        assert!(prepared_text(&mut view, 80).lines.is_empty());
-        assert!(view.message.contains("No readable retained ACP content"));
-        state
-            .acp_event_store
-            .record(
-                &id,
-                1,
-                &Event::AgentMessageChunk {
-                    text: "RESET-RETAINED".into(),
-                    message_id: None,
-                },
-            )
-            .unwrap();
-        assert!(refresh(&mut view).await);
-        let text = prepared_text(&mut view, 80).to_string();
-        assert!(text.contains("RESET-RETAINED"));
-        assert!(!text.contains("KEEP-ON-ERROR"));
-        state
-            .acp_event_store
-            .record(
-                &id,
-                3,
-                &Event::AgentMessageChunk {
-                    text: "AFTER-GAP".into(),
-                    message_id: Some("after-gap".into()),
-                },
-            )
-            .unwrap();
-        assert!(refresh(&mut view).await);
-        let previous_reads = full_reads.load(Ordering::SeqCst);
-        for unrelated_write in [false, true] {
-            if unrelated_write {
-                state
-                    .acp_event_store
-                    .record(
-                        "unrelated",
-                        1,
-                        &Event::Stopped {
-                            reason: "done".into(),
-                        },
-                    )
-                    .unwrap();
-            }
-            tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(3600)).await;
-            tokio::time::resume();
-            assert!(!refresh(&mut view).await);
-            assert_eq!(
-                full_reads.load(Ordering::SeqCst),
-                previous_reads,
-                "unchanged retention gaps must not refetch or refold history"
-            );
-        }
-        state
-            .acp_event_store
-            .record(
-                &id,
-                2,
-                &Event::AgentMessageChunk {
-                    text: "BACKFILLED".into(),
-                    message_id: Some("backfill".into()),
-                },
-            )
-            .unwrap();
-        assert!(refresh(&mut view).await);
-        assert!(prepared_text(&mut view, 80)
-            .to_string()
-            .contains("BACKFILLED"));
-        assert_eq!(full_reads.load(Ordering::SeqCst), previous_reads + 1);
-        replacement.abort();
-        let _ = replacement.await;
-    }
-
-    #[tokio::test]
-    async fn obsolete_read_is_cancelled_and_failure_does_not_become_empty_history() {
-        let started = Arc::new(tokio::sync::Notify::new());
-        let app = Router::new()
-            .route(
-                "/api/sessions/{id}/acp/replay",
-                get(
-                    |Path(id): Path<String>,
-                     axum::extract::Query(query): axum::extract::Query<
-                        crate::acp::protocol::ReplayQuery,
-                    >,
-                     State(started): State<Arc<tokio::sync::Notify>>| async move {
-                        use axum::response::IntoResponse;
-                        if id == "obsolete" || (id == "refresh" && query.since == u64::MAX) {
-                            started.notify_one();
-                            std::future::pending::<()>().await;
-                        }
-                        if id == "refresh" {
-                            return axum::Json(serde_json::json!({
-                                "frames": [], "lost": false, "highest_seq": 0,
-                                "lowest_seq": null, "next_cursor": null, "has_more": false,
-                                "history_identity": "refresh-fixture",
-                            }))
-                            .into_response();
-                        }
-                        StatusCode::SERVICE_UNAVAILABLE.into_response()
-                    },
-                ),
-            )
-            .with_state(started.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = DaemonEndpoint::new(
-            format!("http://{}", listener.local_addr().unwrap()),
-            None,
-            crate::daemon::Source::Env,
-        );
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let mut inst = crate::session::Instance::new("retained", "/tmp");
-        inst.trashed_at = Some(chrono::Utc::now());
-        for id in ["obsolete", "refresh"] {
-            inst.id = id.into();
-            let mut obsolete = RetainedView::new(Some(endpoint.clone()), &inst);
-            if id == "refresh" {
-                tokio::time::timeout(Duration::from_secs(5), obsolete.load.as_mut().unwrap())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(obsolete.tick());
-                obsolete.next_read = Instant::now();
-                assert!(!obsolete.tick());
-            }
-            tokio::time::timeout(Duration::from_secs(5), started.notified())
-                .await
-                .unwrap();
-            let task = obsolete.load.as_ref().unwrap().abort_handle();
-            for _ in 0..10 {
-                assert!(!obsolete.tick());
-            }
-            drop(obsolete);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !task.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-        }
-        inst.id = "failed".into();
-        let mut failed = RetainedView::new(Some(endpoint), &inst);
-        tokio::time::timeout(Duration::from_secs(5), failed.load.as_mut().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(failed.tick());
-        assert!(failed.message.contains("503"), "{}", failed.message);
-        assert!(prepared_text(&mut failed, 60).lines.is_empty());
-        server.abort();
-        let _ = server.await;
-    }
-}
+mod retained_tests;

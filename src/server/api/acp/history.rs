@@ -366,6 +366,45 @@ pub async fn acp_replay(
     .into_response()
 }
 
+/// Read retained transcript bytes without preparing a pane or starting a worker.
+pub async fn acp_retained_source(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<crate::acp::protocol::RetainedSourceQuery>,
+) -> Response {
+    use crate::acp::event_store::RetainedSourceRead;
+    use crate::acp::protocol::RETAINED_SOURCE_HEADER;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
+    }
+    let store = Arc::clone(&state.acp_event_store);
+    match tokio::task::spawn_blocking(move || store.retained_source(&id, &query)).await {
+        Ok(Ok(RetainedSourceRead::Changed)) => {
+            (StatusCode::CONFLICT, "retained history changed during read").into_response()
+        }
+        Ok(Ok(RetainedSourceRead::InvalidCursor)) => {
+            (StatusCode::BAD_REQUEST, "invalid retained history cursor").into_response()
+        }
+        Ok(Ok(RetainedSourceRead::Block { meta, bytes })) => {
+            let encoded = match serde_json::to_string(&meta) {
+                Ok(encoded) => encoded,
+                Err(error) => return blocking_failed("retained source metadata failed", error),
+            };
+            let header = match axum::http::HeaderValue::from_str(&encoded) {
+                Ok(header) => header,
+                Err(error) => return blocking_failed("retained source metadata failed", error),
+            };
+            let mut response = bytes.into_response();
+            response
+                .headers_mut()
+                .insert(RETAINED_SOURCE_HEADER, header);
+            response
+        }
+        Ok(Err(error)) => blocking_failed("retained source read failed", error),
+        Err(error) => blocking_failed("blocking task failed", error),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ImportableSessionsQuery {
     pub agent: String,

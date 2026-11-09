@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
+exclude = ["vendor/pulldown-cmark", "vendor/unicode-width"]
 
 [package]
 name = "agent-of-empires"
@@ -8,9 +9,8 @@ edition = "2021"
 rust-version = "1.89"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
-# MIT throughout, except the OSC 8 emission state machine in
-# src/tui/hyperlink.rs, which is derived from herdr under Apache-2.0.
-# See THIRD_PARTY_NOTICES.md.
+# The herdr-derived OSC 8 state machine uses Apache-2.0.
+# See THIRD_PARTY_NOTICES.md for ported and vendored code.
 license = "MIT AND Apache-2.0"
 repository = "https://github.com/agent-of-empires/agent-of-empires"
 keywords = ["tmux", "tui", "ai", "claude", "terminal"]
@@ -24,18 +24,14 @@ clap_complete = "4.6"
 # TUI
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
-ansi-to-tui = "8.0"
 # In-process VT emulator for the default live-preview path (`src/tmux/vt.rs`,
 # opt out with `AOE_VT_LIVE=0`): parse a pane's raw byte stream into an owned
 # grid instead of scraping `capture-pane` snapshots.
 vt100 = "0.18"
 ratatui-textarea = "0.9"
 tui-input = "0.15"
-# Markdown parsing for the structured view transcript. We map events to ratatui
-# Lines ourselves (see src/tui/structured_view/render.rs) so raw markers are
-# stripped and styling tracks the app theme; default-features = false
-# drops the unused HTML renderer.
-pulldown-cmark = { version = "0.13", default-features = false }
+# The pinned fork shares Markdown grammar between memory and disk storage.
+pulldown-cmark = { version = "=0.13.6", default-features = false, features = ["disk"] }
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
@@ -140,7 +136,7 @@ tempfile = "3.14"
 which = "8.0"
 
 # SQLite
-rusqlite = "0.40"
+rusqlite = { version = "0.40", features = ["blob"] }
 
 axum = { version = "0.8", features = ["ws"] }
 # hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
@@ -296,3 +292,7 @@ required-features = ["e2e-tests"]
 [[bin]]
 name = "aoe"
 path = "src/main.rs"
+
+[patch.crates-io]
+pulldown-cmark = { path = "vendor/pulldown-cmark" }
+unicode-width = { path = "vendor/unicode-width" }

@@ -46,24 +46,52 @@ pub struct Todo {
     pub completed: bool,
 }
 
+/// A payload collection whose size is available without loading its contents.
+pub trait PayloadCollection {
+    fn is_empty(&self) -> bool;
+}
+
+impl<T> PayloadCollection for Vec<T> {
+    fn is_empty(&self) -> bool {
+        Vec::is_empty(self)
+    }
+}
+
+impl<T> PayloadCollection for &[T] {
+    fn is_empty(&self) -> bool {
+        (*self).is_empty()
+    }
+}
+
+pub(crate) fn payload_is_empty<T: PayloadCollection>(value: &T) -> bool {
+    value.is_empty()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
+#[serde(bound(
+    deserialize = "Text: Deserialize<'de> + Default, Recall: Deserialize<'de>, Diffs: Deserialize<'de> + Default"
+))]
+pub struct ToolCall<
+    Text = String,
+    Recall = MemoryRecall,
+    Diffs: PayloadCollection = Vec<DiffPreview>,
+> {
+    pub id: Text,
+    pub name: Text,
     /// ACP `ToolKind`, lowercased.
     #[serde(default)]
-    pub kind: String,
+    pub kind: Text,
     /// Capped at 16 KB at ingest, control chars stripped.
-    pub args_preview: String,
+    pub args_preview: Text,
     pub started_at: DateTime<Utc>,
     /// The sub-agent `Task` call this call runs under, from `_meta.claudeCode.parentToolUseId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_tool_call_id: Option<String>,
+    pub parent_tool_call_id: Option<Text>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_recall: Option<MemoryRecall>,
+    pub memory_recall: Option<Recall>,
     /// File diffs attached via ACP `ToolCallContent::Diff`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub diffs: Vec<DiffPreview>,
+    #[serde(default, skip_serializing_if = "payload_is_empty")]
+    pub diffs: Diffs,
 }
 
 /// Structured payload for a `memory_recall` tool call.

@@ -9,6 +9,12 @@ pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
+
+pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    std::iter::once(("pbcopy", &[] as &'static [&'static str]))
+}
+
 /// Prove only the absence of the Linux scope backend on this kernel.
 /// Native process, worker and tmux custody must still pass their own guards.
 pub(super) fn legacy_scope_inventory_clear(

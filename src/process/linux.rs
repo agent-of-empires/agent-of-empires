@@ -12,6 +12,17 @@ pub(super) use super::unix::{
     restore_environment_value, terminate_process_group, try_wait_status_hook,
 };
 
+pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    std::env::var_os("WAYLAND_DISPLAY")
+        .map(|_| ("wl-copy", &[] as &'static [&'static str]))
+        .into_iter()
+        .chain([
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ])
+}
+
 struct LegacyRuntimeDirectories {
     run: std::os::fd::OwnedFd,
     user: Option<std::os::fd::OwnedFd>,

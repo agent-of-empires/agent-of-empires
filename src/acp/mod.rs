@@ -25,6 +25,7 @@ pub mod node;
 pub mod option_catalog;
 pub mod permissions;
 pub mod protocol;
+pub(crate) mod retained;
 pub mod runner_lifecycle;
 pub mod sandbox;
 pub mod session_listing;

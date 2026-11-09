@@ -5,6 +5,7 @@ pub(crate) mod identity;
 mod rate_limit;
 mod replay;
 mod search;
+mod source;
 mod turns;
 mod wakeups;
 
@@ -22,6 +23,7 @@ pub use attachments::AttachmentBlob;
 pub use rate_limit::RateLimitPark;
 pub use replay::ReplayPage;
 pub use search::ContentHit;
+pub(crate) use source::RetainedSourceRead;
 pub use turns::{TerminalRepairProbe, UnresolvedBackgroundAgentLaunch};
 
 /// Lifecycle and metadata events that do not count as session activity. All

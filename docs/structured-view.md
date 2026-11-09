@@ -163,7 +163,9 @@ regardless of the session's current view or click preference.
 
 Scroll with the mouse wheel. Without reader focus, use **Earlier/Later** in the
 footer or **Shift+PageUp/PageDown**. Press **Enter** to focus the reader and use
-**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
+**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it,
+including a selection scrolled out of view. Press **y** in the focused reader
+to copy the complete rendered transcript without loading it into memory.
 **Esc** returns to the session list. Restore and permanent deletion remain
 separate management actions shown in the footer.
 
@@ -178,6 +180,16 @@ placeholders.
 Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
+Thoughts are shown in full rather than the active view's one-line preview.
+
+Large histories are processed off the UI thread and stored in temporary files.
+Only visible text and fixed-size caches stay in memory; an unusually large
+visible grapheme still needs its full bytes. A first visit at a new width may
+show preparation in progress. Scrolling and copy can revisit evicted windows;
+there is no transcript-size or application clipboard-size cutoff.
+Desktop clipboard helpers and terminal OSC 52 support can impose their own
+limits. An OSC 52 write confirms emission, not clipboard acceptance.
+
 
 The reader refreshes available content automatically, including replacements or
 backfills that leave sequence bounds unchanged, and preserves focus and scroll

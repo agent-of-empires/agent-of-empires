@@ -1277,6 +1277,35 @@ impl HomeView {
         matches!(self.drag_state, Some(DragKind::PreviewSelect))
     }
 
+    pub(super) fn request_retained_selection_copy(&mut self) -> bool {
+        let matching = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| {
+                inst.is_trashed()
+                    && self
+                        .retained_preview
+                        .as_ref()
+                        .is_some_and(|view| view.matches(inst))
+            });
+        if !matching {
+            return false;
+        }
+        self.preview_copy_text = None;
+        if let Some(selection) = self.preview_selection {
+            let (start, end) = selection.ordered_abs(self.preview_text_view);
+            self.retained_preview.as_mut().unwrap().copy_selection(
+                self.preview_text_view.pane.width,
+                crate::tui::rich_text::window::Selection {
+                    start: (start.0, start.1 as u64),
+                    end: (end.0, end.1 as u64),
+                },
+            );
+        }
+        true
+    }
+
     /// Join the text under the current preview selection into a tmux-style flow string,
     /// called from `paint_preview_selection` on the render after `handle_drag_end`.
     ///
@@ -1292,30 +1321,22 @@ impl HomeView {
         if width == 0 || view.total_lines == 0 {
             return None;
         }
-        // Retained copy borrows the painted projection; live previews rebuild their line source.
-        let retained = self
+        if self
             .selected_session
             .as_deref()
             .and_then(|id| self.get_instance(id))
-            .filter(|inst| inst.is_trashed());
-        let structured_lines = if retained.is_none() {
-            self.structured_preview
-                .as_ref()
-                .filter(|_| self.structured_transcript_painted)
-                .map(|view| view.selection_text(width))
-        } else {
-            None
-        };
-        let lines = if let Some(inst) = retained {
-            self.retained_preview
-                .as_ref()
-                .filter(|view| view.matches(inst))?
-                .rendered_text(width)?
-        } else {
-            match structured_lines.as_ref() {
-                Some(text) => text,
-                None => self.active_preview_cache().parsed_text.as_ref()?,
-            }
+            .is_some_and(|inst| inst.is_trashed())
+        {
+            return None;
+        }
+        let structured_lines = self
+            .structured_preview
+            .as_ref()
+            .filter(|_| self.structured_transcript_painted)
+            .map(|view| view.selection_text(width));
+        let lines = match structured_lines.as_ref() {
+            Some(text) => text,
+            None => self.active_preview_cache().parsed_text.as_ref()?,
         };
         // Resolve `from_bottom` distances against the same `total_lines` the renderer used
         // this frame, so the copied range matches the painted highlight cell for cell.
@@ -1359,15 +1380,15 @@ impl HomeView {
     /// highlight. True when state changed, so the caller can redraw.
     pub fn clear_preview_selection(&mut self) -> bool {
         if self.preview_selection.take().is_some() {
-            // Cancel any in-progress drag too, so the next Up(Left) can't re-finalize a
-            // stale selection and the edge auto-scroll stops chasing a cleared one.
+            if let Some(view) = self.retained_preview.as_mut() {
+                view.cancel_copy();
+            }
+            // A stale mouse release must not restart a cleared selection.
             if matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
                 self.drag_state = None;
             }
             self.preview_drag_pos = None;
             self.preview_autoscroll_at = None;
-            // A pending capture from an earlier finalized drag is moot once the selection
-            // is gone.
             self.preview_copy_pending = false;
             self.preview_copy_text = None;
             true
@@ -2228,6 +2249,11 @@ impl HomeView {
                 }
                 KeyCode::Home => self.retained_scroll_offset = usize::MAX,
                 KeyCode::End => self.retained_scroll_offset = 0,
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    if let Some(view) = self.retained_preview.as_mut() {
+                        view.copy_all();
+                    }
+                }
                 _ => {}
             }
             return None;

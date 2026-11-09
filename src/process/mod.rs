@@ -76,6 +76,18 @@ mod platform {
 pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> (u64, u64) {
     platform::metadata_identity(metadata)
 }
+
+pub(crate) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::clipboard_commands()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::iter::empty()
+    }
+}
 pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {

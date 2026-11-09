@@ -107,6 +107,19 @@ than tool start order. Replacement snapshots keep that order. Turn endings move
 orphan snapshots into read-only history without inventing stopped rows or feeding
 that output into subsequent tool invocations.
 
+The native retained reader has no interactive view state. Its authenticated
+`GET /api/sessions/{id}/acp/retained-source` reads at most 64 KiB from one
+persisted event per response, with byte offsets pinned to the event-store
+incarnation and session revision. Non-timeline metadata is withheld. Identity
+probes do not refold unchanged histories.
+
+The shared reducer stores retained payloads and indexes on disk. Markdown,
+ANSI, grapheme widths, and wrapping share their semantics with the live renderer.
+A cancellable background reader owns temporary files, rich logical lines and
+two disk-backed width indexes; the UI receives only the latest visible window.
+RAM grows with visible grapheme bytes, not total history. Copy streams from the
+disk projection after eviction and rechecks source identity before publication.
+
 Raw event frames still stream for what the daemon does not model (worker lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts). A client reading only the projections passes `?frames=0`, as the native view does. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or an auto-resume; the native view renders it inline while the web shows the same information as a dismissible banner.
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.

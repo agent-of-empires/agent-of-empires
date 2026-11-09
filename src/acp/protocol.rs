@@ -231,6 +231,34 @@ pub struct ReplayResponse {
     pub history_identity: Option<String>,
 }
 
+pub(crate) const RETAINED_SOURCE_BLOCK_BYTES: usize = 64 * 1024;
+pub(crate) const RETAINED_SOURCE_HEADER: &str = "aoe-retained-source";
+
+/// Byte cursor for a pinned retained transcript, independent of event size.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct RetainedSourceQuery {
+    #[serde(default)]
+    pub after: u64,
+    pub seq: Option<u64>,
+    #[serde(default)]
+    pub offset: u64,
+    pub history_identity: Option<String>,
+}
+
+/// Metadata accompanying one binary retained-source block.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RetainedSourceMeta {
+    pub history_identity: String,
+    pub highest_seq: u64,
+    pub lowest_seq: Option<u64>,
+    pub seq: Option<u64>,
+    pub total_bytes: u64,
+    pub offset: u64,
+    /// Metadata-only events have no transcript payload on this endpoint.
+    pub omitted: bool,
+    pub invalid: bool,
+}
+
 /// `GET /api/sessions/{id}/acp/files` response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FilesResponse {

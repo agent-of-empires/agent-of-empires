@@ -9,6 +9,7 @@ pub mod mention;
 pub mod queue;
 pub mod reducer;
 pub mod render;
+mod retained;
 pub mod slash;
 pub mod state;
 

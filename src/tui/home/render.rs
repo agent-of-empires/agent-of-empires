@@ -3861,7 +3861,9 @@ impl HomeView {
         let capture = self.preview_copy_pending;
         if capture {
             self.preview_copy_pending = false;
-            self.preview_copy_text = self.extract_preview_selection_text();
+            if !self.request_retained_selection_copy() {
+                self.preview_copy_text = self.extract_preview_selection_text();
+            }
         }
         if segments.is_empty() {
             return;
@@ -4107,12 +4109,12 @@ impl HomeView {
             if changed || previous_text_area != geometry.text_area {
                 self.clear_preview_selection();
             }
-            if geometry.total_lines > 0 {
-                self.retained_scroll_offset = self.retained_scroll_offset.min(
-                    geometry
-                        .total_lines
-                        .saturating_sub(geometry.text_area.height as usize),
-                );
+            if let Some(offset) = self
+                .retained_preview
+                .as_ref()
+                .and_then(|view| view.effective_offset())
+            {
+                self.retained_scroll_offset = offset;
             }
             self.preview_pane_area = geometry.text_area;
             self.preview_visible_rows = geometry.text_area.height as usize;

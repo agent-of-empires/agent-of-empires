@@ -2526,9 +2526,6 @@ impl App {
                 .retained_preview
                 .as_mut()
                 .is_some_and(|view| view.tick());
-            if changed {
-                self.home.clear_preview_selection();
-            }
             return changed || !matches;
         }
         let removed_retained = self.home.retained_preview.take().is_some();
@@ -3792,7 +3789,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn retained_refresh_discards_captured_selection_without_resetting_reader() {
+    async fn retained_reflow_and_refresh_clear_selection_without_resetting_reader() {
         use crate::acp::state::Event as AcpEvent;
         use axum::{routing::get, Router};
         let temp = tempfile::tempdir().unwrap();
@@ -3824,8 +3821,8 @@ mod tests {
             .unwrap();
         let router = Router::new()
             .route(
-                "/api/sessions/{id}/acp/replay",
-                get(crate::server::api::acp_replay),
+                "/api/sessions/{id}/acp/retained-source",
+                get(crate::server::api::acp_retained_source),
             )
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3856,79 +3853,87 @@ mod tests {
         ));
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
         let theme = crate::tui::styles::Theme::default();
-        let mut ticker = tokio::time::interval(Duration::from_millis(10));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                ticker.tick().await;
-                app.reconcile_structured_preview().await;
-                terminal
-                    .draw(|frame| {
-                        app.home
-                            .render(frame, frame.area(), &theme, None, None, None);
-                    })
-                    .unwrap();
-                if app
-                    .home
-                    .retained_preview
-                    .as_ref()
-                    .unwrap()
-                    .rendered_text(app.home.preview_text_view.pane.width)
-                    .is_some_and(|text| text.to_string().contains("OLD-RETAINED"))
-                {
-                    break;
+        fn painted(terminal: &Terminal<ratatui::backend::TestBackend>) -> String {
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect()
+        }
+        async fn settle(
+            app: &mut App,
+            terminal: &mut Terminal<ratatui::backend::TestBackend>,
+            theme: &crate::tui::styles::Theme,
+            predicate: impl Fn(&App, &str) -> bool,
+        ) {
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            tokio::time::timeout(Duration::from_secs(12), async {
+                loop {
+                    ticker.tick().await;
+                    app.reconcile_structured_preview().await;
+                    terminal
+                        .draw(|frame| {
+                            app.home
+                                .render(frame, frame.area(), theme, None, None, None);
+                        })
+                        .unwrap();
+                    if app
+                        .home
+                        .retained_preview
+                        .as_ref()
+                        .and_then(|view| view.effective_offset())
+                        .is_some()
+                        && predicate(app, &painted(terminal))
+                    {
+                        break;
+                    }
                 }
-            }
+            })
+            .await
+            .unwrap();
+        }
+        fn select(app: &mut App, terminal: &Terminal<ratatui::backend::TestBackend>) {
+            let pane = app.home.preview_text_view.pane;
+            let (x, y) = (pane.y..pane.bottom())
+                .find_map(|y| {
+                    let line: String = (pane.x..pane.right())
+                        .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                        .collect();
+                    line.find("OLD-RETAINED").map(|byte| {
+                        (
+                            pane.x + unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16,
+                            y,
+                        )
+                    })
+                })
+                .expect("retained content must be painted before selecting");
+            assert!(app.home.handle_drag_start(x, y));
+            assert!(app.home.handle_drag_move(x + 8, y));
+        }
+        settle(&mut app, &mut terminal, &theme, |_, text| {
+            text.contains("OLD-RETAINED")
         })
-        .await
-        .unwrap();
+        .await;
         app.home.retained_focus = Some((id.clone(), inst.lifecycle_generation));
         app.home.retained_scroll_offset = 7;
-        terminal
-            .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
-            })
-            .unwrap();
-        let pane = app.home.preview_text_view.pane;
-        let (x, y) = (pane.y..pane.bottom())
-            .find_map(|y| {
-                let line: String = (pane.x..pane.right())
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect();
-                line.find("OLD-RETAINED").map(|byte| {
-                    (
-                        pane.x + unicode_width::UnicodeWidthStr::width(&line[..byte]) as u16,
-                        y,
-                    )
-                })
-            })
-            .expect("retained text must be painted before selecting it");
-        assert!(app.home.handle_drag_start(x, y));
-        assert!(app.home.handle_drag_move(x + 8, y));
-        app.home.handle_drag_end();
-        terminal
-            .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
-            })
-            .unwrap();
-        assert!(app
-            .home
-            .preview_copy_text
-            .as_ref()
-            .is_some_and(|text| text.contains("OLD")));
-        terminal
-            .draw(|frame| {
-                app.home
-                    .render(frame, frame.area(), &theme, None, None, None);
-            })
-            .unwrap();
-        assert!(
-            app.home.preview_selection.is_some(),
-            "unchanged repaint keeps selection"
-        );
-        assert!(app.home.preview_copy_text.is_some());
+        settle(&mut app, &mut terminal, &theme, |app, text| {
+            app.home.retained_scroll_offset == 7 && text.contains("OLD-RETAINED")
+        })
+        .await;
         for resize in [false, true] {
+            select(&mut app, &terminal);
+            terminal
+                .draw(|frame| {
+                    app.home
+                        .render(frame, frame.area(), &theme, None, None, None);
+                })
+                .unwrap();
+            assert!(
+                app.home.preview_selection.is_some(),
+                "unchanged repaint keeps selection"
+            );
             let changed_theme = crate::tui::styles::Theme {
                 text: ratatui::style::Color::Yellow,
                 ..theme.clone()
@@ -3951,32 +3956,16 @@ mod tests {
                 })
                 .unwrap();
             assert!(app.home.preview_selection.is_none());
-            assert!(!app.home.preview_copy_pending);
-            assert!(app.home.take_preview_copy_text().is_none());
             assert!(app.home.retained_reader_focused());
             assert_eq!(app.home.retained_scroll_offset, 7);
             terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
-            terminal
-                .draw(|frame| {
-                    app.home
-                        .render(frame, frame.area(), &theme, None, None, None);
-                })
-                .unwrap();
-            assert!(app.home.handle_drag_start(x, y));
-            assert!(app.home.handle_drag_move(x + 8, y));
-            app.home.handle_drag_end();
-            terminal
-                .draw(|frame| {
-                    app.home
-                        .render(frame, frame.area(), &theme, None, None, None);
-                })
-                .unwrap();
-            assert!(app
-                .home
-                .preview_copy_text
-                .as_ref()
-                .is_some_and(|text| text.contains("OLD")));
+            settle(&mut app, &mut terminal, &theme, |_, text| {
+                text.contains("OLD-RETAINED")
+            })
+            .await;
         }
+        select(&mut app, &terminal);
+        let previous_lines = app.home.preview_text_view.total_lines;
         state
             .acp_event_store
             .record(
@@ -3988,35 +3977,19 @@ mod tests {
                 },
             )
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(8), async {
-            loop {
-                ticker.tick().await;
-                app.reconcile_structured_preview().await;
-                terminal
-                    .draw(|frame| {
-                        app.home
-                            .render(frame, frame.area(), &theme, None, None, None);
-                    })
-                    .unwrap();
-                if app
-                    .home
-                    .retained_preview
-                    .as_ref()
-                    .unwrap()
-                    .rendered_text(app.home.preview_text_view.pane.width)
-                    .is_some_and(|text| text.to_string().contains("NEW-RETAINED"))
-                {
-                    break;
-                }
-            }
+        settle(&mut app, &mut terminal, &theme, |app, _| {
+            app.home.preview_text_view.total_lines > previous_lines
+                && app.home.preview_selection.is_none()
         })
-        .await
-        .unwrap();
-        assert!(app.home.preview_selection.is_none());
-        assert!(!app.home.preview_copy_pending);
-        assert!(app.home.take_preview_copy_text().is_none());
+        .await;
         assert!(app.home.retained_reader_focused());
         assert_eq!(app.home.retained_scroll_offset, 7);
+        app.home.retained_scroll_offset = 0;
+        settle(&mut app, &mut terminal, &theme, |_, text| {
+            text.contains("NEW-RETAINED")
+        })
+        .await;
+        drop(app);
         server.abort();
         let _ = server.await;
     }
