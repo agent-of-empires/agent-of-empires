@@ -102,7 +102,8 @@ pub struct AgentInfo {
     /// Whether a non-sandboxed structured create in the requested profile, and in the requested
     /// project when given, will accept this agent: the adapter resolves, or an
     /// `on_create`/`on_launch` hook may install it first (the profile's, or the project
-    /// repository's while its trust isn't declined).
+    /// repository's while its trust isn't declined). The repository's `agent_detect_as` can
+    /// make this true for an agent that isn't `acp_capable`.
     pub acp_create_ready: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
@@ -369,9 +370,12 @@ pub async fn list_agents(
             Some(path) => preparation_hooks_apply(&config.hooks, path, false, None),
             None => preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None),
         };
-        for agent in agents.iter_mut().filter(|a| a.acp_capable) {
-            agent.acp_installed =
-                adapter_installed(&agent.name, &config, &host_environment, &|| false);
+        for agent in agents.iter_mut() {
+            if agent.acp_capable {
+                agent.acp_installed =
+                    adapter_installed(&agent.name, &config, &host_environment, &|| false);
+            }
+            // Every row, since the repository may give a profile-terminal agent an ACP base.
             agent.acp_create_ready = adapter_installed(
                 &agent.name,
                 create_config.as_ref().unwrap_or(&config),
@@ -3874,7 +3878,7 @@ mod tests {
         std::fs::create_dir_all(realiased.path().join(".agent-of-empires")).unwrap();
         std::fs::write(
             realiased.path().join(".agent-of-empires/config.toml"),
-            "[session.agent_detect_as]\nrepo-loses = \"cursor\"\nrepo-gains = \"vibe\"\n",
+            "[session.agent_detect_as]\nrepo-loses = \"cursor\"\nrepo-gains = \"vibe\"\nterminal = \"vibe\"\n",
         )
         .unwrap();
         let awaiting = repo_with_on_launch();
@@ -3897,10 +3901,20 @@ mod tests {
         )
         .unwrap();
         // (label, profile on_create hook, CityHall, project, scratch, then create-ready for
-        // `missing`, `repo-loses` and `repo-gains`). The profile hook persists once set, so its
-        // case comes last.
+        // `missing`, `repo-loses`, `repo-gains` and the profile-terminal `terminal`). The profile
+        // hook persists once set, so its case comes last.
         let cases = [
-            ("no project", false, false, None, false, false, true, false),
+            (
+                "no project",
+                false,
+                false,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false,
+            ),
             (
                 "no hooks",
                 false,
@@ -3909,6 +3923,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 false,
             ),
             (
@@ -3920,6 +3935,7 @@ mod tests {
                 true,
                 true,
                 true,
+                false,
             ),
             (
                 "repo hook awaiting trust",
@@ -3930,6 +3946,7 @@ mod tests {
                 true,
                 true,
                 true,
+                false,
             ),
             (
                 "scratch with a repo hook",
@@ -3939,6 +3956,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 false,
             ),
             (
@@ -3950,6 +3968,7 @@ mod tests {
                 false,
                 false,
                 true,
+                true,
             ),
             (
                 "CityHall ignores the caller's path",
@@ -3960,6 +3979,7 @@ mod tests {
                 true,
                 true,
                 true,
+                false,
             ),
             (
                 "CityHall ignores scratch",
@@ -3970,10 +3990,23 @@ mod tests {
                 true,
                 true,
                 true,
+                false,
             ),
-            ("profile hook", true, false, None, false, true, true, true),
+            (
+                "profile hook",
+                true,
+                false,
+                None,
+                false,
+                true,
+                true,
+                true,
+                false,
+            ),
         ];
-        for (label, profile_hook, cityhall, project, scratch, missing, loses, gains) in cases {
+        for (label, profile_hook, cityhall, project, scratch, missing, loses, gains, terminal) in
+            cases
+        {
             if profile_hook {
                 crate::session::config::update_config(|config| {
                     config.hooks.on_create = vec!["npm install".into()];
@@ -3997,7 +4030,7 @@ mod tests {
             for (name, installed, create_ready) in [
                 ("on-path", true, true),
                 ("missing", false, missing),
-                ("terminal", false, false),
+                ("terminal", false, terminal),
                 ("repo-loses", true, loses),
                 ("repo-gains", false, gains),
             ] {
@@ -4009,6 +4042,11 @@ mod tests {
                 );
                 assert_eq!(agent.display_name, name);
             }
+            let terminal_agent = agents.iter().find(|a| a.name == "terminal").unwrap();
+            assert!(
+                !terminal_agent.acp_capable,
+                "{label}: capability stays profile-only"
+            );
             let claude = agents.iter().find(|a| a.name == "claude").unwrap();
             assert_eq!(claude.display_name, "Claude Code");
         }
