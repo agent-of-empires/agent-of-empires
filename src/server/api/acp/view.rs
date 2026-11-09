@@ -2919,7 +2919,7 @@ mod tests {
             "tmux is required"
         );
         let real_tmux = which::which("tmux")?;
-        let root = tempfile::tempdir()?;
+        let root = tempfile::TempDir::with_prefix_in("aoe-", "/tmp")?;
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
         let _environment = crate::session::test_support::EnvGuard::unset(&[
             "HOME",
