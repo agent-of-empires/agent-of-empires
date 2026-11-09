@@ -2910,6 +2910,10 @@ mod tests {
     async fn unproven_terminal_birth_at_recovery(
         recovery: Option<HandoffRecovery>,
     ) -> anyhow::Result<()> {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment()?;
+            return Ok(());
+        }
         use std::os::unix::fs::PermissionsExt;
         anyhow::ensure!(
             crate::tmux::test_helpers::tmux_available(),
@@ -2918,6 +2922,20 @@ mod tests {
         let real_tmux = which::which("tmux")?;
         let root = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let entry = match recovery.as_ref() {
+            None => concat!(module_path!(), "::unproven_terminal_birth_keeps_handoff_and_projection"),
+            Some(HandoffRecovery::Maintenance) => concat!(module_path!(), "::unproven_terminal_birth_stays_pending_during_maintenance"),
+            Some(HandoffRecovery::Startup) => concat!(module_path!(), "::unproven_terminal_birth_stays_pending_after_app_state_reconstruction"),
+        };
+        let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(root.path(), entry);
+        let _environment = crate::session::test_support::EnvGuard::unset(&[
+            "HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR",
+        ]).and_set("HOME", root.path()).and_set("XDG_CONFIG_HOME", root.path().join(".config"))
+            .and_set("CLAUDE_CONFIG_DIR", root.path().join(".claude"));
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(), "claude",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+        );
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
         })?;
@@ -2926,7 +2944,7 @@ mod tests {
             config.session.agent_status_hooks = false;
             config.session.smart_rename = false;
         })?;
-        let bin = root.path().join("bin");
+        let bin = root.path().join("tmux-bin");
         std::fs::create_dir(&bin)?;
         let shim = bin.join("tmux");
         let quote = crate::session::environment::shell_escape_script_word;
@@ -2939,7 +2957,7 @@ mod tests {
         let mut source = Instance::new("unproven-terminal-handoff", root.path().to_str().unwrap());
         source.source_profile = "default".into();
         source.view = View::Structured;
-        source.command = "sleep 60".into();
+        source.command = "claude".into();
         let name = crate::tmux::Session::generate_name(&source.id, &source.title);
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
         let events = Arc::new(crate::acp::event_store::EventStore::open(

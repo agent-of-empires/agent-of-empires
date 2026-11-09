@@ -1189,7 +1189,7 @@ mod tests {
         prior.status = Status::Starting;
         prior.sandbox_info = Some(test_sandbox(
             "boot-store-contention",
-            Some("/workspace/boot-store-contention"),
+            None,
         ));
         admit_sandbox_fixture(&prior);
         let store = prior.sandbox_capture_store_dir().unwrap();

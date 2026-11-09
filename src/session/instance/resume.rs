@@ -2409,6 +2409,10 @@ mod tests {
     #[test]
     #[serial]
     fn public_ensure_refuses_unknown_observation_after_a_real_launch() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
         use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
         use crate::tmux::test_helpers::{only_pane_id, pane_field};
         use std::cell::RefCell;
@@ -2421,6 +2425,12 @@ mod tests {
             let root = tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
             let _env = isolate_resume_environment(root.path());
+            let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+                root.path(),
+                concat!(module_path!(), "::public_ensure_refuses_unknown_observation_after_a_real_launch"),
+            );
+            let _agent = install_fake_claude(root.path(),
+                "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n");
             crate::session::config::update_config(|config| {
                 config.systemd.enabled = false;
                 config.session.agent_status_hooks = false;
@@ -2428,8 +2438,8 @@ mod tests {
             })
             .unwrap();
             let mut instance = Instance::new("post-launch-unknown", root.path().to_str().unwrap());
-            instance.tool = "bash".into();
-            instance.command = "sleep 60".into();
+            instance.tool = "claude".into();
+            instance.command = "claude".into();
             instance.source_profile = "post-launch-unknown".into();
             let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
             storage
@@ -2442,7 +2452,7 @@ mod tests {
             let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
             let _corpse = dead.then(|| observed_dead_resume_fixture(&instance));
             let blocked = root.path().join("post-finalization-query-failure");
-            let bin = root.path().join("bin");
+            let bin = root.path().join("tmux-bin");
             std::fs::create_dir(&bin).unwrap();
             let shim = bin.join("tmux");
             let quote = crate::session::environment::shell_escape_script_word;
