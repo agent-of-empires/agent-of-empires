@@ -44,7 +44,6 @@ impl Instance {
         // Runtime custody follows the same held conversation rules as a disk reload.
         let prior = std::mem::replace(self, disk);
         self.inherit_runtime(prior, preserve_errors);
-
     }
 
     /// Flush the previous pane's publication before its source is retired.

@@ -106,8 +106,8 @@ pub use instance::{
 };
 pub(crate) use instance::{
     ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
-    NativeInputError, NativeInputFence, NativeStartAdmission, ResumeAttemptPolicy, ResumeLaunchOptions,
-    TerminalContextResume,
+    NativeInputError, NativeInputFence, NativeStartAdmission, ResumeAttemptPolicy,
+    ResumeLaunchOptions, TerminalContextResume,
 };
 pub use instance::{
     ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,

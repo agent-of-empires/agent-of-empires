@@ -262,7 +262,6 @@ impl NativeStartAdmission {
         anyhow::ensure!(unchanged, LaunchIndeterminateCause::OwnershipUnproven);
         Ok(())
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -668,19 +667,24 @@ impl Instance {
             }
         };
         if live_observed
-            || revival.as_ref().is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Alive)
+            || revival
+                .as_ref()
+                .is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Alive)
         {
-                return Ok(match self.positive_pane_readiness() {
-                    Ok(true) => StartOutcome::Fresh,
-                    Ok(false) => StartOutcome::Indeterminate {
-                        cause: LaunchIndeterminateCause::StabilizationExpired,
-                    },
-                    Err(_) => StartOutcome::Indeterminate {
-                        cause: LaunchIndeterminateCause::ObservationFailed,
-                    },
-                });
+            return Ok(match self.positive_pane_readiness() {
+                Ok(true) => StartOutcome::Fresh,
+                Ok(false) => StartOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                Err(_) => StartOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::ObservationFailed,
+                },
+            });
         }
-        if revival.as_ref().is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Dead) {
+        if revival
+            .as_ref()
+            .is_some_and(|target| target.state == crate::tmux::utils::PaneProbe::Dead)
+        {
             options.restart = true;
         }
         if options.restart && self.status == Status::Error {
@@ -945,10 +949,7 @@ impl Instance {
                     .as_ref()
                     .map(|(probe, prior)| (Some(probe), Some(prior)))
                     .unwrap_or((None, None));
-                self.fail_reserved_launch(
-                    storage,
-                    generation,
-                    &error, probe, prior);
+                self.fail_reserved_launch(storage, generation, &error, probe, prior);
                 return Err(error);
             }
         };
@@ -1032,36 +1033,36 @@ impl Instance {
             );
         }
         if let Some(carry) = conversation_carry {
-        self.absorb_published_prime_session(publication);
-        // Only the default conversation may be refreshed from a final
-        // observation: under Use/Fork/Cleared the launch names a specific
-        // conversation, and an outgoing sidecar must not rebind it
-        // (launch_command's preparation applies the same gate).
-        if matches!(self.resume_intent, ResumeIntent::Default) {
-            if let Some(observation) =
-                self.capture_freshest_conversation_in(CaptureStorage::Scoped(storage))
-            {
-                self.apply_conversation_observation(&observation);
+            self.absorb_published_prime_session(publication);
+            // Only the default conversation may be refreshed from a final
+            // observation: under Use/Fork/Cleared the launch names a specific
+            // conversation, and an outgoing sidecar must not rebind it
+            // (launch_command's preparation applies the same gate).
+            if matches!(self.resume_intent, ResumeIntent::Default) {
+                if let Some(observation) =
+                    self.capture_freshest_conversation_in(CaptureStorage::Scoped(storage))
+                {
+                    self.apply_conversation_observation(&observation);
+                }
             }
-        }
-        let original = self.agent_session_binding.clone();
-        let relocated = match carry.run_for(self) {
-            Ok(relocated) => relocated,
-            Err(error) => {
-                self.adopt_conversation_state(expected);
-                return Err(error);
+            let original = self.agent_session_binding.clone();
+            let relocated = match carry.run_for(self) {
+                Ok(relocated) => relocated,
+                Err(error) => {
+                    self.adopt_conversation_state(expected);
+                    return Err(error);
+                }
+            };
+            let excluded = original
+                .filter(|binding| self.retroactive_capture_excludes.insert(binding.clone()));
+            let mut prepared =
+                self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected)?;
+            if let Some(binding) = excluded {
+                self.retroactive_capture_excludes.remove(&binding);
             }
-        };
-        let excluded = original
-            .filter(|binding| self.retroactive_capture_excludes.insert(binding.clone()));
-        let mut prepared =
-            self.prepare_launch_command_in(CaptureStorage::Scoped(storage), expected)?;
-        if let Some(binding) = excluded {
-            self.retroactive_capture_excludes.remove(&binding);
+            prepared.require_conversation_publication |= relocated;
+            return Ok(prepared);
         }
-        prepared.require_conversation_publication |= relocated;
-        return Ok(prepared);
-    }
         let stores = CaptureStorage::Scoped(storage);
         let prepared = self.prepare_launch_command_in(stores, expected)?;
         if retiring {
@@ -1218,22 +1219,22 @@ impl Instance {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         #[cfg(test)]
         let deadline = tests::probe_deadline(deadline);
-        let state =
-            match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline) {
-                Ok(Some(crate::tmux::utils::OwnedPaneProbe {
-                    state:
-                        state @ (crate::tmux::utils::PaneProbe::Dead
-                        | crate::tmux::utils::PaneProbe::Missing),
-                    exclusive: true,
-                    ..
-                })) => state,
-                Ok(_) => {
-                    return Ok(ProbeResult::Indeterminate(
-                        LaunchIndeterminateCause::OwnershipUnproven,
-                    ))
-                }
-                Err(error) => return Ok(self.indeterminate_probe(error)),
-            };
+        let state = match crate::tmux::utils::probe_owned_pane(&probe.tmux_session, pane, &deadline)
+        {
+            Ok(Some(crate::tmux::utils::OwnedPaneProbe {
+                state:
+                    state @ (crate::tmux::utils::PaneProbe::Dead
+                    | crate::tmux::utils::PaneProbe::Missing),
+                exclusive: true,
+                ..
+            })) => state,
+            Ok(_) => {
+                return Ok(ProbeResult::Indeterminate(
+                    LaunchIndeterminateCause::OwnershipUnproven,
+                ))
+            }
+            Err(error) => return Ok(self.indeterminate_probe(error)),
+        };
         if let Err(cause) = self.fence_launch_probe(storage, generation, probe) {
             return Ok(ProbeResult::Indeterminate(cause));
         }

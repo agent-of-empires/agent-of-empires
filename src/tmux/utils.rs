@@ -1811,9 +1811,7 @@ mod tests {
             .unwrap();
         wait_for_pane_dead(&pane);
         let OwnedPaneProbe {
-            state,
-            exclusive,
-            ..
+            state, exclusive, ..
         } = probe_owned_pane(
             guard.name(),
             &born,

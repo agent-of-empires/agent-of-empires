@@ -3462,7 +3462,9 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((reservation, started, native, hooks, carry, _)))) if started.is_structured() => {
+        Ok(Ok(Some((reservation, started, native, hooks, carry, _))))
+            if started.is_structured() =>
+        {
             return finish_structured_restart(
                 &state,
                 &id,
