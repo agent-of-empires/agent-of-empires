@@ -1195,7 +1195,7 @@ fn trash_retained_transcript_is_read_only() {
         .unwrap() as u16
         + 1;
     h.send_mouse_click(0, 7, row);
-    h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
+    h.wait_for_timeout("CONCURRENT-TEARDOWN-SUMMARY", replay_timeout);
     h.run_cli_ok(&["rm", &id, "--purge"]);
     h.wait_for_absent("TrashRetained", Duration::from_secs(5));
     h.wait_for_absent("CONCURRENT-TEARDOWN-SUMMARY", Duration::from_secs(5));
