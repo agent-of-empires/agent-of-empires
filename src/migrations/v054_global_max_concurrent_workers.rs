@@ -19,18 +19,24 @@ fn run_in(app_dir: &Path) -> Result<()> {
 }
 
 fn served_profile(app_dir: &Path) -> Result<Option<String>> {
-    let path = app_dir.join("serve.launch");
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
-    };
-    let record: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
-    Ok(record
-        .as_ref()
-        .and_then(|record| record.get("profile"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned))
+    // A restart deletes `serve.launch` before migrating but retains the rollback copy.
+    for name in ["serve.launch", "serve.rollback.launch"] {
+        let path = app_dir.join(name);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("Read {}", path.display())),
+        };
+        let record: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+        if let Some(profile) = record
+            .as_ref()
+            .and_then(|record| record.get("profile"))
+            .and_then(serde_json::Value::as_str)
+        {
+            return Ok(Some(profile.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -50,13 +56,22 @@ mod tests {
 
     #[test]
     fn promotes_the_effective_cap_and_drops_the_rest() {
-        // (serve.launch contents, expected global cap)
-        for (launch, expected) in [
-            (None, 3),
-            (Some(r#"{"profile":"other"}"#), 1),
-            (Some(r#"{"profile":"bare"}"#), 100),
-            (Some(r#"{"profile":"deleted"}"#), 3),
-            (Some("{"), 3),
+        const LIVE: &str = "serve.launch";
+        const ROLLBACK: &str = "serve.rollback.launch";
+        let served = |name: &str| format!(r#"{{"profile":"{name}"}}"#);
+        // (launch records, expected global cap)
+        for (records, expected) in [
+            (vec![], 3),
+            (vec![(LIVE, served("other"))], 1),
+            (vec![(ROLLBACK, served("other"))], 1),
+            (vec![(LIVE, served("other")), (ROLLBACK, served("work"))], 1),
+            (
+                vec![(LIVE, "{".to_string()), (ROLLBACK, served("other"))],
+                1,
+            ),
+            (vec![(LIVE, served("bare"))], 100),
+            (vec![(LIVE, served("deleted"))], 3),
+            (vec![(LIVE, "{".to_string())], 3),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let app = dir.path();
@@ -76,8 +91,8 @@ mod tests {
                 "[acp]\nmax_concurrent_workers = 1\n",
             );
             seed(app, "profiles/bare/config.toml", "");
-            if let Some(launch) = launch {
-                seed(app, "serve.launch", launch);
+            for (name, contents) in &records {
+                seed(app, name, contents);
             }
 
             for _ in 0..2 {
@@ -85,7 +100,7 @@ mod tests {
                 assert_eq!(
                     read(app, "config.toml")["acp"]["max_concurrent_workers"].as_integer(),
                     Some(expected),
-                    "{launch:?}"
+                    "{records:?}"
                 );
                 assert_eq!(
                     read(app, "profiles/work/config.toml"),
