@@ -1659,6 +1659,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn indeterminate_creation_write_failure_cannot_be_hidden_by_a_healthy_reload() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
         use axum::extract::{Query, State};
         use axum::response::IntoResponse;
         use axum::Json;
@@ -1669,7 +1673,24 @@ mod tests {
         let real_tmux = which::which("tmux").unwrap();
         let root = tempfile::tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _environment = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", root.path().join(".config")),
+            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
+        ]);
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
+            root.path(),
+            concat!(
+                module_path!(),
+                "::indeterminate_creation_write_failure_cannot_be_hidden_by_a_healthy_reload"
+            ),
+        );
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+        );
         let app = crate::session::get_app_dir().unwrap();
         crate::session::purge_owners::initialize(&app).unwrap();
         crate::tmux::tool_retirement::initialize(&app).unwrap();
@@ -1683,6 +1704,38 @@ mod tests {
             config.session.smart_rename = false;
         })
         .unwrap();
+
+        // The canonical native fork API pre-pins its child. Plain Fresh/opaque
+        // creation has no prior SID and never enters the owned-pane SID probe.
+        let mut parent =
+            crate::session::Instance::new("attested-fork-source", root.path().to_str().unwrap());
+        parent.source_profile = "test".into();
+        parent.tool = "claude".into();
+        parent.command = "claude".into();
+        let parent_sid = crate::session::capture::generate_session_uuid();
+        crate::session::instance::test_helpers::seed_claude_transcript(&mut parent, &parent_sid);
+        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![parent.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![parent.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        struct OwnCreationCleanup;
+        impl Drop for OwnCreationCleanup {
+            fn drop(&mut self) {
+                if let Ok(rows) = crate::session::Storage::open_unwatched("test")
+                    .and_then(|storage| storage.load())
+                {
+                    for row in rows.into_iter().filter(|row| {
+                        row.title == "failed-indeterminate-finalization"
+                            && row.idempotency_key.as_deref()
+                                == Some("failed-indeterminate-finalization")
+                    }) {
+                        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+                        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+                    }
+                }
+            }
+        }
+        let _cleanup = OwnCreationCleanup;
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         let creations = root.path().join("real-births");
@@ -1699,18 +1752,15 @@ mod tests {
         )).unwrap();
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path = crate::session::test_support::path_prepended(&bin);
-        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         let body = serde_json::json!({
-            "title": "failed-indeterminate-finalization", "path": "", "tool": "claude",
-            "scratch": true, "view": "terminal", "profile": "test",
+            "title": "failed-indeterminate-finalization", "path": root.path(), "tool": "claude",
+            "view": "terminal", "profile": "test",
+            "fork_session_id": parent.id,
             "idempotency_key": "failed-indeterminate-finalization",
-            "command_override": format!("exec cat > {}", quote(&root.path().join("agent-input").to_string_lossy())),
         });
         let create_state = state.clone();
         let create_body = body.clone();
-        let create = tokio::spawn(async move {
+        let mut create = tokio::spawn(async move {
             crate::server::api::sessions::create_session(
                 State(create_state),
                 Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
@@ -1723,21 +1773,37 @@ mod tests {
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while !probe.exists() {
+                if create.is_finished() {
+                    let response = (&mut create).await.unwrap();
+                    panic!(
+                        "canonical native fork finished before its ownership probe: HTTP {}",
+                        response.status()
+                    );
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("the real born pane must reach its post-finalization ownership probe");
+        .expect("the real forked birth must reach its post-finalization ownership probe");
         let storage = crate::session::Storage::open_unwatched("test").unwrap();
-        let before = storage.load().unwrap().remove(0);
+        let before = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.idempotency_key.as_deref() == Some("failed-indeterminate-finalization"))
+            .expect("the real API-created child is durable");
         assert_eq!(before.status, crate::session::Status::Creating);
+        let child_sid = before
+            .agent_session_id
+            .as_deref()
+            .expect("the production fork pre-pins its child");
+        assert_ne!(child_sid, parent_sid);
         let generation = before.lifecycle_generation;
         assert!(before.lifecycle_reservation_is_owned(
             crate::session::LifecycleOperation::Launch,
             generation
         ));
         let name = crate::tmux::Session::generate_name(&before.id, &before.title);
-        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
         let pane = crate::tmux::test_helpers::only_pane_id(&name);
         let pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
             .parse::<u32>()
@@ -1745,6 +1811,7 @@ mod tests {
         let birth = crate::process::process_birth_identity(pid)
             .unwrap()
             .expect("actual born process");
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
         let write_failure = storage.fail_writes_for_test();
         let heal_state = state.clone();
         let healed = Arc::new(AtomicBool::new(false));
@@ -1797,7 +1864,12 @@ mod tests {
             crate::process::process_birth_is_live(pid, &birth).unwrap(),
             "an unresolved finalization must not roll back its born process"
         );
-        let current = storage.load().unwrap().remove(0);
+        let current = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .unwrap();
         if first.status() == axum::http::StatusCode::CREATED {
             assert_eq!(current.status, crate::session::Status::Starting,
                 "healthy canonical adoption cannot turn a failed durable finalization into 201 Creating");
@@ -1806,10 +1878,14 @@ mod tests {
             assert_eq!(first.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
         }
         state.runtime.work.drain().await;
-        let finalized = storage.load().unwrap().remove(0);
+        let finalized = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .unwrap();
         assert_eq!(finalized.status, crate::session::Status::Starting);
         assert!(finalized.lifecycle_reservation.is_none());
-        assert_eq!(finalized.id, before.id);
         let second = crate::server::api::sessions::create_session(
             State(state.clone()),
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),

@@ -3173,7 +3173,11 @@ exec sleep 60
             .unwrap();
         let name = instance.tmux_session().unwrap().name().to_owned();
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
-        instance.start_with_size_opts(None, true).unwrap();
+        assert_eq!(
+            instance.start_with_size_opts(None, true).unwrap(),
+            LaunchSidOutcome::Existing { sid: SID.into() },
+            "the real outgoing Native launch must resume the attested conversation"
+        );
         let wait_publication = |path: &std::path::Path| {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while !path.exists() {
