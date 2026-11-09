@@ -3827,8 +3827,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        // A custom agent runs its registry base's adapter. Of the bases used here only `vibe`'s
-        // is reachable; `aoe-agent` installs into the isolated app dir.
+        // A custom agent runs its registry base's adapter, and only `vibe`'s is on the fixture PATH.
         std::fs::write(bin.path().join("vibe-acp"), "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(
             bin.path().join("vibe-acp"),
@@ -3836,16 +3835,14 @@ mod tests {
         )
         .unwrap();
         crate::session::config::update_config(|config| {
-            for (name, base) in [("repo-loses", "vibe"), ("repo-gains", "aoe-agent")] {
-                config
-                    .session
-                    .custom_agents
-                    .insert(name.into(), "true".into());
-                config
-                    .session
-                    .agent_detect_as
-                    .insert(name.into(), base.into());
-            }
+            config
+                .session
+                .custom_agents
+                .insert("repo-loses".into(), "true".into());
+            config
+                .session
+                .agent_detect_as
+                .insert("repo-loses".into(), "vibe".into());
             for (name, acp) in [
                 ("on-path", Some(format!("{adapter} acp"))),
                 ("missing", Some(format!("{adapter}-missing acp"))),
@@ -3878,7 +3875,7 @@ mod tests {
         std::fs::create_dir_all(realiased.path().join(".agent-of-empires")).unwrap();
         std::fs::write(
             realiased.path().join(".agent-of-empires/config.toml"),
-            "[session.agent_detect_as]\nrepo-loses = \"cursor\"\nrepo-gains = \"vibe\"\nterminal = \"vibe\"\n",
+            "[session.agent_detect_as]\nrepo-loses = \"cursor\"\nterminal = \"vibe\"\n",
         )
         .unwrap();
         let awaiting = repo_with_on_launch();
@@ -3901,20 +3898,10 @@ mod tests {
         )
         .unwrap();
         // (label, profile on_create hook, CityHall, project, scratch, then create-ready for
-        // `missing`, `repo-loses`, `repo-gains` and the profile-terminal `terminal`). The profile
-        // hook persists once set, so its case comes last.
+        // `missing`, `repo-loses` and the profile-terminal `terminal`). The profile hook persists
+        // once set, so its case comes last.
         let cases = [
-            (
-                "no project",
-                false,
-                false,
-                None,
-                false,
-                false,
-                true,
-                false,
-                false,
-            ),
+            ("no project", false, false, None, false, false, true, false),
             (
                 "no hooks",
                 false,
@@ -3923,7 +3910,6 @@ mod tests {
                 false,
                 false,
                 true,
-                false,
                 false,
             ),
             (
@@ -3934,7 +3920,6 @@ mod tests {
                 false,
                 true,
                 true,
-                true,
                 false,
             ),
             (
@@ -3943,7 +3928,6 @@ mod tests {
                 false,
                 Some(awaiting.path()),
                 false,
-                true,
                 true,
                 true,
                 false,
@@ -3957,7 +3941,6 @@ mod tests {
                 false,
                 true,
                 false,
-                false,
             ),
             (
                 "repo re-aliases the agents",
@@ -3968,7 +3951,6 @@ mod tests {
                 false,
                 false,
                 true,
-                true,
             ),
             (
                 "CityHall ignores the caller's path",
@@ -3976,7 +3958,6 @@ mod tests {
                 true,
                 Some(plain.path()),
                 false,
-                true,
                 true,
                 true,
                 false,
@@ -3989,24 +3970,11 @@ mod tests {
                 true,
                 true,
                 true,
-                true,
                 false,
             ),
-            (
-                "profile hook",
-                true,
-                false,
-                None,
-                false,
-                true,
-                true,
-                true,
-                false,
-            ),
+            ("profile hook", true, false, None, false, true, true, false),
         ];
-        for (label, profile_hook, cityhall, project, scratch, missing, loses, gains, terminal) in
-            cases
-        {
+        for (label, profile_hook, cityhall, project, scratch, missing, loses, terminal) in cases {
             if profile_hook {
                 crate::session::config::update_config(|config| {
                     config.hooks.on_create = vec!["npm install".into()];
@@ -4032,7 +4000,6 @@ mod tests {
                 ("missing", false, missing),
                 ("terminal", false, terminal),
                 ("repo-loses", true, loses),
-                ("repo-gains", false, gains),
             ] {
                 let agent = agents.iter().find(|a| a.name == name).unwrap();
                 assert_eq!(agent.acp_installed, installed, "{label}: {name} installed");
