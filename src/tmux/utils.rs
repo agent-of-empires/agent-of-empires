@@ -1357,7 +1357,9 @@ mod tests {
                 "dead-pid-changed" => current.panes[0].identity.pane_pid = Some(7003),
                 "dead-pid-disappeared" => current.panes[0].identity.pane_pid = None,
                 "new-pane" => current.panes[0].identity.pane_id = "%2".into(),
-                "server-birth-changed" => current.server.as_mut().unwrap().birth = birth("other-server"),
+                "server-birth-changed" => {
+                    current.server.as_mut().unwrap().birth = birth("other-server")
+                }
                 "socket-changed" => current.socket.push_str("-other"),
                 "alive-birth-changed" => current.panes[0].birth = Some(birth("other-pane")),
                 "alive-to-dead" => current.panes[0].birth = None,
@@ -1366,7 +1368,10 @@ mod tests {
             }
             assert_eq!(
                 current.ensure_only_preexisting_live_panes(&prior).is_ok(),
-                matches!(case, "dead-with-pid" | "dead-without-pid" | "alive-unchanged"),
+                matches!(
+                    case,
+                    "dead-with-pid" | "dead-without-pid" | "alive-unchanged"
+                ),
                 "{case}"
             );
         }
@@ -2462,15 +2467,19 @@ mod pane_probe_tests {
         let prior = capture_pane_birth_inventory(
             Some(&expected.server.socket),
             &crate::tmux::TmuxCommandDeadline::new(),
-        ).unwrap();
-        let dead = prior.panes.iter().find(|pane| {
-            pane.identity.pane_id == expected.identity.pane_id
-        }).expect("the existing corpse remains in the complete inventory");
+        )
+        .unwrap();
+        let dead = prior
+            .panes
+            .iter()
+            .find(|pane| pane.identity.pane_id == expected.identity.pane_id)
+            .expect("the existing corpse remains in the complete inventory");
         assert!(dead.birth.is_none());
         let current = capture_pane_birth_inventory(
             Some(&expected.server.socket),
             &crate::tmux::TmuxCommandDeadline::new(),
-        ).unwrap();
+        )
+        .unwrap();
         current.ensure_only_preexisting_live_panes(&prior).unwrap();
     }
 
