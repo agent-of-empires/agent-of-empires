@@ -528,6 +528,11 @@ impl Session {
                 grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
                 "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
             );
+            // The runner may still be running the turn; without this the next
+            // local prompt hits the stale waiter and kills the connection.
+            if let Some(control) = self.control.as_ref() {
+                control.release_local_prompt();
+            }
             return Flow::Break;
         }
         if fire {

@@ -504,12 +504,34 @@ impl AnchoredDir {
     }
 
     pub(crate) fn read_dir(&self, relative: &Path, max_entries: usize) -> Result<Vec<OsString>> {
+        self.list_dir(relative, max_entries, false)
+    }
+
+    /// Like `read_dir`, but an entry that cannot be read fails the listing.
+    pub(crate) fn read_dir_complete(
+        &self,
+        relative: &Path,
+        max_entries: usize,
+    ) -> Result<Vec<OsString>> {
+        self.list_dir(relative, max_entries, true)
+    }
+
+    fn list_dir(
+        &self,
+        relative: &Path,
+        max_entries: usize,
+        complete: bool,
+    ) -> Result<Vec<OsString>> {
         let fd = self.open_dir(relative)?;
         let mut dir = Dir::from_fd(fd)?;
         let mut names = Vec::with_capacity(max_entries.min(64));
         for entry in dir.iter() {
-            let Ok(entry) = entry else {
-                continue;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if complete => {
+                    return Err(error).context("reading anchored directory entry")
+                }
+                Err(_) => continue,
             };
             let name = entry.file_name().to_bytes();
             if name == b"." || name == b".." {

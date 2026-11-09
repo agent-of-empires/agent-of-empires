@@ -2490,6 +2490,62 @@ Do you want to proceed?\n\
         assert_eq!(detect_vibe_status("Loading..."), Status::Running);
     }
 
+    #[test]
+    fn vibe_captured_screens_separate_parked_from_working() {
+        const LOGO_3: &str = " ⢠⢢    ⡠⡀⡠⡀   Mistral Vibe v3.1.0\n \
+                              ⢸⢸⣀⡔⢉⢑⠇⠨⡠⢇   mock[off]\n \
+                              ⠈⠒⠒⠣⠤⠵⠭⠭⠯⠇   Type /help for more information\n";
+        const LOGO_2: &str = "  ⡠⣒⠄  ⡔⢄⠔⡄\n \
+                              ⢸⠸⣀⡔⢉⠱⣃⡢⣂⡣\n  \
+                              ⠉⠒⠣⠤⠵⠤⠬⠮⠆\n\
+                              Mistral Vibe v2.26.1 · mock[off] · unified harness\n";
+        const TURN: &str = "> run the tests\n──────────\n  Reading and writing finished.\n";
+        const INPUT: &str = "─── mock[off] · accept edits ─\n>\n──────────\n\
+                             …/data-processing ⧉       ctx ▁ 0%\n";
+        const DRAFT: &str = "──────────\n> keep reading\n──────────\n\
+                             …/proj ⧉       ctx ▁ 0%\n";
+        const APPROVAL: &str = "■ Running sleep 12\n\
+                                ⠤⡄ Running command… (0s Esc/Ctrl+C to interrupt)\n\
+                                ┌──────────┐\n\
+                                │ Permission for the file_system.bash tool\n\
+                                │   1. Allow once\n\
+                                │   4. Deny\n\
+                                │ ↑↓/jk navigate  Enter select  Esc reject\n\
+                                └──────────┘\n";
+
+        let cases = [
+            (format!("{LOGO_3}{INPUT}"), Status::Idle),
+            (format!("{LOGO_2}{INPUT}"), Status::Idle),
+            (format!("{LOGO_3}{TURN}{INPUT}"), Status::Idle),
+            (format!("{TURN}{INPUT}"), Status::Idle),
+            (format!("{LOGO_3}{DRAFT}"), Status::Idle),
+            (
+                "  Reading it.\n──────────\n! ls\n──────────\n".into(),
+                Status::Idle,
+            ),
+            (
+                "  Reading it.\n──────────\n/ hel\n──────────\n".into(),
+                Status::Idle,
+            ),
+            (
+                format!("{LOGO_3}⠒⠂ Generating… (3s Esc/Ctrl+C to interrupt)\n{INPUT}"),
+                Status::Running,
+            ),
+            (
+                format!("{LOGO_3}⠋  Generating… (4s Esc/Ctrl+C to i\n{INPUT}"),
+                Status::Running,
+            ),
+            (
+                format!("{LOGO_2}{TURN} ⣠ Generating… (4s Esc/Ctrl+C to interrupt)\n{INPUT}"),
+                Status::Running,
+            ),
+            (format!("{LOGO_3}{APPROVAL}"), Status::Waiting),
+        ];
+        for (pane, expected) in cases {
+            assert_eq!(detect_vibe_status(&pane), expected, "{pane}");
+        }
+    }
+
     const PI_RUNNING_PANE: &str = "\
 Twelve is a dozen.\n\
 ⠏ Working...\n\
