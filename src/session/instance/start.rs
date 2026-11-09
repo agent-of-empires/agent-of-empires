@@ -1857,6 +1857,7 @@ if sys.argv[1] == 'serve':
             stream.sendall(b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
 else:
     with open(os.environ['FORK_RECORD'] + '.pid', 'w') as log: log.write(str(os.getpid()))
+    with open(os.environ['FORK_RECORD'] + '.births', 'a') as log: log.write(json.dumps(dict(pid=os.getpid(), argv=sys.argv[1:])) + '\n')
     with open(os.environ['FORK_RECORD'] + '.tmp', 'w') as log: json.dump(sys.argv[1:], log)
     os.replace(os.environ['FORK_RECORD'] + '.tmp', os.environ['FORK_RECORD'])
     while True:
@@ -1903,6 +1904,8 @@ else:
             let physical = std::rc::Rc::new(std::cell::RefCell::new(None));
             let captured = physical.clone();
             let expected_parent = parent.clone();
+            let invocations = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let captured_invocations = invocations.clone();
             let observer = test_support::FinalizeObserver::install(
                 instance.id.clone(),
                 move |instance, phase| {
@@ -1923,14 +1926,38 @@ else:
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     };
                     assert!(argv.windows(2).any(|pair| pair == ["--session", CHILD]));
-                    let (pane, state, exclusive) = crate::tmux::utils::observe_pane(
+                    let (pane, state, _shell) = crate::tmux::utils::observe_pane(
                         instance.tmux_session().unwrap().name(),
                         &crate::tmux::TmuxCommandDeadline::new(),
                     )
                     .unwrap()
                     .expect("the invoked native agent owns a real pane");
+                    let census = crate::tmux::tmux_command()
+                        .args([
+                            "list-panes", "-a", "-F",
+                            "#{session_id}|#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{session_windows}|#{window_panes}|#{window_linked}|#{pid}",
+                        ])
+                        .output()
+                        .unwrap();
+                    assert!(census.status.success(), "{census:?}");
+                    let first = captured_invocations.borrow().is_empty();
+                    captured_invocations.borrow_mut().push(
+                        String::from_utf8(census.stdout).unwrap()
+                    );
+                    let owned = crate::tmux::utils::probe_owned_pane(
+                        instance.tmux_session().unwrap().name(),
+                        &pane,
+                        &crate::tmux::TmuxCommandDeadline::new(),
+                    )
+                    .unwrap()
+                    .expect("the exact captured native birth must still be owned");
                     assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
-                    assert!(exclusive);
+                    assert_eq!(owned.state, crate::tmux::utils::PaneProbe::Alive);
+                    assert!(
+                        owned.exclusive,
+                        "case ({fail_adoption}, {fail_final}, {peer_pin}); all callbacks/census: {:?}",
+                        captured_invocations.borrow()
+                    );
                     let native_pid =
                         std::fs::read_to_string(launch_record.with_extension("json.pid"))
                             .unwrap()
@@ -1939,12 +1966,14 @@ else:
                     let native_birth = crate::process::process_birth_identity(native_pid)
                         .unwrap()
                         .expect("the ready native child has a kernel birth");
+                    if first {
                     *captured.borrow_mut() = Some((
                         pane,
                         native_pid,
                         native_birth,
                         instance.lifecycle_generation,
                     ));
+                    }
                     if fail_adoption {
                         assert_eq!(instance.agent_session_id.as_deref(), Some(CHILD));
                         assert!(matches!(instance.resume_intent, ResumeIntent::Fork { .. }));
@@ -1957,7 +1986,7 @@ else:
                         );
                     }
                     observed.set(true);
-                    if peer_pin {
+                    if peer_pin && first {
                         crate::session::storage::Storage::new_unwatched(profile)
                             .unwrap()
                             .update(|rows, _| {
@@ -1996,6 +2025,7 @@ else:
             let disk = storage.load().unwrap().remove(0);
             if fail_final || peer_pin {
                 if peer_pin {
+                    assert_eq!(invocations.borrow().len(), 1, "{:?}", invocations.borrow());
                     let (pane, native_pid, native_birth, generation) =
                         physical.borrow_mut().take().unwrap();
                     let observe = || {
@@ -2006,10 +2036,17 @@ else:
                         .unwrap()
                         .expect("peer pin must retain the original physical target")
                     };
-                    let (retained, state, exclusive) = observe();
+                    let (retained, state, _shell) = observe();
                     assert_eq!(retained, pane);
                     assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
-                    assert!(exclusive);
+                    let owned = crate::tmux::utils::probe_owned_pane(
+                        instance.tmux_session().unwrap().name(),
+                        &pane,
+                        &crate::tmux::TmuxCommandDeadline::new(),
+                    )
+                    .unwrap()
+                    .expect("peer pin must retain the same owned native birth");
+                    assert!(owned.exclusive);
                     assert!(
                         crate::process::process_birth_is_live(native_pid, &native_birth).unwrap()
                     );
@@ -2017,6 +2054,16 @@ else:
                     assert_eq!(disk.agent_session_binding.as_ref(), Some(&expected_parent));
                     assert_eq!(disk.resume_binding.as_ref(), Some(&expected_parent));
                     assert!(!record.with_extension("json.input").exists());
+                    let births = || {
+                        std::fs::read_to_string(record.with_extension("json.births"))
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                            .collect::<Vec<_>>()
+                    };
+                    let initial_births = births();
+                    assert_eq!(initial_births.len(), 1, "{initial_births:?}");
+                    assert_eq!(initial_births[0]["pid"].as_u64(), Some(u64::from(native_pid)));
                     assert_eq!(
                         instance.start_with_size_opts(None, false).unwrap(),
                         LaunchSidOutcome::Skipped,
@@ -2039,6 +2086,7 @@ else:
                         crate::process::process_birth_is_live(native_pid, &native_birth).unwrap()
                     );
                     assert!(!record.with_extension("json.input").exists());
+                    assert_eq!(births(), initial_births, "retry must not invoke another native agent");
                 } else {
                     assert!(
                         !instance.tmux_session().unwrap().exists(),

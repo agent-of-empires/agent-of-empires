@@ -1907,6 +1907,8 @@ mod tests {
                 let _case = CaseContext { resumed, fault };
                 let logs = crate::session::test_support::LogCapture::start();
                 let dead_first = fault == "dead" || fault.starts_with("dead_");
+                let expects_peer_publication =
+                    matches!(fault, "superseded" | "dead_recheck_owner");
                 let root = tempdir().unwrap();
                 let _app = crate::session::test_support::isolate_app_dir_at(root.path());
                 let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
@@ -1951,6 +1953,7 @@ mod tests {
                     std::fs::create_dir_all(root.path().join(".claude")).unwrap();
                     instance.agent_session_id = Some(SID.into());
                 }
+                let owned_generation = instance.lifecycle_generation + 1;
                 let storage =
                     crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
                 storage
@@ -1974,6 +1977,8 @@ mod tests {
                 }
                 let snapshot = Rc::new(RefCell::new(None));
                 let seen = snapshot.clone();
+                let canonical_snapshot = Rc::new(RefCell::new(None));
+                let canonical_seen = canonical_snapshot.clone();
                 let cache = Rc::new(RefCell::new(None));
                 let force_cache = cache.clone();
                 let old_pane = Rc::new(RefCell::new(None));
@@ -2028,6 +2033,15 @@ mod tests {
                             args.windows(2).any(|pair| pair == [selector, SID]),
                             "{args:?}"
                         );
+                        let canonical = crate::session::Storage::new_unwatched(&row.source_profile)
+                            .unwrap()
+                            .load()
+                            .unwrap()
+                            .into_iter()
+                            .find(|stored| stored.id == row.id)
+                            .unwrap();
+                        assert_eq!(canonical.lifecycle_generation, owned_generation);
+                        *canonical_seen.borrow_mut() = Some(canonical);
                         if fault == "cached_absence" {
                             let guard = crate::tmux::SessionCacheGuard::capture();
                             guard.force_present(&[]);
@@ -2089,6 +2103,8 @@ mod tests {
                 let observed_query = observed.clone();
                 let profile = instance.source_profile.clone();
                 let id = instance.id.clone();
+                let peer_publication = Rc::new(RefCell::new(None));
+                let injected_peer = peer_publication.clone();
                 let _observation = Observer::install(move |output| {
                     let sample = observed_query.get() + 1;
                     observed_query.set(sample);
@@ -2139,8 +2155,15 @@ mod tests {
                                     let row = rows.iter_mut().find(|row| row.id == id).unwrap();
                                     row.status = Status::Running;
                                     if fault == "dead_recheck_owner" {
-                                        row.lifecycle_generation += 1;
+                                        assert_eq!(row.lifecycle_generation, owned_generation);
+                                        row.lifecycle_generation = owned_generation + 1;
                                         row.lifecycle_reservation = None;
+                                        *injected_peer.borrow_mut() = Some((
+                                            row.lifecycle_generation,
+                                            row.lifecycle_reservation.clone(),
+                                            row.conversation_state(),
+                                            row.resume_probe_failed_sid.clone(),
+                                        ));
                                     }
                                     Ok(())
                                 })
@@ -2173,9 +2196,16 @@ mod tests {
                                     let row = rows.iter_mut().find(|row| row.id == id).unwrap();
                                     row.status = Status::Running;
                                     if fault == "superseded" {
-                                        row.lifecycle_generation += 1;
+                                        assert_eq!(row.lifecycle_generation, owned_generation);
+                                        row.lifecycle_generation = owned_generation + 1;
                                         row.lifecycle_reservation = None;
                                         row.resume_probe_failed_sid = Some(SID.into());
+                                        *injected_peer.borrow_mut() = Some((
+                                            row.lifecycle_generation,
+                                            row.lifecycle_reservation.clone(),
+                                            row.conversation_state(),
+                                            row.resume_probe_failed_sid.clone(),
+                                        ));
                                     } else if fault == "same_sid_assertion" {
                                         row.resume_intent = ResumeIntent::Use(SID.into());
                                         row.resume_binding = row.agent_session_binding.clone();
@@ -2276,45 +2306,11 @@ mod tests {
                     assert_eq!(released.get(), 1);
                     continue;
                 }
-                if fault == "superseded" {
-                    let error = result.expect_err("a foreign generation forbids finalization");
-                    let pending = error
-                        .downcast_ref::<LaunchFinalizationPending>()
-                        .expect("lost ownership must retain explicit finalization debt");
-                    assert_eq!(pending.cause, LaunchIndeterminateCause::OwnershipUnproven);
-                } else {
-                    let outcome = result.unwrap();
-                    if fault == "cached_absence" {
-                        assert_eq!(
-                            outcome,
-                            if resumed {
-                                StartOutcome::Resumed
-                            } else {
-                                StartOutcome::Fresh
-                            }
-                        );
-                    } else {
-                        let cause = match fault {
-                            "lookup_timeout"
-                            | "pane_timeout"
-                            | "dead_recheck_timeout"
-                            | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
-                            "expiry" => LaunchIndeterminateCause::StabilizationExpired,
-                            "same_sid_assertion" | "replacement" | "rename_only"
-                            | "server_changed" | "dead_recheck_owner" | "pane_pid_missing"
-                            | "dead_pid_changed" => LaunchIndeterminateCause::OwnershipUnproven,
-                            _ => LaunchIndeterminateCause::ObservationFailed,
-                        };
-                        assert_eq!(
-                            outcome,
-                            StartOutcome::Indeterminate { cause },
-                            "private launch diagnostics:\n{}",
-                            logs.contents()
-                        );
-                        assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
-                    }
-                }
                 let stored = storage.load().unwrap().remove(0);
+                let canonical_before = canonical_snapshot
+                    .borrow_mut()
+                    .take()
+                    .expect("real canonical publication observed before fault injection");
                 assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
                 if let Some(birth) = native_birth.as_ref() {
                     assert!(
@@ -2331,7 +2327,7 @@ mod tests {
                     assert_eq!(stored.resume_intent, ResumeIntent::Use(SID.into()));
                     assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(SID));
                 } else {
-                    assert_eq!(stored.conversation_state(), before.conversation_state());
+                    assert_eq!(stored.conversation_state(), canonical_before.conversation_state());
                     assert_eq!(
                         stored.resume_probe_failed_sid.as_deref(),
                         if fault == "superseded"
@@ -2340,20 +2336,15 @@ mod tests {
                         {
                             Some(SID)
                         } else {
-                            before.resume_probe_failed_sid.as_deref()
+                            canonical_before.resume_probe_failed_sid.as_deref()
                         }
                     );
                 }
-                assert_eq!(stored.active_execution, before.active_execution);
-                assert_eq!(stored.terminal_scopes, before.terminal_scopes);
+                assert_eq!(stored.active_execution, canonical_before.active_execution);
+                assert_eq!(stored.terminal_scopes, canonical_before.terminal_scopes);
                 assert_eq!(
                     stored.lifecycle_generation,
-                    before.lifecycle_generation
-                        + if matches!(fault, "superseded" | "dead_recheck_owner") {
-                            1
-                        } else {
-                            0
-                        }
+                    canonical_before.lifecycle_generation + u64::from(expects_peer_publication)
                 );
                 assert!(stored.lifecycle_reservation.is_none());
                 assert_eq!(instance.capture_started_at, before.capture_started_at);
@@ -2406,6 +2397,57 @@ mod tests {
                 ));
                 if !dead_first {
                     assert!(instance.capture_poller.is_running());
+                }
+                // The independently executed fixture write, not the subject's result or its
+                // final generation alone, determines whether publication authority was lost.
+                let peer_publication = peer_publication.borrow_mut().take();
+                assert_eq!(peer_publication.is_some(), expects_peer_publication);
+                if let Some((generation, reservation, conversation, marker)) = peer_publication {
+                    assert_eq!(stored.lifecycle_generation, generation);
+                    assert_eq!(stored.lifecycle_reservation, reservation);
+                    assert_eq!(stored.conversation_state(), conversation);
+                    assert_eq!(stored.resume_probe_failed_sid, marker);
+                    let error = result.expect_err("the foreign publication forbids finalization");
+                    let pending = error
+                        .downcast_ref::<LaunchFinalizationPending>()
+                        .expect("lost ownership retains explicit finalization debt");
+                    assert_eq!(pending.generation, canonical_before.lifecycle_generation);
+                    assert_eq!(pending.cause, LaunchIndeterminateCause::OwnershipUnproven);
+                    assert!(matches!(
+                        error.downcast_ref::<LifecycleReservationError>(),
+                        Some(LifecycleReservationError::Superseded)
+                    ), "{error:#}");
+                } else {
+                    let outcome = result.unwrap();
+                    if fault == "cached_absence" {
+                        assert_eq!(
+                            outcome,
+                            if resumed {
+                                StartOutcome::Resumed
+                            } else {
+                                StartOutcome::Fresh
+                            }
+                        );
+                    } else {
+                        let cause = match fault {
+                            "lookup_timeout"
+                            | "pane_timeout"
+                            | "dead_recheck_timeout"
+                            | "dead_remove_timeout" => LaunchIndeterminateCause::CommandTimedOut,
+                            "expiry" => LaunchIndeterminateCause::StabilizationExpired,
+                            "same_sid_assertion" | "replacement" | "rename_only"
+                            | "server_changed" | "pane_pid_missing"
+                            | "dead_pid_changed" => LaunchIndeterminateCause::OwnershipUnproven,
+                            _ => LaunchIndeterminateCause::ObservationFailed,
+                        };
+                        assert_eq!(
+                            outcome,
+                            StartOutcome::Indeterminate { cause },
+                            "private launch diagnostics:\n{}",
+                            logs.contents()
+                        );
+                        assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
+                    }
                 }
                 instance.capture_poller.clear();
             }
