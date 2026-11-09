@@ -196,66 +196,72 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
 /// #5253: a prompt that dispatch queues supersedes a pending continuation only once
 /// the enqueue succeeds; a rejected one leaves it in place.
 #[tokio::test]
+#[serial_test::serial]
 async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it() {
-    let _app_dir = crate::session::test_support::isolate_app_dir();
-    let id = "sess-5253-enqueue".to_string();
-    let state = structured_state(&id, false).await;
-    state
-        .acp_event_store
-        .record(&id, 1, &Event::ThinkingStarted)
-        .expect("seed a running turn");
-    state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
-    let seeded = crate::session::PendingInitialTurn {
-        text: "queued before the park".to_string(),
-        attachments: Vec::new(),
-        synthesized: true,
-    };
-    state.instances.write().await[0].pending_initial_turn = Some(seeded.clone());
-    seed_native_row(&state).await;
-
-    let oversized = "x".repeat(300 * 1024);
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.clone()),
-        prompt_req(&oversized),
-    )
-    .await
-    .into_response();
-    assert!(response.status().is_client_error(), "{}", response.status());
-    assert_eq!(
-        state.instances.read().await[0].pending_initial_turn,
-        Some(seeded.clone())
-    );
-    assert_eq!(persisted_pending_turn(&state, &id).await, Some(seeded));
-
-    let response = acp_prompt(
-        State(Arc::clone(&state)),
-        Path(id.clone()),
-        prompt_req("follow up"),
-    )
-    .await
-    .into_response();
-    assert!(response.status().is_success(), "{}", response.status());
-    assert_eq!(
-        state
-            .session_service
-            .queued_prompts_snapshot(&id)
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "sess-5253-enqueue")
+                    .await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let _active_request = live.start_prompt("actual active input").await;
+            let seeded = crate::session::PendingInitialTurn {
+                text: "queued before the park".to_string(),
+                attachments: Vec::new(),
+                synthesized: true,
+            };
+            state
+                .session_service
+                .set_pending_initial_turn(&id, seeded.text.clone(), seeded.attachments.clone())
+                .await;
+            let oversized = "x".repeat(300 * 1024);
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                prompt_req(&oversized),
+            )
             .await
-            .len(),
-        1
-    );
-    assert!(state.instances.read().await[0]
-        .pending_initial_turn
-        .is_none());
-    // One durable write: the row and the continuation's removal are never seen apart.
-    let profile = state.instances.read().await[0].source_profile.clone();
-    let on_disk = crate::server::test_support::load_instances_from_disk_for_test(&profile)
-        .into_iter()
-        .find(|i| i.id == id)
-        .expect("the session row must be on disk");
-    assert_eq!(on_disk.queued_prompts.len(), 1);
-    assert_eq!(on_disk.queued_prompts[0].text, "follow up");
-    assert!(on_disk.pending_initial_turn.is_none());
+            .into_response();
+            assert!(response.status().is_client_error(), "{}", response.status());
+            assert_eq!(
+                state.instances.read().await[0].pending_initial_turn,
+                Some(seeded.clone())
+            );
+            assert_eq!(persisted_pending_turn(&state, &id).await, Some(seeded));
+            let response = acp_prompt(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                prompt_req("follow up"),
+            )
+            .await
+            .into_response();
+            assert!(response.status().is_success(), "{}", response.status());
+            assert_eq!(
+                state
+                    .session_service
+                    .queued_prompts_snapshot(&id)
+                    .await
+                    .len(),
+                1
+            );
+            assert!(state.instances.read().await[0]
+                .pending_initial_turn
+                .is_none());
+            // One durable write: queue row and continuation removal remain inseparable.
+            let profile = state.instances.read().await[0].source_profile.clone();
+            let on_disk = crate::server::test_support::load_instances_from_disk_for_test(&profile)
+                .into_iter()
+                .find(|row| row.id == id)
+                .expect("the session row must be on disk");
+            assert_eq!(on_disk.queued_prompts.len(), 1);
+            assert_eq!(on_disk.queued_prompts[0].text, "follow up");
+            assert!(on_disk.pending_initial_turn.is_none());
+            live.client.shutdown().await.unwrap();
+        })
+    })
+    .await;
 }
 
 /// A Stop pressed right after Enter must wait out the prompt submission rather
@@ -1327,7 +1333,30 @@ async fn a_failed_repost_keeps_the_rows_attachment_bytes() {
     use std::os::unix::fs::PermissionsExt;
     let _app_dir = crate::session::test_support::isolate_app_dir();
     let id = "sess-5253-bytes";
-    let state = state_with_attachment_row(id, true).await;
+    let state = structured_state(id, true).await;
+    state
+        .session_service
+        .enqueue_prompt(
+            id,
+            "q1".into(),
+            "caption".into(),
+            vec![shot_ref()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(state.acp_event_store.record_pending_attachment(
+        id,
+        "q1",
+        &AttachmentBlob {
+            id: "att-1".into(),
+            kind: crate::daemon::PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: Some("shot.png".into()),
+            data: b"stored".to_vec(),
+        },
+    ));
     let profile = state.instances.read().await[0].source_profile.clone();
     crate::server::test_support::seed_instances_on_disk_for_test(
         &profile,

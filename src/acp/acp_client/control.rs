@@ -3332,53 +3332,189 @@ mod tests {
         )
         .await
     }
+    async fn own_stop(fixture: &ManagedControlFixture, request: &serde_json::Value) {
+        real_control_deadline(async {
+                loop {
+                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
+                    if events.iter().any(|stored| {
+                        stored.metadata.scope == EventScope::OperationCurrent
+                            && stored.metadata.native_prompt_id == request["id"].as_i64()
+                            && matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete")
+                    }) { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await;
+    }
 
-    #[tokio::test]
-    async fn released_local_prompt_lets_the_next_prompt_through_and_ignores_the_late_completion() {
-        let mut peer = PromptControlPeer::new().await;
-        let abandoned = peer.prompt().await;
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 5 })
-            .await;
-        peer.drain().await;
-        peer.client.release_local_prompt();
-        assert!(abandoned.await.is_err(), "released waiter aborts");
+    async fn drained_old_completion(
+        fixture: &mut ManagedControlFixture,
+        callback_id: &str,
+        forbidden: &std::path::Path,
+    ) {
+        fixture.native.send(serde_json::json!({"jsonrpc":"2.0","id":callback_id,
+                "method":"fs/write_text_file","params":{
+                    "sessionId":"foreign-correlation-barrier","path":forbidden,"content":"must not be written"
+                }})).await;
+        let reply = real_control_deadline(fixture.native.reply()).await;
+        assert_eq!(reply["id"], callback_id);
+        assert_eq!(reply["error"]["code"], control_protocol::INVALID_PARAMS);
+        assert!(!forbidden.exists());
+        // A direct refusal proves reader progress, not SDK or parent application.
+        let barrier = format!("parent-processed-{callback_id}");
+        fixture.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"foreign-correlation-barrier","update":{
+                    "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":barrier}
+                }
+            }})).await;
+        real_control_deadline(async {
+            loop {
+                let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
+                if let Some(stored) = events.iter().find(|stored| {
+                    matches!(stored.event.as_ref(),
+                        Event::AgentMessageChunk { text, .. } if text == &barrier
+                    )
+                }) {
+                    assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                    assert_eq!(
+                        stored
+                            .metadata
+                            .reported_session_id
+                            .as_ref()
+                            .map(|id| id.0.as_ref()),
+                        Some("foreign-correlation-barrier")
+                    );
+                    assert!(stored.metadata.operation.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
 
-        let mut next = peer.prompt().await;
-        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
-            .await;
-        // The abandoned turn's completion must not resolve the new waiter.
-        peer.completed(5, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-        peer.completed(6, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.await.unwrap(), end("end_turn"));
-        peer.assert_local_terminal_ownership();
+    async fn release_real_prompt_and_keep_the_next_owner(release_before_start: bool) {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(move |scope| {
+            Box::pin(async move {
+                let directory = scope.tempdir();
+                let forbidden = directory.path().join("foreign-write");
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let shim = state.test_shim.get().unwrap().clone();
+                let mut observed = observe_real_relay(&control);
+                let relay_gate = if release_before_start {
+                    let write = shim.lock().await;
+                    fixture.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":"release-before-start-barrier","update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":"block the actual control reader"}
+                            }
+                        }
+                    })).await;
+                    real_relay_observation(
+                        &mut observed,
+                        TestRelayStage::Prepared,
+                        "session/update",
+                    )
+                    .await;
+                    Some(write)
+                } else {
+                    None
+                };
+                let old = fixture.start_prompt("real abandoned input").await;
+                let (old_scope, old_window) = if release_before_start {
+                    let completion = control.completion.lock().unwrap();
+                    match &*completion {
+                        PromptCompletion::Pending {
+                            prompt_req_id: None,
+                            scope,
+                            window_id: None,
+                            ..
+                        } => (scope.clone(), None),
+                        _ => panic!("reader must not have bound the abandoned start"),
+                    }
+                } else {
+                    let (scope, window) = real_pending_scope(&control, &old).await;
+                    (scope, Some(window))
+                };
+                control.release_local_prompt();
+                assert!(matches!(
+                    *control.completion.lock().unwrap(),
+                    PromptCompletion::LocalIdle
+                ));
+                assert_eq!(
+                    control.abandoned_starts.load(AtomicOrdering::Relaxed),
+                    usize::from(release_before_start),
+                );
+                let next = fixture.start_prompt("real next explicit input").await;
+                assert_ne!(old["id"], next["id"]);
+                // Both requests reached the Native peer before the delayed start is released.
+                drop(relay_gate);
+                let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                assert_ne!(old_scope.correlation(), next_scope.correlation());
+                if let Some(old_window) = old_window {
+                    assert_ne!(old_window, next_window);
+                }
+                assert_eq!(control.abandoned_starts.load(AtomicOrdering::Relaxed), 0);
+                let turn = terminal.current_turn();
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                fixture.complete(&old, "end_turn").await;
+                drained_old_completion(&mut fixture, "released-original-barrier", &forbidden).await;
+                assert_eq!(
+                    real_pending_scope(&control, &next).await,
+                    (next_scope.clone(), next_window),
+                );
+                assert_eq!(terminal.current_turn(), turn);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                let before = fixture.store.highest_seq(&fixture.client.id);
+                fixture.complete(&next, "end_turn").await;
+                own_stop(&fixture, &next).await;
+                assert_one_real_stopped(&fixture, before, &next, &next_scope, next_window);
+                assert_eq!(terminal.current_turn(), turn);
+                assert!(terminal.claimed());
+                assert!(!in_flight.load(AtomicOrdering::Acquire));
+                let methods = fixture.native.requests();
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| *method == "session/new")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    2
+                );
+                assert!(!methods.iter().any(|method| matches!(
+                    method.as_str(),
+                    "session/load" | "session/fork" | "session/cancel"
+                )));
+                fixture.client.shutdown().await.unwrap();
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn released_local_prompt_lets_the_next_prompt_through_and_ignores_the_late_completion() {
+        release_real_prompt_and_keep_the_next_owner(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
-        let mut peer = PromptControlPeer::new().await;
-        let abandoned = peer.prompt().await;
-        // Released before its PromptStarted arrived.
-        peer.client.release_local_prompt();
-        assert!(abandoned.await.is_err(), "released waiter aborts");
-
-        let mut next = peer.prompt().await;
-        // The abandoned prompt's delayed start must not bind the next waiter.
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 5 })
-            .await;
-        peer.completed(5, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
-
-        peer.send(ControlBody::PromptStarted { prompt_req_id: 6 })
-            .await;
-        peer.completed(6, "end_turn").await;
-        peer.drain().await;
-        assert_eq!(next.await.unwrap(), end("end_turn"));
-        peer.assert_local_terminal_ownership();
+        release_real_prompt_and_keep_the_next_owner(true).await;
     }
 
     #[tokio::test]
@@ -4460,66 +4596,6 @@ mod tests {
     async fn resumed_prompt_completes_only_for_its_own_runner_request() {
         use crate::acp::event_sender::EventScope;
         use crate::acp::supervisor::test_support::managed::with_managed;
-
-        async fn own_stop(fixture: &ManagedControlFixture, request: &serde_json::Value) {
-            real_control_deadline(async {
-                loop {
-                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
-                    if events.iter().any(|stored| {
-                        stored.metadata.scope == EventScope::OperationCurrent
-                            && stored.metadata.native_prompt_id == request["id"].as_i64()
-                            && matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete")
-                    }) { break; }
-                    tokio::task::yield_now().await;
-                }
-            }).await;
-        }
-
-        async fn drained_old_completion(
-            fixture: &mut ManagedControlFixture,
-            callback_id: &str,
-            forbidden: &std::path::Path,
-        ) {
-            fixture.native.send(serde_json::json!({"jsonrpc":"2.0","id":callback_id,
-                "method":"fs/write_text_file","params":{
-                    "sessionId":"foreign-correlation-barrier","path":forbidden,"content":"must not be written"
-                }})).await;
-            let reply = real_control_deadline(fixture.native.reply()).await;
-            assert_eq!(reply["id"], callback_id);
-            assert_eq!(reply["error"]["code"], control_protocol::INVALID_PARAMS);
-            assert!(!forbidden.exists());
-            // A direct refusal proves reader progress, not SDK or parent application.
-            let barrier = format!("parent-processed-{callback_id}");
-            fixture.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
-                "sessionId":"foreign-correlation-barrier","update":{
-                    "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":barrier}
-                }
-            }})).await;
-            real_control_deadline(async {
-                loop {
-                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
-                    if let Some(stored) = events.iter().find(|stored| {
-                        matches!(stored.event.as_ref(),
-                            Event::AgentMessageChunk { text, .. } if text == &barrier
-                        )
-                    }) {
-                        assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
-                        assert_eq!(
-                            stored
-                                .metadata
-                                .reported_session_id
-                                .as_ref()
-                                .map(|id| id.0.as_ref()),
-                            Some("foreign-correlation-barrier")
-                        );
-                        assert!(stored.metadata.operation.is_none());
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
-        }
 
         with_managed(|scope| {
             Box::pin(async move {

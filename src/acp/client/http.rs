@@ -321,7 +321,7 @@ impl HttpClient {
                             }
                             _ => coverage.push((frame.seq, frame.seq)),
                         }
-                        model.apply_event(frame.seq, &frame.event);
+                        model.apply_scoped_event(frame.seq, &frame.event, &frame.view_metadata());
                     }
                 },
             )
@@ -1378,6 +1378,7 @@ mod tests {
                         text: format!("retained-{seq}"),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1479,7 +1480,12 @@ mod tests {
         for (index, event) in events.iter().enumerate() {
             state
                 .acp_event_store
-                .record(&id, index as u64 + 1, event)
+                .record(
+                    &id,
+                    index as u64 + 1,
+                    event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
         }
         let app = Router::new()
@@ -1562,6 +1568,7 @@ mod tests {
                         text: format!("retained-{seq}\n\n"),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
@@ -1586,6 +1593,7 @@ mod tests {
                                             text: "retained-4".into(),
                                             message_id: None,
                                         },
+                                        &crate::acp::event_sender::EventMetadata::history(),
                                     )
                                     .unwrap();
                             }
@@ -1644,6 +1652,7 @@ mod tests {
                 &Event::AvailableCommandsUpdated {
                     commands: Vec::new(),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         for seq in 2..=20 {
@@ -1655,14 +1664,16 @@ mod tests {
                         text: format!("message-{seq}"),
                         message_id: None,
                     },
+                    &crate::acp::event_sender::EventMetadata::history(),
                 )
                 .unwrap();
         }
         assert_eq!(
             store
                 .replay_from(&id, 0)
+                .unwrap()
                 .iter()
-                .map(|(seq, _)| *seq)
+                .map(|stored| stored.seq)
                 .collect::<Vec<_>>(),
             [1, 18, 19, 20]
         );
