@@ -124,9 +124,10 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         let mut stores: Vec<super::session_store::NativeSessionStore> = Vec::new();
         for instance in &snapshot {
             let profile = instance.source_profile.as_str();
-            if !stores.iter().any(|store| {
-                crate::session::SessionStore::storage(store).profile() == profile
-            }) {
+            if !stores
+                .iter()
+                .any(|store| crate::session::SessionStore::storage(store).profile() == profile)
+            {
                 stores.push(
                     super::session_store::NativeSessionStore::open(
                         worker_state.clone(),
@@ -182,7 +183,14 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
             .collect();
         // The walk ran on a clone.
         let deferred = changed_repair_backoffs(&backoff_before, &snapshot);
-        Ok((_namespace, outcome, snapshot, baseline, runtime_changed, deferred))
+        Ok((
+            _namespace,
+            outcome,
+            snapshot,
+            baseline,
+            runtime_changed,
+            deferred,
+        ))
     })
     .await
     {
@@ -210,7 +218,8 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 };
                 // The schedule-only reapply also belongs to this exact profile
                 // and creation, even when a reused id has the same generation.
-                if dst.created_at != identity_baseline.7 || dst.source_profile != src.source_profile {
+                if dst.created_at != identity_baseline.7 || dst.source_profile != src.source_profile
+                {
                     continue;
                 }
                 if let Some(backoff) = deferred.get(&src.id) {
@@ -877,12 +886,16 @@ mod tests {
         });
         let now = std::time::Instant::now();
         walked.capture_poller.repair_mut().reprobe(now);
-        walked.capture_poller.set_retry_after(Some(now + std::time::Duration::from_secs(30)));
+        walked
+            .capture_poller
+            .set_retry_after(Some(now + std::time::Duration::from_secs(30)));
         let mut reused = original.clone();
         reused.created_at += chrono::Duration::seconds(1);
         apply_drained_identity_if_unchanged(&mut reused, &walked, &baseline);
         apply_poller_repair_if_lifecycle_unchanged(
-            &mut reused, walked.capture_poller.repair(), &baseline,
+            &mut reused,
+            walked.capture_poller.repair(),
+            &baseline,
         );
         apply_poller_runtime_if_unchanged(&mut reused, &walked, &baseline);
         apply_drained_lifecycle_if_unchanged(&mut reused, &walked, &baseline);
@@ -890,7 +903,11 @@ mod tests {
         assert_eq!(reused.lifecycle_generation, original.lifecycle_generation);
         assert!(reused.lifecycle_reservation.is_none());
         assert!(reused.capture_poller.retry_after().is_none());
-        assert!(reused.capture_poller.repair().current_reprobe_delay().is_none());
+        assert!(reused
+            .capture_poller
+            .repair()
+            .current_reprobe_delay()
+            .is_none());
     }
 
     /// A tool swap or a disk write can move a row's execution without moving its lifecycle counter,

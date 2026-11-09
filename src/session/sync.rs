@@ -443,52 +443,54 @@ fn drain_and_persist_session_ids_inner(
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
     for update in &updates {
         let persisted = stores.with_store(&update.profile, |storage| {
-            let ownership =
-                if matches!(stores, CaptureStorage::Scoped(_)) || update.confirms_omp_pin {
-                    None
-                } else {
-                    let lock = storage
-                        .storage()
-                        .acquire_instance_lifecycle_lock(&update.id)?;
-                    let mut conversation_changed = false;
-                    let generation = storage.update(|instances, _| {
-                        let instance = instances
-                            .iter_mut()
-                            .find(|instance| instance.id == update.id)
-                            .ok_or(crate::session::LifecycleReservationError::Superseded)?;
-                        anyhow::ensure!(
-                            instance.created_at == update.created_at
-                                && instance.lifecycle_generation == update.lifecycle_generation
-                                && instance.source_profile == update.profile,
-                            crate::session::LifecycleReservationError::Superseded
-                        );
-                        conversation_changed = !update.expected_prior.matches(instance);
-                        anyhow::ensure!(
-                            !conversation_changed,
-                            crate::session::LifecycleReservationError::Superseded
-                        );
-                        instance
-                            .try_acquire_lifecycle_reservation(
-                                crate::session::LifecycleOperation::Capture,
-                                Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
-                            )
-                            .map_err(anyhow::Error::from)
-                    });
-                    let generation = match generation {
-                        Err(error)
-                            if conversation_changed
-                                && error.downcast_ref::<crate::session::LifecycleReservationError>()
-                                    == Some(&crate::session::LifecycleReservationError::Superseded) =>
-                        {
-                            // Cancel without a write, then retain the existing
-                            // same-lifecycle CAS-loss rollback and env reconcile.
-                            return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
-                        }
-                        result => result?,
-                    };
-                    Some((lock, generation))
+            let ownership = if matches!(stores, CaptureStorage::Scoped(_))
+                || update.confirms_omp_pin
+            {
+                None
+            } else {
+                let lock = storage
+                    .storage()
+                    .acquire_instance_lifecycle_lock(&update.id)?;
+                let mut conversation_changed = false;
+                let generation = storage.update(|instances, _| {
+                    let instance = instances
+                        .iter_mut()
+                        .find(|instance| instance.id == update.id)
+                        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                    anyhow::ensure!(
+                        instance.created_at == update.created_at
+                            && instance.lifecycle_generation == update.lifecycle_generation
+                            && instance.source_profile == update.profile,
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    conversation_changed = !update.expected_prior.matches(instance);
+                    anyhow::ensure!(
+                        !conversation_changed,
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    instance
+                        .try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Capture,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .map_err(anyhow::Error::from)
+                });
+                let generation = match generation {
+                    Err(error)
+                        if conversation_changed
+                            && error
+                                .downcast_ref::<crate::session::LifecycleReservationError>()
+                                == Some(&crate::session::LifecycleReservationError::Superseded) =>
+                    {
+                        // Cancel without a write, then retain the existing
+                        // same-lifecycle CAS-loss rollback and env reconcile.
+                        return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
+                    }
+                    result => result?,
                 };
+                Some((lock, generation))
+            };
             let result = if update.confirms_omp_pin {
                 let SessionIdGuard::OmpGeneration(generation) = &update.observation.guard else {
                     unreachable!("OMP pin confirmations require a generation guard");
@@ -1785,13 +1787,15 @@ mod tests {
             let before = std::fs::read(storage.sessions_path()).unwrap();
             attach_poller_with_update(&mut instance, sid);
             let mut instances = vec![instance];
-            let outcome =
-                drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
+            let outcome = drain_and_persist_session_ids(&mut instances, &FileWatchService::noop());
 
             if case == "same-generation-pin" {
                 assert!(outcome.filtered.is_empty(), "{case}");
                 assert_eq!(outcome.rolled_back, vec![instances[0].id.clone()], "{case}");
-                assert_eq!(instances[0].conversation_state(), durable.conversation_state());
+                assert_eq!(
+                    instances[0].conversation_state(),
+                    durable.conversation_state()
+                );
             } else {
                 assert_eq!(outcome.filtered, vec![instances[0].id.clone()], "{case}");
             }
@@ -1809,11 +1813,21 @@ mod tests {
                 "{case}"
             );
             assert_eq!(
-                stored.lifecycle_reservation.as_ref().map(|reservation| reservation.op),
-                durable.lifecycle_reservation.as_ref().map(|reservation| reservation.op),
+                stored
+                    .lifecycle_reservation
+                    .as_ref()
+                    .map(|reservation| reservation.op),
+                durable
+                    .lifecycle_reservation
+                    .as_ref()
+                    .map(|reservation| reservation.op),
                 "{case}"
             );
-            assert_eq!(stored.conversation_state(), durable.conversation_state(), "{case}");
+            assert_eq!(
+                stored.conversation_state(),
+                durable.conversation_state(),
+                "{case}"
+            );
         }
     }
 
