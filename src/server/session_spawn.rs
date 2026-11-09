@@ -1737,7 +1737,7 @@ mod tests {
         }
         let _cleanup = OwnCreationCleanup;
         let bin = root.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
         let creations = root.path().join("real-births");
         let sends = root.path().join("real-input");
         let probe = root.path().join("post-finalization-owned-probe");
