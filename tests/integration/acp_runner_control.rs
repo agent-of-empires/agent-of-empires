@@ -2497,10 +2497,23 @@ async fn control_connection_loss_reattaches_the_live_runner_mid_command() {
     held.await_prompt_started().await;
     sever_tx.send(()).unwrap();
 
-    tokio::time::timeout(Duration::from_secs(10), reattached_rx)
+    let reattached = tokio::time::timeout(Duration::from_secs(10), reattached_rx)
         .await
-        .expect("the live runner never confirmed resume while the command was held")
-        .unwrap();
+        .expect("the live runner never confirmed resume while the command was held");
+    if reattached.is_err() {
+        // The proxy dropped the sender, so it ended before forwarding
+        // SessionReady. Report its own failure rather than the closed channel.
+        let outcome = tokio::time::timeout(Duration::from_secs(10), proxy.join_next())
+            .await
+            .expect("the control proxy did not finish after dropping its resume signal")
+            .expect("the control proxy task is missing");
+        match outcome {
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            outcome => {
+                panic!("the control proxy ended before forwarding SessionReady: {outcome:?}")
+            }
+        }
+    }
     held.release_turn().await;
     assert_original_turn_completed(&mut held, &store, &mut rx).await;
     assert_eq!(supervisor.running_identity(id), Some(identity));
