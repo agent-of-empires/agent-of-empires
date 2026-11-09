@@ -2771,7 +2771,8 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             if let Some((_, stage)) = pending_recovery {
                 anyhow::ensure!(matches!(stage,
                     crate::session::TerminalHandoffStage::TerminalCommitOwed
-                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed
+                        | crate::session::TerminalHandoffStage::ProjectionCleanupOwed),
                     "terminal handoff must finish original retirement before its native target can change");
                 let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
                 anyhow::ensure!(pending.final_event_seq.is_some(),
@@ -2781,13 +2782,18 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     && pending.generation == inst.lifecycle_generation,
                     crate::session::LifecycleReservationError::Superseded);
                 pending.ensure_original_stopped(&inst.id)?;
-                let pane = inst.tmux_session()?;
-                if pane.exists_live() {
-                    anyhow::ensure!(pane.is_pane_dead(),
-                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
+                let panes = crate::tmux::batch_pane_metadata()
+                    .context("cannot prove terminal pane absence; restore tmux access before selecting a target")?;
+                if let Some((name, pane)) =
+                    crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)?
+                {
+                    anyhow::ensure!(pane.pane_dead,
+                        "terminal handoff pane is live; close it explicitly in tmux before selecting a different terminal target");
                     let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
-                        "existing dead pane has no handoff receipt; pane retained"))?;
-                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
+                        "existing dead pane has no handoff receipt; close it explicitly in tmux before selecting a terminal target"))?;
+                    anyhow::ensure!(launch.receipt.is_some(),
+                        "existing dead pane has no proven handoff birth; close it explicitly in tmux before selecting a terminal target");
+                    crate::session::Instance::ensure_terminal_handoff_pane_matches(name,
                         crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
                 }
             }
@@ -2805,7 +2811,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            if let Some((intent_id, _)) = pending_recovery {
+            if let Some((intent_id, stage)) = pending_recovery {
                 let context = match &new_intent {
                     crate::session::ResumeIntent::Use(_) => {
                         let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
@@ -2831,7 +2837,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.source_acp_session_id = source_acp_session_id;
                 pending.terminal = Some(target);
                 pending.launch_started = false;
-                // Retain the original checkpoint solely as the owned dead-pane receipt.
+                if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
+                    pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
+                }
+                // Retain the prior attempt as evidence, never as proof of an unrecorded birth.
             }
             Ok(inst.title.clone())
         })

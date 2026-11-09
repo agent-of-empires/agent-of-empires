@@ -81,21 +81,24 @@ pub(crate) fn status_command_for_event(
 /// sidecar is trustworthy because `aoe __extract-session-id` refuses daemon workers. A missing or
 /// malformed sidecar keeps the write, and so does a payload that is not compact JSON, which Claude
 /// emits.
-fn session_binding_guard(target: HookInstallTarget) -> String {
-    // Host launches publish `session_id.<AOE_SESSION_SOURCE>`; the sandbox writer has no source.
+fn session_binding_guard(target: HookInstallTarget, bound: bool) -> String {
     let leaf = match target {
         HookInstallTarget::Host => {
             "L=session_id; [ -z \"${AOE_SESSION_SOURCE:-}\" ] || L=\"session_id.$AOE_SESSION_SOURCE\"; "
         }
         HookInstallTarget::Sandbox => "L=session_id; ",
     };
-    // The sidecar must pass the writer's own checks, else it is ignored like a missing one.
-    format!(
+    let mut read = format!(
         "SID=; {leaf}\
-         case \"$L\" in *[!0-9a-z._-]*) ;; *) {{ read SID < \"$D/$L\"; }} 2>/dev/null ;; esac; \
-         case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) ;; \
-         *) [ \"${{#SID}}\" -gt 256 ] || case \"$IN\" in *\\\"session_id\\\":\\\"$SID\\\"*) ;; *) exit 0 ;; esac ;; esac; "
-    )
+         case \"$L\" in *[!0-9a-z._-]*) ;; *) {{ read SID < \"$D/$L\"; }} 2>/dev/null ;; esac; "
+    );
+    if bound {
+        read.push_str(
+            "case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) ;; \
+             *) [ \"${#SID}\" -gt 256 ] || case \"$IN\" in *\\\"session_id\\\":\\\"$SID\\\"*) ;; *) exit 0 ;; esac ;; esac; ",
+        );
+    }
+    read
 }
 
 /// Matches the compact `"tool_name":"X"` bytes, which an escaped mention inside a JSON string
@@ -112,13 +115,13 @@ fn status_command_with_base(
     } else {
         ""
     };
-    let guard = if bound {
-        session_binding_guard(target)
+    let guard = if bound || matches!(target, HookInstallTarget::Host) {
+        session_binding_guard(target, bound)
     } else {
         String::new()
     };
     let write = if waiting_tools.is_empty() {
-        format!("printf {status} > \"$D/status\" 2>/dev/null; ")
+        format!("S={status}; printf {status} > \"$D/status\" 2>/dev/null; ")
     } else {
         let patterns: Vec<String> = waiting_tools
             .iter()
@@ -130,7 +133,20 @@ fn status_command_with_base(
             patterns = patterns.join("|")
         )
     };
-    hook_command_with_write(&format!("{read_stdin}{guard}{write}"), base, target)
+    let qualified_write = if matches!(target, HookInstallTarget::Host) {
+        "case \"${AOE_SESSION_SOURCE:-}\" in \"\"|*[!0-9a-f-]*) ;; \
+         *) case \"$SID\" in \"\"|-*|*[!0-9a-zA-Z._-]*) ;; \
+         *) if [ \"${#SID}\" -le 256 ]; then \
+         printf \"%s|%s\" \"$SID\" \"$S\" > \"$D/status.$AOE_SESSION_SOURCE\" 2>/dev/null; \
+         fi ;; esac ;; esac; "
+    } else {
+        ""
+    };
+    hook_command_with_write(
+        &format!("{read_stdin}{guard}{write}{qualified_write}"),
+        base,
+        target,
+    )
 }
 
 fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -> String {

@@ -88,8 +88,8 @@ impl Instance {
     /// structured view-mode sessions (no backing tmux pane).
     ///
     /// On `Started` / `Respawned`, polls briefly so keystrokes don't race the
-    /// agent's startup splash. Best-effort: returns after the timeout even if
-    /// the pane is still settling.
+    /// agent's startup splash. An expired settling window returns `Indeterminate`;
+    /// failed observation never establishes readiness.
     ///
     /// Latency: `AlreadyAlive` is ~tmux RTT. The `Respawned` path routes
     /// through `restart_with_size` -> `start_with_resume_fallback`, which
@@ -155,12 +155,14 @@ impl Instance {
                 | StartOutcome::Fresh
                 | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
-            self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Started);
+            return Ok(match self.wait_for_pane_ready() {
+                Ok(()) => EnsureReadyOutcome::Started,
+                Err(cause) => EnsureReadyOutcome::Indeterminate { cause },
+            });
         }
         if probe == crate::tmux::utils::PaneProbe::Dead {
             let outcome =
-                self.restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)?;
+                self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
@@ -172,8 +174,10 @@ impl Instance {
                 | StartOutcome::Fresh
                 | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
-            self.wait_for_pane_ready(&session);
-            return Ok(EnsureReadyOutcome::Respawned);
+            return Ok(match self.wait_for_pane_ready() {
+                Ok(()) => EnsureReadyOutcome::Respawned,
+                Err(cause) => EnsureReadyOutcome::Indeterminate { cause },
+            });
         }
         Ok(match self.positive_pane_readiness() {
             Ok(true) => EnsureReadyOutcome::AlreadyAlive,
@@ -192,12 +196,16 @@ impl Instance {
         else {
             return Ok(false);
         };
+        self.pane_is_ready(pane)
+    }
+
+    pub(crate) fn pane_is_ready(&self, pane: &crate::tmux::PaneMetadata) -> Result<bool> {
         if pane.pane_dead {
             return Ok(false);
         }
         if self.expects_shell()
             || self.has_command_override()
-            || crate::hooks::read_hook_status(&self.id).is_some()
+            || self.current_launch_hook_status().is_some()
         {
             return Ok(true);
         }
@@ -209,6 +217,19 @@ impl Instance {
             command,
             pane.pane_start_command_is_protected,
         ))
+    }
+
+    fn current_launch_hook_status(&self) -> Option<crate::session::Status> {
+        let active = self.active_execution.as_ref()?;
+        let binding = self.agent_session_binding.as_ref()?;
+        let session_id = self.agent_session_id.as_deref()?;
+        if active.binding.agent != self.tool
+            || binding.session_id != session_id
+            || !Self::execution_identity_matches(binding.execution.as_ref()?, &active.binding)
+        {
+            return None;
+        }
+        crate::hooks::read_hook_status_for_launch(&self.id, &active.launch_id, session_id)
     }
 
     /// Keystrokes into a live pane are refused for an archived or trashed session, like a start.
@@ -228,35 +249,30 @@ impl Instance {
         Ok(lock)
     }
 
-    /// Best-effort wait for a freshly-started pane to settle past its initial
-    /// shell/splash so subsequent `send-keys` land in the agent instead of a
-    /// boot prompt. Polls up to 3s in 50ms increments; returns even on
-    /// timeout so a sluggish agent doesn't block the send indefinitely.
-    ///
-    /// Readiness signal:
-    /// - Agents that expect a shell, run a custom command override, or have
-    ///   an active hook status file: just wait for the pane to not be dead.
-    ///   Wrapper scripts look like shells to tmux, so `is_pane_running_shell`
-    ///   would never clear for them and we would eat the full 3s every time.
-    ///   This mirrors the same guard chain `ensure_session` uses.
-    /// - Real agents (e.g. claude, opencode): also wait for the pane to no
-    ///   longer be running a shell, so a keystroke doesn't land in the boot
-    ///   prompt that runs before the agent binary takes over.
-    pub(crate) fn wait_for_pane_ready(&self, session: &tmux::Session) {
-        let shell_check_unreliable = self.expects_shell()
-            || self.has_command_override()
-            || crate::hooks::read_hook_status(&self.id).is_some();
+    /// Wait up to three seconds for a newly born live pane to leave its boot shell.
+    /// Missing, dead, unknown and still-settling panes remain indeterminate.
+    pub(crate) fn wait_for_pane_ready(&self) -> Result<(), LaunchIndeterminateCause> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         loop {
-            if !session.exists() {
-                return;
+            let panes =
+                crate::tmux::batch_pane_metadata().map_err(|error| self.probe_failure_cause(error))?;
+            let Some((_, pane)) =
+                crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)
+                    .map_err(|error| self.probe_failure_cause(error))?
+            else {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven);
+            };
+            if pane.pane_dead {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven);
             }
-            let pane_alive = !session.is_pane_dead();
-            if pane_alive && (shell_check_unreliable || !session.is_pane_running_shell()) {
-                return;
+            if self
+                .pane_is_ready(pane)
+                .map_err(|error| self.probe_failure_cause(error))?
+            {
+                return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                return;
+                return Err(LaunchIndeterminateCause::StabilizationExpired);
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

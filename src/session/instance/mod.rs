@@ -86,7 +86,8 @@ pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use resume::{
-    LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
+    LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
+    ResumeLaunchOptions,
 };
 pub(crate) use sid_persist::{
     persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
@@ -238,6 +239,7 @@ pub(crate) struct TerminalHandoffLaunch {
     pub(crate) capture_started_at: Option<SystemTime>,
     pub(crate) omp_capture_metadata: Option<OmpCaptureMetadata>,
     pub(crate) confirm_desired_conversation: bool,
+    pub(crate) receipt: Option<std::sync::Arc<LegacyToolObservation>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

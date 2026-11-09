@@ -539,19 +539,19 @@ impl SessionStore for NativeSessionStore {
     fn release_lifecycle_reservation(
         &self,
         id: &str,
-        operation: crate::session::LifecycleOperation,
+        release: crate::session::LifecycleRelease,
         generation: u64,
         lifecycle: Option<crate::session::StorageFlock>,
     ) -> Result<()> {
         self.settle_lifecycle_reservation(id, lifecycle, |row| {
-            row.release_lifecycle_reservation_if_owned(operation, generation);
+            release.apply(row, generation);
         })
     }
 
     fn defer_lifecycle_release(
         self,
         id: String,
-        operation: crate::session::LifecycleOperation,
+        release: crate::session::LifecycleRelease,
         generation: u64,
         lifecycle: Option<crate::session::StorageFlock>,
     ) {
@@ -569,7 +569,7 @@ impl SessionStore for NativeSessionStore {
             };
             let _namespace = (namespace, fresh_namespace);
             let result = tokio::task::spawn_blocking(move || {
-                self.release_lifecycle_reservation(&id, operation, generation, None)
+                self.release_lifecycle_reservation(&id, release, generation, None)
             }).await;
             match result {
                 Ok(Ok(())) => {}

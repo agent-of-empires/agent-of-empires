@@ -175,9 +175,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
             "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
         Some(ApiErrorCode::LaunchIndeterminate) => committed_failure_message(ApiErrorCode::LaunchIndeterminate).into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
-        "Auto-name is unavailable for this session; check its repository and tool configuration"
-            .into()
-    }
+            "Auto-name is unavailable for this session; check its repository and tool configuration"
+                .into()
+        }
         Some(ApiErrorCode::SmartRenameFailed) => {
             "Auto-name failed; the daemon could not obtain a title from the agent".into()
         }

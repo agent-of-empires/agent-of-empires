@@ -707,7 +707,7 @@ fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
     // `#[serde(skip)]` like the poller, so a fresh disk load defaults it and a
     // revival slower than one tick would stop counting toward its plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
-    fresh.inherit_process_runtime(prior);
+    fresh.inherit_process_runtime_from_reload(prior);
     handoff.settle(&mut fresh.capture_poller);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }

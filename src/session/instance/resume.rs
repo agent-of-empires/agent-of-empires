@@ -141,8 +141,26 @@ pub(crate) enum ResumeAttemptPolicy {
 
 pub(crate) struct LaunchReservation {
     pub(crate) generation: u64,
+    pub(crate) revival: Option<RevivalTarget>,
     pub(crate) title_lock: crate::session::storage::StorageFlock,
     pub(crate) lifecycle_lock: crate::session::storage::StorageFlock,
+}
+
+pub(crate) struct RevivalTarget {
+    pub(super) pane: std::sync::Arc<LegacyToolObservation>,
+    pub(crate) state: crate::tmux::utils::PaneProbe,
+}
+
+pub(crate) struct PreparedLaunchReservation {
+    pub(crate) generation: u64,
+    pub(super) revival: Option<RevivalTarget>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Indeterminate launch is pending durable finalization: {cause}")]
+pub(crate) struct LaunchFinalizationPending {
+    pub(crate) generation: u64,
+    pub(crate) cause: LaunchIndeterminateCause,
 }
 /// Finite launch observations safe to expose without tmux diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,8 +209,13 @@ enum ProbeResult {
 /// Transient proof captured at physical launch, before publication can adopt peer state.
 pub(super) struct LaunchProbe {
     pub(super) tmux_session: String,
-    pub(super) pane: Option<LegacyToolObservation>,
+    pub(super) pane: Option<std::sync::Arc<LegacyToolObservation>>,
     pub(super) expected: ConversationState,
+}
+
+pub(super) struct LaunchFailure {
+    pub(super) error: anyhow::Error,
+    pub(super) born: Option<(LaunchProbe, ConversationState)>,
 }
 
 pub(super) struct LaunchSandboxSnapshot {
@@ -390,7 +413,7 @@ impl Instance {
         ProbeResult::Indeterminate(self.probe_failure_cause(error))
     }
 
-    fn probe_failure_cause(&self, error: anyhow::Error) -> LaunchIndeterminateCause {
+    pub(super) fn probe_failure_cause(&self, error: anyhow::Error) -> LaunchIndeterminateCause {
         let cause = if error.chain().any(|source| {
             source
                 .downcast_ref::<std::io::Error>()
@@ -476,7 +499,7 @@ impl Instance {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         discard_sandbox_container: bool,
-        options: ResumeLaunchOptions,
+        mut options: ResumeLaunchOptions,
     ) -> Result<StartOutcome> {
         crate::session::validate_instance_id(&self.id)
             .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
@@ -496,16 +519,24 @@ impl Instance {
             return Ok(StartOutcome::Fresh);
         }
         self.ensure_startable()?;
+        let revival = match self.capture_revival_target() {
+            Ok(revival) => revival,
+            Err(error) => {
+                return match error.downcast_ref::<LaunchIndeterminateCause>() {
+                    Some(&cause) => Ok(StartOutcome::Indeterminate { cause }),
+                    None => Err(error),
+                };
+            }
+        };
         if !options.restart {
             use crate::tmux::utils::PaneProbe;
-            let present = crate::tmux::utils::probe_pane(self.tmux_session()?.name());
-            match present {
-                PaneProbe::Unknown => {
+            match revival.as_ref().map(|target| target.state) {
+                Some(PaneProbe::Unknown) => {
                     return Ok(StartOutcome::Indeterminate {
                         cause: LaunchIndeterminateCause::ObservationFailed,
                     });
                 }
-                PaneProbe::Alive => {
+                Some(PaneProbe::Alive) => {
                     return Ok(match self.positive_pane_readiness() {
                         Ok(true) => StartOutcome::Fresh,
                         Ok(false) => StartOutcome::Indeterminate {
@@ -516,7 +547,8 @@ impl Instance {
                         },
                     });
                 }
-                PaneProbe::Dead | PaneProbe::Missing => {}
+                Some(PaneProbe::Dead) => options.restart = true,
+                Some(PaneProbe::Missing) | None => {}
             }
         }
         if self.status == Status::Error {
@@ -531,7 +563,7 @@ impl Instance {
         )?;
         if discard_sandbox_container {
             if let Err(error) = self.discard_stale_sandbox_container() {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         }
@@ -541,6 +573,7 @@ impl Instance {
             skip_on_launch,
             LaunchReservation {
                 generation,
+                revival,
                 title_lock,
                 lifecycle_lock,
             },
@@ -556,11 +589,56 @@ impl Instance {
         reservation: LaunchReservation,
         options: ResumeLaunchOptions,
     ) -> Result<StartOutcome> {
-        let generation =
-            self.prepare_reserved_launch_hooks(storage, options.restart, reservation)?;
+        let generation = reservation.generation;
+        let reservation =
+            match self.prepare_reserved_launch_hooks(storage, options.restart, reservation) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                        let probe = LaunchProbe {
+                            tmux_session: self.tmux_session()?.name().to_owned(),
+                            pane: None,
+                            expected: self.conversation_state(),
+                        };
+                        return self.preserve_indeterminate_launch(
+                            storage, generation, &probe, None, cause,
+                        );
+                    }
+                    return Err(error);
+                }
+            };
         let hook_result =
             self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
-        self.finish_reserved_launch(storage, size, options, generation, hook_result)
+        self.finish_reserved_launch(storage, size, options, reservation, hook_result)
+    }
+
+    pub(crate) fn capture_revival_target(&self) -> Result<Option<RevivalTarget>> {
+        let session = self.tmux_session()?;
+        let observed = crate::tmux::utils::observe_pane(
+            session.name(),
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .map_err(|error| anyhow::Error::from(self.probe_failure_cause(error)))?;
+        Ok(observed.map(|(pane, state, _)| RevivalTarget {
+            pane: std::sync::Arc::new(pane),
+            state,
+        }))
+    }
+
+
+    fn preserve_indeterminate_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        probe: &LaunchProbe,
+        sandbox_prior: Option<&LaunchSandboxSnapshot>,
+        cause: LaunchIndeterminateCause,
+    ) -> Result<StartOutcome> {
+        self.last_error = Some(cause.message().to_owned());
+        self.last_error_check = Some(std::time::Instant::now());
+        self.release_indeterminate_launch(storage, generation, probe, sandbox_prior)
+            .map_err(|error| error.context(LaunchFinalizationPending { generation, cause }))?;
+        Ok(StartOutcome::Indeterminate { cause })
     }
     pub(crate) fn capture_before_restart_in(
         &mut self,
@@ -576,7 +654,7 @@ impl Instance {
         generation: u64,
     ) -> Result<()> {
         if let Err(error) = self.discard_stale_sandbox_container() {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         Ok(())
@@ -587,9 +665,10 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         restart: bool,
         reservation: LaunchReservation,
-    ) -> Result<u64> {
+    ) -> Result<PreparedLaunchReservation> {
         let LaunchReservation {
             generation,
+            revival,
             title_lock,
             lifecycle_lock,
         } = reservation;
@@ -598,14 +677,14 @@ impl Instance {
                 .stop_and_flush_poller_lifecycle_locked(storage)
                 .and_then(|()| self.capture_omp_before_restart(storage));
             if let Err(error) = capture {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         }
 
         drop(lifecycle_lock);
         drop(title_lock);
-        Ok(generation)
+        Ok(PreparedLaunchReservation { generation, revival })
     }
 
     pub(super) fn capture_resume_launch_target_in(&mut self, stores: CaptureStorage<'_>) {
@@ -641,9 +720,10 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         size: Option<(u16, u16)>,
         options: ResumeLaunchOptions,
-        generation: u64,
+        reservation: PreparedLaunchReservation,
         hook_result: Result<()>,
     ) -> Result<StartOutcome> {
+        let PreparedLaunchReservation { generation, revival } = reservation;
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         let ResumeLaunchOptions {
@@ -657,7 +737,7 @@ impl Instance {
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         if let Err(error) = self.preflight_resume_launch() {
             self.adopt_conversation_state(prior);
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         if std::mem::take(&mut self.force_fresh_next_launch) {
@@ -673,32 +753,36 @@ impl Instance {
                 workdir: sandbox.container_workdir.clone(),
             });
         let spawned = (|| {
-            let mut prepared =
-                self.stop_carry_and_prepare_in(storage, restart, conversation_carry, prior)?;
+            let mut prepared = self
+                .stop_carry_and_prepare_in(
+                    storage, restart, conversation_carry, prior, revival.as_ref(),
+                )
+                .map_err(|error| LaunchFailure { error, born: None })?;
             prepared.require_conversation_publication |= skipped_failed_resume_sid.is_some();
             self.spawn_prepared_launch(size, storage, prepared)
         })();
         let (launch_outcome, probe) = match spawned {
             Ok(spawned) => spawned,
-            Err(error) => {
+            Err(LaunchFailure { error, born }) => {
                 if let Some(&cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
                     let probe = LaunchProbe {
                         tmux_session: self.tmux_session()?.name().to_owned(),
                         pane: None,
                         expected: self.conversation_state(),
                     };
-                    if let Err(release) = self.release_indeterminate_launch(
+                    return self.preserve_indeterminate_launch(
                         storage,
                         generation,
                         &probe,
                         sandbox_prior.as_ref(),
-                    ) {
-                        tracing::warn!(target: "session.store", session = %self.id, %release,
-                            "indeterminate revival reservation release failed; runtime retained");
-                    }
-                    return Ok(StartOutcome::Indeterminate { cause });
+                        cause,
+                    );
                 }
-                self.fail_reserved_launch(storage, generation, &error, true);
+                let (probe, prior) = born
+                    .as_ref()
+                    .map(|(probe, prior)| (Some(probe), Some(prior)))
+                    .unwrap_or((None, None));
+                self.fail_reserved_launch(storage, generation, &error, probe, prior);
                 return Err(error);
             }
         };
@@ -713,26 +797,17 @@ impl Instance {
             Ok(outcome) => outcome,
             Err(error) => {
                 // Probe cleanup addresses only the captured pane, never a new name owner.
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         };
         if let StartOutcome::Indeterminate { cause } = outcome {
-            self.last_error = Some(cause.message().to_owned());
-            self.last_error_check = Some(std::time::Instant::now());
-            // A failed release cannot turn missing evidence into teardown authority.
-            if let Err(error) = self.release_indeterminate_launch(
-                storage,
-                generation,
-                &probe,
-                sandbox_prior.as_ref(),
-            ) {
-                tracing::warn!(target: "session.store", session = %self.id, error = %format_args!("{error:#}"), "indeterminate launch reservation release failed; runtime retained");
-            }
-            return Ok(outcome);
+            return self.preserve_indeterminate_launch(
+                storage, generation, &probe, sandbox_prior.as_ref(), cause,
+            );
         }
         if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart) {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         Ok(outcome)
@@ -756,6 +831,7 @@ impl Instance {
         restart: bool,
         conversation_carry: Option<ConversationCarry>,
         expected: ConversationState,
+        revival: Option<&RevivalTarget>,
     ) -> Result<PreparedLaunch> {
         let publication = if restart {
             self.prime_root_publication(true)
@@ -763,7 +839,19 @@ impl Instance {
             None
         };
         if restart {
-            self.kill_for_revival_locked()?;
+            let generation = self.lifecycle_generation;
+            if let Err(error) = self.kill_for_revival_locked(revival) {
+                if error.is::<LaunchIndeterminateCause>() {
+                    match self.restore_capture_after_refused_revival(storage, generation, expected) {
+                        Ok(PollerStart::Started) => {}
+                        Ok(outcome) => tracing::warn!(target: "session.store", session = %self.id,
+                            ?outcome, "retained runtime capture is not yet running after revival refusal"),
+                        Err(restore) => tracing::warn!(target: "session.store", session = %self.id,
+                            error = %format_args!("{restore:#}"), "retained runtime capture could not be restored"),
+                    }
+                }
+                return Err(error);
+            }
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -808,6 +896,28 @@ impl Instance {
         Ok(prepared)
     }
 
+    /// A pre-removal refusal may restore only its still-current captured producer.
+    fn restore_capture_after_refused_revival(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        expected: ConversationState,
+    ) -> Result<PollerStart> {
+        let rows = storage.load()?;
+        anyhow::ensure!(
+            self.lifecycle_generation == generation
+                && rows.iter().any(|row| {
+                    row.id == self.id
+                        && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
+                        && expected.matches(row)
+                        && row.omp_capture_generation == self.omp_capture_generation
+                }),
+            LaunchIndeterminateCause::OwnershipUnproven
+        );
+        self.adopt_conversation_state(expected);
+        self.maybe_start_poller_since_in(CaptureStorage::Scoped(storage))
+    }
+
     #[cfg(test)]
     fn stop_carry_and_prepare(
         &mut self,
@@ -817,7 +927,14 @@ impl Instance {
     ) -> Result<PreparedLaunch> {
         let storage =
             crate::session::storage::Storage::new_unwatched(&self.effective_profile()).unwrap();
-        self.stop_carry_and_prepare_in(&storage, restart, conversation_carry, expected)
+        let revival = if restart {
+            self.capture_revival_target()?
+        } else {
+            None
+        };
+        self.stop_carry_and_prepare_in(
+            &storage, restart, conversation_carry, expected, revival.as_ref(),
+        )
     }
 
     /// A failure fails the restart: relaunching into the old container would run the new tool
@@ -1100,7 +1217,7 @@ mod tests {
         let (_pane, observation) = observed_dead_resume_fixture(&instance);
         let probe = LaunchProbe {
             tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-            pane: Some(observation),
+            pane: Some(observation.into()),
             expected: instance.conversation_state(),
         };
         storage
@@ -1204,7 +1321,7 @@ mod tests {
                     restart: true,
                     conversation_carry: None,
                 },
-                generation,
+                PreparedLaunchReservation { generation, revival: None },
                 Ok(()),
             )
             .unwrap();
@@ -4014,7 +4131,7 @@ exec sleep 60
         let (_pane, observation) = observed_dead_resume_fixture(&instance);
         let probe = LaunchProbe {
             tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-            pane: Some(observation),
+            pane: Some(observation.into()),
             expected: instance.conversation_state(),
         };
         let releases = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -4136,7 +4253,7 @@ exec sleep 60
             let (_pane, observation) = observed_dead_resume_fixture(&instance);
             let probe = LaunchProbe {
                 tmux_session: instance.tmux_session().unwrap().name().to_owned(),
-                pane: Some(observation),
+                pane: Some(observation.into()),
                 expected: instance.conversation_state(),
             };
             let peer = std::rc::Rc::new(std::cell::RefCell::new(None));

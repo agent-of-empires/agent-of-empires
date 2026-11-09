@@ -683,7 +683,7 @@ pub(crate) async fn spawn_structured_session(
             let submission =
                 runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let guard = lock.blocking_lock();
-            let reservation = (|| -> anyhow::Result<()> {
+            let reservation = (|| -> anyhow::Result<_> {
                 native.check_available()?;
                 let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
                 let lifecycle_lock =
@@ -693,21 +693,24 @@ pub(crate) async fn spawn_structured_session(
                     false,
                     crate::session::LaunchReservation {
                         generation,
+                        revival: None,
                         title_lock,
                         lifecycle_lock,
                     },
-                )?;
-                Ok(())
+                )
             })();
             drop(guard);
             drop(submission);
             drop(namespace);
             reservation
         };
-        if let Err(error) = launch_reservation {
-            rollback(native, instance, false);
-            return Err(error);
-        }
+        let launch_reservation = match launch_reservation {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                rollback(native, instance, false);
+                return Err(error);
+            }
+        };
 
         creation_guard.phase(CreationPhase::LaunchHooks);
         let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation));
@@ -757,14 +760,23 @@ pub(crate) async fn spawn_structured_session(
                         restart: false,
                         conversation_carry: None,
                     },
-                    generation,
+                    launch_reservation,
                     Ok(()),
                 );
                 let _title = crate::session::acquire_session_title_lock(&instance.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
-                native.adopt_runtime_fields(&instance)?;
-                native.refresh_pane_observations(&instance)?;
-                outcome?;
+                let adoption = native
+                    .adopt_runtime_fields(&instance)
+                    .and_then(|()| native.refresh_pane_observations(&instance));
+                if let Err(error) = outcome {
+                    if let Err(adoption_error) = adoption {
+                        tracing::warn!(target: "session.store", session = %instance.id,
+                            error = %adoption_error,
+                            "canonical adoption also failed after refused launch finalization");
+                    }
+                    return Err(error);
+                }
+                adoption?;
             }
             Ok(())
         })();
@@ -773,6 +785,15 @@ pub(crate) async fn spawn_structured_session(
         drop(submission);
         drop(namespace);
         if let Err(error) = post_hooks {
+            if error.is::<crate::session::LaunchFinalizationPending>() {
+                native.defer_lifecycle_release(
+                    instance.id.clone(),
+                    crate::session::LifecycleRelease::IndeterminateLaunch,
+                    generation,
+                    None,
+                );
+                return Err(error);
+            }
             // Archiving during hooks preserves the row but refuses ACP admission.
             if !error.is::<crate::session::StartBlocked>() {
                 rollback(native, instance, false);

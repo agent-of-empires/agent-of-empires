@@ -589,7 +589,7 @@ impl Instance {
         {
             Ok(lock) => lock,
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         };
@@ -600,12 +600,12 @@ impl Instance {
         {
             Ok(lock) => lock,
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         };
         if let Err(error) = self.reconcile_from_store(storage) {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         // The hooks ran without the lifecycle lock, so a peer may have archived or trashed the
@@ -615,7 +615,7 @@ impl Instance {
             return Err(blocked.into());
         }
         if let Err(error) = hook_result {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         self.ensure_reservation_current_or_fail(storage, generation)?;
@@ -746,7 +746,7 @@ impl Instance {
         match self.ensure_reservation_current(storage, generation) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 Err(error)
             }
         }
@@ -757,22 +757,27 @@ impl Instance {
         storage: &dyn crate::session::SessionStore,
         generation: u64,
         error: &anyhow::Error,
-        cleanup_pane: bool,
+        cleanup: Option<&super::resume::LaunchProbe>,
+        prior: Option<&ConversationState>,
     ) {
-        if !self
-            .reservation_is_current(storage, generation)
-            .unwrap_or(false)
-        {
+        let Ok(rows) = storage.load() else {
+            return;
+        };
+        let Some(row) = rows.iter().find(|row| row.id == self.id) else {
+            return;
+        };
+        if !row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
             return;
         }
-        let scope_failure = if cleanup_pane {
-            if let Err(error) = self.kill_clean_locked() {
-                tracing::debug!(target: "session.lifecycle", session = %self.id, %error, "pane cleanup failed");
-            }
-            self.release_scope().err()
-        } else {
-            None
-        };
+        let cleanup = cleanup.filter(|probe| {
+            !error.is::<super::kill::RuntimeRemovedCleanupFailed>()
+                && !error.is::<crate::session::NativeStoreUnavailable>()
+                && !error.is::<crate::session::SessionCommitApplied>()
+                && (probe.expected.matches_launch_observation(row)
+                    || prior.is_some_and(|prior| prior.matches(row)))
+        });
+        let scope_failure =
+            cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(
@@ -924,10 +929,37 @@ mod tests {
         }
     }
 
+    fn failed_launch_birth(
+        row: &Instance,
+    ) -> (
+        crate::tmux::test_helpers::TmuxTestSession,
+        super::super::resume::LaunchProbe,
+    ) {
+        let session = row.tmux_session().unwrap();
+        let cleanup = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        session
+            .create_with_size(&row.project_path, Some("sleep 60"), None, &row.source_profile)
+            .expect("managed rollback fixture must really create its pane");
+        let observed = row
+            .capture_revival_target()
+            .unwrap()
+            .expect("managed rollback fixture must have physical birth evidence");
+        assert_eq!(observed.state, crate::tmux::utils::PaneProbe::Alive);
+        let probe = super::super::resume::LaunchProbe {
+            tmux_session: session.name().to_owned(),
+            pane: Some(observed.pane),
+            expected: row.conversation_state(),
+        };
+        (cleanup, probe)
+    }
+
     #[test]
     #[serial_test::serial]
     fn managed_refusal_retains_cleanup_diagnostics_without_public_reflection() {
         use crate::process::worker_registry::ScopeOwnership;
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
 
         for cleanup_pane in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -958,8 +990,15 @@ mod tests {
             let error =
                 anyhow::anyhow!("private-primary-diagnostic").context(ManagedResumeRefused(cause));
             let logs = crate::session::test_support::LogCapture::start();
+            let birth = cleanup_pane.then(|| failed_launch_birth(&row));
 
-            row.fail_reserved_launch(&storage, generation, &error, cleanup_pane);
+            row.fail_reserved_launch(
+                &storage,
+                generation,
+                &error,
+                birth.as_ref().map(|(_, probe)| probe),
+                None,
+            );
 
             let public = row.last_error.as_deref().unwrap();
             assert!(!public.contains(&scope_diagnostic), "{public}");
@@ -1691,7 +1730,7 @@ mod tests {
         inst.ensure_reservation_current_or_fail(&storage, reserved_gen)
             .unwrap();
         let error = anyhow::anyhow!("launch failed after status drift");
-        inst.fail_reserved_launch(&storage, reserved_gen, &error, false);
+        inst.fail_reserved_launch(&storage, reserved_gen, &error, None, None);
 
         let leftover = storage
             .update(|instances, _groups| {
@@ -1720,6 +1759,11 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "lifecycle-rollback-scope";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _socket = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", temp.path().join("tmux.sock"));
         let held_at_release = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&held_at_release);
         let _probe = crate::process::systemd::release_probe::install(move |id| {
@@ -1734,7 +1778,7 @@ mod tests {
             seen.borrow_mut().push((id.to_string(), held));
         });
         let reserved = |id: &str| {
-            let mut inst = Instance::new(id, "/tmp/test");
+            let mut inst = Instance::new(id, temp.path().to_str().unwrap());
             inst.source_profile = profile.to_string();
             storage
                 .update(|instances, _groups| {
@@ -1753,7 +1797,10 @@ mod tests {
         let error = anyhow::anyhow!("pinned launch exited");
 
         let mut rolled_back = reserved("rolled-back");
-        rolled_back.fail_reserved_launch(&storage, rolled_back.lifecycle_generation, &error, true);
+        let (_rollback_cleanup, rollback_birth) = failed_launch_birth(&rolled_back);
+        rolled_back.fail_reserved_launch(
+            &storage, rolled_back.lifecycle_generation, &error, Some(&rollback_birth), None,
+        );
         assert_eq!(
             *held_at_release.borrow(),
             [(rolled_back.id.clone(), Some(LifecycleOperation::Launch))]
@@ -1769,10 +1816,11 @@ mod tests {
         held_at_release.borrow_mut().clear();
 
         let mut kept_pane = reserved("kept-pane");
-        kept_pane.fail_reserved_launch(&storage, kept_pane.lifecycle_generation, &error, false);
+        kept_pane.fail_reserved_launch(&storage, kept_pane.lifecycle_generation, &error, None, None);
         let restarted = reserved("restarted");
         restarted.kill_clean_locked().unwrap();
         let mut superseded = reserved("superseded");
+        let (_superseded_cleanup, superseded_birth) = failed_launch_birth(&superseded);
         storage
             .update(|instances, _groups| {
                 let stored = instances
@@ -1783,7 +1831,14 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        superseded.fail_reserved_launch(&storage, superseded.lifecycle_generation, &error, true);
+        superseded.fail_reserved_launch(
+            &storage, superseded.lifecycle_generation, &error, Some(&superseded_birth), None,
+        );
+        assert_eq!(
+            &superseded.capture_revival_target().unwrap().unwrap().pane,
+            superseded_birth.pane.as_ref().unwrap(),
+            "a superseding durable generation must preserve the captured physical producer"
+        );
         assert!(held_at_release.borrow().is_empty());
     }
 

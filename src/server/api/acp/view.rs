@@ -551,7 +551,7 @@ impl Drop for TerminalHandoff {
             SessionStore::defer_lifecycle_release(
                 native,
                 self.session_id.clone(),
-                crate::session::LifecycleOperation::Launch,
+                crate::session::LifecycleRelease::Reservation(crate::session::LifecycleOperation::Launch),
                 key.generation,
                 None,
             );
@@ -946,6 +946,44 @@ fn commit_terminal_in(
     })
 }
 
+/// A prepared payload is not a birth receipt. The existing no-launch transition is
+/// only for a still-blocked row; it neither adopts a pane nor attests a missing birth.
+fn ensure_handoff_launch_receipt(
+    row: &Instance,
+    key: HandoffKey,
+) -> anyhow::Result<()> {
+    let intent = row
+        .terminal_handoff
+        .as_ref()
+        .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+    anyhow::ensure!(
+        row.view == View::Terminal
+            && row.lifecycle_generation == key.generation
+            && intent.id == key.id
+            && intent.generation == key.generation
+            && intent.target_generation <= key.generation,
+        crate::session::LifecycleReservationError::Superseded
+    );
+    if !intent.launch_required && !intent.launch_started && intent.launch.is_none() {
+        anyhow::ensure!(
+            row.ensure_startable().is_err(),
+            crate::session::LaunchIndeterminateCause::OwnershipUnproven
+        );
+        return Ok(());
+    }
+    let launch = intent
+        .launch
+        .as_ref()
+        .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
+    anyhow::ensure!(
+        launch.receipt.is_some()
+            && launch.generation >= intent.target_generation
+            && launch.generation <= key.generation,
+        crate::session::LaunchIndeterminateCause::OwnershipUnproven
+    );
+    Ok(())
+}
+
 fn finish_handoff_in(
     native: &crate::server::session_store::NativeSessionStore,
     session_id: &str,
@@ -963,6 +1001,7 @@ fn finish_handoff_in(
             row.view == View::Terminal,
             LifecycleReservationError::Superseded
         );
+        ensure_handoff_launch_receipt(row, key)?;
         let intent = matching_handoff(row, profile, profile_identity, key)?;
         anyhow::ensure!(
             intent.stage == TerminalHandoffStage::ProjectionCleanupOwed,
@@ -1332,6 +1371,16 @@ fn drive_terminal_handoff(
                             .store()
                             .storage()
                             .acquire_instance_lifecycle_lock(&launch_id)?;
+                        ensure_handoff_launch_receipt(&row, attempt)?;
+                        let launch = row
+                            .terminal_handoff
+                            .as_ref()
+                            .and_then(|intent| intent.launch.as_ref())
+                            .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
+                        let terminal = row.tmux_session()?;
+                        Instance::ensure_terminal_handoff_pane_matches(
+                            terminal.name(), attempt, launch,
+                        )?;
                         held.store().adopt_runtime_fields(&row)?;
                         held.store().refresh_pane_observations(&row)?;
                         let identity = held.store().storage().bound_profile_identity()?;
@@ -1372,6 +1421,17 @@ fn drive_terminal_handoff(
                             .into_iter()
                             .find(|row| row.id == cleanup_id)
                             .ok_or(crate::session::SessionGone)?;
+                        ensure_handoff_launch_receipt(&current, key)?;
+                        if let Some(launch) = current
+                            .terminal_handoff
+                            .as_ref()
+                            .and_then(|intent| intent.launch.as_ref())
+                        {
+                            let terminal = current.tmux_session()?;
+                            Instance::ensure_terminal_handoff_pane_matches(
+                                terminal.name(), key, launch,
+                            )?;
+                        }
                         let identity = native.storage().bound_profile_identity()?;
                         let recorded = matching_handoff(
                             &mut current,

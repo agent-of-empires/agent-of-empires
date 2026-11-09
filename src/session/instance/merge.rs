@@ -25,6 +25,17 @@ impl Instance {
         self.inherit_process_fields(prior);
     }
 
+    /// A tmux status refresh is not a new launch: keep compatible repair pacing.
+    pub(crate) fn inherit_process_runtime_from_reload(&mut self, prior: Self) {
+        self.capture_poller.adopt_reload(
+            &prior.capture_poller,
+            prior.held(),
+            Held::new(&self.tool, self.active_execution.as_ref()),
+            Unserved::Stop,
+        );
+        self.inherit_process_fields(prior);
+    }
+
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
         self.capture_poller.adopt_relaunch(

@@ -363,6 +363,94 @@ pub(crate) struct OwnedPaneProbe {
     pub(crate) exclusive: bool,
 }
 
+/// Capture the physical first pane without turning failed inspection into absence.
+pub(crate) fn observe_pane(
+    session_name: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<Option<(crate::session::LegacyToolObservation, PaneProbe, bool)>> {
+    let panes = match first_window_pane_ids_classified(session_name, deadline, None) {
+        PaneListLookup::Missing => return Ok(None),
+        PaneListLookup::Unknown(error) => return Err(error),
+        PaneListLookup::Panes(panes) => panes,
+    };
+    let pane = panes
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("pane identity unavailable"))?;
+    let mut command = crate::tmux::tmux_query_command();
+    command.args([
+        "display-message", "-p", "-t", pane,
+        "#{n:socket_path}|#{socket_path}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+    ]);
+    let output = deadline.run(&mut command)?;
+    anyhow::ensure!(output.status.success(), "physical pane inspection failed");
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let (length, data) = stdout
+        .trim_end_matches(['\r', '\n'])
+        .split_once('|')
+        .ok_or_else(|| anyhow::anyhow!("missing tmux socket length"))?;
+    let length = length.parse::<usize>()?;
+    let socket = data
+        .get(..length)
+        .ok_or_else(|| anyhow::anyhow!("invalid tmux socket length"))?;
+    let suffix = data
+        .get(length..)
+        .and_then(|rest| rest.strip_prefix('|'))
+        .ok_or_else(|| anyhow::anyhow!("malformed tmux socket field"))?;
+    let mut parts = suffix.splitn(7, '|');
+    let fields: [Option<&str>; 7] = std::array::from_fn(|_| parts.next());
+    let [Some(session_id), Some(pane_id), Some(pane_pid), Some(server_pid), Some(dead), Some(current_command), Some(start_command)] =
+        fields
+    else {
+        bail!("malformed physical pane observation");
+    };
+    for (id, prefix) in [(session_id, '$'), (pane_id, '%')] {
+        anyhow::ensure!(
+            id.strip_prefix(prefix).is_some_and(
+                |digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            ),
+            "invalid physical pane identity"
+        );
+    }
+    anyhow::ensure!(
+        pane_id == pane && !socket.is_empty(),
+        "physical pane changed during inspection"
+    );
+    let state = classify_pane_probe(true, dead, &[]);
+    anyhow::ensure!(
+        state == PaneProbe::Dead || (state == PaneProbe::Alive && !current_command.is_empty()),
+        "physical pane state unavailable"
+    );
+    let pid: u32 = server_pid.parse()?;
+    let birth = crate::process::process_birth_identity(pid)?
+        .ok_or_else(|| anyhow::anyhow!("physical tmux server birth unavailable"))?;
+    let pane_pid = if pane_pid.is_empty() {
+        None
+    } else {
+        Some(pane_pid.parse()?)
+    };
+    anyhow::ensure!(
+        state == PaneProbe::Dead || pane_pid.is_some(),
+        "live pane process identity unavailable"
+    );
+    let observation = crate::session::LegacyToolObservation {
+        identity: crate::session::LegacyToolIdentity {
+            session_id: session_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            pane_pid,
+        },
+        server: std::sync::Arc::new(crate::session::TmuxServerIdentity {
+            socket: socket.to_owned(),
+            pid,
+            birth,
+        }),
+    };
+    let shell = is_pane_running_shell_command(
+        current_command,
+        start_command.contains(PANE_ENV_FILE_PREFIX),
+    );
+    Ok(Some((observation, state, shell)))
+}
+
 /// Fresh observation of the pane this launch created. None means ownership changed.
 pub(crate) fn probe_owned_pane(
     session_name: &str,

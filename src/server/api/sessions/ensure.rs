@@ -211,23 +211,8 @@ pub(super) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
     else {
         return Ok(None);
     };
-    if pane.pane_dead {
+    if !instance.pane_is_ready(pane)? {
         return Ok(None);
-    }
-    if !instance.expects_shell()
-        && !instance.has_command_override()
-        && crate::hooks::read_hook_status(&instance.id).is_none()
-    {
-        let command = pane
-            .pane_current_command
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
-        if crate::tmux::utils::is_pane_running_shell_command(
-            command,
-            pane.pane_start_command_is_protected,
-        ) {
-            return Ok(None);
-        }
     }
     Ok(Some(name.to_owned()))
 }
@@ -272,8 +257,7 @@ pub(super) async fn agent_target_response(
     }
     if outcome.is_some() {
         instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let session = instance.tmux_session()?;
-            instance.wait_for_pane_ready(&session);
+            instance.wait_for_pane_ready()?;
             Ok(instance)
         })
         .await
@@ -381,10 +365,15 @@ pub(super) async fn agent_target_response(
 }
 
 fn agent_target_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if let Some(cause) = error.downcast_ref::<crate::session::LaunchIndeterminateCause>() {
+        return indeterminate_launch_response(*cause);
+    }
     if let Some(response) = lifecycle_rejection(state, &error) {
         return response;
     }
-    if error.is::<crate::session::NativeStoreUnavailable>() {
+    if error.is::<crate::session::NativeStoreUnavailable>()
+        || error.is::<crate::session::LaunchFinalizationPending>()
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if error.is::<AgentTargetUnavailable>() {
