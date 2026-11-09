@@ -52,17 +52,17 @@ impl Budget {
         let mut child = crate::process::OwnedProcessGroup::spawn(command)
             .context("spawning plugin command process group")?;
         let pid = child.id();
-        let mut descendants = match crate::process::CapturedProcessTree::capture(pid) {
-            Ok(tree) => Some(tree),
-            Err(error) => match child.exited() {
-                Ok(true) => None,
-                outcome => {
-                    std::mem::forget(child);
-                    return Err(RecoveryRequired(format!(
-                        "cannot attest descendants of command {pid}: {error:#}; leader status: {outcome:?}"
-                    )).into());
-                }
-            },
+        let stdout = child.take_stdout();
+        let stderr = child.take_stderr();
+        let mut descendants = match crate::process::OwnedProcessTree::capture(&child) {
+            Ok(tree) => tree,
+            Err(error) => {
+                std::mem::forget((child, stdout, stderr));
+                return Err(RecoveryRequired(format!(
+                    "cannot attest descendants of command {pid}: {error:#}"
+                ))
+                .into());
+            }
         };
         // Drain captured Git output concurrently. Build stdio remains attached to its log.
         fn reader<R: Read + Send + 'static>(
@@ -76,8 +76,8 @@ impl Budget {
                 })
             })
         }
-        let stdout = reader(child.take_stdout());
-        let stderr = reader(child.take_stderr());
+        let stdout = reader(stdout);
+        let stderr = reader(stderr);
         let mut timed_out = false;
         let mut next_census = Instant::now() + Duration::from_secs(1);
         loop {
@@ -87,20 +87,13 @@ impl Budget {
             }
             let expired = self.is_expired();
             if expired || Instant::now() >= next_census {
-                let observed = descendants.as_mut().map_or(Ok(()), |tree| tree.refresh());
-                if let Err(error) = observed {
-                    match child.exited() {
-                        Ok(true) => {
-                            timed_out = expired;
-                            break;
-                        }
-                        outcome => {
-                            std::mem::forget((descendants, child));
-                            return Err(RecoveryRequired(format!(
-                                "cannot observe command {pid}: {error:#}; leader status: {outcome:?}"
-                            )).into());
-                        }
-                    }
+                if let Err(error) = descendants.refresh() {
+                    std::mem::forget(descendants);
+                    std::mem::forget(child);
+                    return Err(RecoveryRequired(format!(
+                        "cannot observe command {pid}: {error:#}"
+                    ))
+                    .into());
                 }
                 next_census = Instant::now() + Duration::from_secs(1);
             }
@@ -116,7 +109,8 @@ impl Budget {
                 Ok(true) => break,
                 Ok(false) => std::thread::sleep(Duration::from_millis(25)),
                 Err(error) => {
-                    std::mem::forget((descendants, child));
+                    std::mem::forget(descendants);
+                    std::mem::forget(child);
                     return Err(RecoveryRequired(format!(
                         "cannot wait for command {pid}: {error}"
                     ))
@@ -125,17 +119,17 @@ impl Budget {
             }
         }
         // A completed leader can leave writers behind. Settle them on success too.
-        if let Some(tree) = &descendants {
-            if let Err(error) = tree.settle(Duration::from_millis(250)) {
-                std::mem::forget((descendants, child));
-                return Err(RecoveryRequired(format!(
-                    "command {pid} descendant settlement unproven: {error:#}"
-                ))
-                .into());
-            }
+        if let Err(error) = descendants.settle(Duration::from_millis(250)) {
+            std::mem::forget(descendants);
+            std::mem::forget(child);
+            return Err(RecoveryRequired(format!(
+                "command {pid} descendant settlement unproven: {error:#}"
+            ))
+            .into());
         }
+        drop(descendants);
         if let Err(error) = child.settle(Duration::from_millis(250)) {
-            std::mem::forget((descendants, child));
+            std::mem::forget(child);
             return Err(
                 RecoveryRequired(format!("command {pid} settlement unproven: {error:#}")).into(),
             );

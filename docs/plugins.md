@@ -119,7 +119,8 @@ The host terminates its owned command group and retained descendant handles,
 even after those descendants change group, before rollback and exclusion release.
 The direct command child stays unreaped until settlement, reserving its original
 process group even when the leader exits before a later-born group member.
-It verifies their physical exit. Observation ending does
+It verifies their physical exit. A changed descendant identity does not prove
+exit; unproven custody requires manual recovery. Observation ending does
 not cancel an accepted mutation. This policy adds no cancellation endpoint,
 flag, or configurable timeout, and commands remain unsandboxed: it is not a
 guarantee against malicious commands escaping their owned process scope or

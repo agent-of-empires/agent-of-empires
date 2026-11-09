@@ -1380,6 +1380,12 @@ impl ProcessHandle {
         Self::capture_identity(identity, false)
     }
 
+    pub(super) fn capture_owned(
+        identity: &super::PrimeProcessIdentity,
+    ) -> anyhow::Result<Option<Self>> {
+        Self::capture_identity(identity, true)
+    }
+
     pub(super) fn capture_group(
         identity: &super::PrimeProcessIdentity,
     ) -> anyhow::Result<Option<Self>> {
@@ -1458,6 +1464,10 @@ impl ProcessHandle {
         Ok(result > 0)
     }
 
+    pub(super) fn physically_exited(&self) -> anyhow::Result<bool> {
+        self.exited()
+    }
+
     pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {
         use std::os::fd::AsRawFd as _;
         let result = unsafe {
@@ -1518,12 +1528,41 @@ pub(super) fn runner_group_identities(
 pub(super) fn process_tree_samples(
     root: &super::PrimeProcessIdentity,
 ) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    process_tree_samples_with_root(root, false)
+}
+
+pub(super) fn owned_process_tree_samples(
+    root: &super::OwnedProcessGroup,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    process_tree_samples_with_root(
+        &super::PrimeProcessIdentity {
+            pid: root.id(),
+            start_id: String::new(),
+        },
+        true,
+    )
+}
+
+fn process_tree_samples_with_root(
+    root: &super::PrimeProcessIdentity,
+    owned_root: bool,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
     let mut samples = Vec::new();
+    if owned_root {
+        samples.push(super::PrimeProcessSample {
+            identity: root.clone(),
+            parent: 0,
+            marked: false,
+        });
+    }
     for entry in fs::read_dir("/proc")? {
         let entry = entry?;
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
             continue;
         };
+        if owned_root && pid == root.pid {
+            continue;
+        }
         let stat = match fs::read_to_string(entry.path().join("stat")) {
             Ok(stat) => stat,
             Err(error) if process_disappeared(&error) => continue,
@@ -1546,10 +1585,12 @@ pub(super) fn process_tree_samples(
             });
         }
     }
-    anyhow::ensure!(
-        samples.iter().any(|sample| sample.identity == *root),
-        "tool root omitted from census"
-    );
+    if !owned_root {
+        anyhow::ensure!(
+            samples.iter().any(|sample| sample.identity == *root),
+            "tool root omitted from census"
+        );
+    }
     Ok(samples)
 }
 

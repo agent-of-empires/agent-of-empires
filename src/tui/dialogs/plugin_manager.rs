@@ -2610,7 +2610,7 @@ mod daemon_update_tests {
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _home = crate::session::test_support::isolate_app_dir();
         let source = tempfile::tempdir().unwrap();
-        let effects = tempfile::tempdir_in("/tmp").unwrap();
+        let effects = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         std::fs::set_permissions(effects.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let pid_file = effects.path().join("worker-pid");
         let receipt = effects.path().join("worker-receipt");

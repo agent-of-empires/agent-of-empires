@@ -292,6 +292,20 @@ struct AuditToken {
     values: [u32; 8],
 }
 
+impl AuditToken {
+    fn matches_start_id(&self, value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes.len() == 70
+            && bytes.starts_with(b"audit:")
+            && self.values.iter().enumerate().all(|(index, word)| {
+                (0..8).all(|digit| {
+                    let nibble = ((*word >> (28 - digit * 4)) & 15) as usize;
+                    bytes[6 + index * 8 + digit] == b"0123456789abcdef"[nibble]
+                })
+            })
+    }
+}
+
 unsafe extern "C" {
     static mach_task_self_: libc::mach_port_t;
     fn task_name_for_pid(
@@ -371,15 +385,41 @@ impl ProcessHandle {
         let Some(token) = audit_token(identity.pid)? else {
             return Ok(None);
         };
-        if audit_start_id(&token) != identity.start_id {
+        if !token.matches_start_id(&identity.start_id) {
             return Ok(None);
         }
+        Ok(Some(Self(token)))
+    }
+
+    pub(super) fn capture_owned(
+        identity: &super::PrimeProcessIdentity,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(token) = audit_token(identity.pid)? else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            token.matches_start_id(&identity.start_id),
+            "owned descendant {} changed identity during capture",
+            identity.pid
+        );
         Ok(Some(Self(token)))
     }
 
     pub(super) fn exited(&self) -> anyhow::Result<bool> {
         Ok(audit_token(self.0.values[5])?
             .is_none_or(|current| current.values[7] != self.0.values[7]))
+    }
+
+    pub(super) fn physically_exited(&self) -> anyhow::Result<bool> {
+        let Some(current) = audit_token(self.0.values[5])? else {
+            return Ok(true);
+        };
+        anyhow::ensure!(
+            current == self.0,
+            "owned descendant {} changed identity before physical exit",
+            self.0.values[5]
+        );
+        Ok(false)
     }
 
     pub(super) fn signal(&self, signal: i32) -> anyhow::Result<()> {
@@ -511,6 +551,25 @@ pub(super) fn foreign_runner_group_absent(pid: u32) -> anyhow::Result<bool> {
 pub(super) fn process_tree_samples(
     root: &super::PrimeProcessIdentity,
 ) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    process_tree_samples_with_root(root, false)
+}
+
+pub(super) fn owned_process_tree_samples(
+    root: &super::OwnedProcessGroup,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
+    process_tree_samples_with_root(
+        &super::PrimeProcessIdentity {
+            pid: root.id(),
+            start_id: String::new(),
+        },
+        true,
+    )
+}
+
+fn process_tree_samples_with_root(
+    root: &super::PrimeProcessIdentity,
+    owned_root: bool,
+) -> anyhow::Result<Vec<super::PrimeProcessSample>> {
     let mut command = Command::new("ps");
     command.args(["-A", "-o", "pid=,ppid=,stat="]);
     let output = crate::session::capture::run_with_timeout_limit(
@@ -520,10 +579,20 @@ pub(super) fn process_tree_samples(
         1024 * 1024,
     )?;
     let mut candidates = Vec::new();
+    if owned_root {
+        candidates.push(super::PrimeProcessSample {
+            identity: root.clone(),
+            parent: 0,
+            marked: false,
+        });
+    }
     for line in std::str::from_utf8(&output)?.lines() {
         let mut fields = line.split_ascii_whitespace();
         let pid = fields.next().context("missing process PID")?.parse()?;
         let parent = fields.next().context("missing process parent")?.parse()?;
+        if owned_root && pid == root.pid {
+            continue;
+        }
         if !fields
             .next()
             .context("missing process state")?
@@ -549,23 +618,36 @@ pub(super) fn process_tree_samples(
         if !selected {
             continue;
         }
+        if owned_root && sample.identity.pid == root.pid {
+            samples.push(sample);
+            continue;
+        }
         let pid = sample.identity.pid;
         let Some(token) = audit_token(pid)? else {
             continue;
         };
-        let membership = process_membership(pid)?.context("tool process membership unavailable")?;
+        let Some(membership) = process_membership(pid)? else {
+            anyhow::ensure!(owned_root, "tool process membership unavailable");
+            continue;
+        };
+        let after = audit_token(pid)?;
+        if owned_root && after.is_none() {
+            continue;
+        }
         anyhow::ensure!(
-            audit_token(pid)? == Some(token),
+            after == Some(token),
             "tool process incarnation changed during census"
         );
         sample.identity.start_id = audit_start_id(&token);
         sample.parent = membership.pbi_ppid;
         samples.push(sample);
     }
-    anyhow::ensure!(
-        samples.iter().any(|sample| sample.identity == *root),
-        "tool root omitted from census"
-    );
+    if !owned_root {
+        anyhow::ensure!(
+            samples.iter().any(|sample| sample.identity == *root),
+            "tool root omitted from census"
+        );
+    }
     Ok(samples)
 }
 
@@ -1427,6 +1509,112 @@ mod tests {
         for _ in 0..3 {
             guard.refresh(&mut guard.members.lock()).unwrap();
             assert_eq!(roots(&guard), 1, "root duplicated by refresh");
+        }
+    }
+
+    #[test]
+    fn original_child_custody_handles_zombies_and_exec_without_rebinding_descendants() {
+        use crate::process::{CapturedProcessTree, OwnedProcessGroup, OwnedProcessTree};
+        use std::io::Write as _;
+        use std::time::{Duration, Instant};
+
+        struct Original(Option<OwnedProcessGroup>);
+        impl Drop for Original {
+            fn drop(&mut self) {
+                if let Some(mut group) = self.0.take() {
+                    let _ = group.settle(Duration::ZERO);
+                    let _ = group.reap();
+                }
+            }
+        }
+        fn published_pid(path: &std::path::Path) -> u32 {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(pid) = std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    return pid;
+                }
+                assert!(Instant::now() < deadline, "child did not publish readiness");
+                std::thread::yield_now();
+            }
+        }
+
+        let mut completed = Original(Some(
+            OwnedProcessGroup::spawn(&mut Command::new("true")).unwrap(),
+        ));
+        let group = completed.0.as_ref().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !group.exited().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!runner_group_executing(group.id()).unwrap());
+        completed
+            .0
+            .as_mut()
+            .unwrap()
+            .settle(Duration::ZERO)
+            .unwrap();
+        assert!(completed.0.take().unwrap().reap().unwrap().success());
+
+        for descendant_exec in [false, true] {
+            let effects = tempfile::tempdir().unwrap();
+            std::fs::write(
+                effects.path().join("first.sh"),
+                "printf '%s' \"$$\" > ready\nIFS= read -r release\nexec sh second.sh\n",
+            )
+            .unwrap();
+            std::fs::write(
+                effects.path().join("second.sh"),
+                "printf '%s' \"$$\" > advanced\nIFS= read -r release\n",
+            )
+            .unwrap();
+            let mut command = Command::new("sh");
+            if descendant_exec {
+                command.args(["-c", "sh first.sh <&0 & wait"]);
+            } else {
+                command.arg("first.sh");
+            }
+            command
+                .current_dir(effects.path())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            let mut original = Original(Some(OwnedProcessGroup::spawn(&mut command).unwrap()));
+            let mut input = original.0.as_mut().unwrap().child.stdin.take().unwrap();
+            let group = original.0.as_ref().unwrap();
+            let pid = published_pid(&effects.path().join("ready"));
+            let before = audit_token(pid).unwrap().unwrap();
+            let stale = (!descendant_exec).then(|| CapturedProcessTree::capture(pid).unwrap());
+            let mut owned = OwnedProcessTree::capture(group).unwrap();
+            input.write_all(b"advance\n").unwrap();
+            assert_eq!(published_pid(&effects.path().join("advanced")), pid);
+            let after = audit_token(pid).unwrap().unwrap();
+            assert_ne!(before.values[7], after.values[7]);
+            assert!(!group.exited().unwrap());
+
+            if descendant_exec {
+                assert!(owned.refresh().is_err());
+                assert!(before.matches_start_id(&owned.members.get(&pid).unwrap().0));
+                assert!(owned.settle(Duration::ZERO).is_err());
+                assert!(!group.exited().unwrap());
+            } else {
+                assert_eq!(pid, group.id());
+                let recovered =
+                    CapturedProcessTree::resume(stale.as_ref().unwrap().receipt().clone(), pid)
+                        .unwrap();
+                recovered.settle(Duration::ZERO).unwrap();
+                assert!(!group.exited().unwrap());
+                owned.refresh().unwrap();
+                owned.settle(Duration::ZERO).unwrap();
+                assert!(!group.exited().unwrap());
+            }
+            drop(owned);
+            original.0.as_mut().unwrap().settle(Duration::ZERO).unwrap();
+            assert!(!runner_group_executing(original.0.as_ref().unwrap().id()).unwrap());
+            assert!(!original.0.take().unwrap().reap().unwrap().success());
         }
     }
 }

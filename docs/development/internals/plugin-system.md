@@ -27,8 +27,10 @@ Sources are local paths or GitHub references. Installation stages content in the
 `execution.rs` gives preparation/application one fixed two-hour wall-clock
 budget across Git and approved builds. A private spawn-only owned-child wrapper
 keeps the direct child unreaped, reserving its original PGID through settlement.
-Captured descendants retain escaped live custody but prune physically exited
-history with an active PID index. Recovered runner authority remains birth-bound.
+Its ephemeral descendant tree borrows that custody instead of requiring a
+historical root audit token across exec. Descendants retain their native signal
+authority; token obsolescence is not physical exit. Recovered trees and runners
+remain birth-bound. Physically exited history is pruned through a PID index.
 Tree and target metadata roll back together; the old tree remains until config
 and lock writes commit. Unproven settlement/restoration or post-commit backup
 cleanup retains exclusion, evidence and an in-process recovery fence, including
