@@ -3184,8 +3184,9 @@
       "id": "acp.approval-resolve-clear",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/acpSession/reducer.test.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/hooks/acpSession/reducer.test.ts", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts"],
+      "notes": "A failed approval POST records the error and rejects so the card can retry; a 404 for an approval already resolved counts as resolved."
     },
     {
       "id": "acp.attention-chime",
@@ -3625,14 +3626,16 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
-      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
+      "notes": "Destructive holds run by mouse, touch, or Space/Enter held 800ms; release and blur cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every decision. Card and modal order decisions Allow, Always, Deny."
     },
     {
       "id": "acp.plan-modal",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-plan-modal.spec.ts"],
-      "components": ["web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/PlanModal.tsx", "web/src/components/Dialog.tsx"],
+      "notes": "At 390px an answer list wraps the footer so Close, every answer, and Dismiss stay inside the panel."
     },
     {
       "id": "acp.markdown",

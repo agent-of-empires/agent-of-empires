@@ -159,3 +159,27 @@ test("a plan file link closes the modal and leaves Tab alone while the approval 
 
   await expect(page.getByRole("alertdialog", { includeHidden: true })).toHaveCount(1);
 });
+
+test.describe("phone width", () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test("an answer list wraps the footer so every decision stays on screen", async ({ page }) => {
+    const answers = ["Yes, and auto-accept edits", "Yes, and manually approve edits", "No, keep planning"];
+    const choice = {
+      ...approval,
+      choice: true,
+      options: answers.map((name, i) => ({ option_id: `o-${i}`, name, kind: "allow_once" })),
+    };
+    const mock = await mockAcpSession(page, { title: TITLE, reducedState: { pending_approvals: [choice] } });
+    await openStructuredSession(page, mock);
+    await page.getByRole("button", { name: "View plan" }).click();
+    const dialog = page.getByRole("dialog", { name: "Plan" });
+    const panel = (await dialog.locator("> div").boundingBox())!;
+    for (const name of ["Close", ...answers, "Dismiss"]) {
+      const box = (await dialog.getByRole("button", { name, exact: true }).boundingBox())!;
+      expect(box.x, name).toBeGreaterThanOrEqual(panel.x);
+      expect(box.x + box.width, name).toBeLessThanOrEqual(panel.x + panel.width);
+      expect(box.height, name).toBeLessThan(60);
+    }
+  });
+});

@@ -56,7 +56,7 @@ export function Dialog({
         <div id={`${id}-desc`} className={bodyClassName}>
           {children}
         </div>
-        <div className="flex justify-end gap-3 px-5 py-3 border-t border-surface-700">{footer}</div>
+        <div className="flex flex-wrap justify-end gap-3 px-5 py-3 border-t border-surface-700">{footer}</div>
       </div>
     </div>
   );
