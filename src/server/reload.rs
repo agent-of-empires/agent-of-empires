@@ -684,7 +684,12 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
 /// state to the fresh row, so both must decide the same way whether that row
 /// still runs what the prior one ran.
 pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = Handoff::decide(&prior.capture_poller, prior.held(), fresh.held());
+    let handoff = Handoff::decide(
+        &prior.capture_poller,
+        prior.held(),
+        &fresh.capture_poller,
+        fresh.held(),
+    );
     // `plugin_revival_pending` is `#[serde(skip)]`, so every fresh disk load
     // defaults it; dropping it here would stop counting a plugin revival that is
     // still waking toward its per-plugin cap.
@@ -703,7 +708,12 @@ pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
 /// window are launch-owned whatever decided the status, and `plugin_revival_pending`
 /// is `#[serde(skip)]` like the poller, so a fresh disk load defaults it.
 fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = Handoff::decide(&prior.capture_poller, prior.held(), fresh.held());
+    let handoff = Handoff::decide(
+        &prior.capture_poller,
+        prior.held(),
+        &fresh.capture_poller,
+        fresh.held(),
+    );
     // `#[serde(skip)]` like the poller, so a fresh disk load defaults it and a
     // revival slower than one tick would stop counting toward its plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;

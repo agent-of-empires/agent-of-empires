@@ -1856,9 +1856,13 @@ if sys.argv[1] == 'serve':
             body = b'{{"data":{{"id":"ses_child000000000000000000000000"}}}}'
             stream.sendall(b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body)
 else:
+    with open(os.environ['FORK_RECORD'] + '.pid', 'w') as log: log.write(str(os.getpid()))
     with open(os.environ['FORK_RECORD'] + '.tmp', 'w') as log: json.dump(sys.argv[1:], log)
     os.replace(os.environ['FORK_RECORD'] + '.tmp', os.environ['FORK_RECORD'])
-    sys.stdin.read()
+    while True:
+        payload = os.read(0, 4096)
+        if not payload: break
+        with open(os.environ['FORK_RECORD'] + '.input', 'ab') as log: log.write(payload)
 "#,
                 python.display()
             );
@@ -1896,6 +1900,9 @@ else:
             let reached = std::rc::Rc::new(std::cell::Cell::new(false));
             let observed = reached.clone();
             let launch_record = record.clone();
+            let physical = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let captured = physical.clone();
+            let expected_parent = parent.clone();
             let observer = test_support::FinalizeObserver::install(
                 instance.id.clone(),
                 move |instance, phase| {
@@ -1916,6 +1923,23 @@ else:
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     };
                     assert!(argv.windows(2).any(|pair| pair == ["--session", CHILD]));
+                    let (pane, state, exclusive) = crate::tmux::utils::observe_pane(
+                        instance.tmux_session().unwrap().name(),
+                        &crate::tmux::TmuxCommandDeadline::new(),
+                    )
+                    .unwrap()
+                    .expect("the invoked native agent owns a real pane");
+                    assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
+                    assert!(exclusive);
+                    let native_pid = std::fs::read_to_string(launch_record.with_extension("json.pid"))
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap();
+                    let native_birth = crate::process::process_birth_identity(native_pid)
+                        .unwrap()
+                        .expect("the ready native child has a kernel birth");
+                    *captured.borrow_mut() =
+                        Some((pane, native_pid, native_birth, instance.lifecycle_generation));
                     if fail_adoption {
                         assert_eq!(instance.agent_session_id.as_deref(), Some(CHILD));
                         assert!(matches!(instance.resume_intent, ResumeIntent::Fork { .. }));
@@ -1966,13 +1990,52 @@ else:
             let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let disk = storage.load().unwrap().remove(0);
             if fail_final || peer_pin {
-                assert!(
-                    !instance.tmux_session().unwrap().exists(),
-                    "case ({fail_adoption}, {fail_final}, {peer_pin}): result={result:?}; durable={:?}; current={:?}\n{}",
-                    disk.conversation_state(),
-                    instance.conversation_state(),
-                    logs.contents(),
-                );
+                if peer_pin {
+                    let (pane, native_pid, native_birth, generation) =
+                        physical.borrow_mut().take().unwrap();
+                    let observe = || {
+                        crate::tmux::utils::observe_pane(
+                            instance.tmux_session().unwrap().name(),
+                            &crate::tmux::TmuxCommandDeadline::new(),
+                        )
+                        .unwrap()
+                        .expect("peer pin must retain the original physical target")
+                    };
+                    let (retained, state, exclusive) = observe();
+                    assert_eq!(retained, pane);
+                    assert_eq!(state, crate::tmux::utils::PaneProbe::Alive);
+                    assert!(exclusive);
+                    assert!(crate::process::process_birth_is_live(native_pid, &native_birth).unwrap());
+                    assert_eq!(disk.lifecycle_generation, generation);
+                    assert_eq!(disk.agent_session_binding.as_ref(), Some(&expected_parent));
+                    assert_eq!(disk.resume_binding.as_ref(), Some(&expected_parent));
+                    assert!(!record.with_extension("json.input").exists());
+                    assert_eq!(
+                        instance.start_with_size_opts(None, false).unwrap(),
+                        LaunchSidOutcome::Skipped,
+                        "a refused publication must not admit another physical launch"
+                    );
+                    let after = storage.load().unwrap().remove(0);
+                    assert_eq!(after.lifecycle_generation, generation);
+                    assert_eq!(after.conversation_state(), disk.conversation_state());
+                    assert_eq!(
+                        crate::tmux::utils::observe_pane(
+                            instance.tmux_session().unwrap().name(),
+                            &crate::tmux::TmuxCommandDeadline::new(),
+                        )
+                        .unwrap()
+                        .unwrap()
+                        .0,
+                        pane
+                    );
+                    assert!(crate::process::process_birth_is_live(native_pid, &native_birth).unwrap());
+                    assert!(!record.with_extension("json.input").exists());
+                } else {
+                    assert!(
+                        !instance.tmux_session().unwrap().exists(),
+                        "failed IO publication must clean only its own physical birth: {result:?}"
+                    );
+                }
                 assert_eq!(disk.status, Status::Error);
                 if peer_pin {
                     assert_eq!(disk.agent_session_id.as_deref(), Some(PARENT));

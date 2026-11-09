@@ -2276,6 +2276,13 @@ mod tests {
                     assert_eq!(released.get(), 1);
                     continue;
                 }
+                if fault == "superseded" {
+                    let error = result.expect_err("a foreign generation forbids finalization");
+                    let pending = error
+                        .downcast_ref::<LaunchFinalizationPending>()
+                        .expect("lost ownership must retain explicit finalization debt");
+                    assert_eq!(pending.cause, LaunchIndeterminateCause::OwnershipUnproven);
+                } else {
                 let outcome = result.unwrap();
                 if fault == "cached_absence" {
                     assert_eq!(
@@ -2305,6 +2312,7 @@ mod tests {
                         logs.contents()
                     );
                     assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
+                }
                 }
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);

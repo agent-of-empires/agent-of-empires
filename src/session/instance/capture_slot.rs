@@ -107,13 +107,23 @@ impl CapturePollerSlot {
         }
     }
 
-    /// Take the handle `prior` offers if it serves `held`; report whether it did.
+    /// Return an offered live handle only while it serves the receiving execution.
+    /// Stopped handles remain useful to their owner's final drain, not as replacement watchers.
+    fn running_handle(&self, held: Held<'_>) -> Option<&Arc<Mutex<SessionPoller>>> {
+        self.handle.as_ref().filter(|handle| {
+            let poller = handle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            poller.serves(held.tool, held.execution) && poller.is_running()
+        })
+    }
+
+    /// Take a compatible live offer. A missing or stopped offer leaves the current handle alone.
     fn take_handle(&mut self, prior: &Self, held: Held<'_>) -> bool {
-        let serves = prior.serves(held);
-        if serves {
-            self.handle = prior.handle.clone();
+        if let Some(handle) = prior.running_handle(held) {
+            self.handle = Some(Arc::clone(handle));
+            true
+        } else {
+            false
         }
-        serves
     }
 
     /// Take the repair pacing of a prior row about the same execution; a row whose execution
@@ -221,15 +231,20 @@ pub(crate) struct Handoff {
 }
 
 impl Handoff {
-    /// Stops the prior poller when the receiving row cannot use it: its thread keeps reading the
-    /// launch the row is giving up.
-    pub(crate) fn decide(prior: &CapturePollerSlot, prior_held: Held<'_>, held: Held<'_>) -> Self {
-        let keeps_handle = prior.serves(held);
-        if !keeps_handle {
+    /// Stop an incompatible offer, but preserve a compatible live receiving watcher when
+    /// a transient snapshot offers no usable watcher. A live compatible offer still takes priority.
+    pub(crate) fn decide(
+        prior: &CapturePollerSlot,
+        prior_held: Held<'_>,
+        receiver: &CapturePollerSlot,
+        held: Held<'_>,
+    ) -> Self {
+        let prior_serves = prior.serves(held);
+        if !prior_serves {
             prior.stop();
         }
         Self {
-            keeps_handle,
+            keeps_handle: prior_serves || receiver.running_handle(held).is_some(),
             keeps_pacing: held == prior_held,
         }
     }
@@ -330,7 +345,7 @@ mod tests {
         ] {
             let prior = paced(slot_for("claude", Some(one.clone())));
             let held = Held::new(tool, exec);
-            let handoff = Handoff::decide(&prior, prior_held, held);
+            let handoff = Handoff::decide(&prior, prior_held, &CapturePollerSlot::default(), held);
             let mut moved = prior;
             handoff.settle(&mut moved);
             assert_eq!(moved.handle().is_some(), handle, "{tool} {exec:?}");

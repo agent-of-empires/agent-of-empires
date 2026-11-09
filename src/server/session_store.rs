@@ -921,6 +921,164 @@ fn mark_checkpoint_failure(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runtime_adoption_retains_pi_capture_after_probe_path_changes() {
+        use crate::session::poller::{PollerSpawn, SessionPoller};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(2);
+        let file_watch = crate::file_watch::FileWatchService::new().unwrap();
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        for relaunch in [false, true] {
+            for offer in ["empty", "stopped", "running"] {
+                let mut row = Instance::new("pi adoption", root.path().to_str().unwrap());
+                row.source_profile = "test".into();
+                row.tool = "pi".into();
+                row.agent_session_id = Some(sid.into());
+                row.mark_pi_extension_launched_for_test();
+                // This legacy capture fixture asserts metadata continuity, not Native authority.
+                assert!(row.active_execution.is_none());
+                let generation = row.lifecycle_generation;
+                let source = row.pi_sidecar_source().unwrap();
+                let directory = crate::hooks::ensure_instance_dir_path(&row.id).unwrap();
+                std::fs::write(directory.join("session_id"), format!("{sid}\n")).unwrap();
+                let paths: Vec<_> = ["before", "during", "after"]
+                    .into_iter()
+                    .map(|phase| {
+                        let path = root.path().join(phase).join(format!("{phase}_{sid}.jsonl"));
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(
+                            &path,
+                            format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n"),
+                        )
+                        .unwrap();
+                        path.canonicalize().unwrap().to_string_lossy().into_owned()
+                    })
+                    .collect();
+                std::fs::write(directory.join("session_path"), &paths[0]).unwrap();
+                row.pi_session_path = Some(paths[0].clone());
+                let tmux = row.tmux_session().unwrap();
+                let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux.name());
+                tmux.create(root.path().to_str().unwrap(), Some("exec cat"), "test")
+                    .unwrap();
+                let spawn = || {
+                    let mut poller = SessionPoller::new(tmux.name().into(), "pi".into(), None);
+                    let read = crate::session::capture::pi_sidecar_poll_fn(
+                        row.id.clone(),
+                        source.clone(),
+                        None,
+                    );
+                    assert_eq!(
+                        poller.start_observations(
+                            row.id.clone(),
+                            Box::new(move |_| read()),
+                            Box::new(|_| {}),
+                            None,
+                        ),
+                        PollerSpawn::Spawned
+                    );
+                    poller
+                        .wait_for_observation_for_test(Duration::from_secs(10))
+                        .unwrap();
+                    assert!(poller.pending_observation_matches(|observation| {
+                        observation.sid == sid
+                            && observation.pi_session_path.as_ref() == Some(&paths[0])
+                    }));
+                    Arc::new(Mutex::new(poller))
+                };
+                let mut started = row.clone();
+                let offered = (offer != "empty").then(spawn);
+                if offer == "stopped" {
+                    offered.as_ref().unwrap().lock().unwrap().stop();
+                }
+                started.capture_poller.set_handle(offered.clone());
+                let canonical = spawn();
+                row.capture_poller.set_handle(Some(canonical.clone()));
+                let before = started.clone();
+                crate::server::test_support::seed_instances_on_disk_for_test("test", vec![row.clone()]);
+                let watcher = file_watch.clone();
+                let state = crate::server::test_support::build_test_app_state_configured(
+                    vec![row],
+                    move |state| state.file_watch = watcher,
+                );
+                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+                // The real Pi publisher changes its path after the launch snapshot was captured.
+                std::fs::write(directory.join("session_path"), &paths[1]).unwrap();
+                canonical
+                    .lock()
+                    .unwrap()
+                    .wait_for_observation_for_test(Duration::from_secs(10))
+                    .unwrap();
+                let publish = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = NativeSessionStore::open(publish, "test", Some(started.id.clone()))
+                        .unwrap();
+                    if relaunch {
+                        store
+                            .update_runtime_fields(&started, |row| {
+                                row.merge_post_restart_with_baseline(&before, &started)
+                            })
+                            .unwrap();
+                    } else {
+                        store.adopt_runtime_fields(&started).unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                let expected = if offer == "running" {
+                    offered.as_ref().unwrap()
+                } else {
+                    &canonical
+                };
+                let retained = {
+                    let rows = state.instances.read().await;
+                    let row = &rows[0];
+                    assert_eq!(row.lifecycle_generation, generation);
+                    assert!(row.active_execution.is_none());
+                    assert_eq!(row.agent_session_id.as_deref(), Some(sid));
+                    row.capture_poller.handle().unwrap().clone()
+                };
+                assert!(
+                    Arc::ptr_eq(&retained, expected),
+                    "relaunch={relaunch} offer={offer}"
+                );
+                assert!(retained.lock().unwrap().is_running());
+                // Queue a second real path after adoption; no injected result or timing sleep.
+                if offer == "running" {
+                    retained
+                        .lock()
+                        .unwrap()
+                        .wait_for_observation_for_test(Duration::from_secs(10))
+                        .unwrap();
+                }
+                std::fs::write(directory.join("session_path"), &paths[2]).unwrap();
+                {
+                    let mut poller = retained.lock().unwrap();
+                    poller
+                        .wait_for_observation_for_test(Duration::from_secs(10))
+                        .unwrap();
+                    assert!(poller.pending_observation_matches(|observation| {
+                        observation.sid == sid
+                            && observation.pi_session_path.as_ref() == Some(&paths[2])
+                            && observation.execution.is_none()
+                    }));
+                }
+                canonical.lock().unwrap().stop();
+                if let Some(offered) = offered {
+                    offered.lock().unwrap().stop();
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn creation_boundary_preserves_negotiated_acp_capability() {

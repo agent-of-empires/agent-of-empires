@@ -8,6 +8,8 @@ Physical launch and pane adoption decisions probe the exact tmux name live.
 A cached tmux session snapshot cannot suppress recreation of a missing pane.
 Launch admission uses a fresh marked Agent inventory, not the display resolver's title-derived fallback. Multiple candidates, including corpses or a candidate with the derived name, refuse admission before a new launch reservation. Launch paths recheck uniqueness after hooks and before physical birth; a missing selected target does not authorize substitution. Display and auxiliary name resolution retain their separate policies.
 
+Capture handoffs transfer only live watchers serving the same tool and execution. A missing or stopped launch snapshot cannot replace a compatible running canonical watcher, including when Pi publishes a new transcript path during a probe. A compatible live offered watcher still takes priority. Stopped handles remain available to their own final drain; capture pacing stays separate from watcher adoption. Capture continuity does not establish Native readiness or physical ownership.
+
 ## Automatic capture matrix
 
 | Agent | Host terminal | Sandboxed terminal | Authoritative source |
