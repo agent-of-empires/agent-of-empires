@@ -2927,7 +2927,7 @@ mod tests {
             Some(HandoffRecovery::Maintenance) => concat!(module_path!(), "::unproven_terminal_birth_stays_pending_during_maintenance"),
             Some(HandoffRecovery::Startup) => concat!(module_path!(), "::unproven_terminal_birth_stays_pending_after_app_state_reconstruction"),
         };
-        let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(root.path(), entry);
+        let _native_helper = crate::session::frozen_test_helper(root.path(), entry);
         let _environment = crate::session::test_support::EnvGuard::unset(&[
             "HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR",
         ]).and_set("HOME", root.path()).and_set("XDG_CONFIG_HOME", root.path().join(".config"))

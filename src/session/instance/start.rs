@@ -411,7 +411,7 @@ impl Instance {
         }
         anyhow::ensure!(
             launch.receipt.is_some(),
-            "terminal handoff has no proven physical birth; use aoe session set-session-id SESSION ID --store /absolute/store, or aoe session set-session-id SESSION \"\" to explicitly select a new terminal target"
+            "terminal handoff has no proven physical birth; close its exact pane explicitly in tmux, then use aoe session set-session-id SESSION ID --store /absolute/store, or aoe session set-session-id SESSION \"\" to select a new terminal target"
         );
         let normalized = self.normalized_handoff_launch_state(&launch);
         let current_execution = launch.launched.active.is_some()
@@ -454,7 +454,7 @@ impl Instance {
                 .terminal
                 .ok_or_else(|| anyhow::anyhow!("kept handoff has no native target"))?,
             (None, TerminalHandoffContext::Discard) => {
-                let ambiguous = "terminal launch outcome has no proven exact native target; use aoe session set-session-id SESSION ID --store /absolute/store, or aoe session set-session-id SESSION \"\" to explicitly authorize a fresh terminal launch";
+                let ambiguous = "terminal launch outcome has no proven exact native target; close its exact pane explicitly in tmux, then use aoe session set-session-id SESSION ID --store /absolute/store, or aoe session set-session-id SESSION \"\" to select a new terminal target";
                 let sid = launch.launched.session_id.as_ref().context(ambiguous)?;
                 let binding = launch
                     .launched
