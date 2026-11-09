@@ -13883,6 +13883,63 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn prepared_restart_uses_current_queue_after_original_detaches() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| Box::pin(async move {
+        for remove_during_hooks in [false, true] {
+            let mut live = crate::server::test_support::managed_control_session(
+                scope, "restart-current-queue",
+            ).await;
+            live.park("original interrupted work").await;
+            live.make_quota_due();
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            if remove_during_hooks {
+                let _submission = state.session_service.prompt_submission(&id).await;
+                state.session_service.enqueue_prompt(
+                    &id, "replacement".into(), "new queued work".into(), Vec::new(), None, None,
+                ).await.unwrap();
+            }
+            let submission = state.session_service.prompt_submission(&id).await;
+            let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                .await.unwrap();
+            let generation = state.instances.read().await.iter()
+                .find(|row| row.id == id).unwrap().lifecycle_generation;
+            drop(submission);
+            let requests = live.native.requests();
+            live.client = scope.adopt_with(live.client, false, || async {
+                assert!(!state.acp_supervisor.is_running(&id).await);
+                if remove_during_hooks {
+                    assert!(state.session_service.remove_queued_prompt(&id, "replacement".into()).await);
+                } else {
+                    let _submission = state.session_service.prompt_submission(&id).await;
+                    state.session_service.enqueue_prompt(
+                        &id, "replacement".into(), "new queued work".into(), Vec::new(), None, None,
+                    ).await.unwrap();
+                }
+                let submission = state.session_service.prompt_submission(&id).await;
+                assert!(lifecycle::continue_interrupted_prompt(
+                    &state, &id, generation, chrono::Utc::now(), false, &submission, Some(prepared),
+                ).await.unwrap());
+                let current = state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                assert_eq!(current.pending_initial_turn.as_ref().map(|turn| turn.text.as_str()),
+                    remove_during_hooks.then_some("original interrupted work"));
+                assert_eq!(current.queued_prompts.len(), usize::from(!remove_during_hooks));
+                let durable = crate::session::Storage::open_unwatched(&current.source_profile)
+                    .unwrap().load().unwrap().into_iter().find(|row| row.id == id).unwrap();
+                assert_eq!(serde_json::to_value(durable.pending_initial_turn).unwrap(),
+                    serde_json::to_value(current.pending_initial_turn).unwrap());
+                assert!(!state.acp_supervisor.is_running(&id).await);
+                assert_eq!(live.native.requests(), requests);
+            }).await;
+            live.client.stop_session().await;
+        }
+    })).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
     use crate::acp::supervisor::test_support::managed::with_managed;
     with_managed(|scope| {

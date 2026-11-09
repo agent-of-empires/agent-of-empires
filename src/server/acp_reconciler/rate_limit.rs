@@ -66,13 +66,11 @@ fn row_minted_at_ms(entry: &crate::daemon::QueuedPromptEntry) -> Option<i64> {
 /// An unknown limit never supersedes: the interrupted request is the older one
 /// and losing it is final, since the first prompt the drain delivers retires
 /// the park.
-fn queue_supersedes(minted_at_ms: &[i64], limit_at_ms: Option<i64>) -> bool {
+fn queue_supersedes(mut minted_at_ms: impl Iterator<Item = i64>, limit_at_ms: Option<i64>) -> bool {
     let Some(limit_at_ms) = limit_at_ms else {
         return false;
     };
-    minted_at_ms
-        .iter()
-        .any(|queued_at| *queued_at > limit_at_ms)
+    minted_at_ms.any(|queued_at| queued_at > limit_at_ms)
 }
 
 /// Sent when a limit ended an agent-initiated turn, which has no prompt to redeliver.
@@ -100,7 +98,30 @@ pub(crate) struct PreparedContinuation {
     session_id: String,
     created_at: chrono::DateTime<Utc>,
     pub(crate) prompt: Option<(String, Vec<crate::daemon::PromptAttachmentRef>)>,
-    outcome: ContinuationOutcome,
+    limit_at_ms: Option<i64>,
+}
+
+impl PreparedContinuation {
+    pub(crate) async fn outcome(
+        &self,
+        state: &Arc<AppState>,
+        id: &str,
+        _submission: &tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<ContinuationOutcome, SupervisorError> {
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| self.session_id == id && row.id == id
+            && row.created_at == self.created_at && row.terminal_handoff.is_none())
+            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
+        Ok(if self.prompt.is_some()
+            && queue_supersedes(row.queued_prompts.iter().filter_map(row_minted_at_ms), self.limit_at_ms)
+        {
+            ContinuationOutcome::SupersededByQueue
+        } else if self.prompt.is_some() {
+            ContinuationOutcome::Installed
+        } else {
+            ContinuationOutcome::Stands
+        })
+    }
 }
 
 pub(crate) async fn resolve_continuation(
@@ -130,32 +151,20 @@ pub(crate) async fn resolve_continuation(
         },
         Indeterminate => return Err(SupervisorError::ControlStateUnavailable),
     };
-    #[cfg(test)]
-    state.session_service.await_install_barrier(id).await;
-    let (created_at, minted_at_ms) = {
-        let instances = state.instances.read().await;
-        let row = instances.iter()
-            .find(|row| row.id == id && row.terminal_handoff.is_none())
-            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
-        (row.created_at, row.queued_prompts.iter().filter_map(row_minted_at_ms).collect::<Vec<_>>())
-    };
-    let superseded = if prompt.is_some() && !minted_at_ms.is_empty() {
-        let limit_at_ms = query_control(
+    let limit_at_ms = if prompt.is_some() {
+        query_control(
             &state.acp_event_store, id, "rate-limit supersession",
             |store, id| Ok(store.latest_rate_limit_event(id)?.map(|(_, at)| at)),
-        ).await?;
-        queue_supersedes(&minted_at_ms, limit_at_ms)
+        ).await?
     } else {
-        false
+        None
     };
-    let outcome = if superseded {
-        ContinuationOutcome::SupersededByQueue
-    } else if prompt.is_some() {
-        ContinuationOutcome::Installed
-    } else {
-        ContinuationOutcome::Stands
-    };
-    Ok(PreparedContinuation { session_id: id.to_owned(), created_at, prompt, outcome })
+    #[cfg(test)]
+    state.session_service.await_install_barrier(id).await;
+    let created_at = state.instances.read().await.iter()
+        .find(|row| row.id == id && row.terminal_handoff.is_none())
+        .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?.created_at;
+    Ok(PreparedContinuation { session_id: id.to_owned(), created_at, prompt, limit_at_ms })
 }
 
 #[cfg(test)]
@@ -165,7 +174,8 @@ pub(crate) async fn install_rate_limit_continuation(
     submission: &tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<ContinuationOutcome, SupervisorError> {
     let prepared = resolve_continuation(state, id).await?;
-    install_prepared_continuation(state, id, submission, prepared).await
+    let outcome = prepared.outcome(state, id, submission).await?;
+    install_prepared_continuation(state, id, submission, prepared, outcome).await
 }
 
 pub(crate) async fn install_prepared_continuation(
@@ -173,6 +183,7 @@ pub(crate) async fn install_prepared_continuation(
     id: &str,
     _submission: &tokio::sync::OwnedMutexGuard<()>,
     prepared: PreparedContinuation,
+    outcome: ContinuationOutcome,
 ) -> Result<ContinuationOutcome, SupervisorError> {
     if prepared.session_id != id || !state
         .instances
@@ -184,7 +195,7 @@ pub(crate) async fn install_prepared_continuation(
     {
         return Err(SupervisorError::SpawnCancelled(id.to_owned()));
     }
-    match prepared.outcome {
+    match outcome {
         ContinuationOutcome::SupersededByQueue => {
             state.session_service.clear_pending_initial_turn(id).await;
         }
@@ -195,7 +206,7 @@ pub(crate) async fn install_prepared_continuation(
         }
         ContinuationOutcome::Stands => {}
     }
-    Ok(prepared.outcome)
+    Ok(outcome)
 }
 
 pub(crate) struct QuotaDelivery {
@@ -360,13 +371,22 @@ pub(crate) async fn resume_rate_limited(
         }
         ContinuationOutcome::SupersededByQueue
     } else {
-        prepared.as_ref().ok_or(SupervisorError::ControlStateUnavailable)?.outcome
+        prepared.as_ref().ok_or(SupervisorError::ControlStateUnavailable)?
+            .outcome(state, id, &submission).await?
     };
     let manual = matches!(kind, QuotaResume::Manual);
     if !state.instances.read().await.iter().any(|row|
         row.id == id && row.lifecycle_generation == generation && is_resumable(row))
     {
         return Err(SupervisorError::SpawnCancelled(id.to_owned()));
+    }
+    if let Some(unavailable) = state
+        .session_service
+        .prompt_native_unavailability(id)
+        .await
+        .map_err(|_| SupervisorError::ControlStateUnavailable)?
+    {
+        return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
     }
     if manual || matches!(outcome, ContinuationOutcome::Stands | ContinuationOutcome::Installed) {
         if manual && park.cap_reached {
@@ -388,7 +408,7 @@ pub(crate) async fn resume_rate_limited(
     }
     match prepared {
         Some(prepared) => {
-            install_prepared_continuation(state, id, &submission, prepared).await?;
+            install_prepared_continuation(state, id, &submission, prepared, outcome).await?;
         }
         None => state.session_service.clear_pending_initial_turn(id).await,
     }
@@ -703,9 +723,6 @@ mod tests {
         };
         let after = Utc.timestamp_opt(1_700_000_001, 0).unwrap().to_rfc3339();
         let before = Utc.timestamp_opt(1_699_999_999, 0).unwrap().to_rfc3339();
-        let times = |rows: &[crate::daemon::QueuedPromptEntry]| {
-            rows.iter().filter_map(row_minted_at_ms).collect::<Vec<_>>()
-        };
         let cases = [
             (
                 "row after the limit",
@@ -729,7 +746,7 @@ mod tests {
         ];
         for (name, rows, recorded, expected) in cases {
             assert_eq!(
-                queue_supersedes(&times(&rows), recorded),
+                queue_supersedes(rows.iter().filter_map(row_minted_at_ms), recorded),
                 expected,
                 "{name}"
             );
@@ -1084,13 +1101,14 @@ mod tests {
                 let park = known_park(&live.state, &id);
                 let budget = live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
                 let original = crate::process::worker_registry::load_strict(&id).unwrap().unwrap();
-                live.state.acp_supervisor.detach_all().await;
+                live.client = scope.adopt_with(live.client, false, || async {
                 assert!(!live.state.acp_supervisor.is_running(&id).await);
                 assert!(crate::process::worker_registry::retained_process_may_be_alive(&original));
                 let requests = live.native.requests();
                 let frontier = live.state.acp_event_store.highest_seq(&id);
-                assert_eq!(pending_turn(&live.state, &id).await.as_deref(),
-                    pending.then_some("existing pending work"));
+                assert_eq!(live.state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().pending_initial_turn.as_ref()
+                    .map(|turn| turn.text.as_str()), pending.then_some("existing pending work"));
                 live.state.acp_event_store.test_conn().execute_batch(
                     "CREATE TEMP TRIGGER fail_quota_publication BEFORE INSERT ON acp_events
                      WHEN NEW.discriminant = 'RateLimitAutoResumed'
@@ -1102,8 +1120,9 @@ mod tests {
                     assert!(matches!(result, Err(SupervisorError::NativeStoreUnavailable)), "{result:?}");
                     assert!(!live.state.acp_supervisor.is_running(&id).await,
                         "failed durable publication must precede any worker installation");
-                    assert_eq!(pending_turn(&live.state, &id).await.as_deref(),
-                        pending.then_some("existing pending work"));
+                    assert_eq!(live.state.instances.read().await.iter()
+                        .find(|row| row.id == id).unwrap().pending_initial_turn.as_ref()
+                        .map(|turn| turn.text.as_str()), pending.then_some("existing pending work"));
                     assert_eq!(live.native.requests(), requests,
                         "failed publication must neither attach nor deliver autonomous input");
                     assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
@@ -1115,7 +1134,7 @@ mod tests {
                     assert!(crate::process::worker_registry::retained_process_may_be_alive(&retained));
                 }
                 live.state.acp_event_store.test_conn().execute_batch("DROP TRIGGER fail_quota_publication").unwrap();
-                live.client = scope.adopt(live.client, false).await;
+                }).await;
                 live.client.ready().await;
                 live.client.stop_session().await;
             }
@@ -1280,6 +1299,65 @@ mod tests {
             })
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_loss_during_continuation_preparation_does_not_publish_a_resume() {
+        with_managed(|scope| Box::pin(async move {
+            for automatic in [false, true] {
+                let mut live = managed_control_session(scope, "quota-loss-during-prepare").await;
+                let id = live.id().to_owned();
+                enable_auto_resume(true);
+                live.park("preserve original work").await;
+                live.make_quota_due();
+                live.state.session_service.set_pending_initial_turn(
+                    &id, "existing pending work".into(), Vec::new(),
+                ).await;
+                let park_seq = known_park(&live.state, &id).seq;
+                let frontier = live.state.acp_event_store.highest_seq(&id);
+                let budget = live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
+                let requests = live.native.requests();
+                let lease = live.state.acp_supervisor.current_lease(&id).unwrap();
+                let before = live.state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                let mut barrier = live.state.session_service.arm_install_barrier();
+                let state = live.state.clone();
+                let target = id.clone();
+                let release_task = tokio::spawn(async move {
+                    let submission = state.session_service.prompt_submission(&target).await;
+                    let kind = if automatic {
+                        QuotaResume::Automatic { park_seq }
+                    } else {
+                        QuotaResume::Manual
+                    };
+                    resume_rate_limited(&state, &target, submission, kind).await
+                });
+                let (observed, release) = tokio::time::timeout(
+                    Duration::from_secs(10), barrier.recv(),
+                ).await.unwrap().unwrap();
+                assert_eq!(observed, id);
+                live.client.actual().test_observe_native_loss();
+                release.send(()).unwrap();
+                let result = release_task.await.unwrap();
+                assert!(matches!(result, Err(SupervisorError::Acp(
+                    crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
+                ))), "{result:?}");
+                let after = live.state.instances.read().await.iter()
+                    .find(|row| row.id == id).unwrap().clone();
+                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                assert_eq!(live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap(), budget);
+                assert_eq!(known_park(&live.state, &id).seq, park_seq);
+                assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                assert_eq!(serde_json::to_value(after.pending_initial_turn).unwrap(),
+                    serde_json::to_value(before.pending_initial_turn).unwrap());
+                assert_eq!(serde_json::to_value(after.queued_prompts).unwrap(),
+                    serde_json::to_value(before.queued_prompts).unwrap());
+                assert_eq!(live.native.requests(), requests);
+                assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
+                drop(barrier);
+            }
+        })).await;
     }
 
     #[tokio::test]

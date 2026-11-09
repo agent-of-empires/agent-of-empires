@@ -124,6 +124,8 @@ Post-hook creation failures release namespace, submission and mutation guards be
 
 An ACP account restart captures the qualified original quota state and interrupted-turn selection before retiring its worker. It publishes the quota breadcrumb under the current generation and prompt-submission guard before installing either a replacement worker or a pending turn. A failed journal write preserves existing pending intent and cannot create a new pending turn, install a worker or authorize autonomous input.
 
+The interrupted prompt and attachments come from the original worker before retirement. Queue priority is decided from the current queue after launch hooks, under the same submission guard as publication and installation. A prompt added during a hook can supersede the continuation; removing that prompt restores the captured continuation without querying the retired worker.
+
 A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
 
 This exclusive-occupancy check also protects later revival and direct-start replacement. The tmux command rechecks immutable pane/server identity and topology atomically before any process-tree signalling or scope release. A legacy corpse does not acquire an invented process PID. A peer split immediately before removal refuses revival; explicit Stop retains its separate authority.
