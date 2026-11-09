@@ -5745,7 +5745,7 @@ mod restart_wake_tests {
     async fn explicit_restart_keeps_existing_pending_when_quota_publication_fails() {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| Box::pin(async move {
-            let live = crate::server::test_support::managed_control_session(
+            let mut live = crate::server::test_support::managed_control_session(
                 scope, "restart-quota-publication-io",
             ).await;
             live.park("original interrupted work").await;
