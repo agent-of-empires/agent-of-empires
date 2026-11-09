@@ -889,6 +889,9 @@ impl Instance {
                 omp_capture_metadata.is_none() || omp_generation_published,
                 "handoff OMP launch generation was not durably published"
             );
+            let birth_inventory = crate::tmux::utils::capture_pane_birth_inventory(
+                None, &crate::tmux::TmuxCommandDeadline::new(),
+            )?;
             prior_executable = Some(self.launch_executable.take());
             self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
             prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
@@ -908,6 +911,7 @@ impl Instance {
                 confirm_desired_conversation: canonicalized
                     || prepared.require_conversation_publication,
                 receipt: None,
+                birth_inventory: Some(birth_inventory),
             })
         } else {
             None

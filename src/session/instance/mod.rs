@@ -240,6 +240,9 @@ pub(crate) struct TerminalHandoffLaunch {
     pub(crate) omp_capture_metadata: Option<OmpCaptureMetadata>,
     pub(crate) confirm_desired_conversation: bool,
     pub(crate) receipt: Option<std::sync::Arc<LegacyToolObservation>>,
+    /// Negative evidence only; never substitutes for the launch's birth receipt.
+    #[serde(default)]
+    pub(crate) birth_inventory: Option<crate::tmux::utils::PaneBirthInventory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2794,19 +2794,26 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     && pending.generation == inst.lifecycle_generation,
                     crate::session::LifecycleReservationError::Superseded);
                 pending.ensure_original_stopped(&inst.id)?;
-                let panes = crate::tmux::batch_pane_metadata()
-                    .context("cannot prove terminal pane absence; restore tmux access before selecting a target")?;
-                if let Some((name, pane)) =
-                    crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)?
-                {
-                    anyhow::ensure!(pane.pane_dead,
-                        "terminal handoff pane is live; close it explicitly in tmux before selecting a different terminal target");
-                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
-                        "existing dead pane has no handoff receipt; close it explicitly in tmux before selecting a terminal target"))?;
-                    anyhow::ensure!(launch.receipt.is_some(),
-                        "existing dead pane has no proven handoff birth; close it explicitly in tmux before selecting a terminal target");
-                    crate::session::Instance::ensure_terminal_handoff_pane_matches(name,
-                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                let launch = pending.launch.as_ref().context(
+                    "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent")?;
+                let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
+                    .or_else(|| launch.birth_inventory.as_ref().map(|inventory| inventory.socket()))
+                    .context("terminal handoff has no captured physical socket; restore its original ownership evidence")?;
+                let complete = crate::tmux::utils::capture_pane_birth_inventory(
+                    Some(socket), &crate::tmux::TmuxCommandDeadline::new(),
+                ).context("cannot prove terminal pane absence from its complete physical inventory")?;
+                if let Some(receipt) = launch.receipt.as_deref() {
+                    if complete.receipt_present(receipt)? {
+                        let actual = inst.tmux_session()?;
+                        let probe = crate::session::Instance::ensure_terminal_handoff_pane_matches(actual.name(),
+                            crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                        anyhow::ensure!(probe == crate::tmux::utils::PaneProbe::Dead,
+                            "terminal handoff pane is live; close it explicitly in tmux before selecting a target");
+                    }
+                } else {
+                    complete.ensure_only_preexisting_live_panes(
+                        launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
+                    )?;
                 }
             }
             inst.source_profile = storage.profile().to_string();

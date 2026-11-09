@@ -2409,10 +2409,6 @@ mod tests {
     #[test]
     #[serial]
     fn public_ensure_refuses_unknown_observation_after_a_real_launch() {
-        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
-            crate::process::exec_frozen_environment().unwrap();
-            return;
-        }
         use crate::session::instance::start::test_support::{FinalizeObserver, FinalizePhase};
         use crate::tmux::test_helpers::{only_pane_id, pane_field};
         use std::cell::RefCell;
@@ -2425,10 +2421,6 @@ mod tests {
             let root = tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
             let _env = isolate_resume_environment(root.path());
-            let _native_helper = crate::session::instance::test_helpers::frozen_test_helper(
-                root.path(),
-                concat!(module_path!(), "::public_ensure_refuses_unknown_observation_after_a_real_launch"),
-            );
             let agent_pid_file = root.path().join("actual-host-agent.pid");
             let _agent = install_fake_claude(root.path(), &format!(
                 "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nprintf '%s\\n' \"$$\" > {}\nexec sleep 60\n",
