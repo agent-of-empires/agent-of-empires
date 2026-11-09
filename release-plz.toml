@@ -15,11 +15,35 @@ dependencies_update = false
 semver_check = false
 pr_labels = ["release"]
 
+# Cargo leaves the nested crates out of the root package, so they share its version
+# group: their changes bump the release and land in its changelog, with no tag or
+# changelog of their own. Their versions must equal the root's to find its `v*` tag.
 [[package]]
 name = "agent-of-empires"
 release = true
-# The root package owns the whole repo, including the other workspace crates.
+version_group = "aoe"
 changelog_include = ["aoe-plugin-api", "aoe-settings-derive", "xtask"]
+
+[[package]]
+name = "aoe-plugin-api"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "aoe-settings-derive"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "xtask"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
 
 [changelog]
 header = """
