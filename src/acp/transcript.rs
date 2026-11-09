@@ -1124,6 +1124,7 @@ mod tests {
             stopped("cancelled"),
             Event::AgentStartupError {
                 message: "boom".into(),
+                native_subject: None,
             },
             Event::IncompatibleAgent {
                 detail: crate::acp::state::StartupErrorDetail::UnsupportedProtocolVersion {

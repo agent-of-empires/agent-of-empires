@@ -792,9 +792,6 @@ pub(crate) async fn spawn_structured_session(
             }
             // Archived rows refuse ACP admission without rollback.
             if !error.is::<crate::session::StartBlocked>() {
-                drop(_guard);
-                drop(_submission);
-                drop(_namespace);
                 rollback(native, instance, false);
                 return Err(error);
             }
