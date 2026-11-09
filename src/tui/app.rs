@@ -3760,6 +3760,7 @@ mod tests {
                     text: "OLD-RETAINED\n\n".repeat(80),
                     message_id: None,
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         let router = Router::new()
@@ -3926,6 +3927,7 @@ mod tests {
                     text: "NEW-RETAINED".into(),
                     message_id: Some("next".into()),
                 },
+                &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(8), async {

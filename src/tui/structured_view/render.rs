@@ -2726,7 +2726,12 @@ mod tests {
         transcript.merge_server_rows(rows.clone());
         // An overlapping snapshot must neither duplicate nor move the prefix back.
         transcript.merge_server_rows(rows);
-        let out = joined(&transcript_lines(&transcript, &Theme::default(), None));
+        let out = joined(&transcript_lines(
+            &transcript,
+            &Theme::default(),
+            None,
+            ToolOutputMode::Compact,
+        ));
         let clear = out.find("Conversation cleared").unwrap();
         assert!(out.find("old history").unwrap() < clear, "{out}");
         assert!(clear < out.find("new handshake prefix").unwrap(), "{out}");
@@ -2743,7 +2748,12 @@ mod tests {
         ]);
         rows[0].seq = 0;
         legacy.merge_server_rows(rows);
-        let out = joined(&transcript_lines(&legacy, &Theme::default(), None));
+        let out = joined(&transcript_lines(
+            &legacy,
+            &Theme::default(),
+            None,
+            ToolOutputMode::Compact,
+        ));
         assert!(out.find("legacy prefix").unwrap() < out.find("Conversation cleared").unwrap());
         assert!(out.find("Conversation cleared").unwrap() < out.find("legacy followup").unwrap());
     }

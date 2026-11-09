@@ -178,6 +178,8 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
+HTTP and websocket replay preserve operation qualifiers even in hidden prefixes. A local request's terminal cannot settle other tools or replace their streamed output with an invented success.
+
 The reader refreshes available content automatically and preserves focus and
 scroll position. Read failures keep the last loaded content visible with an
 error. Content, size, or theme changes clear the previous text selection.
