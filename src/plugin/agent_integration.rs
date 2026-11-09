@@ -393,12 +393,14 @@ fn declared_agent_in(
             return cached;
         }
     }
-    // Resolve under the lock so concurrent misses publish one canonical value:
-    // `declared_launch_words` compares this identity by pointer. The entry also
-    // carries the generation it resolved against, so a lookup that raced a
-    // reload is discarded instead of outliving it.
+    // Resolve under the lock so concurrent misses share one identity.
     let resolved = declared_for(registry, tool).map(build_declared_agent);
-    cache.insert(tool.to_string(), (generation, resolved));
+    if cache
+        .get(tool)
+        .is_none_or(|(cached_generation, _)| *cached_generation <= generation)
+    {
+        cache.insert(tool.to_string(), (generation, resolved));
+    }
     resolved
 }
 
@@ -1313,6 +1315,40 @@ command = "ACME_TOKEN=local acme-helper --serve"
         })
         .unwrap();
         super::super::reload_registry();
+
+        let (old_registry, old_generation) = super::super::registry_with_generation();
+        let barrier = std::sync::Barrier::new(9);
+        let declared = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        declared_agent("acme-helper").expect("declared agent")
+                    })
+                })
+                .collect();
+            barrier.wait();
+            let agents: Vec<_> = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect();
+            assert!(agents.iter().all(|agent| std::ptr::eq(*agent, agents[0])));
+            agents[0]
+        });
+        assert!(std::ptr::eq(
+            declared,
+            crate::agents::get_agent("acme-helper").unwrap()
+        ));
+
+        super::super::reload_registry();
+        let current = declared_agent("acme-helper").expect("reloaded declaration");
+        let old = declared_agent_in(&old_registry, old_generation, "acme-helper")
+            .expect("old snapshot declaration");
+        assert!(!std::ptr::eq(old, current));
+        assert!(std::ptr::eq(
+            current,
+            declared_agent("acme-helper").unwrap()
+        ));
 
         assert_eq!(
             declared_launch_words("acme-helper"),
