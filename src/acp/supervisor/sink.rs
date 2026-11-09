@@ -110,10 +110,16 @@ impl ChannelSink {
             .name("acp-event-writer".into())
             .spawn(move || {
                 for job in queue {
+                    // The job moves into the guarded call, so keep what names its gap.
+                    let publication = match &job {
+                        Job::Publish(p) => Some((p.session_id.clone(), p.seq)),
+                        _ => None,
+                    };
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(job)))
                         .is_err()
                     {
-                        tracing::error!(target: "acp.event_store", "event writer job panicked; publication may be incomplete, continuing queued jobs");
+                        let (session_id, seq) = publication.unzip();
+                        tracing::error!(target: "acp.event_store", session_id, seq, "event writer job panicked; publication may be incomplete, continuing queued jobs");
                     }
                 }
             })

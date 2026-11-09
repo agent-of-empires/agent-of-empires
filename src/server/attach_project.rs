@@ -312,29 +312,40 @@ mod tests {
     use super::*;
     use crate::server::test_support as support;
 
-    /// A queued stop must reach disk before attachment checks turn state.
+    /// A queued stop must reach disk before attachment checks turn state, so a
+    /// finished turn is not refused as mid-turn.
     #[tokio::test]
-    async fn attachment_probe_waits_for_a_queued_stop() {
+    #[serial_test::serial]
+    async fn attachment_waits_for_a_queued_stop() {
         use crate::acp::state::Event;
         use std::time::Duration;
 
-        let state = support::build_test_app_state(vec![]);
-        let id = "queued-stop";
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let mut inst =
+            crate::session::Instance::new("queued-stop", not_a_repo.path().to_str().unwrap());
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        support::seed_instances_on_disk_for_test(&inst.source_profile, vec![inst.clone()]);
+        let state = support::build_test_app_state(vec![inst]);
+        state.acp_supervisor.test_insert_worker(&id).await;
         state
             .acp_supervisor
-            .publish_user_prompt(id, "work".into())
+            .publish_user_prompt(&id, "work".into())
             .await;
-        assert!(state.acp_event_store.has_in_flight_turn(id));
+        assert!(state.acp_event_store.has_in_flight_turn(&id));
 
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::sync_channel(1);
         let store = Arc::clone(&state.acp_event_store);
+        let stopped_id = id.clone();
         state.acp_supervisor.test_run_on_writer(move || {
             entered.send(()).unwrap();
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
             store
                 .record(
-                    id,
+                    &stopped_id,
                     2,
                     &Event::Stopped {
                         reason: "prompt_complete".into(),
@@ -343,21 +354,35 @@ mod tests {
                 .unwrap();
         });
         ready.await.unwrap();
-        let mut probe = tokio::spawn({
+        let mut attach = tokio::spawn({
             let state = Arc::clone(&state);
-            async move { turn_in_flight(&state, id).await }
+            let id = id.clone();
+            let repo = not_a_repo.path().to_path_buf();
+            async move {
+                attach_project(
+                    &state,
+                    &id,
+                    &repo,
+                    crate::session::attach_project::ExistingBranch::Refuse,
+                )
+                .await
+            }
         });
-        let early = tokio::time::timeout(Duration::from_millis(100), &mut probe).await;
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut attach).await;
         release.send(()).unwrap();
         assert!(
             early.is_err(),
-            "the probe returned before the queued stop was written: {early:?}"
+            "attachment decided before the queued stop was written: {early:?}"
         );
-        assert!(!tokio::time::timeout(Duration::from_secs(5), probe)
+        let outcome = tokio::time::timeout(Duration::from_secs(5), attach)
             .await
             .unwrap()
-            .unwrap()
-            .unwrap());
+            .unwrap();
+        // Past the turn check, planning rejects the directory as not a repository.
+        assert!(
+            matches!(outcome, Err(AttachError::Rejected(_))),
+            "{outcome:?}"
+        );
     }
 
     /// #4116: an archive committed while the restarted worker's `before_session` hook runs
