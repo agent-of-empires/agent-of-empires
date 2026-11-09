@@ -1,5 +1,5 @@
-//! Plugin management REST API: list plugins and enable/disable them. The web
-//! twin of `aoe plugin`.
+//! Plugin management REST API, source authorization and lifecycle jobs.
+//! Host configuration reads run on blocking workers.
 //!
 //! The enable/disable toggle is a mutation that runs on the host, so it
 //! requires read-write mode AND an elevated session when login is enabled,
@@ -82,14 +82,14 @@ fn source_gate(source: &str, dev: bool, principal: Option<&Principal>) -> Result
     Ok(())
 }
 
-fn update_source_gate(id: &str, principal: Option<&Principal>) -> Result<(), Response> {
-    let config = crate::session::Config::load().map_err(|_| {
-        api_error(
+async fn update_source_gate(id: &str, principal: Option<&Principal>) -> Result<(), Response> {
+    let Ok(Ok(config)) = tokio::task::spawn_blocking(crate::session::Config::load).await else {
+        return Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "config_error",
             "Cannot read plugin configuration",
-        )
-    })?;
+        ));
+    };
     if let Some(entry) = config.plugins.get(id) {
         if let Some(source) = &entry.source {
             source_gate(source, entry.dev, principal)?;
@@ -706,7 +706,7 @@ pub async fn plugin_update_preview(
     if state.read_only {
         return super::read_only_response();
     }
-    if let Err(resp) = update_source_gate(&id, principal.as_deref()) {
+    if let Err(resp) = update_source_gate(&id, principal.as_deref()).await {
         return resp;
     }
     match plugin::install::preview_update(
@@ -738,7 +738,7 @@ pub async fn apply_plugin_update(
     if let Err(resp) = mutation_gate(&state, session.as_deref(), loopback.as_deref()).await {
         return resp;
     }
-    if let Err(resp) = update_source_gate(&id, loopback.as_deref()) {
+    if let Err(resp) = update_source_gate(&id, loopback.as_deref()).await {
         return resp;
     }
     let allow_local_source = authorize(loopback.as_deref(), Capability::LocalPluginSource);
