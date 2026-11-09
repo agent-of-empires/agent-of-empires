@@ -344,18 +344,28 @@ impl PaneBirthInventory {
         &self.socket
     }
 
-    pub(crate) fn receipt_present(&self, receipt: &crate::session::LegacyToolObservation) -> Result<bool> {
+    pub(crate) fn receipt_present(
+        &self,
+        receipt: &crate::session::LegacyToolObservation,
+    ) -> Result<bool> {
         if self.server.as_ref() == Some(receipt.server.as_ref()) {
-            return Ok(self.panes.iter().any(|pane| pane.identity.pane_id == receipt.identity.pane_id));
+            return Ok(self
+                .panes
+                .iter()
+                .any(|pane| pane.identity.pane_id == receipt.identity.pane_id));
         }
-        anyhow::ensure!(!crate::process::process_birth_is_live(
-            receipt.server.pid, &receipt.server.birth,
-        )?, "cannot prove the original terminal handoff server absent");
+        anyhow::ensure!(
+            !crate::process::process_birth_is_live(receipt.server.pid, &receipt.server.birth,)?,
+            "cannot prove the original terminal handoff server absent"
+        );
         Ok(false)
     }
 
     pub(crate) fn ensure_only_preexisting_live_panes(&self, prior: &Self) -> Result<()> {
-        anyhow::ensure!(self.socket == prior.socket, "terminal handoff socket changed");
+        anyhow::ensure!(
+            self.socket == prior.socket,
+            "terminal handoff socket changed"
+        );
         if self.panes.is_empty() {
             if let Some(server) = &prior.server {
                 anyhow::ensure!(!crate::process::process_birth_is_live(server.pid, &server.birth)?,
@@ -363,12 +373,16 @@ impl PaneBirthInventory {
             }
             return Ok(());
         }
-        anyhow::ensure!(self.server == prior.server,
-            "terminal handoff server changed; cannot prove an unrecorded birth absent");
+        anyhow::ensure!(
+            self.server == prior.server,
+            "terminal handoff server changed; cannot prove an unrecorded birth absent"
+        );
         for pane in &self.panes {
-            let old = prior.panes.binary_search_by(|old|
-                old.identity.pane_id.cmp(&pane.identity.pane_id))
-                .ok().map(|index| &prior.panes[index]);
+            let old = prior
+                .panes
+                .binary_search_by(|old| old.identity.pane_id.cmp(&pane.identity.pane_id))
+                .ok()
+                .map(|index| &prior.panes[index]);
             anyhow::ensure!(pane.birth.is_some() && old.is_some_and(|old|
                 old.identity.pane_pid == pane.identity.pane_pid && old.birth == pane.birth),
                 "unrecorded terminal birth may still exist; close its exact pane explicitly in tmux before selecting a target");
@@ -389,60 +403,96 @@ pub(crate) fn capture_pane_birth_inventory(
             .ok_or_else(|| anyhow::anyhow!("terminal handoff socket is unavailable"))?,
     };
     let mut command = crate::tmux::tmux_query_command_for_socket(&socket);
-    command.args(["list-panes", "-a", "-F",
-        "#{pid}|#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}"]);
+    command.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pid}|#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}",
+    ]);
     let output = deadline.run(&mut command)?;
-    let mut inventory = PaneBirthInventory { socket, server: None, panes: Vec::new() };
+    let mut inventory = PaneBirthInventory {
+        socket,
+        server: None,
+        panes: Vec::new(),
+    };
     if !output.status.success() {
         if crate::tmux::tmux_no_server_running(&output.stderr) {
             return Ok(inventory);
         }
-        let no_target = std::str::from_utf8(&output.stderr)?
-            .trim() == "no current target";
+        let no_target = std::str::from_utf8(&output.stderr)?.trim() == "no current target";
         anyhow::ensure!(no_target, "complete terminal handoff inventory failed");
         let mut command = crate::tmux::tmux_query_command_for_socket(&inventory.socket);
         command.args(["list-sessions", "-F", "#{session_id}"]);
         let empty = deadline.run(&mut command)?;
-        anyhow::ensure!(empty.status.success() && empty.stdout.is_empty(),
-            "complete terminal handoff inventory is unavailable");
+        anyhow::ensure!(
+            empty.status.success() && empty.stdout.is_empty(),
+            "complete terminal handoff inventory is unavailable"
+        );
         return Ok(inventory);
     }
     for line in std::str::from_utf8(&output.stdout)?.lines() {
         let mut parts = line.split('|');
         let fields: [Option<&str>; 5] = std::array::from_fn(|_| parts.next());
-        let [Some(server_pid), Some(session_id), Some(pane_id), Some(pane_pid), Some(dead)] = fields
-        else { bail!("malformed complete terminal handoff inventory") };
-        anyhow::ensure!(parts.next().is_none(), "extra terminal handoff inventory fields");
-        let identity = crate::session::LegacyToolIdentity {
-            session_id: session_id.to_owned(), pane_id: pane_id.to_owned(),
-            pane_pid: if pane_pid.is_empty() { None } else { Some(pane_pid.parse()?) },
+        let [Some(server_pid), Some(session_id), Some(pane_id), Some(pane_pid), Some(dead)] =
+            fields
+        else {
+            bail!("malformed complete terminal handoff inventory")
         };
-        anyhow::ensure!(crate::tmux::ToolSession::valid_identity(&identity),
-            "invalid complete terminal handoff identity");
+        anyhow::ensure!(
+            parts.next().is_none(),
+            "extra terminal handoff inventory fields"
+        );
+        let identity = crate::session::LegacyToolIdentity {
+            session_id: session_id.to_owned(),
+            pane_id: pane_id.to_owned(),
+            pane_pid: if pane_pid.is_empty() {
+                None
+            } else {
+                Some(pane_pid.parse()?)
+            },
+        };
+        anyhow::ensure!(
+            crate::tmux::ToolSession::valid_identity(&identity),
+            "invalid complete terminal handoff identity"
+        );
         let pid = server_pid.parse()?;
         if let Some(expected) = &inventory.server {
-            anyhow::ensure!(expected.pid == pid, "terminal handoff inventory server changed");
+            anyhow::ensure!(
+                expected.pid == pid,
+                "terminal handoff inventory server changed"
+            );
         } else {
             let birth = crate::process::process_birth_identity(pid)?
                 .ok_or_else(|| anyhow::anyhow!("terminal handoff server birth unavailable"))?;
             inventory.server = Some(crate::session::TmuxServerIdentity {
-                socket: inventory.socket.clone(), pid, birth,
+                socket: inventory.socket.clone(),
+                pid,
+                birth,
             });
         }
         let birth = match dead {
             "1" => None,
-            "0" => Some(crate::process::process_birth_identity(
-                identity.pane_pid.ok_or_else(|| anyhow::anyhow!("live pane PID unavailable"))?,
-            )?.ok_or_else(|| anyhow::anyhow!("live pane birth unavailable"))?),
+            "0" => Some(
+                crate::process::process_birth_identity(
+                    identity
+                        .pane_pid
+                        .ok_or_else(|| anyhow::anyhow!("live pane PID unavailable"))?,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("live pane birth unavailable"))?,
+            ),
             _ => bail!("invalid complete terminal handoff pane state"),
         };
         inventory.panes.push(InventoriedPane { identity, birth });
     }
     if let Some(server) = &inventory.server {
-        anyhow::ensure!(crate::process::process_birth_is_live(server.pid, &server.birth)?,
-            "terminal handoff server changed during complete inventory");
+        anyhow::ensure!(
+            crate::process::process_birth_is_live(server.pid, &server.birth)?,
+            "terminal handoff server changed during complete inventory"
+        );
     }
-    inventory.panes.sort_unstable_by(|left, right| left.identity.pane_id.cmp(&right.identity.pane_id));
+    inventory
+        .panes
+        .sort_unstable_by(|left, right| left.identity.pane_id.cmp(&right.identity.pane_id));
     Ok(inventory)
 }
 

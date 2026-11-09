@@ -105,8 +105,8 @@ pub use instance::{
     TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
-    ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
-    ResumeLaunchOptions, TerminalContextResume,
+    ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
+    ResumeAttemptPolicy, ResumeLaunchOptions, TerminalContextResume,
 };
 pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
 pub(crate) use instance::{
@@ -206,9 +206,9 @@ pub(crate) use storage::{
     acquire_recovery_storage_flock, acquire_session_title_lock, acquire_storage_flock,
     acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
-    GroupMovePlan, LaunchConfig, LifecycleRelease, LockedDataFile, NativeStoreUnavailable, ProfileMoveRejected,
-    SessionCommitApplied, SessionMutation, SessionStore, StorageFlock, StorageTransition,
-    STORAGE_LOCK_FILENAME,
+    GroupMovePlan, LaunchConfig, LifecycleRelease, LockedDataFile, NativeStoreUnavailable,
+    ProfileMoveRejected, SessionCommitApplied, SessionMutation, SessionStore, StorageFlock,
+    StorageTransition, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

@@ -776,8 +776,7 @@ impl Instance {
                 && (probe.expected.matches_launch_observation(row)
                     || prior.is_some_and(|prior| prior.matches(row)))
         });
-        let scope_failure =
-            cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
+        let scope_failure = cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(
@@ -938,7 +937,12 @@ mod tests {
         let session = row.tmux_session().unwrap();
         let cleanup = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
         session
-            .create_with_size(&row.project_path, Some("sleep 60"), None, &row.source_profile)
+            .create_with_size(
+                &row.project_path,
+                Some("sleep 60"),
+                None,
+                &row.source_profile,
+            )
             .expect("managed rollback fixture must really create its pane");
         let observed = row
             .capture_revival_target()
@@ -1799,7 +1803,11 @@ mod tests {
         let mut rolled_back = reserved("rolled-back");
         let (_rollback_cleanup, rollback_birth) = failed_launch_birth(&rolled_back);
         rolled_back.fail_reserved_launch(
-            &storage, rolled_back.lifecycle_generation, &error, Some(&rollback_birth), None,
+            &storage,
+            rolled_back.lifecycle_generation,
+            &error,
+            Some(&rollback_birth),
+            None,
         );
         assert_eq!(
             *held_at_release.borrow(),
@@ -1816,7 +1824,13 @@ mod tests {
         held_at_release.borrow_mut().clear();
 
         let mut kept_pane = reserved("kept-pane");
-        kept_pane.fail_reserved_launch(&storage, kept_pane.lifecycle_generation, &error, None, None);
+        kept_pane.fail_reserved_launch(
+            &storage,
+            kept_pane.lifecycle_generation,
+            &error,
+            None,
+            None,
+        );
         let restarted = reserved("restarted");
         restarted.kill_clean_locked().unwrap();
         let mut superseded = reserved("superseded");
@@ -1832,7 +1846,11 @@ mod tests {
             })
             .unwrap();
         superseded.fail_reserved_launch(
-            &storage, superseded.lifecycle_generation, &error, Some(&superseded_birth), None,
+            &storage,
+            superseded.lifecycle_generation,
+            &error,
+            Some(&superseded_birth),
+            None,
         );
         assert_eq!(
             &superseded.capture_revival_target().unwrap().unwrap().pane,

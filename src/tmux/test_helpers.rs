@@ -77,8 +77,7 @@ pub(crate) fn wait_for_pane_agent_command(
             .and_then(|text| text.trim().parse::<u32>().ok())
         {
             if let Some((_, argv0)) = crate::process::parent_and_argv0(pid) {
-                if std::path::Path::new(&argv0).file_name()
-                    == Some(std::ffi::OsStr::new(expected))
+                if std::path::Path::new(&argv0).file_name() == Some(std::ffi::OsStr::new(expected))
                 {
                     let agent_birth = crate::process::process_birth_identity(pid)
                         .unwrap()

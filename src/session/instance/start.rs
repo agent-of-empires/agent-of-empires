@@ -782,285 +782,294 @@ impl Instance {
         let mut prior_executable = None;
         let mut born = None;
         let result: Result<(LaunchSidOutcome, resume::LaunchProbe)> = (|| {
-        let profile = storage.storage().profile();
-        let handoff_key = self
-            .terminal_handoff
-            .as_ref()
-            .map(|intent| TerminalHandoffKey {
-                id: intent.id,
-                generation: self.lifecycle_generation,
-            });
-        let session = self.tmux_session()?;
-        if session.exists_live() {
-            anyhow::bail!(
-                "session {} gained a tmux pane before its reserved launch",
-                self.id
-            );
-        }
+            let profile = storage.storage().profile();
+            let handoff_key = self
+                .terminal_handoff
+                .as_ref()
+                .map(|intent| TerminalHandoffKey {
+                    id: intent.id,
+                    generation: self.lifecycle_generation,
+                });
+            let session = self.tmux_session()?;
+            if session.exists_live() {
+                anyhow::bail!(
+                    "session {} gained a tmux pane before its reserved launch",
+                    self.id
+                );
+            }
 
-        // A takeover can replace the pane without changing the agent or the execution, and a poller
-        // for either would then be watching the pane this launch is replacing.
-        self.capture_poller.clear();
-        if !self.is_sandboxed() {
-            self.install_agent_status_hooks(self.status_agent());
-        }
-        self.report_store_override(prepared.execution.as_ref());
-        let canonicalized = prepared.canonical_conversation.is_some();
-        let launch_sid = if prepared.is_existing {
-            Some(
-                prepared
-                    .canonical_conversation
-                    .as_ref()
-                    .and_then(|state| state.session_id.clone())
-                    .or_else(|| self.agent_session_id.clone())
-                    .expect("existing launch command carries agent_session_id"),
-            )
-        } else {
-            None
-        };
-        // Read before `finalize_launch`, which may replace `agent_session_id`.
-        let pinned_prior_sid = self.agent_session_id.clone().filter(|sid| {
-            prepared.expected_conversation.session_id.as_deref() == Some(sid.as_str())
-        });
-
-        tracing::debug!(
-            target: "session.store",
-            sandboxed = self.is_sandboxed(),
-            has_command = prepared.command.is_some(),
-            "agent launch command prepared"
-        );
-
-        self.clear_pane_identity_sidecar();
-
-        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan.take() {
-            let launched_at_ms = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .context("system clock predates UNIX_EPOCH during OMP launch")
-                .and_then(|elapsed| {
-                    u64::try_from(elapsed.as_millis())
-                        .context("OMP launch timestamp does not fit in u64")
-                })?;
-            Some(OmpCaptureMetadata {
-                layout: plan.layout,
-                launched_at_ms,
-                launch_id: plan.launch_id,
-                launch_marker: plan.launch_marker,
-                routing_fingerprint: plan.routing_fingerprint,
-                container_runtime: plan.container_runtime,
-            })
-        } else {
-            None
-        };
-        let omp_generation_published = self.publish_omp_launch_generation_with_store(
-            storage,
-            omp_capture_metadata.as_ref(),
-            prepared.expected_prior_omp_generation.as_deref(),
-        )?;
-        if let Some(metadata) = omp_capture_metadata.as_ref() {
-            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb and writes the
-            // capture marker only if the store's terminal-sessions directory already exists.
+            // A takeover can replace the pane without changing the agent or the execution, and a poller
+            // for either would then be watching the pane this launch is replacing.
+            self.capture_poller.clear();
             if !self.is_sandboxed() {
-                if let Err(error) = std::fs::create_dir_all(&metadata.layout.terminal_sessions) {
-                    tracing::warn!(
-                        target: "session.store",
-                        instance = %self.id,
-                        "OMP capture may no-op: could not ensure terminal-sessions dir: {error}"
-                    );
-                }
+                self.install_agent_status_hooks(self.status_agent());
             }
-            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
-                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
-                metadata.launch_id.clone(),
-            ));
-        }
-        if let (Some((reason, _)), Some(command)) = (
-            prepared.sandbox_context_reset.as_ref(),
-            prepared.command.as_mut(),
-        ) {
-            *command = format!(
-                "{}\n{command}",
-                crate::session::environment::native_context_notice_command(reason)
-            );
-        }
-        self.capture_started_at = Some(SystemTime::now());
-        let handoff_launch = if let Some(key) = handoff_key {
-            self.validate_terminal_handoff(storage, key)?;
-            anyhow::ensure!(
-                omp_capture_metadata.is_none() || omp_generation_published,
-                "handoff OMP launch generation was not durably published"
-            );
-            let birth_inventory = crate::tmux::utils::capture_pane_birth_inventory(
-                None, &crate::tmux::TmuxCommandDeadline::new(),
-            )?;
-            prior_executable = Some(self.launch_executable.take());
-            self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
-            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
-                crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY.to_owned(),
-                key.id.to_string(),
-            ));
-            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
-                crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY.to_owned(),
-                key.generation.to_string(),
-            ));
-            Some(TerminalHandoffLaunch {
-                generation: key.generation,
-                prior: prepared.expected_conversation.clone(),
-                launched: self.conversation_state(),
-                capture_started_at: self.capture_started_at,
-                omp_capture_metadata: omp_capture_metadata.clone(),
-                confirm_desired_conversation: canonicalized
-                    || prepared.require_conversation_publication,
-                receipt: None,
-                birth_inventory: Some(birth_inventory),
-            })
-        } else {
-            None
-        };
-        let scope = crate::process::systemd::scope_prefix_for(&self.id, &self.id, profile);
-        let recorded_scopes = self.terminal_scopes.clone();
-        let resolved_scopes = match recorded_scopes.as_deref() {
-            Some(scopes)
-                if !scopes
-                    .contains(&crate::process::worker_registry::ScopeOwnership::Unresolved) =>
-            {
+            self.report_store_override(prepared.execution.as_ref());
+            let canonicalized = prepared.canonical_conversation.is_some();
+            let launch_sid = if prepared.is_existing {
+                Some(
+                    prepared
+                        .canonical_conversation
+                        .as_ref()
+                        .and_then(|state| state.session_id.clone())
+                        .or_else(|| self.agent_session_id.clone())
+                        .expect("existing launch command carries agent_session_id"),
+                )
+            } else {
                 None
-            }
-            recorded => crate::process::systemd::resolve_unknown_scopes(&self.id, recorded).ok(),
-        };
-        let generation = self.lifecycle_generation;
-        self.terminal_scopes = Some(storage.update(|rows, _| {
-            let row = rows
-                .iter_mut()
-                .find(|row| row.id == self.id)
-                .ok_or(LifecycleReservationError::Superseded)?;
-            anyhow::ensure!(
-                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
-                LifecycleReservationError::Superseded
-            );
-            if let Some(key) = handoff_key {
-                row.validate_terminal_handoff(storage, key)?;
-                row.terminal_handoff
-                    .as_mut()
-                    .expect("validated handoff")
-                    .launch = handoff_launch.clone();
-            }
-            if let Some(resolved) = resolved_scopes.as_ref() {
-                if row.terminal_scopes == recorded_scopes {
-                    row.terminal_scopes = Some(resolved.clone());
-                }
-            }
-            let scopes = row.terminal_scopes.get_or_insert_with(|| {
-                vec![crate::process::worker_registry::ScopeOwnership::Unresolved]
+            };
+            // Read before `finalize_launch`, which may replace `agent_session_id`.
+            let pinned_prior_sid = self.agent_session_id.clone().filter(|sid| {
+                prepared.expected_conversation.session_id.as_deref() == Some(sid.as_str())
             });
-            if let Some(scope) = &scope {
-                let owned = scope.ownership();
-                if !scopes.contains(&owned) {
-                    scopes.push(owned);
-                }
-            }
-            Ok(scopes.clone())
-        })?);
-        if handoff_key.is_some() {
-            self.terminal_handoff
-                .as_mut()
-                .ok_or(LifecycleReservationError::Superseded)?
-                .launch = handoff_launch;
-        }
-        let pane = session.create_with_size_env_and_container_env(
-            &self.project_path,
-            prepared.command.as_deref(),
-            size,
-            profile,
-            &prepared.launch_env.pane,
-            &prepared.launch_env.container,
-            scope.as_ref(),
-        )?
-        .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
-        if let Some(metadata) = omp_capture_metadata.as_ref() {
-            let pane_generation =
-                crate::tmux::env::get_env(session.name(), crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY);
-            if !omp_generation_published
-                || pane_generation.as_deref() != Some(metadata.launch_id.as_str())
-            {
-                omp_capture_metadata = None;
-            }
-        }
 
-        if handoff_key.is_none() {
-            self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
-        }
-        let pane = std::sync::Arc::new(pane);
-        let receipt = handoff_key.map(|_| std::sync::Arc::clone(&pane));
-        born = Some(resume::LaunchProbe {
-            tmux_session: session.name().to_owned(),
-            pane: Some(pane),
-            expected: self.published_launch_conversation(),
-        });
-        self.record_abandoned_launch_conversation(&prepared);
-        if let Some(key) = handoff_key {
-            let receipt = receipt.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
-            storage.update(|rows, _| {
+            tracing::debug!(
+                target: "session.store",
+                sandboxed = self.is_sandboxed(),
+                has_command = prepared.command.is_some(),
+                "agent launch command prepared"
+            );
+
+            self.clear_pane_identity_sidecar();
+
+            let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan.take() {
+                let launched_at_ms = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .context("system clock predates UNIX_EPOCH during OMP launch")
+                    .and_then(|elapsed| {
+                        u64::try_from(elapsed.as_millis())
+                            .context("OMP launch timestamp does not fit in u64")
+                    })?;
+                Some(OmpCaptureMetadata {
+                    layout: plan.layout,
+                    launched_at_ms,
+                    launch_id: plan.launch_id,
+                    launch_marker: plan.launch_marker,
+                    routing_fingerprint: plan.routing_fingerprint,
+                    container_runtime: plan.container_runtime,
+                })
+            } else {
+                None
+            };
+            let omp_generation_published = self.publish_omp_launch_generation_with_store(
+                storage,
+                omp_capture_metadata.as_ref(),
+                prepared.expected_prior_omp_generation.as_deref(),
+            )?;
+            if let Some(metadata) = omp_capture_metadata.as_ref() {
+                // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb and writes the
+                // capture marker only if the store's terminal-sessions directory already exists.
+                if !self.is_sandboxed() {
+                    if let Err(error) = std::fs::create_dir_all(&metadata.layout.terminal_sessions)
+                    {
+                        tracing::warn!(
+                            target: "session.store",
+                            instance = %self.id,
+                            "OMP capture may no-op: could not ensure terminal-sessions dir: {error}"
+                        );
+                    }
+                }
+                prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                    crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
+                    metadata.launch_id.clone(),
+                ));
+            }
+            if let (Some((reason, _)), Some(command)) = (
+                prepared.sandbox_context_reset.as_ref(),
+                prepared.command.as_mut(),
+            ) {
+                *command = format!(
+                    "{}\n{command}",
+                    crate::session::environment::native_context_notice_command(reason)
+                );
+            }
+            self.capture_started_at = Some(SystemTime::now());
+            let handoff_launch = if let Some(key) = handoff_key {
+                self.validate_terminal_handoff(storage, key)?;
+                anyhow::ensure!(
+                    omp_capture_metadata.is_none() || omp_generation_published,
+                    "handoff OMP launch generation was not durably published"
+                );
+                let birth_inventory = crate::tmux::utils::capture_pane_birth_inventory(
+                    None,
+                    &crate::tmux::TmuxCommandDeadline::new(),
+                )?;
+                prior_executable = Some(self.launch_executable.take());
+                self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
+                prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                    crate::tmux::env::AOE_TERMINAL_HANDOFF_ID_KEY.to_owned(),
+                    key.id.to_string(),
+                ));
+                prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                    crate::tmux::env::AOE_TERMINAL_HANDOFF_GENERATION_KEY.to_owned(),
+                    key.generation.to_string(),
+                ));
+                Some(TerminalHandoffLaunch {
+                    generation: key.generation,
+                    prior: prepared.expected_conversation.clone(),
+                    launched: self.conversation_state(),
+                    capture_started_at: self.capture_started_at,
+                    omp_capture_metadata: omp_capture_metadata.clone(),
+                    confirm_desired_conversation: canonicalized
+                        || prepared.require_conversation_publication,
+                    receipt: None,
+                    birth_inventory: Some(birth_inventory),
+                })
+            } else {
+                None
+            };
+            let scope = crate::process::systemd::scope_prefix_for(&self.id, &self.id, profile);
+            let recorded_scopes = self.terminal_scopes.clone();
+            let resolved_scopes = match recorded_scopes.as_deref() {
+                Some(scopes)
+                    if !scopes
+                        .contains(&crate::process::worker_registry::ScopeOwnership::Unresolved) =>
+                {
+                    None
+                }
+                recorded => {
+                    crate::process::systemd::resolve_unknown_scopes(&self.id, recorded).ok()
+                }
+            };
+            let generation = self.lifecycle_generation;
+            self.terminal_scopes = Some(storage.update(|rows, _| {
                 let row = rows
                     .iter_mut()
                     .find(|row| row.id == self.id)
                     .ok_or(LifecycleReservationError::Superseded)?;
-                row.validate_terminal_handoff(storage, key)?;
-                let launch = row
-                    .terminal_handoff
-                    .as_ref()
-                    .and_then(|intent| intent.launch.as_ref())
-                    .ok_or(LifecycleReservationError::Superseded)?;
                 anyhow::ensure!(
-                    row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, key.generation)
-                        && launch.generation == key.generation
-                        && launch.receipt.is_none()
-                        && (launch.prior.matches(row) || launch.launched.matches(row)),
+                    row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
                     LifecycleReservationError::Superseded
                 );
-                row.terminal_handoff
+                if let Some(key) = handoff_key {
+                    row.validate_terminal_handoff(storage, key)?;
+                    row.terminal_handoff
+                        .as_mut()
+                        .expect("validated handoff")
+                        .launch = handoff_launch.clone();
+                }
+                if let Some(resolved) = resolved_scopes.as_ref() {
+                    if row.terminal_scopes == recorded_scopes {
+                        row.terminal_scopes = Some(resolved.clone());
+                    }
+                }
+                let scopes = row.terminal_scopes.get_or_insert_with(|| {
+                    vec![crate::process::worker_registry::ScopeOwnership::Unresolved]
+                });
+                if let Some(scope) = &scope {
+                    let owned = scope.ownership();
+                    if !scopes.contains(&owned) {
+                        scopes.push(owned);
+                    }
+                }
+                Ok(scopes.clone())
+            })?);
+            if handoff_key.is_some() {
+                self.terminal_handoff
+                    .as_mut()
+                    .ok_or(LifecycleReservationError::Superseded)?
+                    .launch = handoff_launch;
+            }
+            let pane = session
+                .create_with_size_env_and_container_env(
+                    &self.project_path,
+                    prepared.command.as_deref(),
+                    size,
+                    profile,
+                    &prepared.launch_env.pane,
+                    &prepared.launch_env.container,
+                    scope.as_ref(),
+                )?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+            if let Some(metadata) = omp_capture_metadata.as_ref() {
+                let pane_generation = crate::tmux::env::get_env(
+                    session.name(),
+                    crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                );
+                if !omp_generation_published
+                    || pane_generation.as_deref() != Some(metadata.launch_id.as_str())
+                {
+                    omp_capture_metadata = None;
+                }
+            }
+
+            if handoff_key.is_none() {
+                self.apply_prepared_launch_state(&mut prepared, omp_capture_metadata.as_ref());
+            }
+            let pane = std::sync::Arc::new(pane);
+            let receipt = handoff_key.map(|_| std::sync::Arc::clone(&pane));
+            born = Some(resume::LaunchProbe {
+                tmux_session: session.name().to_owned(),
+                pane: Some(pane),
+                expected: self.published_launch_conversation(),
+            });
+            self.record_abandoned_launch_conversation(&prepared);
+            if let Some(key) = handoff_key {
+                let receipt = receipt.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+                storage.update(|rows, _| {
+                    let row = rows
+                        .iter_mut()
+                        .find(|row| row.id == self.id)
+                        .ok_or(LifecycleReservationError::Superseded)?;
+                    row.validate_terminal_handoff(storage, key)?;
+                    let launch = row
+                        .terminal_handoff
+                        .as_ref()
+                        .and_then(|intent| intent.launch.as_ref())
+                        .ok_or(LifecycleReservationError::Superseded)?;
+                    anyhow::ensure!(
+                        row.lifecycle_reservation_is_owned(
+                            LifecycleOperation::Launch,
+                            key.generation
+                        ) && launch.generation == key.generation
+                            && launch.receipt.is_none()
+                            && (launch.prior.matches(row) || launch.launched.matches(row)),
+                        LifecycleReservationError::Superseded
+                    );
+                    row.terminal_handoff
+                        .as_mut()
+                        .and_then(|intent| intent.launch.as_mut())
+                        .ok_or(LifecycleReservationError::Superseded)?
+                        .receipt = Some(std::sync::Arc::clone(&receipt));
+                    Ok(())
+                })?;
+                self.terminal_handoff
                     .as_mut()
                     .and_then(|intent| intent.launch.as_mut())
                     .ok_or(LifecycleReservationError::Superseded)?
-                    .receipt = Some(std::sync::Arc::clone(&receipt));
-                Ok(())
-            })?;
-            self.terminal_handoff
-                .as_mut()
-                .and_then(|intent| intent.launch.as_mut())
-                .ok_or(LifecycleReservationError::Superseded)?
-                .receipt = Some(receipt);
-        }
-        if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
-            crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
-                profile,
-                &self.id,
-                crate::migrations::v033_isolate_sandbox_content::NativeContextView::Terminal,
-                self.lifecycle_generation,
-                transactions,
-                None,
+                    .receipt = Some(receipt);
+            }
+            if let Some((_, transactions)) = prepared.sandbox_context_reset.as_ref() {
+                crate::migrations::v033_isolate_sandbox_content::acknowledge_context_reset(
+                    profile,
+                    &self.id,
+                    crate::migrations::v033_isolate_sandbox_content::NativeContextView::Terminal,
+                    self.lifecycle_generation,
+                    transactions,
+                    None,
+                )?;
+            }
+            #[cfg(test)]
+            test_support::observe(self, test_support::FinalizePhase::Before);
+
+            self.finalize_launch_with_store(
+                session.name(),
+                storage,
+                &prepared.expected_conversation,
+                omp_capture_metadata,
+                canonicalized || prepared.require_conversation_publication,
             )?;
-        }
-        #[cfg(test)]
-        test_support::observe(self, test_support::FinalizePhase::Before);
 
-        self.finalize_launch_with_store(
-            session.name(),
-            storage,
-            &prepared.expected_conversation,
-            omp_capture_metadata,
-            canonicalized || prepared.require_conversation_publication,
-        )?;
-
-        #[cfg(test)]
-        test_support::observe(self, test_support::FinalizePhase::After);
-        let outcome = match launch_sid {
-            Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
-        };
-        let probe = born
-            .take()
-            .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
-        Ok((outcome, probe))
+            #[cfg(test)]
+            test_support::observe(self, test_support::FinalizePhase::After);
+            let outcome = match launch_sid {
+                Some(sid) => LaunchSidOutcome::Existing { sid },
+                None => LaunchSidOutcome::Fresh { pinned_prior_sid },
+            };
+            let probe = born
+                .take()
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+            Ok((outcome, probe))
         })();
         result.map_err(|error| {
             let prior = prepared.expected_conversation;
@@ -1173,7 +1182,8 @@ impl Instance {
     fn record_abandoned_launch_conversation(&mut self, prepared: &PreparedLaunch) {
         if !prepared.is_existing {
             if let Some(prior_sid) = prepared.expected_conversation.session_id.as_deref() {
-                match self.abandoned_prior_conversation(&prepared.expected_conversation, prior_sid) {
+                match self.abandoned_prior_conversation(&prepared.expected_conversation, prior_sid)
+                {
                     Some(abandoned) => {
                         self.retroactive_capture_excludes.insert(abandoned);
                     }

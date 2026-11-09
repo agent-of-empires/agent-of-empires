@@ -254,8 +254,8 @@ impl Instance {
     pub(crate) fn wait_for_pane_ready(&self) -> Result<(), LaunchIndeterminateCause> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
         loop {
-            let panes =
-                crate::tmux::batch_pane_metadata().map_err(|error| self.probe_failure_cause(error))?;
+            let panes = crate::tmux::batch_pane_metadata()
+                .map_err(|error| self.probe_failure_cause(error))?;
             let Some((_, pane)) =
                 crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)
                     .map_err(|error| self.probe_failure_cause(error))?

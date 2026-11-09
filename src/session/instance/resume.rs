@@ -625,7 +625,6 @@ impl Instance {
         }))
     }
 
-
     fn preserve_indeterminate_launch(
         &mut self,
         storage: &dyn crate::session::SessionStore,
@@ -684,7 +683,10 @@ impl Instance {
 
         drop(lifecycle_lock);
         drop(title_lock);
-        Ok(PreparedLaunchReservation { generation, revival })
+        Ok(PreparedLaunchReservation {
+            generation,
+            revival,
+        })
     }
 
     pub(super) fn capture_resume_launch_target_in(&mut self, stores: CaptureStorage<'_>) {
@@ -723,7 +725,10 @@ impl Instance {
         reservation: PreparedLaunchReservation,
         hook_result: Result<()>,
     ) -> Result<StartOutcome> {
-        let PreparedLaunchReservation { generation, revival } = reservation;
+        let PreparedLaunchReservation {
+            generation,
+            revival,
+        } = reservation;
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         let ResumeLaunchOptions {
@@ -755,7 +760,11 @@ impl Instance {
         let spawned = (|| {
             let mut prepared = self
                 .stop_carry_and_prepare_in(
-                    storage, restart, conversation_carry, prior, revival.as_ref(),
+                    storage,
+                    restart,
+                    conversation_carry,
+                    prior,
+                    revival.as_ref(),
                 )
                 .map_err(|error| LaunchFailure { error, born: None })?;
             prepared.require_conversation_publication |= skipped_failed_resume_sid.is_some();
@@ -803,7 +812,11 @@ impl Instance {
         };
         if let StartOutcome::Indeterminate { cause } = outcome {
             return self.preserve_indeterminate_launch(
-                storage, generation, &probe, sandbox_prior.as_ref(), cause,
+                storage,
+                generation,
+                &probe,
+                sandbox_prior.as_ref(),
+                cause,
             );
         }
         if let Err(error) = self.commit_lifecycle_launch(storage, generation, restart) {
@@ -842,7 +855,8 @@ impl Instance {
             let generation = self.lifecycle_generation;
             if let Err(error) = self.kill_for_revival_locked(revival) {
                 if error.is::<LaunchIndeterminateCause>() {
-                    match self.restore_capture_after_refused_revival(storage, generation, expected) {
+                    match self.restore_capture_after_refused_revival(storage, generation, expected)
+                    {
                         Ok(PollerStart::Started) => {}
                         Ok(outcome) => tracing::warn!(target: "session.store", session = %self.id,
                             ?outcome, "retained runtime capture is not yet running after revival refusal"),
@@ -908,7 +922,8 @@ impl Instance {
             self.lifecycle_generation == generation
                 && rows.iter().any(|row| {
                     row.id == self.id
-                        && row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
+                        && row
+                            .lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation)
                         && expected.matches(row)
                         && row.omp_capture_generation == self.omp_capture_generation
                 }),
@@ -933,7 +948,11 @@ impl Instance {
             None
         };
         self.stop_carry_and_prepare_in(
-            &storage, restart, conversation_carry, expected, revival.as_ref(),
+            &storage,
+            restart,
+            conversation_carry,
+            expected,
+            revival.as_ref(),
         )
     }
 
@@ -1321,7 +1340,10 @@ mod tests {
                     restart: true,
                     conversation_carry: None,
                 },
-                PreparedLaunchReservation { generation, revival: None },
+                PreparedLaunchReservation {
+                    generation,
+                    revival: None,
+                },
                 Ok(()),
             )
             .unwrap();
@@ -2472,7 +2494,11 @@ mod tests {
                     "one actual launch, not a replay"
                 );
                 let pane = only_pane_id(&launched_name);
-                crate::tmux::test_helpers::wait_for_pane_agent_command(&pane, &agent_pid_file, "sleep");
+                crate::tmux::test_helpers::wait_for_pane_agent_command(
+                    &pane,
+                    &agent_pid_file,
+                    "sleep",
+                );
                 assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
                 let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
                 let birth = crate::process::process_birth_identity(pid)
@@ -4094,8 +4120,8 @@ exec sleep 60
     #[test]
     #[serial]
     fn revival_retains_replacement_between_dead_observation_and_capture_return() {
-        use std::os::unix::fs::PermissionsExt;
         use crate::tmux::test_helpers::{only_pane_id, pane_field, TmuxTestSession};
+        use std::os::unix::fs::PermissionsExt;
         crate::tmux::test_helpers::require_tmux!();
         let real_tmux = which::which("tmux").unwrap();
         for replacement_dead in [false, true] {
@@ -4106,15 +4132,26 @@ exec sleep 60
                 config.systemd.enabled = false;
                 config.session.agent_status_hooks = false;
                 config.session.smart_rename = false;
-            }).unwrap();
-            let mut instance = Instance::new("dead-observation-replaced", root.path().to_str().unwrap());
+            })
+            .unwrap();
+            let mut instance =
+                Instance::new("dead-observation-replaced", root.path().to_str().unwrap());
             instance.source_profile = "dead-observation-replaced".into();
             instance.command = "sleep 60".into();
             let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
-            storage.update(|rows, _| { rows.push(instance.clone()); Ok(()) }).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
             let sentinel = TmuxTestSession::new("dead-observation-server-sentinel");
             crate::tmux::Session::from_name(sentinel.name())
-                .create(root.path().to_str().unwrap(), Some("exec sleep 60"), &instance.source_profile)
+                .create(
+                    root.path().to_str().unwrap(),
+                    Some("exec sleep 60"),
+                    &instance.source_profile,
+                )
                 .unwrap();
             let (_old_guard, old) = observed_dead_resume_fixture(&instance);
             let name = instance.tmux_session().unwrap().name().to_owned();
@@ -4127,21 +4164,38 @@ exec sleep 60
             let actor = std::thread::spawn(move || {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while !actor_request.exists() {
-                    assert!(std::time::Instant::now() < deadline, "physical dead observation must complete");
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "physical dead observation must complete"
+                    );
                     std::thread::yield_now();
                 }
-                assert!(crate::tmux::tmux_command().args(["kill-pane", "-t", &old_pane])
-                    .status().unwrap().success());
+                assert!(crate::tmux::tmux_command()
+                    .args(["kill-pane", "-t", &old_pane])
+                    .status()
+                    .unwrap()
+                    .success());
                 let (guard, replacement) = if replacement_dead {
                     observed_dead_resume_fixture(&actor_row)
                 } else {
                     let session = actor_row.tmux_session().unwrap();
                     let guard = TmuxTestSession::from_name(session.name());
-                    let replacement = session.create_with_size_env_and_container_env(
-                        &actor_row.project_path, Some("exec sleep 60"), None,
-                        &actor_row.source_profile, &[], &[], None,
-                    ).unwrap().unwrap();
-                    crate::tmux::test_helpers::wait_for_pane_command(&replacement.identity.pane_id, "sleep");
+                    let replacement = session
+                        .create_with_size_env_and_container_env(
+                            &actor_row.project_path,
+                            Some("exec sleep 60"),
+                            None,
+                            &actor_row.source_profile,
+                            &[],
+                            &[],
+                            None,
+                        )
+                        .unwrap()
+                        .unwrap();
+                    crate::tmux::test_helpers::wait_for_pane_command(
+                        &replacement.identity.pane_id,
+                        "sleep",
+                    );
                     (guard, replacement)
                 };
                 std::fs::write(&actor_ready, b"replacement physically installed").unwrap();
@@ -4163,14 +4217,27 @@ exec sleep 60
             let _path = crate::session::test_support::path_prepended(&bin);
             let result = instance.ensure_pane_ready();
             let (_replacement_guard, replacement) = actor.join().unwrap();
-            assert!(matches!(result, Ok(crate::session::EnsureReadyOutcome::Indeterminate { .. })), "{result:?}");
+            assert!(
+                matches!(
+                    result,
+                    Ok(crate::session::EnsureReadyOutcome::Indeterminate { .. })
+                ),
+                "{result:?}"
+            );
             assert_ne!(replacement.identity.pane_id, old.identity.pane_id);
             assert_eq!(only_pane_id(&name), replacement.identity.pane_id);
-            assert_eq!(pane_field(&replacement.identity.pane_id, "#{pane_dead}"), if replacement_dead { "1" } else { "0" });
-            assert!(std::fs::read_to_string(stdout).unwrap().contains(&old.identity.pane_id));
+            assert_eq!(
+                pane_field(&replacement.identity.pane_id, "#{pane_dead}"),
+                if replacement_dead { "1" } else { "0" }
+            );
+            assert!(std::fs::read_to_string(stdout)
+                .unwrap()
+                .contains(&old.identity.pane_id));
             if !replacement_dead {
                 let pid = replacement.identity.pane_pid.unwrap();
-                assert!(crate::process::process_birth_identity(pid).unwrap().is_some());
+                assert!(crate::process::process_birth_identity(pid)
+                    .unwrap()
+                    .is_some());
             }
         }
     }

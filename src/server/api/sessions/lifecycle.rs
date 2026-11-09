@@ -3176,7 +3176,10 @@ async fn prepare_agent_session_inner(
                             if super::ensure::ready_agent_session(row)?.is_some() {
                                 return Ok(None);
                             }
-                            return Err(crate::session::LaunchIndeterminateCause::StabilizationExpired.into());
+                            return Err(
+                                crate::session::LaunchIndeterminateCause::StabilizationExpired
+                                    .into(),
+                            );
                         }
                     }
                     revival = observed;

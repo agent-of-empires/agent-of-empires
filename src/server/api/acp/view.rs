@@ -551,7 +551,9 @@ impl Drop for TerminalHandoff {
             SessionStore::defer_lifecycle_release(
                 native,
                 self.session_id.clone(),
-                crate::session::LifecycleRelease::Reservation(crate::session::LifecycleOperation::Launch),
+                crate::session::LifecycleRelease::Reservation(
+                    crate::session::LifecycleOperation::Launch,
+                ),
                 key.generation,
                 None,
             );
@@ -948,10 +950,7 @@ fn commit_terminal_in(
 
 /// A prepared payload is not a birth receipt. The existing no-launch transition is
 /// only for a still-blocked row; it neither adopts a pane nor attests a missing birth.
-fn ensure_handoff_launch_receipt(
-    row: &Instance,
-    key: HandoffKey,
-) -> anyhow::Result<()> {
+fn ensure_handoff_launch_receipt(row: &Instance, key: HandoffKey) -> anyhow::Result<()> {
     let intent = row
         .terminal_handoff
         .as_ref()
@@ -1379,7 +1378,9 @@ fn drive_terminal_handoff(
                             .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
                         let terminal = row.tmux_session()?;
                         Instance::ensure_terminal_handoff_pane_matches(
-                            terminal.name(), attempt, launch,
+                            terminal.name(),
+                            attempt,
+                            launch,
                         )?;
                         held.store().adopt_runtime_fields(&row)?;
                         held.store().refresh_pane_observations(&row)?;
@@ -1429,7 +1430,9 @@ fn drive_terminal_handoff(
                         {
                             let terminal = current.tmux_session()?;
                             Instance::ensure_terminal_handoff_pane_matches(
-                                terminal.name(), key, launch,
+                                terminal.name(),
+                                key,
+                                launch,
                             )?;
                         }
                         let identity = native.storage().bound_profile_identity()?;
@@ -2919,9 +2922,13 @@ mod tests {
         let root = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
         let _environment = crate::session::test_support::EnvGuard::unset(&[
-            "HOME", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR",
-        ]).and_set("HOME", root.path()).and_set("XDG_CONFIG_HOME", root.path().join(".config"))
-            .and_set("CLAUDE_CONFIG_DIR", root.path().join(".claude"));
+            "HOME",
+            "XDG_CONFIG_HOME",
+            "CLAUDE_CONFIG_DIR",
+        ])
+        .and_set("HOME", root.path())
+        .and_set("XDG_CONFIG_HOME", root.path().join(".config"))
+        .and_set("CLAUDE_CONFIG_DIR", root.path().join(".claude"));
         let agent_pid_file = root.path().join("actual-host-agent.pid");
         let _agent = crate::session::test_support::install_login_shell_path_command(
             root.path(), "claude",
@@ -2954,13 +2961,20 @@ mod tests {
         source.command = "claude".into();
         let name = crate::tmux::Session::generate_name(&source.id, &source.title);
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
-        let peer = crate::tmux::test_helpers::TmuxTestSession::new("unrelated-preexisting-birth-peer");
-        anyhow::ensure!(crate::tmux::tmux_command()
-            .args(["new-session", "-d", "-s", peer.name(), "exec sleep 60"])
-            .output()?.status.success(), "create a genuine unrelated pane before the launch");
+        let peer =
+            crate::tmux::test_helpers::TmuxTestSession::new("unrelated-preexisting-birth-peer");
+        anyhow::ensure!(
+            crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", peer.name(), "exec sleep 60"])
+                .output()?
+                .status
+                .success(),
+            "create a genuine unrelated pane before the launch"
+        );
         let peer_pane = crate::tmux::test_helpers::only_pane_id(peer.name());
         crate::tmux::test_helpers::wait_for_pane_command(&peer_pane, "sleep");
-        let peer_pid = crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_pid}").parse::<u32>()?;
+        let peer_pid =
+            crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_pid}").parse::<u32>()?;
         let peer_birth = crate::process::process_birth_identity(peer_pid)?.unwrap();
         let events = Arc::new(crate::acp::event_store::EventStore::open(
             &root.path().join("events.db"),
@@ -3065,57 +3079,124 @@ mod tests {
             let storage = crate::session::Storage::open_unwatched("default")?;
             let old_key = handoff_key(&durable)?;
             let old_pane = crate::tmux::test_helpers::only_pane_id(&name);
-            crate::tmux::test_helpers::wait_for_pane_agent_command(&old_pane, &agent_pid_file, "sleep");
-            let old_pid = crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
+            crate::tmux::test_helpers::wait_for_pane_agent_command(
+                &old_pane,
+                &agent_pid_file,
+                "sleep",
+            );
+            let old_pid =
+                crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
             let old_birth = crate::process::process_birth_identity(old_pid)?
                 .expect("unproven birth still names a real live process");
-            let (old_physical, _, _) = crate::tmux::utils::observe_pane(
-                &name, &crate::tmux::TmuxCommandDeadline::new(),
-            )?.expect("physical original pane exists independently of its missing durable receipt");
+            let (old_physical, _, _) =
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .expect(
+                    "physical original pane exists independently of its missing durable receipt",
+                );
             storage.update(|rows, _| {
                 let row = rows.iter_mut().find(|row| row.id == source.id).unwrap();
                 row.terminal_handoff.as_mut().unwrap().stage = HandoffStage::ProjectionCleanupOwed;
                 Ok(())
             })?;
-            let select_fresh = || SessionCli::try_parse_from([
-                "aoe-session", "set-session-id", source.id.as_str(), "",
-            ]);
-            assert!(crate::cli::session::run("default", select_fresh()?.command).await.is_err());
+            let select_fresh = || {
+                SessionCli::try_parse_from([
+                    "aoe-session",
+                    "set-session-id",
+                    source.id.as_str(),
+                    "",
+                ])
+            };
+            assert!(crate::cli::session::run("default", select_fresh()?.command)
+                .await
+                .is_err());
             assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
-            let refused = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            let refused = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
             assert_eq!(handoff_key(&refused)?, old_key);
-            assert_eq!(refused.terminal_handoff.as_ref().unwrap().stage, HandoffStage::ProjectionCleanupOwed);
+            assert_eq!(
+                refused.terminal_handoff.as_ref().unwrap().stage,
+                HandoffStage::ProjectionCleanupOwed
+            );
             let renamed = "operator-moved-unproven-birth";
             let _renamed = crate::tmux::test_helpers::TmuxTestSession::from_name(renamed);
-            anyhow::ensure!(crate::tmux::tmux_command()
-                .args(["rename-session", "-t", &name, renamed]).output()?.status.success(),
-                "rename the real unproven birth outside the AoE name prefix");
-            assert!(crate::cli::session::run("default", select_fresh()?.command).await.is_err(),
-                "renaming a living unproven pane must not grant new target authority");
-            let unchanged = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["rename-session", "-t", &name, renamed])
+                    .output()?
+                    .status
+                    .success(),
+                "rename the real unproven birth outside the AoE name prefix"
+            );
+            assert!(
+                crate::cli::session::run("default", select_fresh()?.command)
+                    .await
+                    .is_err(),
+                "renaming a living unproven pane must not grant new target authority"
+            );
+            let unchanged = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
             assert_eq!(handoff_key(&unchanged)?, old_key);
-            assert_eq!(crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}"),
-                old_pid.to_string());
+            assert_eq!(
+                crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}"),
+                old_pid.to_string()
+            );
             assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
-            anyhow::ensure!(crate::tmux::tmux_command()
-                .args(["rename-session", "-t", renamed, &name]).output()?.status.success(),
-                "restore the same physical pane name before explicit operator close");
-            anyhow::ensure!(crate::tmux::tmux_command()
-                .args(["join-pane", "-s", &old_pane, "-t", &peer_pane])
-                .output()?.status.success(), "move the real unproven pane outside pane zero");
-            assert!(crate::cli::session::run("default", select_fresh()?.command).await.is_err(),
-                "moving a living unproven pane must not grant new target authority");
-            let unmoved_target = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["rename-session", "-t", renamed, &name])
+                    .output()?
+                    .status
+                    .success(),
+                "restore the same physical pane name before explicit operator close"
+            );
+            anyhow::ensure!(
+                crate::tmux::tmux_command()
+                    .args(["join-pane", "-s", &old_pane, "-t", &peer_pane])
+                    .output()?
+                    .status
+                    .success(),
+                "move the real unproven pane outside pane zero"
+            );
+            assert!(
+                crate::cli::session::run("default", select_fresh()?.command)
+                    .await
+                    .is_err(),
+                "moving a living unproven pane must not grant new target authority"
+            );
+            let unmoved_target = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
             assert_eq!(handoff_key(&unmoved_target)?, old_key);
             assert!(crate::process::process_birth_is_live(old_pid, &old_birth)?);
             drop(_path);
             anyhow::ensure!(
-                crate::tmux::tmux_command().args(["kill-pane", "-t", &old_pane]).output()?.status.success(),
+                crate::tmux::tmux_command()
+                    .args(["kill-pane", "-t", &old_pane])
+                    .output()?
+                    .status
+                    .success(),
                 "operator must explicitly close the exact unproven pane"
             );
-            assert!(crate::tmux::agent_pane_metadata_in(&crate::tmux::batch_pane_metadata()?, &source.id, &source.title)?.is_none());
+            assert!(crate::tmux::agent_pane_metadata_in(
+                &crate::tmux::batch_pane_metadata()?,
+                &source.id,
+                &source.title
+            )?
+            .is_none());
             crate::cli::session::run("default", select_fresh()?.command).await?;
-            let selected = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            let selected = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
             let renewed = selected.terminal_handoff.as_ref().unwrap();
             assert_eq!(renewed.id, old_key.id);
             assert!(renewed.generation > old_key.generation);
@@ -3123,17 +3204,24 @@ mod tests {
             assert_eq!(renewed.stage, HandoffStage::TerminalLaunchOwed);
             assert!(matches!(renewed.context, HandoffContext::Discard));
             assert!(renewed.launch.as_ref().unwrap().receipt.is_none());
-            assert!(events.replay_from(&source.id, 0).iter().any(|(seq, _)| *seq == sentinel));
+            assert!(events
+                .replay_from(&source.id, 0)
+                .iter()
+                .any(|(seq, _)| *seq == sentinel));
             let response = terminal_handoff_request(state.clone(), source.id.clone()).await;
             assert_eq!(response.status(), StatusCode::OK);
-            let completed = storage.load()?.into_iter().find(|row| row.id == source.id).unwrap();
+            let completed = storage
+                .load()?
+                .into_iter()
+                .find(|row| row.id == source.id)
+                .unwrap();
             assert!(completed.terminal_handoff.is_none());
             assert!(completed.lifecycle_reservation.is_none());
             assert!(completed.lifecycle_generation > renewed.generation);
             let new_pane = crate::tmux::test_helpers::only_pane_id(&name);
-            let (new_physical, _, _) = crate::tmux::utils::observe_pane(
-                &name, &crate::tmux::TmuxCommandDeadline::new(),
-            )?.expect("new physical pane exists");
+            let (new_physical, _, _) =
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                    .expect("new physical pane exists");
             let new_pid = new_physical.identity.pane_pid.expect("new pane PID");
             let new_birth = crate::process::process_birth_identity(new_pid)?
                 .expect("new pane has a real process birth");
@@ -3145,13 +3233,23 @@ mod tests {
             let repeat = terminal_handoff_request(state.clone(), source.id.clone()).await;
             assert_eq!(repeat.status(), StatusCode::OK);
             assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), new_pane);
-            assert_eq!(crate::tmux::utils::observe_pane(
-                &name, &crate::tmux::TmuxCommandDeadline::new(),
-            )?.unwrap().0, new_physical, "a repeated request must retain the actual new physical owner");
+            assert_eq!(
+                crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new(),)?
+                    .unwrap()
+                    .0,
+                new_physical,
+                "a repeated request must retain the actual new physical owner"
+            );
             assert!(crate::process::process_birth_is_live(new_pid, &new_birth)?);
             assert!(events.replay_from(&source.id, 0).is_empty());
-            assert_eq!(crate::tmux::test_helpers::only_pane_id(peer.name()), peer_pane);
-            assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth)?);
+            assert_eq!(
+                crate::tmux::test_helpers::only_pane_id(peer.name()),
+                peer_pane
+            );
+            assert!(crate::process::process_birth_is_live(
+                peer_pid,
+                &peer_birth
+            )?);
             state.runtime.work.drain().await;
         }
         Ok(())

@@ -1187,18 +1187,19 @@ mod tests {
         prior.source_profile = "default".into();
         prior.tool = "prime-agent".into();
         prior.status = Status::Starting;
-        prior.sandbox_info = Some(test_sandbox(
-            "boot-store-contention",
-            None,
-        ));
+        prior.sandbox_info = Some(test_sandbox("boot-store-contention", None));
         admit_sandbox_fixture(&prior);
         let store = prior.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let storage = crate::session::Storage::new_unwatched("default").unwrap();
-        prior.prime_agent_capture_plan_in(
-            prior.prime_agent_capture_options().expect("Prime fixture has valid capture arguments"),
-            crate::session::CaptureStorage::Scoped(&storage),
-        ).expect("the fixture must reach real lease contention, not configuration refusal");
+        prior
+            .prime_agent_capture_plan_in(
+                prior
+                    .prime_agent_capture_options()
+                    .expect("Prime fixture has valid capture arguments"),
+                crate::session::CaptureStorage::Scoped(&storage),
+            )
+            .expect("the fixture must reach real lease contention, not configuration refusal");
         let backend = crate::agents::SessionCaptureBackend::PrimeAgent;
         let lease = super::try_acquire_managed_capture_lease(backend, &store).unwrap();
         assert!(
