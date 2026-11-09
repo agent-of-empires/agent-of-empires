@@ -106,6 +106,9 @@ publishing worker epoch. Unknown origin or recoverability stays unknown.
 Terminal observations use the separate instance lifecycle-generation namespace.
 Publication rejects superseded workers before allocating a sequence, persisting
 or folding. Snapshot metadata is a diagnostic hint, never effect authority.
+Admission-refusal and quota-resume producers use the same per-session
+sequence-and-publication critical section; a separately allocated sequence must
+not escape that fence.
 The exact original drain may still publish its tagged tail while its current
 lease retains retirement custody, including a late native session ID needed for
 Keep handoff. This does not authorize an absent uncaptured publisher, a replaced

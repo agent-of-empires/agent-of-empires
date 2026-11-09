@@ -1954,7 +1954,10 @@ mod tests {
         assert_eq!(next.try_recv(), Err(oneshot::error::TryRecvError::Empty));
         peer.completed(6, "end_turn").await;
         peer.drain().await;
-        assert_eq!(next.await.unwrap(), end("end_turn"));
+        assert_eq!(
+            next.await.unwrap(),
+            ControlPromptResult::Outcome(end("end_turn"))
+        );
         peer.assert_local_terminal_ownership();
     }
 
@@ -1978,7 +1981,10 @@ mod tests {
             .await;
         peer.completed(6, "end_turn").await;
         peer.drain().await;
-        assert_eq!(next.await.unwrap(), end("end_turn"));
+        assert_eq!(
+            next.await.unwrap(),
+            ControlPromptResult::Outcome(end("end_turn"))
+        );
         peer.assert_local_terminal_ownership();
     }
 
