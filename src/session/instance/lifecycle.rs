@@ -249,6 +249,7 @@ impl Instance {
         self.idle_dormant_since = None;
         self.idle_entered_at = None;
         self.last_error = None;
+        self.last_error_evidence = None;
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         Ok(generation)
     }
@@ -777,6 +778,7 @@ impl Instance {
                     || prior.is_some_and(|prior| prior.matches(row)))
         });
         let scope_failure = cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
+        self.last_error_evidence = None;
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(

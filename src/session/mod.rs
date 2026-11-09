@@ -109,6 +109,10 @@ pub(crate) use instance::{
     ResumeAttemptPolicy, ResumeLaunchOptions, TerminalContextResume,
 };
 pub(crate) use instance::{Held, SandboxPin, Unserved};
+pub use instance::{
+    ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,
+    OperationErrorEvidence, RuntimeEvidence,
+};
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
     TerminalHandoffUnbornFence,
