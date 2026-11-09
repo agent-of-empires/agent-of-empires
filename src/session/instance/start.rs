@@ -778,7 +778,8 @@ impl Instance {
         size: Option<(u16, u16)>,
         storage: &dyn crate::session::SessionStore,
         mut prepared: PreparedLaunch,
-    ) -> std::result::Result<(LaunchSidOutcome, resume::LaunchProbe), Box<resume::LaunchFailure>> {
+    ) -> std::result::Result<(LaunchSidOutcome, resume::LaunchProbe), Box<resume::LaunchFailure>>
+    {
         let prior_capture_started_at = self.capture_started_at;
         let mut prior_executable = None;
         let mut born = None;
