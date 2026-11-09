@@ -688,26 +688,39 @@ pub(crate) async fn spawn_structured_session(
                 let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
                 let lifecycle_lock =
                     native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
+                let start_admission = if instance.is_structured() {
+                    None
+                } else {
+                    Some(instance.admit_native_start()?.ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?)
+                };
                 instance.prepare_reserved_launch_hooks(
                     store,
                     false,
                     crate::session::LaunchReservation {
                         generation,
-                        revival: None,
+                        revival: start_admission
+                            .as_ref()
+                            .and_then(|admission| admission.revival_target()),
                         title_lock,
                         lifecycle_lock,
                     },
                 )
+                .map(|reservation| (reservation, start_admission))
             })();
             drop(guard);
             drop(submission);
             drop(namespace);
             reservation
         };
-        let launch_reservation = match launch_reservation {
+        let (launch_reservation, start_admission) = match launch_reservation {
             Ok(reservation) => reservation,
             Err(error) => {
-                rollback(native, instance, false);
+                if error.is::<crate::session::LaunchIndeterminateCause>() {
+                    instance.fail_reserved_launch(store, generation, &error, None, None);
+                    native.adopt_runtime_fields(&instance)?;
+                } else {
+                    rollback(native, instance, false);
+                }
                 return Err(error);
             }
         };
@@ -759,6 +772,7 @@ pub(crate) async fn spawn_structured_session(
                         resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
                         restart: false,
                         conversation_carry: None,
+                        start_admission,
                     },
                     launch_reservation,
                     Ok(()),
@@ -792,6 +806,9 @@ pub(crate) async fn spawn_structured_session(
                     pending.generation,
                     None,
                 );
+                return Err(error);
+            }
+            if error.is::<crate::session::LaunchIndeterminateCause>() {
                 return Err(error);
             }
             // Archiving during hooks preserves the row but refuses ACP admission.

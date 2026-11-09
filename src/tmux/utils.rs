@@ -623,20 +623,25 @@ pub(crate) fn observe_pane(
     Ok(Some((observation, state, shell)))
 }
 
-/// Fresh observation of the pane this launch created. None means ownership changed.
-pub(crate) fn probe_owned_pane(
-    session_name: &str,
+fn probe_owned_pane_with<T>(
+    session_name: Option<&str>,
     expected: &crate::session::LegacyToolObservation,
     deadline: &crate::tmux::TmuxCommandDeadline,
-) -> Result<Option<OwnedPaneProbe>> {
+    inspect: impl FnOnce(&str, bool) -> T,
+) -> Result<Option<(PaneProbe, T, bool)>> {
     anyhow::ensure!(
         crate::process::process_birth_is_live(expected.server.pid, &expected.server.birth)?,
         "original tmux server is unavailable"
     );
-    let ids = match first_window_pane_ids_classified(
-        session_name,
-        deadline,
-        Some(&expected.server.socket),
+    let ids = match session_name.map_or_else(
+        || {
+            pane_ids_for_target_classified(
+                &format!("{}:", expected.identity.session_id),
+                deadline,
+                Some(&expected.server.socket),
+            )
+        },
+        |name| first_window_pane_ids_classified(name, deadline, Some(&expected.server.socket)),
     ) {
         PaneListLookup::Panes(ids) => ids,
         PaneListLookup::Unknown(error) => return Err(error),
@@ -690,11 +695,7 @@ pub(crate) fn probe_owned_pane(
             if owned_identity_present {
                 return Ok(None);
             }
-            return Ok(Some(OwnedPaneProbe {
-                state: PaneProbe::Missing,
-                shell: false,
-                exclusive: true,
-            }));
+            return Ok(Some((PaneProbe::Missing, inspect("", false), true)));
         }
     };
     if ids.first() != Some(&expected.identity.pane_id) {
@@ -765,13 +766,11 @@ pub(crate) fn probe_owned_pane(
     {
         return Ok(None);
     }
-    let shell =
-        is_pane_running_shell_command(command, start_command.contains(PANE_ENV_FILE_PREFIX));
-    Ok(Some(OwnedPaneProbe {
-        state: probe,
-        shell,
+    Ok(Some((
+        probe,
+        inspect(command, start_command.contains(PANE_ENV_FILE_PREFIX)),
         exclusive,
-    }))
+    )))
 }
 
 /// The tmux server checks the same dead pane identity in the command that removes it.
@@ -781,12 +780,15 @@ pub(crate) fn remove_owned_dead_pane(
     remove_owned_pane(expected, true)
 }
 
-/// Remove only the captured exclusive pane, with topology checked in the same tmux command.
 pub(crate) fn remove_owned_pane(
     expected: &crate::session::LegacyToolObservation,
     expected_dead: bool,
 ) -> Result<()> {
     let identity = &expected.identity;
+    anyhow::ensure!(
+        crate::process::process_birth_is_live(expected.server.pid, &expected.server.birth)?,
+        "original tmux server is unavailable"
+    );
     let literal = crate::tmux::Session::tmux_format_literal;
     let session = format!("#{{==:#{{session_id}},{}}}", literal(&identity.session_id));
     let pane = format!("#{{==:#{{pane_id}},{}}}", literal(&identity.pane_id));
@@ -797,7 +799,6 @@ pub(crate) fn remove_owned_pane(
         (Some(pid), true) => format!(
             "#{{&&:#{{==:#{{pane_dead}},1}},#{{||:#{{==:#{{pane_pid}},{pid}}},#{{==:#{{pane_pid}},}}}}}}"
         ),
-        // A legacy corpse has no live process identity. Require it to remain a corpse.
         (None, true) => "#{&&:#{==:#{pane_dead},1},#{==:#{pane_pid},}}".to_owned(),
         (None, false) => bail!("live pane process identity unavailable"),
     };
@@ -886,12 +887,60 @@ enum PaneListLookup {
     Unknown(anyhow::Error),
 }
 
+/// Fresh observation of the pane this launch created. None means ownership changed.
+pub(crate) fn probe_owned_pane(
+    session_name: &str,
+    expected: &crate::session::LegacyToolObservation,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<Option<OwnedPaneProbe>> {
+    Ok(probe_owned_pane_with(
+        Some(session_name),
+        expected,
+        deadline,
+        is_pane_running_shell_command,
+    )?
+    .map(|(state, shell, exclusive)| OwnedPaneProbe {
+        state,
+        shell,
+        exclusive,
+    }))
+}
+
+pub(crate) fn probe_owned_pane_readiness(
+    expected: &crate::session::LegacyToolObservation,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) -> Result<Option<(PaneProbe, bool, String)>> {
+    Ok(
+        probe_owned_pane_with(None, expected, deadline, |command, protected| {
+            (
+                is_pane_running_shell_command(command, protected),
+                command.to_owned(),
+            )
+        })?
+        .map(|(probe, (shell, command), _)| (probe, shell, command)),
+    )
+}
+
+/// Remove a positively identified live birth, without targeting a mutable name.
+pub(crate) fn remove_owned_live_pane(
+    expected: &crate::session::LegacyToolObservation,
+) -> Result<()> {
+    remove_owned_pane(expected, false)
+}
+
 fn first_window_pane_ids_classified(
     session_name: &str,
     deadline: &crate::tmux::TmuxCommandDeadline,
     socket: Option<&str>,
 ) -> PaneListLookup {
-    let target = format!("={session_name}:");
+    pane_ids_for_target_classified(&format!("={session_name}:"), deadline, socket)
+}
+
+fn pane_ids_for_target_classified(
+    target: &str,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+    socket: Option<&str>,
+) -> PaneListLookup {
     let mut command = socket.map_or_else(
         crate::tmux::tmux_query_command,
         crate::tmux::tmux_query_command_for_socket,
@@ -900,7 +949,7 @@ fn first_window_pane_ids_classified(
         "list-panes",
         "-s",
         "-t",
-        &target,
+        target,
         "-F",
         "#{window_index} #{pane_index} #{pane_id}",
     ]);
@@ -1726,6 +1775,165 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dead_probe_removes_the_original_owned_birth_without_repinning() {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+        if !tmux_available() {
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_birth_to_corpse");
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name(), "sleep 60"])
+            .status()
+            .unwrap()
+            .success());
+        let pane = only_pane_id(guard.name());
+        let (born, state, _) = observe_pane(guard.name(), &crate::tmux::TmuxCommandDeadline::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, PaneProbe::Alive);
+        let processes = crate::process::CapturedProcessTree::capture(
+            born.identity
+                .pane_pid
+                .expect("live birth has its native process"),
+        )
+        .unwrap();
+        assert!(crate::tmux::tmux_command()
+            .args(["set-option", "-p", "-t", &pane, "remain-on-exit", "on"])
+            .status()
+            .unwrap()
+            .success());
+        processes
+            .settle(std::time::Duration::from_millis(500))
+            .unwrap();
+        wait_for_pane_dead(&pane);
+        let OwnedPaneProbe {
+            state,
+            exclusive,
+            ..
+        } = probe_owned_pane(
+            guard.name(),
+            &born,
+            &crate::tmux::TmuxCommandDeadline::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state, PaneProbe::Dead);
+        assert!(exclusive);
+        let (actual, state, _) =
+            observe_pane(guard.name(), &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap()
+                .unwrap();
+        assert_eq!(state, PaneProbe::Dead);
+        assert_eq!(born.identity.session_id, actual.identity.session_id);
+        assert_eq!(born.identity.pane_id, actual.identity.pane_id);
+        assert_eq!(born.server, actual.server);
+        remove_owned_dead_pane(&born).unwrap();
+        assert!(!crate::tmux::tmux_command()
+            .args(["has-session", "-t", guard.name()])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dead_pane_removal_refuses_changed_ownership_and_requires_completion() {
+        use crate::tmux::test_helpers::{only_pane_id, wait_for_pane_dead, TmuxTestSession};
+        if !tmux_available() {
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_owned_corpse");
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name(), "sleep 60"])
+            .status()
+            .unwrap()
+            .success());
+        let pane = only_pane_id(guard.name());
+        let (live, state, _) = observe_pane(guard.name(), &crate::tmux::TmuxCommandDeadline::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, PaneProbe::Alive);
+        let live_pid = live.identity.pane_pid.expect("a real live pane has a PID");
+        let live_birth = crate::process::process_birth_identity(live_pid)
+            .unwrap()
+            .expect("the live pane has an actual process birth");
+        let mut wrong_process = live.clone();
+        assert_ne!(live_pid, std::process::id());
+        wrong_process.identity.pane_pid = Some(std::process::id());
+        assert!(remove_owned_pane(&wrong_process, false).is_err());
+        assert_eq!(only_pane_id(guard.name()), pane);
+        assert_eq!(
+            crate::process::process_birth_identity(live_pid).unwrap(),
+            Some(live_birth),
+            "strict live authorization must not consume a different PID"
+        );
+        assert!(crate::tmux::tmux_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &pane,
+                "remain-on-exit",
+                "on",
+                ";",
+                "respawn-pane",
+                "-k",
+                "-t",
+                &pane,
+                "exit 0"
+            ])
+            .status()
+            .unwrap()
+            .success());
+        wait_for_pane_dead(&pane);
+        let (corpse, state, _) =
+            observe_pane(guard.name(), &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap()
+                .unwrap();
+        assert_eq!(state, PaneProbe::Dead);
+        // A corpse can retain its old PID or expose no PID, depending on tmux.
+        // No process handle is authorized here; PID mismatch is proved above
+        // against the live state, where exact PID equality is required.
+        for field in ["session", "pane", "server", "birth"] {
+            let mut foreign = corpse.clone();
+            match field {
+                "session" => foreign.identity.session_id = "$999999999".into(),
+                "pane" => foreign.identity.pane_id = "%999999999".into(),
+                "server" => std::sync::Arc::make_mut(&mut foreign.server).pid = 0,
+                "birth" => std::sync::Arc::make_mut(&mut foreign.server)
+                    .birth
+                    .start_id
+                    .push('x'),
+                _ => unreachable!(),
+            }
+            assert!(remove_owned_dead_pane(&foreign).is_err(), "{field}");
+            assert_eq!(
+                probe_owned_pane(
+                    guard.name(),
+                    &corpse,
+                    &crate::tmux::TmuxCommandDeadline::new()
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+                PaneProbe::Dead,
+                "{field} refusal must preserve the corpse"
+            );
+        }
+        let observer = owned_probe_test_support::Observer::install(|_| {});
+        owned_probe_test_support::expire_removal();
+        assert!(remove_owned_dead_pane(&corpse).is_err());
+        drop(observer);
+        remove_owned_dead_pane(&corpse).unwrap();
+        assert!(!crate::tmux::tmux_command()
+            .args(["has-session", "-t", guard.name()])
+            .status()
+            .unwrap()
+            .success());
     }
 
     // Serialized like every test that talks to the shared tmux server: a

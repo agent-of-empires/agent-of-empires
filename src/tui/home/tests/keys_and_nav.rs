@@ -652,6 +652,7 @@ fn second_stop_key_press_confirms_the_stop() {
                         state: crate::session::PanePresence::Alive,
                         tmux_session: Some("host".into()),
                         legacy_tool: None,
+                        physical: None,
                     },
                 }];
             });
