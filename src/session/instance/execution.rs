@@ -1806,7 +1806,7 @@ impl Instance {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo(
             &self.effective_profile(),
-            std::path::Path::new(&self.project_path),
+            self.repo_config_path(),
         )?;
         let agent =
             Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;

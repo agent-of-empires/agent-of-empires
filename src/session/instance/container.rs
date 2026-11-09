@@ -179,7 +179,7 @@ impl Instance {
         launch_generation: Option<u64>,
         mut run_hook: impl FnMut(&mut Self, &crate::session::LaunchConfig) -> Result<()>,
     ) -> Result<(containers::DockerContainer, bool)> {
-        let launch_config = store.launch_configuration(Path::new(&self.project_path))?;
+        let launch_config = store.launch_configuration(self.repo_config_path())?;
         let global_config = &launch_config.global;
         let profile_config = &launch_config.profile;
         let checkpoint = || {
@@ -541,7 +541,7 @@ impl Instance {
     ) -> Result<crate::containers::ContainerConfig> {
         let config = crate::session::storage::local_launch_configuration(
             &self.effective_profile(),
-            Path::new(&self.project_path),
+            self.repo_config_path(),
         );
         self.build_container_config(&config)
     }

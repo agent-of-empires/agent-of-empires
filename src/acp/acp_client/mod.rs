@@ -476,10 +476,11 @@ impl AcpClient {
         let sandbox = match &config.sandbox_info {
             // Resolving the workdir touches git2 and may shell out to docker.
             Some(info) => {
-                let (info, cwd) = (info.clone(), config.cwd.clone());
+                let (info, cwd, config_path) =
+                    (info.clone(), config.cwd.clone(), config.config_path.clone());
                 let profile = config.source_profile.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                    SessionSandbox::from_info(&info, cwd.as_path(), &config_path, profile)
                 })
                 .await
                 .map_err(|e| AcpError::Spawn(format!("sandbox resolve task panicked: {e}")))??;

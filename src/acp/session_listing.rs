@@ -58,6 +58,7 @@ async fn list_with_spec(
         tool: agent.to_string(),
         spec,
         cwd: tmp.path().to_path_buf(),
+        config_path: tmp.path().to_path_buf(),
         additional_dirs: Vec::new(),
         provider_env: Vec::new(),
         provider_routing: Vec::new(),

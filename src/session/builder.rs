@@ -1573,7 +1573,7 @@ pub mod structured {
     pub fn apply_structured_choice(instance: &mut Instance) {
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         );
         if !tool_acp_capable(&instance.tool, &config) {
             tracing::warn!(

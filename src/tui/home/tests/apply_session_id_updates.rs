@@ -41,6 +41,67 @@ async fn canonical_identity_updates_never_install_a_tui_poller_or_write_payloads
     assert_eq!(payload_bytes("test"), bytes);
 }
 
+/// Runtime reads resolve to the main repo, so Settings has to edit that copy.
+#[test]
+#[serial]
+fn settings_repo_scope_targets_a_workspace_launch_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main_repo = tmp.path().join("repo");
+    let git = git2::Repository::init(&main_repo).unwrap();
+    let signature = git2::Signature::now("t", "t@example.com").unwrap();
+    let tree = git
+        .find_tree(git.index().unwrap().write_tree().unwrap())
+        .unwrap();
+    git.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+        .unwrap();
+    let workspace = tmp.path().join("workspace");
+    let checkout = workspace.join("repo");
+    std::fs::create_dir_all(&workspace).unwrap();
+    git.worktree("feat", &checkout, None).unwrap();
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances().next().unwrap().id.clone();
+    env.view.selected_session = Some(id.clone());
+    let workspace_dir = workspace.to_string_lossy().into_owned();
+    let repo_path = main_repo.to_string_lossy().into_owned();
+    let worktree_path = checkout.to_string_lossy().into_owned();
+    env.view.mutate_instance(&id, |inst| {
+        inst.project_path = workspace_dir.clone();
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feat".into(),
+            workspace_dir,
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: false,
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repo".into(),
+                source_path: repo_path.clone(),
+                branch: "feat".into(),
+                worktree_path,
+                main_repo_path: repo_path,
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
+            }],
+        });
+    });
+
+    env.view.open_settings();
+
+    let opened = env
+        .view
+        .settings_view
+        .as_ref()
+        .unwrap()
+        .project_path
+        .clone()
+        .unwrap();
+    assert_eq!(
+        std::fs::canonicalize(opened).unwrap(),
+        std::fs::canonicalize(&checkout).unwrap()
+    );
+}
+
 /// Discarding unsaved Settings changes via a mouse click on the
 /// confirmation dialog's [Yes] button must revert a live theme preview,
 /// exactly like the keyboard discard path. Regression for the

@@ -3314,7 +3314,7 @@ impl HomeView {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &inst.source_profile,
-            std::path::Path::new(&inst.project_path),
+            inst.repo_config_path(),
         );
         // The reverse direction stays available regardless, so a session can always get out.
         (config.acp.structured_view.is_offered()
@@ -3860,7 +3860,7 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.project_path.clone());
+            .map(|inst| inst.repo_config_path().to_string_lossy().into_owned());
         match SettingsView::new(&self.config_profile(), project_path) {
             Ok(view) => self.settings_view = Some(view),
             Err(e) => {
@@ -5665,7 +5665,7 @@ impl HomeView {
                         .map(|wt| wt.branch.clone())
                         .or_else(|| inst.workspace_info.as_ref().map(|w| w.branch.clone())),
                     has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
-                    project_path: Some(inst.project_path.clone()),
+                    config_path: Some(inst.repo_config_path().to_string_lossy().into_owned()),
                     is_scratch: inst.scratch,
                 };
 
