@@ -1,5 +1,11 @@
 mode: shadow
 
+# The AWS account tier has no Claude 5.x access on Bedrock yet; switch back
+# to us.anthropic.claude-sonnet-5-5 and us.anthropic.claude-haiku-5-5 once it does.
+models:
+  review: us.anthropic.claude-sonnet-4-6
+  triage: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
 limits:
   maxLines: 100
   maxFiles: 5
