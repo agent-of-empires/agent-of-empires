@@ -1686,6 +1686,24 @@ mod tests {
             .unwrap()
             .success());
         let pane = only_pane_id(guard.name());
+        let (live, state, _) = observe_pane(guard.name(), &crate::tmux::TmuxCommandDeadline::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state, PaneProbe::Alive);
+        let live_pid = live.identity.pane_pid.expect("a real live pane has a PID");
+        let live_birth = crate::process::process_birth_identity(live_pid)
+            .unwrap()
+            .expect("the live pane has an actual process birth");
+        let mut wrong_process = live.clone();
+        assert_ne!(live_pid, std::process::id());
+        wrong_process.identity.pane_pid = Some(std::process::id());
+        assert!(remove_owned_pane(&wrong_process, false).is_err());
+        assert_eq!(only_pane_id(guard.name()), pane);
+        assert_eq!(
+            crate::process::process_birth_identity(live_pid).unwrap(),
+            Some(live_birth),
+            "strict live authorization must not consume a different PID"
+        );
         assert!(crate::tmux::tmux_command()
             .args([
                 "set-option",
@@ -1710,17 +1728,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(state, PaneProbe::Dead);
-        for field in ["session", "pane", "process", "server", "birth"] {
+        // A corpse can retain its old PID or expose no PID, depending on tmux.
+        // No process handle is authorized here; PID mismatch is proved above
+        // against the live state, where exact PID equality is required.
+        for field in ["session", "pane", "server", "birth"] {
             let mut foreign = corpse.clone();
             match field {
                 "session" => foreign.identity.session_id = "$999999999".into(),
                 "pane" => foreign.identity.pane_id = "%999999999".into(),
-                "process" => {
-                    foreign.identity.pane_pid = match corpse.identity.pane_pid {
-                        Some(_) => None,
-                        None => Some(std::process::id()),
-                    };
-                }
                 "server" => std::sync::Arc::make_mut(&mut foreign.server).pid = 0,
                 "birth" => std::sync::Arc::make_mut(&mut foreign.server)
                     .birth
