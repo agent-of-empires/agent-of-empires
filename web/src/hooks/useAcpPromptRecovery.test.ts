@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { emptyAcpState } from "../lib/acpTypes";
 import { clearAcpCache, useAcpSession } from "./useAcpSession";
 import { flushAsync, installAcpFakes, json, lastSocket, profileWrapper } from "./__tests__/acpHarness";
 
@@ -255,6 +256,108 @@ describe("sent prompt transcript recovery", () => {
     expect(result.current.state.activity.map((row) => row.id)).toEqual([old.id, id, start.id, done.id]);
     expect(result.current.state.optimisticRows).toEqual([]);
   });
+
+  it.each(["live", "replay", "snapshot", "cache"] as const)(
+    "does not move a recovered prompt ahead of a repeated tool start from %s",
+    async (source) => {
+      let id = "";
+      let reads = 0;
+      let release!: (response: Response) => void;
+      const held = new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+      const tool = {
+        id: "earlier-tool",
+        name: "Read",
+        kind: "read",
+        args_preview: "{}",
+        started_at: "2026-01-01T00:00:00Z",
+      };
+      const frame = { session_id: "prompt-recovery", seq: 100, event: { ToolCallStarted: { tool_call: tool } } };
+      const start = {
+        id: "start-earlier-tool",
+        kind: "tool_start",
+        tool_call_id: tool.id,
+        tool,
+        text: "Read",
+        at: "t",
+      };
+      const done = { id: "done-earlier-tool", kind: "tool_complete", tool_call_id: tool.id, text: "done", at: "t" };
+      if (source === "cache") {
+        localStorage.setItem(
+          "aoe:acp-state:v1:prompt-recovery",
+          JSON.stringify({
+            savedAt: Date.now(),
+            state: {
+              ...emptyAcpState(),
+              lastSeq: 100,
+              oldestSeq: 1,
+              activity: [old, { ...start, toolCallId: tool.id }],
+            },
+          }),
+        );
+      }
+      const calls = installAcpFakes(({ url, body }) => {
+        if (url.includes("/acp/prompt")) {
+          id = JSON.parse(body!).prompt_id;
+          return json({ disposition: "sent" }, 202);
+        }
+        if (!url.includes("/acp/replay")) return undefined;
+        const params = new URL(url, "http://x").searchParams;
+        if (id && params.get("since") === "100" && params.get("view") === "rows") {
+          reads += 1;
+          return held;
+        }
+        const rows = [old];
+        if (source === "replay") rows.push(start);
+        return json({
+          frames: source === "replay" ? [frame] : [],
+          rows,
+          highest_seq: 100,
+          next_cursor: 100,
+          has_more: false,
+          lost: false,
+        });
+      });
+      const { result, unmount } = await open();
+      try {
+        if (source === "live") lastSocket().message(frame);
+        if (source === "live" || source === "snapshot") {
+          lastSocket().message({ kind: "transcript_snapshot", rows: [start] });
+        }
+        await waitFor(() => expect(result.current.state.activity.map((row) => row.id)).toEqual([old.id, start.id]));
+        await act(() => result.current.sendPrompt("steer the running turn"));
+        lastSocket().message({
+          session_id: "prompt-recovery",
+          seq: 101,
+          event: { UserPromptSent: { prompt_id: id, text: "steer the running turn" } },
+        });
+        lastSocket().message({ ...frame, seq: 102 });
+        lastSocket().message({ kind: "transcript_delta", delta: { Patch: { id: start.id, row: start } } });
+        lastSocket().message({
+          session_id: "prompt-recovery",
+          seq: 103,
+          event: { ToolCallCompleted: { tool_call_id: tool.id, is_error: false, content: "done" } },
+        });
+        lastSocket().message({ kind: "transcript_delta", delta: { Append: done } });
+        await waitFor(() => expect(reads).toBe(1));
+        await act(async () =>
+          release(
+            json({
+              rows: [{ id, kind: "user_prompt", text: "steer the running turn", at: "t" }, start, done],
+              highest_seq: 103,
+              lost: false,
+            }),
+          ),
+        );
+        await waitFor(() => expect(result.current.state.optimisticRows).toEqual([]));
+        expect(result.current.state.activity.map((row) => row.id)).toEqual([old.id, start.id, id, done.id]);
+        expect(calls.filter((call) => call.method === "POST" && call.url.includes("/acp/prompt"))).toHaveLength(1);
+      } finally {
+        unmount();
+      }
+    },
+  );
 
   it("bounds failed recovery to three attempts and never resends or hides the prompt", async () => {
     vi.useFakeTimers();

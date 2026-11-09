@@ -260,7 +260,8 @@ export function useAcpConnection(
       (cached?.activity ?? []).filter((row) => row.kind === "user_prompt").map((row) => row.id),
     );
     const recoveryAttempts = new Map<string, number>();
-    const toolStartSeqs = new Map<string, number>();
+    // null preserves an existing row whose original start sequence is unknown.
+    const toolStartSeqs = new Map<string, number | null>();
     let latestFrameSeq = cached?.lastSeq ?? 0;
     let promptRecovery: AbortController | null = null;
     let promptRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -268,20 +269,33 @@ export function useAcpConnection(
       if (frame.session_id !== sessionId || !Number.isSafeInteger(frame.seq) || frame.seq < 0) return;
       latestFrameSeq = Math.max(latestFrameSeq, frame.seq);
       if (typeof frame.event !== "object") return;
-      if ("ToolCallStarted" in frame.event) toolStartSeqs.set(frame.event.ToolCallStarted.tool_call.id, frame.seq);
+      if ("ToolCallStarted" in frame.event) {
+        const id = frame.event.ToolCallStarted.tool_call.id;
+        const first = toolStartSeqs.get(id);
+        if (first === undefined) {
+          if (activityRef.current.some((row) => row.kind === "tool_start" && row.toolCallId === id))
+            toolStartSeqs.set(id, null);
+          else toolStartSeqs.set(id, frame.seq);
+        } else if (first !== null) {
+          toolStartSeqs.set(id, Math.min(first, frame.seq));
+        }
+      }
       if (!("UserPromptSent" in frame.event)) return;
       const prompt = frame.event.UserPromptSent;
       if (prompt.prompt_id && !prompt.synthesized && !promptRows.has(prompt.prompt_id))
         promptEchoes.set(prompt.prompt_id, frame.seq);
     };
-    const observePromptRows = (rows: readonly { id: string; kind: string }[]) => {
+    const observePromptRows = (rows: readonly { id: string; kind: string; toolCallId?: string }[]) => {
       for (const row of rows) {
+        if (row.kind === "tool_start" && row.toolCallId && !toolStartSeqs.has(row.toolCallId))
+          toolStartSeqs.set(row.toolCallId, null);
         if (row.kind !== "user_prompt") continue;
         promptRows.add(row.id);
         promptEchoes.delete(row.id);
         recoveryAttempts.delete(row.id);
       }
     };
+    observePromptRows(cached?.activity ?? []);
     const cancelPromptRecovery = () => {
       promptRecovery?.abort();
       promptRecovery = null;
@@ -324,7 +338,9 @@ export function useAcpConnection(
         )
           return;
         const rows = toActivityRows(page.rows ?? [], sessionId);
-        const toolStartIds = [...toolStartSeqs].filter(([, startedSeq]) => startedSeq > seq).map(([id]) => id);
+        const toolStartIds = [...toolStartSeqs]
+          .filter(([, startedSeq]) => startedSeq !== null && startedSeq > seq)
+          .map(([id]) => id);
         dispatch({ kind: "prompt_recovered", id: pending.id, rows, toolStartIds });
       })()
         .catch(() => {})
