@@ -558,8 +558,8 @@ fn drain_and_persist_session_ids_inner(
             inst.apply_conversation_observation(&update.observation);
             inst.resume_probe_failed_sid = failed_sid.take();
             if update.confirms_omp_pin {
+                // This typed confirmation consumes only the intent, not its durable binding.
                 inst.resume_intent = ResumeIntent::Default;
-                inst.resume_binding = None;
             }
             // The conversation CAS already stored a path that names the same file.
             let path_committed_with_sid = matches!(
@@ -1191,6 +1191,7 @@ mod tests {
             let sid = "019342ab-1234-7def-8901-abcdef012340";
             let generation = "launch-exact";
             let mut inst = pinned_omp_instance(profile, sid, generation);
+            let original_resume_binding = inst.resume_binding.clone();
             seed_instance_on_disk(profile, &inst);
             attach_poller_with_omp_update(&mut inst, sid, generation);
 
@@ -1217,6 +1218,8 @@ mod tests {
             assert_eq!(instances[0].resume_intent, ResumeIntent::Default);
             let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
             assert_eq!(disk[0].resume_intent, ResumeIntent::Default);
+            assert_eq!(disk[0].resume_binding, original_resume_binding);
+            assert_eq!(instances[0].conversation_state(), disk[0].conversation_state());
             if with_witness {
                 assert_ne!(selection, original_selection);
                 assert_eq!(selection, disk[0].native_preparation_selection().unwrap());
