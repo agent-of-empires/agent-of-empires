@@ -73,6 +73,7 @@ teardown; this is not permission for new native I/O or callback effects.
 An already correlated completion remains its genuine outcome even if its SDK
 relay marker, or a later relay, fails. The separate connection loss fences
 further native controls; it cannot rewrite a completed result as `NativeLost`.
+An unreachable SDK output route releases only an outcome already correlated by the control reader, before waking ordered-loss foreground cancellation. SDK output EOF and actual SDK close share that retirement path. Ordinary runner EOF does not release a marker still readable by the SDK; its earlier ordered completion remains deliverable.
 An idle established command loop observes the ordered loss boundary so SDK
 close cannot wait forever for that foreground to finish. Pending-ingress
 overflow fails closed, discards its uncommitted replay and establishes its own
@@ -230,6 +231,7 @@ The runtime-only `prompt_wake_eligible` snapshot field separately represents the
 existing explicit WorkerDown queue/wake and initial-start governor, including ordinary known
 absence, dormancy, snooze and rate-limit parks. It is not native health, generic
 unreadable/ambiguous-owner admission, automatic replay or fresh-conversation permission.
+An installed, current owned connection that completed Initialize but still awaits its initial session result retains only explicit initial-start intent eligibility. The producer qualifies its lifecycle lease, Native context and connected owner under the existing observation fence. It does not claim Native readiness or admit generic phase-zero Unknown. Stop, loss, replacement and completed-driver observations revoke the claim; the daemon still rechecks submission under its existing governor before any Native input.
 TUI consumers accept the live wrapper at sequence zero and same-sequence
 refreshes too. They retain wake eligibility separately from native readiness;
 the optional wake field is deserializable live metadata but is omitted from

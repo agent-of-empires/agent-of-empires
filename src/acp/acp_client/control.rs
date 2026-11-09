@@ -204,6 +204,17 @@ fn release_settled(settled: &std::sync::Mutex<Option<LocalOutcome>>) {
     }
 }
 
+fn settle_unreachable_sdk_route(
+    settled: &std::sync::Mutex<Option<LocalOutcome>>,
+    state: &ConnectionState,
+    source: AcpConnectionSource,
+    cause: AcpConnectionCause,
+) {
+    state.observe(source, cause);
+    release_settled(settled);
+    state.mark_ordered_loss();
+}
+
 /// A failed relay releases any local outcome whose marker can no longer arrive.
 async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
@@ -214,16 +225,19 @@ async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
     if shim_write_line(duplex, value).await {
         return true;
     }
-    state.observe(
-        crate::acp::state::AcpConnectionSource::Control,
-        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+    settle_unreachable_sdk_route(
+        settled, state, AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
     );
-    release_settled(settled);
-    state.mark_ordered_loss();
     false
 }
 
 impl DaemonControlClient {
+    pub(super) fn close_sdk_route(&self, source: AcpConnectionSource, cause: AcpConnectionCause) {
+        // Only an already-correlated outcome may precede the ordered loss wakeup.
+        settle_unreachable_sdk_route(&self.settled, &self.connection_state, source, cause);
+        self.shutdown();
+    }
+
     pub(super) fn shutdown(&self) {
         // SAFETY: `self` keeps this exact socket alive for the call.
         unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
@@ -1102,22 +1116,16 @@ pub(super) async fn connect_runner_control_v5(
             line.clear();
             match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
                 Ok(0) => {
-                    pump_connection_state.observe(
-                        crate::acp::state::AcpConnectionSource::Control,
-                        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
                     );
-                    // SAFETY: pump_write retains this exact socket.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                     return;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    pump_connection_state.observe(
-                        crate::acp::state::AcpConnectionSource::Control,
-                        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control, AcpConnectionCause::ForwardPumpEnded,
                     );
-                    // SAFETY: pump_write retains this exact socket.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                     debug!(
                         target: "acp.protocol",
                         session = %pump_session,
@@ -1993,11 +2001,21 @@ mod tests {
     #[tokio::test]
     async fn failed_marker_relay_preserves_completed_result_without_further_native_controls() {
         let mut peer = PromptControlPeer::new().await;
-        let completion = peer.prompt().await;
+        let mut completion = peer.prompt().await;
         peer.send(ControlBody::PromptStarted { prompt_req_id: 9 })
             .await;
-        peer.close_crate_side();
         peer.completed(9, "end_turn").await;
+        peer.await_settled_outcome(&mut completion).await;
+        // Fail the actual relay writer only after the real reader correlated completion.
+        // Dropping the entire SDK duplex before correlation would race native EOF instead.
+        let (closed_crate, shim) = tokio::io::duplex(64);
+        drop(closed_crate);
+        let (_, write) = tokio::io::split(shim);
+        let failed_relay = Mutex::new(write);
+        assert!(!shim_write_line_releasing(
+            &failed_relay, &PromptCompletedMarker::default(), &peer.client.settled,
+            &peer.client.connection_state,
+        ).await);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), completion)
                 .await
@@ -2073,8 +2091,8 @@ mod tests {
             .await;
         peer.completed(9, "end_turn").await;
         peer.await_settled_outcome(&mut completion).await;
-        // Reading the marker proves the relay that wrote it returned, so the
-        // notification below is the relay that fails.
+        // Reading the marker proves correlation and its successful relay.
+        // SDK EOF below must settle it even if no further native frame arrives.
         let mut relayed = String::new();
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -2091,11 +2109,6 @@ mod tests {
             &serde_json::json!(PromptCompletedMarker::default().method())
         );
         peer.close_crate_side();
-        peer.send(ControlBody::Notify {
-            method: "test/after".into(),
-            params: serde_json::json!({}),
-        })
-        .await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), completion)
                 .await
