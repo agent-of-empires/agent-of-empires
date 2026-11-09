@@ -1227,15 +1227,27 @@ pub(crate) fn try_acquire_storage_flock(dir: &Path, name: &str) -> Result<Option
 /// Cached disk rows; callers apply live status only to the returned clones.
 #[derive(Default)]
 pub(crate) struct SessionsFileCache {
-    entry: Option<(
-        Option<super::anchored_fs::DataFileStamp>,
-        bool,
-        Vec<Instance>,
-    )>,
+    entry: Option<(super::anchored_fs::DataFileStamp, bool, Vec<Instance>)>,
+    first_seen: Option<(super::anchored_fs::DataFileStamp, std::time::Instant)>,
     #[cfg(test)]
     reads: usize,
     #[cfg(test)]
-    read_time: Option<std::time::SystemTime>,
+    clock: Option<std::time::Instant>,
+    #[cfg(test)]
+    around_read: Option<Box<dyn FnMut(bool) + Send>>,
+}
+
+impl SessionsFileCache {
+    /// Covers two-second filesystem timestamps.
+    const TIMESTAMP_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn now(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = self.clock {
+            return now;
+        }
+        std::time::Instant::now()
+    }
 }
 
 pub struct Storage {
@@ -2082,39 +2094,50 @@ impl Storage {
         policy: ReadPolicy<'_>,
         cache: &mut SessionsFileCache,
     ) -> Result<Vec<Instance>> {
-        let read_started = std::time::SystemTime::now();
-        #[cfg(test)]
-        let read_started = cache.read_time.unwrap_or(read_started);
-        let stamp = files
-            .sessions
-            .stamp()
-            .with_context(|| crate::session::LoadSource(self.sessions_path.clone()))?;
+        let stamp_file = || {
+            files
+                .sessions
+                .stamp()
+                .with_context(|| crate::session::LoadSource(self.sessions_path.clone()))
+        };
+        let read_started = cache.now();
+        let stamp = stamp_file()?;
         let complete = matches!(policy, ReadPolicy::Complete(_));
-        let instances = match &cache.entry {
-            Some((previous, strict, rows)) if *previous == stamp && *strict == complete => {
-                rows.clone()
+        if let (Some(stamp), Some((cached, strict, rows))) = (&stamp, &cache.entry) {
+            if cached == stamp && *strict == complete {
+                return Ok(rows.clone());
             }
+        }
+        cache.entry = None;
+        let first_seen = match &cache.first_seen {
+            Some((seen, at)) if Some(seen) == stamp.as_ref() => *at,
             _ => {
-                cache.entry = None;
-                #[cfg(test)]
-                {
-                    cache.reads += 1;
-                }
-                let rows = self.load_instances(policy)?;
-                if files
-                    .sessions
-                    .stamp()
-                    .with_context(|| crate::session::LoadSource(self.sessions_path.clone()))?
-                    == stamp
-                    // Do not cache racy timestamps: equal-size rewrites can share a tick.
-                    && stamp.as_ref().is_none_or(|stamp| stamp.settled_before(read_started))
-                {
-                    cache.entry = Some((stamp, complete, rows.clone()));
-                }
-                rows
+                let at = cache.now();
+                cache.first_seen = stamp.clone().map(|stamp| (stamp, at));
+                at
             }
         };
-        Ok(instances)
+        #[cfg(test)]
+        {
+            cache.reads += 1;
+            if let Some(hook) = cache.around_read.as_mut() {
+                hook(true);
+            }
+        }
+        let rows = self.load_instances(policy)?;
+        #[cfg(test)]
+        if let Some(hook) = cache.around_read.as_mut() {
+            hook(false);
+        }
+        // Writes sharing a stamp fall in one filesystem timestamp tick, which closes
+        // within a tick of first seeing it whatever the filesystem clock's offset.
+        let settled = read_started >= first_seen + SessionsFileCache::TIMESTAMP_TICK;
+        if let Some(stamp) = stamp.filter(|_| settled) {
+            if stamp_file()?.as_ref() == Some(&stamp) {
+                cache.entry = Some((stamp, complete, rows.clone()));
+            }
+        }
+        Ok(rows)
     }
 
     /// Read group metadata without reading sessions or writing quarantine files.
@@ -4186,52 +4209,97 @@ fn reconcile_groups_after_repair(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
+    use crate::session::GroupTree;
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    /// Freezes the reader clock one timestamp tick ahead.
+    fn settle(cache: &mut SessionsFileCache) {
+        cache.clock = Some(cache.now() + SessionsFileCache::TIMESTAMP_TICK);
+    }
+
+    /// Returns once the filesystem clock has passed `path`'s ctime, so a later
+    /// edit gets a distinct ctime even on coarse timestamps.
+    fn await_ctime_tick(path: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let ctime = |metadata: fs::Metadata| (metadata.ctime(), metadata.ctime_nsec());
+        let before = ctime(fs::metadata(path)?);
+        let probe = path.with_extension("tick");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while {
+            fs::write(&probe, b"")?;
+            ctime(fs::metadata(&probe)?) <= before
+        } {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "filesystem clock did not advance"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        fs::remove_file(probe)?;
+        Ok(())
+    }
+
     #[test]
     #[serial_test::serial]
-    fn sessions_file_cache_rereads_recent_timestamps_until_they_are_safe() -> Result<()> {
+    fn sessions_file_cache_waits_a_timestamp_tick_after_first_seeing_a_stamp() -> Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = Storage::new_unwatched("racy")?;
         storage.update(|rows, _| {
             rows.push(Instance::new("first", "/repo"));
             Ok(())
         })?;
-        // A read in the same timestamp tick must never establish a cache hit.
         let mut cache = SessionsFileCache {
-            read_time: Some(fs::metadata(storage.sessions_path())?.modified()?),
+            clock: Some(std::time::Instant::now()),
             ..Default::default()
         };
         storage.load_complete_with_groups_cached(&mut cache)?;
         storage.load_complete_with_groups_cached(&mut cache)?;
         assert_eq!(
             cache.reads, 2,
-            "coarse timestamps can hide another same-size rewrite"
+            "a same-size rewrite can share the first sighting's timestamp tick"
         );
         assert!(cache.entry.is_none());
-        let now = std::time::SystemTime::now();
-        let file = fs::File::options()
-            .write(true)
-            .open(storage.sessions_path())?;
-        // An old ctime alone is insufficient when mtime is in the future.
-        file.set_times(
-            fs::FileTimes::new().set_modified(now + std::time::Duration::from_secs(60)),
-        )?;
-        cache.read_time = Some(now + std::time::Duration::from_secs(3));
+        settle(&mut cache);
         storage.load_complete_with_groups_cached(&mut cache)?;
         storage.load_complete_with_groups_cached(&mut cache)?;
-        assert_eq!(cache.reads, 4);
-        // An old mtime alone is insufficient when ctime is recent.
-        file.set_times(
-            fs::FileTimes::new().set_modified(now - std::time::Duration::from_secs(60)),
-        )?;
-        cache.read_time = Some(std::time::SystemTime::now());
+        assert_eq!(cache.reads, 3, "settled files can skip reads and parsing");
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sessions_file_cache_never_caches_an_absent_file() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("absent")?;
+        let path = storage.sessions_path().to_path_buf();
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        let transient = serde_json::to_vec(&vec![Instance::new("transient", "/repo")])?;
+        let mut cache = SessionsFileCache::default();
         storage.load_complete_with_groups_cached(&mut cache)?;
-        storage.load_complete_with_groups_cached(&mut cache)?;
-        assert_eq!(cache.reads, 6);
-        // Advance the read clock, rather than sleeping on filesystem granularity.
-        cache.read_time = Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3));
-        storage.load_complete_with_groups_cached(&mut cache)?;
-        storage.load_complete_with_groups_cached(&mut cache)?;
-        assert_eq!(cache.reads, 7, "settled files can skip reads and parsing");
+        settle(&mut cache);
+        // The file appears only while its rows are read.
+        cache.around_read = Some(Box::new(move |before| {
+            if before {
+                fs::write(&path, &transient).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+        }));
+        let (rows, _) = storage.load_complete_with_groups_cached(&mut cache)?;
+        assert_eq!(rows[0].title, "transient");
+        cache.around_read = None;
+        settle(&mut cache);
+        assert!(cache.entry.is_none());
+        assert!(storage
+            .load_complete_with_groups_cached(&mut cache)?
+            .0
+            .is_empty());
         Ok(())
     }
 
@@ -4240,19 +4308,13 @@ mod tests {
     fn sessions_file_cache_reuses_rows_and_detects_edits_replacements_and_removal() -> Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
         let storage = Storage::new_unwatched("cached")?;
-        let mut cache = SessionsFileCache {
-            read_time: Some(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
-            ..Default::default()
-        };
-        assert!(storage
-            .load_complete_with_groups_cached(&mut cache)?
-            .0
-            .is_empty());
-        assert_eq!(cache.reads, 1);
+        let mut cache = SessionsFileCache::default();
         storage.update(|rows, _| {
             rows.push(Instance::new("first", "/repo"));
             Ok(())
         })?;
+        storage.load_complete_with_groups_cached(&mut cache)?;
+        settle(&mut cache);
         let (rows, _) = storage.load_complete_with_groups_cached(&mut cache)?;
         assert_eq!(rows[0].title, "first");
         assert_eq!(cache.reads, 2);
@@ -4266,8 +4328,8 @@ mod tests {
         let mtime = fs::metadata(path)?.modified()?;
         let mut edited = rows;
         edited[0].title = "other".into();
-        let bytes = serde_json::to_vec_pretty(&edited)?;
-        fs::write(path, &bytes)?;
+        await_ctime_tick(path)?;
+        fs::write(path, serde_json::to_vec_pretty(&edited)?)?;
         fs::File::options()
             .write(true)
             .open(path)?
@@ -4295,6 +4357,8 @@ mod tests {
             "atomic replacements invalidate equal-size, equal-mtime rows"
         );
 
+        settle(&mut cache);
+        storage.load_complete_with_groups_cached(&mut cache)?;
         fs::write(
             path.with_file_name("groups.json"),
             serde_json::to_vec(&vec![Group::new("fresh", "fresh")])?,
@@ -4302,7 +4366,7 @@ mod tests {
         let (_, groups) = storage.load_complete_with_groups_cached(&mut cache)?;
         assert_eq!(groups[0].name, "fresh");
         assert_eq!(
-            cache.reads, 4,
+            cache.reads, 5,
             "groups refresh independently of session rows"
         );
         fs::remove_file(path)?;
@@ -4310,37 +4374,30 @@ mod tests {
             .load_complete_with_groups_cached(&mut cache)?
             .0
             .is_empty());
-        assert_eq!(cache.reads, 5);
+        assert_eq!(cache.reads, 6);
         fs::write(path, b"not json")?;
+        settle(&mut cache);
         assert!(storage
             .load_complete_with_groups_cached(&mut cache)
             .is_err());
+        settle(&mut cache);
         assert!(storage
             .load_complete_with_groups_cached(&mut cache)
             .is_err());
-        assert_eq!(cache.reads, 7, "failed reads are retried");
-        fs::write(path, b"[]")?;
-        assert!(storage
-            .load_complete_with_groups_cached(&mut cache)?
-            .0
-            .is_empty());
-        assert_eq!(cache.reads, 8);
+        assert_eq!(cache.reads, 8, "failed reads are retried");
+
         fs::write(path, br#"[{"invalid":"row"}]"#)?;
         let bound = Storage::open_unwatched("cached")?;
         assert!(bound.load_instances_readonly_cached(&mut cache)?.is_empty());
+        settle(&mut cache);
+        assert!(bound.load_instances_readonly_cached(&mut cache)?.is_empty());
+        assert!(cache.entry.is_some());
         assert!(
             bound.load_complete_with_groups_cached(&mut cache).is_err(),
             "a best-effort read must not bypass strict validation"
         );
         Ok(())
     }
-
-    use super::*;
-    use crate::file_watch::{FileMatcher, FileWatchService, WatchSpec};
-    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
-    use crate::session::GroupTree;
-    use serial_test::serial;
-    use tempfile::tempdir;
 
     #[test]
     #[serial]

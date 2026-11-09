@@ -803,6 +803,8 @@ pub(crate) async fn publish_loop(state: Arc<AppState>) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[tokio::test]
     #[serial_test::serial]
     async fn cached_status_poll_publishes_disk_change_on_the_next_tick() {
@@ -872,8 +874,6 @@ mod tests {
         state.shutdown.cancel();
         polling.await;
     }
-
-    use super::*;
 
     #[test]
     fn sandbox_progress_poison_keeps_last_activity_without_publishing() {

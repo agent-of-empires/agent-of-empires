@@ -1613,6 +1613,9 @@ pub(super) fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [I
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use chrono::Utc;
+
     #[test]
     #[serial_test::serial]
     fn cached_reload_refreshes_profiles_and_prunes_removed_stores() {
@@ -1630,10 +1633,29 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // Alias reads run on a bounded worker, so a single load may return no or stale rows.
+        let await_alias_title = |cache: &mut ProfileSessionsCache, title: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let (loaded, metadata) = cache.load(&watch);
+                metadata.unwrap();
+                if loaded
+                    .cache
+                    .alias_only_instances
+                    .iter()
+                    .any(|row| row.title == title)
+                {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "alias row {title:?} was never sampled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
         let mut cache = ProfileSessionsCache::default();
-        let (loaded, metadata) = cache.load(&watch);
-        metadata.unwrap();
-        assert_eq!(loaded.cache.alias_only_instances[0].title, "before");
+        await_alias_title(&mut cache, "before");
         let groups = storage.sessions_path().with_file_name("groups.json");
         std::fs::write(&groups, b"not json").unwrap();
         let (_, metadata) = cache.load(&watch);
@@ -1658,9 +1680,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let (loaded, metadata) = cache.load(&watch);
-        metadata.unwrap();
-        assert_eq!(loaded.cache.alias_only_instances[0].title, "after");
+        await_alias_title(&mut cache, "after");
         assert_eq!(cache.supplementary.len(), 1);
 
         let added = Storage::new_unwatched("added").unwrap();
@@ -1682,9 +1702,6 @@ mod tests {
         assert!(cache.supplementary.is_empty());
         assert_eq!(cache.sessions.len(), 1);
     }
-
-    use super::*;
-    use chrono::Utc;
 
     #[test]
     fn external_session_changes_reports_added_removed_and_edited_rows() {

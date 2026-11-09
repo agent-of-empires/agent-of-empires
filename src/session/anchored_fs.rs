@@ -52,20 +52,6 @@ pub(crate) struct DataFileStamp {
     changed: (i64, i64),
 }
 
-impl DataFileStamp {
-    pub(crate) fn settled_before(&self, read_started: std::time::SystemTime) -> bool {
-        let Ok(elapsed) = read_started.duration_since(std::time::SystemTime::UNIX_EPOCH) else {
-            return false;
-        };
-        // Cover coarse two-second timestamps, including clocks ahead of this read.
-        let cutoff = elapsed.as_nanos() as i128 - 2_000_000_000;
-        let older = |(seconds, nanos): (i64, i64)| {
-            i128::from(seconds) * 1_000_000_000 + i128::from(nanos) < cutoff
-        };
-        older(self.modified) && older(self.changed)
-    }
-}
-
 impl ResolvedDataFile {
     pub(crate) fn open(path: &Path) -> Result<Self> {
         let parent = path.parent().context("data file needs a parent")?;
