@@ -1,6 +1,7 @@
 import { test, expect } from "./helpers/mockedTest";
 import { sessionResponse } from "./helpers/sessions";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
+import { CLAUDE_AGENT } from "./helpers/wizard";
 
 const item = {
   id: "issue-1",
@@ -70,6 +71,10 @@ test("Start opens the wizard with the draft prompt and creates nothing until Lau
   await page.route("**/api/settings**", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/projects**", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/git/is-repo**", (route) => route.fulfill({ json: { is_git_repo: true } }));
+  await page.route(
+    (url) => url.pathname === "/api/agents",
+    (route) => route.fulfill({ json: [CLAUDE_AGENT] }),
+  );
   await page.goto("/suggestions");
 
   await expect(page.getByRole("heading", { name: "Suggested sessions" })).toBeVisible();
@@ -274,6 +279,10 @@ test("a started suggestion offers Open, and Start another sends no suggestion re
   await page.route("**/api/settings**", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/projects**", (route) => route.fulfill({ json: [] }));
   await page.route("**/api/git/is-repo**", (route) => route.fulfill({ json: { is_git_repo: true } }));
+  await page.route(
+    (url) => url.pathname === "/api/agents",
+    (route) => route.fulfill({ json: [CLAUDE_AGENT] }),
+  );
   await page.goto("/suggestions");
 
   await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(0);
