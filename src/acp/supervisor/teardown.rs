@@ -503,12 +503,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             .await
     }
 
-    /// Stop a worker reclaimed for inactivity; with `observed`, only while
-    /// that epoch is still the running one.
+    /// Stop a worker reclaimed for inactivity; with `observed` (the epoch and
+    /// its admission count when seen idle), only while that epoch is still
+    /// running and has admitted no prompt since.
     pub(crate) async fn shutdown_idle(
         &self,
         session_id: &str,
-        observed: Option<&Lease>,
+        observed: Option<(&Lease, u64)>,
     ) -> Result<(), SupervisorError> {
         if observed.is_none() {
             self.cancel_restart_request(session_id).await;
@@ -675,7 +676,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         stop_reason: &str,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
-        observed: Option<&Lease>,
+        observed: Option<(&Lease, u64)>,
     ) -> Result<(), SupervisorError> {
         self.shutdown_with_reason_and_pending_cancellation(
             session_id,
@@ -694,7 +695,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         stop_reason: &str,
         delete_adapter_state: bool,
         expected: Option<&RetirementTarget>,
-        observed: Option<&Lease>,
+        observed: Option<(&Lease, u64)>,
         cancel_pending: bool,
     ) -> Result<(), SupervisorError> {
         // Close the request lane before inspecting lifecycle state. Pending
@@ -726,12 +727,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut workers = self.workers.lock().await;
         let decision = {
             let mut lifecycle = lock_recover(&self.lifecycle);
-            if observed.is_some_and(|observed| {
+            if observed.is_some_and(|(observed, admissions)| {
                 lifecycle
                     .running(session_id)
-                    .map(|(lease, _)| lease)
-                    .as_ref()
-                    != Some(observed)
+                    .is_none_or(|(lease, _)| &lease != observed || lease.admissions() != admissions)
             }) {
                 return Err(SupervisorError::Superseded(session_id.into()));
             }

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState } from "../lib/acpTypes";
@@ -445,6 +445,63 @@ describe("lightweight control projection", () => {
 });
 
 describe("mid-turn cache recovery (#4530)", () => {
+  it("keeps the cached window through delayed catch-up and reconnect without new events", async () => {
+    const sid = "sess-stable-warm";
+    const rows = Array.from({ length: 6 }, (_, index) => [
+      { id: `user-${index}`, kind: "user_prompt" as const, text: `prompt ${index}`, at: "t" },
+      { id: `reply-${index}`, kind: "message" as const, text: `reply ${index}`, at: "t" },
+    ]).flat();
+    localStorage.setItem(
+      `${STORAGE_KEY_PREFIX}${sid}`,
+      JSON.stringify({
+        savedAt: Date.now(),
+        state: { ...emptyAcpState(), lastSeq: 1200, oldestSeq: 1, activity: rows },
+      }),
+    );
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reads = 0;
+    calls = installAcpFakes(async ({ url }) => {
+      if (!url.includes("/acp/replay")) return undefined;
+      reads += 1;
+      await held;
+      const params = new URL(url, "http://x").searchParams;
+      let incoming: typeof rows = [];
+      if (params.get("view") === "rows") incoming = [{ ...rows[rows.length - 1]!, text: "canonical reply" }];
+      return json({ frames: [], rows: incoming, lost: false, highest_seq: 1200, next_cursor: 1200, has_more: false });
+    });
+    const renders: string[][] = [];
+    const { result, unmount } = renderHook(
+      () => {
+        const session = useAcpSession(sid);
+        renders.push(session.state.activity.map((row) => row.id));
+        return session;
+      },
+      { wrapper: profileWrapper },
+    );
+    await waitFor(() => expect(reads).toBe(2), { timeout: 2000 });
+    expect(result.current.state.activity).toEqual(rows);
+    await act(async () => release());
+    await waitFor(() => expect(result.current.state.activity.at(-1)?.text).toBe("canonical reply"), { timeout: 2000 });
+    await waitFor(() => expect(sockets).toHaveLength(1), { timeout: 2000 });
+    lastSocket().open();
+    expect(result.current.state.activity.map((row) => row.id)).toEqual(rows.map((row) => row.id));
+    const firstSocket = lastSocket();
+    act(() => result.current.manualReconnect());
+    await waitFor(() => expect(reads).toBe(4), { timeout: 2000 });
+    await waitFor(() => expect(sockets).toHaveLength(2), { timeout: 2000 });
+    lastSocket().open();
+    lastSocket().message({ kind: "transcript_snapshot", rows: [] });
+    expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
+    expect(result.current.state.activity.map((row) => row.id)).toEqual(rows.map((row) => row.id));
+    expect(result.current.state.oldestSeq).toBe(1);
+    expect(new URL(lastSocket().url).searchParams.get("since")).toBe("1200");
+    for (const ids of renders) expect(ids).toEqual(rows.map((row) => row.id));
+    unmount();
+  });
+
   it("dials from the cursor the recovery caught up to, not the cached one", async () => {
     const activity = [{ id: "t", kind: "tool_start", text: "t", at: "t" }];
     const state = { ...emptyAcpState(), lastSeq: 900, oldestSeq: 40, activity };
@@ -828,6 +885,38 @@ describe("server queue", () => {
       expect(result.current.state.queuedPrompts.map((q) => q.id)).not.toContain("r1");
       expect(result.current.state.lastError).toBeNull();
     });
+  });
+});
+
+describe("resolveApproval outcomes", () => {
+  it.each([
+    ["a 500", () => new Response("boom", { status: 500 }), /Could not resolve approval \(500\)/],
+    [
+      "a network failure",
+      () => {
+        throw new TypeError("network down");
+      },
+      /Network error resolving approval/,
+    ],
+  ])("rejects and reports %s so the card can retry", async (_label, respond, error) => {
+    installAcpFakes(({ url }) => (url.includes("/acp/approvals/") ? respond() : undefined));
+    const { result } = render("sess-approve");
+    await flushAsync();
+    await act(() => expect(result.current.resolveApproval("n-1", "Allow")).rejects.toThrow());
+    expect(result.current.state.lastError).toMatch(error);
+  });
+
+  it.each([
+    ["a 200", () => json({})],
+    ["a 404 for an approval already resolved", () => new Response("no pending approval n-1", { status: 404 })],
+  ])("resolves on %s", async (_label, respond) => {
+    calls = installAcpFakes(({ url }) => (url.includes("/acp/approvals/") ? respond() : undefined));
+    const { result } = render("sess-approve");
+    await flushAsync();
+    await act(() => result.current.resolveApproval("n-1", "Allow", "opt-1"));
+    const [post] = posts("/api/sessions/sess-approve/acp/approvals/n-1");
+    expect(JSON.parse(post!.body!)).toEqual({ decision: "Allow", option_id: "opt-1" });
+    expect(result.current.state.lastError).toBeFalsy();
   });
 });
 

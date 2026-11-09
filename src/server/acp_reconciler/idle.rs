@@ -177,9 +177,11 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if idle_secs == 0 {
             continue;
         }
-        // Only a running epoch; the lease pins the stop to the worker observed here.
+        // Only a running epoch; the lease and admission count pin the stop to the
+        // worker and activity observed here.
         if let Some(lease) = state.acp_supervisor.running_lease(&id) {
-            live.push((id, profile, idle_secs, lease));
+            let admissions = lease.admissions();
+            live.push((id, profile, idle_secs, lease, admissions));
         }
     }
     if live.is_empty() {
@@ -197,7 +199,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         }
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    for (id, profile, idle_secs, lease) in live {
+    for (id, profile, idle_secs, lease, admissions) in live {
         // A resume is activity: its prompt is recorded only after the worker is ready.
         let last_ms = latest.get(&id).map(|&ms| ms.max(lease.idle_baseline_ms()));
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
@@ -222,7 +224,11 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             tracing::warn!(target: "acp.supervisor", session = %id, "idle-reap persist failed; leaving worker alive");
             continue;
         }
-        match state.acp_supervisor.shutdown_idle(&id, Some(&lease)).await {
+        match state
+            .acp_supervisor
+            .shutdown_idle(&id, Some((&lease, admissions)))
+            .await
+        {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {
                 tracing::info!(target: "acp.supervisor", session = %id, idle_secs, "auto-stopped idle structured view worker");
             }
@@ -293,6 +299,8 @@ mod tests {
             Running {
                 admitted_secs_ago: i64,
             },
+            /// Quiet for an hour, but a prompt was admitted and not yet stored.
+            PromptPending,
         }
         // (worker, reaped)
         let cases = [
@@ -310,6 +318,7 @@ mod tests {
                 },
                 true,
             ),
+            (Worker::PromptPending, false),
         ];
         for (worker, reaped) in cases {
             let id = "resuming-session";
@@ -349,6 +358,13 @@ mod tests {
                     );
                     (None, Running)
                 }
+                Worker::PromptPending => {
+                    sup.test_insert_worker(id).await;
+                    let lease = sup.running_lease(id).unwrap();
+                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    sup.test_note_admission(id);
+                    (None, Running)
+                }
             };
 
             reap_idle_workers(&state).await;
@@ -373,7 +389,22 @@ mod tests {
         let observed = sup.running_lease(id).unwrap();
         sup.test_respawn_worker(id).await;
         assert!(matches!(
-            sup.shutdown_idle(id, Some(&observed)).await,
+            sup.shutdown_idle(id, Some((&observed, observed.admissions())))
+                .await,
+            Err(crate::acp::supervisor::SupervisorError::Superseded(_))
+        ));
+        assert_eq!(sup.worker_state(id).await, Running);
+
+        // A prompt admitted after the observation, before the claim (#5048).
+        let id = "prompted-session";
+        let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+        let sup = &state.acp_supervisor;
+        sup.test_insert_worker(id).await;
+        let observed = sup.running_lease(id).unwrap();
+        let admissions = observed.admissions();
+        sup.publish_user_prompt(id, "hello".into()).await;
+        assert!(matches!(
+            sup.shutdown_idle(id, Some((&observed, admissions))).await,
             Err(crate::acp::supervisor::SupervisorError::Superseded(_))
         ));
         assert_eq!(sup.worker_state(id).await, Running);

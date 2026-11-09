@@ -69,6 +69,48 @@ fn stage_live_send(env: &mut TestEnv) {
     });
 }
 
+#[test]
+#[serial]
+fn terminal_interactions_start_at_the_displayed_viewport() {
+    let pane = Rect::new(40, 0, 60, 20);
+    for interaction in ["drag", "click", "click-scroll", "up", "down"] {
+        let mut env = create_test_env_empty();
+        stage_pane(&mut env, pane, 50, 100);
+        env.view.view_mode = ViewMode::Terminal;
+        env.view.selected_session = Some("test-session".to_string());
+        env.view.terminal_preview_cache.dimensions = (pane.width, pane.height + 1);
+        env.view.terminal_preview_cache.captured_lines = 100;
+        env.view.preview_scroll_offset = 0;
+        match interaction {
+            "drag" => {
+                assert!(env.view.handle_drag_start(50, 10));
+                assert_eq!(env.view.preview_selection.unwrap().anchor, (10, 39));
+                assert_eq!(env.view.preview_scroll_offset, 30);
+            }
+            "click" => {
+                assert!(env.view.handle_drag_start(50, 10));
+                assert!(env.view.handle_drag_end());
+                assert_eq!(env.view.preview_scroll_offset, 0);
+                assert!(env.view.preview_selection.is_none());
+            }
+            "click-scroll" => {
+                assert!(env.view.handle_drag_start(50, 10));
+                assert!(env.view.handle_scroll_up(50, 10));
+                assert!(env.view.handle_drag_end());
+                assert_eq!(env.view.preview_scroll_offset, 33);
+            }
+            "up" => {
+                assert!(env.view.handle_scroll_up(50, 10));
+                assert_eq!(env.view.preview_scroll_offset, 33);
+            }
+            _ => {
+                assert!(env.view.handle_scroll_down(50, 10));
+                assert_eq!(env.view.preview_scroll_offset, 27);
+            }
+        }
+    }
+}
+
 /// A press on the preview seeds a PreviewSelect at the absolute content line under the
 /// cursor, in or out of live mode, so users can copy from a regular preview too. A modal over
 /// the preview swallows the press instead of seeding a hidden highlight, and a pane with no
