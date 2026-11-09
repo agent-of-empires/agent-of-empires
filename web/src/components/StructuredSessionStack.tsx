@@ -32,7 +32,8 @@ export function StructuredSessionStack({
 
   return (
     <div className="flex-1 min-h-0 overflow-hidden relative">
-      {visibleIds.map((sessionId) => {
+      {/* Recency order would make React re-insert kept views, and re-insertion resets their scroll. */}
+      {[...visibleIds].sort().map((sessionId) => {
         const session = sessionsById.get(sessionId);
         if (!session) return null;
         const selected = sessionId === activeSessionId;

@@ -248,41 +248,6 @@ describe("useTranscriptScroll fold corrections", () => {
     expect(metrics.scrollTop).toBeLessThan(metrics.scrollHeight - metrics.clientHeight);
   });
 
-  it.each([false, true])(
-    "keeps the coarse bottom pin through a composer resize unless the reader gestures: %s",
-    (gesture) => {
-      Object.defineProperty(window, "matchMedia", {
-        configurable: true,
-        value: (query: string) =>
-          ({
-            matches: query === "(pointer: coarse)",
-            addEventListener: () => {},
-            removeEventListener: () => {},
-          }) as MediaQueryList,
-      });
-      const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 1100, cardPageTop: 1150 };
-      const sessionId = `coarse-composer-resize-${gesture}`;
-      saveScrollState(sessionId, { stuck: true, top: metrics.scrollTop });
-      const view = render(
-        <Harness metrics={metrics} sessionId={sessionId} folded={false} closed={false} streamed={false} />,
-      );
-      const viewport = view.getByTestId("viewport") as HTMLDivElement;
-      act(() => {
-        viewport.dispatchEvent(new Event("scroll"));
-        contentObserver(viewport).fire();
-      });
-
-      act(() => {
-        if (gesture) viewport.dispatchEvent(new Event("wheel"));
-        metrics.clientHeight = 60;
-        metrics.scrollTop = 1080;
-        viewport.dispatchEvent(new Event("scroll"));
-        contentObserver(viewport).fire();
-      });
-      expect(metrics.scrollTop).toBe(gesture ? 1080 : 1140);
-    },
-  );
-
   it("continues following final text after a closed run folds without cards", () => {
     const metrics: Metrics = { clientHeight: 100, scrollHeight: 1200, scrollTop: 1100, cardPageTop: 1150 };
     const sessionId = "closed-fold-bottom-pin";

@@ -194,8 +194,8 @@ export function useTranscriptScroll({
     const onScroll = () => {
       const previous = toolAnchorsRef.current;
       const folding = previous.some(({ el }) => !el.isConnected);
-      const viewportResized = vp.clientHeight !== lastClientHeightRef.current;
-      const layoutChanged = vp.scrollHeight !== lastScrollHeightRef.current || viewportResized;
+      const layoutChanged =
+        vp.scrollHeight !== lastScrollHeightRef.current || vp.clientHeight !== lastClientHeightRef.current;
       const scrollChanged = vp.scrollTop !== lastScrollTopRef.current;
       let readerMoved = false;
       if (scrollChanged) {
@@ -215,11 +215,7 @@ export function useTranscriptScroll({
           }
         }
       }
-      // A coarse viewport resize can move the scroll position without reader input; folds still preserve reader deltas.
-      sample(
-        readerMoved && (!isCoarse || gestureActive || !viewportResized),
-        !layoutChanged || readerMoved || gestureActive,
-      );
+      sample(readerMoved, !layoutChanged || readerMoved || gestureActive);
       if (!folding) {
         toolAnchorsRef.current = resampleToolAnchors(vp, previous);
       }
