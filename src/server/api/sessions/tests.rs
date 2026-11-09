@@ -13673,250 +13673,330 @@ async fn a_refused_account_swap_leaves_every_kind_of_session_untouched() {
 #[tokio::test]
 #[serial_test::serial]
 async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prompt() {
+    use crate::acp::event_store::ControlKnowledge::Known;
+    use crate::acp::supervisor::test_support::managed::with_managed;
     use crate::acp::Event;
-
-    let _home = crate::session::test_support::isolate_app_dir();
-    let project = tempfile::tempdir().unwrap();
-    let mut rows = Vec::new();
-    for id in [
-        "parked",
-        "explicit",
-        "superseded",
-        "nothing-to-replay",
-        "pending-only",
-        "unparked",
-    ] {
-        let mut row = Instance::new(id, project.path().to_str().unwrap());
-        row.id = id.into();
-        row.source_profile = "default".into();
-        row.view = crate::session::View::Structured;
-        row.tool = "claude".into();
-        row.agent_name = Some("claude".into());
-        rows.push(row);
-    }
-    crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
-    let state = crate::server::test_support::build_test_app_state(rows);
-    let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
-    let prompt = || Event::UserPromptSent {
-        text: "finish the migration".into(),
-        attachments: Vec::new(),
-        prompt_id: None,
-        synthesized: false,
-        origin_plugin: None,
-    };
-    let limit = || Event::RateLimit {
-        info: crate::acp::state::RateLimitInfo {
-            status: "limited".into(),
-            resets_at: Some(resets_at),
-            kind: "usage".into(),
-        },
-    };
-    let stopped = || Event::Stopped {
-        reason: "rate_limited".into(),
-    };
-    for id in ["parked", "explicit", "superseded"] {
-        for (seq, event) in [prompt(), limit(), stopped()].iter().enumerate() {
-            state
-                .acp_event_store
-                .record(id, u64::try_from(seq).unwrap() + 1, event)
+    with_managed(|scope| {
+        Box::pin(async move {
+            for case in [
+                "parked",
+                "explicit",
+                "superseded",
+                "nothing-to-replay",
+                "pending-only",
+                "unparked",
+            ] {
+                let mut live =
+                    crate::server::test_support::managed_control_session(scope, case).await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                if case == "unparked" {
+                    assert_eq!(
+                        crate::server::api::acp::rate_limit_resume_probe(&state, &id)
+                            .await
+                            .unwrap(),
+                        Known(None),
+                        "not parked: the wake message stays",
+                    );
+                    live.client.shutdown().await.unwrap();
+                    continue;
+                }
+                if matches!(case, "nothing-to-replay" | "pending-only") {
+                    // A real runner operation without a daemon user-prompt record has no
+                    // interrupted user input to redeliver.
+                    live.client
+                        .send_prompt("Native operation without user journal input", &[])
+                        .await
+                        .unwrap();
+                    let request = live.next_prompt().await;
+                    live.finish_prompt(&request, Some("rate_limit")).await;
+                } else {
+                    live.park("finish the migration").await;
+                }
+                let resets_at = match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
+                    .await
+                    .unwrap()
+                {
+                    Known(Some(at)) => at,
+                    other => {
+                        panic!("actual Native quota stop must establish a known park: {other:?}")
+                    }
+                };
+                if case == "pending-only" {
+                    state
+                        .session_service
+                        .set_pending_initial_turn(&id, "earlier continuation".into(), Vec::new())
+                        .await;
+                } else if case == "explicit" {
+                    state
+                        .session_service
+                        .set_pending_initial_turn(&id, "newer continuation".into(), Vec::new())
+                        .await;
+                }
+                let row = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                let pending = || {
+                    crate::session::Storage::open_unwatched(&row.source_profile)
+                        .unwrap()
+                        .load()
+                        .unwrap()
+                        .into_iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .pending_initial_turn
+                        .map(|turn| turn.text)
+                };
+                let breadcrumbs = || {
+                    state
+                        .acp_event_store
+                        .replay_from(&id, 0)
+                        .unwrap()
+                        .iter()
+                        .filter(|stored| {
+                            matches!(
+                                stored.event.as_ref(),
+                                Event::RateLimitAutoResumed { manual: true, .. }
+                            )
+                        })
+                        .count()
+                };
+                let explicit = case == "explicit";
+                let prepared = if explicit {
+                    None
+                } else {
+                    crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                        .await
+                        .unwrap()
+                };
+                let generation = row.lifecycle_generation + u64::from(case == "superseded");
+                let selected = lifecycle::continue_interrupted_prompt(
+                    &state, &id, generation, resets_at, explicit, prepared,
+                )
+                .await
                 .unwrap();
-        }
-    }
-    for id in ["nothing-to-replay", "pending-only"] {
-        for (seq, event) in [limit(), stopped()].iter().enumerate() {
-            state
-                .acp_event_store
-                .record(id, u64::try_from(seq).unwrap() + 1, event)
-                .unwrap();
-        }
-    }
-    state
-        .session_service
-        .set_pending_initial_turn("pending-only", "earlier continuation".into(), Vec::new())
-        .await;
-    state.acp_supervisor.hydrate_seqs(
-        [
-            "parked",
-            "explicit",
-            "superseded",
-            "nothing-to-replay",
-            "pending-only",
-        ]
-        .map(|id| (id.to_string(), state.acp_event_store.highest_seq(id))),
-    );
-
-    let probe = |id: &'static str| {
-        let state = state.clone();
-        async move { crate::server::api::acp::rate_limit_resume_probe(&state, id).await }
-    };
-    assert!(probe("parked").await.is_some());
-    assert_eq!(
-        probe("unparked").await,
-        None,
-        "not parked: the wake message stays"
-    );
-
-    let generations: std::collections::HashMap<String, u64> = state
-        .instances
-        .read()
-        .await
-        .iter()
-        .map(|row| (row.id.clone(), row.lifecycle_generation))
-        .collect();
-    let generation = |id: &str| generations[id];
-    let pending = |id: &str| {
-        crate::session::Storage::open_unwatched("default")
-            .unwrap()
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|row| row.id == id)
-            .unwrap()
-            .pending_initial_turn
-            .map(|turn| turn.text)
-    };
-    let breadcrumbs = |id: &str| {
-        state
-            .acp_event_store
-            .replay_from(id, 1)
-            .into_iter()
-            .filter(|(_, event)| matches!(event, Event::RateLimitAutoResumed { manual: true, .. }))
-            .count()
-    };
-
-    let g = generation("parked");
-    assert!(
-        lifecycle::continue_interrupted_prompt(&state, "parked", g, resets_at, false).await,
-        "the interrupted prompt is the next turn, so no wake message"
-    );
-    assert_eq!(pending("parked").as_deref(), Some("finish the migration"));
-    assert_eq!(breadcrumbs("parked"), 1);
-
-    state
-        .session_service
-        .set_pending_initial_turn("explicit", "newer continuation".into(), Vec::new())
-        .await;
-    let g = generation("explicit");
-    assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "explicit", g, resets_at, true).await,
-        "an explicit wake message is sent by the restart itself"
-    );
-    assert_eq!(
-        pending("explicit").as_deref(),
-        Some("newer continuation"),
-        "work installed after the launch finalized is not the restart's to clear"
-    );
-    assert_eq!(breadcrumbs("explicit"), 1, "the budget is still disarmed");
-
-    let g = generation("superseded") + 1;
-    assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "superseded", g, resets_at, false).await
-    );
-    assert_eq!(
-        pending("superseded"),
-        None,
-        "a superseded restart installs nothing"
-    );
-    assert_eq!(breadcrumbs("superseded"), 0);
-
-    let g = generation("nothing-to-replay");
-    assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "nothing-to-replay", g, resets_at, false)
-            .await,
-        "no turn to deliver: the default wake message must still go out"
-    );
-    assert_eq!(breadcrumbs("nothing-to-replay"), 1);
-
-    let g = generation("pending-only");
-    assert!(
-        lifecycle::continue_interrupted_prompt(&state, "pending-only", g, resets_at, false).await,
-        "a continuation already pending is work, so the default wake message must not go out"
-    );
-    assert_eq!(
-        pending("pending-only").as_deref(),
-        Some("earlier continuation")
-    );
+                match case {
+                    "parked" => {
+                        assert!(
+                            selected,
+                            "interrupted prompt is next: suppress the default wake"
+                        );
+                        assert_eq!(pending().as_deref(), Some("finish the migration"));
+                        assert_eq!(breadcrumbs(), 1);
+                    }
+                    "explicit" => {
+                        assert!(!selected, "the restart itself sends its explicit wake");
+                        assert_eq!(
+                            pending().as_deref(),
+                            Some("newer continuation"),
+                            "work installed after launch finalized is not the restart's to clear"
+                        );
+                        assert_eq!(breadcrumbs(), 1, "manual budget disarmed exactly once");
+                    }
+                    "superseded" => {
+                        assert!(!selected);
+                        assert_eq!(pending(), None, "superseded restart installs nothing");
+                        assert_eq!(breadcrumbs(), 0);
+                    }
+                    "nothing-to-replay" => {
+                        assert!(!selected, "no turn to deliver: keep the default wake");
+                        assert_eq!(breadcrumbs(), 1);
+                    }
+                    "pending-only" => {
+                        assert!(selected, "already pending continuation is selected work");
+                        assert_eq!(pending().as_deref(), Some("earlier continuation"));
+                    }
+                    _ => unreachable!(),
+                }
+                live.client.shutdown().await.unwrap();
+            }
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
-    use crate::acp::Event;
-
-    let _home = crate::session::test_support::isolate_app_dir();
-    let project = tempfile::tempdir().unwrap();
-    let mut row = Instance::new("drained", project.path().to_str().unwrap());
-    row.id = "drained".into();
-    row.source_profile = "default".into();
-    row.view = crate::session::View::Structured;
-    row.tool = "claude".into();
-    row.agent_name = Some("claude".into());
-    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-    let generation = row.lifecycle_generation;
-    let state = crate::server::test_support::build_test_app_state(vec![row]);
-    let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
-    for (seq, event) in [
-        Event::UserPromptSent {
-            text: "finish the migration".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
-        },
-        Event::RateLimit {
-            info: crate::acp::state::RateLimitInfo {
-                status: "limited".into(),
-                resets_at: Some(resets_at),
-                kind: "usage".into(),
-            },
-        },
-        Event::Stopped {
-            reason: "rate_limited".into(),
-        },
-    ]
-    .iter()
-    .enumerate()
-    {
-        state
-            .acp_event_store
-            .record("drained", u64::try_from(seq).unwrap() + 1, event)
-            .unwrap();
-    }
-    state.acp_supervisor.hydrate_seqs([(
-        "drained".to_string(),
-        state.acp_event_store.highest_seq("drained"),
-    )]);
-    // The live drain delivers and clears the continuation the moment the producer releases the
-    // submission authority; the verdict must already be decided by then.
-    let mut barrier = state.session_service.arm_install_barrier();
-    let helper = {
-        let state = state.clone();
-        tokio::spawn(async move {
-            lifecycle::continue_interrupted_prompt(&state, "drained", generation, resets_at, false)
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "drained").await;
+            live.park("finish the migration").await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let generation = state
+                .instances
+                .read()
                 .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .lifecycle_generation;
+            let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                .await
+                .unwrap();
+            let resets_at = chrono::Utc::now() + chrono::Duration::hours(1);
+            let mut barrier = state.session_service.arm_install_barrier();
+            let helper = {
+                let state = state.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    lifecycle::continue_interrupted_prompt(
+                        &state, &id, generation, resets_at, false, prepared,
+                    )
+                    .await
+                })
+            };
+            let (_, release) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), barrier.recv())
+                    .await
+                    .expect("the install reaches its barrier")
+                    .expect("barrier open");
+            let drain = {
+                let state = state.clone();
+                let id = id.clone();
+                tokio::spawn(async move {
+                    let _submission = state.session_service.prompt_submission(&id).await;
+                    state.session_service.clear_pending_initial_turn(&id).await;
+                })
+            };
+            release.send(()).unwrap();
+            assert!(
+                helper.await.unwrap().unwrap(),
+                "a continuation drained immediately after install still counts as selected work"
+            );
+            drain.await.unwrap();
+            live.client.shutdown().await.unwrap();
         })
-    };
-    let (_, release) = tokio::time::timeout(std::time::Duration::from_secs(10), barrier.recv())
-        .await
-        .expect("the install reaches its barrier")
-        .expect("barrier open");
-    let drain = {
-        let state = state.clone();
-        tokio::spawn(async move {
-            // Contends for the same authority, so it runs right after the install releases it.
-            let _submission = state.session_service.prompt_submission("drained").await;
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn quota_breadcrumb_write_failure_does_not_install_pending_input() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    with_managed(|scope| {
+        Box::pin(async move {
+            let mut live =
+                crate::server::test_support::managed_control_session(scope, "quota-write-refused")
+                    .await;
+            live.park("finish the migration").await;
+            let id = live.id().to_owned();
+            let state = live.state.clone();
+            let row = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .clone();
+            let prepared = crate::server::acp_reconciler::resolve_continuation(&state, &id)
+                .await
+                .unwrap();
+            assert!(
+                prepared.is_some(),
+                "the actual interrupted request must be recoverable"
+            );
+            let budget = state
+                .acp_event_store
+                .rate_limit_redelivery_streak(&id)
+                .unwrap();
             state
-                .session_service
-                .clear_pending_initial_turn("drained")
-                .await;
+                .acp_event_store
+                .test_conn()
+                .execute_batch(
+                    "CREATE TEMP TRIGGER fail_quota_breadcrumb BEFORE INSERT ON acp_events
+                 WHEN NEW.discriminant = 'RateLimitAutoResumed'
+                 BEGIN SELECT RAISE(ABORT, 'forced quota breadcrumb write failure'); END;",
+                )
+                .unwrap();
+            let result = lifecycle::continue_interrupted_prompt(
+                &state,
+                &id,
+                row.lifecycle_generation,
+                chrono::Utc::now(),
+                false,
+                prepared,
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(crate::acp::supervisor::SupervisorError::NativeStoreUnavailable)
+            ));
+            assert_eq!(
+                state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .pending_initial_turn,
+                None,
+                "a failed publication must not install input in memory",
+            );
+            let durable = crate::session::Storage::open_unwatched(&row.source_profile)
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(
+                durable.pending_initial_turn, None,
+                "a failed publication must not persist input for a later drain"
+            );
+            assert_eq!(
+                state
+                    .acp_event_store
+                    .rate_limit_redelivery_streak(&id)
+                    .unwrap(),
+                budget
+            );
+            assert!(!state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .unwrap()
+                .iter()
+                .any(|stored| {
+                    matches!(
+                        stored.event.as_ref(),
+                        crate::acp::Event::RateLimitAutoResumed { .. }
+                    )
+                }));
+            let methods = live.native.requests();
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| *method == "session/prompt")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|method| *method == "session/new")
+                    .count(),
+                1
+            );
+            state
+                .acp_event_store
+                .test_conn()
+                .execute_batch("DROP TRIGGER fail_quota_breadcrumb")
+                .unwrap();
+            live.client.shutdown().await.unwrap();
         })
-    };
-    release.send(()).unwrap();
-    assert!(
-        helper.await.unwrap(),
-        "a continuation drained right after the install still counts as selected work"
-    );
-    drain.await.unwrap();
+    })
+    .await;
 }
 
 /// A Claude row on account `a` with a recorded conversation, swappable to account `b`. `b` has

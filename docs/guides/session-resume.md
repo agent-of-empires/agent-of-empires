@@ -122,6 +122,8 @@ An indeterminate creation still finalizes its idempotency key: its durable statu
 
 Post-hook creation failures release namespace, submission and mutation guards before rollback cleanup re-enters them.
 
+An ACP account restart keeps its quota breadcrumb and interrupted-turn selection inside the same prompt-submission guard.
+
 A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
 
 This exclusive-occupancy check also protects later revival and direct-start replacement. The tmux command rechecks immutable pane/server identity and topology atomically before any process-tree signalling or scope release. A legacy corpse does not acquire an invented process PID. A peer split immediately before removal refuses revival; explicit Stop retains its separate authority.
@@ -129,6 +131,8 @@ This exclusive-occupancy check also protects later revival and direct-start repl
 A live-pane teardown authorization requires the pane to remain live with the exact captured PID; it cannot consume a later corpse. Corpse cleanup does not capture new process handles. Exclusive occupancy also excludes windows linked into another session, including grouped sessions.
 
 Revival takes the pane state, PID, physical IDs and server birth from one captured observation before acquiring process handles; it does not combine separate name-based and cached batch lookups.
+
+Some tmux versions display a corpse's previous PID, while others hide it. Revival preserves that observed value for its dead-pane guard without capturing or signalling it as a live process.
 
 Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. A matching OMP confirmation can consume an explicit pin during stabilization without changing the captured launch owner. Capturing a different ID clears the marker; an explicit `set-session-id` assertion or a successful launch can also clear it.
 
