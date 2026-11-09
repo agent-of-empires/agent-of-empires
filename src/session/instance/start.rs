@@ -1619,10 +1619,31 @@ mod tests {
                 .unwrap()
                 .status
                 .success());
+            let removal_seen = std::rc::Rc::new(std::cell::Cell::new(false));
+            let captured_removal = removal_seen.clone();
+            let _removal = crate::tmux::utils::owned_probe_test_support::BeforeRemoval::install(
+                move |expected| {
+                    let raw_pid = pane_field(&expected.identity.pane_id, "#{pane_pid}");
+                    let observed_pid = if raw_pid.is_empty() {
+                        None
+                    } else {
+                        Some(raw_pid.parse::<u32>().unwrap())
+                    };
+                    assert_eq!(
+                        expected.identity.pane_pid, observed_pid,
+                        "corpse cleanup must preserve its real displayed PID without live handles",
+                    );
+                    captured_removal.set(true);
+                },
+            );
             let retry = instance.start_with_size_opts(None, true);
             assert!(
                 retry.is_ok(),
                 "removing the split must permit immediate direct start: {retry:?}"
+            );
+            assert!(
+                removal_seen.get(),
+                "the retry must reach the actual corpse-removal guard"
             );
             assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
         }
