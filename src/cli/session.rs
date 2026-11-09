@@ -2794,6 +2794,15 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     && pending.generation == inst.lifecycle_generation,
                     crate::session::LifecycleReservationError::Superseded);
                 pending.ensure_original_stopped(&inst.id)?;
+                // The target launch may own newer units than the retired Native Original.
+                // Observe those exact obligations without stopping or adopting a new peer.
+                let target_scopes = crate::process::systemd::resolve_unknown_scopes(
+                    &inst.id, inst.terminal_scopes.as_deref(),
+                ).context("terminal target scope ownership remains unresolved")?;
+                for scope in &target_scopes {
+                    anyhow::ensure!(crate::process::systemd::scope_stopped(&inst.id, scope)?,
+                        "terminal target scope remains live; complete its explicit shutdown before selecting a target");
+                }
                 let launch = pending.launch.as_ref().context(
                     "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent")?;
                 let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
