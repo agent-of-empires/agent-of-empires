@@ -4048,7 +4048,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-worker-api.spec.ts", "tests/live/acp-stories/agent-status.spec.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "src/server/api/acp.rs", "src/acp/acp_client/"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "src/server/api/acp.rs", "src/acp/acp_client/"],
+      "notes": "The existing native-binary startup story opens Details and the agent log, refreshes it, waits for loading to settle, and saves/attaches the positive disclosed surface to the Playwright HTML report."
     },
     {
       "id": "read-only.mode",
