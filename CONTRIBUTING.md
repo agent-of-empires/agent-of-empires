@@ -52,7 +52,8 @@ server, and the optional shared build cache.
 release notes. Maintenance types such as `build`, `chore`, `ci`, `docs`,
 `refactor`, `style`, and `test` do not. A web scope follows the same rule, so
 `feat(web)` is visible and `refactor(web)` is not. The PR title check enforces
-`<type>(<scope>)?: <lowercase subject>`.
+`<type>(<scope>)?: <lowercase subject>`. A `!` after the type or scope proposes
+a major release; use it only for breaking changes that warrant one.
 
 ## Pull requests
 

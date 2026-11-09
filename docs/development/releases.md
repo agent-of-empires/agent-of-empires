@@ -4,7 +4,7 @@ Maintainer reference for how `agent-of-empires` ships: stable releases cut from 
 
 ## Stable releases
 
-`.github/workflows/release-plz.yml` runs [release-plz](https://release-plz.dev) on every push to `main`. It keeps one release PR open, branch `release-plz-*` and label `release`, that bumps `Cargo.toml` and `Cargo.lock` and prepends the new section to `CHANGELOG.md`. Merge it whenever you want to ship. On that merge release-plz pushes the `vX.Y.Z` tag with `RELEASE_TOKEN`, and the tag push starts `release.yml`. That workflow waits for `release` environment approval, builds the platform binaries through `build-binaries.yml`, publishes the GitHub release with the version's `CHANGELOG.md` section as its body, and publishes the ClawHub skill. `docker.yml` pushes the sandbox images for the same tag.
+`.github/workflows/release-plz.yml` runs [release-plz](https://release-plz.dev) daily and on `workflow_dispatch`. It keeps one release PR open, branch `release-plz-*` and label `release`, that bumps `Cargo.toml` and `Cargo.lock` and prepends the new section to `CHANGELOG.md`. To ship, dispatch the workflow so the PR covers everything on `main`, then merge it. When it merges, release-plz pushes the `vX.Y.Z` tag on the PR's own squash commit with `RELEASE_TOKEN`, and the tag push starts `release.yml`. That workflow waits for `release` environment approval, builds the platform binaries through `build-binaries.yml`, publishes the GitHub release with the version's `CHANGELOG.md` section as its body, and publishes the ClawHub skill. `docker.yml` pushes the sandbox images for the same tag.
 
 Configuration lives in `release-plz.toml`: only `agent-of-empires` is released, versions come from `v*` tags, and nothing is published to crates.io. The changelog groups commits by conventional-commit type; `pr-title-check.yml` keeps PR titles, which become squash-commit subjects, within those types.
 
@@ -22,7 +22,7 @@ The build checks out the requested tag and reads `[toolchain].channel` from its 
 
 ## Versioning
 
-Semver, from conventional commits since the last `v*` tag: `feat` is minor, anything else is patch, and `feat!:` or a `BREAKING CHANGE:` footer is major. Bump minor for user-visible features without a `feat` prefix, new CLI subcommands, or new config sections. Bump major for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. Override the computed bump as described in [Stable releases](#stable-releases). When uncertain, take the bigger bump.
+Semver, from conventional commits since the last `v*` tag: `feat` is minor, anything else is patch, and any `!` (`feat!:`, `fix!:`) or a `BREAKING CHANGE:` footer is major. Mark a commit `!` only when it warrants a major release. Bump minor for user-visible features without a `feat` prefix, new CLI subcommands, or new config sections. Bump major for breaking config changes, removed CLI subcommands, or on-disk breakage needing maintainer attention beyond a migration. Override the computed bump as described in [Stable releases](#stable-releases). When uncertain, take the bigger bump.
 
 ## Nightly channel
 
@@ -34,7 +34,13 @@ Once a migration is merged to `main`, its number and behavior are frozen: nightl
 
 ### Enabling nightlies
 
-The workflow does nothing until the `NIGHTLY_ENABLED` repository variable is `true`. Stable clients up to v1.22.2 read the newest entry of the full release list, cannot parse a `nightly-*` tag as a version, and then report no update, so publishing a nightly hides every later stable release from them. Turn nightlies on only after a stable release with the channel-aware update check has shipped and most users have updated to it:
+The workflow does nothing until the `NIGHTLY_ENABLED` repository variable is `true`. Stable clients up to v1.22.2 read the newest entry of the full release list, cannot parse a `nightly-*` tag as a version, and then report no update, so publishing a nightly hides every later stable release from them. Before turning nightlies on:
+
+1. Ship a stable release with the channel-aware update check, and wait until most users have updated to it.
+2. Exclude `refs/tags/nightly-*` from the `Tags` ruleset, whose deletion rule otherwise makes the prune step fail.
+3. Give the homebrew-core `aoe` formula a `livecheck` regex such as `/^v?(\d+(?:\.\d+)+)$/i`, so `nightly-*` tags are not read as versions.
+
+Then:
 
 ```bash
 gh variable set NIGHTLY_ENABLED --body true -R agent-of-empires/agent-of-empires
