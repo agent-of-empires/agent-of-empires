@@ -170,7 +170,6 @@ impl Instance {
                 return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
             }
             instance.resume_intent = ResumeIntent::Default;
-            instance.resume_binding = None;
             if selection.is_some() {
                 next_selection = Some(instance.native_preparation_selection()?);
             }
