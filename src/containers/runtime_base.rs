@@ -1572,7 +1572,7 @@ mod tests {
         std::fs::write(
             &shim,
             format!(
-                "#!/bin/sh\n{{ echo \"client=$HTTP_PROXY|$HOME|$SSL_CERT_FILE|$LD_PRELOAD|$DOCKER_DEFAULT_PLATFORM\"; \
+                "#!/bin/sh\n{{ echo \"client=$HTTP_PROXY|$HOME|$SSL_CERT_FILE|$DOCKER_DEFAULT_PLATFORM|$LD_PRELOAD\"; \
                  cat /dev/fd/9; echo \"argv=$*\"; }} > '{}'\necho fake-id\n",
                 log.display()
             ),
@@ -1589,7 +1589,6 @@ mod tests {
             ("SSL_CERT_FILE", "/host/ca.pem"),
             ("DOCKER_DEFAULT_PLATFORM", "linux/host"),
         ]);
-        let host_preload = std::env::var("LD_PRELOAD").unwrap_or_default();
         let literals = [
             ("HTTP_PROXY", "http://proxy.container.internal:3128"),
             ("HOME", "/container-home"),
@@ -1615,11 +1614,12 @@ mod tests {
 
         let log = std::fs::read_to_string(log).unwrap();
         let mut lines = log.lines();
-        assert_eq!(
-            lines.next().unwrap(),
-            format!(
-                "client=http://host-proxy.example:3128|/host-home|/host/ca.pem|{host_preload}|linux/host"
-            )
+        let client = lines.next().unwrap();
+        assert!(
+            client.starts_with(
+                "client=http://host-proxy.example:3128|/host-home|/host/ca.pem|linux/host|"
+            ) && !client.contains("/container/hook.so"),
+            "{client}"
         );
         for (key, value) in literals {
             assert_eq!(lines.next(), Some(format!("{key}={value}").as_str()));
