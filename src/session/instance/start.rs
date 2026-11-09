@@ -241,6 +241,17 @@ impl Instance {
             self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
+        let current = crate::tmux::unique_agent_session_presence(&self.id).and_then(|presence| {
+            anyhow::ensure!(
+                revival.is_some() == (presence == crate::tmux::SessionExistence::Present),
+                LaunchIndeterminateCause::OwnershipUnproven
+            );
+            Ok(())
+        });
+        if let Err(error) = current {
+            self.fail_reserved_launch(storage, generation, &error, None, None);
+            return Err(error);
+        }
         if let Some((key, _)) = handoff {
             self.validate_terminal_handoff_target(storage, key)?;
         }
@@ -792,13 +803,12 @@ impl Instance {
                     id: intent.id,
                     generation: self.lifecycle_generation,
                 });
+            anyhow::ensure!(
+                crate::tmux::unique_agent_session_presence(&self.id)?
+                    == crate::tmux::SessionExistence::Absent,
+                LaunchIndeterminateCause::OwnershipUnproven
+            );
             let session = self.tmux_session()?;
-            if session.exists_live() {
-                anyhow::bail!(
-                    "session {} gained a tmux pane before its reserved launch",
-                    self.id
-                );
-            }
 
             // A takeover can replace the pane without changing the agent or the execution, and a poller
             // for either would then be watching the pane this launch is replacing.
@@ -1540,27 +1550,35 @@ mod tests {
                         expected.identity.pane_pid, observed_pid,
                         "corpse cleanup must preserve its real displayed PID without live handles",
                     );
-                    if superseded {
-                        let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
-                        let generation = storage
-                            .update(|rows, _| {
-                                let row = &mut rows[0];
-                                let generation = row.lifecycle_generation;
-                                assert!(row.release_lifecycle_reservation_if_owned(
-                                    LifecycleOperation::Launch,
-                                    generation
-                                ));
-                                Ok(row.try_acquire_lifecycle_reservation(
-                                    LifecycleOperation::Launch,
-                                    Instance::LIFECYCLE_RESERVATION_TTL,
-                                    chrono::Utc::now(),
-                                )?)
-                            })
-                            .unwrap();
-                        captured_foreign.set(Some(generation));
-                    }
                 },
             );
+            let _supersession =
+                crate::tmux::utils::owned_probe_test_support::Observer::install(move |output| {
+                    if !superseded || captured_foreign.get().is_some() {
+                        return;
+                    }
+                    assert!(
+                        output.status.success(),
+                        "supersession follows a real owned-pane probe"
+                    );
+                    let storage = crate::session::Storage::new_unwatched(&profile).unwrap();
+                    let generation = storage
+                        .update(|rows, _| {
+                            let row = &mut rows[0];
+                            let generation = row.lifecycle_generation;
+                            assert!(row.release_lifecycle_reservation_if_owned(
+                                LifecycleOperation::Launch,
+                                generation
+                            ));
+                            Ok(row.try_acquire_lifecycle_reservation(
+                                LifecycleOperation::Launch,
+                                Instance::LIFECYCLE_RESERVATION_TTL,
+                                chrono::Utc::now(),
+                            )?)
+                        })
+                        .unwrap();
+                    captured_foreign.set(Some(generation));
+                });
             let refusal = instance.start_with_size_opts(None, true).unwrap_err();
             assert!(refusal.is::<LaunchIndeterminateCause>(), "{refusal:#}");
             assert!(crate::process::process_birth_is_live(peer_pid, &peer_birth).unwrap());
@@ -1948,7 +1966,13 @@ else:
             let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let disk = storage.load().unwrap().remove(0);
             if fail_final || peer_pin {
-                assert!(!instance.tmux_session().unwrap().exists());
+                assert!(
+                    !instance.tmux_session().unwrap().exists(),
+                    "case ({fail_adoption}, {fail_final}, {peer_pin}): result={result:?}; durable={:?}; current={:?}\n{}",
+                    disk.conversation_state(),
+                    instance.conversation_state(),
+                    logs.contents(),
+                );
                 assert_eq!(disk.status, Status::Error);
                 if peer_pin {
                     assert_eq!(disk.agent_session_id.as_deref(), Some(PARENT));

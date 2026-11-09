@@ -6,6 +6,7 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 Physical launch and pane adoption decisions probe the exact tmux name live.
 A cached tmux session snapshot cannot suppress recreation of a missing pane.
+Launch admission uses a fresh marked Agent inventory, not the display resolver's title-derived fallback. Multiple candidates, including corpses or a candidate with the derived name, refuse admission before a new launch reservation. Launch paths recheck uniqueness after hooks and before physical birth; a missing selected target does not authorize substitution. Display and auxiliary name resolution retain their separate policies.
 
 ## Automatic capture matrix
 

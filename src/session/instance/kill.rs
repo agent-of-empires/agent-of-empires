@@ -192,15 +192,17 @@ impl Instance {
         expected: Option<&resume::RevivalTarget>,
     ) -> Result<()> {
         let removed = (|| -> Result<(Option<crate::process::CapturedProcessTree>, bool)> {
+            let current = crate::tmux::unique_agent_session_name(&self.id)?;
             let Some(expected) = expected else {
                 anyhow::ensure!(
-                    self.capture_revival_target()?.is_none(),
+                    current.is_none(),
                     LaunchIndeterminateCause::OwnershipUnproven
                 );
                 return Ok((None, false));
             };
+            let name = current.ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
             let processes =
-                self.remove_captured_runtime_locked(&expected.pane, Some(expected.state))?;
+                self.remove_captured_runtime_locked(&name, &expected.pane, Some(expected.state))?;
             Ok((processes, true))
         })();
         let (processes, removed_pane) = match removed {
@@ -220,13 +222,13 @@ impl Instance {
 
     fn remove_captured_runtime_locked(
         &self,
+        session_name: &str,
         expected: &LegacyToolObservation,
         state: Option<crate::tmux::utils::PaneProbe>,
     ) -> Result<Option<crate::process::CapturedProcessTree>> {
         use crate::tmux::utils::PaneProbe;
-        let session = self.tmux_session()?;
         let observation = crate::tmux::utils::probe_owned_pane(
-            session.name(),
+            session_name,
             expected,
             &crate::tmux::TmuxCommandDeadline::new(),
         )?
@@ -282,7 +284,7 @@ impl Instance {
             .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
         // Only a receipt from this launch permits either state: a newborn may have exited,
         // but an automatic revival must retain its original captured state.
-        let processes = self.remove_captured_runtime_locked(pane, None)?;
+        let processes = self.remove_captured_runtime_locked(&probe.tmux_session, pane, None)?;
         self.finish_removed_runtime_cleanup(processes, true)?;
         self.release_scope()
     }

@@ -613,13 +613,14 @@ impl Instance {
     }
 
     pub(crate) fn capture_revival_target(&self) -> Result<Option<RevivalTarget>> {
-        let session = self.tmux_session()?;
-        let observed = crate::tmux::utils::observe_pane(
-            session.name(),
-            &crate::tmux::TmuxCommandDeadline::new(),
-        )
-        .map_err(|error| anyhow::Error::from(self.probe_failure_cause(error)))?;
-        Ok(observed.map(|(pane, state, _)| RevivalTarget {
+        let Some(name) = crate::tmux::unique_agent_session_name(&self.id)? else {
+            return Ok(None);
+        };
+        let (pane, state, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())
+                .map_err(|error| anyhow::Error::from(self.probe_failure_cause(error)))?
+                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
+        Ok(Some(RevivalTarget {
             pane: std::sync::Arc::new(pane),
             state,
         }))
@@ -867,6 +868,12 @@ impl Instance {
                 }
                 return Err(error);
             }
+        } else {
+            anyhow::ensure!(
+                crate::tmux::unique_agent_session_presence(&self.id)?
+                    == crate::tmux::SessionExistence::Absent,
+                LaunchIndeterminateCause::OwnershipUnproven
+            );
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -1876,7 +1883,6 @@ mod tests {
                 "failed",
                 "malformed",
                 "expiry",
-                "release_failure",
                 "cached_absence",
                 "superseded",
                 "same_sid_assertion",
@@ -2081,8 +2087,6 @@ mod tests {
                 );
                 let observed = Rc::new(Cell::new(0usize));
                 let observed_query = observed.clone();
-                let writes = Rc::new(RefCell::new(None));
-                let fail_writes = writes.clone();
                 let profile = instance.source_profile.clone();
                 let id = instance.id.clone();
                 let _observation = Observer::install(move |output| {
@@ -2183,14 +2187,6 @@ mod tests {
                             if fault == "concurrent_status" {
                                 output.stdout = b"not a pane observation\n".to_vec();
                             }
-                        }
-                        "release_failure" => {
-                            *fail_writes.borrow_mut() = Some(
-                                crate::session::Storage::new_unwatched(&profile)
-                                    .unwrap()
-                                    .fail_writes_for_test(),
-                            );
-                            output.stdout = b"not a pane observation\n".to_vec();
                         }
                         _ => {}
                     }
@@ -2310,7 +2306,6 @@ mod tests {
                     );
                     assert!(!crate::session::restart::launched_agent(&Ok(outcome)));
                 }
-                writes.borrow_mut().take();
                 let stored = storage.load().unwrap().remove(0);
                 assert_eq!(pane_field(&pane, "#{pane_pid}"), pid);
                 if let Some(birth) = native_birth.as_ref() {
@@ -2352,10 +2347,7 @@ mod tests {
                             0
                         }
                 );
-                assert_eq!(
-                    stored.lifecycle_reservation.is_some(),
-                    fault == "release_failure"
-                );
+                assert!(stored.lifecycle_reservation.is_none());
                 assert_eq!(instance.capture_started_at, before.capture_started_at);
                 assert_eq!(instance.started_at, before.started_at);
                 assert_eq!(released.get(), 0);

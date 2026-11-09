@@ -1699,7 +1699,6 @@ mod tests {
             ("XDG_CONFIG_HOME", root.path().join(".config")),
             ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
         ]);
-        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         let _native_helper = crate::session::frozen_test_helper(
             root.path(),
             concat!(
