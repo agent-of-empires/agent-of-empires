@@ -2052,12 +2052,6 @@ mod tests {
         );
     }
 
-    /// Restores the pre-test SIGINT/SIGQUIT disposition on drop. `#[serial]`
-    /// only keeps these tests from racing each other; it does nothing to
-    /// stop a mid-test `expect`/`assert!` panic from leaving process-wide
-    /// signal state mutated for the rest of the test binary's run, since
-    /// the harness catches per-test panics and keeps going. This guard
-    /// makes that restoration unconditional.
     /// The ACP runner holds the descriptor and starts docker with a plain spawn.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
@@ -2085,6 +2079,12 @@ mod tests {
         assert_eq!(output.stdout, b"payload");
     }
 
+    /// Restores the pre-test SIGINT/SIGQUIT disposition on drop. `#[serial]`
+    /// only keeps these tests from racing each other; it does nothing to
+    /// stop a mid-test `expect`/`assert!` panic from leaving process-wide
+    /// signal state mutated for the rest of the test binary's run, since
+    /// the harness catches per-test panics and keeps going. This guard
+    /// makes that restoration unconditional.
     #[cfg(unix)]
     struct RestoreSignalsOnDrop {
         prev_sigint: Option<nix::sys::signal::SigAction>,
