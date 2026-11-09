@@ -353,6 +353,13 @@ impl Instance {
             self.capture_poller.stop();
         }
         self.capture_poller.drop_handle();
+        if self
+            .capture_poller
+            .retry_after()
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return Ok(PollerStart::Deferred);
+        }
         let Some((capture, context)) = self.source_session_support() else {
             return Ok(PollerStart::NotApplicable);
         };
@@ -1187,6 +1194,11 @@ mod tests {
         admit_sandbox_fixture(&prior);
         let store = prior.sandbox_capture_store_dir().unwrap();
         std::fs::create_dir_all(&store).unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        prior.prime_agent_capture_plan_in(
+            prior.prime_agent_capture_options().expect("Prime fixture has valid capture arguments"),
+            crate::session::CaptureStorage::Scoped(&storage),
+        ).expect("the fixture must reach real lease contention, not configuration refusal");
         let backend = crate::agents::SessionCaptureBackend::PrimeAgent;
         let lease = super::try_acquire_managed_capture_lease(backend, &store).unwrap();
         assert!(
@@ -1200,7 +1212,6 @@ mod tests {
             .retry_after()
             .expect("the real contended store lease must arm its retry deadline");
         assert!(prior.capture_poller.handle().is_none());
-        let storage = crate::session::Storage::new_unwatched("default").unwrap();
         storage
             .update(|rows, _| {
                 rows.push(prior.clone());

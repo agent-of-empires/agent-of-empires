@@ -2429,7 +2429,7 @@ mod tests {
             .unwrap();
             let mut instance = Instance::new("post-launch-unknown", root.path().to_str().unwrap());
             instance.tool = "bash".into();
-            instance.command = "exec sleep 60".into();
+            instance.command = "sleep 60".into();
             instance.source_profile = "post-launch-unknown".into();
             let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
             storage
@@ -2467,6 +2467,7 @@ mod tests {
                     "one actual launch, not a replay"
                 );
                 let pane = only_pane_id(&launched_name);
+                crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
                 assert_eq!(pane_field(&pane, "#{pane_dead}"), "0");
                 let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>().unwrap();
                 let birth = crate::process::process_birth_identity(pid)
@@ -3347,6 +3348,12 @@ exec sleep 60
             assert_eq!(publication[2], NEXT);
             assert!(instance.capture_poller.is_running(),
                 "the refused public revival must restore the watcher before this real Native publication");
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let _runtime = runtime.enter();
             let watch = crate::file_watch::FileWatchService::new().unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -4097,7 +4104,7 @@ exec sleep 60
             }).unwrap();
             let mut instance = Instance::new("dead-observation-replaced", root.path().to_str().unwrap());
             instance.source_profile = "dead-observation-replaced".into();
-            instance.command = "exec sleep 60".into();
+            instance.command = "sleep 60".into();
             let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
             storage.update(|rows, _| { rows.push(instance.clone()); Ok(()) }).unwrap();
             let sentinel = TmuxTestSession::new("dead-observation-server-sentinel");

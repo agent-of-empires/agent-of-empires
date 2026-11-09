@@ -938,7 +938,7 @@ impl Instance {
                 row.terminal_handoff
                     .as_mut()
                     .expect("validated handoff")
-                    .launch = handoff_launch;
+                    .launch = handoff_launch.clone();
             }
             if let Some(resolved) = resolved_scopes.as_ref() {
                 if row.terminal_scopes == recorded_scopes {
@@ -956,6 +956,12 @@ impl Instance {
             }
             Ok(scopes.clone())
         })?);
+        if handoff_key.is_some() {
+            self.terminal_handoff
+                .as_mut()
+                .ok_or(LifecycleReservationError::Superseded)?
+                .launch = handoff_launch;
+        }
         let pane = session.create_with_size_env_and_container_env(
             &self.project_path,
             prepared.command.as_deref(),

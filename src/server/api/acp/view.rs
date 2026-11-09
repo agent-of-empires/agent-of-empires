@@ -2939,7 +2939,7 @@ mod tests {
         let mut source = Instance::new("unproven-terminal-handoff", root.path().to_str().unwrap());
         source.source_profile = "default".into();
         source.view = View::Structured;
-        source.command = "exec sleep 60".into();
+        source.command = "sleep 60".into();
         let name = crate::tmux::Session::generate_name(&source.id, &source.title);
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
         let events = Arc::new(crate::acp::event_store::EventStore::open(
@@ -2984,6 +2984,7 @@ mod tests {
         if let Some(mode) = recovery {
             use crate::tmux::test_helpers::{only_pane_id, pane_field};
             let pane = only_pane_id(&name);
+            crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
             let pid = pane_field(&pane, "#{pane_pid}").parse::<u32>()?;
             let birth = crate::process::process_birth_identity(pid)?
                 .expect("the unproven terminal nevertheless has a real process birth");
@@ -3044,6 +3045,7 @@ mod tests {
             let storage = crate::session::Storage::open_unwatched("default")?;
             let old_key = handoff_key(&durable)?;
             let old_pane = crate::tmux::test_helpers::only_pane_id(&name);
+            crate::tmux::test_helpers::wait_for_pane_command(&old_pane, "sleep");
             let old_pid = crate::tmux::test_helpers::pane_field(&old_pane, "#{pane_pid}").parse::<u32>()?;
             let old_birth = crate::process::process_birth_identity(old_pid)?
                 .expect("unproven birth still names a real live process");

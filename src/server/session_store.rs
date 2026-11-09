@@ -497,11 +497,14 @@ impl NativeSessionStore {
             .block_on(self.state.session_service.disk_reload_guard());
         let transition = self.storage.acquire_write_transition();
         let publication = self.state.publication.blocking_write();
+        let mut status_changed = false;
         let committed = transition.and_then(|transition| {
             self.storage.verify_bound_profile()?;
             transition.update_with_snapshot(&self.storage, |rows, _| {
                 if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    let previous = row.status;
                     settle(row);
+                    status_changed = row.status != previous;
                 }
                 Ok(())
             })
@@ -518,7 +521,10 @@ impl NativeSessionStore {
             .block_on(super::reload::adopt_committed_profiles(
                 &self.state,
                 [(self.storage.profile(), rows, groups)],
-                |_| None,
+                |changed_id| {
+                    (status_changed && changed_id == id)
+                        .then_some(super::reload::StatusCommit::Lifecycle)
+                },
                 &reload,
                 &publication,
             ))
