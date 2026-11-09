@@ -357,15 +357,20 @@ impl PaneBirthInventory {
     pub(crate) fn ensure_only_preexisting_live_panes(&self, prior: &Self) -> Result<()> {
         anyhow::ensure!(self.socket == prior.socket, "terminal handoff socket changed");
         if self.panes.is_empty() {
+            if let Some(server) = &prior.server {
+                anyhow::ensure!(!crate::process::process_birth_is_live(server.pid, &server.birth)?,
+                    "original terminal handoff server remains live but its inventory is unavailable");
+            }
             return Ok(());
         }
         anyhow::ensure!(self.server == prior.server,
             "terminal handoff server changed; cannot prove an unrecorded birth absent");
         for pane in &self.panes {
-            anyhow::ensure!(pane.birth.is_some() && prior.panes.iter().any(|old|
-                old.identity.pane_id == pane.identity.pane_id
-                    && old.identity.pane_pid == pane.identity.pane_pid
-                    && old.birth == pane.birth),
+            let old = prior.panes.binary_search_by(|old|
+                old.identity.pane_id.cmp(&pane.identity.pane_id))
+                .ok().map(|index| &prior.panes[index]);
+            anyhow::ensure!(pane.birth.is_some() && old.is_some_and(|old|
+                old.identity.pane_pid == pane.identity.pane_pid && old.birth == pane.birth),
                 "unrecorded terminal birth may still exist; close its exact pane explicitly in tmux before selecting a target");
         }
         Ok(())
@@ -437,6 +442,7 @@ pub(crate) fn capture_pane_birth_inventory(
         anyhow::ensure!(crate::process::process_birth_is_live(server.pid, &server.birth)?,
             "terminal handoff server changed during complete inventory");
     }
+    inventory.panes.sort_unstable_by(|left, right| left.identity.pane_id.cmp(&right.identity.pane_id));
     Ok(inventory)
 }
 
