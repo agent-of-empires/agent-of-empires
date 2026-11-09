@@ -1471,8 +1471,8 @@ impl PluginManifest {
         }
         if let Some(suggestions) = &self.suggestions {
             check(
-                self.api_version >= 20,
-                "suggestions require api_version >= 20".into(),
+                self.api_version >= 21,
+                "suggestions require api_version >= 21".into(),
             );
             check(
                 !suggestions.sources.is_empty(),

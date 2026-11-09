@@ -690,46 +690,46 @@ fn suggestions_require_current_schema_and_worker() {
     let body = format!(
         "{worker}[suggestions]\n[[suggestions.sources]]\ncriterion = \"review_requested\"\nlabel = \"Review requests\"\nvariables = [\"pr_number\", \"repo\"]\n[[suggestions.sources]]\ncriterion = \"ci_failed\"\nlabel = \"Failing checks\"\ndefault_enabled = false\n"
     );
-    let spec = parse(20, &body).suggestions.expect("declared");
+    let spec = parse(21, &body).suggestions.expect("declared");
     assert_eq!(spec.sources.len(), 2);
     assert_eq!(spec.sources[0].variables, vec!["pr_number", "repo"]);
     assert!(spec.sources[0].default_enabled);
     assert!(!spec.sources[1].default_enabled);
-    assert!(parse(20, "").suggestions.is_none());
+    assert!(parse(21, "").suggestions.is_none());
 
     let source = "[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \"A\"\n";
     let long = "x".repeat(257);
     let cases = [
-        (19, body.clone(), "api_version >= 20"),
+        (20, body.clone(), "api_version >= 21"),
         (
-            20,
+            21,
             format!("{worker}[suggestions]\n"),
             "at least one source",
         ),
-        (20, source.to_string(), "runtime worker"),
+        (21, source.to_string(), "runtime worker"),
         (
-            20,
+            21,
             format!("[runtime]\nkind = \"command\"\ncommand = [\"./w\"]\n{source}"),
             "runtime.worker capability",
         ),
-        (20, format!("{worker}{source}{source}"), "duplicate"),
+        (21, format!("{worker}{source}{source}"), "duplicate"),
         (
-            20,
+            21,
             format!("{worker}[[suggestions.sources]]\ncriterion = \"{long}\"\nlabel = \"A\"\n"),
             "at most 256 bytes",
         ),
         (
-            20,
+            21,
             format!("{worker}[[suggestions.sources]]\ncriterion = \"a\"\nlabel = \" \"\n"),
             "needs a label",
         ),
         (
-            20,
+            21,
             format!("{worker}{source}variables = [\"Pr-Number\"]\n"),
             "[a-z0-9_]+",
         ),
         (
-            20,
+            21,
             format!("{worker}{source}variables = [\"repo\", \"repo\"]\n"),
             "duplicate variables",
         ),

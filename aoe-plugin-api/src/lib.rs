@@ -21,4 +21,4 @@ pub use suggestions::{
     SuggestionSource, SuggestionsError, SuggestionsSpec,
 };
 
-pub const API_VERSION: u32 = 20;
+pub const API_VERSION: u32 = 21;

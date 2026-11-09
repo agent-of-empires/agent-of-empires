@@ -1864,7 +1864,7 @@ mod tests {
     fn suggestions_spec_changed_compares_the_installed_block() {
         let manifest = |sources: &str| {
             PluginManifest::from_toml_str(&format!(
-                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 20\ncapabilities = [\"runtime.worker\"]\n\
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 21\ncapabilities = [\"runtime.worker\"]\n\
                  [runtime]\nkind = \"command\"\nsystem = true\ncommand = [\"true\"]\n{sources}"
             ))
             .unwrap()
