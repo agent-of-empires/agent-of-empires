@@ -36,6 +36,22 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Commits merged after the release PR's last refresh ship in the tag without a
+      # CHANGELOG.md entry; see docs/development/releases.md.
+      - name: Warn about commits missing from the changelog
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          MERGE: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin "refs/pull/$PR/head"
+          BASE="$(git merge-base FETCH_HEAD "$MERGE~1")"
+          MISSED="$(git log --oneline "$BASE..$MERGE~1")"
+          if [ -n "$MISSED" ]; then
+            echo "::warning title=Missing from CHANGELOG.md::$(echo "$MISSED" | wc -l) commit(s) merged after the release PR's last refresh are tagged but not in CHANGELOG.md. See the job summary."
+            { echo '### Tagged but missing from CHANGELOG.md'; echo '```'; echo "$MISSED"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
