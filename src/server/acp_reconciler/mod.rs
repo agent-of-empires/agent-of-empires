@@ -19,8 +19,11 @@ use crate::acp::event_store::EventStore;
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
-
-pub(crate) use rate_limit::{install_rate_limit_continuation, ContinuationOutcome};
+#[cfg(test)]
+pub(crate) use rate_limit::install_rate_limit_continuation;
+pub(crate) use rate_limit::{
+    install_prepared_continuation, resolve_continuation, ContinuationOutcome,
+};
 pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::ensure_rate_limit_worker;
 pub(crate) use resume::{trigger_resume_background, ResumeTrigger};

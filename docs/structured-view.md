@@ -89,6 +89,8 @@ Two further effects are worth knowing before you switch:
 
 The switch is refused while a turn or a background agent is running, since it restarts the worker. Once idle, the worker restarts and resumes the same conversation.
 
+An account restart out of a confirmed rate-limit park captures its qualified continuation before the replacement worker's assignment retires that park. Unconfirmed or unreadable quota history refuses the restart instead of defaulting to an unparked turn. Continuation installation and the manual budget breadcrumb stay under the submission guard and current lifecycle generation; an explicit wake and newer queued work keep precedence.
+
 ### Feature matrix
 
 Features depend on the ACP adapter and its profile:

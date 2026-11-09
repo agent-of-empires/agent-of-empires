@@ -659,7 +659,7 @@ impl HomeView {
         self.mouse_forward_btn = None;
         self.hover_forward_cell = None;
         self.send_message_dialog = None;
-        self.pending_send_session = None;
+        self.pending_message = None;
         self.permission_response_dialog = None;
         self.pending_permission_response = None;
         self.restart_dialog = None;

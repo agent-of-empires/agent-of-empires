@@ -1148,7 +1148,10 @@ mod workspace_ordering_tests {
             async move {
                 list_sessions(
                     State(state),
-                    axum::extract::Query(ListSessionsQuery { state: scope }),
+                    axum::extract::Query(ListSessionsQuery {
+                        state: scope,
+                        profile: None,
+                    }),
                     headers,
                 )
                 .await
@@ -1858,6 +1861,7 @@ mod profile_selection_tests {
                     state: Some(crate::session::SessionScope::All),
                     profile: Some(requested.into()),
                 }),
+                axum::http::HeaderMap::new(),
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
@@ -1876,6 +1880,7 @@ mod profile_selection_tests {
                 state: None,
                 profile: Some("missing".into()),
             }),
+            axum::http::HeaderMap::new(),
         )
         .await;
         assert_eq!(refused.status(), StatusCode::NOT_FOUND);
