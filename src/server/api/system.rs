@@ -356,7 +356,8 @@ pub async fn list_agents(
         use crate::session::builder::structured::{adapter_installed, preparation_hooks_apply};
         let host_environment =
             crate::session::environment::resolve_host_environment_pairs(&config.environment);
-        // The create resolves the repository's config over the profile's.
+        // The create resolves the repository's config over the profile's, which may re-alias
+        // an agent through `agent_detect_as`.
         let create_config = project.as_deref().map(|path| {
             crate::session::config::repo_config::resolve_config_with_repo_or_warn(&profile, path)
         });
@@ -369,16 +370,14 @@ pub async fn list_agents(
             None => preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None),
         };
         for agent in agents.iter_mut().filter(|a| a.acp_capable) {
-            let installed = adapter_installed(&agent.name, &config, &host_environment, &|| false);
-            // An installed adapter is create-ready, so the hooked check runs only when it isn't.
-            agent.acp_create_ready = installed
-                || adapter_installed(
-                    &agent.name,
-                    create_config.as_ref().unwrap_or(&config),
-                    create_environment.as_deref().unwrap_or(&host_environment),
-                    &hooks_apply,
-                );
-            agent.acp_installed = installed;
+            agent.acp_installed =
+                adapter_installed(&agent.name, &config, &host_environment, &|| false);
+            agent.acp_create_ready = adapter_installed(
+                &agent.name,
+                create_config.as_ref().unwrap_or(&config),
+                create_environment.as_deref().unwrap_or(&host_environment),
+                &hooks_apply,
+            );
         }
         agents
     })
@@ -3824,7 +3823,22 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
+        // `aliased` runs its registry base `vibe`'s adapter.
+        std::fs::write(bin.path().join("vibe-acp"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            bin.path().join("vibe-acp"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         crate::session::config::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("aliased".into(), "true".into());
+            config
+                .session
+                .agent_detect_as
+                .insert("aliased".into(), "vibe".into());
             for (name, acp) in [
                 ("on-path", Some(format!("{adapter} acp"))),
                 ("missing", Some(format!("{adapter}-missing acp"))),
@@ -3853,6 +3867,13 @@ mod tests {
             repo
         };
         let plain = tempfile::tempdir().unwrap();
+        let realiased = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(realiased.path().join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            realiased.path().join(".agent-of-empires/config.toml"),
+            "[session.agent_detect_as]\naliased = \"cursor\"\n",
+        )
+        .unwrap();
         let awaiting = repo_with_on_launch();
         let trusted = repo_with_on_launch();
         let on_launch = crate::session::HooksConfig {
@@ -3872,17 +3893,26 @@ mod tests {
             false,
         )
         .unwrap();
-        // (label, profile on_create hook, CityHall, project, scratch, `missing` create-ready).
-        // The profile hook persists once set, so its case comes last.
+        // (label, profile on_create hook, CityHall, project, scratch, `missing` create-ready,
+        // `aliased` create-ready). The profile hook persists once set, so its case comes last.
         let cases = [
-            ("no project", false, false, None, false, false),
-            ("no hooks", false, false, Some(plain.path()), false, false),
+            ("no project", false, false, None, false, false, true),
+            (
+                "no hooks",
+                false,
+                false,
+                Some(plain.path()),
+                false,
+                false,
+                true,
+            ),
             (
                 "trusted repo hook",
                 false,
                 false,
                 Some(trusted.path()),
                 false,
+                true,
                 true,
             ),
             (
@@ -3892,6 +3922,7 @@ mod tests {
                 Some(awaiting.path()),
                 false,
                 true,
+                true,
             ),
             (
                 "scratch with a repo hook",
@@ -3899,6 +3930,16 @@ mod tests {
                 false,
                 Some(trusted.path()),
                 true,
+                false,
+                true,
+            ),
+            (
+                "repo re-aliases to a base without an adapter",
+                false,
+                false,
+                Some(realiased.path()),
+                false,
+                false,
                 false,
             ),
             (
@@ -3908,6 +3949,7 @@ mod tests {
                 Some(plain.path()),
                 false,
                 true,
+                true,
             ),
             (
                 "CityHall ignores scratch",
@@ -3916,10 +3958,12 @@ mod tests {
                 Some(plain.path()),
                 true,
                 true,
+                true,
             ),
-            ("profile hook", true, false, None, false, true),
+            ("profile hook", true, false, None, false, true, true),
         ];
-        for (label, profile_hook, cityhall, project, scratch, missing_ready) in cases {
+        for (label, profile_hook, cityhall, project, scratch, missing_ready, aliased_ready) in cases
+        {
             if profile_hook {
                 crate::session::config::update_config(|config| {
                     config.hooks.on_create = vec!["npm install".into()];
@@ -3944,6 +3988,7 @@ mod tests {
                 ("on-path", true, true),
                 ("missing", false, missing_ready),
                 ("terminal", false, false),
+                ("aliased", true, aliased_ready),
             ] {
                 let agent = agents.iter().find(|a| a.name == name).unwrap();
                 assert_eq!(agent.acp_installed, installed, "{label}: {name} installed");
