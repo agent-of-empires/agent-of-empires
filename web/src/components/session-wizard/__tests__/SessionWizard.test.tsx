@@ -1599,6 +1599,7 @@ describe("SessionWizard create failures", () => {
     expect(screen.queryByTestId("create-failure")).toBeNull();
     expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("false");
     expect(screen.getByTestId("wizard-view-row").textContent).toContain("ACP adapter not installed");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("radio", { name: "Terminal view" })));
   });
 
   it("a failed hook shows the message as sent and its last output, with no Sandbox action", async () => {

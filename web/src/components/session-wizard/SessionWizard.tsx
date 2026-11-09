@@ -231,6 +231,7 @@ export function SessionWizard({
   // A Retry found the Container runtime still down after a sandbox_unavailable failure.
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
+  const viewGroupRef = useRef<HTMLDivElement>(null);
   const offline = useServerDown();
   const [progress, setProgress] = useState<CreateProgress | null>(null);
   const [progressKey, setProgressKey] = useState<string | null>(null);
@@ -800,6 +801,10 @@ export function SessionWizard({
           structuredAvailable(sent.tool, agent, sent) &&
           !structuredAvailable(sent.tool, agent, { ...sent, sandboxEnabled: false })
         ) {
+          // The box held focus and is gone, so focus the row that explains why nothing launched.
+          requestAnimationFrame(() =>
+            viewGroupRef.current?.querySelector<HTMLElement>('[aria-checked="true"]')?.focus(),
+          );
           return;
         }
         // A relaunch, not a retry: handleSubmit sends it under a new key.
@@ -992,6 +997,7 @@ export function SessionWizard({
           <SegmentedRow
             label="View"
             testId="wizard-view-row"
+            groupRef={viewGroupRef}
             value={structuredOn ? "structured" : "terminal"}
             onChange={(v) => handleChange("useStructuredView", v === "structured")}
             options={[
