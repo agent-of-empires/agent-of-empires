@@ -1933,11 +1933,11 @@ for line in sys.stdin:
     let mut elicitation = read_frame(&mut second);
     assert_eq!(elicitation["kind"], "server_call");
     assert_eq!(elicitation["method"], "elicitation/create");
-    let request: agent_client_protocol::schema::v1::CreateElicitationRequest =
+    let request: agent_client_protocol::v1::schema::CreateElicitationRequest =
         serde_json::from_value(elicitation["params"].take()).unwrap();
     assert!(matches!(
         request.scope(),
-        agent_client_protocol::schema::v1::ElicitationScope::Request(_)
+        agent_client_protocol::v1::schema::ElicitationScope::Request(_)
     ));
     write_frame(
         &mut second,

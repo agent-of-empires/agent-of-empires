@@ -44,8 +44,8 @@ pub struct TranscriptRow {
     /// A `tool_complete` row that launched an async sub-agent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub async_subagent: bool,
-    /// A `message` row that opens a new agent message, so a client keeps it
-    /// apart from the previous message's text.
+    /// A `message` or `thinking` row that opens a new agent message, so a
+    /// client keeps it apart from the previous one's text.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub message_start: bool,
 }
@@ -58,6 +58,8 @@ pub enum TranscriptRowKind {
     ToolError,
     ToolStopped,
     Message,
+    /// Summarized model thinking; consecutive rows of one group form one block.
+    Thinking,
     UserPrompt,
     UserDiffComments,
     ElicitationAnswered,
@@ -122,6 +124,11 @@ pub struct TranscriptModel {
     open_message_group: Option<String>,
     /// ACP message id of the last chunk that carried one.
     last_message_id: Option<String>,
+    /// The thought counterparts of `open_message_group` and `last_message_id`.
+    open_thought_group: Option<String>,
+    last_thought_id: Option<String>,
+    /// A blank chunk changed the thought id, so the next row starts a thought.
+    thought_start_pending: bool,
     group_counter: u64,
     /// Frames at or below this seq are dropped, so replay overlap is harmless.
     last_seq: u64,
@@ -162,8 +169,13 @@ impl TranscriptModel {
                 message_id: Some(id),
                 ..
             } => self.last_message_id = Some(id.clone()),
+            Event::AgentThoughtChunk {
+                message_id: Some(id),
+                ..
+            } => self.last_thought_id = Some(id.clone()),
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
                 self.last_message_id = None;
+                self.last_thought_id = None;
             }
             _ => {}
         }
@@ -177,6 +189,9 @@ impl TranscriptModel {
         self.last_seq = seq;
         if !matches!(event, Event::AgentMessageChunk { .. }) {
             self.open_message_group = None;
+        }
+        if !matches!(event, Event::AgentThoughtChunk { .. }) {
+            self.open_thought_group = None;
         }
 
         match event {
@@ -200,6 +215,38 @@ impl TranscriptModel {
                     text.clone(),
                 );
                 row.message_start = message_start;
+                vec![self.append(row)]
+            }
+            Event::AgentThoughtChunk { text, message_id } => {
+                self.turn_has_output = true;
+                if message_id.is_some()
+                    && self.last_thought_id.is_some()
+                    && self.last_thought_id != *message_id
+                {
+                    self.open_thought_group = None;
+                    self.thought_start_pending = true;
+                }
+                if message_id.is_some() {
+                    self.last_thought_id = message_id.clone();
+                }
+                if text.trim().is_empty() && self.open_thought_group.is_none() {
+                    return Vec::new();
+                }
+                let group_id = match &self.open_thought_group {
+                    Some(group) => group.clone(),
+                    None => {
+                        let group = self.fresh_group();
+                        self.open_thought_group = Some(group.clone());
+                        group
+                    }
+                };
+                let mut row = TranscriptRow::new(
+                    format!("thought-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Thinking,
+                    text.clone(),
+                );
+                row.message_start = std::mem::take(&mut self.thought_start_pending);
                 vec![self.append(row)]
             }
             Event::UserPromptSent {
@@ -657,6 +704,8 @@ impl TranscriptModel {
 
     fn begin_turn(&mut self) {
         self.last_message_id = None;
+        self.last_thought_id = None;
+        self.thought_start_pending = false;
         let steered_continuation = self.turn_active && self.steering;
         self.turn_active = true;
         if !steered_continuation {
@@ -1425,6 +1474,92 @@ mod tests {
             let groups: HashSet<_> = messages.iter().map(|r| &r.group_id).collect();
             assert_eq!(groups.len() == 1, one_group, "{label}");
         }
+    }
+
+    /// #5088: thought chunks fold into `thinking` rows with their own groups,
+    /// split by a new thought id or any other event, and blank ones render
+    /// nothing but still carry a boundary.
+    #[test]
+    fn agent_thought_chunks_fold_into_thinking_rows() {
+        let thought = |text: &str, id: Option<&str>| Event::AgentThoughtChunk {
+            text: text.into(),
+            message_id: id.map(Into::into),
+        };
+        let msg = |text: &str| Event::AgentMessageChunk {
+            text: text.into(),
+            message_id: None,
+        };
+        let (a, b) = (Some("t-a"), Some("t-b"));
+        // (events, (text, message_start) per thinking row, thinking groups)
+        let cases: [(Vec<Event>, Vec<(&str, bool)>, usize); 7] = [
+            (
+                vec![
+                    thought("Weighing", a),
+                    thought(" ", a),
+                    thought("options", a),
+                ],
+                vec![("Weighing", false), (" ", false), ("options", false)],
+                1,
+            ),
+            (
+                vec![thought("one ", a), thought("two", a)],
+                vec![("one ", false), ("two", false)],
+                1,
+            ),
+            (
+                vec![thought("one", a), thought(" ", b), thought("two", b)],
+                vec![("one", false), ("two", true)],
+                2,
+            ),
+            (
+                vec![thought("one", a), msg("reply"), thought("two", a)],
+                vec![("one", false), ("two", false)],
+                2,
+            ),
+            (vec![thought("", None), thought("\n", a)], vec![], 0),
+            (
+                vec![thought("one", a), prompt("next"), thought("two", b)],
+                vec![("one", false), ("two", false)],
+                2,
+            ),
+            (
+                vec![thought("x", None), thought("y", None)],
+                vec![("x", false), ("y", false)],
+                1,
+            ),
+        ];
+        for (events, want, groups) in cases {
+            let label = format!("{events:?}");
+            let m = fold(events);
+            let thinking: Vec<_> = m
+                .rows()
+                .iter()
+                .filter(|r| r.kind == TranscriptRowKind::Thinking)
+                .collect();
+            let got: Vec<(&str, bool)> = thinking
+                .iter()
+                .map(|r| (r.text.as_str(), r.message_start))
+                .collect();
+            assert_eq!(got, want, "{label}");
+            let distinct: HashSet<_> = thinking.iter().map(|r| &r.group_id).collect();
+            assert_eq!(distinct.len(), groups, "{label}");
+        }
+
+        // A thought splits the message around it, and a partial fold that
+        // observed an earlier thought id marks the next thought's start.
+        let m = fold(vec![msg("a"), thought("t", a), msg("b")]);
+        assert_eq!(
+            kinds(&m),
+            [
+                TranscriptRowKind::Message,
+                TranscriptRowKind::Thinking,
+                TranscriptRowKind::Message
+            ]
+        );
+        let mut m = TranscriptModel::new();
+        m.observe_prior(&thought("earlier", a));
+        m.apply_event(1, &thought("later", b));
+        assert!(m.rows()[0].message_start);
     }
 
     /// A fold that starts after earlier events (a reconnect, a rows page)

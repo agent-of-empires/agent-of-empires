@@ -80,6 +80,9 @@ pub enum ProjectMutation {
     Remove {
         target: ProjectTarget,
         name_or_path: String,
+        /// The client's absolute reading of a path-like argument, matched
+        /// against entry paths while `name_or_path` stays a candidate name.
+        anchored_path: Option<String>,
     },
 }
 
@@ -146,6 +149,9 @@ pub struct RuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_instance_id: Option<String>,
     pub protocol_version: u16,
+    /// Supports CLI selection intent and deferred terminal creation.
+    #[serde(default)]
+    pub cli_creation: bool,
     pub epoch: String,
     pub namespace: String,
     pub tmux_socket: Option<String>,

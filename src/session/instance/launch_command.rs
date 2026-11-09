@@ -1033,6 +1033,15 @@ impl Instance {
         prepared: PreparedLaunch,
         publication: Option<PrimeRootPublication>,
     ) -> Result<PreparedLaunch> {
+        if publication.is_none()
+            && prepared
+                .execution
+                .as_ref()
+                .and_then(|execution| prime_runtime_for_capture(execution.capture.as_ref()))
+                .is_none()
+        {
+            return Ok(prepared);
+        }
         // Preserve the already adopted child across the second preparation.
         if !prepared.is_existing && self.stored_fork_child().is_none() {
             self.set_agent_conversation(
@@ -1410,7 +1419,7 @@ impl Instance {
             })
         });
         let mut env_prefix =
-            status_hook_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
+            host_launch_env_prefix(profile, &self.id, self.status_agent(), program.as_deref());
         // The publisher is pane-scoped, including for safe Default wrappers.
         self.pi_extension_launched = false;
         if let Some((_, ref env)) = identity_extension {

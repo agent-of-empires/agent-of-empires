@@ -541,6 +541,7 @@ async fn admit_and_create(
         import_binding: None,
         fork_seed: None,
         progress: None,
+        cli: None,
     };
 
     // Resolve an idempotent replay/conflict BEFORE charging admission, so a
@@ -1072,6 +1073,7 @@ mod tests {
             plugin_id: "cron".to_string(),
             granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
             ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 1,
         }
     }

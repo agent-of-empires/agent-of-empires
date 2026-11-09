@@ -35,7 +35,7 @@ use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{RetirementResources, RetirementTarget};
 
-pub(crate) use agents::apply_agent_command_override;
+pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 
@@ -121,6 +121,14 @@ pub enum PromptDisposition {
     /// A clear command the adapter cannot handle natively: drive
     /// [`Supervisor::reset_session_context`] instead of forwarding it.
     ResetContext,
+}
+
+/// A published user prompt: how to route its text, and the seq of its
+/// `UserPromptSent` event, which is `None` when that event was not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedPrompt {
+    pub disposition: PromptDisposition,
+    pub seq: Option<u64>,
 }
 
 /// How this supervisor acquired the worker.

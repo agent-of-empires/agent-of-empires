@@ -165,10 +165,9 @@ function useSwitchTargets(current: string | null, limited: boolean): { targets: 
     let cancelled = false;
     void fetchAgents().then((agents) => {
       if (cancelled) return;
-      // The server always lists its builtins, so an empty list is a failed request.
-      setListFailed(agents.length === 0);
+      setListFailed(agents === null);
       setTargets(
-        agents
+        (agents ?? [])
           .filter((a) => a.acp_capable && a.installed && a.acp_installed && a.acp_allowed !== false)
           .map((a) => a.name)
           .filter((name) => name !== current),

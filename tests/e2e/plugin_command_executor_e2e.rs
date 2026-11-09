@@ -224,21 +224,23 @@ fn tui_executes_plugin_commands_with_live_daemon() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("worker.js"), WORKER_JS).unwrap();
     std::fs::write(src.join("aoe-plugin.toml"), manifest("worker.js")).unwrap();
-    for args in [
-        &["plugin", "install", src.to_str().unwrap(), "--yes"][..],
-        &["plugin", "enable", "acme.gh"],
-    ] {
-        let out = h.run_cli(args);
-        assert!(
-            out.status.success(),
-            "{args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let installed = h.run_cli(&["plugin", "install", src.to_str().unwrap(), "--yes"]);
+    assert!(
+        installed.status.success(),
+        "plugin install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    // `plugin enable` goes through the Daemon, which must already run and see
+    // the env below.
     let opened = h.home_path().join("opened-urls.txt");
     h.set_env("AOE_OPEN_URL_TO", opened.to_str().unwrap());
-
     let (port, session_id) = h.start_structured_session("plugin-exec");
+    let enabled = h.run_cli(&["plugin", "enable", "acme.gh"]);
+    assert!(
+        enabled.status.success(),
+        "plugin enable failed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
     h.spawn(&["acp", "attach", &session_id]);
     h.wait_for("Message the agent");
 

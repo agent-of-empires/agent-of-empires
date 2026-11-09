@@ -7,7 +7,7 @@ let names = NONE;
 let requested = false;
 const listeners = new Set<() => void>();
 
-/** Replaces the names with the server's `display_name`s; an empty list is a failed fetch and is ignored. */
+/** Replaces the names with the server's `display_name`s; an empty list is ignored. */
 export function setAgentNames(agents: AgentInfo[]) {
   if (agents.length === 0) return;
   // A Map, so custom registry keys such as `constructor` never hit Object.prototype.
@@ -19,8 +19,8 @@ function load() {
   if (requested) return;
   requested = true;
   fetchAgents().then((agents) => {
-    setAgentNames(agents);
-    requested = agents.length > 0;
+    if (agents) setAgentNames(agents);
+    requested = !!agents?.length;
   });
 }
 

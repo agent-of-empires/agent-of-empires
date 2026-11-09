@@ -17,7 +17,7 @@ A session runs in one of the modes its adapter advertises. For `claude-agent-acp
 
 Other adapters report their own ids (Gemini's `auto_edit` and `yolo` map onto `acceptEdits` and `bypassPermissions`).
 
-`[session] yolo_mode_default`, or the wizard's "Auto-approve actions" toggle, asks the adapter to start in `bypassPermissions`. This is best-effort: if the adapter refuses, an amber notice appears and the session keeps whatever mode it landed in. `claude-agent-acp` offers `bypassPermissions` only when `aoe serve` was launched with `ALLOW_BYPASS=1` in its environment; without it, use `acceptEdits` or approve as you go.
+`[session] yolo_mode_default`, or the wizard's "Yolo mode" switch, asks the adapter to start in `bypassPermissions`. This is best-effort: if the adapter refuses, an amber notice appears and the session keeps whatever mode it landed in. `claude-agent-acp` offers `bypassPermissions` only when `aoe serve` was launched with `ALLOW_BYPASS=1` in its environment; without it, use `acceptEdits` or approve as you go. An Agent that always runs in yolo mode shows the switch locked on.
 
 ## Approvals
 
@@ -61,6 +61,10 @@ When an approval lands and you are away from the dashboard, two channels fire:
 When the adapter advertises them, the composer footer shows a model dropdown and a reasoning-effort selector beside the mode pill. `claude-agent-acp` v0.39.0+ advertises a model selector for every session, and a reasoning-effort selector when the current model reports `supportsEffort`. Adapters advertising neither show no pickers, by design.
 
 The chip keeps the previous value until the adapter confirms, so it never snaps back on a slow connection. The effort dropdown's `Default` option drops any session-level pin so the model uses its own budget. A rejected switch (rate limit, transient error) shows an amber non-blocking notice with the adapter's reason, which clears when a later snapshot reports the requested value. The selector list clears when you switch agents but survives `/clear`. How the two underlying ACP channels are normalized is in [Structured View Internals](../development/internals/structured-view.md#permission-modes-and-model-channels).
+
+## Sign-in
+
+When the Agent reports it isn't signed in, the composer footer shows **Not logged in**. Clicking it shows the Agent's sign-in command with **Copy command**, **Open Terminal** (the host shell, or the Container shell for a sandboxed Session) and **Restart Agent** (not on a read-only or CityHall dashboard), which the Agent needs to read a new sign-in. To use an API key instead, set it (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) where `aoe serve` runs, restart `aoe serve`, which reads its environment only at start, then click **Restart Agent**: the running Agent keeps the environment it started with across a daemon restart. [Provider credentials](../structured-view.md#provider-credentials) lists the keys each adapter receives, in a Container too.
 
 ## Session persistence
 

@@ -163,6 +163,10 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             repo_base_branches: Vec::new(),
             scratch: data.scratch,
             fork_seed: data.fork_seed,
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         }
     }
 }
@@ -928,10 +932,7 @@ impl NewSessionDialog {
     }
 
     fn selected_tool_always_yolo(&self) -> bool {
-        let tool_name = &self.available_tools[self.tool_index];
-        crate::agents::get_agent(tool_name)
-            .and_then(|a| a.yolo.as_ref())
-            .is_some_and(|y| matches!(y, crate::agents::YoloMode::AlwaysYolo))
+        crate::agents::is_always_yolo(&self.available_tools[self.tool_index])
     }
 
     fn selected_tool_host_only(&self) -> bool {

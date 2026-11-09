@@ -94,6 +94,8 @@ mod serve_dynamic_profile_rewire;
 mod serve_filewatch_propagation;
 mod serve_mcp_crud;
 #[cfg(debug_assertions)]
+mod serve_response_compression;
+#[cfg(debug_assertions)]
 mod serve_settings_layers;
 #[cfg(debug_assertions)]
 mod serve_settings_logging;

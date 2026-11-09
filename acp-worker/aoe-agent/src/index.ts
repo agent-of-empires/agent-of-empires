@@ -23,6 +23,7 @@ import { google } from "@ai-sdk/google";
 import { z } from "zod";
 import { appendTurn, createTranscript, loadTranscript } from "./transcript.ts";
 import { classifyKind } from "./toolKind.ts";
+import { createAgentStream } from "./transport.ts";
 
 const DEFAULT_MODEL = "claude-opus-4-7";
 
@@ -295,7 +296,7 @@ function randomHexId(): string {
 function main() {
   const input = Writable.toWeb(process.stdout);
   const output = Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>;
-  const stream = acp.ndJsonStream(input, output);
+  const stream = createAgentStream(input, output);
 
   acp
     .agent({ name: "aoe-agent" })

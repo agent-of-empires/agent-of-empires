@@ -13,6 +13,14 @@ describe("terminalFocus pending intent", () => {
     expect(consumePendingTerminalFocus("paired")).toBe(true);
   });
 
+  it("an intent naming a terminal is taken only by that one; one naming none by any", () => {
+    setPendingTerminalFocus("paired", 2);
+    expect(consumePendingTerminalFocus("paired", 1)).toBe(false);
+    expect(consumePendingTerminalFocus("paired", 2)).toBe(true);
+    setPendingTerminalFocus("paired");
+    expect(consumePendingTerminalFocus("paired", 1)).toBe(true);
+  });
+
   it("setting a new target overwrites the previous pending intent", () => {
     setPendingTerminalFocus("paired");
     setPendingTerminalFocus("agent");

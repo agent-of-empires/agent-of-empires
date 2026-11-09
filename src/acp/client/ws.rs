@@ -41,11 +41,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tracing::debug;
 
-use super::discovery::DaemonEndpoint;
 use super::passphrase_session::{self, Credential, PassphraseSessionCache};
 use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::AcpState;
 use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
+use crate::daemon::DaemonEndpoint;
 use crate::daemon::{
     websocket::{self, NativeSocket},
     WsError,
@@ -385,7 +385,7 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::Source;
+    use crate::daemon::Source;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
         DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)

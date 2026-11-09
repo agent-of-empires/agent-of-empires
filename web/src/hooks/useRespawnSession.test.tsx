@@ -24,6 +24,33 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("useRespawnSession request", () => {
+  it.each([
+    ["a plain respawn to /acp/spawn", undefined, "/api/sessions/s1/acp/spawn"],
+    ["a restart to /acp/restart", { restart: true }, "/api/sessions/s1/acp/restart"],
+  ])("posts %s", async (_label, options, path) => {
+    const { result } = renderHook(() => useRespawnSession("s1", null, options));
+    await act(async () => {
+      await result.current.respawn();
+    });
+    const [url, init] = vi.mocked(fetch).mock.calls[0]!;
+    expect(url).toBe(path);
+    expect(JSON.parse(String(init?.body))).toEqual({});
+  });
+
+  it.each([
+    ["a restart", true, "ok"],
+    ["a spawn", false, "failed"],
+  ])("settles %s refused by another Device's restart in progress as %s", async (_label, restart, state) => {
+    stubFetch(false, 409, "restart_in_progress: a restart is already in progress for this session");
+    const { result } = renderHook(() => useRespawnSession("s1", null, { restart }));
+    await act(async () => {
+      await result.current.respawn();
+    });
+    expect(result.current.state).toBe(state);
+  });
+});
+
 describe("useRespawnSession failure text", () => {
   it.each([
     ["plain text", "spawn failed: boom", "spawn failed: boom"],

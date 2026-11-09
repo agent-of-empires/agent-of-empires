@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { ToastBusBridge, ToastProvider } from "../Toasts";
 import { toastBus } from "../../lib/toastBus";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -42,6 +42,57 @@ afterEach(() => {
 });
 
 describe("ToastProvider", () => {
+  it("runs an action toast's button once and dismisses it", () => {
+    renderProvider();
+    const reopen = vi.fn();
+    act(() => toastBus.handler?.action("Session was not created", "Reopen", reopen));
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("Session was not created");
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(reopen).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("keeps an action toast past a plain toast's lifetime until it is dismissed", () => {
+    renderProvider();
+    act(() => {
+      toastBus.handler?.error("plain");
+      toastBus.handler?.action("Session was not created", "Reopen", vi.fn());
+    });
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(screen.getAllByRole("alert").map((a) => a.textContent)).toEqual([
+      expect.stringContaining("Session was not created"),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("scrolls the column to a newly added toast, but not when one is dismissed", () => {
+    renderProvider();
+    const list = screen.getByTestId("toast-list");
+    let top = 0;
+    Object.defineProperty(list, "scrollHeight", { configurable: true, get: () => 500 });
+    Object.defineProperty(list, "scrollTop", { configurable: true, get: () => top, set: (v: number) => (top = v) });
+    const dismiss = (message: string) =>
+      fireEvent.click(
+        within(screen.getByText(message).closest("[role]") as HTMLElement).getByRole("button", { name: "Dismiss" }),
+      );
+    act(() => toastBus.handler?.action("first", "Reopen", vi.fn()));
+    expect(top).toBe(500);
+    top = 0;
+    act(() => toastBus.handler?.action("second", "Reopen", vi.fn()));
+    expect(top).toBe(500);
+    // Removing the newest leaves an older one newest; nothing arrived.
+    top = 120;
+    dismiss("second");
+    expect(top).toBe(120);
+    act(() => toastBus.handler?.action("third", "Reopen", vi.fn()));
+    expect(top).toBe(500);
+    top = 120;
+    dismiss("first");
+    expect(top).toBe(120);
+  });
+
   it("renders info, push, and error toasts with their roles and dismisses on click", () => {
     const { container } = renderProvider();
     expect(container.querySelector("div.fixed")?.children.length).toBe(0);
@@ -121,6 +172,15 @@ describe("click-to-open (ui.open_url) toast", () => {
     expect(open).toHaveBeenCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer");
     expect(screen.queryByText("Open link")).toBeNull();
     open.mockRestore();
+  });
+
+  it("keeps the error styling of a clickable toast", () => {
+    renderProvider();
+    act(() => toastBus.handler?.openLink("Approve?", "/plugins/acme.kit/approvals?link=ab12", "error"));
+
+    const toast = screen.getByText("Approve?").closest("div");
+    expect(toast?.getAttribute("role")).toBe("alert");
+    expect(toast?.className).toContain("cursor-pointer");
   });
 });
 

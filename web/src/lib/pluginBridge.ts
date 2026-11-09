@@ -134,7 +134,7 @@ export const bridgeError = (id: BridgeId, code: BridgeErrorCode, message: string
   error: { code, message },
 });
 
-export const bridgePush = (event: "context" | "theme" | "selection", data: unknown) => ({
+export const bridgePush = (event: "context" | "theme" | "selection" | "link", data: unknown) => ({
   aoeBridge: BRIDGE_VERSION,
   event,
   data,

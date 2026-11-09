@@ -12,7 +12,7 @@ use tracing::{debug, info, warn};
 use super::agents::log_wrapper_substitution;
 use super::launch::{
     admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
-    await_resume_to_completion, before_session_env, overlay_env, publish_rejection,
+    await_resume_to_completion, before_session_env, discovery_key, overlay_env, publish_rejection,
     refresh_spawn_model_effort, resolve_mcp_servers,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
@@ -738,6 +738,10 @@ impl<S: BroadcastSink> Drain<S> {
             ),
         }
 
+        let (target, native) = config.wrapper_substitution.as_ref().map_or(
+            (config.agent_key.as_str(), config.agent_key.as_str()),
+            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
+        );
         let mut claude_config_dir = None;
         if config.sandbox_info.is_none() {
             let mut host_environment = config.base_host_environment.clone();
@@ -773,10 +777,6 @@ impl<S: BroadcastSink> Drain<S> {
                 apply_claude_store_pin(&mut host_environment, config.claude_store_pin.as_ref())
                     .or_else(|| {
                         let cfg = resolved.as_ref().ok()?;
-                        let (target, native) = config.wrapper_substitution.as_ref().map_or(
-                            (config.agent_key.as_str(), config.agent_key.as_str()),
-                            |(wrapper, base)| (wrapper.as_str(), base.as_str()),
-                        );
                         apply_declared_config_dir(
                             &mut host_environment,
                             cfg,
@@ -789,7 +789,7 @@ impl<S: BroadcastSink> Drain<S> {
         }
 
         config.mcp_servers = resolve_mcp_servers(
-            &config.agent_key,
+            discovery_key(config.sandbox_info.is_some(), &config.agent_key, native),
             session_id,
             config.source_profile.clone(),
             config.cwd.clone(),
@@ -2210,7 +2210,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn respawn_drops_a_withdrawn_hook_route_and_realigns_native_mcp() {
-        use agent_client_protocol::schema::v1::McpServer;
+        use agent_client_protocol::v1::schema::McpServer;
 
         let (_home, temp) = isolate_home();
         let hook_store = temp.path().join("hook-store");
@@ -2269,8 +2269,48 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn respawn_discovers_declared_codex_wrapper_store_on_host_only() {
+        let (_home, _temp, account) = codex_wrapper_fixture();
+        // A sandbox applies no override, so it must not read the base store.
+        for (sandboxed, expected) in [(false, vec!["account"]), (true, vec![])] {
+            let mut config =
+                runner_config(worker_registry::socket_path_for("s-codex-wrapper").unwrap());
+            config.agent_key = "work-codex".into();
+            config.tool = "work-codex".into();
+            config.wrapper_substitution = Some(("work-codex".into(), "codex".into()));
+            config.sandbox_info = sandboxed.then(sandbox_info);
+
+            Drain::<VecSink>::refresh_launch_env("s-codex-wrapper", &mut config).await;
+
+            let names: Vec<_> = config
+                .mcp_servers
+                .iter()
+                .map(|server| match server {
+                    agent_client_protocol::v1::schema::McpServer::Stdio(server) => {
+                        server.name.as_str()
+                    }
+                    _ => "unknown",
+                })
+                .collect();
+            assert_eq!(names, expected, "sandboxed={sandboxed}");
+            assert_eq!(
+                config
+                    .host_environment
+                    .iter()
+                    .find(|(key, _)| key == "CODEX_HOME")
+                    .map(|(_, value)| value.as_str()),
+                (!sandboxed)
+                    .then(|| account.join(".codex-work"))
+                    .as_deref()
+                    .and_then(|p| p.to_str()),
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn respawn_reapplies_selected_claude_store_before_native_mcp_discovery() {
-        use agent_client_protocol::schema::v1::McpServer;
+        use agent_client_protocol::v1::schema::McpServer;
 
         let (_home, temp) = isolate_home();
         let declared = temp.path().join("declared");

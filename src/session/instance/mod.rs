@@ -45,6 +45,7 @@ pub use execution::{
 };
 mod flags;
 mod hooks;
+pub(crate) use hooks::HostHookApprovalRequired;
 mod identity_sidecar;
 mod kill;
 mod launch_command;
@@ -133,7 +134,7 @@ pub(crate) use types::{
 };
 
 // Sibling items the submodules reach through `use super::*`.
-use hooks::status_hook_env_prefix;
+use hooks::host_launch_env_prefix;
 pub(crate) use hooks::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes,

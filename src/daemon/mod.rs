@@ -1,5 +1,8 @@
 //! Reusable client and shared wire contract for the daemon REST API.
 
+mod endpoint;
+pub use endpoint::{DaemonEndpoint, Source};
+
 mod error;
 pub use error::{ApiErrorCode, ERROR_CODE_HEADER, MANAGED_RESUME_CAUSE_HEADER};
 
@@ -31,20 +34,21 @@ use thiserror::Error;
 pub use wire::{
     AbandonPurgeBody, AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState, AttachProjectBody,
     AttachProjectOutcome, AttachedProject, AttachedWorkerOutcome, CleanupDefaults,
-    CollapseGroupBody, ContextResumeAvailability, ContextResumeIndeterminateReason,
-    ContextResumeUnavailableReason, CreateProfileBody, CreateProjectBody, CreateSessionBody,
-    CreationTrustFingerprint, CreationTrustRequest, CreationTrustReview, DefaultProfileBody,
-    DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome, DeleteProfileQuery, DeleteSessionBody,
-    EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody, GroupLocation, GroupSessionFailure,
-    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
-    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
-    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
-    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
-    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
-    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
-    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
-    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
-    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
+    CliCreationOptions, CollapseGroupBody, ContextResumeAvailability,
+    ContextResumeIndeterminateReason, ContextResumeUnavailableReason, CreateProfileBody,
+    CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
+    CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
+    DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
+    GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
+    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
+    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
+    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
+    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
+    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
+    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
+    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
+    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -155,6 +159,8 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
 fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &str) -> String {
     match code {
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
+        Some(ApiErrorCode::AgentHooksNotApproved) =>
+            "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"
                 .into()
@@ -178,6 +184,42 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         }
         _ => format!("daemon returned HTTP {status}: {body}"),
     }
+}
+
+fn public_creation_failure(body: &str, local_owner: bool) -> String {
+    #[derive(serde::Deserialize)]
+    struct Failure {
+        error: String,
+        message: String,
+        stage: Option<String>,
+        reference: Option<String>,
+    }
+    let Ok(failure) = serde_json::from_str::<Failure>(body) else {
+        return "Session creation failed; inspect the Daemon log".to_owned();
+    };
+    let public = matches!(
+        failure.error.as_str(),
+        "create_failed"
+            | "internal"
+            | "hook_failed"
+            | "sandbox_unavailable"
+            | "sandbox_image_pull_failed"
+            | "working_dir_missing"
+            | "create_outcome_unknown"
+            | "creation_cancelled"
+            | "creation_trust_changed"
+    );
+    if !public && !local_owner {
+        return "Session creation refused; inspect the Daemon log".to_owned();
+    }
+    let mut message = failure.message;
+    if let Some(stage) = failure.stage {
+        message.push_str(&format!(" [stage: {stage}]"));
+    }
+    if let Some(reference) = failure.reference {
+        message.push_str(&format!(" [reference: {reference}]"));
+    }
+    message
 }
 
 impl DaemonClient {
@@ -252,6 +294,24 @@ impl DaemonClient {
         self.request_json(self.http.get(url)).await
     }
 
+    /// Publish and read canonical state from the same Daemon epoch.
+    pub async fn runtime_snapshot(
+        &self,
+        epoch: &str,
+    ) -> Result<RuntimeSnapshot, DaemonClientError> {
+        let url = self
+            .sessions_url
+            .join("runtime/snapshot")
+            .map_err(|_| DaemonClientError::Transport)?;
+        let snapshot: RuntimeSnapshot = self
+            .request_json(self.http.get(url).header(RUNTIME_EPOCH_HEADER, epoch))
+            .await?;
+        if snapshot.cursor.epoch != epoch {
+            return Err(DaemonClientError::InvalidMutationReceipt);
+        }
+        Ok(snapshot)
+    }
+
     /// The daemon's own default profile, which can differ from this client's config.
     pub async fn default_profile(&self) -> Result<String, DaemonClientError> {
         let url = self
@@ -310,6 +370,19 @@ impl DaemonClient {
             && namespace.is_some_and(|expected| expected == info.namespace)
     }
 
+    /// Advisory output only; absence never proves a create failed.
+    pub async fn creation_progress(
+        &self,
+        key: &str,
+    ) -> Result<wire::CreationOutput, DaemonClientError> {
+        let url = format!(
+            "{}/create-progress/{}",
+            self.sessions_url,
+            transport::path_segment(key)?
+        );
+        self.request_json(self.http.get(url)).await
+    }
+
     /// Review executable repository configuration without provisioning or granting trust.
     pub async fn review_creation_trust(
         &self,
@@ -333,7 +406,10 @@ impl DaemonClient {
         epoch: &str,
     ) -> Result<MutationReceipt<SessionResponse>, DaemonClientError> {
         self.request_mutation_with_outcome(
-            self.http.post(self.sessions_url.clone()).json(body),
+            self.http
+                .post(self.sessions_url.clone())
+                .timeout(Duration::from_secs(30 * 60))
+                .json(body),
             epoch,
         )
         .await
@@ -366,8 +442,14 @@ impl DaemonClient {
             self.sessions_url,
             transport::path_segment(session_id)?
         );
-        self.request_mutation_with_outcome(self.http.post(url).json(body), epoch)
-            .await
+        self.request_mutation_with_outcome(
+            self.http
+                .post(url)
+                .timeout(Duration::from_secs(30 * 60))
+                .json(body),
+            epoch,
+        )
+        .await
     }
 
     pub async fn ensure_terminal(
@@ -672,6 +754,7 @@ impl DaemonClient {
             ProjectMutation::Remove {
                 target,
                 name_or_path,
+                anchored_path,
             } => {
                 let url = self
                     .sessions_url
@@ -680,7 +763,11 @@ impl DaemonClient {
                         transport::path_segment(name_or_path)?
                     ))
                     .map_err(|_| DaemonClientError::Transport)?;
-                self.http.delete(url).query(target)
+                let request = self.http.delete(url).query(target);
+                match anchored_path {
+                    Some(path) => request.query(&[("path", path)]),
+                    None => request,
+                }
             }
         };
         self.request_mutation(request, epoch).await
@@ -865,6 +952,8 @@ impl DaemonClient {
             request = request.header(name.clone(), value.clone());
         }
         let mut request = request.build().map_err(|_| DaemonClientError::Transport)?;
+        let creating =
+            request.method() == reqwest::Method::POST && request.url() == &self.sessions_url;
         if request.timeout().is_none() {
             *request.timeout_mut() = Some(DEFAULT_TIMEOUT);
         }
@@ -929,6 +1018,23 @@ impl DaemonClient {
                     code,
                     body: String::new(),
                     truncated: false,
+                });
+            }
+            if creating
+                && !(self.unix_path.is_some()
+                    && code == Some(ApiErrorCode::CreateHookFailed)
+                    && self.should_read_error_body(code))
+            {
+                let (body, truncated) = self.read_error_body(&mut response).await?;
+                let body = public_creation_failure(
+                    &body,
+                    self.unix_path.is_some() && !self.authenticated(),
+                );
+                return Err(DaemonClientError::Status {
+                    status,
+                    code,
+                    body,
+                    truncated,
                 });
             }
             if !self.should_read_error_body(code) {
@@ -1255,6 +1361,56 @@ fn default_of(rows: Vec<ProfileRow>) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cli_creation_hook_details_stay_available_only_to_the_unix_owner() {
+        for (unix, authenticated) in [(true, false), (false, false), (false, true)] {
+            let root = tempfile::tempdir().unwrap();
+            let app = axum::Router::new().route(
+                "/api/sessions",
+                axum::routing::post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        ApiErrorCode::CreateHookFailed.header(),
+                        "on_create hook failed: LOCAL_HOOK_SENTINEL",
+                    )
+                }),
+            );
+            let (client, server) = if unix {
+                let socket = root.path().join("api.sock");
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let client = DaemonClient::new_unix(socket).unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (client, server)
+            } else {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = DaemonClient::new(
+                    &format!("http://{}", listener.local_addr().unwrap()),
+                    authenticated.then_some("credential"),
+                )
+                .unwrap();
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (client, server)
+            };
+            let body = serde_json::from_value(serde_json::json!({
+                "path": "/tmp", "tool": "claude", "cli": {},
+            }))
+            .unwrap();
+            let error = client.create_session(&body, "epoch").await.unwrap_err();
+            assert!(matches!(
+                &error,
+                DaemonClientError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    code: Some(ApiErrorCode::CreateHookFailed),
+                    ..
+                }
+            ));
+            assert_eq!(error.to_string().contains("LOCAL_HOOK_SENTINEL"), unix);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     #[test]
     fn default_profile_is_the_row_the_daemon_marks() {
         let rows: Vec<ProfileRow> = serde_json::from_str(
@@ -1263,6 +1419,20 @@ mod tests {
         .unwrap();
         assert_eq!(default_of(rows).as_deref(), Some("work"));
         assert_eq!(default_of(Vec::new()), None);
+    }
+
+    #[test]
+    fn creation_failure_discloses_only_the_public_contract_remotely() {
+        let private = r#"{"error":"validation_failed","message":"private configured command SECRET","stage":"SECRET","reference":"SECRET"}"#;
+        let remote = public_creation_failure(private, false);
+        assert!(!remote.contains("SECRET"));
+        assert!(public_creation_failure(private, true).contains("private configured command"));
+        assert!(!public_creation_failure("raw stderr SECRET", false).contains("SECRET"));
+        let public = r#"{"error":"hook_failed","message":"An on_create hook exited with code 7.","stage":"running_hooks","reference":"creation-ref"}"#;
+        let rendered = public_creation_failure(public, false);
+        assert!(rendered.contains("exited with code 7"));
+        assert!(rendered.contains("running_hooks"));
+        assert!(rendered.contains("creation-ref"));
     }
 
     #[tokio::test]
@@ -1276,6 +1446,7 @@ mod tests {
             owner_diagnostics: Vec::new(),
             owner_instance_id: None,
             protocol_version: RUNTIME_PROTOCOL_VERSION,
+            cli_creation: true,
             epoch: "native-epoch".into(),
             namespace: root.path().to_str().unwrap().into(),
             tmux_socket: None,
@@ -1921,16 +2092,32 @@ mod tests {
     #[tokio::test]
     async fn managed_resume_refusal_recovers_without_reflecting_private_bodies() {
         use axum::response::IntoResponse;
+        use clap::CommandFactory;
+
+        let mut recovery_command = crate::cli::Cli::command();
         for (unix, authenticated, cause) in [
             (false, false, "wrapper_contract_required"),
             (false, true, "wrapper_contract_required"),
             (true, false, "wrapper_contract_required"),
+            (false, false, "pi_transcript_binding_required"),
+            (false, true, "pi_transcript_binding_required"),
+            (true, false, "pi_transcript_binding_required"),
+            (false, false, "omp_transcript_binding_required"),
+            (false, true, "omp_transcript_binding_required"),
+            (true, false, "omp_transcript_binding_required"),
             (false, false, "secret-token"),
         ] {
-            let expected = if cause == "wrapper_contract_required" {
-                crate::session::ManagedResumeCause::WrapperContractRequired
-            } else {
-                crate::session::ManagedResumeCause::ExecutionContextUnattested
+            let expected = match cause {
+                "wrapper_contract_required" => {
+                    crate::session::ManagedResumeCause::WrapperContractRequired
+                }
+                "pi_transcript_binding_required" => {
+                    crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                }
+                "omp_transcript_binding_required" => {
+                    crate::session::ManagedResumeCause::OmpTranscriptBindingRequired
+                }
+                _ => crate::session::ManagedResumeCause::ExecutionContextUnattested,
             };
             let root = tempfile::tempdir().unwrap();
             let socket = root.path().join("api.sock");
@@ -1986,17 +2173,56 @@ mod tests {
                 };
                 let message = error.to_string();
                 assert!(!format!("{error:?}").contains("secret"));
-                assert!(message.contains("aoe session set-session-id"), "{message}");
-                assert!(message.contains("--store"), "{message}");
                 assert!(!message.contains("secret"), "{message}");
                 if expected == crate::session::ManagedResumeCause::WrapperContractRequired {
                     assert!(message.contains("session.agent_execution_as"), "{message}");
                     assert!(message.contains("session.agent_config_dir"), "{message}");
                 }
-                assert!(
-                    message.contains("aoe session set-session-id <session> \"\""),
-                    "{message}"
-                );
+                if matches!(
+                    expected,
+                    crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                        | crate::session::ManagedResumeCause::OmpTranscriptBindingRequired
+                ) {
+                    let agent = if expected
+                        == crate::session::ManagedResumeCause::PiTranscriptBindingRequired
+                    {
+                        "Pi"
+                    } else {
+                        "OMP"
+                    };
+                    assert!(
+                        message
+                            .split(|ch: char| !ch.is_ascii_alphanumeric())
+                            .any(|token| token == agent),
+                        "{message}"
+                    );
+                    let mut rebind = false;
+                    let mut fresh = false;
+                    for line in message
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| line.starts_with("aoe "))
+                    {
+                        let argv = shell_words::split(line).expect("recovery command quoting");
+                        let parsed = recovery_command
+                            .try_get_matches_from_mut(argv)
+                            .expect("recovery command must parse");
+                        let args = parsed
+                            .subcommand_matches("session")
+                            .and_then(|args| args.subcommand_matches("set-session-id"))
+                            .expect("recovery command must select a native conversation");
+                        let sid = args.get_one::<String>("session_id").unwrap();
+                        let store = args.get_one::<std::path::PathBuf>("store");
+                        if sid.is_empty() {
+                            assert!(store.is_none(), "{message}");
+                            fresh = true;
+                        } else {
+                            assert!(store.is_some_and(|path| path.is_absolute()), "{message}");
+                            rebind = true;
+                        }
+                    }
+                    assert!(rebind && fresh, "{message}");
+                }
                 if committed {
                     assert!(
                         matches!(error, DaemonClientError::Committed { cursor, code }

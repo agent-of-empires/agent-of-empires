@@ -213,7 +213,7 @@ Add a new session
 
 ###### **Options:**
 
-* `-t`, `--title <TITLE>` — Session title (defaults to folder name)
+* `-t`, `--title <TITLE>` — Session title (defaults to a civilization name, or the worktree branch)
 * `-i`, `--interactive` — Prompt for the session name, mirroring the TUI `n` flow. Shows the generated default; press Enter to accept it. Ignored when --title is given. Requires an interactive terminal
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
@@ -1867,7 +1867,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 ###### **Subcommands:**
 
-* `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
+* `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude auth login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
 * `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
 * `recover` — Retire unprovable worker ownership after external shutdown confirmation
@@ -1889,7 +1889,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 ## `aoe acp doctor`
 
-Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
+Verify the structured view can start: Node runtime, configured agents, provider auth (claude auth login)
 
 **Usage:** `aoe acp doctor [OPTIONS]`
 

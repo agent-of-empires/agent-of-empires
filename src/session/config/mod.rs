@@ -2130,22 +2130,32 @@ pub fn is_resolvable_agent_config_dir(dir: &str) -> bool {
 }
 
 impl SessionConfig {
-    /// Resolve the command override for a tool, checking agent_command_override first,
-    /// then falling back to custom_agents. Returns empty string if no override found.
+    /// Resolve the explicit command, custom command, or installed plugin agent command.
     pub fn resolve_tool_command(&self, tool: &str) -> String {
         self.agent_command_override
             .get(tool)
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.custom_agents.get(tool))
+            .filter(|command| !command.trim().is_empty())
             .cloned()
+            .or_else(|| {
+                self.custom_agents
+                    .get(tool)
+                    .filter(|command| !command.trim().is_empty())
+                    .cloned()
+            })
+            .or_else(|| {
+                crate::plugin::agent_integration::agent_command(
+                    tool,
+                    self.custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                )
+            })
             .unwrap_or_default()
     }
 
-    /// The command a launch runs for `tool` when the session carries no
-    /// per-session override: `agent_command_override`, else `custom_agents`,
-    /// else the built-in's binary, else empty. A surface with no session to
-    /// ask names the agent from this, so it describes the launch instead of a
-    /// second derivation of it.
+    /// The launch command when no per-session override is set: explicit
+    /// override, custom command, active plugin agent command, then built-in binary.
     pub fn launch_command_for(&self, tool: &str) -> String {
         let resolved = self.resolve_tool_command(tool);
         if !resolved.is_empty() {
@@ -3908,20 +3918,8 @@ fn shell_quote_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
-/// string, leaving every other token exactly as the user wrote it.
-///
-/// `extra_args` is spliced into the launch command verbatim, so a model id
-/// carrying shell metacharacters aborts the whole line before the agent
-/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
-/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
-/// pane is dead at launch with nothing to show for it.
-///
-/// Quoting only the model value keeps the rest of `extra_args` usable as the
-/// caller's own argv, where shell syntax may well be intended. Untouched
-/// regions (including their original whitespace) are copied byte-for-byte
-/// rather than round-tripped through a tokenize/rejoin, which would collapse
-/// runs of whitespace elsewhere in the string.
+/// Quote model values without changing other shell words or their whitespace.
+/// Quoted text and escaped separators stay within their original argument.
 pub fn quote_model_value_in_args(args: &str) -> String {
     let mut out = String::with_capacity(args.len());
     let mut rest = args;
@@ -3933,7 +3931,36 @@ pub fn quote_model_value_in_args(args: &str) -> String {
         if rest.is_empty() {
             break;
         }
-        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let mut quote = None;
+        let mut escaped = false;
+        let tok_len = rest
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                if escaped {
+                    escaped = false;
+                    return None;
+                }
+                match quote {
+                    Some('\'') => {
+                        if ch == '\'' {
+                            quote = None;
+                        }
+                    }
+                    Some('"') => match ch {
+                        '"' => quote = None,
+                        '\\' => escaped = true,
+                        _ => {}
+                    },
+                    _ => match ch {
+                        '\'' | '"' => quote = Some(ch),
+                        '\\' => escaped = true,
+                        _ if ch.is_whitespace() => return Some(offset),
+                        _ => {}
+                    },
+                }
+                None
+            })
+            .unwrap_or(rest.len());
         let tok = &rest[..tok_len];
         let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
             if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
@@ -3963,7 +3990,7 @@ mod model_value_quoting_tests {
     use super::*;
 
     #[test]
-    fn only_an_unquoted_context_window_model_value_is_quoted() {
+    fn model_quoting_respects_shell_word_boundaries() {
         let cases = [
             ("--model claude-x[1m]", "--model 'claude-x[1m]'"),
             ("--model=claude-x[1m]", "--model='claude-x[1m]'"),
@@ -3982,6 +4009,18 @@ mod model_value_quoting_tests {
             ("--model \"gpt-5\"", "--model \"gpt-5\""),
             ("--flag1   --flag2", "--flag1   --flag2"),
             ("--model 'claude-x[1m]'", "--model 'claude-x[1m]'"),
+            (
+                "--append-system-prompt 'Use --model $(id) now'",
+                "--append-system-prompt 'Use --model $(id) now'",
+            ),
+            (
+                r#"--append-system-prompt "Use --model $(id) now""#,
+                r#"--append-system-prompt "Use --model $(id) now""#,
+            ),
+            (
+                r"--append-system-prompt Use\ --model\ \$\(id\)",
+                r"--append-system-prompt Use\ --model\ \$\(id\)",
+            ),
             ("--model", "--model"),
             ("", ""),
         ];

@@ -106,7 +106,7 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
 | `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrow terminals keep the list above the preview. Global only. |
-| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view; shortcuts, `?` help, dialog controls, and temporary notifications still work. |
+| `show_shortcut_bar` | `true` | Show the TUI's bottom shortcut row, including the LIVE banner. Global only, under Settings > Global > Interaction. Hiding it gives that row to the main view and suppresses the repeated Ctrl+C reminder in Live mode without changing interrupt forwarding. Shortcuts, `?` help, dialog controls, the leader menu, and other temporary notifications still work. |
 | `preview_link_prefixes` | `[]` | Link targets beyond http and https that a click in the preview may open, as case-insensitive `scheme://authority/` prefixes, for example `["vscode://file/"]` to open file links in VS Code. Entries not in that form, including a missing `/` after the authority, are ignored, and `file:`, `javascript:`, `data:` and `vbscript:` never open. Unlisted targets are neither opened nor passed to the terminal; a new entry applies to links printed after it. Global only and not editable from the web dashboard; under Settings > Global > Interaction (advanced). |
 | `tie_workdir_to_name` | `true` | Keep a managed worktree session's directory named after its title. See [Worktrees](worktrees.md#naming). |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. In tmux mode this passes `--dangerously-skip-permissions` to the agent CLI; in structured view it maps to ACP `bypassPermissions` (see [Structured view: Permission modes and YOLO](../structured-view/controls.md#permission-modes-and-yolo) for the adapter caveat). |
@@ -212,6 +212,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 - **`default_tool`** can select a custom-agent name for new sessions.
 
 Custom agents remain selectable even for remote or unmanaged commands. Maps are editable in config files or the TUI. Profile maps recursively merge with global maps; scalar and array values replace global values. `agent_detect_as` also permits repo overrides. `agent_execution_as` and `agent_config_dir` are trusted global/profile declarations, never repo overrides. The web wizard can select a custom agent but never edits these command strings.
+
 
 ### One CLI, two accounts
 
@@ -554,6 +555,15 @@ aoe profile create client-xyz
 aoe profile list
 aoe profile default work
 ```
+
+Profile writes and global project registration use the Daemon even when the
+profile catalogue is empty or the configured default is missing. Create a
+profile and select it with `aoe profile default NAME` to restore the default.
+These commands do not create the missing profile implicitly. An explicit `-p`
+still selects the profile used for cross-scope project conflict checks.
+Unreadable or malformed configuration remains an error; session operations
+still require a valid default. `--no-autostart` refuses writes when no Daemon
+is available.
 
 ## Repo config
 

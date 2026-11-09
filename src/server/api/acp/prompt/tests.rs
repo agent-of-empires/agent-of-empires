@@ -1242,3 +1242,87 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
     assert_eq!(queue[0].id, "q1");
     assert_eq!(queue[0].origin_plugin.as_deref(), Some("cron"));
 }
+
+/// The 202 names how the prompt was dispatched and, when it became a turn, the seq of its
+/// `UserPromptSent`; a queued prompt has a row id and no seq.
+#[tokio::test]
+async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
+    let caps = |steering| Event::PromptCapabilities {
+        image: false,
+        audio: false,
+        embedded_context: false,
+        load_session: None,
+        steering,
+    };
+    let earlier_turn = || Event::UserPromptSent {
+        text: "an earlier turn".into(),
+        attachments: Vec::new(),
+        prompt_id: None,
+        synthesized: false,
+        origin_plugin: None,
+    };
+    // (case, events already on disk, disposition)
+    let cases = [
+        ("idle", vec![], "sent"),
+        (
+            "mid-turn, steerable",
+            vec![caps(true), earlier_turn()],
+            "steered",
+        ),
+        (
+            "mid-turn, not steerable",
+            vec![caps(false), earlier_turn()],
+            "queued",
+        ),
+    ];
+    for (case, events, disposition) in cases {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = "sess-dispatch-seq";
+        let state = structured_state(id, true).await;
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        for (seq, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(id, seq as u64 + 1, event)
+                .expect("seed");
+        }
+        state
+            .acp_supervisor
+            .hydrate_seqs([(id.to_string(), state.acp_event_store.highest_seq(id))]);
+
+        let response = acp_prompt(
+            State(Arc::clone(&state)),
+            Path(id.to_string()),
+            prompt_req("the new prompt"),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::ACCEPTED, "{case}");
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["disposition"], disposition, "{case}: {body}");
+        let recorded = state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .find_map(|(seq, e)| {
+                matches!(&e, Event::UserPromptSent { text, .. } if text == "the new prompt")
+                    .then_some(seq)
+            });
+        if disposition == "queued" {
+            assert!(body.get("seq").is_none(), "{case}: {body}");
+            assert!(body["queued_id"].is_string(), "{case}: {body}");
+            assert_eq!(recorded, None, "{case}");
+        } else {
+            assert_eq!(body["seq"].as_u64(), recorded, "{case}: {body}");
+            assert!(recorded.is_some(), "{case}");
+        }
+    }
+}

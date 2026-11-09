@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
+use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 
 use crate::tmux::osc8::{Osc8Scanner, PaneLink};
+use crate::tmux::session::OwnerClaim;
 use crate::tmux::PaneCursor;
 
 /// Largest base64 payload an OSC 52 sequence may carry before the scanner
@@ -30,6 +32,14 @@ use crate::tmux::PaneCursor;
 /// bytes anyway, and an unbounded accumulator would let a malformed stream
 /// grow it forever).
 const OSC52_MAX_PAYLOAD: usize = 2 * 1024 * 1024;
+
+fn new_parser(rows: u16, cols: u16, scrollback: usize) -> vt100::Parser {
+    vt100::Parser::new(
+        NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN),
+        NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN),
+        scrollback,
+    )
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Osc52State {
@@ -1072,6 +1082,13 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Why no VT channel is available. `PipeOwned` is a confirmed live competing owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VtUnavailable {
+    PipeOwned,
+    Other,
+}
+
 /// (Re)build `parser` from tmux's authoritative `capture-pane` at `cols`x`rows`,
 /// resetting any prior content. `pipe-pane` carries only the app's incremental
 /// output, never tmux's reflow, so on a resize a grid that merely `set_size`d
@@ -1317,7 +1334,7 @@ fn swap_seeded_parser(
         return VtRefreshResult::Busy;
     }
     let (cols, rows) = size;
-    *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+    *p = new_parser(rows, cols, SCROLLBACK_LINES);
     p.process(stream);
     app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
     // Under the parser lock so the grid and its links are installed together.
@@ -1832,8 +1849,7 @@ fn row_to_ansi_upto(screen: &vt100::Screen, row: u16, last: u16) -> String {
 pub(crate) fn capture_rows_padded(raw: &[u8], cols: u16, rows: u16) -> Vec<String> {
     let cols = cols.max(1);
     let rows = rows.max(1);
-    // At least two rows: vt100 0.16 panics when content wraps on a one-row grid.
-    let mut parser = vt100::Parser::new(rows.max(2), cols, 0);
+    let mut parser = new_parser(rows.max(2), cols, 0);
     // `capture-pane` joins rows with a bare LF, which staircases each row off
     // the previous one's end column unless it is promoted to CRLF first (the
     // same seeding fix the live channel applies).
@@ -2492,25 +2508,23 @@ impl VtChannel {
         &self.target
     }
 
-    /// Get the shared channel for `session`, arming a new one if none is live.
-    /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
-    /// step fails; callers then use the legacy capture/send-keys path. The
-    /// returned `Arc` keeps the channel alive; drop it to release this viewer's
-    /// hold (the channel tears down when the last `Arc` drops).
+    /// The shared channel for `session`, arming one if none is live. `Err` when
+    /// tmux is too old, another process owns the pipe, or any step fails; callers
+    /// then use capture/send-keys.
     #[cfg(test)]
     pub(crate) fn acquire(session: &str) -> Option<Arc<VtChannel>> {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        Self::acquire_with_deadline(session, &deadline)
+        Self::acquire_with_deadline(session, &deadline).ok()
     }
 
     pub(crate) fn acquire_with_deadline(
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> Option<Arc<VtChannel>> {
+    ) -> Result<Arc<VtChannel>, VtUnavailable> {
         // A dead entry (the session was recreated) must not be reused.
         if let Some(ch) = lookup(session) {
             if ch.lifecycle() == VtLifecycle::Live {
-                return Some(ch);
+                return Ok(ch);
             }
         }
         // Serialize arming per session so the loser adopts the winner's channel.
@@ -2524,7 +2538,7 @@ impl VtChannel {
             let _armed = arm_lock.lock().unwrap();
             if let Some(ch) = lookup(session) {
                 if ch.lifecycle() == VtLifecycle::Live {
-                    Some(ch)
+                    Ok(ch)
                 } else {
                     Self::arm_and_register(session, deadline)
                 }
@@ -2547,7 +2561,7 @@ impl VtChannel {
     fn arm_and_register(
         session: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> Option<Arc<VtChannel>> {
+    ) -> Result<Arc<VtChannel>, VtUnavailable> {
         Self::arm(session, deadline).map(|channel| {
             let channel = Arc::new(channel);
             REGISTRY
@@ -2558,30 +2572,35 @@ impl VtChannel {
         })
     }
 
-    fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Option<Self> {
+    fn arm(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> Result<Self, VtUnavailable> {
         if !tmux_supports_pipe_pane_io(deadline) {
-            return None;
+            return Err(VtUnavailable::Other);
         }
-        let target = super::utils::first_pane_id_with_deadline(name, deadline)?;
+        let target = super::utils::first_pane_id_with_deadline(name, deadline)
+            .ok_or(VtUnavailable::Other)?;
         // Arming only needs the geometry; the cursor rides along because the
         // probe is shared with `reconcile_grid` and costs one fork either way.
-        let (cols, rows, _, _) = pane_size_cursor(&target, deadline)?;
+        let (cols, rows, _, _) = pane_size_cursor(&target, deadline).ok_or(VtUnavailable::Other)?;
         // `pipe-pane` is exclusive per pane, so defer to another live VT owner.
         let session = crate::tmux::Session::from_name(name);
         let owner = new_pipe_owner_id();
-        if !session.claim_vt_owner_with_deadline(
+        match session.claim_vt_owner_with_deadline(
             &owner,
             crate::tmux::session::VT_OWNER_TTL,
             deadline,
         ) {
-            tracing::info!(
-                %target,
-                pid = std::process::id(),
-                "vt: pipe owned by another process; using capture fallback"
-            );
-            return None;
+            OwnerClaim::Claimed => {}
+            OwnerClaim::Held => {
+                tracing::info!(
+                    %target,
+                    pid = std::process::id(),
+                    "vt: pipe owned by another process; using capture fallback"
+                );
+                return Err(VtUnavailable::PipeOwned);
+            }
+            OwnerClaim::Error => return Err(VtUnavailable::Other),
         }
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
+        let parser = Arc::new(Mutex::new(new_parser(rows, cols, SCROLLBACK_LINES)));
         let stop = Arc::new(AtomicBool::new(false));
         let seeded = Arc::new(AtomicBool::new(false));
         let snapshot = Arc::new(Mutex::new(()));
@@ -2614,12 +2633,12 @@ impl VtChannel {
         let Some((sock_path, listener, control_path, control_listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
-            return None;
+            return Err(VtUnavailable::Other);
         };
         let Some(exe) = std::env::current_exe().ok() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
             session.release_vt_owner_with_deadline(&owner, deadline);
-            return None;
+            return Err(VtUnavailable::Other);
         };
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let chunk_seq = Arc::new(AtomicU64::new(0));
@@ -2669,7 +2688,7 @@ impl VtChannel {
             session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            return None;
+            return Err(VtUnavailable::Other);
         }
         let control_stop = stop.clone();
         let control_drain = drain.clone();
@@ -2694,7 +2713,7 @@ impl VtChannel {
                 session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
-                return None;
+                return Err(VtUnavailable::Other);
             }
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -2745,7 +2764,7 @@ impl VtChannel {
             session.release_vt_pipe_owner_with_deadline(&owner, &target, deadline);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            return None;
+            return Err(VtUnavailable::Other);
         }
         tracing::info!(
             %target,
@@ -2756,7 +2775,7 @@ impl VtChannel {
             "vt channel armed (pipe-pane <-> vt100 grid)"
         );
 
-        Some(Self {
+        Ok(Self {
             name: name.to_string(),
             input,
             owner_id: owner,
@@ -3445,11 +3464,12 @@ impl Osc52Channel {
         let target = super::utils::first_pane_id_with_deadline(name, deadline)?;
         let session = crate::tmux::Session::from_name(name);
         let owner = new_pipe_owner_id();
-        if !session.claim_vt_owner_with_deadline(
+        if session.claim_vt_owner_with_deadline(
             &owner,
             crate::tmux::session::VT_OWNER_TTL,
             deadline,
-        ) {
+        ) != OwnerClaim::Claimed
+        {
             return None;
         }
 
@@ -3665,7 +3685,7 @@ pub(crate) fn dummy_channel_with_input(
         input,
         owner_id: new_pipe_owner_id(),
         target: format!("={name}:^"),
-        parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
+        parser: Arc::new(Mutex::new(new_parser(4, 20, SCROLLBACK_LINES))),
         stream: Arc::new(Mutex::new(None)),
         app_cursor: Arc::new(AtomicBool::new(false)),
         lifecycle: lifecycle.clone(),
@@ -3878,7 +3898,7 @@ mod tests {
         // `ansi_to_tui` ignores cursor movement, so the gap collapsed to "AB"
         // and aligned UIs lost their spacing (#2433). The literal serializer
         // must emit those columns as real spaces.
-        let mut p = vt100::Parser::new(2, 20, 0);
+        let mut p = new_parser(2, 20, 0);
         p.process(b"A\x1b[12GB");
         let (content, _) = grid_content(&mut p, 2, 20, 2);
         assert!(
@@ -3945,7 +3965,7 @@ mod tests {
 
     #[test]
     fn seed_install_reports_failure_and_preserves_newer_chunks() {
-        let parser = Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_LINES));
+        let parser = Mutex::new(new_parser(24, 80, SCROLLBACK_LINES));
         parser.lock().unwrap().process(b"LIVE-CHUNK");
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
@@ -4025,7 +4045,7 @@ mod tests {
         // prompt whose seed never gets a live repaint rendered staircased,
         // putting the cursor on the wrong row).
         let raw = b"line-1\nline-2\nREADY> ";
-        let mut staircased = vt100::Parser::new(6, 40, 0);
+        let mut staircased = new_parser(6, 40, 0);
         staircased.process(raw);
         assert_eq!(
             staircased.screen().cell(1, 0).map(|c| c.contents()),
@@ -4033,7 +4053,7 @@ mod tests {
             "control: bare LF should staircase (row 1 col 0 empty)"
         );
 
-        let mut fixed = vt100::Parser::new(6, 40, 0);
+        let mut fixed = new_parser(6, 40, 0);
         fixed.process(&lf_to_crlf(raw));
         assert_eq!(
             fixed.screen().cell(0, 0).map(|c| c.contents()),
@@ -4101,7 +4121,7 @@ mod tests {
                 pane_height,
                 ..Default::default()
             };
-            let mut p = vt100::Parser::new(rows, 20, SCROLLBACK_LINES);
+            let mut p = new_parser(rows, 20, SCROLLBACK_LINES);
             p.process(&assemble_seed_stream(body.as_bytes(), &state, rows));
             let screen = p.screen();
             assert_eq!(screen.cursor_position(), position, "{}", screen.contents());
@@ -4626,7 +4646,7 @@ mod tests {
             app_cursor: true,
             ..Default::default()
         };
-        let mut p = vt100::Parser::new(4, 10, 0);
+        let mut p = new_parser(4, 10, 0);
         p.process(&assemble_seed_stream(b"hi\n", &on, 4));
         assert!(
             p.screen().application_cursor(),
@@ -4634,7 +4654,7 @@ mod tests {
         );
 
         let off = PaneSeedState::default();
-        let mut p = vt100::Parser::new(4, 10, 0);
+        let mut p = new_parser(4, 10, 0);
         p.process(&assemble_seed_stream(b"hi\n", &off, 4));
         assert!(
             !p.screen().application_cursor(),
@@ -4656,7 +4676,7 @@ mod tests {
         let grid_gen = Arc::new(AtomicU64::new(0));
         let ctx = ReaderCtx {
             snapshot_contended: None,
-            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            parser: Arc::new(Mutex::new(new_parser(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
             snapshot: Arc::new(Mutex::new(())),
@@ -4698,7 +4718,7 @@ mod tests {
         let (waiting, idle_rx, resume_tx) = TestRendezvous::new();
         let ctx = ReaderCtx {
             snapshot_contended: None,
-            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            parser: Arc::new(Mutex::new(new_parser(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
             snapshot: snapshot.clone(),
@@ -4753,7 +4773,7 @@ mod tests {
         let stream = Arc::new(Mutex::new(None));
         let ctx = ReaderCtx {
             snapshot_contended: None,
-            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            parser: Arc::new(Mutex::new(new_parser(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
             snapshot: Arc::new(Mutex::new(())),
@@ -4869,7 +4889,7 @@ mod tests {
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let stop = Arc::new(AtomicBool::new(false));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
         let chunk_seq = Arc::new(AtomicU64::new(0));
@@ -4977,7 +4997,7 @@ mod tests {
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
         let stop = Arc::new(AtomicBool::new(false));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
         let chunk_seq = Arc::new(AtomicU64::new(0));
@@ -5085,7 +5105,7 @@ mod tests {
         let (mut reader, mut writer) = UnixStream::pair().expect("pipe pair");
         writer.write_all(b"UNREAD-MARKER").expect("queue output");
 
-        let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
+        let parser = Mutex::new(new_parser(24, 80, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let chunk_seq = AtomicU64::new(0);
@@ -5180,7 +5200,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("forwarder must pause after reading pane output");
 
-        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let parser = Mutex::new(new_parser(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let control = Mutex::new(DrainControl {
@@ -5238,7 +5258,7 @@ mod tests {
             before_deadline: Some(before_deadline),
             next_now: None,
         });
-        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let parser = Mutex::new(new_parser(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let snapshot = Mutex::new(());
@@ -5358,7 +5378,7 @@ mod tests {
             before_deadline: None,
             next_now: None,
         });
-        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let parser = Mutex::new(new_parser(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let first = swap_drained_seeded_parser(
@@ -5467,7 +5487,7 @@ mod tests {
     fn grid_content_preserves_color() {
         // SGR 31 (red fg) on "X" must round-trip as an SGR escape, not a bare
         // cursor move, so color survives into the preview.
-        let mut p = vt100::Parser::new(2, 20, 0);
+        let mut p = new_parser(2, 20, 0);
         p.process(b"\x1b[31mX\x1b[0m");
         let (content, _) = grid_content(&mut p, 2, 20, 2);
         assert!(content.contains('X'), "glyph missing:\n{content:?}");
@@ -5483,7 +5503,7 @@ mod tests {
         // with a bg set): cols 2..10 carry a bgcolor but no glyph, like a status
         // bar or selection that runs to the right edge. They must survive as
         // colored spaces, not be trimmed as if blank.
-        let mut p = vt100::Parser::new(2, 10, 0);
+        let mut p = new_parser(2, 10, 0);
         p.process(b"Hi\x1b[44m\x1b[K");
         let (content, _) = grid_content(&mut p, 2, 10, 2);
         let first = content.split('\n').next().unwrap_or("");
@@ -5509,7 +5529,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let stream: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
@@ -5633,7 +5653,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let lifecycle = Arc::new(AtomicU8::new(VtLifecycle::Starting as u8));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -5705,7 +5725,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let links: Arc<LinkTable> = Arc::new(LinkTable::default());
         let ctx = ReaderCtx {
@@ -5860,7 +5880,7 @@ mod tests {
         let stream = capture_seed_stream(&target, (80, rows), &deadline, || ())
             .expect("capture seed stream")
             .0;
-        let mut p = vt100::Parser::new(rows, 80, SCROLLBACK_LINES);
+        let mut p = new_parser(rows, 80, SCROLLBACK_LINES);
         p.process(&stream);
 
         let (cy, cx) = p.screen().cursor_position();
@@ -6032,7 +6052,7 @@ mod tests {
                 uri: "https://example.com/live".to_string(),
             }],
         );
-        let parser = Mutex::new(vt100::Parser::new(24, 80, 0));
+        let parser = Mutex::new(new_parser(24, 80, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(7);
         assert_eq!(
@@ -6077,7 +6097,7 @@ mod tests {
             before_deadline: Some(before_deadline),
             next_now: Some(Instant::now()),
         });
-        let parser = Mutex::new(vt100::Parser::new(6, 40, 0));
+        let parser = Mutex::new(new_parser(6, 40, 0));
         let app_cursor = AtomicBool::new(false);
         let grid_gen = AtomicU64::new(0);
         let links = LinkTable::default();
@@ -6183,7 +6203,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let app_cursor = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
         let links: Arc<LinkTable> = Arc::new(LinkTable::default());
@@ -6462,7 +6482,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).expect("bind");
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(24, 80, 0)));
         let stop = Arc::new(AtomicBool::new(false));
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let settled_chunk_seq = Arc::new(AtomicU64::new(0));
@@ -6539,7 +6559,7 @@ mod tests {
     fn grid_content_assembles_scrollback_and_screen() {
         // 4-row screen; 12 distinct lines means several rows scroll into
         // history. Markers are non-substrings of each other (LINE01 vs LINE12).
-        let mut p = vt100::Parser::new(4, 20, 100);
+        let mut p = new_parser(4, 20, 100);
         for i in 1..=12 {
             p.process(format!("LINE{i:02}\r\n").as_bytes());
         }
@@ -6581,7 +6601,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let grid_gen = Arc::new(AtomicU64::new(0));
         let seeded = Arc::new(AtomicBool::new(false));
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(6, 40, 0)));
+        let parser = Arc::new(Mutex::new(new_parser(6, 40, 0)));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let snapshot = Arc::new(Mutex::new(()));
         let stream = Arc::new(Mutex::new(None));
@@ -7095,7 +7115,7 @@ mod tests {
         let wakeup: ChangeWakeup = Arc::new((Mutex::new(0u64), Condvar::new()));
         let ctx = ReaderCtx {
             snapshot_contended: None,
-            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            parser: Arc::new(Mutex::new(new_parser(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(true)),
             snapshot: Arc::new(Mutex::new(())),
@@ -7179,7 +7199,7 @@ mod tests {
         let signals = Arc::new(ViewerSignals::new());
         let ctx = ReaderCtx {
             snapshot_contended: None,
-            parser: Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0))),
+            parser: Arc::new(Mutex::new(new_parser(24, 80, 0))),
             stop: stop.clone(),
             seeded: Arc::new(AtomicBool::new(false)),
             stream: Arc::new(Mutex::new(None)),

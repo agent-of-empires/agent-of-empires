@@ -2,7 +2,9 @@
 
 use tracing::info;
 
-use super::{next_seq, BroadcastSink, PromptDisposition, SeqMap, Supervisor, WorkerKind};
+use super::{
+    next_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor, WorkerKind,
+};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
@@ -107,6 +109,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
         self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None)
             .await
+            .disposition
     }
 
     /// Record a `UserPromptSent` (attachments stored as blobs keyed to its seq)
@@ -121,7 +124,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         prompt_id: Option<String>,
         synthesized: bool,
         origin_plugin: Option<String>,
-    ) -> PromptDisposition {
+    ) -> PublishedPrompt {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let is_clear = profile.is_clear_command(&text);
@@ -130,12 +133,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         } else {
             PromptDisposition::Forward
         };
+        let unrecorded = PublishedPrompt {
+            disposition,
+            seq: None,
+        };
         let seq = next_seq(&self.next_seqs, session_id);
         let mut refs = Vec::with_capacity(attachments.len());
         for blob in attachments {
             if !self.sink.record_attachment(session_id, seq, blob) {
                 self.sink.delete_attachments_for_seq(session_id, seq);
-                return disposition;
+                return unrecorded;
             }
             refs.push(crate::daemon::PromptAttachmentRef {
                 id: blob.id.clone(),
@@ -155,12 +162,15 @@ impl<S: BroadcastSink> Supervisor<S> {
         if !self.sink.publish_persisted(session_id, seq, &event) {
             // Roll back so refs never point at blobs that were not published.
             self.sink.delete_attachments_for_seq(session_id, seq);
-            return disposition;
+            return unrecorded;
         }
         if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, &Event::SessionCleared);
         }
-        disposition
+        PublishedPrompt {
+            disposition,
+            seq: Some(seq),
+        }
     }
 
     /// Publish a "Send diff comments" submission; never treated as a clear command.
@@ -607,5 +617,45 @@ mod tests {
             })
             .collect();
         assert_eq!(flags, [false, true]);
+    }
+
+    /// The published seq is the `UserPromptSent` event's, and there is none when the
+    /// event did not reach the store; the text is still routed either way.
+    #[tokio::test]
+    async fn publish_user_prompt_reports_the_seq_it_recorded() {
+        struct RefusesToPersist;
+        impl BroadcastSink for RefusesToPersist {
+            fn publish(&self, _: &str, _: u64, _: &Event) {}
+            fn publish_persisted(&self, _: &str, _: u64, _: &Event) -> bool {
+                false
+            }
+        }
+
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.publish_user_prompt("s-1", "first".into()).await;
+        let published = sup
+            .publish_user_prompt_with_attachments("s-1", "second".into(), &[], None, false, None)
+            .await;
+        let recorded = sink.frames.lock().unwrap().last().unwrap().1;
+        assert_eq!(
+            published,
+            PublishedPrompt {
+                disposition: PromptDisposition::Forward,
+                seq: Some(recorded),
+            }
+        );
+
+        let sup = Supervisor::new(std::sync::Arc::new(RefusesToPersist));
+        let published = sup
+            .publish_user_prompt_with_attachments("s-1", "lost".into(), &[], None, false, None)
+            .await;
+        assert_eq!(
+            published,
+            PublishedPrompt {
+                disposition: PromptDisposition::Forward,
+                seq: None,
+            }
+        );
     }
 }

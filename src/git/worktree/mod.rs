@@ -44,6 +44,7 @@ pub(crate) struct WorktreeCreation {
     pub branch_created: bool,
     pub checkout_created: bool,
 }
+#[derive(Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: Option<String>,
