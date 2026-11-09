@@ -392,6 +392,46 @@ impl PaneBirthInventory {
     }
 }
 
+fn parse_pane_birth_inventory_row(
+    line: &str,
+) -> Result<(u32, crate::session::LegacyToolIdentity, bool)> {
+    let mut parts = line.split('|');
+    let fields: [Option<&str>; 5] = std::array::from_fn(|_| parts.next());
+    let [Some(server_pid), Some(session_id), Some(pane_id), Some(pane_pid), Some(dead)] = fields
+    else {
+        bail!("malformed complete terminal handoff inventory")
+    };
+    anyhow::ensure!(
+        parts.next().is_none(),
+        "extra terminal handoff inventory fields"
+    );
+    let identity = crate::session::LegacyToolIdentity {
+        session_id: session_id.to_owned(),
+        pane_id: pane_id.to_owned(),
+        pane_pid: if pane_pid.is_empty() {
+            None
+        } else {
+            Some(pane_pid.parse()?)
+        },
+    };
+    anyhow::ensure!(
+        crate::tmux::ToolSession::valid_identity(&identity)
+            || (dead == "1"
+                && identity.pane_pid.is_none()
+                && crate::tmux::ToolSession::valid_pane_ids(
+                    &identity.session_id,
+                    &identity.pane_id,
+                )),
+        "invalid complete terminal handoff identity"
+    );
+    let dead = match dead {
+        "1" => true,
+        "0" => false,
+        _ => bail!("invalid complete terminal handoff pane state"),
+    };
+    Ok((server_pid.parse()?, identity, dead))
+}
+
 /// No name, kind, pane-index or first-window filtering is permitted here.
 pub(crate) fn capture_pane_birth_inventory(
     socket: Option<&str>,
@@ -432,31 +472,7 @@ pub(crate) fn capture_pane_birth_inventory(
         return Ok(inventory);
     }
     for line in std::str::from_utf8(&output.stdout)?.lines() {
-        let mut parts = line.split('|');
-        let fields: [Option<&str>; 5] = std::array::from_fn(|_| parts.next());
-        let [Some(server_pid), Some(session_id), Some(pane_id), Some(pane_pid), Some(dead)] =
-            fields
-        else {
-            bail!("malformed complete terminal handoff inventory")
-        };
-        anyhow::ensure!(
-            parts.next().is_none(),
-            "extra terminal handoff inventory fields"
-        );
-        let identity = crate::session::LegacyToolIdentity {
-            session_id: session_id.to_owned(),
-            pane_id: pane_id.to_owned(),
-            pane_pid: if pane_pid.is_empty() {
-                None
-            } else {
-                Some(pane_pid.parse()?)
-            },
-        };
-        anyhow::ensure!(
-            crate::tmux::ToolSession::valid_identity(&identity),
-            "invalid complete terminal handoff identity"
-        );
-        let pid = server_pid.parse()?;
+        let (pid, identity, dead) = parse_pane_birth_inventory_row(line)?;
         if let Some(expected) = &inventory.server {
             anyhow::ensure!(
                 expected.pid == pid,
@@ -471,17 +487,17 @@ pub(crate) fn capture_pane_birth_inventory(
                 birth,
             });
         }
-        let birth = match dead {
-            "1" => None,
-            "0" => Some(
+        let birth = if dead {
+            None
+        } else {
+            Some(
                 crate::process::process_birth_identity(
                     identity
                         .pane_pid
                         .ok_or_else(|| anyhow::anyhow!("live pane PID unavailable"))?,
                 )?
                 .ok_or_else(|| anyhow::anyhow!("live pane birth unavailable"))?,
-            ),
-            _ => bail!("invalid complete terminal handoff pane state"),
+            )
         };
         inventory.panes.push(InventoriedPane { identity, birth });
     }
@@ -1317,6 +1333,49 @@ mod tests {
     }
 
     #[test]
+    fn birth_inventory_parser_accepts_only_complete_typed_pane_rows() {
+        for (row, expected) in [
+            ("7001|$1|%2||1", Some((7001, "$1", "%2", None, true))),
+            (
+                "7001|$1|%2|7002|1",
+                Some((7001, "$1", "%2", Some(7002), true)),
+            ),
+            (
+                "7001|$1|%2|7002|0",
+                Some((7001, "$1", "%2", Some(7002), false)),
+            ),
+            ("7001|$|%2||1", None),
+            ("7001|$1|%||1", None),
+            ("7001|$x|%2||1", None),
+            ("7001|$1|%x||1", None),
+            ("7001|$1|%2|0|1", None),
+            ("7001|$1|%2|2147483648|1", None),
+            ("7001|$1|%2|-1|1", None),
+            ("7001|$1|%2||0", None),
+            ("7001|$1|%2|0|0", None),
+            ("7001|$1|%2|2147483648|0", None),
+            ("7001|$1|%2|7002|2", None),
+            ("7001|$1|%2||2", None),
+            ("7001|$1|%2|7002", None),
+            ("7001|$1|%2|7002|1|extra", None),
+            ("invalid|$1|%2|7002|1", None),
+        ] {
+            let parsed = parse_pane_birth_inventory_row(row);
+            if let Some((server_pid, session_id, pane_id, pane_pid, dead)) = expected {
+                let (actual_server, identity, actual_dead) =
+                    parsed.unwrap_or_else(|error| panic!("{row}: {error:#}"));
+                assert_eq!(actual_server, server_pid, "{row}");
+                assert_eq!(identity.session_id, session_id, "{row}");
+                assert_eq!(identity.pane_id, pane_id, "{row}");
+                assert_eq!(identity.pane_pid, pane_pid, "{row}");
+                assert_eq!(actual_dead, dead, "{row}");
+            } else {
+                assert!(parsed.is_err(), "malformed inventory accepted: {row}");
+            }
+        }
+    }
+
+    #[test]
     fn birth_inventory_accepts_only_unchanged_preexisting_panes() {
         let birth = |id: &str| crate::process::ProcessBirthIdentity {
             boot_id: "inventory-test-boot".into(),
@@ -1327,6 +1386,7 @@ mod tests {
             "dead-without-pid",
             "dead-pid-changed",
             "dead-pid-disappeared",
+            "dead-pid-appeared",
             "new-pane",
             "server-birth-changed",
             "socket-changed",
@@ -1347,7 +1407,8 @@ mod tests {
                     identity: crate::session::LegacyToolIdentity {
                         session_id: "$1".into(),
                         pane_id: "%1".into(),
-                        pane_pid: (case != "dead-without-pid").then_some(7002),
+                        pane_pid: (!matches!(case, "dead-without-pid" | "dead-pid-appeared"))
+                            .then_some(7002),
                     },
                     birth: alive.then(|| birth("pane")),
                 }],
@@ -1356,6 +1417,7 @@ mod tests {
             match case {
                 "dead-pid-changed" => current.panes[0].identity.pane_pid = Some(7003),
                 "dead-pid-disappeared" => current.panes[0].identity.pane_pid = None,
+                "dead-pid-appeared" => current.panes[0].identity.pane_pid = Some(7002),
                 "new-pane" => current.panes[0].identity.pane_id = "%2".into(),
                 "server-birth-changed" => {
                     current.server.as_mut().unwrap().birth = birth("other-server")
@@ -2454,14 +2516,6 @@ mod pane_probe_tests {
             .success());
         wait_for_pane_dead(&expected.identity.pane_id);
 
-        let removed = remove_owned_pane(&expected, false);
-        assert!(
-            removed.is_err(),
-            "a live-process authorization must not consume a corpse: {removed:?}"
-        );
-        assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "1");
-        assert!(session.exists_live());
-
         // A corpse that already existed in both complete inventories is not a
         // new birth, and still cannot be consumed by the old live receipt.
         let prior = capture_pane_birth_inventory(
@@ -2480,7 +2534,22 @@ mod pane_probe_tests {
             &crate::tmux::TmuxCommandDeadline::new(),
         )
         .unwrap();
+        let current_dead = current
+            .panes
+            .iter()
+            .find(|pane| pane.identity.pane_id == expected.identity.pane_id)
+            .expect("the same existing corpse remains in the second inventory");
+        assert!(current_dead.birth.is_none());
+        assert_eq!(current_dead.identity, dead.identity);
         current.ensure_only_preexisting_live_panes(&prior).unwrap();
+
+        let removed = remove_owned_pane(&expected, false);
+        assert!(
+            removed.is_err(),
+            "a live-process authorization must not consume a corpse: {removed:?}"
+        );
+        assert_eq!(pane_field(&expected.identity.pane_id, "#{pane_dead}"), "1");
+        assert!(session.exists_live());
     }
 
     #[test]
