@@ -122,6 +122,8 @@ An indeterminate creation still finalizes its idempotency key: its durable statu
 
 Post-hook creation failures release namespace, submission and mutation guards before rollback cleanup re-enters them.
 
+An ACP account restart keeps its quota breadcrumb and interrupted-turn selection inside the same prompt-submission guard.
+
 A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
 
 This exclusive-occupancy check also protects later revival and direct-start replacement. The tmux command rechecks immutable pane/server identity and topology atomically before any process-tree signalling or scope release. A legacy corpse does not acquire an invented process PID. A peer split immediately before removal refuses revival; explicit Stop retains its separate authority.
