@@ -937,7 +937,7 @@ mod tests {
         let file_watch = crate::file_watch::FileWatchService::new().unwrap();
         let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
         for relaunch in [false, true] {
-            for offer in ["empty", "stopped", "running"] {
+            for offer in ["empty", "stopped", "running", "foreign-empty"] {
                 let mut row = Instance::new("pi adoption", root.path().to_str().unwrap());
                 row.source_profile = "test".into();
                 row.tool = "pi".into();
@@ -994,14 +994,26 @@ mod tests {
                     Arc::new(Mutex::new(poller))
                 };
                 let mut started = row.clone();
-                let offered = (offer != "empty").then(spawn);
+                let offered = matches!(offer, "stopped" | "running").then(spawn);
                 if offer == "stopped" {
                     offered.as_ref().unwrap().lock().unwrap().stop();
                 }
                 started.capture_poller.set_handle(offered.clone());
                 let canonical = spawn();
+                let blocker = (offer != "running").then(spawn);
+                // Both real observer threads occupy the private budget. Let the production
+                // repair path produce a real backoff before installing the canonical watcher.
+                assert!(!row.reconcile_capture_poller(&crate::tmux::LiveSessionSnapshot::new()));
+                assert_eq!(row.capture_poller.repair().deferrals(), 1);
+                let canonical_pacing = row.capture_poller.repair().clone();
+                if let Some(blocker) = blocker {
+                    blocker.lock().unwrap().stop();
+                }
                 row.capture_poller.set_handle(Some(canonical.clone()));
                 let before = started.clone();
+                if offer == "foreign-empty" {
+                    started.tool = "claude".into();
+                }
                 crate::server::test_support::seed_instances_on_disk_for_test("test", vec![row.clone()]);
                 let watcher = file_watch.clone();
                 let state = crate::server::test_support::build_test_app_state_configured(
@@ -1044,6 +1056,12 @@ mod tests {
                     assert_eq!(row.lifecycle_generation, generation);
                     assert!(row.active_execution.is_none());
                     assert_eq!(row.agent_session_id.as_deref(), Some(sid));
+                    assert_eq!(row.tool, "pi");
+                    if offer == "running" && !relaunch {
+                        assert_eq!(row.capture_poller.repair().deferrals(), 0);
+                    } else {
+                        assert_eq!(row.capture_poller.repair(), &canonical_pacing);
+                    }
                     row.capture_poller.handle().unwrap().clone()
                 };
                 assert!(

@@ -1229,6 +1229,33 @@ mod tests {
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         crate::server::test_support::reload_tmux_applied_for_test(&state, vec![fresh], Vec::new())
             .await;
+        // A transient API snapshot offers neither a watcher nor a repair outcome.
+        // It must not erase the canonical deadline earned from real store contention,
+        // whether it still describes this tool or describes a stale different tool.
+        for foreign_tool in [false, true] {
+            let mut snapshot = state.instances.read().await[0].clone();
+            snapshot.capture_poller = Default::default();
+            if foreign_tool {
+                snapshot.tool = "claude".into();
+            }
+            let publish = state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::server::session_store::NativeSessionStore::open(
+                    publish,
+                    "default",
+                    Some(snapshot.id.clone()),
+                )
+                .unwrap()
+                .adopt_runtime_fields(&snapshot)
+                .unwrap();
+            })
+            .await
+            .unwrap();
+            let rows = state.instances.read().await;
+            assert_eq!(rows[0].tool, "prime-agent");
+            assert!(rows[0].capture_poller.handle().is_none());
+            assert_eq!(rows[0].capture_poller.retry_after(), Some(deadline));
+        }
         let mut rows = state.instances.write().await;
         let reloaded = &mut rows[0];
         assert_eq!(

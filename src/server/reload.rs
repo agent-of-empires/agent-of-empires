@@ -2,7 +2,6 @@
 //! already holds in memory.
 
 use crate::file_watch::FileWatchService;
-use crate::session::Handoff;
 use crate::session::Instance;
 use crate::session::Status;
 use crate::session::Storage;
@@ -679,46 +678,30 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
 
 /// Keep process state without replacing the committed lifecycle or identity.
 ///
-/// The poller guards live in [`Handoff`], shared with the status-poll
-/// branch of [`merge_loaded_rows`]: both hand a prior row's launch-owned process
-/// state to the fresh row, so both must decide the same way whether that row
-/// still runs what the prior one ran.
+/// CapturePollerSlot applies the same execution and live-watcher rules as the
+/// status-poll branch. A transient snapshot must not clear a canonical watcher
+/// or its own compatible repair pacing after that adoption has settled it.
 pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = Handoff::decide(
-        &prior.capture_poller,
-        prior.held(),
-        &fresh.capture_poller,
-        fresh.held(),
-    );
     // `plugin_revival_pending` is `#[serde(skip)]`, so every fresh disk load
     // defaults it; dropping it here would stop counting a plugin revival that is
     // still waking toward its per-plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
     fresh.last_error_check = prior.last_error_check;
     fresh.inherit_runtime(prior, fresh.status == Status::Error);
-    handoff.settle(&mut fresh.capture_poller);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 
 /// Adopt the prior row's launch-owned process state onto a fresh row whose
 /// status, panes and detection this tick's tmux scrape already decided, and so
 /// must keep them: [`merge_runtime_fields`] would carry the prior row's
-/// observations back over the fresh ones. The poller guards are the same
-/// [`Handoff`] the full merge applies, because the poller and its repair
-/// window are launch-owned whatever decided the status, and `plugin_revival_pending`
-/// is `#[serde(skip)]` like the poller, so a fresh disk load defaults it.
+/// observations back over the fresh ones. Both paths share CapturePollerSlot's
+/// adoption guards. `plugin_revival_pending` is runtime-only like the poller,
+/// so a fresh disk load defaults it.
 fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = Handoff::decide(
-        &prior.capture_poller,
-        prior.held(),
-        &fresh.capture_poller,
-        fresh.held(),
-    );
     // `#[serde(skip)]` like the poller, so a fresh disk load defaults it and a
     // revival slower than one tick would stop counting toward its plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
     fresh.inherit_process_runtime_from_reload(prior);
-    handoff.settle(&mut fresh.capture_poller);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 

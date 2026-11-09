@@ -126,10 +126,20 @@ impl CapturePollerSlot {
         }
     }
 
-    /// Take the repair pacing of a prior row about the same execution; a row whose execution
-    /// another process replaced does not inherit a window armed for the old one.
-    fn take_pacing(&mut self, prior: &Self, prior_held: Held<'_>, held: Held<'_>) {
-        if held == prior_held {
+    /// Take pacing for the same execution from a live offer or an actual pending repair.
+    /// An empty transient snapshot cannot clear the receiver's own repair window.
+    fn take_pacing(
+        &mut self,
+        prior: &Self,
+        prior_held: Held<'_>,
+        held: Held<'_>,
+        took_handle: bool,
+    ) {
+        if held == prior_held
+            && (took_handle
+                || prior.retry_after.is_some()
+                || prior.repair != PollerRepairBackoff::default())
+        {
             self.repair = prior.repair.clone();
             self.retry_after = prior.retry_after;
         }
@@ -145,10 +155,11 @@ impl CapturePollerSlot {
         unserved: Unserved,
     ) {
         self.settle(held);
-        if !self.take_handle(prior, held) && unserved == Unserved::Stop {
+        let took_handle = self.take_handle(prior, held);
+        if !took_handle && unserved == Unserved::Stop {
             prior.stop();
         }
-        self.take_pacing(prior, prior_held, held);
+        self.take_pacing(prior, prior_held, held, took_handle);
     }
 
     /// Take what a relaunch offers for the row that now runs `held`: the handle (stopping one
@@ -220,46 +231,6 @@ impl CapturePollerSlot {
     }
 }
 
-/// What a row may keep of a prior row's slot when it takes the whole slot over: a poller serves
-/// one tool on one execution, and the repair window it paces was armed for the same, so each is
-/// kept only while the receiving row still runs what the prior row ran.
-///
-/// Decided against the prior slot before the slot moves, since the move consumes it.
-pub(crate) struct Handoff {
-    keeps_handle: bool,
-    keeps_pacing: bool,
-}
-
-impl Handoff {
-    /// Stop an incompatible offer, but preserve a compatible live receiving watcher when
-    /// a transient snapshot offers no usable watcher. A live compatible offer still takes priority.
-    pub(crate) fn decide(
-        prior: &CapturePollerSlot,
-        prior_held: Held<'_>,
-        receiver: &CapturePollerSlot,
-        held: Held<'_>,
-    ) -> Self {
-        let prior_serves = prior.serves(held);
-        if !prior_serves {
-            prior.stop();
-        }
-        Self {
-            keeps_handle: prior_serves || receiver.running_handle(held).is_some(),
-            keeps_pacing: held == prior_held,
-        }
-    }
-
-    /// Drop what the move brought in that the receiving row cannot use.
-    pub(crate) fn settle(self, slot: &mut CapturePollerSlot) {
-        if !self.keeps_handle {
-            slot.handle = None;
-        }
-        if !self.keeps_pacing {
-            slot.repair = PollerRepairBackoff::default();
-            slot.retry_after = None;
-        }
-    }
-}
 
 #[cfg(test)]
 impl CapturePollerSlot {
@@ -332,26 +303,6 @@ mod tests {
         assert!(empty.handle().is_none());
     }
 
-    #[test]
-    fn handoff_carries_the_handle_and_pacing_only_for_the_same_run() {
-        let (one, two) = (execution("one"), execution("two"));
-        let prior_held = Held::new("claude", Some(&one));
-        // (receiving tool, receiving execution, keeps handle, keeps pacing)
-        for (tool, exec, handle, pacing) in [
-            ("claude", Some(&one), true, true),
-            ("claude", Some(&two), false, false),
-            ("codex", Some(&one), false, false),
-            ("claude", None, false, false),
-        ] {
-            let prior = paced(slot_for("claude", Some(one.clone())));
-            let held = Held::new(tool, exec);
-            let handoff = Handoff::decide(&prior, prior_held, &CapturePollerSlot::default(), held);
-            let mut moved = prior;
-            handoff.settle(&mut moved);
-            assert_eq!(moved.handle().is_some(), handle, "{tool} {exec:?}");
-            assert_eq!(has_pacing(&moved), pacing, "{tool} {exec:?}");
-        }
-    }
 
     fn running_slot(tool: &str, execution: Option<ActiveExecution>) -> CapturePollerSlot {
         let mut poller = SessionPoller::new("tmux".into(), tool.into(), execution);
