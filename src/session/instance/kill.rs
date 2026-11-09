@@ -181,31 +181,25 @@ impl Instance {
     /// Capture process handles first, but signal them only after tmux's guard.
     pub(super) fn kill_for_revival_locked(&self) -> Result<()> {
         let removed = (|| -> Result<()> {
-            use crate::tmux::utils::{probe_pane, PaneProbe};
+            use crate::tmux::utils::{observe_pane, PaneProbe};
             let session = self.tmux_session()?;
-            match probe_pane(session.name()) {
-                PaneProbe::Missing => return Ok(()),
-                PaneProbe::Unknown => {
-                    return Err(LaunchIndeterminateCause::ObservationFailed.into());
-                }
-                PaneProbe::Alive | PaneProbe::Dead => {}
-            }
-            let server = std::sync::Arc::new(crate::tmux::ToolSession::server_identity()?);
-            let panes = crate::tmux::batch_pane_metadata()?;
-            let (_, metadata) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
-                .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?;
-            let identity = crate::tmux::ToolSession::legacy_identity(metadata)?;
-            let processes = if metadata.pane_dead {
-                None
-            } else {
-                Some(crate::process::CapturedProcessTree::capture(
-                    identity
+            let deadline = crate::tmux::TmuxCommandDeadline::new();
+            let Some((observation, state, _)) = observe_pane(session.name(), &deadline)? else {
+                return Ok(());
+            };
+            let processes = match state {
+                PaneProbe::Dead => None,
+                PaneProbe::Alive => Some(crate::process::CapturedProcessTree::capture(
+                    observation
+                        .identity
                         .pane_pid
                         .ok_or(LaunchIndeterminateCause::OwnershipUnproven)?,
-                )?)
+                )?),
+                PaneProbe::Missing | PaneProbe::Unknown => {
+                    return Err(LaunchIndeterminateCause::ObservationFailed.into());
+                }
             };
-            let observation = LegacyToolObservation { identity, server };
-            crate::tmux::utils::remove_owned_pane(&observation, metadata.pane_dead)?;
+            crate::tmux::utils::remove_owned_pane(&observation, state == PaneProbe::Dead)?;
             if let Some(processes) = processes {
                 processes.settle(std::time::Duration::from_millis(100))?;
             }
