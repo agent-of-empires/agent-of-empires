@@ -1,7 +1,8 @@
 //! Capability-gated session release, distinct from deleting persisted history.
 
-use agent_client_protocol::schema::v1::{CloseSessionRequest, ErrorCode, SessionId};
-use agent_client_protocol::{Agent, ConnectionTo};
+use agent_client_protocol::v1::schema::{CloseSessionRequest, ErrorCode, SessionId};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::Agent;
 use tokio::sync::oneshot;
 
 use super::delete::{truncate_for_log, ACP_DELETE_ERROR_MSG_MAX};

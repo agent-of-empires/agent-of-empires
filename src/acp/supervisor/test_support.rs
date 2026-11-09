@@ -84,6 +84,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             .epoch()
     }
 
+    /// Admit a prompt without storing it, as `publish_user_prompt` does first.
+    pub(crate) fn test_note_admission(&self, session_id: &str) {
+        lock_recover(&self.lifecycle).note_admission(session_id);
+    }
+
     /// Occupy a slot with a fake worker already carrying what a real drain
     /// publishes before the assigned frame reaches the listener: the
     /// agent-assigned id, and the store the launch observed (#4127).
@@ -284,6 +289,54 @@ pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, temp
     let tmp = tempfile::TempDir::with_prefix_in("aoe-lease-", "/tmp").unwrap();
     let home = crate::session::test_support::isolate_app_dir_at(tmp.path());
     (home, tmp)
+}
+
+/// A `work-codex` wrapper of `codex` with a declared store under a hook-supplied HOME. The
+/// base `~/.codex` holds a conflicting `base` server; the wrapper store holds `account`.
+pub(super) fn codex_wrapper_fixture() -> (
+    crate::session::test_support::AppDirGuard,
+    tempfile::TempDir,
+    PathBuf,
+) {
+    let (home, temp) = isolate_home();
+    let account = temp.path().join("account");
+    let base = dirs::home_dir().unwrap().join(".codex");
+    for (dir, name) in [(account.join(".codex-work"), "account"), (base, "base")] {
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[mcp_servers.{name}]\ncommand = \"{name}\"\n"),
+        )
+        .unwrap();
+    }
+    let app_dir = crate::session::get_app_dir().unwrap();
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(
+        app_dir.join("config.toml"),
+        format!(
+            "[host_hooks]\nbefore_session = \"printf 'HOME={}\\n'\"\n\
+             [session.agent_detect_as]\nwork-codex = \"codex\"\n\
+             [session.agent_config_dir]\nwork-codex = \"~/.codex-work\"\n",
+            account.display()
+        ),
+    )
+    .unwrap();
+    (home, temp, account)
+}
+
+pub(super) fn sandbox_info() -> crate::session::SandboxInfo {
+    crate::session::SandboxInfo {
+        provider: None,
+        enabled: true,
+        container_id: None,
+        image: "alpine:latest".into(),
+        container_name: "aoe-test-sandbox".into(),
+        extra_env: None,
+        custom_instruction: None,
+        before_start_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        container_workdir: None,
+    }
 }
 
 pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {

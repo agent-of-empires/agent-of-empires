@@ -29,7 +29,8 @@ fn web_row(h: &TuiTestHarness) -> String {
 #[test]
 #[parallel]
 fn test_plugin_cli_lists_describes_and_toggles_builtins() {
-    let h = TuiTestHarness::new("plugin_cli");
+    let mut h = TuiTestHarness::new_in_tmp("plugin_cli");
+    h.stop_daemon_on_drop();
     let list = h.run_cli_ok(&["plugin", "list"]);
     assert!(
         list.contains("ID") && list.contains("VERSION") && list.contains("STATE"),
@@ -69,7 +70,8 @@ fn test_plugin_cli_lists_describes_and_toggles_builtins() {
 #[test]
 #[parallel]
 fn test_serve_refuses_when_web_plugin_disabled() {
-    let h = TuiTestHarness::new("plugin_serve_gate");
+    let mut h = TuiTestHarness::new_in_tmp("plugin_serve_gate");
+    h.stop_daemon_on_drop();
     let free_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -93,6 +95,8 @@ fn test_serve_refuses_when_web_plugin_disabled() {
 
     let enable = h.run_cli(&["plugin", "enable", "aoe.web"]);
     assert!(enable.status.success(), "enable aoe.web failed");
+    // The disable auto-started a Daemon; stop it so the explicit start below binds its own port.
+    assert!(h.run_cli(&["serve", "--stop"]).status.success());
 
     let started = h.run_cli(&["serve", "--daemon", "--port", &free_port, "--no-auth"]);
     assert!(
@@ -128,10 +132,129 @@ fn open_manager(h: &TuiTestHarness) {
     h.wait_for(" Plugins ");
 }
 
-/// The manager lists builtins by manifest name and version with their state.
-/// Enter opens the details popup (`aoe plugin info`'s TUI twin) and Esc closes
-/// it; Space toggles the plugin and reports where the write landed (no daemon
-/// here, so the plain local message).
+#[test]
+#[parallel]
+fn test_tui_web_toggle_does_not_replay_daemon_rejection() {
+    require_tmux!();
+    if !crate::serve::isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("web_toggle_no_replay");
+    h.stop_daemon_on_drop();
+    h.start_daemon_with(&["--read-only"]);
+    h.spawn_tui();
+    open_manager(&h);
+    let config = crate::harness::app_dir_in(h.home_path()).join("config.toml");
+    let before = std::fs::read(&config).unwrap();
+    let error = h.run_cli_err(&["plugin", "disable", "aoe.web"]);
+    assert!(error.contains("read-only"), "{error}");
+    assert!(!error.contains("aoe serve --stop"), "{error}");
+    assert_eq!(std::fs::read(&config).unwrap(), before);
+    h.send_keys("Space");
+    h.wait_for("read-only");
+    h.assert_screen_not_contains("aoe serve --stop");
+    assert_eq!(std::fs::read(config).unwrap(), before);
+}
+
+/// A live owner with an unusable RPC endpoint is not an absent daemon.
+#[test]
+#[parallel]
+fn test_tui_web_toggle_does_not_replay_stale_daemon_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    require_tmux!();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for missing_route in [false, true] {
+        let mut h = TuiTestHarness::new_in_tmp("web_toggle_stale_daemon");
+        h.stop_daemon_on_drop();
+        h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+        h.spawn_tui();
+        h.wait_for_runtime_ready();
+        open_manager(&h);
+        let app = crate::harness::app_dir_in(h.home_path());
+        let config = app.join("config.toml");
+        let before = std::fs::read(&config).unwrap();
+        let pid = std::fs::read(app.join("serve.pid")).unwrap();
+        let socket = app.join("daemon/api.sock");
+        let retained = app.join("daemon/retained-api.sock");
+        std::fs::rename(&socket, &retained).unwrap();
+
+        let (server, received) = if missing_route {
+            let (sent, received) = std::sync::mpsc::channel();
+            let listener = {
+                let _entered = runtime.enter();
+                tokio::net::UnixListener::bind(&socket).unwrap()
+            };
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let router = axum::Router::new()
+                .route(
+                    "/api/plugins/aoe.web/enabled",
+                    axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                        assert_eq!(body["enabled"], false);
+                        sent.send(()).unwrap();
+                        std::future::ready(axum::http::StatusCode::NOT_FOUND)
+                    }),
+                )
+                .route(
+                    "/api/sessions",
+                    axum::routing::get(|| async { axum::http::StatusCode::OK }),
+                );
+            let server = runtime.spawn(async move {
+                axum::serve(listener, router).await.unwrap();
+            });
+            (Some(server), Some(received))
+        } else {
+            (None, None)
+        };
+        h.run_cli_ok(&["serve", "--status"]);
+        assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
+        let error = h.run_cli_err(&["--no-autostart", "plugin", "disable", "aoe.web"]);
+        assert_eq!(error.contains("aoe serve --stop"), missing_route, "{error}");
+        if let Some(received) = &received {
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        h.send_keys("Space");
+        if let Some(received) = received {
+            received.recv_timeout(Duration::from_secs(5)).unwrap();
+            h.wait_for("HTTP 404");
+        }
+        h.wait_for("aoe serve --stop");
+        assert!(
+            std::fs::read(&config).unwrap() == before,
+            "A failed Web RPC rewrote local configuration"
+        );
+        if let Some(server) = server {
+            server.abort();
+            let _ = runtime.block_on(server);
+        }
+        std::fs::rename(&retained, &socket).unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+        h.send_keys("Space");
+        h.wait_for("Disabled aoe.web; the daemon reconciled its workers.");
+        let saved: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            saved["plugins"]["aoe.web"]["enabled"].as_bool(),
+            Some(false)
+        );
+        h.run_cli_ok(&["serve", "--status"]);
+        assert_eq!(std::fs::read(app.join("serve.pid")).unwrap(), pid);
+        h.kill_tui();
+        h.run_cli_ok(&["serve", "--stop"]);
+        h.run_cli_ok(&["plugin", "info", "aoe.web"]);
+        h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+        h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+        let recovered: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            recovered["plugins"]["aoe.web"]["enabled"].as_bool(),
+            Some(false)
+        );
+    }
+}
+
 #[test]
 #[parallel]
 fn test_tui_manager_lists_details_and_toggles() {

@@ -297,16 +297,22 @@ export interface AgentInfo {
   name: string;
   /** How copy names the agent; the registry id for custom agents. */
   display_name: string;
-  kind: "builtin" | "custom";
+  kind: "builtin" | "custom" | "plugin";
   binary: string;
   host_only: boolean;
+  /** Always runs in Yolo mode in a terminal session, so the wizard locks the switch on. */
+  always_yolo?: boolean;
+  /** The same for a structured session, which can run a custom agent's own adapter instead. */
+  acp_always_yolo?: boolean;
   installed: boolean;
   install_hint: string;
   /** Has a one-shot mode for smart rename. Always false for custom agents. */
   oneshot_capable?: boolean;
   acp_capable: boolean;
-  /** The ACP adapter binary is resolvable on the host. */
+  /** The ACP adapter resolves on the host now; `on_create`/`on_launch` hooks don't count. Import and usage-limit alternatives need this. */
   acp_installed: boolean;
+  /** A non-sandboxed structured create in the served profile will accept this agent; its own hooks count. */
+  acp_create_ready?: boolean;
   /** Allowed by `[acp] allowed_agents`; `acp_capable` stays the intrinsic fact. Absent means permitted. */
   acp_allowed?: boolean;
   /** Built-in ACP launch command after `${aoe_data_dir}` substitution; absent for custom agents. */
@@ -376,6 +382,8 @@ export interface ProjectInfo {
 export interface DockerStatusResponse {
   available: boolean;
   runtime: string | null;
+  /** The configured runtime's display name ("Apple Container"), also when it is down. */
+  runtime_name?: string | null;
 }
 
 export interface CreationTrustFingerprint {
@@ -430,11 +438,23 @@ export interface CreateSessionRequest {
   retry_origin?: string;
 }
 
+export type CreateStage = "preparing" | "starting_container" | "running_hooks" | "starting";
+
 export interface CreateProgress {
-  stage: "preparing" | "starting_container" | "running_hooks" | "starting";
+  stage: CreateStage;
   /** The `on_create` command currently running. */
   hook: string | null;
   output: string[];
+}
+
+/** A create the server refused, in the credential-free terms it sends to any client. */
+export interface CreateFailure {
+  code: string;
+  message: string;
+  /** Unknown for a refusal made before the create started. */
+  stage: CreateStage | null;
+  /** Finds the failure's line in the Daemon log; null when the server sent none. */
+  reference: string | null;
 }
 
 export interface ImportableSession {

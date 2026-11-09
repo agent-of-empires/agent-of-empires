@@ -58,11 +58,56 @@ pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
 use crate::session::Instance;
 use anyhow::{bail, Result};
 
+/// A client for the Daemon, auto-started when none runs (ADR 0004).
+pub(crate) async fn daemon_client() -> Result<crate::acp::client::HttpClient> {
+    let endpoint = crate::acp::client::require_daemon().await?;
+    Ok(crate::acp::client::HttpClient::new(endpoint)?)
+}
+
+/// A profile or project write on the epoch-checked Daemon routes. The Daemon,
+/// auto-started when none runs, validates profiles, paths and names against its
+/// own store and answers with its own message.
+pub(crate) async fn runtime_write(
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value> {
+    let endpoint = crate::acp::client::daemon_manager::require_config_daemon().await?;
+    let client = crate::acp::client::HttpClient::new(endpoint)?;
+    // Its client carries the passphrase session, which a bare endpoint's does not.
+    let info = client.daemon_client().await?.runtime_info().await?;
+    anyhow::ensure!(
+        info.protocol_version == crate::daemon::RUNTIME_PROTOCOL_VERSION,
+        "Daemon runtime protocol is incompatible"
+    );
+    Ok(client
+        .mutate_with(method, path, |request| {
+            let request = request.header(crate::daemon::RUNTIME_EPOCH_HEADER, &info.epoch);
+            match &body {
+                Some(body) => request.json(body),
+                None => request,
+            }
+        })
+        .await?)
+}
+
 /// The fields `resolve_session` matches an identifier against.
 pub trait SessionRef {
     fn id(&self) -> &str;
     fn title(&self) -> &str;
     fn project_path(&self) -> &str;
+}
+
+impl<T: SessionRef + ?Sized> SessionRef for &T {
+    fn id(&self) -> &str {
+        T::id(self)
+    }
+    fn title(&self) -> &str {
+        T::title(self)
+    }
+    fn project_path(&self) -> &str {
+        T::project_path(self)
+    }
 }
 
 impl SessionRef for Instance {

@@ -4,11 +4,15 @@ use super::*;
 use crate::session::SessionStore;
 use anyhow::bail;
 
+#[derive(Debug, thiserror::Error)]
+#[error("agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching this host session")]
+pub(crate) struct HostHookApprovalRequired;
+
 /// `program` is the basename of the executable the launch runs. A bare-token wrapper such as
 /// `company-codex` can be the agent itself under another name (a symlink or copy), so the identity
 /// hook's ancestor walk must count that name too: otherwise a nested `codex exec` is the only
 /// process named like the agent and passes as the pane's own.
-pub(super) fn status_hook_env_prefix(
+pub(super) fn host_launch_env_prefix(
     profile: &str,
     instance_id: &str,
     agent: Option<&crate::agents::AgentDef>,
@@ -320,10 +324,11 @@ impl Instance {
         skip_on_launch: bool,
         store: &dyn SessionStore,
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
+        launch_generation: Option<u64>,
     ) -> Result<()> {
         let config = store.configuration(Some(store.storage().profile()))?;
         self.mint_host_session_env(&config)?;
-        self.run_launch_hooks(skip_on_launch, store, progress)
+        self.run_launch_hooks(skip_on_launch, store, progress, launch_generation)
     }
 
     fn run_launch_hooks(
@@ -331,6 +336,7 @@ impl Instance {
         skip_on_launch: bool,
         store: &dyn SessionStore,
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
+        launch_generation: Option<u64>,
     ) -> Result<()> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&crate::session::config::quote_model_value_in_args(
@@ -356,7 +362,7 @@ impl Instance {
         };
 
         if self.is_sandboxed() {
-            self.ensure_container_in(store)?;
+            self.ensure_container_in(store, launch_generation)?;
             if let (Some(hook_cmds), Some(sandbox)) =
                 (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
             {
@@ -497,10 +503,7 @@ impl Instance {
             return Ok(());
         }
         if !host_hooks_acknowledged() {
-            bail!(
-                "agent hook paths have not been approved; run `aoe hooks approve` \
-                 before launching this host session"
-            );
+            return Err(HostHookApprovalRequired.into());
         }
         let profile_environment = self.profile_host_environment();
         let resolved_environment = self.resolved_host_environment();
@@ -2014,12 +2017,12 @@ mod tests {
     }
 
     #[test]
-    fn status_hook_env_prefix_is_set_for_hook_agents_only() {
+    fn host_launch_env_prefix_adds_identity_only_for_hooks() {
         for agent in ["codex", "hermes", "settl", "claude", "kiro", "kimi"] {
             let binary = crate::agents::get_agent(agent).unwrap().binary;
             for program in [None, Some(binary)] {
                 assert_eq!(
-                    status_hook_env_prefix(
+                    host_launch_env_prefix(
                         "work",
                         "abc123",
                         crate::agents::get_agent(agent),
@@ -2030,7 +2033,7 @@ mod tests {
             }
         }
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
+            host_launch_env_prefix("work", "abc123", crate::agents::get_agent("opencode"), None),
             ""
         );
     }
@@ -2038,8 +2041,8 @@ mod tests {
     /// A renamed launch (`company-codex` running Codex) tells the identity hook its name, so the
     /// hook's ancestor walk counts the outer agent and refuses a nested `codex exec`.
     #[test]
-    fn status_hook_env_prefix_names_a_renamed_launched_program() {
-        let prefix = status_hook_env_prefix(
+    fn host_launch_env_prefix_names_a_renamed_launched_program() {
+        let prefix = host_launch_env_prefix(
             "work",
             "abc123",
             crate::agents::get_agent("codex"),

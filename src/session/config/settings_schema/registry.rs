@@ -70,6 +70,36 @@ mod tests {
     use crate::session::config::settings_schema::{ValidationKind, WebWritePolicy, WidgetKind};
 
     #[test]
+    fn split_terminal_settings_expose_defaults_and_validate_bounds() {
+        let config: SessionConfig = toml::from_str("").unwrap();
+        let defaults = serde_json::to_value(config).unwrap();
+        for (field, default, min, max) in [
+            ("split_terminal_height_percent", 50, 1, 99),
+            ("split_terminal_min_width", 100, 0, 1000),
+            ("split_terminal_min_height", 30, 0, 1000),
+        ] {
+            assert_eq!(defaults[field], default, "{field}");
+            let d = descriptor("session", field).unwrap();
+            assert!(!d.profile_overridable, "{field}");
+            assert_eq!(
+                d.widget,
+                WidgetKind::Number {
+                    min: Some(min),
+                    max: Some(max),
+                },
+                "{field}"
+            );
+            for (value, valid) in [(min - 1, false), (min, true), (max, true), (max + 1, false)] {
+                assert_eq!(
+                    super::super::validate_value(&d.validation, &serde_json::json!(value)).is_ok(),
+                    valid,
+                    "{field}: {value}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn notice_timeout_is_capped_below_the_browser_timer_limit() {
         // The web dashboard passes this value to setTimeout in milliseconds,
         // which overflows above 2^31 - 1 ms (#4475).

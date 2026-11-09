@@ -3,9 +3,9 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.21.0"
+version = "1.22.3"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.95"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
 # MIT throughout, except the OSC 8 emission state machine in
@@ -28,7 +28,7 @@ ansi-to-tui = "8.0"
 # In-process VT emulator for the default live-preview path (`src/tmux/vt.rs`,
 # opt out with `AOE_VT_LIVE=0`): parse a pane's raw byte stream into an owned
 # grid instead of scraping `capture-pane` snapshots.
-vt100 = "0.16"
+vt100 = "0.18"
 ratatui-textarea = "0.9"
 tui-input = "0.15"
 # Markdown parsing for the structured view transcript. We map events to ratatui
@@ -84,7 +84,7 @@ zstd = "0.14"
 rand = "0.10"
 
 # Directory utilities
-dirs = "6.0"
+dirs = "7.0"
 
 # Glob expansion for sandbox volume_ignores patterns (e.g. `**/bin`, `**/obj`)
 glob = "0.3"
@@ -103,6 +103,7 @@ percent-encoding = "2"
 tokio-util = { version = "0.7", features = ["codec", "compat", "io-util"] }
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
+unicode-general-category = "1"
 unicode-normalization = "0.1"
 unicode-segmentation = "1"
 # 0.2.3 widens U+FF9E/U+FF9F to one cell, which ratatui-core 0.1.2's `CellWidth`
@@ -127,7 +128,7 @@ sha2 = "0.11"
 
 # Locking
 fs2 = "0.4"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Stream utilities (for crossterm EventStream)
 futures-util = "0.3"
@@ -139,7 +140,7 @@ tempfile = "3.14"
 which = "8.0"
 
 # SQLite
-rusqlite = "0.40"
+rusqlite = "0.41"
 
 axum = { version = "0.8", features = ["ws"] }
 # hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
@@ -148,7 +149,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # Cross-platform browser launcher: `aoe serve --open`, the plugin host's
 # `ui.open_url`, and structured-view link activation.
 webbrowser = "1"
-tower-http = { version = "0.7", features = ["fs"] }
+tower-http = { version = "0.7", features = ["compression-gzip", "compression-zstd", "fs"] }
 # Embedded dashboard bundle, behind `web`.
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
 # Content type for the session file-read endpoint.
@@ -173,7 +174,7 @@ jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 getrandom = "0.4"
 
 # Agent Client Protocol — drives the structured view surface.
-agent-client-protocol = { version = "2.2", features = ["unstable_end_turn_token_usage", "unstable_session_compaction", "unstable_session_fork", "unstable_session_notices"] }
+agent-client-protocol = { version = "5", features = ["unstable_end_turn_token_usage", "unstable_session_fork"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = "1"
@@ -199,6 +200,10 @@ schemars = { version = "1", features = ["chrono04"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a

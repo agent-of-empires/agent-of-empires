@@ -912,6 +912,7 @@ fn an_unset_hook_env_variable_warns_about_the_host_hook_not_the_container() {
 fn structured_view_setting_gates_the_offer_and_sets_the_default() {
     use crate::session::config::StructuredView;
     for (view, offered, starts_structured) in [
+        (StructuredView::Auto, true, false),
         (StructuredView::Off, false, false),
         (StructuredView::Terminal, true, false),
         (StructuredView::Structured, true, true),
@@ -924,6 +925,7 @@ fn structured_view_setting_gates_the_offer_and_sets_the_default() {
             starts_structured
         );
     }
+    assert_eq!(Config::default().acp.structured_view, StructuredView::Auto);
 }
 
 #[test]
@@ -953,6 +955,149 @@ fn the_structured_row_appears_only_for_an_acp_capable_tool() {
     dialog.set_structured_capable(false);
     assert!(!dialog.structured_enabled);
     assert!(!submitted(dialog.build_submit_result()).structured);
+}
+
+#[test]
+fn a_custom_agent_locks_yolo_only_in_the_views_that_run_an_always_yolo_base() {
+    // (terminal locked, structured locked), with a Yolo the user turned on beforehand.
+    for (name, expected) in [
+        ("my-pi", (true, true)),
+        ("own-pi", (true, false)),
+        ("my-claude", (false, false)),
+    ] {
+        let mut dialog = NewSessionDialog::new_with_tools(vec![name], TEST_PATH.to_string());
+        let base = name.trim_start_matches("my-").trim_start_matches("own-");
+        dialog
+            .agent_detect_as
+            .insert(name.to_string(), base.to_string());
+        dialog
+            .agent_acp_cmd
+            .insert("own-pi".to_string(), "own-pi-acp".to_string());
+        dialog.set_structured_capable(true);
+        dialog.yolo_mode = true;
+        let locked = |d: &NewSessionDialog| d.field_indices().yolo == FieldIndices::ABSENT;
+        assert_eq!(locked(&dialog), expected.0, "{name} terminal");
+
+        dialog.focused_field = dialog.field_indices().structured;
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert!(dialog.structured_enabled, "{name}");
+        assert_eq!(locked(&dialog), expected.1, "{name} structured");
+        // Leaving the lock resets Yolo to the default; an unchanged lock keeps the choice.
+        let yolo = expected.1 || expected.0 == expected.1;
+        assert_eq!(dialog.yolo_mode, yolo, "{name}");
+        assert_eq!(
+            submitted(dialog.build_submit_result()).yolo_mode,
+            yolo,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_view() {
+    let temp_home = tempfile::tempdir().expect("temp home");
+    let _home = crate::session::test_support::isolate_home(temp_home.path());
+    let repo_mapping = |base: &str| {
+        let repo = tempfile::tempdir().expect("repo dir");
+        fs::create_dir_all(repo.path().join(".agent-of-empires")).expect("repo config dir");
+        fs::write(
+            repo.path().join(".agent-of-empires/config.toml"),
+            format!("[session]\nagent_detect_as = {{ wrap = \"{base}\" }}\n"),
+        )
+        .expect("repo config");
+        repo
+    };
+    let (pi, claude) = (repo_mapping("pi"), repo_mapping("claude"));
+    type Arrive = fn(&mut NewSessionDialog, String);
+    let arrivals: &[(&str, Arrive)] = &[
+        ("typed", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(String::new());
+            type_str(d, &path);
+            d.handle_key(key(KeyCode::Tab));
+        }),
+        ("picked", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(path);
+            d.handle_key(ctrl_key(KeyCode::Char('p')));
+            d.handle_key(key(KeyCode::Enter));
+            assert!(!d.dir_picker.is_active());
+        }),
+        ("clicked away", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(path);
+            let worktree = d.field_indices().worktree;
+            d.focusable_rects
+                .push((worktree, ratatui::layout::Rect::new(0, 9, 30, 1)));
+            d.handle_click(10, 9);
+            assert!(d.worktree_enabled, "the click must toggle the row it hit");
+        }),
+        ("sandbox env edited", |d, path| {
+            d.extra_env_overridden = true;
+            d.set_path(path);
+        }),
+        ("back-tabbed", |d, path| {
+            d.focused_field = d.path_field();
+            d.path = Input::new(path);
+            d.handle_key(key(KeyCode::BackTab));
+            assert_eq!(
+                d.focused_field,
+                d.field_indices().group,
+                "BackTab wraps to Group"
+            );
+        }),
+        ("scratch", |d, _| {
+            d.focused_field = d.field_indices().worktree;
+            d.handle_key(ctrl_key(KeyCode::Char('t')));
+            assert_eq!(
+                d.focused_field,
+                d.field_indices().worktree,
+                "focus stays on Worktree"
+            );
+        }),
+    ];
+    let locked = |d: &NewSessionDialog| d.field_indices().yolo == FieldIndices::ABSENT;
+    // Leaving the `pi` lock must drop the forced Yolo, not submit it.
+    for (from, to, to_locked) in [(&pi, &claude, false), (&claude, &pi, true)] {
+        for (name, arrive) in arrivals {
+            let mut dialog = NewSessionDialog::new_with_tools(vec!["wrap"], TEST_PATH.to_string());
+            dialog.set_path(from.path().to_string_lossy().to_string());
+            assert!(dialog.structured_capable, "{name}");
+            assert_eq!(locked(&dialog), !to_locked, "{name}");
+            arrive(&mut dialog, to.path().to_string_lossy().to_string());
+            // Scratch has no repo, so `wrap` is an unknown agent again.
+            let (lock, capable) = if *name == "scratch" {
+                (false, false)
+            } else {
+                (to_locked, true)
+            };
+            assert_eq!(
+                dialog.structured_capable, capable,
+                "{name} to_locked={to_locked}"
+            );
+            assert_eq!(locked(&dialog), lock, "{name} to_locked={to_locked}");
+            assert_eq!(
+                submitted(dialog.build_submit_result()).yolo_mode,
+                lock,
+                "{name} to_locked={to_locked}"
+            );
+        }
+    }
+
+    // A clicked row the move hides activates nothing in its place.
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["wrap"], TEST_PATH.to_string());
+    dialog.set_path(claude.path().to_string_lossy().to_string());
+    dialog.focused_field = dialog.path_field();
+    dialog.path = Input::new(pi.path().to_string_lossy().to_string());
+    let (yolo, worktree) = (dialog.field_indices().yolo, dialog.worktree_enabled);
+    dialog
+        .focusable_rects
+        .push((yolo, ratatui::layout::Rect::new(0, 9, 30, 1)));
+    dialog.handle_click(10, 9);
+    assert!(locked(&dialog));
+    assert_eq!(dialog.focused_field, dialog.path_field());
+    assert_eq!(dialog.worktree_enabled, worktree);
 }
 
 #[test]

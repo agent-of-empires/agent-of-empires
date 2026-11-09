@@ -79,8 +79,11 @@ const AGENT_TURN_CONTINUATION: &str = "continue";
 /// What the continuation producer decided for one session (#4092).
 #[must_use]
 pub(crate) enum ContinuationOutcome {
-    /// The interrupted prompt is the next turn, is already installed, or there
-    /// was nothing to replay. Only this outcome licenses the automatic
+    /// This call installed the interrupted prompt as the next turn. Licenses
+    /// the automatic `RateLimitAutoResumed`, like [`Self::Stands`].
+    Installed,
+    /// The continuation is already in place, a handoff owns the session, or
+    /// there was nothing to replay. Licenses the automatic
     /// `RateLimitAutoResumed`, which is the budget's arming step.
     Stands,
     /// A queued prompt owns the next turn, and any continuation an earlier
@@ -187,7 +190,7 @@ pub(crate) async fn install_rate_limit_continuation(
         .session_service
         .set_pending_initial_turn(id, text, attachments)
         .await;
-    ContinuationOutcome::Stands
+    ContinuationOutcome::Installed
 }
 
 /// Releases rate-limit parks whose window elapsed: install the interrupted
@@ -347,7 +350,7 @@ pub(super) async fn reap_rate_limit_resumes(
         };
         let outcome = install_rate_limit_continuation(state, &id, submission).await;
         match outcome {
-            ContinuationOutcome::Stands => {
+            ContinuationOutcome::Stands | ContinuationOutcome::Installed => {
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resume_at, false);

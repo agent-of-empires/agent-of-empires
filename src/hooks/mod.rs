@@ -5,7 +5,7 @@
 mod codex;
 mod command;
 mod config_io;
-mod dir_guard;
+pub(crate) mod dir_guard;
 mod hermes;
 mod hermes_yaml;
 mod json_settings;

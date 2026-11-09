@@ -15,7 +15,7 @@ The dashboard is the home screen of the web app: a workspace sidebar on the left
 
 Each sidebar row carries an animated braille glyph encoding the session's state: a spinner of dots while **Running**, an orbiting dot while **Waiting** or **Creating**, a slow breathe while **Starting** or freshly idle. Errors render in the error color. The frame is offset by each session's creation time so rows don't pulse in lockstep.
 
-The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
+The **?** in the sidebar header opens a legend of every glyph and mark: the status glyphs, Unread, Pinned Session, Favorite, Project, Pinned project and the Group dot. It's a popover on desktop and a sheet on a phone. Hovering a glyph or mark with a mouse shows what it means, and a row that needs attention for another reason adds that on a second line. With a row focused from the keyboard, its glyph's meaning shows too, along with **Press Enter to open**. Animated glyphs in the legend hold still when your system asks for reduced motion.
 
 ## Creating a session
 
@@ -25,9 +25,10 @@ The **New session** wizard is one screen of one-line rows, like the TUI dialog; 
 - **Title**: auto-slugifies into a worktree branch name unless you edit the branch.
 - **Group**: search existing groups, including empty groups, or select the create row for a new name; surrounding spaces are trimmed on selection and `/` nests groups. Counts show sessions directly in the group, excluding archived and trashed sessions. Escape closes the suggestions without closing the wizard.
 - **Agent**: the tool, plus instructions, command override, and extra args.
-- **Structured**, **Auto-approve**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
+- **Structured**, **Yolo mode**, **Worktree**, and **Sandbox** switches; the Worktree and Sandbox rows open their branch, base, image, and env options.
 
 Choosing a profile (the **Profile** row, shown when there is more than one) seeds these defaults; switching profiles after you have edited a field asks first. A create that runs `on_create` hooks shows their output while it runs, and **Continue in background** closes the wizard and reports the result when it finishes.
+If the daemon refuses the create, the wizard stays open and says what failed and at which step. For a Sandbox or Project failure, it outlines the row that caused it. It offers the fixes that apply, such as **Retry** once the container runtime is running or **Launch without Sandbox**. Its reference finds the failure in `debug.log`. A create the daemon refuses after **Continue in background** shows a notice whose **Reopen** brings the wizard back with the same form, unless the connection dropped while it was sent.
 Renaming a profile in either Settings surface refreshes the served-profile
 authority before an implicit wizard reads profile settings or projects. Failed
 refreshes keep Launch disabled and offer Retry server profile without discarding edits.
@@ -66,14 +67,14 @@ A sort picker next to the filter button offers three modes:
 
 Drag-to-reorder is disabled in the computed modes. The picker's state is per-browser (localStorage), not synced and not tied to your profile. The Multi-repo and Scratch groups default to the bottom; in manual mode you can drag them anywhere, in computed modes they stay at the bottom.
 
-## Sidebar grouping: repo, org, group, both, or status
+## Sidebar grouping: repo, organization, group, both, or status
 
 A grouping picker (layers icon) next to the sort picker opens a menu of axes, so any of them is one pick away:
 
 ![The sidebar grouped by session status, with the grouping picker open](../../assets/web/sidebar-grouping.png)
 
 - **By repo** (default): groups by git repository.
-- **By org**: groups repositories by their remote owner, across any hosted git remote. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
+- **By organization**: groups repositories by the owner in their git remote (any hosted remote, not only GitHub), with each repository's header inside its owner. Repos with no resolvable owner fall into a **No organization** bucket pinned to the bottom.
 - **By group**: groups by the user-defined group assigned in the TUI rename dialog, with `aoe group move`, or via **Move to another group** below. Ungrouped sessions fall into an **Ungrouped** bucket pinned to the bottom.
 - **By repo and group**: repository headers with user groups nested inside each. A session split across groups appears once per subgroup.
 - **By status**: groups by each session's actual execution status, in the same attention order the Attention sort and the Board's cards use: Waiting, Error, Idle, Unknown, Running, Stopped, then the transient Creating, Deleting and Starting. A workspace whose sessions differ in status appears once per status. This mirrors the TUI's Status grouping (`g` then Status).
@@ -116,12 +117,17 @@ With more than one row selected, right-click (long-press on touch) any selected 
 
 ## Projects
 
-A **Projects, no sessions** section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects that are not pinned and have no live session. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆. The section is expanded by default; its collapsed state persists per-browser.
+A Projects section near the bottom of the sidebar (above "Snoozed & archived") lists your registered Projects. It is the same registry the new-session wizard's "Projects" list reads, and it shows on every grouping axis. The section is expanded by default; its collapsed state persists per-browser.
 
-Pinned projects always render above as their own headers, with or without sessions. Projects with live sessions also render above as normal groups.
+What it lists depends on whether the grouping draws repository headers:
+
+- **By repo**, **By organization** and **By repo and group** draw them, so the section is **Projects, no sessions**: registered Projects that are not pinned and have no live session. A pinned Project renders above as its own header, with or without sessions, and a Project with live sessions renders above as a normal group. Repository headers backed by a registered Project carry a ◇ marker, and a pinned one ◆.
+- **By group** draws Groups instead, so the section is **Projects** and lists every registered Project once, with or without live sessions; a pinned one is marked ◆.
+
+The compact sidebar labels it **Projects** in every mode.
 
 - **Add** with the **+** on the section header: browse for a path or type one, optionally set a name and a default base branch, choose global or profile scope, then save. The project appears in the section, ready to start work in.
-- **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list.
+- **Start a session** by clicking a project row (or its **+**), which opens the new-session flow in that repo. Once it has a session it moves up into the normal group list, except **By group**, where it stays in the section.
 - **Project settings** and **Remove** live in the row's right-click (long-press on touch) menu. Project settings control the default base branch plus worktree-by-default, smart-rename and start-in-container overrides. Remove targets that row's registrations; see [project registry scope](../multi-repo-workspaces.md#web-dashboard). The add, edit, and remove controls are hidden in read-only mode.
 
 ## Settings

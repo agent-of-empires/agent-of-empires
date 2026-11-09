@@ -2,6 +2,7 @@
 
 use axum::Router;
 use std::sync::Arc;
+use tower_http::compression::predicate::{Predicate, SizeAbove};
 use tracing::Instrument;
 
 use super::access::{access_policy, cityhall_gate, security_headers};
@@ -269,6 +270,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/settings/resolved", get(api::get_settings_resolved))
         // The CityHall config bundle an admin hands to CityHall.
         .route("/api/cityhall/bundle", get(api::get_cityhall_bundle))
+        .route("/api/cityhall/apply", post(api::apply_cityhall_bundle))
         .route("/api/tips", get(api::get_tips))
         .route("/api/tips/show", post(api::set_show_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
@@ -410,6 +412,7 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         // posts to the telemetry backend directly).
         .route("/api/telemetry/status", get(api::get_telemetry_status))
         .route("/api/telemetry/consent", post(api::set_telemetry_consent))
+        .route("/api/telemetry/reset-id", post(api::reset_telemetry_id))
         .route("/api/telemetry/seen", post(api::post_telemetry_seen))
         .route(
             "/api/telemetry/structured-interaction",
@@ -554,8 +557,27 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     ))
     .layer(axum::middleware::from_fn(security_headers))
     .layer(axum::middleware::from_fn(http_request_span))
+    .layer(compression_layer())
     .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
     .with_state(state)
+}
+
+/// gzip/zstd for JSON bodies only. Upgrades, SSE, replay streams and assets
+/// carry other content types and pass through untouched.
+fn compression_layer() -> tower_http::compression::CompressionLayer<impl Predicate> {
+    let json = |_: axum::http::StatusCode,
+                _: axum::http::Version,
+                headers: &axum::http::HeaderMap,
+                _: &axum::http::Extensions| {
+        headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("application/json"))
+    };
+    tower_http::compression::CompressionLayer::new()
+        .no_br()
+        .no_deflate()
+        .compress_when(SizeAbove::new(1024).and(json))
 }
 
 /// Placeholder logged in place of a route template when axum matched no
@@ -607,27 +629,15 @@ pub(super) fn is_log_safe_request_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Middleware that wraps every request in an `http.request` span with a
-/// generated or echoed `X-Request-Id`, then emits one completion event at
-/// the level matching the response status. Logs fired inside the request
-/// (auth middleware, route handlers, downstream `tracing` events) inherit
-/// the span fields, so a single grep on `request_id` reconstructs the call.
-///
-/// The completion event repeats `request_id`, `method`, and `path` as its
-/// own fields rather than relying on the span: `[logging].show_spans` is
-/// `false` by default, which drops the span prefix from the rendered line
-/// and used to leave `completed status=500 latency_ms=0` with nothing to
-/// identify the request (#3402). For the same reason the event is emitted
-/// outside the span, so enabling `show_spans` prints each field once
-/// instead of twice.
-///
-/// Successful completions (2xx/3xx) emit at `debug`, not `info`: the web
-/// UI polls `/api/sessions` every ~2s, so an info-level success log here
-/// would flood `debug.log` at the default `info` filter. Users who want
-/// to see every request can dial `http.request=debug` from settings;
-/// 4xx (`warn`) and 5xx (`error`) stay visible at the default level.
+/// The request's `X-Request-Id`, generated or echoed, for handlers that report it.
+#[derive(Debug, Clone)]
+pub struct RequestId(pub String);
+
+/// Middleware that wraps every request in an `http.request` span with a generated or echoed
+/// `X-Request-Id`, then emits one completion event at the level matching the response
+/// status.
 pub(super) async fn http_request_span(
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let rid = request
@@ -637,6 +647,7 @@ pub(super) async fn http_request_span(
         .filter(|v| is_log_safe_request_id(v))
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    request.extensions_mut().insert(RequestId(rid.clone()));
     let method = request.method().clone();
     let route = log_route(&request).to_string();
     let span = tracing::debug_span!(
@@ -681,45 +692,17 @@ pub(super) async fn http_request_span(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::test_helpers::vecs;
+    use crate::server::test_helpers::{capture_logs, vecs};
     use crate::server::test_support;
 
-    /// `MakeWriter` sink so the request-log test can read back exactly the
-    /// bytes a daemon would have appended to `debug.log`.
-    #[derive(Clone)]
-    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogSink {
-        fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(src);
-            Ok(src.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// #3402: the `http.request` completion line must identify the request.
-    /// It is rendered with the default `show_spans = false` formatter, which
-    /// drops span fields, so `request_id` / `method` / `path` have to be
-    /// fields of the event itself. `path` is the route template, never the
-    /// raw URI: `aoe serve` ships its auth token in the query string and
-    /// session ids sit in path segments, and neither may reach the log.
+    /// #3402.
     #[tokio::test]
     async fn http_request_log_identifies_request_without_leaking_uri() {
         use tower::ServiceExt;
         const TOKEN: &str = "super-secret-token";
         const SESSION: &str = "sess-9f3a";
 
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let sink = LogSink(buf.clone());
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(move || sink.clone())
-            .with_ansi(false)
-            .event_format(crate::logging::NoSpanFormat)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_guard, buf) = capture_logs();
 
         // (request URI, expected level, expected `path` field, expected status)
         let cases = [
@@ -827,22 +810,78 @@ mod tests {
             ("6f1c2b7e-0f2a-4a1e-9d3c-2b8f5a0c7d11", true),
         ];
         for (header, echoed) in ids {
+            // Handlers see the id the line logs and the response echoes.
             let app = axum::Router::new()
-                .route("/api/sessions", axum::routing::get(|| async { "[]" }))
+                .route(
+                    "/api/sessions",
+                    axum::routing::get(|axum::Extension(id): axum::Extension<RequestId>| async {
+                        id.0
+                    }),
+                )
                 .layer(axum::middleware::from_fn(http_request_span));
             let req = axum::http::Request::builder()
                 .uri("/api/sessions")
                 .header("x-request-id", header)
                 .body(axum::body::Body::empty())
                 .unwrap();
-            app.oneshot(req).await.unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            let echoed_id = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_string();
+            let seen = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(seen, echoed_id.as_bytes(), "{header:?}");
             let line = take_line();
+            assert!(line.contains(&format!("request_id={echoed_id}")), "{line}");
             assert_eq!(
                 line.contains(&format!("request_id={header}")),
                 echoed,
                 "{header:?}: got {line}"
             );
             assert!(line.contains("request_id="), "no request id at all: {line}");
+        }
+    }
+
+    /// Only large JSON is compressed; streams, other types and small bodies
+    /// pass through byte-identical.
+    #[tokio::test]
+    async fn compression_skips_non_json_and_small_bodies() {
+        use tower::ServiceExt;
+        let big = "x".repeat(8192);
+        let cases = [
+            ("application/json", big.clone(), true),
+            ("application/json; charset=utf-8", big.clone(), true),
+            ("application/json", "{}".to_string(), false),
+            ("text/event-stream", big.clone(), false),
+            ("text/plain", big.clone(), false),
+            ("application/octet-stream", big.clone(), false),
+        ];
+        for (content_type, body, compressed) in cases {
+            let payload = body.clone();
+            let app = axum::Router::new()
+                .route(
+                    "/",
+                    axum::routing::get(move || async move {
+                        ([(axum::http::header::CONTENT_TYPE, content_type)], payload)
+                    }),
+                )
+                .layer(compression_layer());
+            let req = axum::http::Request::builder()
+                .uri("/")
+                .header("accept-encoding", "gzip, zstd")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let encoded = resp.headers().contains_key("content-encoding");
+            assert_eq!(encoded, compressed, "{content_type} len={}", body.len());
+            if !compressed {
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(bytes, body.as_bytes(), "{content_type}");
+            }
         }
     }
 }

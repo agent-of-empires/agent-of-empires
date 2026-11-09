@@ -105,7 +105,7 @@ pub enum ActionId {
     /// Dismiss the update, status or image banner for this session. `App` owns the
     /// banner state, so it executes this before the home view sees the key.
     DismissUpdateBanner,
-    /// Scroll the preview back or forward a page while live-send relays keys.
+    /// Scroll the preview back or forward a page.
     PreviewScrollUp,
     PreviewScrollDown,
 }
@@ -233,9 +233,8 @@ pub enum Context {
     /// Rows can be arranged by hand. Under a computed sort the action still resolves, so
     /// the keys are not silently swallowed by cursor movement: it explains itself instead.
     CustomSortable,
-    /// Only while live-send relays keys to the agent; inert in the session list, where the
-    /// same keys mean something else.
-    LiveSend,
+    /// Preview scrolling is available for live-send and visible retained history.
+    PreviewScroll,
     /// `App` dispatches the chord before the home view, so it never resolves here and the
     /// key still falls through to plugin bindings when `App` declines it.
     AppOnly,
@@ -278,8 +277,7 @@ pub struct Ctx {
     /// True when the cursor sits on a real project header in project view, so
     /// the pin toggle can claim its chord ahead of the projects-dialog binding.
     pub project_group_selected: bool,
-    /// Live-send is relaying keys to the agent.
-    pub live_send: bool,
+    pub preview_scroll: bool,
 }
 
 fn chord_matches(c: &Chord, key: &KeyEvent) -> bool {
@@ -307,7 +305,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
         Context::CustomSortable => true,
-        Context::LiveSend => ctx.live_send,
+        Context::PreviewScroll => ctx.preview_scroll,
         Context::AppOnly => false,
     }
 }
@@ -582,13 +580,12 @@ pub static BINDINGS: &[Binding] = &[
             group: PaletteGroup::Actions,
         }),
     },
-    // Live-send only: bare PageUp/PageDown belong to the agent (and to cursor paging in
-    // the list), so the scroll chords need Shift.
+    // Shift separates preview paging from agent input and sidebar paging.
     Binding {
         id: ActionId::PreviewScrollUp,
         non_strict: &[shift_code(KeyCode::PageUp)],
         strict: &[shift_code(KeyCode::PageUp)],
-        context: Context::LiveSend,
+        context: Context::PreviewScroll,
         help: None,
         palette: None,
     },
@@ -596,7 +593,7 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::PreviewScrollDown,
         non_strict: &[shift_code(KeyCode::PageDown)],
         strict: &[shift_code(KeyCode::PageDown)],
-        context: Context::LiveSend,
+        context: Context::PreviewScroll,
         help: None,
         palette: None,
     },
@@ -1358,7 +1355,7 @@ mod tests {
             sort_order: SortOrder::Newest,
             has_search: false,
             project_group_selected: false,
-            live_send: false,
+            preview_scroll: false,
         }
     }
 
@@ -1690,7 +1687,7 @@ mod tests {
     fn app_and_live_chords_resolve_in_their_own_context() {
         let ev = |code, modifiers| KeyEvent::new(code, modifiers);
         let live = Ctx {
-            live_send: true,
+            preview_scroll: true,
             ..ctx()
         };
         let cases = [

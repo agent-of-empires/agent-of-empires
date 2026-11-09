@@ -4,12 +4,13 @@
 use crate::acp::state::{
     ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor, Event, ModeInfo,
 };
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionModeState,
     SetSessionConfigOptionRequest, SetSessionModeRequest,
 };
-use agent_client_protocol::{Agent, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::Agent;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -280,7 +281,7 @@ pub(super) fn map_acp_config_option(option: SessionConfigOption) -> Option<Confi
         return None;
     };
     let choice =
-        |o: agent_client_protocol::schema::v1::SessionConfigSelectOption| ConfigOptionChoice {
+        |o: agent_client_protocol::v1::schema::SessionConfigSelectOption| ConfigOptionChoice {
             value: o.value.0.to_string(),
             name: o.name,
             description: o.description,
@@ -388,7 +389,7 @@ mod tests {
     /// #3403: `ModelConfig` maps explicitly, without the unknown-variant warning.
     #[test]
     fn model_config_options() {
-        use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+        use agent_client_protocol::v1::schema::SessionConfigSelectOption;
         let logs = crate::session::test_support::LogCapture::start();
         let mapped = map_acp_config_option(
             SessionConfigOption::select(
@@ -409,7 +410,7 @@ mod tests {
             .contains("unknown SessionConfigOptionCategory"));
 
         {
-            use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+            use agent_client_protocol::v1::schema::SessionConfigSelectOption;
             let options = [SessionConfigOption::select(
                 "model",
                 "Model",

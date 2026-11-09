@@ -199,9 +199,14 @@ isolated history is not replayed automatically.
 
 Sessions created under the older shared-store layout move to a private store the next time they start. Once every session that used the shared store has moved, AoE preserves that store intact under `.aoe-sandbox-recovery/v027-<transaction>/original` instead of deleting it. A session that already had a private store receives only the shared store's top-level configuration and credentials, not its directories of caches, logs, plugins, or unrelated conversation history. If a live sandbox can see the recovery directory, preservation is deferred until that mount is gone.
 
-The first start can therefore be slower; the TUI shows progress. `aoe migrate`
-moves every eligible session at once. Trashed and archived sessions keep the
-shared store until they are started again.
+The first start can therefore be slower. The Daemon prepares the store within
+the existing ensure, start or restart operation; the TUI displays its progress
+and attaches only after the canonical result. An unavailable Daemon never
+triggers a local copy or launch. Cancelling an attachment does not roll back a
+copy already in flight, and reconnecting does not repeat the operation.
+Other sessions remain controllable while preparation runs.
+`aoe migrate` moves every eligible session at once. Trashed and archived
+sessions keep the shared store until they are started again.
 
 A sandbox still running during an upgrade remains pending: transcript capture
 pauses until it is stopped, isolated and launched again. If native configuration
@@ -209,9 +214,10 @@ changes throughout isolation, that session remains pending; `aoe migrate`
 continues with other sessions and retries later. A running sandbox whose mounts
 AoE cannot prove clear of `.aoe-sandbox-recovery` holds back moving any original
 there, and `aoe migrate` names it; launches that retire no original proceed.
-`AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for that launch. A running sandbox
-carries on on the shared store; a stopped one cannot start until its store has
-moved, so drop the variable or run `aoe migrate` before launching it.
+In the Daemon's environment, `AOE_DEFER_SANDBOX_MIGRATION=1` skips the move for
+that launch. A running sandbox carries on on the shared store; a stopped one
+cannot start until its store has moved. Relaunch the Daemon without this variable,
+or stop it and run `aoe migrate` before launching the session.
 
 ### Shared credentials
 

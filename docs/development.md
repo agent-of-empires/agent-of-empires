@@ -33,6 +33,10 @@ emergency hook watchdog beyond the request budget for abrupt test-process exit.
 
 The binary is `target/{profile}/aoe`. Web commands and test selection live in `web/AGENTS.md`.
 
+Live web fixtures own any Daemon started by `seedFn`, including when seeding
+fails. Teardown stops that Daemon before its runners and removes the isolated
+HOME only after cleanup succeeds. A shutdown failure retains HOME for diagnosis.
+
 When adding a mutating REST route, classify it in the CityHall allow or deny table in `src/server/access.rs`. Audit its handler or declare an exact, justified exemption in `src/server/api/mod.rs`.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
@@ -72,7 +76,7 @@ Debug also uses an app-directory tmux socket, which `AOE_TMUX_SOCKET` overrides.
 
 ## Build cache across worktrees
 
-Each worktree has its own `target/`. Developers with many worktrees can opt into [kache](https://github.com/kunobi-ninja/kache), which shares dependency artifacts through a local content-addressed store. It is optional and unused by the repository, CI, Nix, and release builds.
+Each worktree has its own `target/`. Developers with many worktrees can opt into [kache](https://github.com/kunobi-ninja/kache), which shares dependency artifacts through a local content-addressed store. It is optional locally; CI uses it through `.github/actions/kache`, and Nix and release builds do not use it.
 
 ```sh
 cargo binstall kache
@@ -82,6 +86,19 @@ cargo build --all-features
 ```
 
 Install kache before exporting `RUSTC_WRAPPER`, to avoid a bootstrap loop, and unset the variable to disable it. The cache and the worktrees must share a filesystem for linking; crates with native linking may still rebuild. `kache monitor` and `kache stats` inspect it, and `scripts/verify-shared-target.sh` verifies shared artifacts.
+
+Maintainers can share artifacts through the `aoe-rust-kache` S3 bucket. Ask a maintainer with AWS access for an access key for your `kache-<github-user>` IAM user, store it as the `aoe-kache` profile with `aws configure --profile aoe-kache`, then add this to `~/.config/kache/config.toml` and check it with `kache doctor`:
+
+```toml
+[cache.remote]
+type = "s3"
+bucket = "aoe-rust-kache"
+region = "us-east-1"
+prefix = "maint"
+profile = "aoe-kache"
+```
+
+Maintainer keys can only read and write `maint/`, so CI never consumes artifacts built on a laptop.
 
 ## Demo recordings
 

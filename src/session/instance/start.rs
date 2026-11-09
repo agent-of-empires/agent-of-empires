@@ -230,7 +230,8 @@ impl Instance {
         // Hooks may invoke aoe; retain the token, not the flocks, across them.
         drop(lifecycle_lock);
         drop(title_lock);
-        let hook_result = self.run_pre_launch_hooks(skip_on_launch, storage, None);
+        let hook_result =
+            self.run_pre_launch_hooks(skip_on_launch, storage, None, Some(generation));
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(storage, generation, hook_result)?;
         if let Some((key, _)) = handoff {
@@ -826,7 +827,7 @@ impl Instance {
         } else {
             None
         };
-        let scope = crate::process::systemd::scope_prefix_for(&self.id, profile);
+        let scope = crate::process::systemd::scope_prefix_for(&self.id, &self.id, profile);
         let recorded_scopes = self.terminal_scopes.clone();
         let resolved_scopes = match recorded_scopes.as_deref() {
             Some(scopes)

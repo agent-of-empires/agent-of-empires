@@ -45,6 +45,10 @@ Pick an `id` outside the reserved `aoe.*` and `agent-of-empires.*` namespaces, s
 
 A worker requests only the grants it uses. `runtime.worker` is required to run any code at all; add `net`, `session.read`, `notifications`, and so on as needed. Static contributions (commands, keybinds, themes, ui, status) need no capability. The user grants the exact declared set at install, pinned to the manifest hash, so an update that widens capabilities must be re-approved. Keep the list honest and minimal.
 
+Agent integrations are optional contributions, not worker RPCs. They require `api_version >= 19`; provider-native status and replies also require `session.integration`. When declared, `session.integration` requires valid, nonempty `provider_versions` on every integration entry. See [Agent integrations](../plugin-api.md#agent-integrations) for the launch grammar and communication contract.
+
+The install approval lists each declared tool and exact launch command. Updates that add an agent integration or change its launch command require approval again; removals alone do not. The command runs as the host user only when a user launches that agent.
+
 ## The worker
 
 The host spawns the worker, sends one JSON-RPC request per line on stdin, and reads one response per line on stdout; the worker exits when stdin reaches EOF.
@@ -85,6 +89,8 @@ aoe plugin install ./my-plugin     # runs the build steps, prompts for grants
 aoe plugin update my-plugin        # re-runs the build, re-approves changed grants
 aoe plugin uninstall my-plugin
 ```
+
+To work on a plugin whose id is in a reserved namespace (`aoe.*`, `agent-of-empires.*`), install the checkout with `--dev`. TypeScript plugins can run Node through `AOE_NODE`, which build steps and workers receive.
 
 Drive the worker by hand before installing, to confirm the protocol:
 

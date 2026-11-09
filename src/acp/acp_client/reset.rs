@@ -301,6 +301,9 @@ sid=''
 update() {
   printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$1" "$2"
 }
+user() {
+  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$1" "$2"
+}
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
   case $line in
@@ -315,13 +318,16 @@ while IFS= read -r line; do
       sid=child
       update parent PARENT
       update "$sid" early-fork
+      user "$sid" user-history
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid" ;;
     *'"method":"session/load"'*)
       sid=stored
       update foreign FOREIGN
       update "$sid" history
+      user "$sid" user-history
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
     *'"method":"session/prompt"'*)
+      user "$sid" user-live
       update "$sid" live
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
   esac
@@ -395,11 +401,18 @@ done
 
     #[tokio::test]
     async fn native_identity_preserves_pre_response_new_fork_and_load_updates() {
-        for (operation, imported, expected) in [
-            ("new", false, vec!["early-1", "live"]),
-            ("fork", false, vec!["early-fork", "live"]),
-            ("load", true, vec!["history", "live"]),
-            ("load", false, vec!["live"]),
+        // Only replayed user messages of an import or fork are recorded (#5224).
+        for (operation, imported, expected, expected_user) in [
+            ("new", false, vec!["early-1", "live"], vec![]),
+            ("fork", false, vec!["early-fork", "live"], vec![]),
+            (
+                "fork",
+                true,
+                vec!["early-fork", "live"],
+                vec!["user-history"],
+            ),
+            ("load", true, vec!["history", "live"], vec!["user-history"]),
+            ("load", false, vec!["live"], vec![]),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let script = write_early_identity_agent(temp.path());
@@ -421,6 +434,17 @@ done
                 identity_texts(&events),
                 expected,
                 "operation={operation} imported={imported}"
+            );
+            let user: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::UserPromptSent { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                user, expected_user,
+                "user chunks: operation={operation} imported={imported}"
             );
         }
     }

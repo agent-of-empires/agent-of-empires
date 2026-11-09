@@ -1,4 +1,4 @@
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import {
   existsSync,
@@ -17,13 +17,17 @@ import type * as NativeTimers from "node:timers/promises";
 import { expect, it, vi } from "vitest";
 import { appDirFor, spawnAoeServe, type ServeHandle } from "./aoeServe";
 
-/** A stand-in `aoe` that only answers the harness readiness probe. */
+/** A stand-in `aoe` that answers the harness readiness probe and reports no Daemon to stop. */
 function writeFakeAoe(root: string): string {
   const binary = join(root, "aoe");
   writeFileSync(
     binary,
     `#!${process.execPath}
 const http = require("node:http");
+if (process.argv.includes("--stop")) {
+  console.error("No running daemon found");
+  process.exit(1);
+}
 const port = Number(process.argv[process.argv.indexOf("--port") + 1]);
 http.createServer((_, response) => response.end("{}")).listen(port, "127.0.0.1", () => {
   console.log("http://127.0.0.1:" + port + "/");
@@ -235,6 +239,84 @@ setInterval(() => {
       vi.unstubAllEnvs();
       if (serve && existsSync(serve.home)) await serve.stop().catch(() => {});
       rmSync(root, { recursive: true, force: true });
+    }
+  },
+  20_000,
+);
+
+it.skipIf(process.platform === "win32")(
+  "failed seeding stops its Daemon or retains its home when shutdown fails",
+  async () => {
+    for (const stopFails of [false, true]) {
+      const root = mkdtempSync(join(tmpdir(), "aoe-seed-failure-"));
+      const binary = join(root, "aoe");
+      const pidFile = join(root, "seed.pid");
+      const stopped = join(root, "stopped");
+      // Separate OS processes require real polling; the marker confirms shutdown before HOME removal.
+      writeFileSync(
+        binary,
+        `#!${process.execPath}
+const fs = require("node:fs");
+if (!process.argv.includes("--stop")) process.exit(2);
+if (${stopFails}) { console.error("seed shutdown refused"); process.exit(1); }
+process.kill(Number(fs.readFileSync(${JSON.stringify(pidFile)}, "utf8")), "SIGTERM");
+const deadline = Date.now() + 3000;
+setInterval(() => {
+  if (fs.existsSync(${JSON.stringify(stopped)})) process.exit(0);
+  if (Date.now() > deadline) process.exit(1);
+}, 10);
+`,
+        { mode: 0o700 },
+      );
+      let home: string | undefined;
+      let child: ChildProcess | undefined;
+      let exited: Promise<unknown> | undefined;
+      const seedError = new Error("seed rejected after Daemon startup");
+      try {
+        vi.stubEnv("AOE_E2E_BINARY", binary);
+        const startup = spawnAoeServe({
+          workerIndex: 0,
+          parallelIndex: 0,
+          async seedFn(seed) {
+            home = seed.home;
+            child = spawn(
+              process.execPath,
+              [
+                "-e",
+                `const fs = require("node:fs");
+process.on("SIGTERM", () => {
+  fs.writeFileSync(${JSON.stringify(stopped)}, String(fs.existsSync(${JSON.stringify(seed.home)})));
+  process.exit(0);
+});
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+console.log("ready");
+setInterval(() => {}, 1000);`,
+              ],
+              { stdio: ["ignore", "pipe", "pipe"] },
+            );
+            exited = once(child, "exit");
+            await once(child.stdout!, "data", { signal: AbortSignal.timeout(5000) });
+            throw seedError;
+          },
+        });
+        if (stopFails) {
+          await expect(startup).rejects.toMatchObject({ errors: [seedError, expect.any(AggregateError)] });
+          expect(existsSync(home!)).toBe(true);
+          expect(child!.exitCode).toBeNull();
+        } else {
+          await expect(startup).rejects.toBe(seedError);
+          await expect.poll(() => child!.exitCode, { timeout: 3000 }).toBe(0);
+          await exited;
+          expect(readFileSync(stopped, "utf8")).toBe("true");
+          expect(existsSync(home!)).toBe(false);
+        }
+      } finally {
+        child?.kill("SIGTERM");
+        await exited;
+        vi.unstubAllEnvs();
+        if (home) rmSync(home, { recursive: true, force: true });
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   },
   20_000,

@@ -43,10 +43,13 @@ fn is_serve_daemon_child(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(ref args)) if args.daemon_child)
 }
 
-/// With the `aoe.web` plugin disabled, starting `aoe serve` is an unknown subcommand;
-/// the lifecycle verbs stay usable.
+/// Reject disabled Web starts while keeping lifecycle controls available.
 fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
-    cli::graft::serve_start_blocked(cli, cli::graft::web_disabled()).then(|| {
+    if !cli::graft::serve_start_blocked(cli, true) {
+        return None;
+    }
+    let config = agent_of_empires::session::Config::load_or_warn();
+    cli::graft::serve_start_blocked(cli, cli::graft::web_disabled(&config)).then(|| {
         Cli::command().error(
             clap::error::ErrorKind::InvalidSubcommand,
             "unrecognized subcommand 'serve'",
@@ -378,11 +381,18 @@ async fn run(
             let profile = cli.profile.clone().unwrap_or_default();
             return exit_zero(cli::mcp::run(&profile, command).await);
         }
-        Some(Commands::Skill { command }) => return exit_zero(cli::skill::run(command)),
+        // Reads need no app data; writes go through the Daemon, which needs migrated data.
+        Some(Commands::Skill { command }) if !command.writes() => {
+            return exit_zero(cli::skill::run(command).await)
+        }
         Some(Commands::Uninstall(args)) => return exit_zero(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
         Some(Commands::Migrate(args)) => return exit_zero(cli::migrate::run(&args).await),
 
+        Some(Commands::Add(args)) => {
+            let profile = cli.profile.as_deref().unwrap_or_default();
+            return exit_zero(cli::add::run(profile, *args).await);
+        }
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         // Before the startup lock and migrations: see `cli::serve::run_control`.
         Some(Commands::Serve(ref args)) => {
@@ -427,7 +437,6 @@ async fn run(
     }
 
     let result = match cli.command {
-        Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::Ps(args)) => cli::ps::run(&profile, profile_explicit, args).await,
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
@@ -440,11 +449,11 @@ async fn run(
             cli::project::run(&profile, profile_explicit, command).await
         }
         Some(Commands::Worktree { command }) => cli::worktree::run(&profile, command).await,
-        // Runs after migrations because `apply` writes the project registry.
-        Some(Commands::Cityhall { command }) => cli::cityhall::run(command),
-        // After migrations: enable/disable rewrite config.toml through the
-        // current schema, which drops any key a pending migration would carry.
-        Some(Commands::Telemetry { command }) => return exit_zero(cli::telemetry::run(command)),
+        Some(Commands::Skill { command }) => cli::skill::run(command).await,
+        Some(Commands::Cityhall { command }) => cli::cityhall::run(command).await,
+        Some(Commands::Telemetry { command }) => {
+            return exit_zero(cli::telemetry::run(command).await)
+        }
         Some(Commands::Serve(args)) => cli::serve::run(&profile, args, serve_lock).await,
         Some(Commands::Url(args)) => cli::url::run(args),
         Some(Commands::Sandbox { command }) => cli::sandbox::run(command),

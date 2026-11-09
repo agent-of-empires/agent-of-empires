@@ -4,7 +4,7 @@
 
 use crate::acp::control_protocol::PromptOutcome;
 use crate::acp::state::{Event, RateLimitInfo};
-use agent_client_protocol::schema::v1::{ContentBlock, PromptRequest, PromptResponse, StopReason};
+use agent_client_protocol::v1::schema::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -146,6 +146,7 @@ impl Session {
             control.supersede_adopted_turn();
         }
         shared.reset_message_dedup();
+        shared.seed_user_replay.store(false, Ordering::Relaxed);
         if shared
             .suppress_history_replay
             .swap(false, Ordering::Relaxed)
@@ -527,6 +528,11 @@ impl Session {
                 grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
                 "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
             );
+            // The runner may still be running the turn; without this the next
+            // local prompt hits the stale waiter and kills the connection.
+            if let Some(control) = self.control.as_ref() {
+                control.release_local_prompt();
+            }
             return Flow::Break;
         }
         if fire {

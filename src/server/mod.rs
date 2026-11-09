@@ -69,7 +69,7 @@ pub fn web_build_id() -> Option<&'static str> {
 pub(crate) use disk_watch::{
     add_profile_disk_watch, remove_profile_disk_watch, rename_profile_disk_watch,
 };
-pub use ip_discovery::{discover_tagged_ips, IpKind};
+pub use ip_discovery::{discover_tagged_ips, local_published_hosts, IpKind};
 pub use serve_snapshot::{FormFactorCounters, StructuredTelemetryCounters};
 pub(crate) use sleep_inhibit::{
     SLEEP_INHIBIT_SNAPSHOT_ENABLED, SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT,
@@ -77,5 +77,5 @@ pub(crate) use sleep_inhibit::{
 pub(crate) use startup::resolve_auth_mode;
 pub(crate) use startup::{start_server, ServerConfig};
 pub use state::{AppState, CleanupDefaultsCache};
-pub(crate) use token::generate_token;
 pub use token::TokenManager;
+pub(crate) use token::{generate_token, TOKEN_REUSE_MAX_AGE};

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Which "state" of session a caller wants. The variants are the wire
-/// vocabulary (`state=live|trashed|all`); `#[serde(rename_all = "lowercase")]`
+/// vocabulary (`state=live|untrashed|trashed|all`); `#[serde(rename_all = "lowercase")]`
 /// pins that and rejects any other value at deserialize time so a typo
 /// surfaces as an error rather than silently returning every session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -16,14 +16,16 @@ pub enum SessionScope {
     /// archived nor trashed. Matches what a user thinks of as "my active
     /// sessions".
     Live,
+    /// Everything except trashed sessions: the dashboard sidebar, which
+    /// still shows archived rows but loads the trash on demand.
+    Untrashed,
     /// Sessions currently in the trash (`remove` but not yet purged). Kept
     /// separate because #3156 flagged that an external supervisor keying on
     /// "does my session still exist" would otherwise treat a trashed row as
     /// alive.
     Trashed,
-    /// Every persisted session, regardless of state. Used by the dashboard's
-    /// client-side Trash view (which still filters locally, #3187) and by
-    /// tests that need to count everything.
+    /// Every persisted session, regardless of state. Used by callers that
+    /// need the whole inventory, and by tests that count everything.
     All,
 }
 
@@ -33,6 +35,7 @@ impl SessionScope {
         match scope {
             None | Some(SessionScope::All) => true,
             Some(SessionScope::Live) => !archived && !trashed,
+            Some(SessionScope::Untrashed) => !trashed,
             Some(SessionScope::Trashed) => trashed,
         }
     }
@@ -49,6 +52,7 @@ mod tests {
             (None, [true, true, true, true]),
             (Some(SessionScope::All), [true, true, true, true]),
             (Some(SessionScope::Live), [true, false, false, false]),
+            (Some(SessionScope::Untrashed), [true, true, false, false]),
             (Some(SessionScope::Trashed), [false, false, true, true]),
         ] {
             for ((archived, trashed), expected) in states.into_iter().zip(expected) {

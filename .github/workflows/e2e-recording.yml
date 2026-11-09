@@ -11,11 +11,14 @@ jobs:
   record:
     name: Record E2E Tests
     if: github.event.label.name == 'needs-recording'
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-record-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: 45
     permissions:
       contents: write
       pull-requests: write
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/rust-toolchain
@@ -28,6 +31,11 @@ jobs:
 
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
+
+      # RunsOn appends `. /etc/environment` to /etc/profile, so every login shell
+      # resets PATH and aoe's login-shell launches lose the e2e stub dirs.
+      - name: Keep inherited PATH in login shells
+        run: sudo sed -i '/runs-on\/env/d' /etc/profile
 
       - name: Install asciinema
         run: pipx install asciinema

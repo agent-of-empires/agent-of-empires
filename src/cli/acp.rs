@@ -11,7 +11,7 @@ use crate::agents::registry_lifecycle;
 #[derive(Subcommand)]
 pub enum AcpCommands {
     /// Verify the structured view can start: Node runtime, configured agents,
-    /// provider auth (claude login).
+    /// provider auth (claude auth login).
     Doctor {
         /// Emit machine-readable JSON instead of a human report.
         #[arg(long)]
@@ -195,6 +195,21 @@ pub enum AcpCommands {
         #[arg(long)]
         model: Option<String>,
     },
+    /// Switch a structured session to another account of the same agent,
+    /// keeping the conversation. Accounts are tool names with their own
+    /// `[session.agent_config_dir]`; the transcript is copied into the new
+    /// account's store and the worker resumes it. A session parked on a
+    /// rate limit continues with the interrupted prompt; otherwise it gets
+    /// the usual restart wake message. Refuses, changing nothing, where the
+    /// swap would start a fresh conversation (not Claude, no recorded
+    /// conversation, other agent).
+    SwitchAccount {
+        /// Acp session id.
+        session: String,
+        /// Tool name of the target account, as declared in
+        /// `[session.agent_config_dir]` (e.g. `claude-b`).
+        tool: String,
+    },
     /// Re-route a Claude session to a different LLM provider, keeping the
     /// transcript. Refused mid-turn; once idle the worker restarts and
     /// resumes the same conversation. Credentials are not provisioned by
@@ -262,6 +277,7 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             target,
             model,
         } => switch_agent(&session, &target, model.as_deref()).await,
+        AcpCommands::SwitchAccount { session, tool } => switch_account(&session, &tool).await,
         AcpCommands::SwitchProvider { session, provider } => {
             switch_provider(&session, &provider).await
         }
@@ -819,21 +835,44 @@ pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
     Ok(targets.len())
 }
 
+/// Stops a structured session's runner from outside the daemon, then retires the scope its
+/// record names, then the record itself, so a failed scope retirement can be retried. The
+/// scope is left alone when the stop fails, so a runner the supervisor still owns is not
+/// cut off. A record that cannot be parsed fails the call instead of counting as no runner.
+pub(crate) async fn stop_runner(session_id: &str) -> Result<()> {
+    use crate::process::worker_registry;
+    if let Some(record) = worker_registry::load_strict(session_id)? {
+        settle_worker(&record, 5).await?;
+        crate::process::systemd::retire_scopes(session_id, std::slice::from_ref(&record.scope))?;
+        worker_registry::retire_selected(&record)?;
+    }
+    Ok(())
+}
+
+/// The stop intent goes first so the supervisor reads a user stop, not a crash to respawn.
+async fn settle_worker(
+    record: &crate::process::worker_registry::WorkerRecord,
+    timeout_secs: u64,
+) -> Result<()> {
+    crate::process::worker_registry::request_stop(record)?;
+    signal_and_wait(record, timeout_secs).await
+}
+
+async fn stop_worker_record(
+    record: &crate::process::worker_registry::WorkerRecord,
+    timeout_secs: u64,
+) -> Result<()> {
+    settle_worker(record, timeout_secs).await?;
+    crate::process::worker_registry::retire_selected(record)
+}
+
 async fn stop_worker_records(
     targets: &[crate::process::worker_registry::WorkerRecord],
     timeout_secs: u64,
 ) -> Result<()> {
-    use crate::process::worker_registry;
     let mut failures = Vec::new();
     for record in targets {
-        let result = async {
-            worker_registry::request_stop(record)?;
-            signal_and_wait(record, timeout_secs).await?;
-            worker_registry::retire_selected(record)?;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        match result {
+        match stop_worker_record(record, timeout_secs).await {
             Ok(()) => println!(
                 "Stopped agent worker for {} (PID {}).",
                 record.session_id, record.pid
@@ -1167,6 +1206,25 @@ async fn switch_agent(session: &str, target: &str, model: Option<&str>) -> Resul
     Ok(())
 }
 
+async fn switch_account(session: &str, tool: &str) -> Result<()> {
+    let body = crate::daemon::RestartSessionBody {
+        tool: Some(tool.to_owned()),
+        require_account_carry: true,
+        ..Default::default()
+    };
+    let row = super::session::restart_through_daemon(None, session, body, |row| {
+        anyhow::ensure!(
+            row.view == crate::session::View::Structured,
+            "'{}' is not a structured session; use `aoe session restart --tool {tool}`",
+            row.title
+        );
+        Ok(())
+    })
+    .await?;
+    println!("switched account for {} -> {tool}", row.title);
+    Ok(())
+}
+
 async fn switch_provider(session: &str, provider: &str) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
@@ -1240,6 +1298,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
+        Event::AgentThoughtChunk { .. } => "agent_thought_chunk",
         Event::ThinkingEnded => "thinking_ended",
         Event::RateLimit { .. } => "rate_limit",
         Event::RateLimitAutoResumed { .. } => "rate_limit_auto_resumed",
@@ -1286,6 +1345,129 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_runner_fences_resume_ends_the_runner_then_releases_the_scope() {
+        use crate::process::worker_registry;
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-stop-runner-", "/tmp").unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let child = std::rc::Rc::new(std::cell::RefCell::new(child));
+        worker_registry::save(&worker_registry::WorkerRecord::new(
+            "sess-stop".into(),
+            pid,
+            tmp.path().join("sock"),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            std::path::PathBuf::from("/repo"),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        ))
+        .unwrap();
+        let released = std::rc::Rc::new(std::cell::Cell::new(false));
+        let _probe = crate::process::systemd::release_probe::install({
+            let released = released.clone();
+            let child = child.clone();
+            move |id| {
+                assert_eq!(id, "sess-stop");
+                // `try_wait` reaps; `is_pid_alive` would still see a zombie.
+                assert!(
+                    child.borrow_mut().try_wait().unwrap().is_some(),
+                    "scope released while the runner was alive"
+                );
+                released.set(true);
+            }
+        });
+
+        stop_runner("sess-stop").await.unwrap();
+
+        assert!(worker_registry::load("sess-stop").unwrap().is_none());
+        assert!(
+            worker_registry::stop_requested("sess-stop"),
+            "the stop intent must fence an automatic respawn"
+        );
+        assert!(released.get());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_runner_keeps_the_scope_when_the_stop_fails() {
+        use crate::process::worker_registry;
+        let _app = crate::session::test_support::isolate_app_dir();
+        worker_registry::save(&worker_registry::WorkerRecord::new(
+            "untracked-prime".into(),
+            i32::MAX as u32,
+            worker_registry::socket_path_for("untracked-prime").unwrap(),
+            "prime-agent".into(),
+            "prime-agent".into(),
+            "/tmp".into(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        ))
+        .unwrap();
+        let _probe = crate::process::systemd::release_probe::install(|id| {
+            panic!("scope of {id} released after a failed stop")
+        });
+
+        assert!(stop_runner("untracked-prime").await.is_err());
+        assert!(worker_registry::load("untracked-prime").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_runner_fails_on_a_record_it_cannot_parse() {
+        use crate::process::worker_registry;
+        let _app = crate::session::test_support::isolate_app_dir();
+        let record = worker_registry::record_path("garbled").unwrap();
+        std::fs::write(&record, b"{ not json").unwrap();
+        let _probe = crate::process::systemd::release_probe::install(|id| {
+            panic!("scope of {id} released without a provable stop")
+        });
+
+        assert!(stop_runner("garbled").await.is_err());
+        assert!(record.exists(), "the evidence must stay for recovery");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stop_runner_keeps_the_record_when_the_scope_cannot_be_retired() {
+        use crate::process::worker_registry::{self, ScopeOwnership};
+        let _app = crate::session::test_support::isolate_app_dir();
+        let mut record = worker_registry::WorkerRecord::new(
+            "scope-stuck".into(),
+            i32::MAX as u32,
+            worker_registry::socket_path_for("scope-stuck").unwrap(),
+            "aoe-agent".into(),
+            "aoe-agent".into(),
+            "/tmp".into(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        record.scope = ScopeOwnership::Unresolved;
+        worker_registry::save(&record).unwrap();
+
+        assert!(stop_runner("scope-stuck").await.is_err());
+        assert!(
+            worker_registry::load("scope-stuck").unwrap().is_some(),
+            "the record names the scope, so it must outlive a failed retirement"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]

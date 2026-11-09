@@ -75,6 +75,26 @@ impl YoloMode {
             mode => Some(mode),
         }
     }
+
+    /// Whether the agent runs in Yolo mode with no way to turn it off, whichever
+    /// generation is installed.
+    pub fn always_on(&self) -> bool {
+        match self {
+            YoloMode::AlwaysYolo => true,
+            YoloMode::EitherGeneration { legacy, current } => {
+                legacy.always_on() && current.always_on()
+            }
+            YoloMode::CliFlag(_) | YoloMode::EnvVar(..) => false,
+        }
+    }
+}
+
+/// Whether the built-in agent `name` always runs in Yolo mode. False for
+/// unknown and custom agents.
+pub fn is_always_yolo(name: &str) -> bool {
+    get_agent(name)
+        .and_then(|agent| agent.yolo.as_ref())
+        .is_some_and(YoloMode::always_on)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +304,8 @@ pub struct ResolvedHookEvent {
     pub identity_field: Option<HookIdentityField>,
     pub waiting_tools: Vec<String>,
     /// Binary of the agent whose config declares this event. The identity publisher carries it
-    /// so a nested agent of another kind cannot publish into the pane's sidecar.
+    /// so a nested agent of another kind cannot publish into the pane's sidecar, and Claude's
+    /// status writers use it to bind to the pane's `session_id`.
     pub publisher: Option<&'static str>,
 }
 
@@ -388,16 +409,16 @@ pub struct AgentDef {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KeyToken {
-    Literal(&'static str),
-    Named(&'static str),
+pub enum KeyToken<'a> {
+    Literal(&'a str),
+    Named(&'a str),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PermissionResponse {
-    pub allow: &'static [KeyToken],
-    pub allow_always: Option<&'static [KeyToken]>,
-    pub deny: &'static [KeyToken],
+    pub allow: &'static [KeyToken<'static>],
+    pub allow_always: Option<&'static [KeyToken<'static>]>,
+    pub deny: &'static [KeyToken<'static>],
 }
 
 const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
@@ -978,6 +999,12 @@ pub const AGENTS: &[AgentDef] = &[
             "prime-agent",
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
         )
+    },
+    // Neutral stand-in for core tests; keep last so settings indices stay stable.
+    #[cfg(feature = "e2e-tests")]
+    AgentDef {
+        host_only: true,
+        ..agent("fake-agent", "fake-agent", "test-only agent, nothing to install")
     },
 ];
 
@@ -1587,6 +1614,7 @@ pub fn effective_status_map(
 fn append_configured_status_events(
     events: &mut Vec<ResolvedHookEvent>,
     overrides: Option<&BTreeMap<String, HookStatus>>,
+    publisher: &'static str,
 ) {
     let Some(overrides) = overrides else {
         return;
@@ -1600,7 +1628,7 @@ fn append_configured_status_events(
                 status: Some(*status),
                 identity_field: None,
                 waiting_tools: Vec::new(),
-                publisher: None,
+                publisher: Some(publisher),
             });
         }
     }
@@ -1644,7 +1672,7 @@ pub fn resolved_hook_events(
             publisher: Some(agent.binary),
         })
         .collect();
-    append_configured_status_events(&mut events, overrides);
+    append_configured_status_events(&mut events, overrides, agent.binary);
     Ok(events)
 }
 
@@ -1672,7 +1700,7 @@ pub fn resolved_sidecar_hook_events(
             publisher: Some(agent.binary),
         })
         .collect();
-    append_configured_status_events(&mut events, overrides);
+    append_configured_status_events(&mut events, overrides, agent.binary);
     Ok(events)
 }
 
@@ -1773,6 +1801,34 @@ mod tests {
     #[test]
     fn naming_reprobes_success_without_losing_context_failure_cooldown() {
         use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "AOE_NAMING_PROBE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    &format!(
+                        "{module}::naming_reprobes_success_without_losing_context_failure_cooldown"
+                    ),
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1");
+            let output = crate::process::run_with_timeout_process_group(
+                &mut command,
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap()
+            .expect("naming probe test child timed out");
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let program = directory.path().join("claude");
         let response = directory.path().join("help");
@@ -1825,6 +1881,29 @@ mod tests {
         assert!(!acp_transcript_cli_resumable("claude", "codex"));
         assert!(!acp_transcript_cli_resumable("claude", "aoe-agent"));
         assert!(!acp_transcript_cli_resumable("codex", "codex"));
+    }
+
+    #[test]
+    fn always_yolo_follows_each_agents_declaration() {
+        for agent in AGENTS {
+            let declared = agent.yolo.as_ref().is_some_and(YoloMode::always_on);
+            assert_eq!(is_always_yolo(agent.name), declared, "{}", agent.name);
+        }
+        for name in ["pi", "settl", "prime-agent"] {
+            assert!(is_always_yolo(name), "{name}");
+        }
+        assert!(!is_always_yolo("not-an-agent"));
+        // A mode spanning two generations is always on only when both are.
+        static ON: YoloMode = YoloMode::AlwaysYolo;
+        static FLAG: YoloMode = YoloMode::CliFlag("--yolo");
+        for (legacy, current, expected) in
+            [(&ON, &ON, true), (&ON, &FLAG, false), (&FLAG, &ON, false)]
+        {
+            assert_eq!(
+                YoloMode::EitherGeneration { legacy, current }.always_on(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2462,6 +2541,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
             .unwrap();
         assert_eq!(custom.status, Some(HookStatus::Running));
         assert!(custom.matcher.is_none() && custom.identity_field.is_none());
+        assert_eq!(custom.publisher, Some("claude"));
 
         let config = config_with_status("vertex", "session.idle", HookStatus::Idle);
         let map = effective_status_map(&config, "vertex").unwrap();
@@ -2519,6 +2599,17 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         ];
         for (cmd, expected) in cases {
             assert_eq!(resolve_tool_name(cmd), expected, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn fake_agent_exists_only_in_e2e_builds_and_is_last() {
+        assert_eq!(
+            get_agent("fake-agent").is_some(),
+            cfg!(feature = "e2e-tests")
+        );
+        if cfg!(feature = "e2e-tests") {
+            assert_eq!(AGENTS.last().map(|a| a.name), Some("fake-agent"));
         }
     }
 

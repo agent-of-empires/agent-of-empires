@@ -10,7 +10,6 @@ use crate::daemon::transport::path_segment;
 use reqwest::{header, StatusCode};
 use thiserror::Error;
 
-use super::discovery::DaemonEndpoint;
 use super::passphrase_session::{
     self, may_retry_with_login, select_credential, Credential, PassphraseSessionCache,
 };
@@ -19,6 +18,7 @@ use crate::acp::protocol::{
     ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
     SwitchAgentRequest, SwitchAgentResponse, SwitchProviderRequest, SwitchProviderResponse,
 };
+use crate::daemon::DaemonEndpoint;
 use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
@@ -38,6 +38,23 @@ pub struct PluginCommandView {
     pub keybinds: Vec<String>,
     #[serde(default)]
     pub action: Option<aoe_plugin_api::ClientAction>,
+}
+
+#[derive(Clone, Copy)]
+enum ReplayKind {
+    Live,
+    Rows,
+    Retained,
+}
+
+#[derive(Debug)]
+pub(crate) struct RetainedReplay {
+    pub transcript: crate::acp::transcript::RetainedTranscript,
+    /// The first page's cap, not a later page's maximum.
+    pub highest_seq: u64,
+    /// Inclusive ranges of successfully folded sequence numbers.
+    pub coverage: Vec<(u64, u64)>,
+    pub incomplete: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -170,33 +187,39 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Fold replay pages through the first page's snapshot window. Lost pages
-    /// are consumed before stopping, so callers can reset using the same data.
+    /// Live replay stops for reset after loss; retained replay keeps reading.
     async fn replay_pages(
         &self,
         session_id: &str,
         since: u64,
         page_size: u64,
-        view_rows: bool,
-        mut consume: impl FnMut(ReplayResponse),
+        kind: ReplayKind,
+        mut consume: impl FnMut(ReplayResponse, u64),
     ) -> Result<(u64, Option<u64>, bool), HttpError> {
         let mut cursor = since;
         let mut target = None;
+        let mut any_lost = false;
         loop {
-            let page = if view_rows {
+            let page = if matches!(kind, ReplayKind::Rows) {
                 self.replay_rows_page(session_id, cursor, page_size).await?
             } else {
                 self.replay_page(session_id, cursor, page_size).await?
             };
             let cap = *target.get_or_insert(page.highest_seq);
             let (highest_seq, lowest_seq, lost) = (page.highest_seq, page.lowest_seq, page.lost);
+            any_lost |= lost;
             let (next_cursor, has_more) = (page.next_cursor, page.has_more);
-            consume(page);
+            consume(page, cap);
             match next_cursor {
-                Some(next) if !lost && has_more && next > cursor && next < cap => {
+                Some(next)
+                    if (!lost || !matches!(kind, ReplayKind::Live))
+                        && has_more
+                        && next > cursor
+                        && next < cap =>
+                {
                     cursor = next;
                 }
-                _ => return Ok((highest_seq, lowest_seq, lost)),
+                _ => return Ok((highest_seq, lowest_seq, any_lost)),
             }
         }
     }
@@ -211,7 +234,7 @@ impl HttpClient {
     ) -> Result<ReplayResponse, HttpError> {
         let mut frames = Vec::new();
         let (highest_seq, lowest_seq, lost) = self
-            .replay_pages(session_id, since, page_size, false, |page| {
+            .replay_pages(session_id, since, page_size, ReplayKind::Live, |page, _| {
                 frames.extend(page.frames);
             })
             .await?;
@@ -246,8 +269,8 @@ impl HttpClient {
         decode_replay(res).await
     }
 
-    /// Reconcile server-folded rows by ID across page seams, using the same
-    /// snapshot cap and retention-gap handling as raw replay.
+    /// Reconcile server-folded rows by ID across page seams, retaining the
+    /// snapshot cap and reporting gaps without dropping later retained pages.
     pub async fn replay_rows_paged(
         &self,
         session_id: &str,
@@ -256,7 +279,7 @@ impl HttpClient {
     ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
         let mut rows = Vec::new();
         let (_, _, lost) = self
-            .replay_pages(session_id, since, page_size, true, |page| {
+            .replay_pages(session_id, since, page_size, ReplayKind::Rows, |page, _| {
                 if let Some(page_rows) = page.rows {
                     for row in page_rows {
                         crate::acp::transcript::upsert_transcript_row(&mut rows, row);
@@ -265,6 +288,51 @@ impl HttpClient {
             })
             .await?;
         Ok((rows, lost))
+    }
+
+    /// Fold retained raw events once, preserving reducer state across pages.
+    pub(crate) async fn replay_retained_paged(
+        &self,
+        session_id: &str,
+        page_size: u64,
+    ) -> Result<RetainedReplay, HttpError> {
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        let mut last_seen = 0;
+        let mut snapshot_highest = 0;
+        let mut incomplete = false;
+        let mut coverage: Vec<(u64, u64)> = Vec::new();
+        let (_, _, reported_lost) = self
+            .replay_pages(
+                session_id,
+                0,
+                page_size,
+                ReplayKind::Retained,
+                |page, cap| {
+                    snapshot_highest = cap;
+                    for frame in page.frames {
+                        if frame.seq <= last_seen || frame.seq > cap {
+                            continue;
+                        }
+                        incomplete |= frame.seq != last_seen.saturating_add(1);
+                        last_seen = frame.seq;
+                        match coverage.last_mut() {
+                            Some((_, end)) if end.checked_add(1) == Some(frame.seq) => {
+                                *end = frame.seq;
+                            }
+                            _ => coverage.push((frame.seq, frame.seq)),
+                        }
+                        model.apply_event(frame.seq, &frame.event);
+                    }
+                },
+            )
+            .await?;
+        incomplete |= reported_lost || last_seen < snapshot_highest;
+        Ok(RetainedReplay {
+            transcript: model.into_retained(),
+            highest_seq: snapshot_highest,
+            coverage,
+            incomplete,
+        })
     }
 
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
@@ -382,19 +450,10 @@ impl HttpClient {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<(), HttpError> {
-        let url = format!(
-            "{}/api/plugins/{}/enabled",
-            self.endpoint.base_url,
-            path_segment(plugin_id)?
-        );
-        let res = self
-            .execute_elevated(|| {
-                self.http
-                    .post(&url)
-                    .json(&serde_json::json!({ "enabled": enabled }))
-            })
+        let path = format!("/api/plugins/{}/enabled", path_segment(plugin_id)?);
+        let body = serde_json::json!({ "enabled": enabled });
+        self.mutate(reqwest::Method::POST, &path, Some(body))
             .await?;
-        check_global_status(res)?;
         Ok(())
     }
 
@@ -408,6 +467,43 @@ impl HttpClient {
         let res = self.execute_elevated(|| self.http.post(&url)).await?;
         check_global_status(res)?;
         Ok(())
+    }
+
+    /// A config mutation on a daemon-wide endpoint, retried after a passphrase
+    /// step-up. Returns the JSON body, `Null` when empty.
+    pub async fn mutate(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, HttpError> {
+        self.mutate_with(method, path, |request| match &body {
+            Some(body) => request.json(body),
+            None => request,
+        })
+        .await
+    }
+
+    /// Like [`mutate`](Self::mutate), with the caller shaping the request
+    /// (a non-JSON body or a longer timeout).
+    pub async fn mutate_with(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        shape: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    ) -> Result<serde_json::Value, HttpError> {
+        let url = format!("{}{path}", self.endpoint.base_url);
+        let res = self
+            .execute_elevated(|| shape(self.http.request(method.clone(), &url)))
+            .await?;
+        if !res.status().is_success() {
+            return Err(brief_server_error(status_error(&res, None, false), res).await);
+        }
+        let text = res.text().await?;
+        if text.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&text).map_err(|_| HttpError::Transport)
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.
@@ -973,6 +1069,29 @@ fn check_status(res: reqwest::Response, session_id: &str) -> Result<reqwest::Res
     }
 }
 
+/// The daemon's own message reads best for config commands; the typed error
+/// carries only a code. An empty 404 is an absent route: the daemon predates
+/// the endpoint.
+async fn brief_server_error(error: HttpError, res: reqwest::Response) -> HttpError {
+    let HttpError::Server { status, body } = error else {
+        return error;
+    };
+    let text = res.text().await.unwrap_or_default();
+    let body = match serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("message")?.as_str().map(str::to_string))
+    {
+        Some(message) => message,
+        None if status == StatusCode::NOT_FOUND && text.trim().is_empty() => {
+            "the running daemon does not support this command; restart it with `aoe serve --restart`"
+                .to_string()
+        }
+        None if !text.trim().is_empty() => text,
+        None => body,
+    };
+    HttpError::Server { status, body }
+}
+
 fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
     if res.status().is_success() {
         Ok(res)
@@ -1037,7 +1156,7 @@ fn classify_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::discovery::Source;
+    use crate::daemon::Source;
     use std::time::Duration;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
@@ -1230,6 +1349,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn row_replay_keeps_later_pages_after_retention_gap() {
+        use crate::acp::state::Event;
+        use axum::{routing::get, Router};
+        let mut inst = crate::session::Instance::new("retained", "/tmp");
+        inst.trashed_at = Some(chrono::Utc::now());
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        for seq in 10..=16 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: format!("retained-{seq}"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, None)).unwrap();
+        let (rows, lost) = client.replay_rows_paged(&id, 0, 2).await.unwrap();
+        assert!(lost);
+        assert_eq!(
+            rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+            (10..=16)
+                .map(|seq| format!("retained-{seq}"))
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_preserves_reducer_state_across_pages() {
+        use crate::acp::{
+            approvals::Nonce,
+            elicitations::Elicitation,
+            state::{Event, ToolCall},
+            transcript::TranscriptRowKind,
+        };
+        use axum::{routing::get, Router};
+        let inst = crate::session::Instance::new("retained state", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+        let completed = |tool_call_id: &str| Event::ToolCallCompleted {
+            tool_call_id: tool_call_id.into(),
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: at,
+            async_subagent: false,
+        };
+        let events = [
+            Event::AgentMessageChunk {
+                text: "first".into(),
+                message_id: Some("a".into()),
+            },
+            Event::AgentMessageChunk {
+                text: " continuation".into(),
+                message_id: Some("a".into()),
+            },
+            Event::AgentMessageChunk {
+                text: "second".into(),
+                message_id: Some("b".into()),
+            },
+            Event::ToolCallContent {
+                tool_call_id: "output".into(),
+                content: "retained output".into(),
+            },
+            completed("output"),
+            Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "question".into(),
+                    name: "Ask".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: at,
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            },
+            Event::ElicitationRequested {
+                elicitation: Elicitation {
+                    nonce: Nonce(uuid::Uuid::new_v4().to_string()),
+                    message: "Pick one".into(),
+                    title: None,
+                    description: None,
+                    tool_call_id: Some("question".into()),
+                    questions: Vec::new(),
+                    requested_at: at,
+                    resolved: None,
+                },
+            },
+            completed("question"),
+            Event::ToolCallContent {
+                tool_call_id: "orphan".into(),
+                content: "old orphan output".into(),
+            },
+            Event::ToolCallContent {
+                tool_call_id: "orphan".into(),
+                content: "latest orphan output".into(),
+            },
+        ];
+        for (index, event) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(&id, index as u64 + 1, event)
+                .unwrap();
+        }
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for size in [1, 2, 8] {
+            let snapshot = client.replay_retained_paged(&id, size).await.unwrap();
+            let rows = snapshot.transcript.rows;
+            assert!(!snapshot.incomplete);
+            let messages: Vec<_> = rows
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::Message)
+                .collect();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|row| row.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["first", " continuation", "second"]
+            );
+            assert_eq!(messages[0].group_id, messages[1].group_id);
+            assert_ne!(
+                messages[1].group_id, messages[2].group_id,
+                "page size {size}"
+            );
+            let output = rows
+                .iter()
+                .find(|row| row.kind == TranscriptRowKind::ToolComplete)
+                .unwrap();
+            assert_eq!(output.text, "retained output");
+            assert!(!rows
+                .iter()
+                .any(|row| row.tool_call_id.as_deref() == Some("question")));
+            assert_eq!(
+                snapshot
+                    .transcript
+                    .unfinished_outputs
+                    .iter()
+                    .map(|output| (output.tool_call_id.as_str(), output.text.as_str()))
+                    .collect::<Vec<_>>(),
+                [("orphan", "latest orphan output")]
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_caches_only_the_folded_snapshot_cap() {
+        use crate::acp::{protocol::ReplayQuery, state::Event};
+        use axum::{
+            extract::{Path, Query, State},
+            routing::get,
+            Router,
+        };
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let inst = crate::session::Instance::new("concurrent retained output", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        for seq in 1..=3 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: format!("retained-{seq}\n\n"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        let appended = Arc::new(AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get({
+                    let appended = appended.clone();
+                    move |State(state): State<Arc<crate::server::AppState>>,
+                          Path(id): Path<String>,
+                          Query(q): Query<ReplayQuery>| {
+                        let appended = appended.clone();
+                        async move {
+                            if q.since == 2 && !appended.swap(true, Ordering::SeqCst) {
+                                state
+                                    .acp_event_store
+                                    .record(
+                                        &id,
+                                        4,
+                                        &Event::AgentMessageChunk {
+                                            text: "retained-4".into(),
+                                            message_id: None,
+                                        },
+                                    )
+                                    .unwrap();
+                            }
+                            crate::server::api::acp_replay(State(state), Path(id), Query(q)).await
+                        }
+                    }
+                }),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let first = client.replay_retained_paged(&id, 2).await.unwrap();
+        assert!(appended.load(Ordering::SeqCst));
+        assert_eq!(first.highest_seq, 3);
+        assert!(!first.incomplete);
+        assert!(first
+            .transcript
+            .rows
+            .iter()
+            .any(|row| row.text.contains("retained-3")));
+        assert!(!first
+            .transcript
+            .rows
+            .iter()
+            .any(|row| row.text.contains("retained-4")));
+        assert_eq!(client.replay(&id, u64::MAX).await.unwrap().highest_seq, 4);
+        let next = client.replay_retained_paged(&id, 2).await.unwrap();
+        assert_eq!(next.highest_seq, 4);
+        assert!(next
+            .transcript
+            .rows
+            .iter()
+            .any(|row| row.text.contains("retained-4")));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_marks_pinned_sequence_gaps() {
+        use crate::acp::{event_store::EventStore, state::Event};
+        use axum::{routing::get, Router};
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(EventStore::open(&dir.path().join("events.db"), 3).unwrap());
+        let inst = crate::session::Instance::new("pinned metadata", "/tmp");
+        let id = inst.id.clone();
+        store
+            .record(
+                &id,
+                1,
+                &Event::AvailableCommandsUpdated {
+                    commands: Vec::new(),
+                },
+            )
+            .unwrap();
+        for seq in 2..=20 {
+            store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: format!("message-{seq}"),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .replay_from(&id, 0)
+                .iter()
+                .map(|(seq, _)| *seq)
+                .collect::<Vec<_>>(),
+            [1, 18, 19, 20]
+        );
+        let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+            vec![inst],
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(store),
+            |_| {},
+            std::convert::identity,
+        );
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for size in [1, 2, 10] {
+            let replay = client.replay_retained_paged(&id, size).await.unwrap();
+            let rows = replay.transcript.rows;
+            assert!(replay.incomplete, "page size {size}");
+            assert_eq!(
+                rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
+                ["message-18", "message-19", "message-20"]
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn replay_rejects_incomplete_or_extra_documents_without_reflecting_payloads() {
         let valid = r#"{"frames":[],"lost":false,"highest_seq":9,"next_cursor":9}"#;
         for body in [
@@ -1399,7 +1859,7 @@ mod tests {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_stalled_replay(stream, r#"{"frames":["#).await;
                 });
-                (DaemonEndpoint::local_unix(path), server)
+                (DaemonEndpoint::local_unix(path, None), server)
             } else {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let address = listener.local_addr().unwrap();

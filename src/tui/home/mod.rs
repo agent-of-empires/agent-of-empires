@@ -85,9 +85,28 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+pub(super) struct SessionDialogTarget {
+    session_id: String,
+    source_profile: String,
+    lifecycle_generation: u64,
+}
+
+pub(super) struct SessionDeleteDialog {
+    dialog: UnifiedDeleteDialog,
+    target: SessionDialogTarget,
+    request: crate::daemon::DeleteSessionBody,
+}
+
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
-    Structured { session_id: String, nonce: String },
+    Structured {
+        session_id: String,
+        nonce: String,
+    },
+    Integration {
+        session_id: String,
+        snapshot: aoe_plugin_api::agent_integration::AgentIntegrationSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -252,13 +271,14 @@ pub struct HomeView {
     /// Sessions the open bulk-archive prompt counted, archived as-is on confirm and
     /// dropped on cancel.
     pub(super) pending_archive_group_ids: Option<Vec<String>>,
-    pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
+    pub(super) unified_delete_dialog: Option<SessionDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
     pub(super) worktree_name_dialog: Option<WorktreeNameDialog>,
     pub(super) restart_dialog: Option<RestartDialog>,
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
+    pub(super) session_dialog_target: Option<SessionDialogTarget>,
     pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending
@@ -304,6 +324,7 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
+    pub(super) agent_question_dialog: Option<super::dialogs::AgentQuestionDialog>,
     pub(super) pending_permission_response: Option<PermissionResponseTarget>,
     pub(super) pending_send_session: Option<String>,
     pub(super) pending_send_target: live_send::LiveSendTarget,
@@ -345,12 +366,16 @@ pub struct HomeView {
     pub(in crate::tui) structured_preview:
         Option<crate::tui::structured_view::embedded::EmbeddedView>,
     pub(in crate::tui) structured_preview_pending: bool,
+    pub(in crate::tui) retained_preview:
+        Option<crate::tui::structured_view::embedded::RetainedView>,
+    pub(in crate::tui) retained_focus: Option<(String, u64)>,
+    pub(in crate::tui) retained_scroll_offset: usize,
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
-    pub(super) pending_trash_session: Option<String>,
+    pub(super) pending_trash_session: Option<SessionDialogTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,
@@ -392,10 +417,6 @@ pub struct HomeView {
     /// Sessions awaiting a daemon start snapshot (see `apply_restart_results`).
     pub(super) restart_in_flight: std::collections::HashSet<String>,
 
-    store_move_poller: crate::tui::store_move_poller::StoreMovePoller,
-    store_move_in_flight: Option<store_move::StoreMoveInFlight>,
-    store_move_bypass: Option<String>,
-
     /// The creation this view submitted to the daemon and still displays. The
     /// daemon owns provisioning, hooks, and the committed row.
     pub(super) pending_creation: Option<PendingCreation>,
@@ -413,6 +434,7 @@ pub struct HomeView {
 
     pub(super) preview_timings: PreviewTimings,
     pub(super) preview_scroll_offset: u16,
+    pub(super) preview_explicit_tail: bool,
     pub(super) preview_area: Rect,
     /// Output sub-rect of `preview_area` (minus the info header); tmux panes are sized to it.
     pub(super) preview_pane_area: Rect,
@@ -477,6 +499,7 @@ pub struct HomeView {
     pub(super) preview_autoscroll_at: Option<std::time::Instant>,
 
     pub(super) preview_selection: Option<PreviewSelection>,
+    pub(super) preview_click_seed: Option<u16>,
 
     /// Copy text is read from the next frame's buffer; after `draw` returns the buffers are swapped.
     pub(super) preview_copy_pending: bool,
@@ -487,6 +510,9 @@ pub struct HomeView {
 
     /// Preview the agent above its paired terminal; `view_mode` picks the focused half.
     pub(super) split_terminal: bool,
+    pub(super) split_terminal_height_percent: u16,
+    pub(super) split_terminal_min_width: u16,
+    pub(super) split_terminal_min_height: u16,
     /// Captures whichever split half is not focused; the focused half uses
     /// `preview_capture_worker` like a single preview.
     pub(super) split_capture_worker: Option<live_send::LiveCaptureWorker>,

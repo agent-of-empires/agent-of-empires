@@ -48,7 +48,10 @@ export function PluginCard({
               {plugin.name}
             </button>
             <span className="text-xs text-text-dim">v{plugin.version}</span>
-            <span className={`${PILL} bg-accent-500/20 text-accent-500`} data-testid={`plugin-validation-${plugin.id}`}>
+            <span
+              className={`${PILL} ${plugin.validation === "dev" ? "bg-status-warning/20 text-status-warning" : "bg-accent-500/20 text-accent-500"}`}
+              data-testid={`plugin-validation-${plugin.id}`}
+            >
               {plugin.validation}
             </span>
             {plugin.needs_reapproval && (

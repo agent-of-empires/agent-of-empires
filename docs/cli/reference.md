@@ -137,6 +137,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe acp tail`↴](#aoe-acp-tail)
 * [`aoe acp attach`↴](#aoe-acp-attach)
 * [`aoe acp switch-agent`↴](#aoe-acp-switch-agent)
+* [`aoe acp switch-account`↴](#aoe-acp-switch-account)
 * [`aoe acp switch-provider`↴](#aoe-acp-switch-provider)
 * [`aoe uninstall`↴](#aoe-uninstall)
 * [`aoe update`↴](#aoe-update)
@@ -213,7 +214,7 @@ Add a new session
 
 ###### **Options:**
 
-* `-t`, `--title <TITLE>` — Session title (defaults to folder name)
+* `-t`, `--title <TITLE>` — Session title (defaults to a civilization name, or the worktree branch)
 * `-i`, `--interactive` — Prompt for the session name, mirroring the TUI `n` flow. Shows the generated default; press Enter to accept it. Ignored when --title is given. Requires an interactive terminal
 * `-g`, `--group <GROUP>` — Group path (defaults to parent folder)
 * `-c`, `--cmd <COMMAND>` — Command to run (e.g., 'claude' or any other supported agent)
@@ -495,6 +496,8 @@ Restart session (or all sessions with `--all`)
 * `--parallel <PARALLEL>` — Concurrency cap for `--all`. Restarting many sandboxed sessions in parallel pressures dockerd, so the default is intentionally modest. Ignored when `--all` is not set
 
   Default value: `3`
+* `--tool <TOOL>` — Restart as this tool, through the Daemon. Swapping between tools that run the same agent under different `[session.agent_config_dir]` accounts keeps the conversation (Claude). Any other swap starts a fresh conversation. Use `aoe acp switch-account` to refuse instead
+* `--to-profile <TO_PROFILE>` — Move the session to this existing profile while restarting, through the Daemon
 
 
 
@@ -990,6 +993,7 @@ Install an external plugin from a `gh:owner/repo[@ref]` slug or a local director
 ###### **Options:**
 
 * `--yes` — Grant all requested capabilities without prompting
+* `--dev` — Install a local directory as a dev plugin: it may claim a reserved `aoe.*` / `agent-of-empires.*` id, is never featured, and is refused under `aoe serve --remote`
 
 
 
@@ -1867,7 +1871,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 ###### **Subcommands:**
 
-* `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
+* `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude auth login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
 * `stop` — Stop an agent worker and settle its owned native processes. Unlike `aoe serve --stop`, this ends the worker rather than detaching
 * `recover` — Retire unprovable worker ownership after external shutdown confirmation
@@ -1883,13 +1887,14 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`, or `AOE_DAEMON_PASSPHRASE` against a `--auth=passphrase` daemon) to attach across machines without going through the home session list
 * `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
+* `switch-account` — Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt; otherwise it gets the usual restart wake message. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
 * `switch-provider` — Re-route a Claude session to a different LLM provider, keeping the transcript. Refused mid-turn; once idle the worker restarts and resumes the same conversation. Credentials are not provisioned by this: the target provider's own variables must already be set on the host (for example `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION` for vertex). The model resets to the new provider's default, because model ids differ between providers
 
 
 
 ## `aoe acp doctor`
 
-Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
+Verify the structured view can start: Node runtime, configured agents, provider auth (claude auth login)
 
 **Usage:** `aoe acp doctor [OPTIONS]`
 
@@ -2123,6 +2128,19 @@ Switch an agent session to a different ACP agent, keeping the transcript. Valid 
 ###### **Options:**
 
 * `--model <MODEL>` — Optional model override forwarded to the new agent
+
+
+
+## `aoe acp switch-account`
+
+Switch a structured session to another account of the same agent, keeping the conversation. Accounts are tool names with their own `[session.agent_config_dir]`; the transcript is copied into the new account's store and the worker resumes it. A session parked on a rate limit continues with the interrupted prompt; otherwise it gets the usual restart wake message. Refuses, changing nothing, where the swap would start a fresh conversation (not Claude, no recorded conversation, other agent)
+
+**Usage:** `aoe acp switch-account <SESSION> <TOOL>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Acp session id
+* `<TOOL>` — Tool name of the target account, as declared in `[session.agent_config_dir]` (e.g. `claude-b`)
 
 
 

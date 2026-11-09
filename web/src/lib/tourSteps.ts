@@ -38,8 +38,9 @@ export interface TourStep {
   desktopOnly?: boolean;
 }
 
+/** Skips inert retained views, whose hidden anchors would otherwise match first and end the tour. */
 export function tourSelector(anchor: TourAnchorId): string {
-  return `[data-tour="${anchor}"]`;
+  return `[data-tour="${anchor}"]:not([inert] *)`;
 }
 
 /** The only sanctioned way to attach a tour anchor; spread it onto the element. */

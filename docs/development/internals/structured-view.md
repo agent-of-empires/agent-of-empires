@@ -95,6 +95,18 @@ The daemon folds the event stream once per WebSocket connection into two project
 - **Control state**: turn flags, pending approvals and elicitations, usage, plan, modes, slash commands, shipped as `reduced_state` on connect and after every event. `unchanged` names the cold fields the socket already holds, which the daemon omits rather than re-serializing. The connect frame is folded over the whole session even with a `since` cursor, because clients adopt it verbatim.
 - **Transcript rows**: a `transcript_snapshot` on connect plus a `transcript_delta` (`Append` / `Patch` / `Remove`, reconciled by row id) per event, with `GET /api/sessions/{id}/acp/replay?view=rows` for history. Presentation (markdown, tool cards, diffs) stays client-side.
 
+With a `since` cursor, retained prefix events advance the projection watermark
+without recreating historical rows. Tool lifecycle and latest output survive
+the cursor, so later completions keep their correlation and turn ends close
+only still-open tools once. Turn endings discard orphaned output; metadata
+alone does not reopen completed or elicited tools. After broadcast lag, both
+projections rebuild from retained history before processing queued frames.
+
+Trash inspection orders unfinished snapshots by their first content event rather
+than tool start order. Replacement snapshots keep that order. Turn endings move
+orphan snapshots into read-only history without inventing stopped rows or feeding
+that output into subsequent tool invocations.
+
 Raw event frames still stream for what the daemon does not model (worker lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts). A client reading only the projections passes `?frames=0`, as the native view does. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or an auto-resume; the native view renders it inline while the web shows the same information as a dismissible banner.
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
@@ -162,9 +174,7 @@ worker cannot settle before the bounded shutdown wait, the endpoint returns a
 `503` settlement error and leaves the replacement admission to a retry. A
 separate `409 worker_not_stopped` response is used when the worker is still
 present after a successful shutdown wait. The restart request is runtime-owned,
-so disconnecting the HTTP client does not leave the session half-restarted. Web
-startup and Retry adoption of this endpoint are follow-up UI work; the current
-Retry flow still uses `/acp/spawn`.
+so disconnecting the HTTP client does not leave the session half-restarted.
 
 ## Agent switching
 

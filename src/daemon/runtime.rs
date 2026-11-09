@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::SessionResponse;
 
-pub const RUNTIME_PROTOCOL_VERSION: u16 = 3;
+pub const RUNTIME_PROTOCOL_VERSION: u16 = 4;
 pub const RUNTIME_EPOCH_HEADER: &str = "aoe-runtime-epoch";
 pub const RUNTIME_REVISION_HEADER: &str = "aoe-runtime-revision";
 
@@ -80,6 +80,9 @@ pub enum ProjectMutation {
     Remove {
         target: ProjectTarget,
         name_or_path: String,
+        /// The client's absolute reading of a path-like argument, matched
+        /// against entry paths while `name_or_path` stays a candidate name.
+        anchored_path: Option<String>,
     },
 }
 
@@ -146,6 +149,9 @@ pub struct RuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_instance_id: Option<String>,
     pub protocol_version: u16,
+    /// Supports CLI selection intent and deferred terminal creation.
+    #[serde(default)]
+    pub cli_creation: bool,
     pub epoch: String,
     pub namespace: String,
     pub tmux_socket: Option<String>,
@@ -213,6 +219,15 @@ pub enum CreationPhase {
     LaunchHooks,
 }
 
+/// Advisory progress of a daemon-owned sandbox preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxProgress {
+    pub operation_id: String,
+    pub session_id: String,
+    pub profile: String,
+    pub activity: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeContents {
     pub health: RuntimeHealth,
@@ -239,6 +254,10 @@ pub enum RuntimeFrame<T = RuntimeSnapshot> {
     /// Creation progress, sent only to streams the daemon authorized as the
     /// local owner. See [`CreationProgress`].
     Creation(Vec<CreationProgress>),
+    Sandbox {
+        epoch: String,
+        progress: Vec<SandboxProgress>,
+    },
     OwnerDiagnostics {
         epoch: String,
         diagnostics: Vec<OwnerLoadDiagnostic>,

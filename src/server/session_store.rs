@@ -342,7 +342,7 @@ impl NativeSessionStore {
                         committed.target.1,
                     ),
                 ],
-                |_| false,
+                |_| None,
                 &reload,
                 &publication,
             ))
@@ -366,19 +366,71 @@ impl NativeSessionStore {
             error.context(NativeStoreUnavailable)
         })
     }
-}
 
-impl SessionStore for NativeSessionStore {
-    fn storage(&self) -> &Storage {
-        &self.storage
+    fn commit_with_status(
+        &self,
+        mutation: &mut SessionMutation<'_>,
+        status: super::reload::StatusCommit,
+    ) -> Result<()> {
+        self.check_source()?;
+        let reload = self
+            .runtime
+            .block_on(self.state.session_service.disk_reload_guard());
+        let transition = self.storage.acquire_write_transition();
+        let publication = self.state.publication.blocking_write();
+        ensure_healthy(&self.state)?;
+        let transition = match transition {
+            Ok(transition) => transition,
+            Err(error) => {
+                mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
+                return Err(error);
+            }
+        };
+        let mut rejected = false;
+        let result = transition.update_with_snapshot(&self.storage, |rows, groups| {
+            self.validate_launch_identity(rows)
+                .and_then(|()| mutation(rows, groups))
+                .inspect_err(|_| rejected = true)
+        });
+        let ((), rows, groups) = match result {
+            Ok(committed) => committed,
+            Err(error) => {
+                if !rejected {
+                    mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(test)]
+        before_adoption_for_test();
+        if let Err(error) = self
+            .runtime
+            .block_on(super::reload::adopt_committed_profiles(
+                &self.state,
+                [(self.storage.profile(), rows, groups)],
+                |id| (self.status_id.as_deref() == Some(id)).then_some(status),
+                &reload,
+                &publication,
+            ))
+        {
+            *self.state.canonical_health.blocking_write() = error.health.clone();
+            self.state.runtime.request_publish();
+            return Err(anyhow::Error::new(error).context(crate::session::SessionCommitApplied));
+        }
+        Ok(())
     }
 
-    fn release_lifecycle_reservation(
+    pub(crate) fn retire_trash_reservation(&self, id: &str, generation: u64) -> Result<()> {
+        self.settle_lifecycle_reservation(id, None, |row| {
+            row.retire_trash_reservation_if_owned(generation, chrono::Utc::now());
+        })
+    }
+
+    fn settle_lifecycle_reservation(
         &self,
         id: &str,
-        operation: crate::session::LifecycleOperation,
-        generation: u64,
         lifecycle: Option<crate::session::StorageFlock>,
+        settle: impl FnOnce(&mut Instance),
     ) -> Result<()> {
         // Cleanup must not depend on canonical adoption health.
         crate::migrations::ensure_schema_supported()?;
@@ -396,7 +448,7 @@ impl SessionStore for NativeSessionStore {
             self.storage.verify_bound_profile()?;
             transition.update_with_snapshot(&self.storage, |rows, _| {
                 if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                    row.release_lifecycle_reservation_if_owned(operation, generation);
+                    settle(row);
                 }
                 Ok(())
             })
@@ -413,7 +465,7 @@ impl SessionStore for NativeSessionStore {
             .block_on(super::reload::adopt_committed_profiles(
                 &self.state,
                 [(self.storage.profile(), rows, groups)],
-                |_| false,
+                |_| None,
                 &reload,
                 &publication,
             ))
@@ -423,6 +475,24 @@ impl SessionStore for NativeSessionStore {
             return Err(anyhow::Error::new(error).context(crate::session::SessionCommitApplied));
         }
         Ok(())
+    }
+}
+
+impl SessionStore for NativeSessionStore {
+    fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    fn release_lifecycle_reservation(
+        &self,
+        id: &str,
+        operation: crate::session::LifecycleOperation,
+        generation: u64,
+        lifecycle: Option<crate::session::StorageFlock>,
+    ) -> Result<()> {
+        self.settle_lifecycle_reservation(id, lifecycle, |row| {
+            row.release_lifecycle_reservation_if_owned(operation, generation);
+        })
     }
 
     fn defer_lifecycle_release(
@@ -511,63 +581,68 @@ impl SessionStore for NativeSessionStore {
     }
 
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
-        self.check_source()?;
-        let reload = self
-            .runtime
-            .block_on(self.state.session_service.disk_reload_guard());
-        let transition = self.storage.acquire_write_transition();
-        let publication = self.state.publication.blocking_write();
-        ensure_healthy(&self.state)?;
-        let transition = match transition {
-            Ok(transition) => transition,
-            Err(error) => {
-                mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
-                return Err(error);
-            }
-        };
-        let mut rejected = false;
-        let result = transition.update_with_snapshot(&self.storage, |rows, groups| {
-            self.validate_launch_identity(rows)
-                .and_then(|()| mutation(rows, groups))
-                .inspect_err(|_| rejected = true)
-        });
-        let ((), rows, groups) = match result {
-            Ok(committed) => committed,
-            Err(error) => {
-                if !rejected {
-                    mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
-                }
-                return Err(error);
-            }
-        };
-        #[cfg(test)]
-        before_adoption_for_test();
-        if let Err(error) = self
-            .runtime
-            .block_on(super::reload::adopt_committed_profiles(
-                &self.state,
-                [(self.storage.profile(), rows, groups)],
-                |id| self.status_id.as_deref() == Some(id),
-                &reload,
-                &publication,
-            ))
-        {
-            *self.state.canonical_health.blocking_write() = error.health.clone();
-            self.state.runtime.request_publish();
-            return Err(anyhow::Error::new(error).context(crate::session::SessionCommitApplied));
-        }
-        Ok(())
+        self.commit_with_status(mutation, super::reload::StatusCommit::Lifecycle)
+    }
+
+    fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit_with_status(mutation, super::reload::StatusCommit::LaunchReady)
     }
 
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()> {
-        self.run_sandbox_migration(|| {
-            crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
-        })
+        let (reporter, _progress) =
+            super::runtime::sandbox_reporter(self.state.clone(), id, self.storage.profile());
+        let result = self.run_sandbox_migration(|| {
+            crate::migrations::migrate_sandbox_store_for_with(id, Some(reporter), self, runtime)
+        });
+        // Content isolation also retires conversation bindings in this profile.
+        match (result, self.commit(&mut |_, _| Ok(()))) {
+            (Err(mut error), Err(commit_error)) => {
+                tracing::warn!(
+                    target: "server.session_store",
+                    session = %id,
+                    migration_error = %format_args!("{error:#}"),
+                    error = %format_args!("{commit_error:#}"),
+                    "post-migration commit failed"
+                );
+                if !error.is::<NativeStoreUnavailable>() {
+                    if let Some(rejection) = commit_error
+                        .downcast_ref::<crate::session::LifecycleReservationError>()
+                        .filter(|_| !error.is::<crate::session::LifecycleReservationError>())
+                    {
+                        error = error.context(*rejection);
+                    }
+                    if let Some(blocked) = commit_error
+                        .downcast_ref::<crate::session::StartBlocked>()
+                        .filter(|_| !error.is::<crate::session::StartBlocked>())
+                    {
+                        error = error.context(*blocked);
+                    }
+                    if commit_error.is::<crate::session::SessionGone>()
+                        && !error.is::<crate::session::SessionGone>()
+                    {
+                        error = error.context(crate::session::SessionGone);
+                    }
+                    if commit_error.is::<crate::session::SessionCommitApplied>()
+                        && !error.is::<crate::session::SessionCommitApplied>()
+                    {
+                        error = error.context(crate::session::SessionCommitApplied);
+                    }
+                    if commit_error.is::<NativeStoreUnavailable>()
+                        || *self.state.canonical_health.blocking_read()
+                            != crate::daemon::RuntimeHealth::Healthy
+                    {
+                        error = error.context(NativeStoreUnavailable);
+                    }
+                }
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), committed) => committed,
+        }
     }
 
     fn sandbox_registry_guard(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
@@ -786,6 +861,287 @@ fn mark_checkpoint_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn creation_boundary_preserves_negotiated_acp_capability() {
+        use crate::acp::{protocol::AcpBroadcastFrame, Event};
+        use crate::session::{Status, View};
+        let _home = crate::session::test_support::isolate_app_dir();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                for (initial, capable) in [(None, true), (Some(true), false)] {
+                    let mut row = Instance::new("capability race", "/tmp");
+                    row.source_profile = "default".into();
+                    row.tool = "claude".into();
+                    row.view = View::Structured;
+                    row.status = Status::Starting;
+                    row.lifecycle_generation = 7;
+                    row.acp_load_session_capable = initial;
+                    let id = row.id.clone();
+                    Storage::new_unwatched("default")
+                        .unwrap()
+                        .update(|rows, _| {
+                            *rows = vec![row.clone()];
+                            Ok(())
+                        })
+                        .unwrap();
+                    let state = crate::server::test_support::build_test_app_state(vec![row]);
+                    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+                    let generation = state.acp_supervisor.test_insert_worker(&id).await;
+                    let listener =
+                        tokio::spawn(super::super::acp_events::acp_event_listener(state.clone()));
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while state.acp_events_tx.receiver_count() == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(state.acp_events_tx.receiver_count(), 1);
+                    let (entered, observed) = tokio::sync::oneshot::channel();
+                    let (release, blocked) = std::sync::mpsc::channel();
+                    let producer_state = state.clone();
+                    let producer_id = id.clone();
+                    let native = tokio::task::spawn_blocking(move || {
+                        let native =
+                            NativeSessionStore::open(producer_state, "default", Some(producer_id))
+                                .unwrap();
+                        before_next_adoption_for_test(move || {
+                            entered.send(()).unwrap();
+                            blocked
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        });
+                        Arc::new(native)
+                    })
+                    .await
+                    .unwrap();
+                    let finalizer_state = state.clone();
+                    let finalizer_id = id.clone();
+                    let finalizer = tokio::spawn(async move {
+                        super::super::session_spawn::finish_structured_launch(
+                            &finalizer_state,
+                            native,
+                            &finalizer_id,
+                            7,
+                            Ok(()),
+                        )
+                        .await
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    state
+                        .acp_events_tx
+                        .send(AcpBroadcastFrame {
+                            session_id: id.clone(),
+                            seq: 1,
+                            event: Arc::new(Event::PromptCapabilities {
+                                image: false,
+                                audio: false,
+                                embedded_context: false,
+                                load_session: Some(capable),
+                                steering: false,
+                            }),
+                            worker_generation: Some(generation),
+                            sidebar_status: None,
+                        })
+                        .unwrap();
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !state.acp_events_tx.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let during = state.instances.read().await[0].acp_load_session_capable;
+                    release.send(()).unwrap();
+                    finalizer.await.unwrap().unwrap();
+                    assert_eq!(during, initial);
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while state.instances.read().await[0].acp_load_session_capable
+                            != Some(capable)
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    listener.abort();
+                    let _ = listener.await;
+                }
+            });
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn created_launch_readiness_preserves_an_admitted_turn_and_newer_generation() {
+        use crate::acp::{protocol::AcpBroadcastFrame, Event};
+        use crate::session::{LifecycleReservationError, Status, View};
+        let _home = crate::session::test_support::isolate_app_dir();
+        for active in [false, true] {
+            let mut row = Instance::new("handshake race", "/tmp");
+            row.source_profile = "default".into();
+            row.view = View::Structured;
+            row.status = Status::Starting;
+            row.lifecycle_generation = 7;
+            let id = row.id.clone();
+            let storage = Storage::new_unwatched("default").unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![row.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let listener =
+                tokio::spawn(super::super::acp_events::acp_event_listener(state.clone()));
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while state.acp_events_tx.receiver_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let (committed, observed) = tokio::sync::oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let producer_state = state.clone();
+            let mut launching = row.clone();
+            let producer = tokio::task::spawn_blocking(move || {
+                let native =
+                    NativeSessionStore::open(producer_state, "default", Some(launching.id.clone()))
+                        .unwrap();
+                before_next_adoption_for_test(move || {
+                    committed.send(()).unwrap();
+                    blocked
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                });
+                launching.commit_created_launch(&native, 7, Status::Idle)
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), observed)
+                .await
+                .unwrap()
+                .unwrap();
+            if active {
+                let event = Event::UserPromptSent {
+                    text: "hold this turn".into(),
+                    attachments: vec![],
+                    prompt_id: None,
+                    synthesized: false,
+                    origin_plugin: None,
+                };
+                state.acp_event_store.record(&id, 1, &event).unwrap();
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame {
+                        session_id: id.clone(),
+                        seq: 1,
+                        event: Arc::new(event),
+                        worker_generation: None,
+                        sidebar_status: None,
+                    })
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while state.instances.read().await[0].status != Status::Running {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .turn_active
+                );
+            }
+            release.send(()).unwrap();
+            producer.await.unwrap().unwrap();
+            assert_eq!(
+                state.instances.read().await[0].status,
+                if active {
+                    Status::Running
+                } else {
+                    Status::Idle
+                },
+            );
+            if active {
+                assert!(
+                    state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .turn_active
+                );
+                let event = Event::Stopped {
+                    reason: "prompt_complete".into(),
+                };
+                state.acp_event_store.record(&id, 2, &event).unwrap();
+                let sidebar_status = state.acp_control_cache.apply_if_cached(&id, 2, &event);
+                state
+                    .acp_events_tx
+                    .send(AcpBroadcastFrame {
+                        session_id: id.clone(),
+                        seq: 2,
+                        event: Arc::new(event),
+                        worker_generation: None,
+                        sidebar_status,
+                    })
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while state.instances.read().await[0].status != Status::Idle {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    !state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .turn_active
+                );
+            }
+            listener.abort();
+            let _ = listener.await;
+            storage
+                .update(|rows, _| {
+                    rows[0].lifecycle_generation = 8;
+                    rows[0].status = Status::Stopped;
+                    Ok(())
+                })
+                .unwrap();
+            {
+                let mut rows = state.instances.write().await;
+                rows[0].lifecycle_generation = 8;
+                rows[0].status = Status::Stopped;
+            }
+            let error = tokio::task::spawn_blocking(move || {
+                let native = NativeSessionStore::open(state, "default", Some(id)).unwrap();
+                row.commit_created_launch(&native, 7, Status::Idle)
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<LifecycleReservationError>(),
+                Some(&LifecycleReservationError::Superseded)
+            );
+            let persisted = storage.load().unwrap();
+            assert_eq!(persisted[0].lifecycle_generation, 8);
+            assert_eq!(persisted[0].status, Status::Stopped);
+        }
+    }
 
     #[test]
     #[serial_test::serial]
@@ -1854,6 +2210,124 @@ mod tests {
                 .is_none(),
             "resnapshot must reflect the completed reservation release without a push loop"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandbox_migration_settlement_preserves_primary_causes_and_authority() -> Result<()> {
+        for damage in ["checkpoint", "migration", "both", "settlement"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let app = crate::session::get_app_dir()?;
+            std::fs::write(
+                app.join(".schema_version"),
+                crate::migrations::current_schema_version().to_string(),
+            )?;
+            let storage = Storage::new_unwatched("migration-owner")?;
+            let mut owner = Instance::new("owner", "/tmp/migration-owner");
+            owner.source_profile = storage.profile().into();
+            owner.tool = "gemini".into();
+            owner.sandbox_store_generation = 0;
+            owner.sandbox_info = (damage != "settlement").then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true, "image": "test-image", "container_name": "migration-owner"
+                }))
+                .unwrap()
+            });
+            storage.update(|rows, _| {
+                rows.push(owner.clone());
+                Ok(())
+            })?;
+            let mut rows = vec![owner.clone()];
+            let peer = if damage == "checkpoint" {
+                let peer = Storage::new_unwatched("migration-peer")?;
+                let mut row = Instance::new("peer", "/tmp/migration-peer");
+                row.source_profile = peer.profile().into();
+                peer.update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })?;
+                rows.push(row);
+                Some(peer)
+            } else {
+                None
+            };
+            let state = crate::server::test_support::build_test_app_state(rows);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let previous = serde_json::to_value(&*state.instances.read().await)?;
+            let worker_state = state.clone();
+            let id = owner.id.clone();
+            let error = tokio::task::spawn_blocking(move || -> Result<anyhow::Error> {
+                let store =
+                    NativeSessionStore::open(worker_state.clone(), "migration-owner", None)?;
+                if let Some(peer) = peer.as_ref() {
+                    std::fs::write(peer.sessions_path(), b"{")?;
+                } else if damage != "settlement" {
+                    std::fs::write(app.join(".v027-sandbox-transition.json"), b"{")?;
+                }
+                if matches!(damage, "both" | "settlement") {
+                    before_next_adoption_for_test(move || {
+                        worker_state
+                            .canonical_metadata
+                            .blocking_write()
+                            .profiles
+                            .clear();
+                    });
+                }
+                Ok(store
+                    .migrate_sandbox_store(&id, &crate::containers::ContainerRuntime::docker())
+                    .expect_err("migration or its final canonical adoption must fail"))
+            })
+            .await??;
+            if damage == "checkpoint" {
+                let failure = error
+                    .downcast_ref::<
+                        crate::migrations::v027_isolate_sandbox_stores::SandboxCheckpointFailure,
+                    >()
+                    .expect("the original cohort checkpoint failure must survive final adoption");
+                assert_eq!(failure.profile.as_deref(), Some("migration-peer"));
+                assert!(error.is::<NativeStoreUnavailable>(), "{error:#}");
+                assert_eq!(
+                    std::fs::read(Storage::open_unwatched("migration-peer")?.sessions_path())?,
+                    b"{"
+                );
+            } else {
+                assert_eq!(
+                    error.chain().any(|cause| cause.is::<serde_json::Error>()),
+                    damage != "settlement",
+                    "{damage}: {error:#}"
+                );
+                assert_eq!(
+                    error.is::<crate::session::SessionCommitApplied>(),
+                    damage != "migration",
+                    "{damage}: {error:#}"
+                );
+                assert_eq!(
+                    error.is::<NativeStoreUnavailable>(),
+                    damage == "both",
+                    "{damage}: {error:#}"
+                );
+                if damage != "settlement" {
+                    assert_eq!(
+                        std::fs::read(
+                            crate::session::get_app_dir()?.join(".v027-sandbox-transition.json")
+                        )?,
+                        b"{"
+                    );
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.instances.read().await)?,
+                previous,
+                "{damage} must not adopt a partial profile"
+            );
+            assert_eq!(
+                *state.canonical_health.read().await == crate::daemon::RuntimeHealth::Healthy,
+                damage == "migration",
+                "{damage}"
+            );
+            assert_eq!(storage.load()?[0].id, owner.id);
+        }
         Ok(())
     }
 

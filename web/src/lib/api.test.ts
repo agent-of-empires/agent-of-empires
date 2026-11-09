@@ -72,7 +72,11 @@ describe("project container override serialization", () => {
 });
 
 const requestCases: RequestCase[] = [
-  ["GET /api/sessions", () => api.fetchSessions(), { respond: runtimeJson(sessions), result: { ...sessions, cursor } }],
+  [
+    "GET /api/sessions?state=untrashed",
+    () => api.fetchSessions(),
+    { respond: runtimeJson(sessions), result: { ...sessions, cursor } },
+  ],
   [
     "GET /api/sessions/search?q=foo%20bar",
     () => api.searchConversations("foo bar"),
@@ -764,7 +768,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["fetchIsGitRepo", () => api.fetchIsGitRepo("/r"), null],
   ["getHomePath", () => api.getHomePath(), null],
   ["browseFilesystem", () => api.browseFilesystem("/r"), { entries: [], has_more: false, ok: false }],
-  ["fetchDockerStatus", () => api.fetchDockerStatus(), { available: false, runtime: null }],
+  ["fetchDockerStatus", () => api.fetchDockerStatus(), { available: false, runtime: null, runtime_name: null }],
   [
     "loginStatus",
     () => api.loginStatus(),
@@ -780,6 +784,7 @@ const failureCases: [string, () => Promise<unknown>, unknown][] = [
   ["invokePluginAction", () => api.invokePluginAction("p", "m"), null],
   ["resolvePluginOptions", () => api.resolvePluginOptions("p", "s", []), []],
   ["fetchSoundBlob", () => api.fetchSoundBlob("x.wav"), null],
+  ["fetchProfileAgents", () => api.fetchProfileAgents("work"), null],
   ["pullSandboxImage", () => api.pullSandboxImage(), { ok: false }],
   ["dismissSandboxImage", () => api.dismissSandboxImage("sha256:new"), false],
 ];
@@ -1046,6 +1051,25 @@ describe("project mutations", () => {
   });
 });
 
+describe("fetchProfileAgents", () => {
+  it.each([
+    ["a list", () => json([{ id: "claude" }]), [{ id: "claude" }]],
+    ["an unknown profile", () => json({ error: "profile_not_found", message: "no" }, 404), "profile_not_found"],
+    ["another 404", () => json({ error: "not_found" }, 404), null],
+    ["a 404 without JSON", () => new Response("gone", { status: 404 }), null],
+    ["a server error", () => json({ error: "profile_not_found" }, 500), null],
+  ])("reads %s", async (_name, respond, result) => {
+    fetchSpy.mockResolvedValueOnce(respond());
+    expect(await api.fetchProfileAgents("work")).toEqual(result);
+    expect(lastCall().url).toBe("/api/agents?profile=work");
+  });
+
+  it("is null for fetchAgents when the profile is unknown", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "profile_not_found" }, 404));
+    expect(await api.fetchAgents("work")).toBeNull();
+  });
+});
+
 describe("createSession errors", () => {
   const body = { path: "/repo", tool: "claude" } as CreateSessionRequest;
 
@@ -1123,11 +1147,30 @@ describe("createSession errors", () => {
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 
+  it.each([
+    ["the body's reference", { reference: "body-ref" }, { "x-request-id": "header-ref" }, "body-ref"],
+    ["the echoed request id without one", {}, { "x-request-id": "header-ref" }, "header-ref"],
+  ])("keeps the failure's code, stage and %s", async (_label, extra, headers, reference) => {
+    const failed = { error: "sandbox_unavailable", message: "Podman isn't running.", stage: "starting_container" };
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ ...failed, ...extra }), { status: 400, headers }));
+    expect((await api.createSession(body)).failure).toEqual({
+      code: "sandbox_unavailable",
+      message: "Podman isn't running.",
+      stage: "starting_container",
+      reference,
+    });
+  });
+
   it("maps plain JSON, text, and network errors", async () => {
     fetchSpy.mockResolvedValueOnce(
-      new Response(JSON.stringify({ error: "create_failed", message: "nope" }), { status: 400 }),
+      new Response(JSON.stringify({ error: "create_failed", message: "nope", stage: "__proto__" }), { status: 400 }),
     );
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "nope" });
+    // An unknown stage reads as none, so the box never looks it up.
+    expect(await api.createSession(body)).toEqual({
+      ok: false,
+      error: "nope",
+      failure: { code: "create_failed", message: "nope", stage: null, reference: null },
+    });
     // A proxy's page is no verdict: the create may still be running behind it.
     fetchSpy.mockResolvedValueOnce(new Response("boom", { status: 500 }));
     expect(await api.createSession(body)).toMatchObject({ ok: false, network: true });
@@ -1141,7 +1184,11 @@ describe("createSession errors", () => {
     fetchSpy.mockResolvedValueOnce(
       new Response(JSON.stringify({ error: "create_failures_full", message: "try later" }), { status: 503 }),
     );
-    expect(await api.createSession(body)).toEqual({ ok: false, error: "try later" });
+    expect(await api.createSession(body)).toMatchObject({
+      ok: false,
+      error: "try later",
+      failure: { code: "create_failures_full" },
+    });
     fetchSpy.mockResolvedValueOnce(new Response("too large", { status: 413 }));
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Server error (413): too large" });
     // A restarted daemon that cannot see the first attempt: settled, and not a failure.
@@ -1646,6 +1693,20 @@ describe("header-complete operations", () => {
       clearTimeout(timer);
       controller.close();
     }
+  });
+});
+
+describe("restartSession", () => {
+  it("POSTs and reports success, the server message on a refusal, and nothing when offline", async () => {
+    fetchSpy.mockResolvedValueOnce(empty());
+    expect(await api.restartSession("s 1")).toEqual({ ok: true });
+    expect(lastCall()).toMatchObject({ url: "/api/sessions/s%201/restart", init: { method: "POST" } });
+
+    fetchSpy.mockResolvedValueOnce(json({ error: "start_failed", message: "Structured restart failed" }, 500));
+    expect(await api.restartSession("s1")).toEqual({ ok: false, message: "Structured restart failed" });
+
+    offline();
+    expect(await api.restartSession("s1")).toEqual({ ok: false });
   });
 });
 

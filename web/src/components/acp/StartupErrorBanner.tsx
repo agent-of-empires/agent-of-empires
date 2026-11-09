@@ -2,37 +2,46 @@ import { useEffect, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { fetchAgentInstallInfo, type AgentInstallInfo } from "../../lib/api";
+import type { AcpWorkerState } from "../../lib/types";
 import { splitInstallHint, startupErrorCause, useAdapterInstall } from "./adapterRecovery";
 import { CommandBlock, RecoveryActionRow, type RecoveryAction } from "./RecoveryActionRow";
+import { ApiKeyAlternative } from "./SignInPopover";
+import { signInSteps } from "./signInSteps";
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
 }
 
+const RETRY = (
+  <>
+    click <strong>Retry</strong>
+  </>
+);
+
 /** Copy for the failures a reinstall won't fix, keyed off the message text. */
-function specificRemediation(message: string, agent: string | undefined, name: string): React.ReactNode {
+function specificRemediation(
+  message: string,
+  agent: string | undefined,
+  name: string,
+  /** Unknown until the install info loads; a command could then name the wrong terminal. */
+  sandboxed: boolean | undefined,
+): React.ReactNode {
   if (/authentic|login|api[_ -]?key/i.test(message)) {
-    if (agent === "claude" || agent === "claude-code") {
-      return (
-        <>
-          The adapter is installed but has no Claude credentials. Either set <Code>ANTHROPIC_API_KEY</Code> in the env
-          that runs <Code>aoe serve</Code>, or run <Code>claude /login</Code> in a terminal to write credentials to{" "}
-          <Code>~/.claude</Code>, then restart aoe.
-        </>
-      );
-    }
-    if (agent === "codex") {
-      return (
-        <>
-          The adapter is installed but has no Codex credentials. Either set <Code>OPENAI_API_KEY</Code> in the env that
-          runs <Code>aoe serve</Code>, or run <Code>codex login</Code> on the host, then restart aoe.
-        </>
-      );
-    }
+    const steps = signInSteps(sandboxed === undefined ? null : agent, name, sandboxed === true);
+    // Retry respawns the Agent, which reads a new sign-in.
     return (
       <>
-        The adapter is installed but {name} isn't signed in. Sign in to {name} or set its API key in the env that runs{" "}
-        <Code>aoe serve</Code>, then restart aoe.
+        The adapter is installed but {name} isn't signed in.{" "}
+        {steps.command ? (
+          <>
+            Run <Code>{steps.command}</Code> in a {sandboxed ? "Container" : "host"} terminal, then click{" "}
+            <strong>Retry</strong>. <ApiKeyAlternative apiKeyEnv={steps.apiKeyEnv} then={RETRY} />
+          </>
+        ) : (
+          <>
+            Sign in to {name}, then click <strong>Retry</strong>. <ApiKeyAlternative apiKeyEnv={null} then={RETRY} />
+          </>
+        )}
       </>
     );
   }
@@ -134,17 +143,29 @@ const ADAPTER_NOT_FOUND = /binary `[^`]+` not found/;
 export function StartupErrorBanner({
   sessionId,
   message,
+  acpWorkerState,
+  sentStopped = false,
   onSwitchToTerminal,
 }: {
   sessionId: string;
   message: string;
+  acpWorkerState: AcpWorkerState;
+  /** A restart stopped the sent message and it hasn't been sent again. */
+  sentStopped?: boolean;
   /** Opens the switch-view confirmation; omitted where the Session can't switch. */
   onSwitchToTerminal?: () => void;
 }) {
   const [info, setInfo] = useState<AgentInstallInfo | null>(null);
   const [infoRequest, setInfoRequest] = useState(0);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const { state: retryState, detail: retryDetail, respawn } = useRespawnSession(sessionId);
+  // A Worker still present would refuse a spawn, so Retry replaces it instead.
+  const {
+    state: retryState,
+    detail: retryDetail,
+    respawn,
+  } = useRespawnSession(sessionId, null, {
+    restart: acpWorkerState !== "absent",
+  });
   // A failed respawn opens Details, where its failure line is, whichever button started it.
   const respawnOrShow = async () => {
     const ok = await respawn();
@@ -164,7 +185,12 @@ export function StartupErrorBanner({
   }, [sessionId, infoRequest]);
 
   const name = info?.display_name ?? AGENT_IN_MESSAGE.exec(message)?.[1] ?? "The agent";
-  const specific = specificRemediation(message, info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1], name);
+  const specific = specificRemediation(
+    message,
+    info?.agent ?? AGENT_IN_MESSAGE.exec(message)?.[1],
+    name,
+    info ? info.sandboxed === true : undefined,
+  );
   const canInstall = !specific && info?.install_allowed === true && info.npm_installable;
   const busy = retryState === "retrying" || install.state === "installing";
 
@@ -227,6 +253,11 @@ export function StartupErrorBanner({
         secondary={[...(canInstall ? [retryAction] : []), ...switchAction]}
         install={install}
       />
+      {sentStopped && (
+        <div data-testid="startup-error-banner-sent-stopped" className="mt-2 text-xs text-text-subtle">
+          The message you sent was stopped. Send it again once {name} is ready.
+        </div>
+      )}
       {retryState === "ok" && (
         <div className="mt-2 text-xs text-text-subtle">Retrying. Events will appear when {name} starts.</div>
       )}
@@ -269,9 +300,9 @@ function InstallSteps({ info }: { info: AgentInstallInfo | null }) {
         <p className="mt-2">Run this inside the container, then Retry:</p>
         <CommandBlock {...hint} testId="startup-error-banner-command" />
         <p className="mt-2 text-text-subtle">
-          This updates the running container only. To keep new Sessions from hitting this, refresh the sandbox image:
-          the aoe TUI shows a "sandbox image update available" banner that pulls the right image with your configured
-          container runtime.
+          This updates the running container only. To keep new Sessions from hitting this, refresh the Sandbox image.
+          When a newer image is published and update checks are on, the dashboard's "Sandbox image update available"
+          banner offers Update now to pull it, or shows the command to run.
         </p>
       </div>
     );

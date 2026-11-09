@@ -91,6 +91,22 @@ fn write_project_omp_dotenv(project: &Path, store: &Path) {
 }
 
 fn install_path_preserving_test_shell(h: &mut TuiTestHarness, path_bin: &Path) {
+    for key in [
+        "NODE_ENV",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CODING_AGENT_DIR",
+        "PI_CODING_AGENT_SESSION_DIR",
+        "PI_CONFIG_DIR",
+        "OMP_CODING_AGENT_DIR",
+        "OMP_CODING_AGENT_SESSION_DIR",
+        "OMP_CONFIG_DIR",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "AOE_INSTANCE_ID",
+    ] {
+        h.remove_env(key);
+    }
     let shell = h.home_path().join("omp-test-shell");
     write_executable(
         &shell,
