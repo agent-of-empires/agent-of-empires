@@ -236,8 +236,8 @@ where
     pairs
 }
 
-/// Shells whose quoting rules are incompatible with POSIX `'\''` escaping.
-const NON_POSIX_SHELLS: &[&str] = &["fish", "nu", "nushell", "pwsh", "powershell"];
+/// Shells that cannot run POSIX scripts or parse POSIX `'\''` escaping.
+const NON_POSIX_SHELLS: &[&str] = &["fish", "nu", "nushell", "pwsh", "powershell", "csh", "tcsh"];
 
 /// Shells we can safely launch with a `-l` login flag. Others (nushell,
 /// PowerShell) are launched plain; they still source their own interactive
@@ -2315,6 +2315,15 @@ environment = ["AOE_TEST_REPO_SECRET_3710", "LEAK=$AOE_TEST_REPO_SECRET_3710"]
     fn test_user_posix_shell_falls_back_for_fish() {
         let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/fish")]);
         assert_eq!(user_posix_shell(), "bash");
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_user_posix_shell_falls_back_for_csh_family() {
+        for shell in ["/bin/csh", "/usr/local/bin/tcsh"] {
+            let _shell = EnvGuard::set(&[("SHELL", shell)]);
+            assert_eq!(user_posix_shell(), "bash", "{shell}");
+        }
     }
 
     #[test]

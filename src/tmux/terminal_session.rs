@@ -941,6 +941,59 @@ mod tests {
         }
     }
 
+    /// A csh-family login shell cannot run the POSIX launch script, so another
+    /// shell runs it and then starts the user's. The shim stands in for tcsh:
+    /// tmux runs pane commands through it with `-c` as its `default-shell`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_csh_family_host_terminal_launches_login_shell_after_posix_script() {
+        use crate::session::environment::shell_escape;
+        use std::os::unix::fs::PermissionsExt;
+
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        for shell_name in ["csh", "tcsh"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+            let output = tmp.path().join("login");
+            let shell = tmp.path().join(shell_name);
+            std::fs::write(
+                &shell,
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in -c) exec /bin/sh -c \"$2\";; esac\n\
+                     printf '%s\\n%s' \"$*\" \"$CSH_TEST_5499\" > {}\nexec sleep 30\n",
+                    shell_escape(&output.to_string_lossy()),
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _env = crate::session::test_support::EnvGuard::set(&[
+                ("CSH_TEST_5499", "from-launch-script"),
+                ("SHELL", shell.to_str().unwrap()),
+            ]);
+            let config_path = crate::session::config::config_path().unwrap();
+            std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n").unwrap();
+
+            let guard = TmuxTestSession::new(&format!("aoe_test_login_{shell_name}"));
+            PairedTerminal {
+                name: guard.name().to_string(),
+                kind: TerminalKind::Host,
+            }
+            .create_with_size("/tmp", None, Some((80, 24)), "default")
+            .expect("create host terminal");
+
+            assert_eq!(
+                read_when_written(&output).as_deref(),
+                Some("-l\nfrom-launch-script"),
+                "{shell_name} must start as the login shell with the exported value"
+            );
+        }
+    }
+
     /// Container terminals keep the container's own env; the host desktop env
     /// (DISPLAY, XDG_*, SSH_AUTH_SOCK, ...) must NOT leak into them. Drive the
     /// real `create_with_size` for a container terminal (a plain command, no
