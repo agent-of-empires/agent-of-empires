@@ -10,8 +10,6 @@ const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
 
 /// Build a short human-readable hint for why a session transitioned to Error.
 pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
-    const MAX_BANNER_LINES: usize = 3;
-
     let cleaned = crate::tmux::utils::strip_ansi(pane_content);
     // Callers pass the captured tail, so keep every nonempty row: a provider
     // footer can sit above plugin rows and wrap across several lines.
@@ -58,9 +56,6 @@ pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
                 break;
             }
             msg_lines.push(line);
-            if msg_lines.len() == MAX_BANNER_LINES {
-                break;
-            }
         }
         if !msg_lines.is_empty() {
             // Reorder to pane order (top first), trim per line, strip a
@@ -294,6 +289,19 @@ mod tests {
                  ╭── π  > GPT-5.6 Sol ─╮\n\
                  ╰─                   ─╯",
                 "building failed: no such file",
+            ),
+            (
+                "whole banner above a multi-row footer",
+                "────\n\
+                 ✘ 502 Bad Gateway: upstream timed out.\n\
+                    The provider kept the request open.\n\
+                    Retrying in 10s, then 20s.\n\
+                    Retry budget is limited.\n\
+                 Dismissed when you send your next message.\n\
+                 ────\n\
+                 ╭── π  > GPT-5.6 Sol ─╮\n\
+                 ╰─                   ─╯",
+                "502 Bad Gateway: upstream timed out. The provider kept the request open. Retrying in 10s, then 20s. Retry budget is limited.",
             ),
         ];
 

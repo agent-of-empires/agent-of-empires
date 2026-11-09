@@ -3083,11 +3083,7 @@ impl Instance {
         else {
             return Ok(command);
         };
-        let mut words = shell_words::split(&command)?;
-        *words.first_mut().context("native program is missing")? = program
-            .to_str()
-            .context("native executable path is not UTF-8")?
-            .to_owned();
+        let mut words = freeze_launch_words(&command, &execution.program)?;
         // A shared service may have opened a different database.
         if execution.is_some_and(|execution| execution.agent.name == "opencode") {
             match launch_context.generation() {
@@ -3100,6 +3096,21 @@ impl Instance {
         }
         Ok(shell_words::join(words))
     }
+}
+
+/// Split a literal launch command and swap in the resolved executable, keeping
+/// any leading environment assignments in front of it.
+fn freeze_launch_words(command: &str, program: &std::path::Path) -> Result<Vec<String>> {
+    let (_, assignments) = aoe_plugin_api::agent_integration::launch_prefix(command)
+        .context("native program is missing")?;
+    let mut words = shell_words::split(command)?;
+    *words
+        .get_mut(assignments)
+        .context("native program is missing")? = program
+        .to_str()
+        .context("native executable path is not UTF-8")?
+        .to_owned();
+    Ok(words)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3827,6 +3838,19 @@ mod tests {
         .expect("the executable follows its assignments");
         assert_eq!(resolved.name, "omp");
         assert_eq!(instance.managed_user_argv(agent).unwrap(), None);
+    }
+
+    #[test]
+    fn freezing_keeps_leading_assignments_ahead_of_the_resolved_program() {
+        let program = std::path::Path::new("/resolved/omp");
+        assert_eq!(
+            freeze_launch_words("TOKEN=local omp", program).expect("literal launch"),
+            vec!["TOKEN=local", "/resolved/omp"]
+        );
+        assert_eq!(
+            freeze_launch_words("omp --model x", program).expect("literal launch"),
+            vec!["/resolved/omp", "--model", "x"]
+        );
     }
 
     #[test]

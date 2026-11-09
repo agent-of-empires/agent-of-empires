@@ -321,8 +321,7 @@ struct DeclaredAgent {
     status: bool,
 }
 
-fn declared_for(tool: &str) -> Option<DeclaredAgent> {
-    let registry = super::registry();
+fn declared_for(registry: &super::PluginRegistry, tool: &str) -> Option<DeclaredAgent> {
     let mut candidates = registry.active().flat_map(|plugin| {
         plugin
             .manifest
@@ -353,11 +352,12 @@ fn declared_for(tool: &str) -> Option<DeclaredAgent> {
 /// assignments counted separately. `None` for a built-in or an undeclared tool,
 /// whose executable is the whole prefix.
 pub(crate) fn declared_launch_words(tool: &str) -> Option<(Vec<String>, usize)> {
-    let declared = declared_agent(tool)?;
+    let (registry, generation) = super::registry_with_generation();
+    let declared = declared_agent_in(&registry, generation, tool)?;
     if !std::ptr::eq(declared, crate::agents::get_agent(tool)?) {
         return None;
     }
-    let command = declared_for(tool)?.command?;
+    let command = declared_for(&registry, tool)?.command?;
     let (words, assignments) = aoe_plugin_api::agent_integration::literal_command_words(&command)?;
     Some((words.into_iter().map(str::to_string).collect(), assignments))
 }
@@ -376,7 +376,15 @@ pub(crate) fn clear_declared_agent_cache() {
 /// entries win in [`crate::agents::get_agent`], so a declaration only takes
 /// effect once the matching core entry is deleted.
 pub(crate) fn declared_agent(tool: &str) -> Option<&'static AgentDef> {
-    let generation = super::registry_generation();
+    let (registry, generation) = super::registry_with_generation();
+    declared_agent_in(&registry, generation, tool)
+}
+
+fn declared_agent_in(
+    registry: &super::PluginRegistry,
+    generation: u64,
+    tool: &str,
+) -> Option<&'static AgentDef> {
     if let Some((cached_generation, cached)) = DECLARED_AGENT_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -387,9 +395,9 @@ pub(crate) fn declared_agent(tool: &str) -> Option<&'static AgentDef> {
             return cached;
         }
     }
-    let resolved = declared_for(tool).map(build_declared_agent);
-    // A lookup that raced a reload stays tagged with the snapshot it read, so
-    // the next call after the swap resolves against the new registry.
+    let resolved = declared_for(registry, tool).map(build_declared_agent);
+    // The entry carries the generation of the snapshot it resolved against, so a
+    // lookup that raced a reload is discarded instead of outliving it.
     DECLARED_AGENT_CACHE
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -1113,6 +1121,39 @@ mod tests {
         )
         .unwrap();
         assert!(rejected.unwrap_err().to_string().contains("another owner"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_reload_publishes_its_registry_and_generation_together() {
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let (before, generation_before) = crate::plugin::registry_with_generation();
+        let reloaded = crate::plugin::reload_registry();
+        let (after, generation_after) = crate::plugin::registry_with_generation();
+        assert_eq!(generation_after, generation_before + 1);
+        assert!(std::sync::Arc::ptr_eq(&after, &reloaded));
+        assert!(!std::sync::Arc::ptr_eq(&before, &after));
+    }
+
+    #[test]
+    fn status_override_covers_reports_dead_panes_and_unconfigured_tools() {
+        use crate::session::Status;
+        let override_status =
+            |configured, dead, report| super::session_status_override(configured, dead, report);
+        assert_eq!(override_status(false, false, None), None);
+        assert_eq!(
+            override_status(true, true, Some(super::AgentIntegrationStatus::Waiting)),
+            Some(Status::Error)
+        );
+        assert_eq!(override_status(true, false, None), Some(Status::Unknown));
+        assert_eq!(
+            override_status(true, false, Some(super::AgentIntegrationStatus::Waiting)),
+            Some(Status::Waiting)
+        );
+        assert_eq!(
+            override_status(true, false, Some(super::AgentIntegrationStatus::Error)),
+            Some(Status::Error)
+        );
     }
 
     fn install_test_integration(plugin_id: &str, tool: &str) {

@@ -146,6 +146,28 @@ pub(crate) fn registry_generation() -> u64 {
     REGISTRY_GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// The active registry with the generation it was published under, read under
+/// one lock so a reload cannot pair a new generation with the old snapshot.
+pub(crate) fn registry_with_generation() -> (Arc<PluginRegistry>, u64) {
+    let guard = REGISTRY.read_safe();
+    if let Some(reg) = guard.as_ref() {
+        let generation = registry_generation();
+        return (reg.clone(), generation);
+    }
+    drop(guard);
+    let mut slot = REGISTRY.write_safe();
+    let reg = match slot.as_ref() {
+        Some(reg) => reg.clone(),
+        None => {
+            let config = crate::session::Config::load_or_warn();
+            let reg = Arc::new(PluginRegistry::load(&config));
+            *slot = Some(reg.clone());
+            reg
+        }
+    };
+    (reg, registry_generation())
+}
+
 pub fn registry() -> Arc<PluginRegistry> {
     if let Some(reg) = REGISTRY.read_safe().as_ref() {
         return reg.clone();
@@ -169,9 +191,15 @@ pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
 pub fn reload_registry() -> Arc<PluginRegistry> {
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
-    REGISTRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    {
+        // Publication and the generation advance share one lock: a lookup that
+        // reads the new generation then reads this registry, never the previous
+        // one under a generation that stays current.
+        let mut slot = REGISTRY.write_safe();
+        *slot = Some(reg.clone());
+        REGISTRY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
     agent_integration::clear_declared_agent_cache();
-    *REGISTRY.write_safe() = Some(reg.clone());
     reg
 }
 

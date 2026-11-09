@@ -1679,7 +1679,19 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 age: crate::hooks::read_hook_status_age(&inst.id),
             }
         });
-        let status = if let Some(plan) =
+        let integration_configured = crate::plugin::agent_integration::configured(inst);
+        let integration_snapshot = integration_configured
+            .then(|| crate::plugin::agent_integration::snapshot(inst))
+            .flatten();
+        let status = if let Some(status) = crate::plugin::agent_integration::session_status_override(
+            integration_configured,
+            tmux_session.is_pane_dead(),
+            integration_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status),
+        ) {
+            status
+        } else if let Some(plan) =
             crate::tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
         {
             let policy = plan.capture_policy();
