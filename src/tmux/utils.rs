@@ -1336,8 +1336,14 @@ mod tests {
     fn birth_inventory_parser_accepts_only_complete_typed_pane_rows() {
         for (row, expected) in [
             ("7001|$1|%2||1", Some((7001, "$1", "%2", None, true))),
-            ("7001|$1|%2|7002|1", Some((7001, "$1", "%2", Some(7002), true))),
-            ("7001|$1|%2|7002|0", Some((7001, "$1", "%2", Some(7002), false))),
+            (
+                "7001|$1|%2|7002|1",
+                Some((7001, "$1", "%2", Some(7002), true)),
+            ),
+            (
+                "7001|$1|%2|7002|0",
+                Some((7001, "$1", "%2", Some(7002), false)),
+            ),
             ("7001|$|%2||1", None),
             ("7001|$1|%||1", None),
             ("7001|$x|%2||1", None),
@@ -2509,7 +2515,6 @@ mod pane_probe_tests {
             .unwrap()
             .success());
         wait_for_pane_dead(&expected.identity.pane_id);
-
 
         // A corpse that already existed in both complete inventories is not a
         // new birth, and still cannot be consumed by the old live receipt.
