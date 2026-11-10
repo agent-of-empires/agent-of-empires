@@ -747,6 +747,34 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     assert_eq!(*cmds.lock().expect("cmd log mutex poisoned"), ["prompt"]);
 }
 
+/// #5401: a queue drain publishes the first row's id as `prompt_id` and the
+/// rest as `merged_prompt_ids`, so the web client settles every optimistic row.
+#[tokio::test]
+async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-5401-drain";
+    let state = structured_state(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    for (row, text) in [("q1", "first"), ("q2", "second")] {
+        state
+            .session_service
+            .enqueue_prompt(id, row.into(), text.into(), vec![], None, None)
+            .await
+            .expect("session exists");
+    }
+
+    state.session_service.drain_queued_prompts_once(id).await;
+
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
+            if p == "q1" && merged_prompt_ids == &["q2".to_string()]
+    )));
+}
+
 /// #3649: a review that loses the guard to a turn-starting submission is
 /// refused, with nothing sent or published.
 #[tokio::test]
