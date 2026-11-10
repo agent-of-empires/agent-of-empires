@@ -41,18 +41,24 @@
 //!   grew by that many lines), appends `shift` blank rows, then replaces the
 //!   listed rows. `base` names the `seq` the patch applies to; a client that
 //!   is not at `base` sends `{"type":"resync"}` and receives a full frame.
-//!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
-//!     the session's size-owner lock. Only the owner resizes the shared
-//!     tmux window and may type; a non-owner renders best-effort at the
-//!     owner's grid and shows a "take over" affordance. A visible
+//!   `{"type":"size_owner","is_owner":bool,"owner"?:"web"|"tui"}`: whether
+//!     this client holds the session's size-owner lock. Only the owner
+//!     resizes the shared tmux window and may type; a non-owner renders
+//!     best-effort at the owner's grid until it sends `claim`.
+//!     `owner` names the holder for a non-owner when its lock id says what
+//!     it is (`live-*` is a Web dashboard view, `tui-*` a TUI in live mode),
+//!     and is absent otherwise. A visible
 //!     non-owner at fast cadence auto-reclaims the lock (claim, never
 //!     steal) once the holder releases it, so ownership returns without
-//!     another "take over" tap.
+//!     another `claim`.
 //!   `{"type":"transport","grid":bool,"reason"?:"pipe_owned"}`: which transport
 //!     is producing frames, sent on the first frame and whenever it flips.
 //!     `false` means the capture fallback, which cannot suppress a half-drawn
 //!     repaint; `reason` is present when another process owns the pane's
-//!     `pipe-pane`.
+//!     `pipe-pane`. After a `claim` succeeds on such a socket, the daemon
+//!     keeps trying to arm the grid on it for a few seconds (the other
+//!     process frees the pipe when it loses the lock), then sends
+//!     `grid: true`; the client does not reconnect.
 //!   `{"type":"clipboard","text":"..."}`: an OSC 52 clipboard write emitted
 //!     by the pane. The browser resolves it against the user gesture that
 //!     triggered the agent's copy action.
@@ -111,7 +117,8 @@ use super::pane::{
 };
 use super::AppState;
 use crate::daemon::live::{
-    LiveClientMessage, LiveCursor, LivePane0, LivePaneMeta, LiveServerMessage, LiveTransportReason,
+    LiveClientMessage, LiveCursor, LiveOwnerKind, LivePane0, LivePaneMeta, LiveServerMessage,
+    LiveTransportReason,
 };
 use crate::tmux::{SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 
@@ -148,6 +155,15 @@ const FIRST_PUBLISH_MAX_WAIT_MS: u64 = 150;
 /// A channel older than this was seeded long before this viewer connected;
 /// its grid has been reconciled by live output and needs no opening hold.
 const FRESH_SEED_MAX_AGE: Duration = Duration::from_secs(1);
+/// How long after a take-over a socket that opened on the capture fallback,
+/// because another process held the pane's pipe, keeps trying to arm the
+/// grid. The TUI frees the pipe on its next tick, and a holder that died lets
+/// its lease lapse within one TTL.
+#[cfg(unix)]
+const GRID_REARM_WINDOW: Duration = Duration::from_secs(crate::tmux::VT_OWNER_TTL.as_secs() * 2);
+/// Gap between those arming attempts.
+#[cfg(unix)]
+const GRID_REARM_RETRY: Duration = Duration::from_millis(250);
 /// How often the grid path re-checks the window's pane count. A split window
 /// is composited from `capture-pane`, which the single-pane grid cannot do.
 const PANE_COUNT_PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -330,6 +346,10 @@ struct LiveSettings {
     /// [`live_now_ms`] until which frames at a pane geometry other than the
     /// requested grid are withheld after an owner resize; 0 when none.
     resize_settle_until_ms: AtomicU64,
+    /// [`live_now_ms`] until which the capture loop retries arming the grid
+    /// after a take-over; 0 when none.
+    #[cfg(unix)]
+    grid_rearm_until_ms: AtomicU64,
 }
 
 impl LiveSettings {
@@ -344,7 +364,22 @@ impl LiveSettings {
             patch: AtomicBool::new(false),
             force_full: AtomicBool::new(false),
             resize_settle_until_ms: AtomicU64::new(0),
+            #[cfg(unix)]
+            grid_rearm_until_ms: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(unix)]
+    fn request_grid_rearm(&self) {
+        self.grid_rearm_until_ms.store(
+            live_now_ms() + GRID_REARM_WINDOW.as_millis() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    #[cfg(unix)]
+    fn grid_rearm_pending(&self) -> bool {
+        live_now_ms() < self.grid_rearm_until_ms.load(Ordering::Relaxed)
     }
 
     /// Withhold frames still at the old geometry after a resize this connection
@@ -534,9 +569,29 @@ fn plan_patch<'a>(
 }
 
 /// JSON control frame telling the client whether it currently owns the
-/// session's size (and may resize/type) or is a read-only viewer.
-fn size_owner_json(is_owner: bool) -> String {
-    live_json(&LiveServerMessage::SizeOwner { is_owner })
+/// session's size (and may resize/type) or is a read-only viewer. A non-owner
+/// also learns which kind of window holds the lock, unless the lock still
+/// names this connection.
+fn size_owner_json(is_owner: bool, holder: Option<&str>, own_id: &str) -> String {
+    let owner = holder
+        .filter(|holder| !is_owner && *holder != own_id)
+        .and_then(LiveOwnerKind::from_owner_id);
+    live_json(&LiveServerMessage::SizeOwner { is_owner, owner })
+}
+
+/// [`size_owner_json`] with the holder read from tmux, which only a non-owner needs.
+async fn size_owner_message(tmux_name: &str, is_owner: bool, own_id: &str) -> Message {
+    let holder = if is_owner {
+        None
+    } else {
+        let name = tmux_name.to_string();
+        tokio::task::spawn_blocking(move || crate::tmux::Session::from_name(&name).size_owner())
+            .await
+            .ok()
+            .flatten()
+            .map(|(id, _)| id)
+    };
+    Message::Text(size_owner_json(is_owner, holder.as_deref(), own_id).into())
 }
 
 fn clipboard_json(text: &str) -> String {
@@ -936,6 +991,11 @@ async fn handle_live_ws_inner(
     );
     #[cfg(unix)]
     let vt = vt_acquired.and_then(Result::ok);
+    // The grid this socket renders from. The capture loop fills it when a
+    // take-over lets a socket that opened on the fallback arm one; resizes
+    // read it to reseed that grid.
+    #[cfg(unix)]
+    let vt_slot = Arc::new(std::sync::Mutex::new(vt.clone()));
     #[cfg(not(unix))]
     let _ = transport;
     // Snapshot surfaces keep OSC 52 through a raw observer that builds no grid.
@@ -961,7 +1021,9 @@ async fn handle_live_ws_inner(
     #[cfg(unix)]
     let capture_osc52 = osc52;
     #[cfg(unix)]
-    let capture_vt = vt.clone();
+    let mut capture_vt = vt.clone();
+    #[cfg(unix)]
+    let capture_slot = Arc::clone(&vt_slot);
     let capture_stop = shutdown.child_token();
     let capture_cancelled = capture_stop.clone();
     let capture_task = tokio::spawn(async move {
@@ -974,6 +1036,10 @@ async fn handle_live_ws_inner(
         // This connection's own change receiver.
         #[cfg(unix)]
         let mut vt_rx = capture_vt.as_ref().map(|ch| ch.subscribe());
+        #[cfg(unix)]
+        let mut vt_pipe_owned = vt_pipe_owned;
+        #[cfg(unix)]
+        let mut last_grid_rearm = Instant::now() - GRID_REARM_RETRY;
         // Pane count of the window, re-probed at most once per PANE_COUNT_PROBE_INTERVAL
         // while the grid path is in use.
         #[cfg(unix)]
@@ -1002,6 +1068,30 @@ async fn handle_live_ws_inner(
         loop {
             if capture_cancelled.is_cancelled() {
                 break;
+            }
+            // A take-over freed the pipe another process held when this socket
+            // opened: arm the grid here rather than make the client reconnect,
+            // which would release the lock it just took.
+            #[cfg(unix)]
+            if vt_pipe_owned
+                && capture_vt.is_none()
+                && capture_settings.grid_rearm_pending()
+                && last_grid_rearm.elapsed() >= GRID_REARM_RETRY
+            {
+                let name = capture_tmux.clone();
+                let armed = tokio::task::spawn_blocking(move || {
+                    let deadline = crate::tmux::TmuxCommandDeadline::new();
+                    crate::tmux::vt::VtChannel::acquire_with_deadline(&name, &deadline)
+                })
+                .await;
+                last_grid_rearm = Instant::now();
+                if let Ok(Ok(ch)) = armed {
+                    vt_clipboard_seen = ch.clipboard_sequence();
+                    vt_rx = Some(ch.subscribe());
+                    *capture_slot.lock().unwrap() = Some(Arc::clone(&ch));
+                    capture_vt = Some(ch);
+                    vt_pipe_owned = false;
+                }
             }
             // The grid serves single-pane windows within its scrollback depth;
             // a split window is composited from capture-pane.
@@ -1160,7 +1250,9 @@ async fn handle_live_ws_inner(
                         if !still_owner {
                             capture_settings.is_owner.store(false, Ordering::Relaxed);
                             let _ = capture_tx
-                                .send(Message::Text(size_owner_json(false).into()))
+                                .send(
+                                    size_owner_message(&capture_tmux, false, &capture_owner).await,
+                                )
                                 .await;
                         }
                     }
@@ -1204,7 +1296,10 @@ async fn handle_live_ws_inner(
                                 capture_settings.is_owner.store(true, Ordering::Relaxed);
                                 last_heartbeat = std::time::Instant::now();
                                 let _ = capture_tx
-                                    .send(Message::Text(size_owner_json(true).into()))
+                                    .send(
+                                        size_owner_message(&capture_tmux, true, &capture_owner)
+                                            .await,
+                                    )
                                     .await;
                             }
                         }
@@ -1268,7 +1363,14 @@ async fn handle_live_ws_inner(
                                 if !still_owner {
                                     capture_settings.is_owner.store(false, Ordering::Relaxed);
                                     let _ = capture_tx
-                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .send(
+                                            size_owner_message(
+                                                &capture_tmux,
+                                                false,
+                                                &capture_owner,
+                                            )
+                                            .await,
+                                        )
                                         .await;
                                 }
                             }
@@ -1614,12 +1716,12 @@ async fn handle_live_ws_inner(
                                 }
                                 // Claim the cross-process size-owner lock; only
                                 // the owner resizes the shared window. A
-                                // non-owner keeps rendering best-effort at the
-                                // owner's grid and shows a "take over" banner.
+                                // non-owner renders at the owner's grid until
+                                // it sends `claim`.
                                 let name = tmux_name.clone();
                                 let who = owner_id.clone();
                                 #[cfg(unix)]
-                                let resize_vt = vt.clone();
+                                let resize_vt = vt_slot.lock().unwrap().clone();
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if !session.claim_size_owner(&who, SIZE_OWNER_TTL) {
@@ -1642,7 +1744,7 @@ async fn handle_live_ws_inner(
                                 settings.record_owner_resize(owned);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
                                 let _ = out_tx
-                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .send(size_owner_message(&tmux_name, owned, &owner_id).await)
                                     .await;
                                 nudge.notify_one();
                             }
@@ -1662,7 +1764,7 @@ async fn handle_live_ws_inner(
                             LiveClientMessage::ClaimIfVacant => {
                                 if read_only {
                                     let _ = out_tx
-                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .send(size_owner_message(&tmux_name, false, &owner_id).await)
                                         .await;
                                     continue;
                                 }
@@ -1679,14 +1781,14 @@ async fn handle_live_ws_inner(
                                 .unwrap_or(false);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
                                 let _ = out_tx
-                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .send(size_owner_message(&tmux_name, owned, &owner_id).await)
                                     .await;
                                 nudge.notify_one();
                             }
                             LiveClientMessage::Claim => {
                                 if read_only {
                                     let _ = out_tx
-                                        .send(Message::Text(size_owner_json(false).into()))
+                                        .send(size_owner_message(&tmux_name, false, &owner_id).await)
                                         .await;
                                     continue;
                                 }
@@ -1696,7 +1798,9 @@ async fn handle_live_ws_inner(
                                 let cols = settings.screen_cols.load(Ordering::Relaxed) as u16;
                                 let rows = settings.screen_rows.load(Ordering::Relaxed) as u16;
                                 #[cfg(unix)]
-                                let claim_vt = vt.clone();
+                                let claim_vt = vt_slot.lock().unwrap().clone();
+                                #[cfg(unix)]
+                                let rearm = vt_pipe_owned && claim_vt.is_none();
                                 let (owned, resized) = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if !session.steal_size_owner(&who) {
@@ -1721,8 +1825,12 @@ async fn handle_live_ws_inner(
                                 .unwrap_or((false, false));
                                 settings.record_owner_resize(resized);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
+                                #[cfg(unix)]
+                                if owned && rearm {
+                                    settings.request_grid_rearm();
+                                }
                                 let _ = out_tx
-                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .send(size_owner_message(&tmux_name, owned, &owner_id).await)
                                     .await;
                                 nudge.notify_one();
                             }
@@ -2385,11 +2493,9 @@ mod tests {
     fn a_resize_whose_reseed_missed_withholds_frames_until_it_lands() {
         use futures_util::FutureExt;
 
-        let home = crate::session::test_support::isolate_app_dir();
-        let _socket = crate::session::test_support::EnvGuard::set(&[(
-            "AOE_TMUX_SOCKET",
-            home.path().join("tmux.sock"),
-        )]);
+        // Unit tests already get a per-process tmux socket; a per-test override would be
+        // cached by the first tmux call and outlive this test's home.
+        let _home = crate::session::test_support::isolate_app_dir();
         if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("Skipping test: tmux unavailable");
             return;
@@ -2545,6 +2651,234 @@ mod tests {
         });
         drop(held);
         crate::tmux::vt::unregister_for_test(pane.name());
+    }
+
+    #[test]
+    fn a_non_owner_learns_the_holders_kind_from_its_lock_id() {
+        let own = "live-7";
+        // (is_owner, holder, expected owner field)
+        let cases = [
+            (false, Some("tui-4812-2"), Some("tui")),
+            (false, Some("live-3"), Some("web")),
+            (false, Some("pty-1"), None),
+            (false, None, None),
+            (false, Some(own), None),
+            (true, Some("tui-4812-2"), None),
+        ];
+        for (is_owner, holder, owner) in cases {
+            let json: serde_json::Value =
+                serde_json::from_str(&size_owner_json(is_owner, holder, own)).unwrap();
+            assert_eq!(json["is_owner"], is_owner, "{holder:?}");
+            assert_eq!(
+                json.get("owner").and_then(|v| v.as_str()),
+                owner,
+                "{is_owner} {holder:?}"
+            );
+        }
+    }
+
+    /// A tab that opened while the TUI was in live mode is on the capture fallback. Taking
+    /// control must bring it onto the grid on the same socket: reconnecting would release the
+    /// lock it just took.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_take_over_from_the_tui_moves_the_same_socket_onto_the_grid() {
+        use futures_util::FutureExt;
+        use tokio_tungstenite::tungstenite::Message as Ws;
+
+        // Unit tests already get a per-process tmux socket; a per-test override would be
+        // cached by the first tmux call and outlive this test's home.
+        let _home = crate::session::test_support::isolate_app_dir();
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("Skipping test: tmux unavailable");
+            return;
+        }
+        let pane = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_ws_takeover");
+        let output = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                pane.name(),
+                "-x",
+                "40",
+                "-y",
+                "6",
+                "printf 'TAKEOVER'; exec cat",
+            ])
+            .output()
+            .expect("create pane");
+        assert!(output.status.success());
+        let target = crate::tmux::test_helpers::only_pane_id(pane.name());
+        crate::tmux::test_helpers::wait_for_pane_command(&target, "cat");
+        // The TUI in live mode: it holds the size lock and the pane's pipe.
+        let session = crate::tmux::Session::from_name(pane.name());
+        let (tui_size, tui_vt) = ("tui-test-1", "tui-test-vt");
+        assert!(session.claim_size_owner(tui_size, SIZE_OWNER_TTL));
+        assert!(session.claim_vt_owner(tui_vt, crate::tmux::VT_OWNER_TTL));
+        let grid_dir = tempfile::tempdir().unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let progress_timeout = crate::tmux::TMUX_COMMAND_TIMEOUT * 3;
+            let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let route_shutdown = shutdown.clone();
+            let name = pane.name().to_string();
+            let router = axum::Router::new().route(
+                "/live",
+                axum::routing::get(move |ws: WebSocketUpgrade| {
+                    let name = name.clone();
+                    let shutdown = route_shutdown.clone();
+                    let closed_tx = closed_tx.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            handle_live_ws_inner(
+                                socket,
+                                name,
+                                false,
+                                shutdown,
+                                LiveTransport::Grid,
+                                0,
+                                false,
+                            )
+                            .await;
+                            let _ = closed_tx.send(());
+                        })
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server_shutdown = shutdown.clone();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(server_shutdown.cancelled_owned())
+                    .await
+                    .unwrap();
+            });
+            let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/live"))
+                .await
+                .unwrap();
+            let checked = std::panic::AssertUnwindSafe(async {
+                // Reads text frames until `done` accepts one, within the progress budget.
+                async fn until<S>(
+                    client: &mut S,
+                    timeout: Duration,
+                    what: &str,
+                    mut done: impl FnMut(&serde_json::Value) -> bool,
+                ) -> serde_json::Value
+                where
+                    S: futures_util::Stream<
+                            Item = Result<Ws, tokio_tungstenite::tungstenite::Error>,
+                        > + Unpin,
+                {
+                    tokio::time::timeout(timeout, async {
+                        loop {
+                            let message = client
+                                .next()
+                                .await
+                                .expect("open websocket")
+                                .expect("websocket message");
+                            if let Ws::Text(text) = message {
+                                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                                if done(&value) {
+                                    return value;
+                                }
+                            }
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+                }
+
+                client
+                    .send(Ws::Text(r#"{"type":"resize","cols":40,"rows":6}"#.into()))
+                    .await
+                    .unwrap();
+                let refused = until(&mut client, progress_timeout, "size_owner", |v| {
+                    v["type"] == "size_owner"
+                })
+                .await;
+                assert_eq!(refused["is_owner"], false, "{refused}");
+                assert_eq!(refused["owner"], "tui", "{refused}");
+                let fallback = until(&mut client, progress_timeout, "transport", |v| {
+                    v["type"] == "transport"
+                })
+                .await;
+                assert_eq!(fallback["grid"], false, "{fallback}");
+                assert_eq!(fallback["reason"], "pipe_owned", "{fallback}");
+
+                // The grid the socket can adopt once the pipe is free, sized to the pane as
+                // an armed channel seeds. Unit tests cannot arm a real one: the pipe helper
+                // is the `aoe` binary. Nothing samples it until the take-over below.
+                let grid = crate::tmux::vt::register_live_for_test(
+                    pane.name(),
+                    grid_dir.path(),
+                    false,
+                    false,
+                );
+                let mut drain = grid.hold_drain_for_test();
+                drain.acknowledge_next();
+                assert_eq!(
+                    grid.set_grid_size_with_deadline(
+                        40,
+                        6,
+                        &crate::tmux::TmuxCommandDeadline::new()
+                    ),
+                    crate::tmux::vt::VtRefreshResult::Refreshed
+                );
+                // Keep the TUI's pipe lease fresh, so no arming attempt before the
+                // release below can win it and fork a real pipe helper.
+                assert!(session.claim_vt_owner(tui_vt, crate::tmux::VT_OWNER_TTL));
+                client
+                    .send(Ws::Text(r#"{"type":"claim"}"#.into()))
+                    .await
+                    .unwrap();
+                let claimed = until(&mut client, progress_timeout, "claimed size_owner", |v| {
+                    v["type"] == "size_owner"
+                })
+                .await;
+                assert_eq!(claimed["is_owner"], true, "{claimed}");
+                assert!(claimed.get("owner").is_none(), "{claimed}");
+
+                // The TUI leaves live mode and frees its pipe.
+                session.release_vt_owner_with_deadline(
+                    tui_vt,
+                    &crate::tmux::TmuxCommandDeadline::new(),
+                );
+                let grid = until(&mut client, progress_timeout, "grid transport", |v| {
+                    v["type"] == "transport"
+                })
+                .await;
+                assert_eq!(grid["grid"], true, "{grid}");
+                assert!(grid.get("reason").is_none(), "{grid}");
+                assert!(closed_rx.try_recv().is_err(), "the socket was not reopened");
+                drop(drain);
+            })
+            .catch_unwind()
+            .await;
+            let close = tokio::time::timeout(progress_timeout, client.close(None)).await;
+            shutdown.cancel();
+            let closed = tokio::time::timeout(progress_timeout, closed_rx.recv()).await;
+            let served = server.await;
+            crate::tmux::vt::unregister_for_test(pane.name());
+            if let Err(panic) = checked {
+                std::panic::resume_unwind(panic);
+            }
+            close
+                .expect("websocket close completes")
+                .expect("close websocket");
+            closed
+                .expect("upgraded handler exits")
+                .expect("handler completion witness");
+            served.expect("HTTP server exits");
+        });
+        session.release_size_owner(tui_size);
     }
 
     #[test]
