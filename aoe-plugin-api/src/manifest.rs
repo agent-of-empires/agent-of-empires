@@ -996,6 +996,13 @@ impl PluginManifest {
             .any(|capability| capability.as_str() == "session.integration");
         for (i, integration) in self.agent_integrations.iter().enumerate() {
             check(
+                self.api_version >= 21
+                    || (integration.launch.is_none()
+                        && integration.detection.is_none()
+                        && integration.reply_fallback.is_none()),
+                format!("agent_integrations[{i}] declarations require api_version >= 21"),
+            );
+            check(
                 if status_integration {
                     !integration.provider_versions.is_empty()
                         && integration.provider_versions.iter().all(|range| {

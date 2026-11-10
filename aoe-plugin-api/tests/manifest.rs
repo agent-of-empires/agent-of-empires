@@ -35,6 +35,35 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
+fn future_agent_declarations_are_rejected_until_the_host_supports_them() {
+    let declarations = [
+        "[agent_integrations.launch]\noneshot_flag = \"-p\"\n",
+        "[agent_integrations.detection]\nmode = \"native_only\"\n",
+        "[agent_integrations.reply_fallback]\nallow = []\ndeny = []\n",
+    ];
+    for declaration in declarations {
+        let body = format!(
+            "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n{declaration}"
+        );
+        let errors = invalid(20, &body);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("api_version >= 21")),
+            "{errors:?}"
+        );
+        assert!(matches!(
+            PluginManifest::from_toml_str(&manifest(21, &body)),
+            Err(ManifestError::UnsupportedApiVersion { found: 21, .. })
+        ));
+    }
+    parse(
+        20,
+        "[[agent_integrations]]\ntool = \"example\"\ncommand = \"example\"\n",
+    );
+}
+
+#[test]
 fn agent_integrations_require_api_capability_and_unique_valid_tools() {
     let base = r#"
 id = "acme.session-agent"
