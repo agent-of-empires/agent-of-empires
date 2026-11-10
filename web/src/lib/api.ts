@@ -782,9 +782,39 @@ export interface PluginUpdateChangelog {
   more_url: string | null;
 }
 
+export interface PluginAgentKey {
+  kind: "literal" | "named";
+  value: string;
+}
+
+export interface PluginAgentLaunch {
+  aliases?: string[];
+  oneshot_flag?: string;
+  instruction_flag?: string;
+  model_flag?: string;
+  yolo?: { kind: "flag"; flag: string } | { kind: "always" } | { kind: "env"; key: string; value: string };
+  container_env?: Record<string, string>;
+  install_hint?: string;
+  host_only?: boolean;
+  resume?:
+    | { kind: "flag"; flag: string }
+    | { kind: "flag_pair"; existing: string; new_session: string }
+    | { kind: "subcommand"; command: string };
+  capture?: {
+    backend: "omp";
+    host: "pane_scoped" | "unsupported";
+    sandbox: "pane_scoped" | "unsupported";
+  };
+}
+
 export interface PluginAgentIntegration {
   tool: string;
   command?: string;
+  provider_versions?: string[];
+  replies?: boolean;
+  launch?: PluginAgentLaunch;
+  detection?: { mode: "native_only" };
+  reply_fallback?: { allow: PluginAgentKey[]; deny: PluginAgentKey[]; allow_always?: PluginAgentKey[] };
 }
 
 /** Structured disclosure for a capability-expanding plugin update, mirroring the

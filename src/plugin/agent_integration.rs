@@ -9,6 +9,9 @@ use std::{
 
 use anyhow::{bail, ensure, Context, Result};
 use aoe_plugin_api::agent_integration::{
+    AgentIntegrationContribution, AgentKeyDeclaration, AgentResumeDeclaration, AgentYoloDeclaration,
+};
+use aoe_plugin_api::agent_integration::{
     AgentIntegrationPrompt, AgentIntegrationReply, AgentIntegrationResponse,
     AgentIntegrationSnapshot, AgentIntegrationStatus, IntegrationApprovalChoice,
 };
@@ -155,6 +158,143 @@ pub fn display_command(command: &str) -> String {
     out
 }
 
+/// Display every declaration without interpreting its contents as terminal control sequences.
+pub fn consent_lines(integration: &AgentIntegrationContribution) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{}: {}",
+        display_command(&integration.tool),
+        integration
+            .command
+            .as_deref()
+            .map(display_command)
+            .unwrap_or_else(|| "No launch command declared".to_string())
+    )];
+    if let Some(launch) = &integration.launch {
+        let mut flags = Vec::new();
+        for (name, flag) in [
+            ("oneshot", &launch.oneshot_flag),
+            ("instruction", &launch.instruction_flag),
+            ("model", &launch.model_flag),
+        ] {
+            if let Some(flag) = flag {
+                flags.push(format!("{name} {}", display_command(flag)));
+            }
+        }
+        if let Some(yolo) = &launch.yolo {
+            flags.push(match yolo {
+                AgentYoloDeclaration::Flag { flag } => format!("yolo {}", display_command(flag)),
+                AgentYoloDeclaration::Always => "yolo always".to_string(),
+                AgentYoloDeclaration::Env { key, value } => {
+                    format!("yolo {}={}", display_command(key), display_command(value))
+                }
+            });
+        }
+        if !flags.is_empty() {
+            lines.push(format!("  launch flags: {}", flags.join("; ")));
+        }
+        if !launch.aliases.is_empty() {
+            lines.push(format!(
+                "  aliases: {}",
+                launch
+                    .aliases
+                    .iter()
+                    .map(|value| display_command(value))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !launch.container_env.is_empty() {
+            lines.push(format!(
+                "  sandbox environment: {}",
+                launch
+                    .container_env
+                    .iter()
+                    .map(|(key, value)| format!(
+                        "{}={}",
+                        display_command(key),
+                        display_command(value)
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(resume) = &launch.resume {
+            let resume = match resume {
+                AgentResumeDeclaration::Flag { flag } => format!("flag {}", display_command(flag)),
+                AgentResumeDeclaration::FlagPair {
+                    existing,
+                    new_session,
+                } => format!(
+                    "flags {} / {}",
+                    display_command(existing),
+                    display_command(new_session)
+                ),
+                AgentResumeDeclaration::Subcommand { command } => {
+                    format!("subcommand {}", display_command(command))
+                }
+            };
+            lines.push(format!("  resume: {resume}"));
+        }
+        if let Some(capture) = &launch.capture {
+            lines.push(format!(
+                "  capture: {:?} (host {:?}, sandbox {:?})",
+                capture.backend, capture.host, capture.sandbox
+            ));
+        }
+        lines.push(format!(
+            "  host only: {}",
+            if launch.host_only { "yes" } else { "no" }
+        ));
+        if let Some(hint) = &launch.install_hint {
+            lines.push(format!("  install: {}", display_command(hint)));
+        }
+    }
+    if let Some(detection) = &integration.detection {
+        lines.push(format!("  detection: {:?}", detection.mode));
+    }
+    if !integration.provider_versions.is_empty() {
+        lines.push(format!(
+            "  provider versions: {}",
+            integration
+                .provider_versions
+                .iter()
+                .map(|value| display_command(value))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    lines.push(format!(
+        "  native replies: {}",
+        if integration.replies { "yes" } else { "no" }
+    ));
+    if let Some(reply) = &integration.reply_fallback {
+        let labels = |keys: &[AgentKeyDeclaration]| {
+            keys.iter()
+                .map(|key| match key {
+                    AgentKeyDeclaration::Literal { value } => {
+                        format!("literal {:?}", display_command(value))
+                    }
+                    AgentKeyDeclaration::Named { value } => {
+                        format!("key {}", display_command(value))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let always = reply
+            .allow_always
+            .as_ref()
+            .map_or_else(String::new, |keys| {
+                format!(", allow always [{}]", labels(keys))
+            });
+        lines.push(format!(
+            "  reply fallback: allow [{}], deny [{}]{always}",
+            labels(&reply.allow),
+            labels(&reply.deny)
+        ));
+    }
+    lines
+}
 /// Resolve a unique plugin-provided agent launch command.
 pub fn agent_command<'a>(
     tool: &str,
@@ -834,6 +974,33 @@ replies = true
         assert_eq!(display_command("x\u{202e}tail"), "x\\u{202e}tail");
         // Any Unicode Format character, including tag characters, is escaped.
         assert_eq!(display_command("x\u{E0001}tail"), "x\\u{e0001}tail");
+    }
+
+    #[test]
+    fn consent_lines_escape_nested_values() {
+        use aoe_plugin_api::agent_integration::{AgentLaunchDeclaration, AgentReplyDeclaration};
+        let integration = AgentIntegrationContribution {
+            tool: "helper".into(),
+            command: Some("helper".into()),
+            launch: Some(AgentLaunchDeclaration {
+                install_hint: Some("install \u{202e}now".into()),
+                container_env: [("TEST".into(), "x\u{1b}y".into())].into_iter().collect(),
+                ..Default::default()
+            }),
+            reply_fallback: Some(AgentReplyDeclaration {
+                allow: vec![AgentKeyDeclaration::Literal {
+                    value: "\u{202e}".into(),
+                }],
+                allow_always: None,
+                deny: vec![AgentKeyDeclaration::Named {
+                    value: "Enter".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let lines = consent_lines(&integration).join("\n");
+        assert!(!lines.contains('\u{202e}') && !lines.contains('\u{1b}'));
+        assert!(lines.contains("\\u{202e}") && lines.contains("\\u{1b}"));
     }
 
     #[test]

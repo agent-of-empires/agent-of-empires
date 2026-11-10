@@ -543,9 +543,8 @@ struct Prepared {
 }
 
 /// The consent structures serialize to the CLI/TUI/web disclosures, so their
-/// agent commands carry the display-escaped form (control and bidi characters
-/// made visible) rather than the raw bytes. The runnable command in the
-/// manifest is never altered.
+/// agent commands carry the display-escaped form rather than the raw bytes.
+/// The runnable command in the manifest is never altered.
 fn disclosure_integrations(
     integrations: &[AgentIntegrationContribution],
 ) -> Vec<AgentIntegrationContribution> {
@@ -588,13 +587,10 @@ fn agent_integrations_changed(
         return !current.is_empty();
     };
     current.iter().any(|current| {
-        let Some(previous) = previous
+        previous
             .iter()
             .find(|previous| previous.tool == current.tool)
-        else {
-            return true;
-        };
-        current.command.is_some() && previous.command != current.command
+            .is_none_or(|previous| previous != current)
     })
 }
 
@@ -1340,17 +1336,11 @@ fn confirm_capabilities(
         }
     }
     if !integrations.is_empty() {
-        println!("Plugin {id} declares these agent commands (run as your user, unsandboxed):");
+        println!("Plugin {id} declares these agent behaviors (commands run as you, unsandboxed):");
         for integration in integrations {
-            println!(
-                "  {}: {}",
-                integration.tool,
-                integration
-                    .command
-                    .as_deref()
-                    .map(super::agent_integration::display_command)
-                    .unwrap_or_else(|| "No launch command declared".to_string())
-            );
+            for line in super::agent_integration::consent_lines(integration) {
+                println!("  {line}");
+            }
         }
     }
     println!(
@@ -1804,6 +1794,49 @@ mod tests {
         assert_eq!(disclosed[0].command.as_deref(), Some("x\\u{202e}tail"));
         // The manifest / launch command stays raw.
         assert_eq!(raw.command.as_deref(), Some("x\u{202e}tail"));
+    }
+
+    #[test]
+    fn agent_declaration_changes_require_consent_but_removal_does_not() {
+        use aoe_plugin_api::agent_integration::{
+            AgentDetectionDeclaration, AgentDetectionMode, AgentKeyDeclaration,
+            AgentLaunchDeclaration, AgentReplyDeclaration,
+        };
+        let base = AgentIntegrationContribution {
+            tool: "helper".into(),
+            command: Some("helper".into()),
+            ..Default::default()
+        };
+        let previous = std::slice::from_ref(&base);
+        assert!(!agent_integrations_changed(Some(previous), previous));
+        assert!(!agent_integrations_changed(Some(previous), &[]));
+        assert!(agent_integrations_changed(None, previous));
+        let mut changed = base.clone();
+        changed.command = None;
+        assert!(agent_integrations_changed(Some(previous), &[changed]));
+        let mut changed = base.clone();
+        changed.launch = Some(AgentLaunchDeclaration {
+            container_env: [("AGENT_HOME".into(), "/state".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        assert!(agent_integrations_changed(Some(previous), &[changed]));
+        let mut changed = base.clone();
+        changed.detection = Some(AgentDetectionDeclaration {
+            mode: AgentDetectionMode::NativeOnly,
+        });
+        assert!(agent_integrations_changed(Some(previous), &[changed]));
+        let mut changed = base.clone();
+        changed.reply_fallback = Some(AgentReplyDeclaration {
+            allow: vec![AgentKeyDeclaration::Literal { value: "y".into() }],
+            deny: vec![AgentKeyDeclaration::Literal { value: "n".into() }],
+            allow_always: None,
+        });
+        assert!(agent_integrations_changed(Some(previous), &[changed]));
+        let mut changed = base.clone();
+        changed.replies = true;
+        assert!(agent_integrations_changed(Some(previous), &[changed]));
     }
 
     #[tokio::test]

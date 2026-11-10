@@ -36,7 +36,7 @@ capabilities = ["runtime.worker"]
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21 and a host implementing them. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -65,12 +65,63 @@ replies = true
 | `command` | string | no | Launch command: optional literal `NAME=value` assignments, then the executable, then free-form agent arguments. |
 | `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 
-Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
+Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI/web prompts show each tool, its command, and its agent declarations. Control and format characters are displayed as escapes. Updates require approval when an integration is added or any declaration changes; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
 
-Launch, detection, and reply-fallback declarations for the planned API 21 are
-not accepted by this host. API 20 agent integrations remain supported.
+### Launch, detection, and reply-fallback declarations (API 21)
+
+These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. When a plugin is absent or disabled, built-in OMP and its pane detection and capture behavior remain available.
+
+```toml
+capabilities = ["session.integration"]
+
+[[agent_integrations]]
+tool = "example-agent"
+command = "example-agent"
+provider_versions = ["^1.0"]
+replies = false
+
+[agent_integrations.launch]
+aliases = ["example"]
+oneshot_flag = "-p"
+instruction_flag = "--prompt={}"
+model_flag = "--model"
+host_only = false
+install_hint = "Install example-agent from its vendor"
+
+[agent_integrations.launch.container_env]
+EXAMPLE_HOME = "/state"
+
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--auto-approve"
+
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+
+[agent_integrations.detection]
+mode = "native_only"
+
+[agent_integrations.reply_fallback]
+allow = [{ kind = "named", value = "Enter" }]
+deny = [{ kind = "literal", value = "n" }]
+```
+
+The example's `detection` requires `session.integration` in the manifest's capabilities. All three declaration types require a nonblank `command`.
+
+- `launch.aliases` are unique lowercase agent ids, distinct from the tool. `oneshot_flag` and `model_flag` are single shell-safe flags. `instruction_flag` has one `{}` placeholder, as a whole argument or after `=`, and otherwise contains shell-safe words.
+- `launch.yolo` is `kind = "flag"` with `flag`, `kind = "always"`, or `kind = "env"` with `key` and `value`. `container_env` is applied to sandbox launches. Protected environment names are rejected.
+- `launch.resume` is `kind = "flag"` with `flag`, `kind = "flag_pair"` with `existing` and `new_session`, or `kind = "subcommand"` with `command`. `launch.capture` requires `resume`; only backend `omp` with `pane_scoped` or `unsupported` for each of `host` and `sandbox` is accepted.
+- `detection.mode = "native_only"` requires `session.integration`; the integration owns status rather than falling back to pane parsing when a report is missing or invalid.
+- `reply_fallback` contains nonempty `allow` and `deny` arrays, and an optional nonempty `allow_always` array, of literal or named keys. Named keys are `Enter`, `Tab`, `Escape`, `Space`, `Backspace`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, and `F1` through `F12`. Fallback is allowed only with `replies = false` and does not automatically approve a prompt.
+
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
 ### Report and reply files
