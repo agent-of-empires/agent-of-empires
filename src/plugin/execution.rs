@@ -20,6 +20,20 @@ pub(super) struct Exhausted;
 #[error("plugin recovery required: {0}; mutation exclusion and recovery evidence retained")]
 pub(super) struct RecoveryRequired(pub String);
 
+pub(super) fn catch_panic<T>(run: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(payload) => {
+            // An arbitrary payload's destructor must not unwind past recovery.
+            std::mem::forget(payload);
+            Err(
+                RecoveryRequired("Plugin job panicked; operation outcome unknown".to_owned())
+                    .into(),
+            )
+        }
+    }
+}
+
 impl Budget {
     pub(super) fn new() -> Self {
         Self {

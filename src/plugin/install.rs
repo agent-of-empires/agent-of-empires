@@ -608,7 +608,9 @@ pub async fn install(input: &str, assume_yes: bool, dev: bool) -> Result<Install
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let result = apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit);
+        let result = super::execution::catch_panic(|| {
+            apply_prepared_install(&prepared, &node_env, &OperationLog::Inherit)
+        });
         if super::execution::needs_recovery(&result) {
             log_recovery(&result);
             std::mem::forget(prepared);
@@ -670,7 +672,8 @@ pub async fn apply_install(
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let result = apply_prepared_install(&prepared, &node_env, &log);
+        let result =
+            super::execution::catch_panic(|| apply_prepared_install(&prepared, &node_env, &log));
         if super::execution::needs_recovery(&result) {
             log_recovery(&result);
             std::mem::forget(prepared);
@@ -1096,7 +1099,9 @@ where
     let node_env = provision(prepared.fetched.manifest.clone()).await;
     let report = tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let result = apply_prepared(&prepared, grant, &node_env, &OperationLog::Inherit);
+        let result = super::execution::catch_panic(|| {
+            apply_prepared(&prepared, grant, &node_env, &OperationLog::Inherit)
+        });
         if super::execution::needs_recovery(&result) {
             log_recovery(&result);
             std::mem::forget(prepared);
@@ -1226,7 +1231,8 @@ pub async fn apply_update(
     let node_env = apply_node_env(&prepared.fetched.manifest).await;
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
-        let result = apply_prepared(&prepared, grant, &node_env, &log);
+        let result =
+            super::execution::catch_panic(|| apply_prepared(&prepared, grant, &node_env, &log));
         if super::execution::needs_recovery(&result) {
             log_recovery(&result);
             std::mem::forget(prepared);
@@ -1404,15 +1410,22 @@ fn skip_reason(prepared: &Prepared) -> String {
 pub fn uninstall(id: &str) -> Result<()> {
     PluginId::new(id.to_string()).map_err(|e| anyhow!("{e}"))?;
     let _operation = begin_operation()?;
-    if !is_installed_external(id)? {
-        bail!("{id} is not an installed external plugin");
+    let result = super::execution::catch_panic(|| {
+        if !is_installed_external(id)? {
+            bail!("{id} is not an installed external plugin");
+        }
+        let version = super::registry()
+            .get(id)
+            .map(|p| p.manifest.version.clone());
+        remove_external(id)?;
+        tracing::info!(target: "plugin.install", plugin = %id, ?version, "plugin uninstalled");
+        Ok(())
+    });
+    if super::execution::needs_recovery(&result) {
+        log_recovery(&result);
+        std::mem::forget(_operation);
     }
-    let version = super::registry()
-        .get(id)
-        .map(|p| p.manifest.version.clone());
-    remove_external(id)?;
-    tracing::info!(target: "plugin.install", plugin = %id, ?version, "plugin uninstalled");
-    Ok(())
+    result
 }
 
 fn is_installed_external(id: &str) -> Result<bool> {

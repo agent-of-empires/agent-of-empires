@@ -67,7 +67,7 @@ pub(super) async fn fetch(
     let source = source.clone();
     let stage_operation = operation.clone();
     let fetched = tokio::task::spawn_blocking(move || {
-        let result = stage(source, plugins_root, clone_url);
+        let result = super::execution::catch_panic(|| stage(source, plugins_root, clone_url));
         if super::execution::needs_recovery(&result) {
             super::install::log_recovery(&result);
             std::mem::forget(stage_operation);
@@ -108,63 +108,67 @@ fn stage(
         .context("creating plugin staging dir")?;
     let tree = staging.path().join("tree");
 
-    let (requested_ref, resolved_commit) = match &source {
-        PluginSource::Github { reference, .. } => {
-            let sha = git_clone_checkout(
-                clone_url
-                    .as_deref()
-                    .expect("github source yields a clone url"),
-                reference.as_deref(),
-                &tree,
-                budget,
-            );
-            let sha = match sha {
-                Ok(sha) => sha,
-                Err(error) => {
-                    if error
-                        .downcast_ref::<super::execution::RecoveryRequired>()
-                        .is_some()
-                    {
-                        let retained = staging.keep();
-                        tracing::error!(target: "plugin.install", path = %retained.display(), %error, "plugin staging retained for recovery");
-                    }
-                    return Err(error);
-                }
-            };
-            (source.reference().map(String::from), Some(sha))
-        }
-        PluginSource::Local(path) => {
-            if !path.is_dir() {
-                bail!("local plugin source {} is not a directory", path.display());
+    let result = super::execution::catch_panic(|| {
+        let (requested_ref, resolved_commit) = match &source {
+            PluginSource::Github { reference, .. } => {
+                let sha = git_clone_checkout(
+                    clone_url
+                        .as_deref()
+                        .expect("github source yields a clone url"),
+                    reference.as_deref(),
+                    &tree,
+                    budget,
+                )?;
+                (source.reference().map(String::from), Some(sha))
             }
-            copy_tree(path, &tree)?;
-            (None, None)
+            PluginSource::Local(path) => {
+                if !path.is_dir() {
+                    bail!("local plugin source {} is not a directory", path.display());
+                }
+                copy_tree(path, &tree)?;
+                (None, None)
+            }
+        };
+        let (manifest, manifest_bytes) = read_manifest(&tree)?;
+        if tree.join(super::integrity::BUILD_OUTPUT_DIR).exists() {
+            bail!(
+                "plugin source ships the reserved build-output directory {:?}; it must only be produced by build steps, not committed",
+                super::integrity::BUILD_OUTPUT_DIR
+            );
         }
-    };
-    let (manifest, manifest_bytes) = read_manifest(&tree)?;
-    if tree.join(super::integrity::BUILD_OUTPUT_DIR).exists() {
-        bail!(
-            "plugin source ships the reserved build-output directory {:?}; it must only be produced by build steps, not committed",
-            super::integrity::BUILD_OUTPUT_DIR
-        );
+        let tree_hash = super::integrity::tree_hash(&tree)?;
+        Ok(FetchedPlugin {
+            staging: None,
+            operation: None,
+            tree,
+            manifest,
+            manifest_bytes,
+            tree_hash,
+            source,
+            requested_ref,
+            resolved_commit,
+            release_tag: None,
+            asset_name: None,
+            asset_sha256: None,
+            budget,
+        })
+    });
+    match result {
+        Ok(mut fetched) => {
+            fetched.staging = Some(staging);
+            Ok(fetched)
+        }
+        Err(error) => {
+            if error
+                .downcast_ref::<super::execution::RecoveryRequired>()
+                .is_some()
+            {
+                let retained = staging.keep();
+                tracing::error!(target: "plugin.install", path = %retained.display(), %error, "plugin staging retained for recovery");
+            }
+            Err(error)
+        }
     }
-    // Hash before any release binary is injected so it matches `aoe plugin hash` on the checkout.
-    let tree_hash = super::integrity::tree_hash(&tree)?;
-    Ok(FetchedPlugin {
-        staging: Some(staging),
-        operation: None,
-        tree,
-        manifest,
-        manifest_bytes,
-        tree_hash,
-        source,
-        requested_ref,
-        resolved_commit,
-        release_tag: None,
-        asset_name: None,
-        asset_sha256: None,
-        budget,
-    })
 }
 
 fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
@@ -472,17 +476,34 @@ async fn download_release_binary(
     tokio::task::spawn_blocking(move || {
         let _operation = operation;
         let mut fetched = fetched;
-        #[cfg(test)]
-        test_gate::reach(&fetched.tree, "asset");
-        let sha = sha256_hex(&bytes);
-        if let Err(error) = install_asset_into(&fetched.tree, &name, bin.as_deref(), &bytes) {
-            fetched.close();
-            return Err(error);
+        let result = super::execution::catch_panic(|| {
+            #[cfg(test)]
+            test_gate::reach(&fetched.tree, "asset");
+            let sha = sha256_hex(&bytes);
+            install_asset_into(&fetched.tree, &name, bin.as_deref(), &bytes)?;
+            fetched.release_tag = Some(tag);
+            fetched.asset_name = Some(name);
+            fetched.asset_sha256 = Some(sha);
+            Ok(())
+        });
+        match result {
+            Ok(()) => Ok(fetched),
+            Err(error) => {
+                if error
+                    .downcast_ref::<super::execution::RecoveryRequired>()
+                    .is_some()
+                {
+                    let result = Err(error);
+                    super::install::log_recovery::<FetchedPlugin>(&result);
+                    std::mem::forget(fetched);
+                    std::mem::forget(_operation);
+                    result
+                } else {
+                    fetched.close();
+                    Err(error)
+                }
+            }
         }
-        fetched.release_tag = Some(tag);
-        fetched.asset_name = Some(name);
-        fetched.asset_sha256 = Some(sha);
-        Ok(fetched)
     })
     .await
     .context("plugin asset preparation task failed")?
@@ -1072,20 +1093,27 @@ pub(crate) mod test_gate {
         path: PathBuf,
         phase: &'static str,
         entered: tokio::sync::oneshot::Sender<PathBuf>,
-        release: mpsc::Receiver<()>,
+        release: mpsc::Receiver<bool>,
     }
     static HOOKS: Mutex<Vec<Hook>> = Mutex::new(Vec::new());
 
     pub(crate) struct Gate {
         pub entered: tokio::sync::oneshot::Receiver<PathBuf>,
-        release: Option<mpsc::Sender<()>>,
+        release: Option<mpsc::Sender<bool>>,
         path: PathBuf,
         phase: &'static str,
     }
     impl Gate {
         pub(crate) fn release(&mut self) {
             if let Some(release) = self.release.take() {
-                let _ = release.send(());
+                let _ = release.send(false);
+            }
+        }
+
+        #[cfg(unix)]
+        pub(crate) fn panic_on_release(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(true);
             }
         }
     }
@@ -1124,9 +1152,13 @@ pub(crate) mod test_gate {
         };
         if let Some(hook) = hook {
             let _ = hook.entered.send(path.to_owned());
-            hook.release
+            if hook
+                .release
                 .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("test must release plugin worker gate");
+                .expect("test must release plugin worker gate")
+            {
+                panic!("private-panic-payload");
+            }
         }
     }
 }

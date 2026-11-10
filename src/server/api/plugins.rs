@@ -1179,6 +1179,7 @@ pub async fn plugin_job_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::install::UpdatePreview;
     use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
     use aoe_plugin_api::PluginManifest;
 
@@ -1230,6 +1231,145 @@ mod tests {
             .await;
             let job = finish(&state, response).await;
             assert!(matches!(job.status, PluginJobStatus::Succeeded));
+            state.runtime.work.drain().await;
+        }
+
+        let _reload = plugin::ReloadRegistryOnDrop;
+        for boundary in ["stage", "install", "update"] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let source = tempfile::tempdir().unwrap();
+            let manifest = source.path().join("aoe-plugin.toml");
+            let base = "id = \"acme.blocking\"\nname = \"Blocking panic\"\nversion = \"1.0.0\"\napi_version = 2\n";
+            std::fs::write(&manifest, base).unwrap();
+            let input = source.path().display().to_string();
+            let update = boundary == "update";
+            let fingerprint = if update {
+                plugin::install::install(&input, true, false).await.unwrap();
+                std::fs::write(&manifest, base.replace("1.0.0", "2.0.0")).unwrap();
+                match plugin::install::preview_update("acme.blocking", true)
+                    .await
+                    .unwrap()
+                {
+                    UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
+                    UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
+                    UpdatePreview::NoUpdate { .. } => panic!("fixture must update"),
+                }
+            } else {
+                plugin::install::preview_install(&input, false)
+                    .await
+                    .unwrap()
+                    .fingerprint
+            };
+            let root = crate::session::get_app_dir().unwrap();
+            let plugins = plugin::plugins_dir().unwrap();
+            let final_dir = plugins.join("acme.blocking");
+            let before = serde_json::to_value(Config::load().unwrap().plugins).unwrap();
+            let before_lock = std::fs::read(root.join("plugins.lock")).ok();
+            let mut gate = if boundary == "stage" {
+                plugin::fetch::test_gate::install(&manifest.canonicalize().unwrap(), "copy")
+            } else {
+                plugin::fetch::test_gate::install(&final_dir, "metadata-commit")
+            };
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let response = start_job(
+                state.clone(),
+                if update {
+                    PluginJobKind::Update
+                } else {
+                    PluginJobKind::Install
+                },
+                "acme.blocking".into(),
+                move |log| async move {
+                    if update {
+                        plugin::install::apply_update("acme.blocking", Some(fingerprint), true, log)
+                            .await
+                    } else {
+                        plugin::install::apply_install(&input, &fingerprint, false, log).await
+                    }
+                    .map(|_| ())
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let accepted: PluginJobAccepted = decode(response).await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut gate.entered)
+                .await
+                .unwrap()
+                .unwrap();
+            let staging = std::fs::read_dir(&plugins)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .as_encoded_bytes()
+                        .starts_with(b".staging-")
+                })
+                .expect("accepted operation owns staging");
+            gate.panic_on_release();
+            state.runtime.work.drain().await;
+            let response: PluginJobResponse = decode(
+                plugin_job_status(
+                    State(state.clone()),
+                    Path(accepted.job_id),
+                    Query(JobLogQuery { tail: None }),
+                )
+                .await,
+            )
+            .await;
+            let PluginJobStatus::Failed { error } = response.job.status else {
+                panic!("blocking panic did not fail its job");
+            };
+            assert!(
+                !error.contains("private-panic-payload"),
+                "{boundary}: {error}"
+            );
+            assert!(response.job.finished_at.is_some());
+            let evidence = std::fs::read_to_string(root.join(".plugin-recovery-required"))
+                .expect("blocking panic must persist recovery evidence");
+            assert!(!evidence.contains("private-panic-payload"));
+            assert!(
+                staging.exists(),
+                "{boundary}: staging was removed during unwind"
+            );
+            assert!(
+                crate::session::try_acquire_storage_flock(&root, ".plugin-operation.lock")
+                    .unwrap()
+                    .is_none(),
+                "{boundary}: mutation exclusion was released"
+            );
+            assert!(plugin::install::begin_operation().is_err());
+            assert_eq!(
+                serde_json::to_value(Config::load().unwrap().plugins).unwrap(),
+                before
+            );
+            assert_eq!(std::fs::read(root.join("plugins.lock")).ok(), before_lock);
+            if update {
+                assert_eq!(
+                    std::fs::read_to_string(plugins.join("acme.blocking.bak/aoe-plugin.toml"))
+                        .unwrap(),
+                    base
+                );
+            }
+            let next = start_job(
+                state.clone(),
+                PluginJobKind::Uninstall,
+                "acme.blocking".into(),
+                |log| async move {
+                    tokio::task::spawn_blocking(move || {
+                        plugin::install::uninstall_logged("acme.blocking", &log)
+                    })
+                    .await?
+                },
+            )
+            .await;
+            assert_eq!(next.status(), StatusCode::ACCEPTED);
+            let next = finish(&state, next).await;
+            assert!(matches!(next.status, PluginJobStatus::Failed { .. }));
+            assert_eq!(
+                serde_json::to_value(Config::load().unwrap().plugins).unwrap(),
+                before
+            );
             state.runtime.work.drain().await;
         }
     }
