@@ -3929,16 +3929,28 @@ mod tests {
             .shutdown_idle(id, (&observed, admissions), activity, stamp)
             .await;
         p.release_and_wait().await;
-        assert!(producer.join().unwrap(), "the gated event was actually persisted");
-        assert!(lifecycle_available, "this producer holds only its activity cell");
-        assert!(while_publishing.is_none(), "busy activity must not look idle");
+        assert!(
+            producer.join().unwrap(),
+            "the gated event was actually persisted"
+        );
+        assert!(
+            lifecycle_available,
+            "this producer holds only its activity cell"
+        );
+        assert!(
+            while_publishing.is_none(),
+            "busy activity must not look idle"
+        );
         assert!(matches!(refused, Err(SupervisorError::RegistryBusy)));
         assert_eq!(p.sup.current_lease(id).as_ref(), Some(&lease));
         assert_eq!(
             lock_recover(&p.sup.lifecycle).phase(id),
             crate::acp::runner_lifecycle::WorkerPhase::Running
         );
-        assert_eq!(worker_registry::peek_restart_marker(id), Some(identity.generation));
+        assert_eq!(
+            worker_registry::peek_restart_marker(id),
+            Some(identity.generation)
+        );
         let (fresh, published) = p.sup.idle_observation(id).unwrap();
         assert_eq!(fresh, lease);
         assert_eq!(published, activity + 1);
@@ -3950,8 +3962,14 @@ mod tests {
             Err(SupervisorError::Superseded(_))
         ));
         assert_eq!(p.sup.current_lease(id).as_ref(), Some(&lease));
-        assert_eq!(worker_registry::peek_restart_marker(id), Some(identity.generation));
-        assert!(control.signals().is_empty(), "neither refused stop may signal the runner");
+        assert_eq!(
+            worker_registry::peek_restart_marker(id),
+            Some(identity.generation)
+        );
+        assert!(
+            control.signals().is_empty(),
+            "neither refused stop may signal the runner"
+        );
     }
 
     /// Publication holds its owner through persistence, before the reaper's final sweep.
