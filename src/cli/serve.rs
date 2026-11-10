@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -2022,7 +2023,7 @@ async fn start_daemon(
             let client = &client;
             Box::pin(async move {
                 if !client.local_daemon_ready(pid).await.unwrap_or(false) {
-                    return false;
+                    return Ok(false);
                 }
                 tokio::task::spawn_blocking(move || {
                     let (instance_id, birth) = owner.as_ref();
@@ -2034,7 +2035,7 @@ async fn start_daemon(
                             .is_ok_and(|current| current.as_ref() == Some(birth))
                 })
                 .await
-                .is_ok_and(|ready| ready)
+                .map_err(Into::into)
             })
         },
     )
@@ -2051,14 +2052,13 @@ async fn start_daemon(
     Ok(())
 }
 
-/// Polls until `ready`, the child exits, or `deadline`. The deadline error is
-/// "unconfirmed" because the daemon may still have been starting.
+/// Propagates probe failures; deadline expiry alone leaves startup unconfirmed.
 async fn await_daemon_ready<'a>(
     pid: u32,
     log: &str,
     deadline: tokio::time::Instant,
     mut exited: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
-    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>,
 ) -> Result<()> {
     let started = tokio::time::Instant::now();
     let wait = tokio::time::timeout_at(deadline, async {
@@ -2066,7 +2066,7 @@ async fn await_daemon_ready<'a>(
             if let Some(status) = exited()? {
                 anyhow::bail!("Daemon exited before readiness ({status}).{log}");
             }
-            if ready().await {
+            if ready().await? {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2650,6 +2650,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let mut polls = 0;
+        let mut observed_ready = false;
         await_daemon_ready(
             7,
             "",
@@ -2657,42 +2658,66 @@ mod tests {
             || Ok(None),
             || {
                 polls += 1;
-                Box::pin(std::future::ready(polls == 3))
+                observed_ready = polls >= 3;
+                Box::pin(std::future::ready(Ok(observed_ready)))
             },
         )
         .await
         .unwrap();
+        assert!(observed_ready);
+        assert!(tokio::time::Instant::now() < far);
 
-        let err = await_daemon_ready(
+        let started = tokio::time::Instant::now();
+        await_daemon_ready(
             7,
-            " See /log.",
+            "",
             far,
             || Ok(Some(std::process::ExitStatus::from_raw(1 << 8))),
-            || Box::pin(async { false }),
+            || panic!("readiness must not be probed after child exit"),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("exited before readiness") && err.ends_with("See /log."),
-            "{err}"
-        );
+        .unwrap_err();
+        assert_eq!(tokio::time::Instant::now(), started);
 
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        await_daemon_ready(
+            7,
+            "",
+            deadline,
+            || Ok(None),
+            || Box::pin(async { Ok(false) }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(tokio::time::Instant::now(), deadline);
+
+        let mut probe = Some(tokio::task::spawn_blocking(|| -> bool {
+            panic!("readiness fixture failure");
+        }));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let err = await_daemon_ready(
             7,
-            " See /log.",
+            "",
             deadline,
             || Ok(None),
-            || Box::pin(async { false }),
+            || {
+                let probe = probe.take();
+                Box::pin(async move {
+                    match probe {
+                        Some(probe) => Ok(probe.await?),
+                        None => Ok(false),
+                    }
+                })
+            },
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            err,
-            "Daemon startup remains unconfirmed after 105s (PID 7); stopping it. See /log."
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<tokio::task::JoinError>()
+                .is_some_and(|error| error.is_panic()),
+            "{err:#}"
         );
+        assert!(tokio::time::Instant::now() < deadline);
     }
 
     use super::*;
