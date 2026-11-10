@@ -140,9 +140,8 @@ impl Instance {
         Ok(())
     }
 
-    /// Consume an explicit OMP resume pin only after the matching launch
-    /// reports the already-durable sid. All three facts are checked under the
-    /// storage flock so a concurrent re-pin or relaunch cannot be consumed.
+    /// Consume an OMP pin only when the launched generation confirms its durable SID.
+    /// Check ownership and pin state under storage exclusion.
     pub(crate) fn persist_omp_pin_confirmation(
         storage: &dyn crate::session::SessionStore,
         instance_id: &str,
@@ -169,7 +168,8 @@ impl Instance {
                 session_id,
                 source,
             ) {
-                return Ok(CaptureCommit::unapplied(SidWrite::OwnershipConflict));
+                // Keep the poller's same-SID confirmation pending until ownership clears.
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
             }
             let intent_matches = matches!(
                 &instance.resume_intent,
@@ -1012,6 +1012,66 @@ mod tests {
             SidWrite::Skipped,
             "an unproven pin must remain retryable"
         );
+
+        let request = crate::session::deletion::DeletionRequest {
+            session_id: owner.id.clone(),
+            instance: owner.clone(),
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: true,
+        };
+        let held = crate::session::purge_owners::PurgeOwner::record_plan(
+            &storage,
+            &owner,
+            owner.lifecycle_generation,
+            Some(&request),
+            None,
+            crate::session::purge_owners::PurgeCapture::new(&owner).unwrap(),
+        )
+        .unwrap();
+        storage
+            .update(|rows, _| {
+                rows.retain(|row| row.id != owner.id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            Instance::persist_omp_pin_confirmation(&storage, &claimant.id, VALID_SID, generation)
+                .unwrap()
+                .outcome,
+            SidWrite::Skipped
+        );
+        let blocked = storage.load().unwrap().remove(0);
+        assert_eq!(blocked.resume_intent, ResumeIntent::Use(VALID_SID.into()));
+
+        held.release().unwrap();
+        assert_eq!(
+            Instance::persist_omp_pin_confirmation(&storage, &claimant.id, VALID_SID, generation)
+                .unwrap()
+                .outcome,
+            SidWrite::Applied
+        );
+        let confirmed = storage.load().unwrap().remove(0);
+        assert_eq!(confirmed.resume_intent, ResumeIntent::Default);
+        let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
+        let mut later =
+            crate::session::poller::SessionIdObservation::omp(next_sid.into(), generation.into());
+        later.execution = claimant.active_execution.clone();
+        later.scope_to(claimant.active_execution.as_ref().unwrap().binding.clone());
+        assert_eq!(
+            persist_session_with_storage(
+                &storage,
+                &claimant.id,
+                &later,
+                &confirmed.conversation_state(),
+            )
+            .outcome,
+            SidWrite::Applied
+        );
+        assert_eq!(disk_sid(profile, &claimant.id).as_deref(), Some(next_sid));
     }
 
     #[test]
