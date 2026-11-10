@@ -170,7 +170,7 @@ pub fn check_eligible_resolved(
     sandboxed: bool,
     session_command: &str,
     overrides: &HashMap<String, String>,
-) -> Result<&'static agents::AgentDef, SkipReason> {
+) -> Result<&'static agents::AgentDef<'static>, SkipReason> {
     let rename_tool = resolve_rename_tool(session_tool, rename_setting);
     let agent = agents::get_agent(rename_tool);
     let (command, command_override_in_cfg) = if rename_tool == session_tool {
@@ -2260,7 +2260,7 @@ mod serve {
 mod tests {
     use super::*;
 
-    fn claude() -> &'static agents::AgentDef {
+    fn claude() -> &'static agents::AgentDef<'static> {
         agents::get_agent("claude").expect("claude agent exists")
     }
 

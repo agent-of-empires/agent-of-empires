@@ -2140,7 +2140,7 @@ pub(crate) fn resolve_active_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     resolve_executed_agent(tool, command, session_config).or_else(|| {
         // Legacy status-only provisioning never grants native conversation authority.
         if session_config.agent_execution_as.contains_key(tool) {
@@ -2157,7 +2157,7 @@ fn resolve_executed_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     let command = command
         .or_else(|| session_config.custom_agents.get(tool).map(String::as_str))
         .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))

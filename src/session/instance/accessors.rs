@@ -207,7 +207,7 @@ impl Instance {
     }
 
     /// Native execution identity; explicit targets never trust status aliases.
-    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
         if self.declared_agent().is_some() {
             return None;
         }
@@ -249,7 +249,7 @@ impl Instance {
         }).flatten()
     }
 
-    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
         self.resolved_agent()
             .or_else(|| crate::agents::get_agent(&self.tool))
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
@@ -272,7 +272,7 @@ impl Instance {
     pub(super) fn resolved_agent_in(
         &self,
         config: &crate::session::config::SessionConfig,
-    ) -> Option<&'static crate::agents::AgentDef> {
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(self.effective_detect_as_in(config)))
     }
@@ -515,7 +515,7 @@ impl Instance {
     }
 
     /// Bare wrappers can receive fresh-session selectors without attesting execution.
-    pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
         if matches!(
             self.resume_intent,
             ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
@@ -566,7 +566,7 @@ impl Instance {
         Some(agent)
     }
 
-    pub(super) fn default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(super) fn default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
         self.resolved_agent()
             .or_else(|| self.legacy_default_selector_agent())
     }
@@ -957,7 +957,7 @@ pub(crate) fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     crate::agents::get_agent(tool).or_else(|| {
         crate::agents::get_agent(&tmux::status_rules::effective_detect_as(
             profile, tool, detect_as,

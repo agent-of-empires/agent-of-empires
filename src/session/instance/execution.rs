@@ -1858,7 +1858,7 @@ impl Instance {
         }
     }
 
-    pub(super) fn execution_agent(&self) -> Result<&'static AgentDef> {
+    pub(super) fn execution_agent(&self) -> Result<&'static AgentDef<'static>> {
         let config =
             crate::session::config::profile_config::resolve_config(&self.effective_profile())?;
         Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)
@@ -1868,7 +1868,7 @@ impl Instance {
         tool: &str,
         command: &str,
         config: &crate::session::config::SessionConfig,
-    ) -> Result<&'static AgentDef> {
+    ) -> Result<&'static AgentDef<'static>> {
         if Self::contains_active_shell_syntax(command) {
             return Err(anyhow::anyhow!(
                 "managed conversation requires a direct native command or an explicitly declared wrapper"
