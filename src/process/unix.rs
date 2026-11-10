@@ -1,4 +1,68 @@
 use std::process::{Child, Command};
+
+pub(super) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    let mut name = [0 as libc::c_char; 4096];
+    // SAFETY: ttyname_r writes only into the supplied live buffer.
+    let error = unsafe { libc::ttyname_r(libc::STDOUT_FILENO, name.as_mut_ptr(), name.len()) };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error));
+    }
+    // Opening the terminal, not dup(), gives this writer independent status flags.
+    // SAFETY: ttyname_r supplied a NUL-terminated path.
+    let descriptor = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: this successful open transfers one newly owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let output = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    let actual = file.metadata()?;
+    let expected = output.metadata()?;
+    // SAFETY: both descriptors remain open throughout verification.
+    if unsafe { libc::isatty(file.as_raw_fd()) } != 1
+        || (actual.dev(), actual.ino(), actual.rdev())
+            != (expected.dev(), expected.ino(), expected.rdev())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stdout terminal identity changed",
+        ));
+    }
+    Ok(file)
+}
+
+pub(super) fn terminal_writable(
+    file: &std::fs::File,
+    remaining: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let milliseconds = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
+    // SAFETY: poll receives one valid pollfd and never outlives its file.
+    match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        -1 => Err(std::io::Error::last_os_error()),
+        _ if descriptor.revents & libc::POLLOUT != 0 => Ok(()),
+        _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+    }
+}
 pub(super) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;

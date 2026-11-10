@@ -99,6 +99,32 @@ pub(crate) fn open_read_nonblocking(path: &std::path::Path) -> std::io::Result<s
     }
 }
 
+pub(crate) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::independent_terminal_output()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "bounded terminal output requires Linux or macOS",
+        ))
+    }
+}
+
+pub(crate) fn terminal_writable(file: &std::fs::File, remaining: Duration) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unix::terminal_writable(file, remaining)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (file, remaining);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
 pub(crate) const LIVE_PANE_ENV_KEYS: [&str; 3] = ["TERM", "TMUX", "TMUX_PANE"];
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -245,7 +245,8 @@ fn shortcut_bar_tip_waits_for_idle_and_persists_seen_state() {
     env.view.live_send = Some(live_state());
     assert!(!env.view.try_present_shortcut_bar_tip());
     env.view.live_send = None;
-    let mut structured = crate::tui::structured_view::embedded::EmbeddedView::for_test("test");
+    let mut structured =
+        crate::tui::structured_view::embedded::EmbeddedView::for_test("test", None);
     structured.activate();
     env.view.structured_preview = Some(structured);
     assert!(!env.view.try_present_shortcut_bar_tip());

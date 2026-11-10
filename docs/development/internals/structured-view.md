@@ -125,13 +125,129 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+## Retained history consistency
+
+Retained identities bind the complete event-store incarnation and session revision,
+including appends and replacements. Bounds and identity share one transaction,
+with independent indexed first/last sequence lookups. A stale token produces HTTP
+409; two successful blocks with different identities fail metadata validation.
+Mixed snapshots never replace the last readable window. Unchanged incomplete
+histories use identity probes instead of full replays.
+
+File-backed retained reads reuse the independent query-only search reader, not
+the event writer. Identity, bounds and raw rows share one read transaction; commit
+and release the reader before JSON decoding. Native byte blocks use the same
+reader and keep their blob transaction until the bounded bytes have been copied.
+Private memory and temporary databases use their original connection. Raw retained
+pages preserve scanned rows and cursors without turn alignment.
+
+Migration 54 defers identity installation when `acp_events` is absent, including an
+existing empty database. The normal opener creates schema before identity; actual
+SQL errors still propagate. Backward unsigned cursors above SQLite's signed range
+include its maximum sequence; in-range cursors remain strict.
+
+Scratch parser storage disables synchronization but keeps DELETE journaling,
+FILE temporary storage and a fixed cache. Production parsing batches each event
+inside the existing outer transaction. `Context::parse` must not start a nested
+transaction. Malformed records mark incompleteness without losing readable rows.
+Attachments retain both object and five-position Serde sequence compatibility,
+including optional names, and contribute the same rendered/copied count.
+
+Retained replay records disk-backed invocation provenance before the shared
+reducer can overwrite a reopened start. Explicit reopening creates an independent
+invocation; later terminal snapshots replace only within that invocation. Retained
+formatting consumes those invocation rows and the shared reducer's unfinished
+outputs, not a second projected row set. Shared Core rows still drive live
+replacement, removal and lifecycle deltas. Retained tab layout
+uses logical four-column stops and disk continuation metadata. Source tab bytes
+belong to their first painted cell even across wraps and eviction; active
+`MemoryGlyphs` control filtering stays unchanged.
+An explicit start after a terminal tool state begins fresh invocation metadata:
+empty arguments and changes do not inherit the prior call. Updates within that
+same invocation continue to merge normally.
+
+
+The worker owns read cancellation and disk preparation. Loading copy is refused,
+not deferred. Lifecycle/profile ownership must match before copy-all; mouse release
+reconciles only the last painted window and never performs another scroll. Read
+failures back off at 2, 4, 8, 16, 32, then 60 seconds; only a usable window resets
+the streak, not metadata-only success.
+
+### Clipboard and terminal ownership
+
+One application executor assigns monotonic request tickets before preparation.
+Only the newest pending request survives. Stale prepared results cannot submit,
+and a single joined worker serializes desktop helpers and OSC 52 output. Dropping
+a reader cancels preparation but cannot detach an active helper. The helper
+finishes or reaches its deadline before newer output starts. Feedback reports
+admission separately from completed desktop output or complete OSC byte emission.
+Superseded replies cannot update current feedback.
+Published source updates are reconciled before prepared copy results. Replacement
+cancels stale preparation while retaining the last readable window. Clipboard
+admission holds the publication read guard through ticket submission, so a source
+already published by the worker cannot be overtaken by an old prepared export.
+
+
+App, standalone ACP attach and remote-home frames use the same terminal
+coordinator for setup, drawing, titles and teardown. Before an attached child
+owns the terminal, a suspension refuses clipboard OSC writes; it spans terminal
+mode handoff and restoration. The executor drops before terminal restoration.
+Busy handoffs are safe refusals with retry feedback, not application errors.
+Admission precedes restart preparation and editor probing or child execution.
+Admission includes the complete leave-screen control transaction before changing
+raw mode, dropping the input stream, probing an editor or preparing native start.
+Backpressure keeps the unsent controls and queues restoration behind them, refusing
+the child without disabling input. After an admitted child returns, raw/input state
+is restored immediately; its result is kept while the bounded coordinator pumps
+terminal restoration before any later frame or OSC. A child is never rerun to
+complete restoration.
+
+Terminal owners stage drop-time cursor commands before bounded output. Incomplete
+cursor restoration remains best-effort without invoking Ratatui's synchronous
+stderr diagnostic on a stalled TTY.
+
+The OS layer independently opens and verifies the TTY descriptor. Duplicating
+stdout is not safe because duplicated descriptors share `O_NONBLOCK`.
+Only one moved frame buffer may remain pending. Each bounded write resumes its
+unsent suffix before capturing another frame, emitting OSC/title bytes, or
+handing the terminal to a child. A matching emission receipt commits mouse mode;
+pointer geometry stays unavailable until that frame and retained window match.
+Unpresented geometry cancels drag/copy selection without blocking keyboard input.
+Interactive presentation also owns a view-unique semantic revision, not merely
+frame bytes: approval selection, elicitation ownership, focus, picker/input and
+side-channel changes invalidate old authority. Receipts for an older revision
+cannot enable Allow/answer actions on a replacement request. Draft editing and
+cancellation remain available. Revisions are scalar; unchanged authority compares
+borrowed identities and does not clone a model or allocate per frame.
+
+
+
+Actual nonblocking writes and readiness polls share a deadline. Interrupted OSC
+strings and fatal frame writes record pending framing recovery; recovery emits CAN
+and ST, including a separately
+tmux-wrapped CAN, then sync/link/style resets. Interpretation remains terminal
+dependent, with no remote acceptance or rollback guarantee. Later terminal bytes
+wait for bounded recovery, but input never waits for the output mutex. Recovery
+forces a full redraw. Permanently stalled output cannot display feedback, yet
+input and cancellation remain responsive. Unsupported output paths return errors,
+never an unbounded stdout fallback. Desktop helpers remain independent transports.
+Standalone error screens keep polling the same bounded output coordinator while
+waiting for dismissal. Both a partial frame and an initial capture refused by
+active OSC resume without requiring a dismiss key.
+
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
 
 Native ACP HTTP history decodes each existing JSON replay page incrementally, with a fixed-size read buffer and no copy of the entire encoded body. Replay pages and individual events or rows may exceed 16 MiB; the generic daemon response decoder remains size-bounded. The native history decoder retains the 15-second body-read deadline, requires a complete valid document through EOF, and cancels a pending body read if its caller is dropped. Count-based paging and raw/rows cursor metadata are unchanged. This does not change the pre-existing WebSocket message limits.
 
-A cold open loads recent-first rather than folding from seq 0 before first paint. `GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N` returns the events closest below `before`, aligned to a user-turn boundary so a page never seams a split turn. The client renders the tail immediately and, on a long session, also pulls a small `since=0` prefix for the pinned handshake snapshot (capabilities, slash palette, agent and model) the composer needs. Scrolling to the top pages older history, prepending with the scroll position frozen; each page is fetched twice, once for frames and once for `view=rows`, and a failure on either leg abandons the page rather than advancing the cursor.
+An interactive cold open loads recent-first rather than folding from seq 0.
+Ordinary backward replay, including `view=rows`, trims a leading partial turn
+when older rows remain. The client paints the tail and pulls a small `since=0`
+prefix for the composer's handshake state. Scrolling to the top prepends older
+history with the scroll position frozen. Each page fetches both frames and rows;
+failure on either leg abandons the page without advancing its cursor.
 
 If context restoration fails (the agent's stored session is gone) the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`: a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided), pre-filled into the composer and never auto-sent.
 

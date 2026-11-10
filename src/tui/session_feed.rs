@@ -211,6 +211,34 @@ struct SessionCommand {
     result: tokio::sync::oneshot::Sender<Result<CommandReply, CommandFailure>>,
 }
 
+#[cfg(test)]
+pub(crate) struct CapturedRequest {
+    pub id: String,
+    pub request: SessionRequest,
+    reply: tokio::sync::oneshot::Sender<Result<CommandReply, CommandFailure>>,
+}
+
+#[cfg(test)]
+impl CapturedRequest {
+    pub fn finish(self, result: Result<SessionCommandOutcome, String>) {
+        let reply = result
+            .map(|outcome| match outcome {
+                SessionCommandOutcome::Trashed(receipt) => CommandReply::Trash(receipt),
+                SessionCommandOutcome::Purged(receipt) => CommandReply::Purge(receipt),
+                SessionCommandOutcome::Restored(receipt) => CommandReply::Restore(receipt),
+                SessionCommandOutcome::Renamed(receipt) => CommandReply::Rename(receipt),
+                SessionCommandOutcome::WorktreeEdited(receipt) => {
+                    CommandReply::WorktreeName(receipt)
+                }
+                SessionCommandOutcome::ProjectAttached(receipt) => {
+                    CommandReply::AttachProject(receipt)
+                }
+            })
+            .map_err(CommandFailure::Rejected);
+        assert!(self.reply.send(reply).is_ok());
+    }
+}
+
 struct PendingNamespace {
     grant: Arc<AtomicU64>,
     lease: u64,
@@ -2127,6 +2155,27 @@ impl SessionFeed {
                 panic!("expected session mutation");
             };
             Some((id, mutation))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_request_driver_for_test(
+        &mut self,
+    ) -> impl FnMut() -> Option<CapturedRequest> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        set_grant(&self.native_grant, true);
+        move || {
+            let command = receiver.try_recv().ok()?;
+            let CommandRequest::Session { id, request } = command.request else {
+                panic!("expected a row command");
+            };
+            Some(CapturedRequest {
+                id,
+                request,
+                reply: command.result,
+            })
         }
     }
 

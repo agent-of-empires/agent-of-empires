@@ -13,7 +13,7 @@ mod retained;
 pub mod slash;
 pub mod state;
 
-use std::io::Stdout;
+use crate::tui::terminal_output::Output;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -71,7 +71,7 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     }
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = Output::default();
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -86,7 +86,7 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     );
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = crate::tui::terminal_output::Terminal::new(backend)?;
     let mut event_stream = EventStream::new();
     let theme_name = resolve_theme_name();
     let palette_mode = resolve_theme_palette_mode();
@@ -111,7 +111,7 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
 /// until the user exits with `Esc` or the daemon becomes unrecoverable. The home
 /// screen embeds the view in its preview pane instead (see [`embedded`]).
 pub async fn run(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
     event_stream: &mut EventStream,
     theme: &Theme,
     session_id: &str,
@@ -119,30 +119,25 @@ pub async fn run(
     let endpoint = match ensure_daemon().await {
         Ok((e, _)) => e,
         Err(ManagerError::EnvOverrideUnreachable) => {
-            render_error_screen(
-                terminal,
-                theme,
+            wait_for_dismiss(terminal, theme,
                 "AOE_DAEMON_URL is set but the daemon at that URL is unreachable.\n\nCheck the URL, or unset the env var to use a local daemon.",
-            )?;
-            wait_for_dismiss(event_stream).await?;
+                event_stream).await?;
             return Ok(());
         }
         Err(ManagerError::EnvOverrideUnauthorized) => {
-            render_error_screen(
-                terminal,
-                theme,
+            wait_for_dismiss(terminal, theme,
                 "AOE_DAEMON_URL is set but the daemon rejected the bearer token.\n\nCheck AOE_DAEMON_TOKEN.",
-            )?;
-            wait_for_dismiss(event_stream).await?;
+                event_stream).await?;
             return Ok(());
         }
         Err(e @ (ManagerError::NoDaemonRunning(_) | ManagerError::AutostartFailed(_))) => {
-            render_error_screen(
+            wait_for_dismiss(
                 terminal,
                 theme,
                 &format!("{e}\n\nPress any key to return to the session list."),
-            )?;
-            wait_for_dismiss(event_stream).await?;
+                event_stream,
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -326,7 +321,7 @@ fn should_retry_plugin_ui_poll(error: &HttpError) -> bool {
 }
 
 pub async fn run_for_endpoint(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
     event_stream: &mut EventStream,
     theme: &Theme,
     endpoint: DaemonEndpoint,
@@ -346,9 +341,9 @@ pub async fn run_for_endpoint(
     // A question already pending in the replay presents its menu now.
     auto_present_elicitation(&mut state, &mut toast_deadline);
 
-    redraw(terminal, theme, &mut state)?;
     #[cfg(feature = "e2e-tests")]
     crate::tui::app::e2e_render_ack(true)?;
+    redraw(terminal, theme, &mut state)?;
 
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -366,8 +361,8 @@ pub async fn run_for_endpoint(
                 #[cfg(feature = "e2e-tests")]
                 if matches!(evt, CrosstermEvent::Key(key) if key.code == crossterm::event::KeyCode::F(12))
                     && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
-                    redraw(terminal, theme, &mut state)?;
                     crate::tui::app::e2e_render_ack(false)?;
+                    redraw(terminal, theme, &mut state)?;
                     continue;
                 }
                 if let CrosstermEvent::Mouse(m) = &evt {
@@ -437,6 +432,7 @@ fn apply_session_info(
 /// Fold the one-shot side-channel payload into the view. Shared by the
 /// full-screen loop and the embedded preview.
 pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInfo) {
+    state.interaction_changed();
     state.compaction_reminder_percent = side.compaction_reminder;
     state.notice_policy = side.notice_policy;
     state.set_queue_snapshot(side.queued);
@@ -607,6 +603,10 @@ async fn handle_terminal_event(
     evt: CrosstermEvent,
     toast_deadline: &mut Option<Instant>,
 ) -> Result<bool> {
+    state.reconcile_interaction_authority();
+    if matches!(evt, CrosstermEvent::Mouse(_)) && !state.interaction_presented() {
+        return Ok(false);
+    }
     let has_pending = !state.transcript.pending_approvals.is_empty();
     let intent = match evt {
         CrosstermEvent::Key(key) => {
@@ -655,6 +655,10 @@ async fn handle_terminal_event(
                     })
                     .cloned()
                 {
+                    if !state.interaction_presented() {
+                        return Ok(false);
+                    }
+                    state.interaction_changed();
                     handle_plugin_command(state, cmd, toast_deadline).await;
                     return Ok(false);
                 }
@@ -664,6 +668,7 @@ async fn handle_terminal_event(
         // Bracketed paste goes into the composer whichever pane is focused,
         // pulling focus there so the result is visible.
         CrosstermEvent::Paste(text) => {
+            state.interaction_changed();
             paste_into_composer(state, &text);
             ensure_files_loaded(state, toast_deadline).await;
             return Ok(false);
@@ -677,6 +682,29 @@ async fn handle_terminal_event(
         // Resize needs no bookkeeping: the next frame recomputes the layout.
         _ => return Ok(false),
     };
+    if matches!(
+        intent,
+        Intent::ResolveApproval(_)
+            | Intent::SkipElicitation
+            | Intent::CancelElicitation
+            | Intent::AnswerElicitation
+            | Intent::ChoicePick(_)
+            | Intent::ChoiceAccept
+            | Intent::SubmitPrompt
+            | Intent::OpenModePicker
+    ) && !state.interaction_presented()
+    {
+        set_toast(
+            state,
+            toast_deadline,
+            "View changed; wait for its screen before confirming.".into(),
+            ToastKind::Info,
+        );
+        return Ok(false);
+    }
+    if !matches!(intent, Intent::Ignore) {
+        state.interaction_changed();
+    }
     match intent {
         Intent::Ignore => Ok(false),
         Intent::Exit => Ok(true),
@@ -1012,6 +1040,9 @@ async fn handle_terminal_event(
 /// the highlight, as the arrow keys would, while a button only gets painted.
 /// Returns whether anything visible changed, so callers redraw only then.
 pub(super) fn handle_hover(state: &mut StructuredViewState, col: u16, row: u16) -> bool {
+    if !state.interaction_presented() {
+        return false;
+    }
     let pos = ratatui::layout::Position::new(col, row);
     let (picker_row, buttons) = {
         let targets = state.mouse_targets.borrow();
@@ -1836,53 +1867,340 @@ async fn refresh_queue(state: &mut StructuredViewState) {
 }
 
 fn redraw(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
     theme: &Theme,
     state: &mut StructuredViewState,
 ) -> Result<()> {
-    terminal.draw(|f| {
-        // Stash the pane geometry this frame draws with so mouse events
-        // hit-test against what is actually on screen. The full-screen
-        // attach view always has the keyboard, so `active` is true.
-        state.layout = Some(render::compute_layout(f.area(), state));
-        // The geometry return only matters to the embedded caller.
-        let _ = render::render(f, f.area(), theme, state, true);
+    let outcome = crate::tui::terminal_output::frame(|redraw| {
+        if redraw {
+            crate::tui::clear_terminal(terminal)?;
+        }
+        state.reconcile_interaction_authority();
+        terminal.draw(|f| {
+            // Stash the pane geometry this frame draws with so mouse events
+            // hit-test against what is actually on screen. The full-screen
+            // attach view always has the keyboard, so `active` is true.
+            state.layout = Some(render::compute_layout(f.area(), state));
+            // The geometry return only matters to the embedded caller.
+            let _ = render::render(f, f.area(), theme, state, true);
+        })?;
+        Ok(())
     })?;
+    if let Some(frame) = outcome.captured {
+        state.pending_presentation = Some((frame, state.interaction_revision));
+    }
+    let presented = state
+        .pending_presentation
+        .filter(|(pending, _)| outcome.presented == Some(*pending));
+    state.presentation_ready = false;
+    if let Some((_, revision)) = presented {
+        state.pending_presentation = None;
+        state.confirm_presentation(revision);
+    }
     Ok(())
 }
 
 fn render_error_screen(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
     _theme: &Theme,
     message: &str,
 ) -> Result<()> {
     use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-    let msg = message.to_string();
-    terminal.draw(|f| {
-        let area = f.area();
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(" Acp · error ");
-        let para = Paragraph::new(msg.clone())
-            .block(block)
-            .wrap(Wrap { trim: false });
-        f.render_widget(para, area);
+    crate::tui::terminal_output::frame(|redraw| {
+        if redraw {
+            crate::tui::clear_terminal(terminal)?;
+        }
+        terminal.draw(|f| {
+            let area = f.area();
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Acp · error ");
+            let para = Paragraph::new(message)
+                .block(block)
+                .wrap(Wrap { trim: false });
+            f.render_widget(para, area);
+        })?;
+        Ok(())
     })?;
     Ok(())
 }
 
-async fn wait_for_dismiss(event_stream: &mut EventStream) -> Result<()> {
-    while let Some(evt) = event_stream.next().await {
-        if let Ok(CrosstermEvent::Key(_)) = evt {
-            return Ok(());
+async fn wait_for_dismiss<S>(
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
+    theme: &Theme,
+    message: &str,
+    event_stream: &mut S,
+) -> Result<()>
+where
+    S: futures_util::Stream<Item = std::io::Result<CrosstermEvent>> + Unpin,
+{
+    render_error_screen(terminal, theme, message)?;
+    let mut refresh = tokio::time::interval(Duration::from_millis(30));
+    loop {
+        tokio::select! {
+            event = event_stream.next() => match event {
+                Some(Ok(CrosstermEvent::Key(_))) | None => return Ok(()),
+                _ => {}
+            },
+            _ = refresh.tick() => {
+                if crate::tui::terminal_output::needs_redraw() {
+                    render_error_screen(terminal, theme, message)?;
+                }
+            }
         }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn approval_update_for_test(nonce: &str, seq: u64) -> WsMessage {
+    let at = chrono::DateTime::from_timestamp(100, 0).unwrap();
+    WsMessage::ReducedState {
+        seq,
+        unchanged: Vec::new(),
+        state: Box::new(crate::acp::state::AcpState {
+            pending_approvals: vec![crate::acp::approvals::Approval {
+                nonce: crate::acp::approvals::Nonce(nonce.into()),
+                tool_call: crate::acp::state::ToolCall {
+                    id: nonce.into(),
+                    name: nonce.into(),
+                    kind: "read".into(),
+                    args_preview: "{}".into(),
+                    started_at: at,
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+                destructive: false,
+                options: Vec::new(),
+                choice: false,
+                plan: None,
+                requested_at: at,
+                resolved: None,
+            }],
+            ..Default::default()
+        }),
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn approval_sink_for_test() -> (
+    DaemonEndpoint,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = calls.clone();
+    let app = axum::Router::new().route(
+        "/api/sessions/{id}/acp/approvals/{nonce}",
+        axum::routing::post(
+            move |axum::extract::Path((_, nonce)): axum::extract::Path<(String, String)>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(nonce);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = DaemonEndpoint::new(
+        format!("http://{}", listener.local_addr().unwrap()),
+        None,
+        crate::daemon::Source::Env,
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, calls, server)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crossterm::event::{KeyCode, KeyEvent};
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_frame_receipt_cannot_authorize_replacement_approval() {
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{block_terminal, drain_terminal, private_terminal, resume_terminal},
+        };
+        let (endpoint, calls, server) = approval_sink_for_test().await;
+        let mut state = StructuredViewState::new(
+            "s-1".into(),
+            endpoint.clone(),
+            HttpClient::new(endpoint).unwrap(),
+            None,
+        );
+        let mut toast = None;
+        apply_ws_message(
+            &mut state,
+            &mut toast,
+            Ok(approval_update_for_test("approval-A", 1)),
+        )
+        .await;
+        let (mut master, slave) = private_terminal();
+        let mut control = slave.try_clone().unwrap();
+        let (_guard, _) = install_test_output(slave);
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(Output::default()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
+        let mut emitted = Vec::new();
+        let theme = Theme::default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            drain_terminal(&mut master, &mut emitted);
+            redraw(&mut terminal, &theme, &mut state).unwrap();
+            if state.interaction_presented() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        let allow = state
+            .mouse_targets
+            .borrow()
+            .buttons
+            .iter()
+            .find(|(_, intent)| *intent == Intent::ResolveApproval(ApprovalDecisionWire::Allow))
+            .unwrap()
+            .0;
+        block_terminal(&mut control);
+        crate::tui::terminal_output::request_redraw();
+        redraw(&mut terminal, &theme, &mut state).unwrap();
+        assert!(state.pending_presentation.is_some());
+        apply_ws_message(
+            &mut state,
+            &mut toast,
+            Ok(approval_update_for_test("approval-B", 2)),
+        )
+        .await;
+        resume_terminal(&control);
+        while state.pending_presentation.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            redraw(&mut terminal, &theme, &mut state).unwrap();
+        }
+        assert!(!state.interaction_presented());
+        handle_terminal_event(&mut state, left_click(allow.x, allow.y), &mut toast)
+            .await
+            .unwrap();
+        handle_terminal_event(
+            &mut state,
+            CrosstermEvent::Key(KeyEvent::from(KeyCode::Char('a'))),
+            &mut toast,
+        )
+        .await
+        .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            redraw(&mut terminal, &theme, &mut state).unwrap();
+            if state.interaction_presented() {
+                break;
+            }
+        }
+        let allow = state
+            .mouse_targets
+            .borrow()
+            .buttons
+            .iter()
+            .find(|(_, intent)| *intent == Intent::ResolveApproval(ApprovalDecisionWire::Allow))
+            .unwrap()
+            .0;
+        handle_terminal_event(&mut state, left_click(allow.x, allow.y), &mut toast)
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["approval-B"]);
+        assert!(state.transcript.pending_approvals.is_empty());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stalled_error_screen_completes_without_a_dismiss_key() {
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{block_terminal, drain_terminal, private_terminal, resume_terminal},
+        };
+        for osc_busy in [false, true] {
+            let (mut master, slave) = private_terminal();
+            let mut control = slave.try_clone().unwrap();
+            let (_guard, output) = install_test_output(slave);
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(Output::default()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 12)),
+                },
+            )
+            .unwrap();
+            let mut release = None;
+            let mut writer = None;
+            if osc_busy {
+                let (entered, observed) = std::sync::mpsc::sync_channel(1);
+                let (finish, finished) = std::sync::mpsc::sync_channel(1);
+                writer = Some(std::thread::spawn(move || {
+                    output.osc52(Duration::from_secs(5), |bytes| {
+                        bytes.write_all(b"\x1b]52;c;")?;
+                        entered.send(()).unwrap();
+                        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+                        bytes.write_all(b"\x07")
+                    })
+                }));
+                observed.recv_timeout(Duration::from_secs(2)).unwrap();
+                release = Some(finish);
+            } else {
+                block_terminal(&mut control);
+            }
+            let (send, receive) = tokio::sync::mpsc::channel(1);
+            let mut events = Box::pin(futures_util::stream::unfold(receive, |mut receive| async {
+                receive.recv().await.map(|event| (event, receive))
+            }));
+            let theme = Theme::default();
+            let waiting = wait_for_dismiss(
+                &mut terminal,
+                &theme,
+                "ERROR-BEGIN\n\nERROR-COMPLETE",
+                &mut events,
+            );
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            if let Some(release) = release {
+                release.send(()).unwrap();
+                writer.take().unwrap().join().unwrap().unwrap();
+            } else {
+                resume_terminal(&control);
+            }
+            let mut emitted = Vec::new();
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        result = &mut waiting => panic!("dismissed without input: {result:?}"),
+                        _ = poll.tick() => {
+                            drain_terminal(&mut master, &mut emitted);
+                            if emitted.windows(b"ERROR-COMPLETE".len()).any(|bytes| bytes == b"ERROR-COMPLETE")
+                                && !crate::tui::terminal_output::needs_redraw() { break; }
+                        }
+                    }
+                }
+            }).await.unwrap();
+            send.send(Ok(CrosstermEvent::Key(KeyEvent::from(KeyCode::Char('x')))))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), &mut waiting)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
     use crate::daemon::Source;
 
     fn test_state() -> StructuredViewState {
@@ -2242,6 +2560,8 @@ mod tests {
     }
 
     fn draw(state: &mut StructuredViewState) {
+        state.reconcile_interaction_authority();
+        let revision = state.interaction_revision;
         let theme = Theme::default();
         let backend = ratatui::backend::TestBackend::new(60, 20);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -2251,6 +2571,7 @@ mod tests {
                 render::render(f, f.area(), &theme, state, true);
             })
             .expect("draw");
+        state.confirm_presentation(revision);
     }
 
     fn left_click(column: u16, row: u16) -> CrosstermEvent {

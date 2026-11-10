@@ -180,6 +180,7 @@ fn run(
                     super::document(
                         &loaded.context,
                         &loaded.projection,
+                        &loaded.invocations,
                         &request.theme,
                         Some(roots),
                         current_document,

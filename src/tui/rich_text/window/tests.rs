@@ -108,3 +108,75 @@ fn evicted_windows_preserve_graphemes_copy_and_repeated_line_anchors() {
         io::ErrorKind::Interrupted
     );
 }
+
+#[test]
+fn retained_tabs_keep_source_bytes_across_wrapped_continuations_and_eviction() {
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let store = Store::new(Arc::clone(&cancellation)).unwrap();
+    let spool = Spool::new(1, cancellation).unwrap();
+    let mut document = Document::new(DiskSource {
+        store: &store,
+        spool: &spool,
+    })
+    .unwrap();
+    store
+        .with_transaction(|_| {
+            document.text(spool.append(b"a\tZ")?, Style::default())?;
+            document.end_line()?;
+            document.prefix(Some(("› ", "  ", Style::default())))?;
+            document.text(spool.append("界\tQ".as_bytes())?, Style::default())?;
+            document.end_line()?;
+            glyph::index(&document, || true)
+        })
+        .unwrap();
+    document.seal().unwrap();
+    for width in [2, 1, 12, 2] {
+        let index = store
+            .with_transaction(|_| Index::build(&document, width, || true))
+            .unwrap();
+        let painted = index.window(&document, 0..index.len(), || true).unwrap();
+        assert!(painted
+            .lines
+            .iter()
+            .all(|line| !line.to_string().contains('\t')));
+        if width == 2 {
+            assert_eq!(painted.lines[0].to_string(), "a ");
+            assert_eq!(painted.lines[1].to_string(), "  ");
+            assert_eq!(painted.lines[2].to_string(), "Z");
+            assert_eq!(index.locate(Anchor { line: 0, byte: 1 }).unwrap(), 0);
+            let mut copied = Vec::new();
+            assert!(index
+                .copy_selection(
+                    &document,
+                    Selection {
+                        start: (0, 0),
+                        end: (1, 2),
+                    },
+                    &mut copied,
+                    || true
+                )
+                .unwrap());
+            assert_eq!(copied, b"a\t\n\nZ");
+            let mut continuation = Vec::new();
+            assert!(!index
+                .copy_selection(
+                    &document,
+                    Selection {
+                        start: (0, 1),
+                        end: (1, 1),
+                    },
+                    &mut continuation,
+                    || true
+                )
+                .unwrap());
+            assert!(continuation.is_empty());
+        }
+        if width == 12 {
+            assert_eq!(painted.lines[0].to_string(), "a   Z");
+            assert_eq!(painted.lines[1].to_string(), "› 界    Q");
+        }
+    }
+    let mut all = Vec::new();
+    copy_all(&document, &mut all, || true).unwrap();
+    assert_eq!(all, "a\tZ\n› 界\tQ".as_bytes());
+}

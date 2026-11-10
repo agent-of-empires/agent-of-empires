@@ -14,6 +14,14 @@ fn migrate_database(path: &Path) -> Result<()> {
     }
     let mut conn = rusqlite::Connection::open(path)
         .with_context(|| format!("open retained history {}", path.display()))?;
+    let has_events: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'acp_events')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_events {
+        return Ok(());
+    }
     crate::acp::event_store::identity::install(&mut conn)?;
     info!(target: "migrations.v054", "Added retained history content identity");
     Ok(())
@@ -23,6 +31,31 @@ fn migrate_database(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::acp::{event_store::EventStore, state::Event};
+
+    #[test]
+    fn defers_empty_database_until_event_store_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acp_events.db");
+        drop(rusqlite::Connection::open(&path).unwrap());
+        migrate_database(&path).unwrap();
+        let store = EventStore::open(&path, 0).unwrap();
+        store
+            .record("retained", 1, &Event::ThinkingStarted)
+            .unwrap();
+        let (_, identity) = store
+            .retained_page("retained", 0, None, 10, None)
+            .unwrap()
+            .unwrap();
+        drop(store);
+        migrate_database(&path).unwrap();
+        let store = EventStore::open(&path, 0).unwrap();
+        let (page, reopened) = store
+            .retained_page("retained", 0, None, 10, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity, reopened);
+        assert!(matches!(&page.events[..], [(1, Event::ThinkingStarted)]));
+    }
 
     #[test]
     fn upgrades_legacy_history_without_changing_content_or_identity_on_reentry() {

@@ -849,6 +849,18 @@ impl HomeView {
     ///
     /// The daemon commits the trash reservation, teardown and relocation; UI follows its receipt fence.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
+            self.flash_status("Runtime unavailable; reopen Trash controls");
+            return;
+        };
+        self.trash_session_by_id_at_epoch(id, &epoch);
+    }
+
+    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, epoch: &str) {
+        if self.session_feed.applied_epoch() != Some(epoch) {
+            self.flash_status("Runtime changed; reopen Trash controls");
+            return;
+        }
         let Some(instance) = self
             .get_instance(id)
             .filter(|instance| !instance.is_trashed())

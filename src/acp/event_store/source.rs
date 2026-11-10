@@ -29,7 +29,7 @@ impl EventStore {
         {
             return Ok(RetainedSourceRead::InvalidCursor);
         }
-        let mut connection = self.conn();
+        let mut connection = self.read_conn();
         let transaction = connection.transaction()?;
         let identity = super::identity::read(&transaction, session)?;
         if query
@@ -39,6 +39,8 @@ impl EventStore {
         {
             return Ok(RetainedSourceRead::Changed);
         }
+        #[cfg(test)]
+        self.pause_retained_read(session, super::test_support::RetainedReadStage::Snapshot);
         let table = self.schema.events_table();
         let (highest, lowest): (Option<i64>, Option<i64>) = transaction.query_row(
             &format!(

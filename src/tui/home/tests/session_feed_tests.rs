@@ -2960,7 +2960,7 @@ fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
 #[test]
 #[serial]
 fn trash_confirmation_rejects_a_changed_original_target() {
-    for change in ["trash", "generation", "purge", "selection"] {
+    for change in ["trash", "generation", "purge", "selection", "epoch"] {
         for late_submit in [false, true] {
             let mut env = create_test_env_with_sessions(2);
             let id = env.view.selected_session.clone().unwrap();
@@ -2986,6 +2986,7 @@ fn trash_confirmation_rejects_a_changed_original_target() {
                 "generation" => next.contents.sessions[0].lifecycle_generation += 1,
                 "purge" => next.contents.sessions.retain(|row| row.id != id),
                 "selection" => {}
+                "epoch" => next.cursor.epoch = "replacement".into(),
                 _ => unreachable!(),
             }
             env.view

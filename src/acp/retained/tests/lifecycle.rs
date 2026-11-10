@@ -37,9 +37,11 @@ fn fold(
 ) -> (
     Rc<Context>,
     crate::acp::transcript::reducer::Projection<Disk>,
+    Vec<String>,
 ) {
     let context = Context::new(Arc::new(AtomicBool::new(false))).unwrap();
     let mut model = Core::new(Disk(Rc::clone(&context))).unwrap();
+    let mut stopped = Vec::new();
     context
         .store
         .with_transaction(|_| {
@@ -52,14 +54,21 @@ fn fold(
                     model.observe_prior(index as u64 + 1, event)?;
                 } else {
                     for delta in model.apply(index as u64 + 1, event)?.into_iter() {
-                        delta?;
+                        match delta? {
+                            TranscriptDelta::Append(row) | TranscriptDelta::Patch { row, .. }
+                                if row.kind == TranscriptRowKind::ToolStopped =>
+                            {
+                                stopped.push(text(&context, row.text));
+                            }
+                            _ => {}
+                        }
                     }
                 }
             }
             Ok(())
         })
         .unwrap();
-    (context, model.into_projection().unwrap())
+    (context, model.into_projection().unwrap(), stopped)
 }
 fn unfinished(
     context: &Context,
@@ -140,7 +149,7 @@ fn cursor_boundaries_preserve_latest_output_order_reuse_and_question_suppression
             .map(|(id, text)| ((*id).to_owned(), (*text).to_owned()))
             .collect::<Vec<_>>();
         for split in 0..=events.len() {
-            let (context, projection) = fold(&events, split);
+            let (context, projection, _) = fold(&events, split);
             assert_eq!(
                 unfinished(&context, &projection),
                 expected,
@@ -176,17 +185,12 @@ fn turn_endings_keep_orphans_separate_and_sweep_open_prefix_tools() {
                 if completed {
                     events.push(complete("t", ""));
                 }
-                let (context, projection) = fold(&events, split);
+                let (context, projection, stopped) = fold(&events, split);
                 assert_eq!(
                     unfinished(&context, &projection),
                     [("t".into(), "orphan text".into())]
                 );
-                for position in 0..projection.rows.len() {
-                    assert_ne!(
-                        projection.rows.read(position).unwrap().kind,
-                        TranscriptRowKind::ToolStopped
-                    );
-                }
+                assert!(stopped.is_empty());
             }
         }
         for split in 0..=3 {
@@ -196,14 +200,8 @@ fn turn_endings_keep_orphans_separate_and_sweep_open_prefix_tools() {
                 closer.clone(),
                 stopped("cancelled"),
             ];
-            let (context, projection) = fold(&events, split);
+            let (context, projection, stopped) = fold(&events, split);
             assert!(unfinished(&context, &projection).is_empty());
-            let stopped = (0..projection.rows.len())
-                .filter_map(|position| {
-                    let row = projection.rows.read(position).unwrap();
-                    (row.kind == TranscriptRowKind::ToolStopped).then(|| text(&context, row.text))
-                })
-                .collect::<Vec<_>>();
             assert_eq!(
                 stopped,
                 if split == 3 {

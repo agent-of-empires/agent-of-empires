@@ -266,6 +266,7 @@ impl HomeView {
             restart_in_flight: std::collections::HashSet::new(),
             pending_creation: None,
             structured_transcript_painted: false,
+            presentation_ready: true,
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
             pending_archive_cursor: None,

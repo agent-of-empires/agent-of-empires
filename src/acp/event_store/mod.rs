@@ -73,10 +73,14 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
 /// SQLite-backed structured view event log.
 pub struct EventStore {
     conn: Mutex<Connection>,
-    /// Read-only connection used exclusively by `search_content`.
-    search_conn: Mutex<Connection>,
+    /// Independent file-backed reader; private databases share `conn`.
+    read_conn: Option<Mutex<Connection>>,
     schema: events::Schema,
     max_events_per_session: usize,
+    #[cfg(test)]
+    retained_read_gate: Mutex<Option<test_support::RetainedReadGate>>,
+    #[cfg(any(test, debug_assertions))]
+    _temp_directory: Option<tempfile::TempDir>,
 }
 
 impl EventStore {
@@ -86,17 +90,27 @@ impl EventStore {
         let schema = events::Schema::new("acp")?;
         let mut conn = events::open(db_path, &schema)?;
         identity::install(&mut conn)?;
-        let search_conn = Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("open read-only search handle at {}", db_path.display()))?;
-        search_conn
-            .pragma_update(None, "query_only", "ON")
-            .context("set query_only=ON on search handle")?;
-        search_conn
-            .busy_timeout(std::time::Duration::from_millis(1000))
-            .context("set busy_timeout on search handle")?;
+        let private_database: bool = conn.query_row(
+            "SELECT file = '' FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let read_conn = if private_database {
+            None
+        } else {
+            let reader = Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .with_context(|| format!("open read-only event handle at {}", db_path.display()))?;
+            reader
+                .pragma_update(None, "query_only", "ON")
+                .context("set query_only=ON on event reader")?;
+            reader
+                .busy_timeout(std::time::Duration::from_millis(1000))
+                .context("set busy_timeout on event reader")?;
+            Some(Mutex::new(reader))
+        };
         debug!(
             target: "acp.event_store",
             path = %db_path.display(),
@@ -105,14 +119,37 @@ impl EventStore {
         );
         Ok(Self {
             conn: Mutex::new(conn),
-            search_conn: Mutex::new(search_conn),
+            read_conn,
             schema,
             max_events_per_session,
+            #[cfg(test)]
+            retained_read_gate: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            _temp_directory: None,
         })
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn temporary_for_test(max_events_per_session: usize) -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Self::open(
+            &directory.path().join("acp_events.db"),
+            max_events_per_session,
+        )?;
+        store._temp_directory = Some(directory);
+        Ok(store)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn read_conn(&self) -> MutexGuard<'_, Connection> {
+        self.read_conn
+            .as_ref()
+            .unwrap_or(&self.conn)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Append one event (a duplicate seq is ignored), then prune past the retention cap.
@@ -386,6 +423,61 @@ fn event_kind(json: &str) -> &str {
 pub(super) mod test_support {
     use super::*;
     use tempfile::TempDir;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::acp::event_store) enum RetainedReadStage {
+        Snapshot,
+        BeforeDecode,
+    }
+
+    pub(in crate::acp::event_store) struct RetainedReadGate {
+        session: String,
+        stage: RetainedReadStage,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    pub(in crate::acp::event_store) fn gate_retained_read(
+        store: &EventStore,
+        session: &str,
+        stage: RetainedReadStage,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, entered) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let mut slot = store.retained_read_gate.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some(RetainedReadGate {
+            session: session.into(),
+            stage,
+            reached,
+            release: resume,
+        });
+        (entered, release)
+    }
+
+    impl EventStore {
+        pub(in crate::acp::event_store) fn pause_retained_read(
+            &self,
+            session: &str,
+            stage: RetainedReadStage,
+        ) {
+            let gate = {
+                let mut slot = self.retained_read_gate.lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|gate| gate.session == session && gate.stage == stage)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.reached.send(()).unwrap();
+                let _ = gate.release.recv();
+            }
+        }
+    }
 
     pub(in crate::acp::event_store) fn open_store(max: usize) -> (TempDir, EventStore) {
         let tmp = TempDir::new().unwrap();

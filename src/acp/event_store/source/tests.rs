@@ -1,6 +1,122 @@
 use super::*;
 use crate::acp::state::{Event, WorkflowLaunch};
 
+#[tokio::test]
+async fn retained_source_snapshot_does_not_block_publication_and_rejects_stale_identity() {
+    use crate::acp::event_store::test_support::{gate_retained_read, RetainedReadStage};
+    use crate::acp::supervisor::{BroadcastSink, ChannelSink};
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use tower::ServiceExt;
+
+    let instance = crate::session::Instance::new("concurrent retained source", "/tmp");
+    let id = instance.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![instance]);
+    let store = Arc::clone(&state.acp_event_store);
+    let event = Event::AgentMessageChunk {
+        text: "old snapshot bytes".into(),
+        message_id: None,
+    };
+    store.record(&id, 1, &event).unwrap();
+    let expected = serde_json::to_vec(&event).unwrap();
+    let (entered, release) = gate_retained_read(&store, &id, RetainedReadStage::Snapshot);
+    let reader_store = Arc::clone(&store);
+    let reader_id = id.clone();
+    let reader = std::thread::spawn(move || {
+        reader_store.retained_source(&reader_id, &RetainedSourceQuery::default())
+    });
+    let deadline = Duration::from_secs(5);
+    entered
+        .recv_timeout(deadline)
+        .expect("source reader must establish its snapshot");
+    let (tx, mut broadcasts) = tokio::sync::broadcast::channel(4);
+    let sink = ChannelSink {
+        tx,
+        event_store: Arc::clone(&store),
+        control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+    };
+    let (done, completed) = mpsc::channel();
+    let writer_id = id.clone();
+    let writer = std::thread::spawn(move || {
+        let persisted = sink.publish_persisted("unrelated", 1, &Event::ThinkingStarted)
+            && sink.publish_persisted(&writer_id, 2, &Event::ThinkingEnded);
+        done.send(persisted).unwrap();
+    });
+    let publication = completed.recv_timeout(deadline);
+    release.send(()).unwrap();
+    let result = reader.join().unwrap().unwrap();
+    writer.join().unwrap();
+    assert!(publication.expect("source snapshot must not block live publication"));
+    assert_eq!(broadcasts.try_recv().unwrap().session_id, "unrelated");
+    let published = broadcasts.try_recv().unwrap();
+    assert_eq!(
+        (published.session_id.as_str(), published.seq),
+        (id.as_str(), 2)
+    );
+    assert!(matches!(published.event.as_ref(), Event::ThinkingEnded));
+    let RetainedSourceRead::Block { meta, bytes } = result else {
+        panic!("coherent source block expected");
+    };
+    assert_eq!(bytes, expected);
+    assert!(bytes.len() <= RETAINED_SOURCE_BLOCK_BYTES);
+    assert_eq!(
+        (meta.highest_seq, meta.lowest_seq, meta.seq),
+        (1, Some(1), Some(1))
+    );
+    assert!(!meta.omitted && !meta.invalid);
+    let RetainedSourceRead::Block { meta: latest, .. } = store
+        .retained_source(&id, &RetainedSourceQuery::default())
+        .unwrap()
+    else {
+        panic!("new source snapshot expected");
+    };
+    assert_eq!(latest.highest_seq, 2);
+    assert_ne!(latest.history_identity, meta.history_identity);
+    let app = Router::new()
+        .route(
+            "/api/sessions/{id}/acp/retained-source",
+            get(crate::server::api::acp_retained_source),
+        )
+        .with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/sessions/{id}/acp/retained-source?history_identity={}",
+                    meta.history_identity
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+}
+
+#[test]
+fn retained_source_reads_the_written_private_database() {
+    for name in [":memory:", ""] {
+        let store = EventStore::open(std::path::Path::new(name), 0).unwrap();
+        let event = Event::AgentMessageChunk {
+            text: "private source".into(),
+            message_id: None,
+        };
+        store.record("private", 1, &event).unwrap();
+        let RetainedSourceRead::Block { meta, bytes } = store
+            .retained_source("private", &RetainedSourceQuery::default())
+            .unwrap()
+        else {
+            panic!("private source block expected");
+        };
+        assert_eq!(bytes, serde_json::to_vec(&event).unwrap());
+        assert_eq!(
+            (meta.highest_seq, meta.lowest_seq, meta.seq),
+            (1, Some(1), Some(1))
+        );
+    }
+}
+
 #[test]
 fn retained_source_preserves_byte_offsets_identity_and_private_metadata() {
     let directory = tempfile::tempdir().unwrap();
@@ -237,8 +353,11 @@ async fn malformed_retained_events_preserve_valid_output_and_report_incompletene
         let (incomplete, text) = tokio::task::spawn_blocking(move || {
             let loaded = load::read(&client, &session, &runtime, &Cancellation::default())?;
             let mut bytes = Vec::new();
-            for index in 0..loaded.projection.rows.len() {
-                let row = loaded.projection.rows.read(index)?;
+            for index in 0..loaded.invocations.rows.len() {
+                if !loaded.invocations.visible(index)? {
+                    continue;
+                }
+                let row = loaded.invocations.rows.read(index)?;
                 loaded.context.spool.copy_to(row.text, &mut bytes)?;
             }
             for output in loaded.projection.unfinished.iter() {
@@ -295,7 +414,7 @@ fn complete_retained_reads_have_subquadratic_sqlite_work() {
         let steps = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&steps);
         store
-            .conn()
+            .read_conn()
             .progress_handler(
                 1,
                 Some(move || {
@@ -339,7 +458,7 @@ fn complete_retained_reads_have_subquadratic_sqlite_work() {
         }
         assert_eq!(after, count);
         store
-            .conn()
+            .read_conn()
             .progress_handler(0, None::<fn() -> bool>)
             .unwrap();
         steps.load(Ordering::Relaxed)

@@ -1,3 +1,4 @@
+use super::invocation::Replay;
 use super::*;
 use crate::acp::{
     approvals::Nonce,
@@ -29,15 +30,13 @@ fn tool(id: &str) -> Event {
         },
     }
 }
-fn feed(context: &Context, model: &mut Core<Disk>, seq: u64, event: Event) {
+fn feed(context: &Context, model: &mut Replay, seq: u64, event: Event) {
     let mut writer = context.spool.writer();
     serde_json::to_writer(&mut writer, &event).unwrap();
     let input = writer.finish().unwrap();
     let value = context.parse(input).unwrap();
     let event = context.event(value).unwrap();
-    for delta in model.apply(seq, event).unwrap().into_iter() {
-        delta.unwrap();
-    }
+    model.apply(seq, event).unwrap();
 }
 fn text(context: &Context, value: TextRef) -> String {
     let mut bytes = Vec::new();
@@ -59,7 +58,7 @@ impl Write for Hash {
 fn retained_snapshots_survive_eviction_reuse_and_row_removal() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let context = Context::new(Arc::clone(&cancelled)).unwrap();
-    let mut model = Core::new(Disk(Rc::clone(&context))).unwrap();
+    let mut model = Replay::new(Rc::clone(&context)).unwrap();
     feed(
         &context,
         &mut model,
@@ -142,13 +141,7 @@ fn retained_snapshots_survive_eviction_reuse_and_row_removal() {
     writer.write_all(br#"","message_id":"retained"}}"#).unwrap();
     let input = writer.finish().unwrap();
     let value = context.parse(input).unwrap();
-    for delta in model
-        .apply(11, context.event(value).unwrap())
-        .unwrap()
-        .into_iter()
-    {
-        delta.unwrap();
-    }
+    model.apply(11, context.event(value).unwrap()).unwrap();
 
     let elicitation = Elicitation {
         nonce: Nonce("n".into()),
@@ -164,17 +157,7 @@ fn retained_snapshots_survive_eviction_reuse_and_row_removal() {
     let mut writer = context.spool.writer();
     serde_json::to_writer(&mut writer, &event).unwrap();
     let value = context.parse(writer.finish().unwrap()).unwrap();
-    let mut removed = Vec::new();
-    for delta in model
-        .apply(12, context.event(value).unwrap())
-        .unwrap()
-        .into_iter()
-    {
-        if let TranscriptDelta::Remove(id) = delta.unwrap() {
-            removed.push(text(&context, id));
-        }
-    }
-    assert_eq!(removed, ["start-ask"]);
+    model.apply(12, context.event(value).unwrap()).unwrap();
 
     let mut eviction = context.spool.writer();
     for _ in 0..128 {
@@ -183,33 +166,40 @@ fn retained_snapshots_survive_eviction_reuse_and_row_removal() {
     let eviction = eviction.finish().unwrap();
     context.spool.copy_to(eviction, &mut io::sink()).unwrap();
 
-    let projection = model.into_projection().unwrap();
-    let mut ids = Vec::new();
-    for index in 0..projection.rows.len() {
-        let row = projection.rows.read(index).unwrap();
-        let id = text(&context, row.id);
-        match id.as_str() {
-            "done-reused" => {
-                assert_eq!(row.kind, TranscriptRowKind::ToolComplete);
-                assert_eq!(text(&context, row.text), "first snapshot");
+    let (projection, invocations) = model.into_projection().unwrap();
+    let mut completions = Vec::new();
+    let mut messages = 0;
+    for index in 0..invocations.rows.len() {
+        if !invocations.visible(index).unwrap() {
+            continue;
+        }
+        let row = invocations.rows.read(index).unwrap();
+        assert_ne!(
+            row.tool_call_id.map(|id| text(&context, id)).as_deref(),
+            Some("ask")
+        );
+        match row.kind {
+            TranscriptRowKind::ToolStart => {
+                let completion = invocations.completion(index).unwrap().unwrap();
+                completions.push((completion.kind, text(&context, completion.text)));
             }
-            "stopped-reused-8" => {
-                assert_eq!(row.kind, TranscriptRowKind::ToolStopped);
-                assert_eq!(text(&context, row.text), "");
-            }
-            "msg-11" => {
+            TranscriptRowKind::Message => {
                 let mut hash = Hash(Sha256::new());
                 let copied = context.spool.copy_to(row.text, &mut hash).unwrap();
                 assert_eq!(copied, chunk.len() as u64 * 65_536);
                 assert_eq!(hash.0.finalize(), expected.clone().finalize());
+                messages += 1;
             }
             _ => {}
         }
-        ids.push(id);
     }
+    assert_eq!(messages, 1);
     assert_eq!(
-        ids,
-        ["start-reused", "done-reused", "stopped-reused-8", "msg-11"]
+        completions,
+        [
+            (TranscriptRowKind::ToolComplete, "first snapshot".into()),
+            (TranscriptRowKind::ToolStopped, String::new()),
+        ]
     );
     let unfinished = projection
         .unfinished
@@ -225,7 +215,7 @@ fn retained_snapshots_survive_eviction_reuse_and_row_removal() {
     assert_eq!(unfinished, [("reused".into(), "orphan".into())]);
     cancelled.store(true, Ordering::Relaxed);
     assert_eq!(
-        projection.rows.read(0).err().unwrap().kind(),
+        invocations.rows.read(0).err().unwrap().kind(),
         io::ErrorKind::Interrupted
     );
 }

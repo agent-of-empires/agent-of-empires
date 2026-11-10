@@ -303,7 +303,11 @@ pub(crate) fn index(document: &Document<'_>, current: impl Fn() -> bool) -> io::
                     let range = boundaries
                         .next()?
                         .ok_or_else(|| invalid("rich grapheme disappeared"))?;
-                    let cells = width(&source, range.clone(), &boundaries.forward, &mut reverse)?;
+                    let cells = if source.byte_at(range.start)? == Some(b'\t') {
+                        4 - total % 4
+                    } else {
+                        width(&source, range.clone(), &boundaries.forward, &mut reverse)?
+                    };
                     let ascii = u64::from(
                         range.end - range.start == 1
                             && source

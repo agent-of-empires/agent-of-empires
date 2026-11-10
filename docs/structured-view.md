@@ -190,6 +190,31 @@ there is no transcript-size or application clipboard-size cutoff.
 Desktop clipboard helpers and terminal OSC 52 support can impose their own
 limits. An OSC 52 write confirms emission, not clipboard acceptance.
 
+Clipboard requests belong to the application, not the reader view. New requests
+replace older pending preparation; admitted helper and terminal output remains
+serialized across live and retained copies. Copy while a retained window is
+loading is refused with retry feedback rather than reporting an earlier window.
+Clipboard feedback distinguishes a queued request, completed desktop output,
+and OSC 52 emission. Queuing never means the text was copied. A slow clipboard
+must not prevent input or cancellation. Terminal clipboard acceptance and
+rollback cannot be confirmed by AoE.
+A source replacement cancels a prepared copy before clipboard admission. While
+a screen frame is still unsent, drag selection cannot copy unseen rows. Busy
+terminal attachment or editor handoffs keep the application and pending input
+open with retry feedback.
+Approval and question actions require the corresponding request to have reached
+the screen; an older frame cannot authorize its unseen replacement. Draft editing
+remains available. If terminal handoff controls stall, the child is refused and
+input stays live until ordered restoration finishes. A completed child is never
+rerun just because screen restoration is delayed.
+
+
+
+Retained tabs display at four-column stops and copy as original tabs. Distinct
+tool invocations remain distinct when an agent reuses a tool ID; replacement
+snapshots update only their invocation. Failed reads retry with bounded backoff
+while preserving the last readable window.
+
 The reader refreshes available content automatically, including replacements or
 backfills that leave sequence bounds unchanged, and preserves focus and scroll
 position. Read failures keep the last readable window visible with an error,
@@ -199,9 +224,15 @@ previous selection.
 Missing ranges do not trigger repeated transcript reloads while retained content
 is unchanged.
 
+Retained reads use one complete history snapshot. If stored history changes,
+including an append, the reader rejects mixed content and retries while keeping
+the last readable view. An incomplete but unchanged history does not repeatedly
+reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
+for storage, clipboard ownership, and terminal transport invariants.
+
 Dialogs close when their target session changes or disappears. Trash context
-menus reject actions if the original session, profile, or lifecycle generation
-changes. Restore and permanent deletion never target a replacement selection.
+menus reject actions if the original session, profile, lifecycle generation, or
+runtime epoch changes. Restore and deletion never target a replacement selection.
 
 The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges

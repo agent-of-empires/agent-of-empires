@@ -242,8 +242,8 @@ impl HomeView {
         let status = match opened {
             Ok(()) => format!("opened {url}"),
             Err(e) => {
-                crate::tui::clipboard::copy_to_clipboard(url);
-                format!("{e}; copied {url}")
+                let copy = crate::tui::clipboard::copy_to_clipboard(url);
+                format!("{e}; {copy}")
             }
         };
         self.flash_status(status);
@@ -256,8 +256,8 @@ impl HomeView {
         let Some((copied, flash)) = opener_failure_feedback(&failed) else {
             return false;
         };
-        crate::tui::clipboard::copy_to_clipboard(&copied);
-        self.flash_status(flash);
+        let copy = crate::tui::clipboard::copy_to_clipboard(&copied);
+        self.flash_status(format!("{flash}; {copy}"));
         true
     }
 
@@ -276,6 +276,16 @@ impl HomeView {
         });
         failed
     }
+
+    pub(in crate::tui) fn clipboard_feedback(&mut self, message: String) {
+        if let Some(view) = self.serve_view.as_mut() {
+            view.clipboard_feedback(message.clone());
+        }
+        if let Some(view) = self.diff_view.as_mut() {
+            view.success_message = Some(message.clone());
+        }
+        self.flash_status(message);
+    }
 }
 
 /// Clipboard text and flash for failed openers; several are grouped so no URL is lost.
@@ -284,19 +294,12 @@ pub(super) fn opener_failure_feedback(
 ) -> Option<(String, String)> {
     match failed {
         [] => None,
-        [(url, status)] => Some((
-            url.clone(),
-            format!("nothing opened it ({status}); copied {url}"),
-        )),
+        [(url, status)] => Some((url.clone(), format!("nothing opened it ({status}); {url}"))),
         _ => {
             let urls: Vec<&str> = failed.iter().map(|(url, _)| url.as_str()).collect();
             Some((
                 urls.join("\n"),
-                format!(
-                    "nothing opened {} links; copied {}",
-                    urls.len(),
-                    urls.join(" ")
-                ),
+                format!("nothing opened {} links: {}", urls.len(), urls.join(" ")),
             ))
         }
     }

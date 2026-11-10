@@ -1,14 +1,16 @@
 use super::*;
 use crate::acp::{
+    retained::invocation::Replay,
     state::{DiffPreview, Event, ToolCall, ToolOutputBlock},
-    transcript::{reducer::Core, storage::Changes},
 };
 use crate::tui::rich_text::window::{self, Index};
 use std::sync::{atomic::AtomicBool, Arc};
 
-fn project(events: impl IntoIterator<Item = Event>) -> (Rc<Context>, Projection<Disk>) {
+fn project(
+    events: impl IntoIterator<Item = Event>,
+) -> (Rc<Context>, Projection<Disk>, Invocations) {
     let context = Context::new(Arc::new(AtomicBool::new(false))).unwrap();
-    let mut model = Core::new(Disk(Rc::clone(&context))).unwrap();
+    let mut model = Replay::new(Rc::clone(&context)).unwrap();
     for (position, event) in events.into_iter().enumerate() {
         context
             .store
@@ -16,17 +18,13 @@ fn project(events: impl IntoIterator<Item = Event>) -> (Rc<Context>, Projection<
                 let mut writer = context.spool.writer();
                 serde_json::to_writer(&mut writer, &event).unwrap();
                 let value = context.parse(writer.finish()?)?;
-                for delta in model
-                    .apply(position as u64 + 1, context.event(value)?)?
-                    .into_iter()
-                {
-                    delta?;
-                }
+                model.apply(position as u64 + 1, context.event(value)?)?;
                 Ok(())
             })
             .unwrap();
     }
-    (context, model.into_projection().unwrap())
+    let (projection, invocations) = model.into_projection().unwrap();
+    (context, projection, invocations)
 }
 fn at() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(100, 0).unwrap()
@@ -40,7 +38,7 @@ fn rich_payloads_survive_reflow_and_full_copy_without_live_preview_limits() {
         .map(|line| format!("output-{line:02}\n"))
         .collect::<String>()
         + "OUTPUT-END";
-    let (context, projection) = project([
+    let (context, projection, invocations) = project([
         Event::ToolCallStarted {
             tool_call: ToolCall {
                 id: "t".into(),
@@ -91,7 +89,14 @@ fn rich_payloads_survive_reflow_and_full_copy_without_live_preview_limits() {
                     ..Theme::default()
                 };
                 let document = context.store.with_transaction(|_| {
-                    document(&context, &projection, &theme, Some(&roots), || true)
+                    document(
+                        &context,
+                        &projection,
+                        &invocations,
+                        &theme,
+                        Some(&roots),
+                        || true,
+                    )
                 })?;
                 for width in [32, 80] {
                     let index = context
@@ -179,7 +184,7 @@ fn retained_media_keeps_text_fallback_without_exposing_binary_payloads() {
         (vec![resource(Some("RESOURCE-TEXT"))], "", "RESOURCE-TEXT"),
     ];
     for (blocks, final_text, expected) in cases {
-        let (context, projection) = project([
+        let (context, projection, invocations) = project([
             Event::ToolCallContent {
                 tool_call_id: "media".into(),
                 content: "BUFFER-TEXT".into(),
@@ -195,7 +200,16 @@ fn retained_media_keeps_text_fallback_without_exposing_binary_payloads() {
         ]);
         let document = context
             .store
-            .with_transaction(|_| document(&context, &projection, &Theme::default(), None, || true))
+            .with_transaction(|_| {
+                document(
+                    &context,
+                    &projection,
+                    &invocations,
+                    &Theme::default(),
+                    None,
+                    || true,
+                )
+            })
             .unwrap();
         let mut copied = Vec::new();
         window::copy_all(&document, &mut copied, || true).unwrap();
@@ -211,7 +225,7 @@ fn retained_media_keeps_text_fallback_without_exposing_binary_payloads() {
 #[test]
 fn markdown_groups_and_complete_thoughts_keep_their_content() {
     let thought = "detail\n".repeat(100) + "THOUGHT-END";
-    let (context, projection) = project([
+    let (context, projection, invocations) = project([
         crate::acp::state::test_support::prompt("user\ncontinuation"),
         Event::AgentMessageChunk {
             text: "**bo".into(),
@@ -236,7 +250,16 @@ fn markdown_groups_and_complete_thoughts_keep_their_content() {
     ]);
     let document = context
         .store
-        .with_transaction(|_| document(&context, &projection, &Theme::default(), None, || true))
+        .with_transaction(|_| {
+            document(
+                &context,
+                &projection,
+                &invocations,
+                &Theme::default(),
+                None,
+                || true,
+            )
+        })
         .unwrap();
     let index = context
         .store
@@ -257,4 +280,153 @@ fn markdown_groups_and_complete_thoughts_keep_their_content() {
     assert!(copied.contains("THOUGHT-END"));
     assert_eq!(copied.matches("detail").count(), 100);
     assert!(copied.contains("› Proceed?: Yes"));
+}
+
+#[test]
+fn reused_tool_ids_keep_invocations_but_replace_terminal_snapshots() {
+    let started = |name: &str| Event::ToolCallStarted {
+        tool_call: ToolCall {
+            id: "reused".into(),
+            name: name.into(),
+            kind: "read".into(),
+            args_preview: format!("{name}-arguments"),
+            started_at: at(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        },
+    };
+    let completed = |text: &str| Event::ToolCallCompleted {
+        tool_call_id: "reused".into(),
+        is_error: false,
+        content: text.into(),
+        output: Vec::new(),
+        completed_at: at(),
+        async_subagent: false,
+    };
+    let (context, projection, invocations) = project([
+        started("FIRST-INVOCATION"),
+        completed("STALE-FIRST-SNAPSHOT"),
+        completed("LATEST-FIRST-SNAPSHOT"),
+        started("SECOND-INVOCATION"),
+        Event::Stopped {
+            reason: "done".into(),
+        },
+    ]);
+    for width in [32, 80, 32] {
+        context
+            .spool
+            .with_speculation::<()>(|| {
+                let document = context.store.with_transaction(|_| {
+                    document(
+                        &context,
+                        &projection,
+                        &invocations,
+                        &Theme::default(),
+                        None,
+                        || true,
+                    )
+                })?;
+                let index = context
+                    .store
+                    .with_transaction(|_| Index::build(&document, width, || true))?;
+                let mut copied = Vec::new();
+                window::copy_all(&document, &mut copied, || true)?;
+                let copied = String::from_utf8(copied).unwrap();
+                for name in ["FIRST-INVOCATION", "SECOND-INVOCATION"] {
+                    assert!(copied.contains(&format!("{name}-arguments")), "{copied}");
+                }
+                assert_eq!(copied.matches("LATEST-FIRST-SNAPSHOT").count(), 1);
+                assert!(!copied.contains("STALE-FIRST-SNAPSHOT"));
+                let painted = index
+                    .window(&document, 0..index.len(), || true)?
+                    .to_string();
+                assert!(painted.contains("LATEST-FIRST-SNAPSHOT"));
+                Ok(None)
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn reused_tool_id_with_empty_metadata_does_not_inherit_prior_arguments_or_diffs() {
+    let first: ToolCall = ToolCall {
+        id: "reused".into(),
+        name: "FIRST-CALL".into(),
+        kind: "edit".into(),
+        args_preview: "FIRST-ARGUMENTS".into(),
+        started_at: at(),
+        parent_tool_call_id: None,
+        memory_recall: None,
+        diffs: vec![DiffPreview {
+            path: "first.txt".into(),
+            old_text: Some("FIRST-BEFORE".into()),
+            new_text: Some("FIRST-AFTER".into()),
+            created_at: at(),
+        }],
+    };
+    let mut second = first.clone();
+    second.name = "SECOND-CALL".into();
+    second.args_preview.clear();
+    second.diffs.clear();
+    let (context, projection, invocations) = project([
+        Event::ToolCallStarted { tool_call: first },
+        Event::ToolCallCompleted {
+            tool_call_id: "reused".into(),
+            is_error: false,
+            content: "FIRST-OUTPUT".into(),
+            output: Vec::new(),
+            completed_at: at(),
+            async_subagent: false,
+        },
+        Event::ToolCallStarted { tool_call: second },
+        Event::Stopped {
+            reason: "done".into(),
+        },
+    ]);
+    let document = context
+        .store
+        .with_transaction(|_| {
+            document(
+                &context,
+                &projection,
+                &invocations,
+                &Theme::default(),
+                None,
+                || true,
+            )
+        })
+        .unwrap();
+    let mut copied = Vec::new();
+    window::copy_all(&document, &mut copied, || true).unwrap();
+    let copied = String::from_utf8(copied).unwrap();
+    for token in [
+        "FIRST-ARGUMENTS",
+        "FIRST-BEFORE",
+        "FIRST-AFTER",
+        "FIRST-OUTPUT",
+    ] {
+        assert_eq!(copied.matches(token).count(), 1, "{copied}");
+        assert!(
+            !copied.split("SECOND-CALL").nth(1).unwrap().contains(token),
+            "{copied}"
+        );
+    }
+    for width in [40, 80] {
+        let index = context
+            .store
+            .with_transaction(|_| Index::build(&document, width, || true))
+            .unwrap();
+        let painted = index
+            .window(&document, 0..index.len(), || true)
+            .unwrap()
+            .to_string();
+        assert!(painted.contains("FIRST-ARGUMENTS"));
+        assert!(painted.contains("FIRST-AFTER"));
+        assert!(!painted
+            .split("SECOND-CALL")
+            .nth(1)
+            .unwrap()
+            .contains("FIRST-"));
+    }
 }

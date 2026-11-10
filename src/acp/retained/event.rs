@@ -185,13 +185,43 @@ impl Context {
             let object = object()?;
             let attachments = object.list("attachments")?;
             self.each(attachments, |value| {
-                let attachment = Object::new(self, value)?;
-                attachment.text("id")?;
-                attachment.text("mime_type")?;
-                attachment.optional_text("name")?;
-                self.arena
-                    .unsigned(&self.store, &self.spool, attachment.required("size")?)?;
-                let kind = attachment.text("kind")?;
+                let (id, mime_type, name, size, kind) =
+                    if self.arena.node(&self.store, value)?.kind == Kind::Array {
+                        let mut fields = self.arena.children(&self.store, value)?;
+                        let mut next = || {
+                            fields
+                                .next()
+                                .ok_or_else(|| invalid("attachment field missing"))?
+                        };
+                        let id = next()?;
+                        let kind = next()?;
+                        let mime_type = next()?;
+                        let name = Some(next()?);
+                        let size = next()?;
+                        let values = (id, mime_type, name, size, kind);
+                        if fields.next().is_some() {
+                            return Err(invalid("too many attachment fields"));
+                        }
+                        values
+                    } else {
+                        let attachment = Object::new(self, value)?;
+                        (
+                            attachment.required("id")?,
+                            attachment.required("mime_type")?,
+                            attachment.optional("name")?,
+                            attachment.required("size")?,
+                            attachment.required("kind")?,
+                        )
+                    };
+                self.text(id)?;
+                self.text(mime_type)?;
+                if let Some(name) = name {
+                    if self.arena.node(&self.store, name)?.kind != Kind::Null {
+                        self.text(name)?;
+                    }
+                }
+                self.arena.unsigned(&self.store, &self.spool, size)?;
+                let kind = self.text(kind)?;
                 if !super::json::text_is(&self.spool, kind, "image")?
                     && !super::json::text_is(&self.spool, kind, "audio")?
                     && !super::json::text_is(&self.spool, kind, "resource")?

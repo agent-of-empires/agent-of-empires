@@ -32,6 +32,10 @@ Modifications: shared memory-backed and disk-backed input, parser storage,
 reference dictionaries, and text normalization preserve the parser's grammar.
 The disk backend shares the application's SQLite dependency.
 
+The disk-backed Unicode folding table derives from Sean McArthur's
+`unicase` work. Its full MIT copyright and permission notice is shipped in
+[`licenses/unicase-MIT.txt`](licenses/unicase-MIT.txt).
+
 ## unicode-width 0.2.2
 
 - Project: <https://github.com/unicode-rs/unicode-width>

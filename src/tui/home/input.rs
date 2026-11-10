@@ -441,6 +441,10 @@ impl HomeView {
             .is_some_and(|inst| {
                 inst.is_trashed()
                     && self
+                        .retained_preview
+                        .as_ref()
+                        .is_none_or(|view| view.matches(inst))
+                    && self
                         .retained_focus
                         .as_ref()
                         .is_some_and(|(id, generation)| {
@@ -605,13 +609,15 @@ impl HomeView {
         true
     }
 
-    fn trash_confirmation_is_current(&self, target: &super::SessionDialogTarget) -> bool {
-        self.get_instance(&target.session_id)
-            .is_some_and(|instance| {
-                instance.source_profile == target.source_profile
-                    && instance.lifecycle_generation == target.lifecycle_generation
-                    && !instance.is_trashed()
-            })
+    fn trash_confirmation_is_current(&self, target: &super::TrashDialogTarget) -> bool {
+        self.session_feed.applied_epoch() == Some(target.epoch.as_str())
+            && self
+                .get_instance(&target.session_id)
+                .is_some_and(|instance| {
+                    instance.source_profile == target.source_profile
+                        && instance.lifecycle_generation == target.lifecycle_generation
+                        && !instance.is_trashed()
+                })
             && self
                 .session_feed
                 .applied_session(&target.session_id)
@@ -1002,6 +1008,9 @@ impl HomeView {
     /// events are captured for wheel scroll, and one mechanism has to work on Mosh and
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if self.hit_divider(col, row) {
             self.drag_state = Some(if self.divider_row.is_some() {
                 DragKind::StackedListDivider
@@ -1042,6 +1051,9 @@ impl HomeView {
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
@@ -1135,6 +1147,9 @@ impl HomeView {
     /// ticker rather than by mouse events, so holding the cursor at an edge scrolls
     /// continuously and grows the selection past a page. Returns whether anything moved.
     pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
             return false;
         }
@@ -1271,6 +1286,19 @@ impl HomeView {
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
     pub fn handle_drag_end(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
+        if matches!(self.drag_state, Some(DragKind::PreviewSelect)) && self.selected_is_trashed() {
+            if let Some((col, row)) = self.preview_drag_pos {
+                if self.preview_text_view.total_lines != 0 {
+                    let extent = self.preview_text_view.screen_to_content(col, row);
+                    if let Some(selection) = self.preview_selection.as_mut() {
+                        selection.extent = extent;
+                    }
+                }
+            }
+        }
         let Some(state) = self.drag_state.take() else {
             return false;
         };
@@ -1317,6 +1345,9 @@ impl HomeView {
     }
 
     pub(super) fn request_retained_selection_copy(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         let matching = self
             .selected_session
             .as_deref()
@@ -1412,7 +1443,23 @@ impl HomeView {
     /// Drain the text captured on the last render that painted a finalized preview
     /// selection. `Some` exactly once per finalized drag; `App` calls it after the draw.
     pub fn take_preview_copy_text(&mut self) -> Option<String> {
+        if !self.presentation_ready {
+            return None;
+        }
         self.preview_copy_text.take()
+    }
+
+    pub(in crate::tui) fn invalidate_presentation(&mut self) {
+        self.presentation_ready = false;
+        if let Some(view) = self.structured_preview.as_mut() {
+            view.invalidate_presentation();
+        }
+        self.clear_preview_selection();
+        self.drag_state = None;
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
+        self.preview_copy_pending = false;
+        self.preview_copy_text = None;
     }
 
     /// Discard any in-flight preview selection, so interacting with the TUI dismisses the
@@ -1554,7 +1601,7 @@ impl HomeView {
                 self.reconcile_trash_confirmation();
                 if let Some(target) = self.pending_trash_session.take() {
                     if self.trash_confirmation_is_current(&target) {
-                        self.trash_session_by_id(&target.session_id);
+                        self.trash_session_by_id_at_epoch(&target.session_id, &target.epoch);
                     }
                 }
                 None
@@ -6197,11 +6244,17 @@ impl HomeView {
                     // while a stray keystroke is harmless; the accept path runs the same
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
+                        let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned)
+                        else {
+                            self.flash_status("Runtime unavailable; reopen Trash controls");
+                            return;
+                        };
                         let message = format!("Move '{}' to the trash?", inst.title);
-                        self.pending_trash_session = Some(super::SessionDialogTarget {
+                        self.pending_trash_session = Some(super::TrashDialogTarget {
                             session_id: sid,
                             source_profile: inst.source_profile.clone(),
                             lifecycle_generation: inst.lifecycle_generation,
+                            epoch,
                         });
                         let dialog = self
                             .confirm_by_repeating(

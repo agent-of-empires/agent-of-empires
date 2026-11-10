@@ -50,14 +50,18 @@ pub struct RetainedView {
     epoch: u64,
     document_epoch: u64,
     next_read: Instant,
+    consecutive_failures: u32,
     message: String,
     projection_changed: bool,
     copy_result: Option<tokio::sync::oneshot::Receiver<std::io::Result<std::fs::File>>>,
+    copy_ticket: Option<crate::tui::clipboard::Ticket>,
     clipboard_result:
         Option<tokio::sync::oneshot::Receiver<std::io::Result<crate::tui::clipboard::CopyReport>>>,
     copy_message: Option<String>,
     pending_copy: Option<(String, super::retained::worker::CopyRange)>,
 }
+
+pub(crate) struct RetainedPaint(std::sync::Weak<super::retained::worker::Update>);
 
 impl RetainedView {
     pub fn new(endpoint: Option<DaemonEndpoint>, inst: &crate::session::Instance) -> Self {
@@ -96,9 +100,11 @@ impl RetainedView {
             epoch: 0,
             document_epoch: 0,
             next_read: Instant::now() + std::time::Duration::from_secs(2),
+            consecutive_failures: 0,
             message: "Daemon unavailable; retained transcript could not be read.".into(),
             projection_changed: false,
             copy_result: None,
+            copy_ticket: None,
             clipboard_result: None,
             copy_message: None,
             pending_copy: None,
@@ -106,6 +112,7 @@ impl RetainedView {
         if let Some(endpoint) = endpoint {
             if let Err(error) = view.connect(endpoint) {
                 view.message = format!("Transcript read failed: {error}");
+                view.delay_after_failure();
             }
         }
         view
@@ -127,6 +134,30 @@ impl RetainedView {
         self.worker = Some(worker);
         self.message = "Loading retained ACP transcript…".into();
         Ok(())
+    }
+
+    pub(crate) fn paint_token(&self) -> Option<RetainedPaint> {
+        self.result
+            .as_ref()
+            .map(|result| RetainedPaint(std::sync::Arc::downgrade(result)))
+    }
+
+    pub(crate) fn matches_paint(&self, paint: &RetainedPaint) -> bool {
+        self.result
+            .as_ref()
+            .is_some_and(|result| paint.0.ptr_eq(&std::sync::Arc::downgrade(result)))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_copy_preparation_for_test(&mut self) {
+        let receiver = self.copy_result.take().expect("copy preparation requested");
+        let prepared = tokio::time::timeout(std::time::Duration::from_secs(5), receiver)
+            .await
+            .expect("copy preparation deadline")
+            .expect("copy preparer replied");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender.send(prepared).unwrap();
+        self.copy_result = Some(receiver);
     }
 
     pub fn matches(&self, inst: &crate::session::Instance) -> bool {
@@ -152,9 +183,16 @@ impl RetainedView {
             .as_deref()
             .and_then(|result| result.as_ref().ok())
         else {
+            self.copy_message = Some(
+                "Copy unavailable while retained content loads; retry after it appears.".into(),
+            );
             return false;
         };
         if self.worker.is_none() {
+            self.copy_message = Some(
+                "Copy unavailable while retained reader reconnects; retry after content loads."
+                    .into(),
+            );
             return false;
         }
         if snapshot
@@ -162,25 +200,78 @@ impl RetainedView {
             .as_ref()
             .is_none_or(|window| window.total == 0)
         {
+            self.copy_message =
+                Some("No readable retained content to copy yet; retry after content loads.".into());
             return false;
         }
-        self.pending_copy = Some((snapshot.identity.clone(), range));
+        let identity = snapshot.identity.clone();
+        let ticket = match crate::tui::clipboard::reserve() {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                self.copy_message = Some(format!("Copy failed: {error}"));
+                return false;
+            }
+        };
+        self.cancel_copy();
+        self.copy_ticket = Some(ticket);
+        self.pending_copy = Some((identity, range));
         self.copy_message = Some("Copy queued…".into());
         self.poll_copy();
         true
     }
     fn poll_copy(&mut self) -> bool {
         use tokio::sync::oneshot::error::TryRecvError;
+        if self
+            .copy_ticket
+            .as_ref()
+            .is_some_and(|ticket| !ticket.current())
+        {
+            self.cancel_copy();
+            self.copy_message = Some("Copy superseded by a newer request.".into());
+            return true;
+        }
         let mut changed = false;
         if let Some(mut receiver) = self.copy_result.take() {
             match receiver.try_recv() {
                 Ok(Ok(file)) => {
-                    let (reply, result) = tokio::sync::oneshot::channel();
-                    self.clipboard_result = Some(result);
-                    tokio::task::spawn_blocking(move || {
-                        let _ = reply.send(crate::tui::clipboard::copy_file(file));
-                    });
-                    self.copy_message = Some("Writing clipboard content…".into());
+                    let submitted = self
+                        .copy_ticket
+                        .as_ref()
+                        .filter(|ticket| ticket.current())
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::Interrupted))
+                        .and_then(|ticket| {
+                            let worker = self.worker.as_ref().ok_or_else(|| {
+                                std::io::Error::from(std::io::ErrorKind::Interrupted)
+                            })?;
+                            let latest = worker.results.borrow();
+                            let current = latest.as_deref().is_some_and(|latest| {
+                                latest.as_ref().is_ok_and(|latest| {
+                                    self.result.as_deref().is_some_and(|result| {
+                                        result
+                                            .as_ref()
+                                            .is_ok_and(|shown| shown.identity == latest.identity)
+                                    })
+                                })
+                            });
+                            if !current {
+                                return Err(std::io::ErrorKind::Interrupted.into());
+                            }
+                            ticket.submit(file, std::time::Duration::from_secs(30))
+                        });
+                    match submitted {
+                        Ok(result) => {
+                            self.clipboard_result = Some(result);
+                            self.copy_message = Some("Writing clipboard content…".into());
+                        }
+                        Err(error) => {
+                            self.copy_message =
+                                Some(if error.kind() == std::io::ErrorKind::Interrupted {
+                                    "Copy cancelled before output admission.".into()
+                                } else {
+                                    format!("Copy failed: {error}")
+                                });
+                        }
+                    }
                     changed = true;
                 }
                 Ok(Err(error)) => {
@@ -197,6 +288,13 @@ impl RetainedView {
         if let Some(mut receiver) = self.clipboard_result.take() {
             match receiver.try_recv() {
                 Ok(Ok(report)) => {
+                    if self
+                        .copy_ticket
+                        .as_ref()
+                        .is_none_or(|ticket| !ticket.current())
+                    {
+                        return true;
+                    }
                     self.copy_message = Some(if let Some(desktop) = report.desktop {
                         format!("Copied {} bytes via {desktop}.", report.bytes)
                     } else if report.osc52_emitted {
@@ -238,11 +336,22 @@ impl RetainedView {
         }
         changed
     }
+    fn delay_after_failure(&mut self) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        let seconds = 2u64
+            .saturating_mul(1u64 << self.consecutive_failures.saturating_sub(1).min(5))
+            .min(60);
+        self.next_read = Instant::now() + std::time::Duration::from_secs(seconds);
+    }
     pub fn tick(&mut self) -> bool {
-        let copy_changed = self.poll_copy();
+        let source_changed = self.poll_source();
+        self.poll_copy() || source_changed
+    }
+
+    fn poll_source(&mut self) -> bool {
         if self.worker.is_none() {
             if Instant::now() < self.next_read {
-                return copy_changed;
+                return false;
             }
             self.next_read = Instant::now() + std::time::Duration::from_secs(2);
             let result = crate::acp::client::discover()
@@ -252,16 +361,17 @@ impl RetainedView {
                 let message = format!("Transcript read failed: {error}");
                 let changed = self.message != message;
                 self.message = message;
-                return changed || copy_changed;
+                self.delay_after_failure();
+                return changed;
             }
             return true;
         }
         let worker = self.worker.as_mut().unwrap();
         if !worker.results.has_changed().unwrap_or(true) {
-            return copy_changed;
+            return false;
         }
         let Some(result) = worker.results.borrow_and_update().clone() else {
-            return copy_changed;
+            return false;
         };
         let previous = self
             .result
@@ -272,11 +382,20 @@ impl RetainedView {
                 .as_ref()
                 .as_ref()
                 .is_ok_and(|snapshot| snapshot.window.is_none());
+        let projection_changed = previous.is_none_or(|old| match result.as_ref() {
+            Ok(new) => old.identity != new.identity || old.highest_seq != new.highest_seq,
+            Err(_) => true,
+        });
+        if projection_changed && self.copy_ticket.is_some() {
+            self.cancel_copy();
+            self.copy_message = Some("Copy cancelled: retained history changed.".into());
+        }
         match result.as_ref() {
             Ok(snapshot) => {
-                self.projection_changed |= previous.is_none_or(|old| {
-                    old.identity != snapshot.identity || old.highest_seq != snapshot.highest_seq
-                });
+                if snapshot.window.is_some() {
+                    self.consecutive_failures = 0;
+                }
+                self.projection_changed |= projection_changed;
                 self.message = if snapshot
                     .window
                     .as_ref()
@@ -301,7 +420,7 @@ impl RetainedView {
                 self.projection_changed = true;
                 self.message = format!("Transcript read failed: {error}");
                 self.worker = None;
-                self.next_read = Instant::now() + std::time::Duration::from_secs(2);
+                self.delay_after_failure();
             }
         }
         if result.is_ok() && !preserve_window {
@@ -326,7 +445,9 @@ impl RetainedView {
             .map(|window| window.offset)
     }
     pub(crate) fn cancel_copy(&mut self) {
+        self.copy_ticket = None;
         self.copy_result = None;
+        self.clipboard_result = None;
         self.pending_copy = None;
     }
 
@@ -473,6 +594,18 @@ pub struct EmbeddedView {
 }
 
 impl EmbeddedView {
+    pub(crate) fn interaction_revision(&self) -> u64 {
+        self.state.interaction_revision
+    }
+
+    pub(crate) fn confirm_presentation(&mut self, revision: u64) -> bool {
+        self.state.confirm_presentation(revision)
+    }
+
+    pub(crate) fn invalidate_presentation(&mut self) {
+        self.state.presentation_ready = false;
+    }
+
     /// Connect to `session_id` on an already-located daemon: hydrate the
     /// transcript, open the WebSocket, spawn the side-channel tasks. Startup
     /// errors surface as a toast. Starts in preview (inactive) state.
@@ -503,18 +636,19 @@ impl EmbeddedView {
         Ok(view)
     }
 
-    /// Test constructor: a mounted, non-activated view over a state that
-    /// never talks to a daemon. Lets App-level tests drive the paste-drain
-    /// handoff without a live connection.
+    /// Mounted fixture with controlled HTTP and caller-fed WebSocket messages.
+    /// No automatic connection, worker startup or side-channel tasks.
     #[cfg(test)]
-    pub(crate) fn for_test(session_id: &str) -> Self {
-        let endpoint = crate::daemon::DaemonEndpoint::new(
-            "http://127.0.0.1:8080".into(),
-            None,
-            crate::daemon::Source::Env,
-        );
+    pub(crate) fn for_test(session_id: &str, endpoint: Option<DaemonEndpoint>) -> Self {
+        let endpoint = endpoint.unwrap_or_else(|| {
+            crate::daemon::DaemonEndpoint::new(
+                "http://127.0.0.1:8080".into(),
+                None,
+                crate::daemon::Source::Env,
+            )
+        });
         let http =
-            crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");
+            crate::acp::client::HttpClient::new(endpoint.clone()).expect("test endpoint client");
         Self {
             state: crate::tui::structured_view::StructuredViewState::new(
                 session_id.into(),
@@ -550,6 +684,7 @@ impl EmbeddedView {
     /// Enter interactive mode: the composer takes the keyboard and the caret
     /// shows. A pending approval re-grabs focus on the next reconcile.
     pub fn activate(&mut self) {
+        self.state.interaction_changed();
         self.active = true;
         if matches!(self.state.focus, super::input::Focus::Transcript) {
             self.state.focus = super::input::Focus::Composer;
@@ -562,6 +697,7 @@ impl EmbeddedView {
     /// Drops the plugin pane overlay (#2467): it is modal and keyed off focus, so
     /// leaving it up would paint an unclosable panel over the home preview.
     pub fn deactivate(&mut self) {
+        self.state.interaction_changed();
         self.active = false;
         self.state.close_plugin_pane();
     }
@@ -611,6 +747,7 @@ impl EmbeddedView {
             }
             EmbeddedEvent::SessionInfo(side) => super::apply_side_info(&mut self.state, side),
         }
+        self.state.reconcile_interaction_authority();
     }
 
     /// Route one terminal event (key / paste / mouse) through the
@@ -655,6 +792,7 @@ impl EmbeddedView {
         if area.width == 0 || area.height == 0 {
             return None;
         }
+        self.state.reconcile_interaction_authority();
         // The home view may have painted placeholder content this frame; the
         // structured renderer assumes an empty buffer and skips empty cells, so
         // reset the area or stale text shows through.
@@ -674,6 +812,7 @@ impl EmbeddedView {
     /// index when the paste leaves an open `@`-mention, so a paste forwarded from
     /// the home view lands in the same state a direct one would.
     pub async fn paste_text_with_file_load(&mut self, text: &str) {
+        self.state.interaction_changed();
         super::paste_into_composer(&mut self.state, text);
         super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
     }

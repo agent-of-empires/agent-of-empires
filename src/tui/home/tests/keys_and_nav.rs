@@ -1455,3 +1455,41 @@ fn ctrl_l_toggles_footer_when_not_in_live_send() {
         "Ctrl+L turns the footer back off"
     );
 }
+
+#[test]
+#[serial]
+fn untargeted_paste_survives_trash_and_enters_the_next_runnable_composer_once() {
+    let mut env = create_test_env_with_sessions(2);
+    let trash = env.view.selected_session.clone().unwrap();
+    let live = env
+        .view
+        .instances()
+        .find(|row| row.id != trash)
+        .unwrap()
+        .id
+        .clone();
+    env.view.mutate_instance(&trash, Instance::trash);
+    env.view.pending_paste = Some("saved dictation".into());
+    env.view.enforce_trash_read_only();
+    env.view.handle_paste("must not target Trash");
+    assert!(env.view.send_message_dialog.is_none());
+    assert_eq!(env.view.pending_paste.as_deref(), Some("saved dictation"));
+    env.view.select_session_by_id(&live);
+    env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    let mut composer = env
+        .view
+        .send_message_dialog
+        .take()
+        .expect("runnable composer");
+    assert!(matches!(composer.handle_key(key(KeyCode::Enter)),
+        crate::tui::dialogs::DialogResult::Submit(text) if text == "saved dictation"));
+    assert!(env.view.pending_paste.is_none());
+    env.view.handle_key(key(KeyCode::Char('m')), None);
+    let mut composer = env.view.send_message_dialog.take().expect("new composer");
+    composer.handle_paste("new message");
+    assert!(matches!(
+        composer.handle_key(key(KeyCode::Enter)),
+        crate::tui::dialogs::DialogResult::Submit(text) if text == "new message"
+    ));
+}

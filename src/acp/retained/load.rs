@@ -11,15 +11,15 @@ use anyhow::{Context as _, Result};
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-use super::{invalid, Context, Disk};
+use super::{
+    invalid,
+    invocation::{Invocations, Replay},
+    Context, Disk,
+};
 use crate::acp::{
     client::HttpClient,
     protocol::{RetainedSourceMeta, RetainedSourceQuery, RETAINED_SOURCE_BLOCK_BYTES},
-    transcript::{
-        event::View,
-        reducer::{Core, Projection},
-        storage::Changes,
-    },
+    transcript::{event::View, reducer::Projection},
 };
 
 #[derive(Clone, Default)]
@@ -43,6 +43,7 @@ impl Cancellation {
 pub(crate) struct Loaded {
     pub context: Rc<Context>,
     pub projection: Projection<Disk>,
+    pub invocations: Invocations,
     pub identity: String,
     pub highest_seq: u64,
     pub incomplete: bool,
@@ -55,7 +56,7 @@ pub(crate) fn read(
     cancellation: &Cancellation,
 ) -> Result<Loaded> {
     let context = Context::new(Arc::clone(&cancellation.flag))?;
-    let mut model = Core::new(Disk(Rc::clone(&context)))?;
+    let mut model = Replay::new(Rc::clone(&context))?;
     let mut query = RetainedSourceQuery::default();
     let mut cap = None;
     let mut incomplete = false;
@@ -95,7 +96,9 @@ pub(crate) fn read(
                 offset += count;
             }
             let input = writer.finish()?;
-            let event = context.parse(input).and_then(|value| context.event(value));
+            let event = context
+                .store
+                .with_transaction(|_| context.parse(input).and_then(|value| context.event(value)));
             match event {
                 Ok(event) => apply(&context, &mut model, sequence, event)?,
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
@@ -116,10 +119,11 @@ pub(crate) fn read(
     let identity = query
         .history_identity
         .ok_or_else(|| invalid("retained snapshot identity missing"))?;
-    let projection = model.into_projection()?;
+    let (projection, invocations) = model.into_projection()?;
     Ok(Loaded {
         context,
         projection,
+        invocations,
         identity,
         highest_seq,
         incomplete,
@@ -147,14 +151,12 @@ pub(crate) fn probe(
 
 fn apply(
     context: &Context,
-    model: &mut Core<Disk>,
+    model: &mut Replay,
     sequence: u64,
     event: View<'_, Disk>,
 ) -> io::Result<()> {
     context.store.with_transaction(|_| {
-        for delta in model.apply(sequence, event)?.into_iter() {
-            delta?;
-        }
+        model.apply(sequence, event)?;
         Ok(())
     })
 }

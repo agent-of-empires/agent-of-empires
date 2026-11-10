@@ -20,6 +20,7 @@ struct Snapshot {
     unfinished: Vec<(String, String)>,
     incomplete: bool,
     highest: u64,
+    attachments: Vec<u64>,
 }
 fn string(context: &Context, text: pulldown_cmark::disk::TextRef) -> String {
     let mut bytes = Vec::new();
@@ -31,8 +32,13 @@ async fn snapshot(client: HttpClient, session: String) -> anyhow::Result<Snapsho
     tokio::task::spawn_blocking(move || {
         let loaded = read(&client, &session, &runtime, &Cancellation::default())?;
         let mut rows = Vec::new();
-        for position in 0..loaded.projection.rows.len() {
-            let row = loaded.projection.rows.read(position)?;
+        let mut attachments = Vec::new();
+        for position in 0..loaded.invocations.rows.len() {
+            if !loaded.invocations.visible(position)? {
+                continue;
+            }
+            let row = loaded.invocations.rows.read(position)?;
+            attachments.push(loaded.context.list_length(row.attachments)?);
             rows.push((
                 row.kind,
                 string(&loaded.context, row.text),
@@ -57,6 +63,7 @@ async fn snapshot(client: HttpClient, session: String) -> anyhow::Result<Snapsho
             unfinished,
             incomplete: loaded.incomplete,
             highest: loaded.highest_seq,
+            attachments,
         })
     })
     .await?
@@ -311,6 +318,174 @@ async fn retained_read_preserves_later_content_after_pinned_sequence_gaps() {
             .collect::<Vec<_>>(),
         ["message-18", "message-19", "message-20"]
     );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn persisted_attachment_objects_and_sequences_keep_prompt_and_completeness() {
+    use crate::acp::event_store::EventStore;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("events.db");
+    let store = Arc::new(EventStore::open(&path, 0).unwrap());
+    let schema = crate::events::Schema::new("acp").unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let forms = [
+        serde_json::json!([
+            {"id":"image", "mime_type":"image/png", "name":null, "size":12, "kind":"image"},
+            {"id":"audio", "mime_type":"audio/wav", "name":"voice.wav", "size":34, "kind":"audio"}
+        ]),
+        serde_json::json!([
+            ["image", "image", "image/png", null, 12],
+            ["audio", "audio", "audio/wav", "voice.wav", 34]
+        ]),
+    ];
+    let mut instances = Vec::new();
+    for (index, attachments) in forms.into_iter().enumerate() {
+        let instance = crate::session::Instance::new(&format!("attachment form {index}"), "/tmp");
+        let raw = serde_json::json!({"UserPromptSent":{"text":"PROMPT-CONTENT","attachments":attachments}});
+        serde_json::from_value::<Event>(raw.clone())
+            .unwrap_or_else(|error| panic!("attachment form {index}: {error}"));
+        crate::events::insert_event(&conn, &schema, &instance.id, 1, &raw.to_string(), 0).unwrap();
+        instances.push(instance);
+    }
+    let ids: Vec<_> = instances
+        .iter()
+        .map(|instance| instance.id.clone())
+        .collect();
+    let state = crate::server::test_support::build_test_app_state_impl_with_event_store(
+        instances,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Some(store),
+        |_| {},
+        std::convert::identity,
+    );
+    let (client, server) = serve(
+        Router::new()
+            .route(
+                "/api/sessions/{id}/acp/retained-source",
+                get(crate::server::api::acp_retained_source),
+            )
+            .with_state(state),
+    )
+    .await;
+    for id in ids {
+        let result = snapshot(client.clone(), id).await.unwrap();
+        assert!(!result.incomplete);
+        assert_eq!(result.highest, 1);
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].1, "PROMPT-CONTENT");
+        assert_eq!(result.attachments, [2]);
+    }
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn retained_source_endpoint_returns_raw_conflict_for_stale_identity() {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let instance = crate::session::Instance::new("stale byte source", "/tmp");
+    let id = instance.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![instance]);
+    state
+        .acp_event_store
+        .record(&id, 1, &Event::ThinkingStarted)
+        .unwrap();
+    let app = Router::new()
+        .route(
+            "/api/sessions/{id}/acp/retained-source",
+            get(crate::server::api::acp_retained_source),
+        )
+        .with_state(state.clone());
+    let path = format!("/api/sessions/{id}/acp/retained-source");
+    let initial = app
+        .clone()
+        .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(initial.status(), axum::http::StatusCode::OK);
+    let meta: RetainedSourceMeta = serde_json::from_slice(
+        initial.headers()[crate::acp::protocol::RETAINED_SOURCE_HEADER].as_bytes(),
+    )
+    .unwrap();
+    state
+        .acp_event_store
+        .record(&id, 2, &Event::ThinkingEnded)
+        .unwrap();
+    let stale = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("{path}?history_identity={}", meta.history_identity))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), axum::http::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn retained_loader_rejects_coherent_successful_blocks_with_distinct_identities() {
+    use std::sync::atomic::AtomicUsize;
+    let instance = crate::session::Instance::new("mixed source identities", "/tmp");
+    let id = instance.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![instance]);
+    for sequence in 1..=2 {
+        state
+            .acp_event_store
+            .record(&id, sequence, &Event::ThinkingStarted)
+            .unwrap();
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route(
+            "/api/sessions/{id}/acp/retained-source",
+            get({
+                let calls = Arc::clone(&calls);
+                move |State(state): State<Arc<crate::server::AppState>>,
+                      Path(id): Path<String>,
+                      Query(query): Query<RetainedSourceQuery>| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        let mut response = crate::server::api::acp_retained_source(
+                            State(state),
+                            Path(id),
+                            Query(query),
+                        )
+                        .await;
+                        assert_eq!(response.status(), axum::http::StatusCode::OK);
+                        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                            let name = crate::acp::protocol::RETAINED_SOURCE_HEADER;
+                            let mut meta: RetainedSourceMeta =
+                                serde_json::from_slice(response.headers()[name].as_bytes())
+                                    .unwrap();
+                            meta.history_identity = "different-successful-snapshot".into();
+                            response.headers_mut().insert(
+                                name,
+                                serde_json::to_string(&meta).unwrap().parse().unwrap(),
+                            );
+                        }
+                        response
+                    }
+                }
+            }),
+        )
+        .with_state(state);
+    let (client, server) = serve(app).await;
+    let error = snapshot(client, id).await.err().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(
+        error
+            .to_string()
+            .contains("inconsistent retained source metadata"),
+        "{error:#}"
+    );
+    assert!(error
+        .downcast_ref::<crate::acp::client::HttpError>()
+        .is_none());
     server.abort();
     let _ = server.await;
 }

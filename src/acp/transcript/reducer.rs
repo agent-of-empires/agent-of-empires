@@ -37,7 +37,6 @@ impl<Text> ToolLifecycle<Text> {
 }
 
 pub(crate) struct Projection<B: Backend> {
-    pub rows: B::Rows,
     pub unfinished: B::Outputs,
 }
 
@@ -105,10 +104,7 @@ impl<B: Backend> Core<B> {
                 }
             }
         }
-        Ok(Projection {
-            rows: self.rows,
-            unfinished,
-        })
+        Ok(Projection { unfinished })
     }
 
     pub fn observe_prior<'a>(&mut self, seq: u64, event: View<'a, B>) -> Result<(), B::Error> {
@@ -568,7 +564,7 @@ impl<B: Backend> Core<B> {
         &mut self,
         id: B::Input<'a>,
         reopen_terminal: bool,
-    ) -> Result<(), B::Error> {
+    ) -> Result<bool, B::Error> {
         let current = self.tools.get(id)?.map(|(cursor, state)| {
             (
                 cursor,
@@ -579,6 +575,7 @@ impl<B: Backend> Core<B> {
                 },
             )
         });
+        let reopened = matches!(&current, Some((_, 2)));
         match current {
             Some((cursor, 1)) => {
                 let empty = self.backend.empty_text();
@@ -603,7 +600,7 @@ impl<B: Backend> Core<B> {
                 ToolLifecycle::Open(Buffer::empty(self.backend.empty_text())),
             )?,
         }
-        Ok(())
+        Ok(reopened)
     }
 
     fn buffer_tool_output<'a>(
@@ -659,7 +656,7 @@ impl<B: Backend> Core<B> {
         if self.elicitation_tool_ids.contains(tool.id)? {
             return Ok(self.backend.changes());
         }
-        self.track_tool_start(tool.id, true)?;
+        let reopened = self.track_tool_start(tool.id, true)?;
         self.turn_has_output = true;
         let Some(index) = self.find_tool_start(tool.id)? else {
             let tool = self.backend.retain_tool(tool)?;
@@ -669,8 +666,8 @@ impl<B: Backend> Core<B> {
         let backend = &self.backend;
         let delta = self.rows.update(index, |row| {
             let merged = match row.tool.as_ref() {
-                Some(previous) => backend.merge_tool(previous, tool)?,
-                None => backend.retain_tool(tool)?,
+                Some(previous) if !reopened => backend.merge_tool(previous, tool)?,
+                _ => backend.retain_tool(tool)?,
             };
             row.text = merged.name.clone();
             row.at = merged.started_at;

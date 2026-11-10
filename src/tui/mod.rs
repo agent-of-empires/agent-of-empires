@@ -24,6 +24,7 @@ mod session_feed;
 pub mod settings;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+pub(crate) mod terminal_output;
 mod worker;
 
 pub use app::*;
@@ -160,7 +161,7 @@ impl TerminalGuard {
     fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
         // Roll back partial state so a failed enter never wedges the shell.
         enable_raw_mode()?;
-        let mut stdout = io::stdout();
+        let mut stdout = terminal_output::Output::default();
         if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(err.into());
@@ -193,7 +194,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let mut stdout = io::stdout();
+        let mut stdout = terminal_output::Output::default();
         // Pop the kitty stack first so the shell never inherits it.
         #[cfg(unix)]
         let _ = execute!(stdout, PopKeyboardEnhancementFlags);
@@ -377,8 +378,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         app.show_startup_warning(&warning);
     }
     // Shares the hyperlink map the renderer fills.
-    let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
-    let mut terminal = Terminal::new(backend)?;
+    let backend = crate::tui::hyperlink::HyperlinkBackend::new(
+        terminal_output::Output::default(),
+        app.hyperlink_cells(),
+    );
+    let mut terminal = terminal_output::Terminal::new(backend)?;
     let result = app.run(&mut terminal).await;
 
     crate::session::clear_tui_heartbeat();

@@ -10,7 +10,7 @@ use pulldown_cmark::{
 use ratatui::style::{Modifier, Style};
 
 use crate::acp::{
-    retained::{Context, Disk, List, Positions},
+    retained::{invocation::Invocations, Context, Disk, List},
     session_paths::SessionPathRoots,
     transcript::{
         reducer::Projection,
@@ -34,6 +34,7 @@ pub(super) mod worker;
 pub(super) fn document<'a>(
     context: &'a Rc<Context>,
     projection: &Projection<Disk>,
+    invocations: &Invocations,
     theme: &Theme,
     roots: Option<&SessionPathRoots>,
     current: impl Fn() -> bool,
@@ -43,29 +44,24 @@ pub(super) fn document<'a>(
         spool: &context.spool,
     };
     let mut document = Document::new(source)?;
-    let mut completions = Positions::new(Rc::clone(context))?;
-    for index in 0..projection.rows.len() {
-        check(&current)?;
-        let row = projection.rows.read(index)?;
-        if matches!(
-            row.kind,
-            Kind::ToolComplete | Kind::ToolError | Kind::ToolStopped
-        ) {
-            if let Some(id) = row.tool_call_id {
-                completions.insert(id, index)?;
-            }
-        }
-    }
+    let rows = &invocations.rows;
     let backend = Disk(Rc::clone(context));
     let mut index = 0;
-    while index < projection.rows.len() {
+    while index < rows.len() {
         check(&current)?;
-        let row = projection.rows.read(index)?;
+        if !invocations.visible(index)? {
+            index += 1;
+            continue;
+        }
+        let row = rows.read(index)?;
         match row.kind {
             Kind::Message | Kind::Thinking => {
                 let mut end = index + 1;
-                while end < projection.rows.len() {
-                    let next = projection.rows.read(end)?;
+                while end < rows.len() {
+                    if !invocations.visible(end)? {
+                        break;
+                    }
+                    let next = rows.read(end)?;
                     if next.kind != row.kind || !backend.equal(&row.group_id, next.group_id)? {
                         break;
                     }
@@ -78,7 +74,7 @@ pub(super) fn document<'a>(
                     for position in index..end {
                         context
                             .spool
-                            .copy_to(projection.rows.read(position)?.text, &mut writer)?;
+                            .copy_to(rows.read(position)?.text, &mut writer)?;
                     }
                     writer.finish()?
                 };
@@ -125,13 +121,7 @@ pub(super) fn document<'a>(
                 document.blank_lines(1)?;
             }
             Kind::ToolStart => {
-                let completion = row
-                    .tool_call_id
-                    .map(|id| completions.get(id))
-                    .transpose()?
-                    .flatten()
-                    .map(|position| projection.rows.read(position))
-                    .transpose()?;
+                let completion = invocations.completion(index)?;
                 tool(
                     context,
                     &mut document,

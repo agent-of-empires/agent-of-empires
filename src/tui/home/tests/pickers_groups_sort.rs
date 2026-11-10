@@ -173,23 +173,26 @@ pub(super) async fn settle_row_command(
         }
     }
     let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
-    let mut respond = view.session_feed.request_driver_for_test();
+    let mut capture = view.session_feed.capture_request_driver_for_test();
+    let epoch = view.session_feed.applied_epoch().unwrap().to_owned();
     action(view)?;
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),
         before_rows
     );
-    let (method, path, body) = wire(id, &expected);
-    let (status, headers, value) = request_with_headers(state, method, &path, body.clone()).await;
+    let captured = capture().expect("typed request admitted");
+    assert_eq!(captured.id, id);
+    assert_eq!(wire(&captured.id, &captured.request), wire(id, &expected));
+    let (method, path, body) = wire(&captured.id, &captured.request);
+    let (status, headers, value) =
+        request_at_epoch_with_headers(state, method, &path, body, &epoch).await;
     if !status.is_success() {
         assert!(
             status.is_client_error(),
             "unknown commit is not rejection: {status} {value}"
         );
         let error = value.to_string();
-        let (captured_id, captured) = respond(Err(error.clone())).expect("typed request admitted");
-        assert_eq!(captured_id, id);
-        assert_eq!(wire(id, &captured), (method, path, body));
+        captured.finish(Err(error.clone()));
         view.apply_session_feed();
         apply_published(view, state).await;
         assert!(
@@ -199,7 +202,7 @@ pub(super) async fn settle_row_command(
         anyhow::bail!("{error}");
     }
     let cursor = receipt_cursor(&headers);
-    let outcome = match expected {
+    let outcome = match &captured.request {
         SessionRequest::Rename(_) => SessionCommandOutcome::Renamed(MutationReceipt {
             cursor,
             outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
@@ -230,9 +233,7 @@ pub(super) async fn settle_row_command(
         }
         _ => unreachable!("wire rejected non-edit command"),
     };
-    let (captured_id, captured) = respond(Ok(outcome)).expect("typed request admitted");
-    assert_eq!(captured_id, id);
-    assert_eq!(wire(id, &captured), (method, path, body));
+    captured.finish(Ok(outcome));
     view.apply_session_feed();
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),

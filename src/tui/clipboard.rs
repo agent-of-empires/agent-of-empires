@@ -1,11 +1,203 @@
 //! Clipboard output through desktop helpers and streamed OSC 52.
 //! OSC 52 has no acknowledgement; terminal-specific limits still apply.
 
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::Duration;
 use std::{
     fs::File,
     io::{self, Read, Seek, Write},
     process::{Command, Stdio},
 };
+
+static ACTIVE: Mutex<Weak<Shared>> = Mutex::new(Weak::new());
+
+struct Pending {
+    ticket: u64,
+    file: File,
+    timeout: Duration,
+    reply: tokio::sync::oneshot::Sender<io::Result<CopyReport>>,
+}
+struct Queue {
+    latest: u64,
+    pending: Option<Pending>,
+    stopped: bool,
+    live: Option<(u64, tokio::sync::oneshot::Receiver<io::Result<CopyReport>>)>,
+}
+struct Shared {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+}
+
+pub(crate) struct Executor {
+    shared: Arc<Shared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Executor {
+    pub fn new() -> io::Result<Self> {
+        let executor = Self::start(copy_file_with_timeout)?;
+        *ACTIVE.lock().unwrap_or_else(|error| error.into_inner()) =
+            Arc::downgrade(&executor.shared);
+        Ok(executor)
+    }
+
+    #[cfg(test)]
+    pub(super) fn activate_for_test(&self) {
+        *ACTIVE.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&self.shared);
+    }
+
+    pub(super) fn start(
+        mut output: impl FnMut(File, Duration) -> io::Result<CopyReport> + Send + 'static,
+    ) -> io::Result<Self> {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                latest: 0,
+                pending: None,
+                stopped: false,
+                live: None,
+            }),
+            ready: Condvar::new(),
+        });
+        let worker = Arc::clone(&shared);
+        let thread = std::thread::Builder::new()
+            .name("aoe-clipboard".into())
+            .spawn(move || loop {
+                let pending = {
+                    let mut queue = worker
+                        .queue
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    while !queue.stopped && queue.pending.is_none() {
+                        queue = worker
+                            .ready
+                            .wait(queue)
+                            .unwrap_or_else(|error| error.into_inner());
+                    }
+                    if queue.stopped {
+                        break;
+                    }
+                    let pending = queue.pending.take().expect("clipboard request available");
+                    if pending.ticket != queue.latest {
+                        continue;
+                    }
+                    pending
+                };
+                let result = output(pending.file, pending.timeout);
+                let _ = pending.reply.send(result);
+            })?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn feedback(&self) -> Option<String> {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (number, mut receiver) = queue.live.take()?;
+        if number != queue.latest {
+            return None;
+        }
+        match receiver.try_recv() {
+            Ok(Ok(report)) => Some(report.message()),
+            Ok(Err(error)) => Some(format!("Copy failed: {error}")),
+            Err(TryRecvError::Closed) => Some("Copy cancelled before output completed.".into()),
+            Err(TryRecvError::Empty) => {
+                queue.live = Some((number, receiver));
+                None
+            }
+        }
+    }
+}
+impl Drop for Executor {
+    fn drop(&mut self) {
+        {
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            queue.stopped = true;
+            queue.pending = None;
+            self.shared.ready.notify_one();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Ticket {
+    number: u64,
+    shared: Weak<Shared>,
+}
+pub(crate) fn reserve() -> io::Result<Ticket> {
+    let shared = ACTIVE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .upgrade()
+        .ok_or_else(|| io::Error::other("clipboard executor unavailable"))?;
+    reserve_for(&shared)
+}
+fn reserve_for(shared: &Arc<Shared>) -> io::Result<Ticket> {
+    let mut queue = shared
+        .queue
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if queue.stopped {
+        return Err(io::ErrorKind::Interrupted.into());
+    }
+    queue.latest = queue
+        .latest
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("clipboard ticket overflow"))?;
+    queue.pending = None;
+    Ok(Ticket {
+        number: queue.latest,
+        shared: Arc::downgrade(shared),
+    })
+}
+impl Ticket {
+    pub fn current(&self) -> bool {
+        self.shared.upgrade().is_some_and(|shared| {
+            let queue = shared
+                .queue
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            !queue.stopped && queue.latest == self.number
+        })
+    }
+    pub fn submit(
+        &self,
+        file: File,
+        timeout: Duration,
+    ) -> io::Result<tokio::sync::oneshot::Receiver<io::Result<CopyReport>>> {
+        let shared = self
+            .shared
+            .upgrade()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::Interrupted))?;
+        let mut queue = shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if queue.stopped || queue.latest != self.number {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let (reply, result) = tokio::sync::oneshot::channel();
+        queue.pending = Some(Pending {
+            ticket: self.number,
+            file,
+            timeout,
+            reply,
+        });
+        shared.ready.notify_one();
+        Ok(result)
+    }
+}
 
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
 
@@ -16,34 +208,57 @@ pub(crate) struct CopyReport {
     pub osc52_emitted: bool,
 }
 
-pub fn copy_to_clipboard(text: &str) -> usize {
-    let result = (|| {
-        let mut file = tempfile::tempfile()?;
-        file.write_all(text.as_bytes())?;
-        copy_file_with_timeout(file, std::time::Duration::from_millis(500))
-    })();
-    match result {
-        Ok(report) => usize::try_from(report.bytes).unwrap_or(usize::MAX),
-        Err(error) => {
-            tracing::warn!(target: "tui.clipboard", %error, "clipboard output failed");
-            0
+impl CopyReport {
+    fn message(&self) -> String {
+        if let Some(desktop) = self.desktop {
+            format!("Copied {} bytes via {desktop}.", self.bytes)
+        } else if self.osc52_emitted {
+            format!(
+                "Emitted {} bytes via OSC 52; terminal clipboard support required.",
+                self.bytes
+            )
+        } else {
+            "No clipboard output was accepted.".into()
         }
     }
 }
 
-pub(crate) fn copy_file(file: File) -> io::Result<CopyReport> {
-    copy_file_with_timeout(file, std::time::Duration::from_secs(30))
+pub fn copy_to_clipboard(text: &str) -> String {
+    let result = (|| {
+        let ticket = reserve()?;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(text.as_bytes())?;
+        let receiver = ticket.submit(file, Duration::from_millis(500))?;
+        let shared = ticket
+            .shared
+            .upgrade()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::Interrupted))?;
+        let mut queue = shared
+            .queue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if queue.latest != ticket.number {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        queue.live = Some((ticket.number, receiver));
+        Ok::<_, io::Error>(())
+    })();
+    match result {
+        Ok(()) => "Copy queued; waiting for clipboard output.".into(),
+        Err(error) => {
+            tracing::warn!(target: "tui.clipboard", %error, "clipboard admission failed");
+            format!("Copy failed: {error}")
+        }
+    }
 }
 
 fn copy_file_with_timeout(mut file: File, timeout: std::time::Duration) -> io::Result<CopyReport> {
     let bytes = file.metadata()?.len();
     let desktop = try_subprocess(&mut file, timeout);
     file.rewind()?;
-    let osc52 = write_osc52(
-        &mut file,
-        &mut io::stdout().lock(),
-        std::env::var_os("TMUX").is_some(),
-    );
+    let tmux = std::env::var_os("TMUX").is_some();
+    let osc52 =
+        super::terminal_output::osc52(timeout, tmux, |output| write_osc52(&mut file, output, tmux));
     tracing::info!(target: "tui.clipboard", bytes, desktop = ?desktop, osc52_ok = osc52.is_ok(), "clipboard output");
     if let (Err(desktop), Err(osc52)) = (&desktop, &osc52) {
         return Err(io::Error::other(format!("{desktop}; OSC 52: {osc52}")));
@@ -99,7 +314,7 @@ fn run_subprocess(
 
 fn write_osc52(
     input: &mut (impl Read + Seek),
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
     in_tmux: bool,
 ) -> io::Result<()> {
     if in_tmux {
@@ -112,19 +327,19 @@ fn write_osc52(
 }
 fn sequence(
     input: &mut impl Read,
-    output: &mut impl Write,
+    output: &mut (impl Write + ?Sized),
     prefix: &[u8],
     suffix: &[u8],
 ) -> io::Result<()> {
     output.write_all(prefix)?;
-    let result = (|| {
+    let result: io::Result<()> = (|| {
         let mut encoded = EncoderWriter::new(&mut *output, &STANDARD);
         io::copy(input, &mut encoded)?;
         encoded.finish()?;
         Ok(())
     })();
-    let closed = output.write_all(suffix);
-    result.and(closed)
+    result?;
+    output.write_all(suffix)
 }
 
 #[cfg(test)]
@@ -148,4 +363,98 @@ mod tests {
             assert_eq!(output, expected.as_bytes());
         }
     }
+
+    #[test]
+    fn ordered_executor_coalesces_pending_copies_and_rejects_late_preparation() {
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&written);
+        let executor = Executor::start(move |mut file, _| {
+            file.rewind()?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)?;
+            entered.send(text.clone()).unwrap();
+            if text == "first" {
+                gate.recv().unwrap();
+            }
+            output.lock().unwrap().push(text);
+            Ok(CopyReport {
+                bytes: file.metadata()?.len(),
+                desktop: Some("controlled writer"),
+                osc52_emitted: false,
+            })
+        })
+        .unwrap();
+        let file = |text: &str| {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+            file
+        };
+        let first = reserve_for(&executor.shared).unwrap();
+        let first_done = first.submit(file("first"), Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            started.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "first"
+        );
+        let second = reserve_for(&executor.shared).unwrap();
+        let second_done = second
+            .submit(file("second"), Duration::from_secs(1))
+            .unwrap();
+        let third = reserve_for(&executor.shared).unwrap();
+        let third_done = third.submit(file("third"), Duration::from_secs(1)).unwrap();
+        release.send(()).unwrap();
+        assert!(first_done.blocking_recv().unwrap().is_ok());
+        assert!(third_done.blocking_recv().unwrap().is_ok());
+        assert!(second_done.blocking_recv().is_err());
+        assert_eq!(*written.lock().unwrap(), ["first", "third"]);
+
+        let old_preparation = reserve_for(&executor.shared).unwrap();
+        let newest = reserve_for(&executor.shared).unwrap();
+        newest
+            .submit(file("newest"), Duration::from_secs(1))
+            .unwrap()
+            .blocking_recv()
+            .unwrap()
+            .unwrap();
+        assert!(old_preparation
+            .submit(file("obsolete prepared content"), Duration::from_secs(1))
+            .is_err());
+        drop(executor);
+        assert_eq!(*written.lock().unwrap(), ["first", "third", "newest"]);
+    }
+}
+
+#[cfg(test)]
+#[test]
+#[serial_test::serial]
+fn live_feedback_waits_for_actual_output_and_reports_failure() {
+    let (entered, started) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let executor = Executor::start(move |_, _| {
+        entered.send(()).unwrap();
+        gate.recv().unwrap();
+        Err(io::Error::other("desktop and terminal output refused"))
+    })
+    .unwrap();
+    executor.activate_for_test();
+    let admission = copy_to_clipboard("must not claim copied");
+    assert!(admission.starts_with("Copy queued"), "{admission}");
+    started.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert!(
+        executor.feedback().is_none(),
+        "admission is not transport completion"
+    );
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let message = loop {
+        if let Some(message) = executor.feedback() {
+            break message;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    };
+    assert!(message.starts_with("Copy failed:"), "{message}");
+    assert!(message.contains("desktop and terminal output refused"));
+    drop(executor);
 }

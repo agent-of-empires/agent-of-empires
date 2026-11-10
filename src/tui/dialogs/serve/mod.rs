@@ -654,8 +654,8 @@ pub struct ServeView {
     pending_confirm: Option<(PendingConfirm, Instant)>,
     show_help: bool,
     mouse: RefCell<ServeMouse>,
-    /// The label of the value a click last copied, shown for `FLASH_TTL`.
-    copied: Option<(&'static str, Instant)>,
+    /// Clipboard admission or output feedback, shown for `FLASH_TTL`.
+    copied: Option<(String, Instant)>,
     /// The setting the running daemon started with, when this view started it; `None` for a
     /// reattached daemon.
     running_persists: Option<bool>,
@@ -767,11 +767,15 @@ impl ServeView {
             .find(|(_, rect)| contains(*rect, col, row))
             .map(|(copy, _)| copy.clone());
         if let Some((label, value)) = copy {
-            crate::tui::clipboard::copy_to_clipboard(&value);
-            self.copied = Some((label, Instant::now()));
+            let message = crate::tui::clipboard::copy_to_clipboard(&value);
+            self.copied = Some((format!("{label}: {message}"), Instant::now()));
             return None;
         }
         hit(&mouse.keys, col, row)
+    }
+
+    pub(crate) fn clipboard_feedback(&mut self, message: String) {
+        self.copied = Some((message, Instant::now()));
     }
 
     pub fn handle_hover(&mut self, col: u16, row: u16) -> bool {

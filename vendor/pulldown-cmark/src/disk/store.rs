@@ -44,6 +44,7 @@ impl Store {
                  PRAGMA mmap_size = 0;
                  PRAGMA temp_store = FILE;
                  PRAGMA journal_mode = DELETE;
+                 PRAGMA synchronous = OFF;
                  CREATE TABLE records (
                      collection INTEGER NOT NULL,
                      position INTEGER NOT NULL,

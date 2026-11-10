@@ -91,6 +91,13 @@ pub(super) struct SessionDialogTarget {
     lifecycle_generation: u64,
 }
 
+pub(super) struct TrashDialogTarget {
+    session_id: String,
+    source_profile: String,
+    lifecycle_generation: u64,
+    epoch: String,
+}
+
 pub(super) struct SessionDeleteDialog {
     dialog: UnifiedDeleteDialog,
     target: SessionDialogTarget,
@@ -369,9 +376,10 @@ pub struct HomeView {
     /// The last frame painted the mounted structured transcript into the preview, so
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
+    pub(in crate::tui) presentation_ready: bool,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
-    pub(super) pending_trash_session: Option<SessionDialogTarget>,
+    pub(super) pending_trash_session: Option<TrashDialogTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,
