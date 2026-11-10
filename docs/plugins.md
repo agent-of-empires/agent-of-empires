@@ -62,6 +62,8 @@ With no `@ref`, install resolves the repo's latest stable GitHub release and rec
 CLI install, update, and uninstall run only through the Daemon. With no explicit
 endpoint, the CLI starts the local Daemon when needed. `--no-autostart` refuses
 instead; `--daemon-url` and `AOE_DAEMON_URL` never start a local replacement.
+An empty or whitespace-only `--daemon-url` is rejected as `invalid_endpoint`.
+A blank `AOE_DAEMON_URL` means no override.
 Read-only, CityHall, authentication, and elevation restrictions still apply.
 
 `plugin list`, `info`, `logs`, and `outdated` inspect the local installation when
