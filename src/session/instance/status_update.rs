@@ -466,7 +466,7 @@ impl Instance {
         let policy = plan.capture_policy();
         let fresh = match reuse {
             Some((_, lines)) if policy.scope.can_reuse(lines) => None,
-            _ => session.capture_pane(policy.scope.lines()).ok(),
+            _ => session.try_capture_pane(policy.scope.lines()).ok(),
         };
         let Some(content) = detection_content(fresh.as_deref(), reuse) else {
             return Some((None, CAPTURE_FAILED_RULE));

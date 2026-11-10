@@ -218,7 +218,6 @@ impl McpServer {
         let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
         let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
             None => (false, PromptDelivery::None, None),
-            // A retry's first create already stored or typed the prompt.
             Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
             Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None),
             Some(text) => match wait_for_input_prompt(&self.state, &session.id).await {
@@ -306,6 +305,9 @@ impl McpServer {
             return Err(not_found(&id));
         };
         if structured {
+            if params.message.trim().is_empty() {
+                return Err(tool_error("invalid_request", "The message is empty"));
+            }
             let submission = PromptSubmission {
                 text: &params.message,
                 uploads: &[],

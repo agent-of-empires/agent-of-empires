@@ -881,6 +881,48 @@ async fn read_output_pages_text_by_rendered_size_without_skipping() {
     assert!(next["text"].as_str().unwrap().contains("after"), "{next}");
 }
 
+/// A message that strips to nothing is refused in either view, and nothing is recorded or queued.
+#[tokio::test]
+#[serial_test::serial]
+async fn send_refuses_an_empty_message() {
+    for (view, message) in [("structured", "  "), ("terminal", "\n")] {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let id = "mcp-send-empty";
+        let session = if view == "structured" {
+            structured_session(id)
+        } else {
+            let mut inst = Instance::new(id, &format!("/tmp/aoe-{id}"));
+            inst.id = id.to_string();
+            inst.source_profile = "default".into();
+            inst
+        };
+        let (app, state) = seeded_app(vec![session], false).await;
+        let _cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let refused =
+            call_result(&app, "send", json!({"session_id": id, "message": message})).await;
+        assert_eq!(
+            error_code(&refused),
+            Some("invalid_request"),
+            "{view}: {refused}"
+        );
+        assert!(
+            state.acp_event_store.replay_from(id, 0).is_empty(),
+            "{view}"
+        );
+        assert!(
+            state
+                .session_service
+                .queued_prompts_snapshot(id)
+                .await
+                .is_empty(),
+            "{view}"
+        );
+    }
+}
+
 /// A prompt that strips to nothing is refused before a session is created, as `send` refuses it.
 #[tokio::test]
 #[serial_test::serial]
