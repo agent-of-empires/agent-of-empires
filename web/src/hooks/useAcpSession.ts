@@ -120,29 +120,32 @@ export function useAcpSession(
   const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
   const { status, lastActivityRef } = connection;
 
+  // Resolvers throw on failure so the card re-enables and the same nonce can be resubmitted.
   const resolveApproval = useCallback(
     async (nonce: string, decision: ApprovalDecision, optionId?: string) => {
       if (!sessionId) return;
+      let res: Response;
       try {
-        const res = await fetch(
+        res = await fetch(
           acpUrl(sessionId, `approvals/${encodeURIComponent(nonce)}`),
           jsonPost(optionId === undefined ? { decision } : { decision, option_id: optionId }),
         );
-        const detail = res.ok ? "" : await safeText(res);
-        const outcome = classifyResolveResponse("approval", res.ok, res.status, detail, nonce);
-        dispatch(
-          outcome.kind === "resolved"
-            ? { kind: "approval_resolved_locally", nonce }
-            : { kind: "error", message: outcome.message },
-        );
       } catch (e) {
         dispatch({ kind: "error", message: `Network error resolving approval: ${describeError(e)}` });
+        throw e;
       }
+      const detail = res.ok ? "" : await safeText(res);
+      const outcome = classifyResolveResponse("approval", res.ok, res.status, detail, nonce);
+      if (outcome.kind === "resolved") {
+        dispatch({ kind: "approval_resolved_locally", nonce });
+        return;
+      }
+      dispatch({ kind: "error", message: outcome.message });
+      throw new Error(outcome.message);
     },
     [sessionId],
   );
 
-  // Throws on failure so the card re-enables and the same nonce can be resubmitted.
   const resolveElicitation = useCallback(
     async (nonce: string, resolution: ElicitationResolution) => {
       if (!sessionId) return;

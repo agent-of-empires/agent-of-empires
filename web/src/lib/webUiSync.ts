@@ -23,6 +23,7 @@ const KEY_PREFIXES = [
   "aoe-repo-collapsed-",
   "aoe-nested-group-collapsed-",
   "aoe-group-collapsed-",
+  "aoe-status-collapsed-",
   SETTINGS_INTRO_KEY_PREFIX,
 ];
 

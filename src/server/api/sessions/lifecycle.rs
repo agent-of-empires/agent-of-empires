@@ -3586,6 +3586,9 @@ async fn prepare_agent_session_inner(
             response
         }
     } else {
+        if structured {
+            state.acp_supervisor.request_respawn(&id);
+        }
         if outcome.is_some() || structured {
             tracing::info!(target: "session.start", session = %id, ?outcome, "session started");
         }
