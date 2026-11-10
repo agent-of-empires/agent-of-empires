@@ -3409,6 +3409,7 @@ mod tests {
             tests::{block_terminal, private_terminal, resume_terminal},
         };
         use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         if let Some(directory) = std::env::var_os("AOE_TEST_CONTROL_RESTORE_CHILD") {
             use std::os::unix::fs::OpenOptionsExt;
@@ -3445,6 +3446,7 @@ mod tests {
                         .status()
                         .unwrap();
                     block_terminal(&mut control);
+                    std::fs::write(directory.join("output-paused"), b"ready").unwrap();
                     status
                 })
                 .unwrap();
@@ -3516,6 +3518,7 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
+        let control = slave.try_clone().unwrap();
         drop(command);
         drop(slave);
         let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3542,26 +3545,53 @@ mod tests {
         });
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let mut sent = false;
+        let mut input_error = None;
         let status = loop {
             if !sent && directory.path().join("waiting-input").exists() {
-                input.write_all(b"x").unwrap();
-                sent = true;
+                match input.write(b"x") {
+                    Ok(1) => sent = true,
+                    Ok(_) => break None,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => {
+                        input_error = Some(error);
+                        break None;
+                    }
+                }
             }
             if let Some(status) = child.try_wait().unwrap() {
                 break Some(status);
             }
             if std::time::Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
                 break None;
             }
             std::thread::yield_now();
         };
+        let mut resume_error = None;
+        let mut kill_error = None;
+        if status.is_none() {
+            // SAFETY: release only this fixture's paused output before killing its session leader.
+            if unsafe { libc::tcflow(control.as_raw_fd(), libc::TCOON) } == -1 {
+                resume_error = Some(std::io::Error::last_os_error());
+            }
+            kill_error = child.kill().err();
+            let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < reap_deadline {
+                std::thread::yield_now();
+            }
+        }
+        drop(input);
+        drop(control);
         stopped.store(true, std::sync::atomic::Ordering::Release);
         let emitted = reader.join().unwrap();
         assert!(
             status.is_some_and(|status| status.success()),
-            "child failed: {}",
+            "child failed (paused={}, waiting_input={}, sent={sent}, input_error={input_error:?}, resume_error={resume_error:?}, kill_error={kill_error:?}): {}",
+            directory.path().join("output-paused").exists(),
+            directory.path().join("waiting-input").exists(),
             String::from_utf8_lossy(&emitted)
         );
         assert!(

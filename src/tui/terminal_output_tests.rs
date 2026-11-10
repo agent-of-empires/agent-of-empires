@@ -151,6 +151,11 @@ pub(crate) fn private_terminal() -> (File, File) {
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
             0
         );
+        // SAFETY: neither private PTY endpoint may survive an unrelated child exec.
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
     }
     (master, slave)
 }
