@@ -70,10 +70,43 @@ test.describe("Live terminal control strip at 375px", () => {
     test(`Take control from ${path} resizes the pane once, to the grid without the strip`, async ({ page }) => {
       const handle = await mockTerminalApis(page, { viewOnly: { owner: "tui" } });
       await openLiveSession(page, handle, { mobile: true });
-      await expect(page.locator("[data-live-control-strip]")).toBeVisible();
-      const docked = sizing(handle)
-        .filter((x): x is number => typeof x === "number")
-        .at(-1)!;
+      const strip = page.locator("[data-live-control-strip]");
+      await expect(strip).toBeVisible();
+      // The fit keeps its tallest height until the width changes by more than 1px, so a report sent before the
+      // strip docked would keep the full grid. A narrower width, reported, then the original one resets it to the
+      // docked height.
+      const lastResize = () =>
+        liveTexts(handle)
+          .flatMap((text) => {
+            try {
+              const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
+              return msg.type === "resize" ? [{ cols: msg.cols!, rows: msg.rows! }] : [];
+            } catch {
+              return [];
+            }
+          })
+          .at(-1);
+      const { width, height } = page.viewportSize()!;
+      const wideCols = lastResize()!.cols;
+      await page.setViewportSize({ width: width - 15, height });
+      await expect.poll(() => lastResize()!.cols).toBeLessThan(wideCols);
+      await page.setViewportSize({ width, height });
+      await expect.poll(() => lastResize()!.cols).toBe(wideCols);
+      await expect(strip).toBeVisible();
+      // Settled once two polls past the fit's 150ms debounce agree.
+      let previous: string | undefined;
+      await expect
+        .poll(
+          () => {
+            const current = JSON.stringify(lastResize());
+            const settled = current === previous;
+            previous = current;
+            return settled;
+          },
+          { intervals: [250] },
+        )
+        .toBe(true);
+      const docked = lastResize()!.rows;
 
       await takeControl(page);
       await expect(page.locator("[data-live-control-strip]")).toHaveCount(0);
