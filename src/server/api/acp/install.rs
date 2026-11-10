@@ -235,7 +235,6 @@ fn install_block(state: &AppState) -> Option<InstallBlock> {
 }
 
 fn install_gate(state: &AppState) -> Result<(), Response> {
-    // Kept in this body, where the read-only admission audit looks for it.
     if let Some(resp) = read_only_block(state) {
         return Err(resp);
     }
