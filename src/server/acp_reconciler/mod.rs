@@ -811,7 +811,7 @@ mod tests {
         let stop_deferred = !matches!(outcome, ConstructorOutcome::Resume);
         let _home = crate::session::test_support::isolate_app_dir();
         let project = tempfile::tempdir().unwrap();
-        let id = "owned-constructor-registry-deferral";
+        let id = "owned-constructor-deferral";
         let mut row = test_fixtures::structured_instance(id, project.path().to_str().unwrap());
         row.agent_name = Some("claude-code".into());
         row.acp_mode_id = Some("plan".into());

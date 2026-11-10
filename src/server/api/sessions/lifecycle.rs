@@ -4228,7 +4228,7 @@ mod durable_stop_tests {
         fn new(case: &str) -> anyhow::Result<Self> {
             use std::os::unix::fs::PermissionsExt;
 
-            let root = tempfile::tempdir()?;
+            let root = tempfile::tempdir_in("/tmp")?;
             let home = crate::session::test_support::isolate_app_dir_at(root.path());
             crate::migrations::run_migrations()?;
             crate::session::config::update_app_state(|state| {
@@ -4457,7 +4457,17 @@ mod durable_stop_tests {
             } else {
                 crate::daemon::ApiErrorCode::SandboxMigrationFailed
             };
-            assert_eq!(response.status(), code.status());
+            assert_eq!(
+                response.status(),
+                code.status(),
+                "target={target} deferred={deferred} control_path_and_bytes={:?} logs={}",
+                crate::process::worker_registry::socket_path_for(&row.id).map(|socket| {
+                    let control = crate::process::worker::control_socket_sibling(&socket);
+                    let bytes = control.as_os_str().as_encoded_bytes().len();
+                    (control, bytes)
+                }),
+                logs.contents()
+            );
             assert_eq!(
                 response
                     .headers()
