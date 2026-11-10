@@ -141,33 +141,28 @@ impl<S: BroadcastSink> Supervisor<S> {
             disposition,
             seq: None,
         };
-        let published = publish_with_next_seq(&self.next_seqs, session_id, |seq| {
-            let mut refs = Vec::with_capacity(attachments.len());
-            for blob in attachments {
-                if !self.sink.record_attachment(session_id, seq, blob) {
-                    self.sink.delete_attachments_for_seq(session_id, seq);
-                    return None;
-                }
-                refs.push(crate::daemon::PromptAttachmentRef {
+        let event = Event::UserPromptSent {
+            text,
+            attachments: attachments
+                .iter()
+                .map(|blob| crate::daemon::PromptAttachmentRef {
                     id: blob.id.clone(),
                     kind: blob.kind,
                     mime_type: blob.mime_type.clone(),
                     name: blob.name.clone(),
                     size: blob.data.len() as u64,
-                });
-            }
-            let event = Event::UserPromptSent {
-                text,
-                attachments: refs,
-                prompt_id,
-                synthesized,
-                origin_plugin,
-            };
-            Some((seq, self.sink.queue_persisted(session_id, seq, &event)))
-        });
-        let Some((seq, persisted)) = published else {
-            return unrecorded;
+                })
+                .collect(),
+            prompt_id,
+            synthesized,
+            origin_plugin,
         };
+        let (seq, persisted) = publish_with_next_seq(&self.next_seqs, session_id, |seq| {
+            (
+                seq,
+                self.sink.queue_prompt(session_id, seq, attachments, &event),
+            )
+        });
         if !persisted.wait() {
             // Roll back so refs never point at blobs that were not published.
             self.sink.delete_attachments_for_seq(session_id, seq);

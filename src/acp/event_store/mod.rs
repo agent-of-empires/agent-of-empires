@@ -202,6 +202,12 @@ impl EventStore {
     }
 
     /// Record with an explicit `created_at` (ms epoch) for recency-sensitive tests.
+    /// Hold the writer connection, as a slow save does.
+    #[cfg(test)]
+    pub(crate) fn hold_writer(&self) -> MutexGuard<'_, Connection> {
+        self.conn()
+    }
+
     #[cfg(test)]
     pub(crate) fn record_at(
         &self,

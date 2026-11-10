@@ -23,6 +23,24 @@ pub trait BroadcastSink: Send + Sync + 'static {
             self.publish_persisted(session_id, seq, event),
         ))
     }
+    /// Like `queue_persisted`, storing a prompt's attachments under `seq` first.
+    /// The event is not published if an attachment fails to store.
+    fn queue_prompt(
+        &self,
+        session_id: &str,
+        seq: u64,
+        attachments: &[AttachmentBlob],
+        event: &Event,
+    ) -> Persisted {
+        if attachments
+            .iter()
+            .all(|blob| self.record_attachment(session_id, seq, blob))
+        {
+            self.queue_persisted(session_id, seq, event)
+        } else {
+            Persisted(Receipt::Ready(false))
+        }
+    }
     /// Publish an event pumped from a worker, tagged with that worker's generation.
     fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
         self.publish(session_id, seq, event);
@@ -109,6 +127,7 @@ struct Publication {
     session_id: String,
     seq: u64,
     event: Event,
+    attachments: Vec<AttachmentBlob>,
     worker_generation: Option<u64>,
     persisted: Option<std::sync::mpsc::SyncSender<bool>>,
 }
@@ -245,6 +264,7 @@ impl BroadcastSink for ChannelSink {
             session_id: session_id.to_string(),
             seq,
             event: event.clone(),
+            attachments: Vec::new(),
             worker_generation: Some(generation),
             persisted: None,
         })));
@@ -260,11 +280,22 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn queue_persisted(&self, session_id: &str, seq: u64, event: &Event) -> Persisted {
+        self.queue_prompt(session_id, seq, &[], event)
+    }
+
+    fn queue_prompt(
+        &self,
+        session_id: &str,
+        seq: u64,
+        attachments: &[AttachmentBlob],
+        event: &Event,
+    ) -> Persisted {
         let (done, wait) = std::sync::mpsc::sync_channel(1);
         self.submit(Job::Publish(Box::new(Publication {
             session_id: session_id.to_string(),
             seq,
             event: event.clone(),
+            attachments: attachments.to_vec(),
             worker_generation: None,
             persisted: Some(done),
         })));
@@ -336,10 +367,14 @@ impl Persister {
                     session_id,
                     seq,
                     event,
+                    attachments,
                     worker_generation,
                     persisted,
                 } = *publication;
-                let stored = self.publish_tagged(&session_id, seq, &event, worker_generation);
+                let stored = attachments
+                    .iter()
+                    .all(|blob| self.event_store.record_attachment(&session_id, seq, blob))
+                    && self.publish_tagged(&session_id, seq, &event, worker_generation);
                 if let Some(persisted) = persisted {
                     let _ = persisted.send(stored);
                 }
@@ -457,13 +492,15 @@ mod tests {
         assert_eq!(store.highest_seq("writer-panic"), 3);
     }
 
-    /// Holds the writer until the returned sender fires.
+    /// Stalls a save on the writer connection until the returned sender fires.
     fn stall_writer(sink: &ChannelSink) -> std::sync::mpsc::SyncSender<()> {
         use std::time::Duration;
 
         let (entered, ready) = std::sync::mpsc::sync_channel(1);
         let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let store = Arc::clone(&sink.persister.event_store);
         sink.submit(Job::Test(Box::new(move || {
+            let _writer = store.hold_writer();
             entered.send(()).unwrap();
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
         })));
@@ -477,52 +514,92 @@ mod tests {
     fn a_stalled_sync_publish_leaves_the_seq_lock_to_the_drain() {
         use std::time::{Duration, Instant};
 
-        let (sink, store, _rx, _tmp) = channel_sink();
-        let sup = Arc::new(super::super::Supervisor::new(Arc::clone(&sink)));
-        let release = stall_writer(&sink);
-        let publisher = {
-            let sup = Arc::clone(&sup);
-            std::thread::spawn(move || sup.publish_next("stalled", &Event::ThinkingStarted))
-        };
-        let counter = super::super::session_seq(&sup.next_seqs, "stalled");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !counter.try_lock().is_ok_and(|seq| *seq == 1) {
+        type Publisher = fn(&super::super::Supervisor<ChannelSink>) -> bool;
+        let cases: [(&str, Publisher); 2] = [
+            ("event", |sup| {
+                sup.publish_next("stalled", &Event::ThinkingStarted);
+                true
+            }),
+            ("prompt with an attachment", |sup| {
+                let blob = AttachmentBlob {
+                    id: "a-1".into(),
+                    kind: crate::daemon::PromptAttachmentKind::Image,
+                    mime_type: "image/png".into(),
+                    name: None,
+                    data: vec![1, 2, 3],
+                };
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let published = runtime.block_on(sup.publish_user_prompt_with_attachments(
+                    "stalled",
+                    "look".into(),
+                    &[blob],
+                    None,
+                    false,
+                    None,
+                ));
+                published.seq == Some(1)
+            }),
+        ];
+        for (name, publish) in cases {
+            let (sink, store, _rx, _tmp) = channel_sink();
+            let sup = Arc::new(super::super::Supervisor::new(Arc::clone(&sink)));
+            let release = stall_writer(&sink);
+            let publisher = {
+                let sup = Arc::clone(&sup);
+                std::thread::spawn(move || publish(&sup))
+            };
+            let counter = super::super::session_seq(&sup.next_seqs, "stalled");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !counter.try_lock().is_ok_and(|seq| *seq == 1) {
+                assert!(
+                    Instant::now() < deadline,
+                    "{name}: the seq lock stayed held while the publisher waited for the writer"
+                );
+                std::thread::yield_now();
+            }
+            // What the drain does for each worker frame.
+            let drained = super::super::publish_with_next_seq(&sup.next_seqs, "stalled", |seq| {
+                sink.publish_from_worker("stalled", seq, &Event::ThinkingEnded, 1);
+                seq
+            });
+            assert_eq!(drained, 2, "{name}");
             assert!(
-                Instant::now() < deadline,
-                "the seq lock stayed held while the publisher waited for the writer"
+                !publisher.is_finished(),
+                "{name}: the save is still stalled"
             );
-            std::thread::yield_now();
+            release.send(()).unwrap();
+            assert!(publisher.join().unwrap(), "{name}: publish was not stored");
+            sink.flush();
+            let stored: Vec<_> = store
+                .replay_from("stalled", 0)
+                .into_iter()
+                .map(|(seq, _)| seq)
+                .collect();
+            assert_eq!(stored, [1, 2], "{name}");
         }
-        // What the drain does for each worker frame.
-        let drained = super::super::publish_with_next_seq(&sup.next_seqs, "stalled", |seq| {
-            sink.publish_from_worker("stalled", seq, &Event::ThinkingEnded, 1);
-            seq
-        });
-        assert_eq!(drained, 2);
-        assert!(!publisher.is_finished(), "the save is still stalled");
-        release.send(()).unwrap();
-        assert_eq!(publisher.join().unwrap(), 1);
-        sink.flush();
-        let stored: Vec<_> = store
-            .replay_from("stalled", 0)
-            .into_iter()
-            .map(|(seq, _)| seq)
-            .collect();
-        assert_eq!(stored, [1, 2]);
     }
 
     #[test]
     fn dropping_the_sink_stores_queued_publications() {
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
         let (sink, store, _rx, _tmp) = channel_sink();
         let release = stall_writer(&sink);
         sink.publish_from_worker("shutdown", 1, &Event::ThinkingStarted, 1);
+        let alive = Arc::downgrade(&sink);
         let (dropped, done) = std::sync::mpsc::sync_channel(1);
         let dropper = std::thread::spawn(move || {
             drop(sink);
             dropped.send(()).unwrap();
         });
+        // The last strong reference is gone, so the destructor is running.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive.strong_count() > 0 {
+            assert!(Instant::now() < deadline, "the sink was never dropped");
+            std::thread::yield_now();
+        }
         // Drop may only return once the writer has run what was queued.
         if done.recv_timeout(Duration::from_millis(200)).is_ok() {
             assert_eq!(
