@@ -361,7 +361,7 @@ impl PaneBirthInventory {
         Ok(false)
     }
 
-    pub(crate) fn ensure_only_preexisting_live_panes(&self, prior: &Self) -> Result<()> {
+    pub(crate) fn ensure_only_preexisting_panes(&self, prior: &Self) -> Result<()> {
         anyhow::ensure!(
             self.socket == prior.socket,
             "terminal handoff socket changed"
@@ -1471,7 +1471,7 @@ mod tests {
                 _ => {}
             }
             assert_eq!(
-                current.ensure_only_preexisting_live_panes(&prior).is_ok(),
+                current.ensure_only_preexisting_panes(&prior).is_ok(),
                 matches!(
                     case,
                     "dead-with-pid" | "dead-without-pid" | "alive-unchanged"
@@ -2740,7 +2740,7 @@ mod pane_probe_tests {
             .expect("the same existing corpse remains in the second inventory");
         assert!(current_dead.birth.is_none());
         assert_eq!(current_dead.identity, dead.identity);
-        current.ensure_only_preexisting_live_panes(&prior).unwrap();
+        current.ensure_only_preexisting_panes(&prior).unwrap();
 
         let removed = remove_owned_pane(&expected, false);
         assert!(
