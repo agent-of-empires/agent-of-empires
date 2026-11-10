@@ -783,6 +783,17 @@ impl Instance {
 
     pub fn is_yolo_mode(&self) -> bool {
         self.yolo_mode
+            || (!self.is_structured()
+                && self.declared_agent().is_some_and(|agent| {
+                    matches!(
+                        agent
+                            .contribution()
+                            .launch
+                            .as_ref()
+                            .and_then(|launch| launch.yolo.as_ref()),
+                        Some(aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always)
+                    )
+                }))
     }
 
     /// True when this session renders in the structured (ACP) view. Rows

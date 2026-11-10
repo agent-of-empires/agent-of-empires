@@ -193,12 +193,22 @@ impl HomeView {
         choice: crate::tui::dialogs::PermissionResponseChoice,
         agent: &crate::plugin::agent_integration::DeclaredAgent,
     ) {
-        if !self.session_feed.native_interaction_available()
-            || self.start_blocked(session_id).is_some()
-        {
+        if !self.session_feed.native_interaction_available() {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                "Native interaction is unavailable.",
+            ));
+            return;
+        }
+        if let Some(blocked) = self.start_blocked(session_id) {
+            self.info_dialog = Some(InfoDialog::new("Respond Failed", &blocked.to_string()));
             return;
         }
         let Some(inst) = self.get_instance(session_id) else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                "Session no longer exists.",
+            ));
             return;
         };
         if inst.is_structured()
@@ -207,6 +217,10 @@ impl HomeView {
                 .declared_agent()
                 .is_some_and(|current| current.same_identity(agent))
         {
+            self.info_dialog = Some(InfoDialog::new(
+                "Response Not Sent",
+                "The agent declaration changed or no longer permits this response.",
+            ));
             return;
         }
         let tmux = match crate::tmux::Session::new(&inst.id, &inst.title) {

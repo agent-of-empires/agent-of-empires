@@ -1214,6 +1214,53 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn always_yolo_does_not_persist_after_declaration_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let dir = super::super::plugins_dir().unwrap().join("acme.yolo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut instance = Instance::new("yolo", temp.path().to_str().unwrap());
+        instance.tool = "yolo-helper".into();
+        instance.command = "yolo-helper".into();
+
+        for (declaration, expected) in [
+            ("kind = \"always\"", true),
+            ("kind = \"flag\"\nflag = \"--yes\"", false),
+        ] {
+            let manifest = format!(
+                "id = \"acme.yolo\"\nname = \"Yolo\"\nversion = \"1.0.0\"\napi_version = 21\n[[agent_integrations]]\ntool = \"yolo-helper\"\ncommand = \"yolo-helper\"\n[agent_integrations.launch.yolo]\n{declaration}\n"
+            );
+            std::fs::write(dir.join("aoe-plugin.toml"), &manifest).unwrap();
+            crate::session::update_config(|config| {
+                config.plugins.insert(
+                    "acme.yolo".into(),
+                    crate::session::PluginConfig {
+                        grant: Some(crate::session::CapabilityGrant {
+                            manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                                manifest.as_bytes(),
+                            ),
+                            capabilities: Vec::new(),
+                            granted_at: chrono::Utc::now(),
+                        }),
+                        ..Default::default()
+                    },
+                );
+            })
+            .unwrap();
+            super::super::reload_registry();
+            assert_eq!(instance.is_yolo_mode(), expected);
+            assert!(!instance.yolo_mode);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn declaration_identity_is_bound_to_its_registry_snapshot() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
