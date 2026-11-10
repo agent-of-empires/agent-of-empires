@@ -3532,7 +3532,6 @@ mod tests {
         release_real_prompt_and_keep_the_next_owner(true).await;
     }
 
-
     #[tokio::test]
     async fn oversized_reverse_reply_becomes_error_without_poisoning_connection() {
         use tokio::io::AsyncWriteExt;
