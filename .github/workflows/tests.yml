@@ -15,6 +15,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
 
 permissions:
   contents: read
@@ -25,7 +28,7 @@ jobs:
     # branch ruleset requires every leg's context by name; keep it in sync if
     # the leg set changes.
     name: Cargo Test (linux, ${{ matrix.leg }})
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-cargo-{1}-{2}/runner=8cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, matrix.leg, github.run_attempt) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-cargo-{1}-{2}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, matrix.leg, github.run_attempt) }}
     timeout-minutes: 40
     permissions:
       contents: read
@@ -60,7 +63,7 @@ jobs:
         with:
           manifest-key: test-${{ matrix.leg }}
       - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
-        if: matrix.leg != 'web-e2e'
+        if: matrix.leg == 'core-rest'
         with:
           tool: cargo-nextest
       - name: Install tmux
@@ -105,6 +108,9 @@ jobs:
       # measured 336s -> 114s pinned to 4 cores, with identical results.
       # Raise this only with evidence; 4+ starts trading wall for flake risk on
       # the tests that wait on an ACP handshake.
+      - name: Build tests (web, e2e)
+        if: matrix.leg == 'web-e2e'
+        run: cargo test --features web,e2e-tests --test e2e --test integration --lib --no-run
       - name: Cargo test (web, e2e only)
         if: matrix.leg == 'web-e2e'
         env:
@@ -147,6 +153,9 @@ jobs:
       # skipped here while every non-e2e test binary stays auto-discovered.
       # nextest runs one process per test and the test binaries concurrently,
       # so no test can pass on state an earlier one left behind.
+      - name: Build tests (default features)
+        if: matrix.leg == 'core-rest'
+        run: cargo nextest run --no-run
       - name: Cargo test (default features, everything except e2e)
         if: matrix.leg == 'core-rest'
         # Echo the temp root so a silently-dropped TMPDIR is visible in the log
@@ -181,17 +190,17 @@ jobs:
           test -S "$XDG_RUNTIME_DIR/systemd/private"
           cargo nextest run --test integration --no-tests=fail \
             serve_dynamic_profile_rewire::permanent_scratch_delete_cancels_an_unanswered_initialize
-      # bare-core keeps OpenSSL/SQLite vendoring across flag corners:
-      # default-plugins off for lib/bin and selected lifecycle e2e tests (the
-      # web leg covers the rest), then flag on/web off for all-targets.
-      # e2e-tests includes its target in that compile sweep.
-      - name: Cargo test (bare core, no default features)
+      # bare-core: selected lifecycle e2e tests without `web` (the web-e2e leg
+      # covers the rest). `default-plugins` is an empty compat flag, so lib and
+      # bin tests here would repeat core-rest.
+      - name: Build tests (bare core)
+        if: matrix.leg == 'bare-core'
+        run: cargo test --no-default-features --features vendored,e2e-tests --test e2e --no-run
+      - name: Cargo test (bare core, selected e2e)
         if: matrix.leg == 'bare-core'
         run: |
-          cargo nextest run --no-default-features --features vendored --lib --bins --no-fail-fast
           cargo test --no-default-features --features vendored,e2e-tests --test e2e -- \
             --test-threads=3 cli:: new_session::
-          cargo check --no-default-features --features vendored,default-plugins,e2e-tests --all-targets
       # A default `cargo build` must ship the daemon without invoking Node
       # (#3619). Shadow node and npm with failing stubs so a `web`-gate
       # regression in build.rs fails here rather than silently reintroducing
@@ -340,6 +349,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      - name: Build tests (macOS)
+        run: |
+          cargo nextest run --features e2e-tests --lib --bins --test integration --no-run
+          cargo test --features e2e-tests --test e2e --no-run
       - name: Cargo test (macOS, lib + bins)
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
@@ -349,7 +362,7 @@ jobs:
 
   vitest:
     name: Vitest
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-vitest-{1}/runner=4cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-vitest-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 15
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
@@ -377,9 +390,12 @@ jobs:
       # Nothing ran it before, so both of its test files could rot unnoticed;
       # it rides this job because Node is already set up here. Seconds to run,
       # and it is deliberately not part of the coverage upload below.
+      - name: Install aoe-agent adapter dependencies
+        working-directory: acp-worker/aoe-agent
+        run: npm ci
       - name: aoe-agent adapter tests
         working-directory: acp-worker/aoe-agent
-        run: npm ci && npm test
+        run: npm test
       # Vitest's v8 coverage reporter emits LCOV paths relative to the
       # vitest cwd (web/), so SF: lines read "SF:src/...". Codecov
       # matches file paths against the PR diff, which uses repo-root
@@ -458,7 +474,7 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=4cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
@@ -552,7 +568,7 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=4cpu-linux-x64/family=m8a/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     permissions:
       contents: read

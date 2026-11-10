@@ -95,6 +95,19 @@ impl HomeView {
         Self::persist_app_state("org group collapsed", |s| s.org_group_collapsed = collapsed);
     }
 
+    pub(super) fn save_status_group_collapsed(&self) {
+        // Status groups are the fixed status set, so a bucket whose sessions all
+        // archived keeps its collapse state instead of reloading expanded.
+        let known = crate::session::Status::attention_order()
+            .into_iter()
+            .map(|status| status.wire_str().to_string())
+            .collect();
+        let collapsed = Self::collapsed_known_paths(&self.status_group_collapsed, known);
+        Self::persist_app_state("status group collapsed", |s| {
+            s.status_group_collapsed = collapsed
+        });
+    }
+
     pub fn toggle_preview_info(&mut self) {
         self.show_preview_info = !self.show_preview_info;
         let show = self.show_preview_info;
