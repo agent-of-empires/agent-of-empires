@@ -957,8 +957,11 @@ impl ServeView {
             (TunnelTransport::Tailscale, TransportStatus::FunnelNotEnabled, _) => {
                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
             }
-            (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
+            (TunnelTransport::Tailscale, TransportStatus::TimedOut, TransportStatus::Ready) => {
                 "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
+            }
+            (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
+                "Tailscale didn't answer in time; press R to retry."
             }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
             (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
@@ -1450,6 +1453,17 @@ mod tests {
         assert!(matches!(
             &view.state,
             ServeViewState::Confirm { flash: Some((m, _)), .. } if m.contains("retry Tailscale")
+        ));
+        view.state = ServeViewState::Confirm {
+            selected: TunnelTransport::Tailscale,
+            tailscale: TransportStatus::TimedOut,
+            cloudflare: TransportStatus::NotInstalled,
+            flash: None,
+        };
+        view.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            &view.state,
+            ServeViewState::Confirm { flash: Some((m, _)), .. } if !m.contains("Cloudflare")
         ));
     }
 
