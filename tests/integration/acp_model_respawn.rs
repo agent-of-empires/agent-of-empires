@@ -360,6 +360,54 @@ async fn reset_reapplies_the_live_model_pick() {
     );
 }
 
+/// A reset re-sends the model_config toggles at their live value, not the
+/// spawn-time one.
+#[tokio::test]
+#[serial_test::parallel]
+async fn reset_reapplies_the_live_model_config_pick() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let record_path = temp.path().join("config-option-calls.log");
+    let mut env = shim_env(&record_path, false, false);
+    env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+    config.default_model_config = [("fast".to_string(), "on".to_string())].into();
+    let mut client = AcpClient::spawn(config, AcpSessionId("model-config-reset".into()))
+        .await
+        .expect("spawn shim");
+    drive_one_turn(&mut client).await;
+    // The pick is dispatched in the background; the reset must not overtake it.
+    client.set_config_option("fast", "off").await.unwrap();
+    client.set_config_option("ultracode", "on").await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count()) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live picks never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.reset_session("/clear").await.unwrap();
+    let _ = client.shutdown().await;
+
+    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        [
+            "model=opus",
+            "fast=on",
+            "fast=off",
+            "ultracode=on",
+            "model=opus",
+            "ultracode=on",
+        ],
+        "a reset must re-send the live toggle values (recorded: {recorded:?})"
+    );
+}
+
 /// The reason the model is applied first, and the reason its response is read
 /// back: an adapter may rebuild its option set around the switch. A client that
 /// kept the establish-time id addresses an option that no longer exists, and

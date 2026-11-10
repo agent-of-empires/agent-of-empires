@@ -23,7 +23,7 @@ use crate::acp::acp_client::between_prompt::{
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::config_options::{
     config_option_failure_event, config_options_event, dispatch_set_config_option,
-    dispatch_set_mode, mode_config_id, model_option, modes_available_event,
+    dispatch_set_mode, mode_config_id, model_config_values, model_option, modes_available_event,
     thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::DaemonControlClient;
@@ -86,6 +86,10 @@ impl Session {
             .is_some_and(|option| option.id == config_id)
         {
             self.default_model = Some(value.clone());
+        }
+        if self.channels.model_config.contains_key(&config_id) {
+            self.default_model_config
+                .insert(config_id.clone(), value.clone());
         }
         dispatch_set_config_option(
             &self.connection,
@@ -411,9 +415,9 @@ impl Session {
     }
 
     /// The fresh session starts on adapter defaults, so the model, effort and
-    /// mode are re-sent, best-effort, within the reset deadline. The model
-    /// goes first because a switch rebuilds the option set the effort is
-    /// resolved from.
+    /// mode and model_config picks are re-sent, best-effort, within the reset
+    /// deadline. The model goes first because a switch rebuilds the option
+    /// set the effort and the toggles are resolved from.
     async fn reapply_defaults(
         &self,
         new_id: &SessionId,
@@ -421,6 +425,7 @@ impl Session {
         deadline: tokio::time::Instant,
     ) {
         let mut effort_id = options.and_then(thought_level_config_id);
+        let mut toggles = options.map(model_config_values).unwrap_or_default();
         if let (Some(model), Some(option)) = (
             self.default_model.as_deref(),
             options.and_then(model_option),
@@ -431,7 +436,10 @@ impl Session {
                     .reset_set_option(new_id, config_id, model, deadline)
                     .await
                 {
-                    Some(Ok(options)) => effort_id = thought_level_config_id(&options),
+                    Some(Ok(options)) => {
+                        effort_id = thought_level_config_id(&options);
+                        toggles = model_config_values(&options);
+                    }
                     Some(Err(reason)) => {
                         let event = config_option_failure_event(
                             option.id,
@@ -464,6 +472,19 @@ impl Session {
                 .is_none()
             {
                 return;
+            }
+        }
+        for (id, value) in &self.default_model_config {
+            if toggles.get(id).is_none_or(|current| current == value) {
+                continue;
+            }
+            match self
+                .reset_set_option(new_id, SessionConfigId::new(id.clone()), value, deadline)
+                .await
+            {
+                Some(Ok(options)) => toggles = model_config_values(&options),
+                Some(Err(reason)) => debug!("post-reset {id} rejected: {reason}"),
+                None => return,
             }
         }
     }

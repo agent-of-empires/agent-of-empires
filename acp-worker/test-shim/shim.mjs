@@ -252,6 +252,7 @@ async function handleNewSession(params) {
   model = "default";
   thoughtLevel = "medium";
   thoughtLevelId = "thought_level";
+  for (const id of Object.keys(modelConfig)) modelConfig[id] = "off";
   return withConfigOptions({ sessionId });
 }
 
