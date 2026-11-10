@@ -3044,9 +3044,16 @@ mod tests {
                 &stopped("prompt_complete"),
                 &EventMetadata::history(),
             );
-            assert!(deltas.is_empty(), "{label}: history cannot invent an output diagnosis");
+            assert!(
+                deltas.is_empty(),
+                "{label}: history cannot invent an output diagnosis"
+            );
             assert_eq!(model.rows().len(), rows_before, "{label}");
-            assert_eq!(count(&model, TranscriptRowKind::Notice), notices_before, "{label}");
+            assert_eq!(
+                count(&model, TranscriptRowKind::Notice),
+                notices_before,
+                "{label}"
+            );
         }
 
         let steered = fold([
@@ -3063,35 +3070,84 @@ mod tests {
             stopped("prompt_complete"),
         ]);
         assert_eq!(count(&steered, TranscriptRowKind::UserPrompt), 2);
-        assert!(steered.rows().iter().any(|row| {
-            row.kind == TranscriptRowKind::Message && row.text == "on it"
-        }));
+        assert!(steered
+            .rows()
+            .iter()
+            .any(|row| { row.kind == TranscriptRowKind::Message && row.text == "on it" }));
         assert_eq!(count(&steered, TranscriptRowKind::Notice), 0);
 
         let window = AcpPromptWindowId::new();
         let other_window = AcpPromptWindowId::new();
         let written = Some(AcpPromptObservation::Written { window_id: window });
         for (label, outcome, observation, uncertainty, expected) in [
-            ("original succeeded", Some(AcpOriginalRequestResult::Succeeded), written, Some(window), true),
-            ("original failed", Some(AcpOriginalRequestResult::Failed), written, Some(window), true),
-            ("different window", Some(AcpOriginalRequestResult::Succeeded), written, Some(other_window), false),
+            (
+                "original succeeded",
+                Some(AcpOriginalRequestResult::Succeeded),
+                written,
+                Some(window),
+                true,
+            ),
+            (
+                "original failed",
+                Some(AcpOriginalRequestResult::Failed),
+                written,
+                Some(window),
+                true,
+            ),
+            (
+                "different window",
+                Some(AcpOriginalRequestResult::Succeeded),
+                written,
+                Some(other_window),
+                false,
+            ),
             ("no original result", None, written, Some(window), false),
-            ("no written observation", Some(AcpOriginalRequestResult::Succeeded), None, Some(window), false),
-            ("ambiguous observation", Some(AcpOriginalRequestResult::Succeeded), Some(AcpPromptObservation::Ambiguous), Some(window), false),
-            ("nothing written", Some(AcpOriginalRequestResult::Succeeded), Some(AcpPromptObservation::NoWrittenPrompt), Some(window), false),
-            ("no uncertainty", Some(AcpOriginalRequestResult::Succeeded), written, None, false),
+            (
+                "no written observation",
+                Some(AcpOriginalRequestResult::Succeeded),
+                None,
+                Some(window),
+                false,
+            ),
+            (
+                "ambiguous observation",
+                Some(AcpOriginalRequestResult::Succeeded),
+                Some(AcpPromptObservation::Ambiguous),
+                Some(window),
+                false,
+            ),
+            (
+                "nothing written",
+                Some(AcpOriginalRequestResult::Succeeded),
+                Some(AcpPromptObservation::NoWrittenPrompt),
+                Some(window),
+                false,
+            ),
+            (
+                "no uncertainty",
+                Some(AcpOriginalRequestResult::Succeeded),
+                written,
+                None,
+                false,
+            ),
         ] {
             let correlation = NativeOperationCorrelation::new(None);
             let progress = EventMetadata {
                 scope: EventScope::OperationCurrent,
-                operation: Some(AcpOperationMetadata { correlation, outcome: None }),
+                operation: Some(AcpOperationMetadata {
+                    correlation,
+                    outcome: None,
+                }),
                 prompt_observation: written,
                 ..EventMetadata::history()
             };
             let mut model = fold([prompt("a written operation")]);
             model.apply_scoped_event(2, &Event::ThinkingStarted, &progress);
             let terminal = EventMetadata {
-                operation: Some(AcpOperationMetadata { correlation, outcome }),
+                operation: Some(AcpOperationMetadata {
+                    correlation,
+                    outcome,
+                }),
                 prompt_observation: observation,
                 output_uncertainty: uncertainty,
                 ..EventMetadata::history()

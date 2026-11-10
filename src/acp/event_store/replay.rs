@@ -244,7 +244,11 @@ mod tests {
                 .any(|row| row.kind == TranscriptRowKind::Notice
                     && row.text.contains("request failed")));
             assert_eq!(
-                transcript.rows().iter().filter(|row| row.kind == TranscriptRowKind::Notice).count(),
+                transcript
+                    .rows()
+                    .iter()
+                    .filter(|row| row.kind == TranscriptRowKind::Notice)
+                    .count(),
                 1,
                 "a historical failure must not invent an additional output diagnosis"
             );

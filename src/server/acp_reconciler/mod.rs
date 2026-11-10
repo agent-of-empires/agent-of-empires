@@ -2185,7 +2185,10 @@ mod tests {
         assert_eq!(test_fixtures::startup_errors(&state, id), 0);
         {
             let instances = state.instances.read().await;
-            assert_eq!(instances[0].lifecycle_generation, stopped.lifecycle_generation);
+            assert_eq!(
+                instances[0].lifecycle_generation,
+                stopped.lifecycle_generation
+            );
             assert_eq!(instances[0].resume_intent, stopped.resume_intent);
             assert_eq!(instances[0].acp_establishment, stopped.acp_establishment);
         }
