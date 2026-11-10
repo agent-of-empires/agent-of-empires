@@ -106,13 +106,11 @@ pub fn run_vt_pipe(_socket: &str) -> std::io::Result<()> {
 use anyhow::Result;
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen},
 };
 use ratatui::prelude::*;
 use std::io::{self, IsTerminal};
@@ -168,8 +166,8 @@ impl TerminalGuard {
         }
         if enable_mouse {
             if let Err(err) = execute!(stdout, EnableMouseCapture) {
-                let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
                 let _ = disable_raw_mode();
+                let _ = terminal_output::restore_after_exit(true, None);
                 return Err(err.into());
             }
         }
@@ -194,23 +192,9 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let mut stdout = terminal_output::Output::default();
-        // Pop the kitty stack first so the shell never inherits it.
-        #[cfg(unix)]
-        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
-        if self.disable_mouse {
-            let _ = execute!(stdout, DisableMouseCapture);
-        }
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableBracketedPaste,
-            crossterm::cursor::Show,
-        );
-        if host_title::take_emitted() {
-            let _ = execute!(stdout, SetTitle(host_title::FALLBACK_TITLE));
-        }
+        let title = host_title::take_emitted().then_some(host_title::FALLBACK_TITLE);
+        let _ = terminal_output::restore_after_exit(self.disable_mouse, title);
     }
 }
 

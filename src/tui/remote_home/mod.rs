@@ -114,13 +114,11 @@ impl RemoteHomeState {
 /// down. Invoked from `tui::run` when `AOE_DAEMON_URL` is set.
 pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     use crossterm::event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     };
     use crossterm::execute;
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
     use std::io;
     use std::io::IsTerminal;
 
@@ -154,16 +152,8 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
 
     let result = run(&mut terminal, &mut event_stream, &theme, endpoint).await;
 
-    #[cfg(unix)]
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    crate::tui::terminal_output::restore_after_exit(true, None)?;
     result
 }
 

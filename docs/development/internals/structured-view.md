@@ -202,9 +202,13 @@ is restored immediately; its result is kept while the bounded coordinator pumps
 terminal restoration before any later frame or OSC. A child is never rerun to
 complete restoration.
 
-Terminal owners stage drop-time cursor commands before bounded output. Incomplete
-cursor restoration remains best-effort without invoking Ratatui's synchronous
-stderr diagnostic on a stalled TTY.
+All three terminal owners restore cooked input, cancel obsolete drawing without an
+emission receipt, and queue the final mode/title transaction behind pending controls.
+A bounded 250 ms pump permits transient backpressure to clear. Permanently stalled
+output or a busy coordinator can still prevent delivery before process exit.
+Ratatui cursor drop never invokes a synchronous stderr diagnostic.
+A direct flush that writes no bytes retains its staged command for retry. A partial
+failed command recovers terminal framing instead of replaying its written prefix.
 
 The OS layer independently opens and verifies the TTY descriptor. Duplicating
 stdout is not safe because duplicated descriptors share `O_NONBLOCK`.

@@ -387,6 +387,61 @@ impl Drop for Suspension {
     }
 }
 
+/// Finish output after restoring cooked input; drawing no longer owns the terminal.
+pub(crate) fn restore_after_exit(disable_mouse: bool, title: Option<&str>) -> io::Result<bool> {
+    #[cfg(test)]
+    if let Some(output) = TEST_OUTPUT.with(|output| output.borrow().clone()) {
+        return restore_after_exit_in(&output, disable_mouse, title);
+    }
+    restore_after_exit_in(state()?, disable_mouse, title)
+}
+
+fn restore_after_exit_in(
+    output: &Mutex<State>,
+    disable_mouse: bool,
+    title: Option<&str>,
+) -> io::Result<bool> {
+    let mut bytes = Vec::new();
+    #[cfg(unix)]
+    crossterm::queue!(&mut bytes, crossterm::event::PopKeyboardEnhancementFlags)?;
+    if disable_mouse {
+        crossterm::queue!(&mut bytes, crossterm::event::DisableMouseCapture)?;
+    }
+    crossterm::queue!(
+        &mut bytes,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show
+    )?;
+    if let Some(title) = title {
+        crossterm::queue!(&mut bytes, crossterm::terminal::SetTitle(title))?;
+    }
+    let mut state = match output.try_lock() {
+        Ok(state) => state,
+        Err(TryLockError::WouldBlock) => return Ok(false),
+        Err(TryLockError::Poisoned(error)) => return Err(io::Error::other(error.to_string())),
+    };
+    let deadline = Instant::now() + Duration::from_millis(250);
+    // Exit cancels obsolete drawing without acknowledging an unseen frame.
+    if state.pending.take().is_some_and(|frame| frame.offset != 0) {
+        state.interrupted(std::env::var_os("TMUX").is_some());
+    }
+    state.completed = None;
+    if let Some(control) = state.control.as_mut() {
+        control.bytes.extend(bytes);
+    } else {
+        state.control = Some(PendingControl { bytes, offset: 0 });
+    }
+    if let Err(error) = state.recover(deadline) {
+        return if is_backpressure(&error) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    state.write_control(deadline)
+}
+
 /// Capture at most one frame; retain a partial write until its own receipt is emitted.
 pub(crate) fn frame(
     operation: impl FnOnce(bool) -> anyhow::Result<()>,
@@ -567,8 +622,12 @@ impl Output {
             written: 0,
         };
         let result = writer.write_all(&bytes).and_then(|_| writer.flush());
-        if result.is_err() && writer.written != 0 {
-            state.interrupted(std::env::var_os("TMUX").is_some());
+        if result.is_err() {
+            if writer.written == 0 {
+                self.buffer = bytes;
+            } else {
+                state.interrupted(std::env::var_os("TMUX").is_some());
+            }
         }
         result
     }

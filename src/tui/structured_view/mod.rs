@@ -55,14 +55,11 @@ const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// pair with `AOE_DAEMON_URL` to attach to another machine's daemon.
 pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     use crossterm::event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, EventStream, KeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     };
     use crossterm::execute;
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
     use std::io;
     use std::io::IsTerminal;
 
@@ -94,16 +91,8 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
 
     let result = run(&mut terminal, &mut event_stream, &theme, session_id).await;
 
-    #[cfg(unix)]
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    crate::tui::terminal_output::restore_after_exit(true, None)?;
     result
 }
 

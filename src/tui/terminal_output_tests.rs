@@ -440,3 +440,91 @@ fn child_result_survives_backpressured_terminal_restoration() {
         .unwrap();
     assert!(restore < after);
 }
+
+#[cfg(unix)]
+#[test]
+fn zero_progress_flush_retries_the_original_bytes() {
+    let (mut master, mut slave) = private_terminal();
+    block_terminal(&mut slave);
+    let output = Mutex::new(State::new(slave));
+    let mut writer = Output::default();
+    let packet = b"\x1b[?1006l\x1b[?1049l\x1b[?25h";
+    writer.write_all(packet).unwrap();
+    assert!(is_backpressure(&writer.flush_in(&output).unwrap_err()));
+
+    resume_terminal(&output.lock().unwrap().file);
+    let mut received = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        drain_terminal(&mut master, &mut received);
+        match writer.flush_in(&output) {
+            Ok(()) => break,
+            Err(error) if is_backpressure(&error) => {
+                assert!(Instant::now() < deadline, "retry did not make progress");
+            }
+            Err(error) => panic!("retry flush: {error}"),
+        }
+    }
+    read_terminal_until(&mut master, &mut received, packet);
+    assert!(received.ends_with(packet));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn exit_retains_mode_cleanup_across_stall_and_cancels_obsolete_drawing() {
+    for partial in [false, true] {
+        let (mut master, mut slave) = private_terminal();
+        if !partial {
+            block_terminal(&mut slave);
+        }
+        let output = Mutex::new(State::new(slave));
+        let outcome = frame_in(&output, |_| {
+            let mut writer = Output::default();
+            writer.write_all(&vec![b'x'; 1024 * 1024])?;
+            writer.write_all(b"OBSOLETE-FRAME-END")?;
+            writer.flush()?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(outcome.presented.is_none());
+        let resume = {
+            let mut state = output.lock().unwrap();
+            assert_eq!(state.pending.as_ref().unwrap().offset != 0, partial);
+            if partial {
+                block_terminal(&mut state.file);
+            }
+            state.file.try_clone().unwrap()
+        };
+        let mut received = Vec::new();
+        assert!(!restore_after_exit_in(&output, true, None).unwrap());
+        resume_terminal(&resume);
+        let mut shell = Output::default();
+        shell.write_all(b"SHELL-READY").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            drain_terminal(&mut master, &mut received);
+            match shell.flush_in(&output) {
+                Ok(()) => break,
+                Err(error) if is_backpressure(&error) => {
+                    assert!(Instant::now() < deadline, "cleanup did not make progress");
+                }
+                Err(error) => panic!("terminal cleanup: {error}"),
+            }
+        }
+        read_terminal_until(&mut master, &mut received, b"SHELL-READY");
+        let position = |needle: &[u8]| {
+            received
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("terminal mode command missing")
+        };
+        assert!(position(b"\x1b[?1006l") < position(b"\x1b[?1049l"));
+        assert!(position(b"\x1b[?1049l") < position(b"\x1b[?25h"));
+        assert!(position(b"\x1b[?25h") < position(b"SHELL-READY"));
+        assert!(!received
+            .windows(b"OBSOLETE-FRAME-END".len())
+            .any(|window| window == b"OBSOLETE-FRAME-END"));
+        assert!(output.lock().unwrap().completed.is_none());
+    }
+}
