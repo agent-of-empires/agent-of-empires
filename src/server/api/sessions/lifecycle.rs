@@ -2885,6 +2885,15 @@ fn select_restart_wake_message(
     })
 }
 
+struct AgentPreparationInput {
+    body: Result<
+        Option<Json<crate::daemon::StartSessionBody>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+    captured: Option<Instance>,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
+}
+
 pub(super) async fn prepare_agent_session(
     state: Arc<AppState>,
     id: String,
@@ -2898,9 +2907,39 @@ pub(super) async fn prepare_agent_session(
     prepare_agent_session_inner(
         state,
         id,
-        body,
+        AgentPreparationInput {
+            body,
+            captured: None,
+            physical: None,
+        },
         preparation,
         restart,
+        None,
+        RestartOrigin::Explicit,
+    )
+    .await
+}
+
+pub(super) async fn prepare_captured_terminal_session(
+    state: Arc<AppState>,
+    id: String,
+    instance: Instance,
+    expected: crate::daemon::NativePreparationIdentity,
+    physical: Option<Arc<crate::session::LegacyToolObservation>>,
+) -> axum::response::Response {
+    prepare_agent_session_inner(
+        state,
+        id,
+        AgentPreparationInput {
+            body: Ok(Some(Json(crate::daemon::StartSessionBody {
+                size: None,
+                expected: Some(expected),
+            }))),
+            captured: Some(instance),
+            physical,
+        },
+        AgentPreparation::Ensure,
+        None,
         None,
         RestartOrigin::Explicit,
     )
@@ -2915,7 +2954,11 @@ pub(crate) async fn recovery_restart(
     prepare_agent_session_inner(
         state,
         id,
-        Ok(None),
+        AgentPreparationInput {
+            body: Ok(None),
+            captured: None,
+            physical: None,
+        },
         AgentPreparation::Restart,
         Some(Arc::new(crate::daemon::RestartSessionBody {
             bound_hooks: true,
@@ -2930,15 +2973,17 @@ pub(crate) async fn recovery_restart(
 async fn prepare_agent_session_inner(
     state: Arc<AppState>,
     id: String,
-    body: Result<
-        Option<Json<crate::daemon::StartSessionBody>>,
-        axum::extract::rejection::JsonRejection,
-    >,
+    input: AgentPreparationInput,
     preparation: AgentPreparation,
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
     expected_generation: Option<u64>,
     restart_origin: RestartOrigin,
 ) -> axum::response::Response {
+    let AgentPreparationInput {
+        body,
+        captured,
+        physical: mut captured_physical,
+    } = input;
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
     }
@@ -2965,16 +3010,19 @@ async fn prepare_agent_session_inner(
     };
     let lock = state.instance_lock(&id).await;
     let guard = lock.lock().await;
-    let mut instance = {
-        let instances = state.instances.read().await;
-        let Some(instance) = instances.iter().find(|row| row.id == id) else {
-            return if state.cityhall_mode {
-                crate::server::api::cityhall_response()
-            } else {
-                crate::server::api::session_not_found()
+    let mut instance = match captured {
+        Some(instance) => instance,
+        None => {
+            let instances = state.instances.read().await;
+            let Some(instance) = instances.iter().find(|row| row.id == id) else {
+                return if state.cityhall_mode {
+                    crate::server::api::cityhall_response()
+                } else {
+                    crate::server::api::session_not_found()
+                };
             };
-        };
-        instance.clone()
+            instance.clone()
+        }
     };
     if preparation == AgentPreparation::Ensure && instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -3336,10 +3384,35 @@ async fn prepare_agent_session_inner(
                         return Ok(None);
                     }
                 } else {
-                    let Some(admission) = row.admit_native_start()? else {
+                    let physical_target = captured_physical
+                        .as_ref()
+                        .map(|expected| -> anyhow::Result<_> {
+                            let observed = super::ensure::physical_agent_target(row)?
+                                .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                            anyhow::ensure!(
+                                observed.1.as_ref() == expected.as_ref(),
+                                crate::session::LifecycleReservationError::Superseded
+                            );
+                            Ok(observed)
+                        })
+                        .transpose()?;
+                    let admission = row.admit_native_start()?;
+                    anyhow::ensure!(
+                        captured_physical.is_none() || admission.is_none(),
+                        crate::session::LifecycleReservationError::Superseded
+                    );
+                    let Some(admission) = admission else {
                         if preparation == AgentPreparation::Ensure {
-                            let (name, physical) = super::ensure::physical_agent_target(row)?
-                                .ok_or(crate::session::NativeInputError::Ownership)?;
+                            let (name, observed, ready) = match physical_target {
+                                Some(target) => target,
+                                None => super::ensure::physical_agent_target(row)?
+                                    .ok_or(crate::session::NativeInputError::Ownership)?,
+                            };
+                            anyhow::ensure!(
+                                ready || captured_physical.is_some(),
+                                crate::session::NativeInputError::Ownership
+                            );
+                            let physical = captured_physical.take().unwrap_or(observed);
                             ready_target = Some((
                                 row.created_at,
                                 row.title.clone(),
