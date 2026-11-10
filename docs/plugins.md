@@ -101,6 +101,11 @@ outcome is unknown, not permission to retry. The CLI never resubmits automatical
 If no job id arrived, inspect `GET /api/plugins` on that Daemon before deciding
 whether to submit again. Jobs expire after an hour when another job starts and
 do not survive a Daemon restart; a missing job requires inspecting current state.
+
+A panicking job task reports an unknown operation outcome and releases job
+admission. Inspect current state before starting another job; unfinished owned
+work still holds mutation exclusion.
+
 Failed CLI observations print the bounded tail and the actual full-log path on
 the Daemon host. The TUI and dashboard also show that host-side path. Read the
 file on that host, not on a remote Client; job ids are not log filenames.

@@ -993,6 +993,8 @@ where
     F: FnOnce(OperationLog) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 {
+    use futures_util::FutureExt;
+
     let Some((job_id, log_path)) = state.plugin_jobs.begin(kind, target) else {
         return super::api_error_with_code_header(
             crate::daemon::ApiErrorCode::PluginJobActive,
@@ -1002,9 +1004,23 @@ where
     let jobs = state.plugin_jobs.clone();
     let id = job_id.clone();
     state.runtime.work.spawn("server.plugin_job", async move {
-        let result = match OperationLog::file(&log_path) {
-            Ok(log) => run(log).await,
-            Err(e) => Err(e),
+        let result = std::panic::AssertUnwindSafe(async {
+            let log = OperationLog::file(&log_path)?;
+            run(log).await
+        })
+        .catch_unwind()
+        .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(payload) => {
+                jobs.finish(
+                    &id,
+                    Err(anyhow::anyhow!(
+                        "Plugin job panicked; operation outcome unknown. Inspect current plugin state before submitting another job."
+                    )),
+                );
+                std::panic::resume_unwind(payload);
+            }
         };
         jobs.finish(&id, result);
     });
@@ -1165,6 +1181,58 @@ mod tests {
     use super::*;
     use crate::session::{update_config, CapabilityGrant, Config, PluginConfig};
     use aoe_plugin_api::PluginManifest;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn panicked_job_finishes_and_allows_next_lifecycle_job() {
+        async fn panic_during_poll() -> anyhow::Result<()> {
+            panic!("private-panic-payload");
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        for during_poll in [false, true] {
+            let response = start_job(
+                state.clone(),
+                PluginJobKind::Install,
+                "acme.panic".into(),
+                move |_| {
+                    assert!(during_poll, "private-panic-payload");
+                    panic_during_poll()
+                },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let accepted: PluginJobAccepted = decode(response).await;
+            state.runtime.work.drain().await;
+            let response: PluginJobResponse = decode(
+                plugin_job_status(
+                    State(state.clone()),
+                    Path(accepted.job_id),
+                    Query(JobLogQuery { tail: None }),
+                )
+                .await,
+            )
+            .await;
+            let PluginJobStatus::Failed { error } = response.job.status else {
+                panic!("panicked job did not finish: {:?}", response.job.status);
+            };
+            assert!(response.job.finished_at.is_some());
+            assert!(!error.contains("private-panic-payload"));
+
+            let response = start_job(
+                state.clone(),
+                PluginJobKind::Install,
+                "acme.next".into(),
+                |_| async { Ok(()) },
+            )
+            .await;
+            let job = finish(&state, response).await;
+            assert!(matches!(job.status, PluginJobStatus::Succeeded));
+            state.runtime.work.drain().await;
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]
