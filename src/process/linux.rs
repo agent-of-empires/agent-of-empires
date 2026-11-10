@@ -28,6 +28,32 @@ pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'stat
         ])
 }
 
+pub(super) fn terminal_writable(
+    file: &std::fs::File,
+    remaining: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let milliseconds = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
+    // SAFETY: poll borrows one valid descriptor until it returns.
+    match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        -1 => Err(std::io::Error::last_os_error()),
+        _ if descriptor.revents & libc::POLLOUT != 0 => Ok(()),
+        _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+    }
+}
+
 struct LegacyRuntimeDirectories {
     run: std::os::fd::OwnedFd,
     user: Option<std::os::fd::OwnedFd>,

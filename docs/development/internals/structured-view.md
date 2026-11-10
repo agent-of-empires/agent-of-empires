@@ -226,6 +226,8 @@ ordinary rendering still refuses poisoned state.
 
 The OS layer independently opens and verifies the TTY descriptor. Duplicating
 stdout is not safe because duplicated descriptors share `O_NONBLOCK`.
+Writable readiness uses `poll` on Linux and `pselect` on Darwin, where the
+controlling-terminal alias supports select rather than device polling.
 Only one moved frame buffer may remain pending. Each bounded write resumes its
 unsent suffix before capturing another frame, emitting OSC/title bytes, or
 handing the terminal to a child. A matching emission receipt commits mouse mode;

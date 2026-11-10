@@ -116,7 +116,7 @@ pub(crate) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
 pub(crate) fn terminal_writable(file: &std::fs::File, remaining: Duration) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        unix::terminal_writable(file, remaining)
+        platform::terminal_writable(file, remaining)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
