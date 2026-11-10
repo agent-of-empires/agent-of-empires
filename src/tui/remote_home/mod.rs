@@ -153,7 +153,9 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     let result = run(&mut terminal, &mut event_stream, &theme, endpoint).await;
 
     disable_raw_mode()?;
-    crate::tui::terminal_output::restore_after_exit(true, None)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    drop(terminal);
+    crate::tui::terminal_output::restore_after_exit(true, None, deadline)?;
     result
 }
 

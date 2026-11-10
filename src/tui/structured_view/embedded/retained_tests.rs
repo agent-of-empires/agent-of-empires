@@ -771,7 +771,7 @@ async fn dropping_retained_view_keeps_original_helper_owned_before_newer_live_co
     let sink = output_path.clone();
     let (started, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let mut first = true;
-    let executor = crate::tui::clipboard::Executor::start(move |mut file, timeout| {
+    let executor = crate::tui::clipboard::Executor::start(move |mut file, timeout, _| {
         file.rewind()?;
         let mut command = std::process::Command::new("/bin/sh");
         command
@@ -883,7 +883,7 @@ async fn source_replacement_cancels_already_prepared_copy_before_clipboard_admis
     let _app = crate::session::test_support::isolate_app_dir();
     let written = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&written);
-    let executor = crate::tui::clipboard::Executor::start(move |mut file, _| {
+    let executor = crate::tui::clipboard::Executor::start(move |mut file, _, _| {
         file.rewind()?;
         let mut text = String::new();
         file.read_to_string(&mut text)?;

@@ -6,7 +6,7 @@ use std::process::Command;
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group, try_wait_status_hook,
+    restore_environment_value, terminate_process_group, try_wait_group_status,
 };
 
 pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>

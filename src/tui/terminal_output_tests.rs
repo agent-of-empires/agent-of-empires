@@ -48,6 +48,7 @@ fn stalled_terminal_bounds_actual_writes_and_recovers_framing_before_later_bytes
     let mut writer = DeadlineWriter {
         file: &mut slave,
         deadline: beginning + Duration::from_millis(20),
+        cancel: None,
         written: 0,
     };
     assert_eq!(
@@ -59,7 +60,7 @@ fn stalled_terminal_bounds_actual_writes_and_recovers_framing_before_later_bytes
     );
     assert!(beginning.elapsed() < Duration::from_secs(1));
     let mut state = State::new(slave);
-    state.interrupted(true);
+    state.interrupted(true, Instant::now() + Duration::from_millis(10));
     assert!(
         state.recovery.is_some(),
         "framing must stay pending while output cannot drain"
@@ -83,12 +84,13 @@ fn stalled_terminal_bounds_actual_writes_and_recovers_framing_before_later_bytes
         }
     }
     state
-        .recover(Instant::now() + Duration::from_secs(1))
+        .recover(Instant::now() + Duration::from_secs(1), None)
         .unwrap();
     assert!(state.recovery.is_none());
     let mut writer = DeadlineWriter {
         file: &mut state.file,
         deadline: Instant::now() + Duration::from_secs(1),
+        cancel: None,
         written: 0,
     };
     writer.write_all(b"AFTER-RECOVERY").unwrap();
@@ -201,10 +203,16 @@ fn slow_terminal_finishes_one_frame_suffix_before_osc_or_handoff() {
     );
     let mut osc_called = false;
     assert_eq!(
-        osc52_in(&output, Duration::from_millis(5), false, |_| {
-            osc_called = true;
-            Ok(())
-        })
+        osc52_in(
+            &output,
+            Duration::from_millis(5),
+            false,
+            &CancellationToken::new(),
+            |_| {
+                osc_called = true;
+                Ok(())
+            }
+        )
         .unwrap_err()
         .kind(),
         io::ErrorKind::TimedOut
@@ -233,9 +241,13 @@ fn slow_terminal_finishes_one_frame_suffix_before_osc_or_handoff() {
         }
         assert_eq!(outcome.presented, None);
     }
-    osc52_in(&output, Duration::from_secs(1), false, |writer| {
-        writer.write_all(b"AFTER-FRAME")
-    })
+    osc52_in(
+        &output,
+        Duration::from_secs(1),
+        false,
+        &CancellationToken::new(),
+        |writer| writer.write_all(b"AFTER-FRAME"),
+    )
     .unwrap();
     while !received.ends_with(b"AFTER-FRAME") {
         assert!(Instant::now() < deadline);
@@ -502,7 +514,13 @@ fn exit_retains_mode_cleanup_across_stall_and_cancels_obsolete_drawing() {
             state.file.try_clone().unwrap()
         };
         let mut received = Vec::new();
-        assert!(!restore_after_exit_in(&output, true, None).unwrap());
+        assert!(!restore_after_exit_in(
+            &output,
+            true,
+            None,
+            Instant::now() + Duration::from_millis(250)
+        )
+        .unwrap());
         resume_terminal(&resume);
         let mut shell = Output::default();
         shell.write_all(b"SHELL-READY").unwrap();
@@ -544,7 +562,12 @@ fn exit_retries_transient_coordinator_contention_before_restoring_modes() {
     std::thread::scope(|scope| {
         let cleanup = scope.spawn(|| {
             EXIT_CONTENDED.with(|observer| *observer.borrow_mut() = Some(contended));
-            restore_after_exit_in(&output, true, None)
+            restore_after_exit_in(
+                &output,
+                true,
+                None,
+                Instant::now() + Duration::from_millis(250),
+            )
         });
         observed
             .recv_timeout(Duration::from_secs(5))
@@ -595,7 +618,13 @@ fn exit_restores_modes_after_render_panic_or_poisoned_partial_frame() {
         assert!(panic.is_err());
         let mut received = Vec::new();
         drain_terminal(&mut master, &mut received);
-        assert!(restore_after_exit_in(&output, true, None).unwrap());
+        assert!(restore_after_exit_in(
+            &output,
+            true,
+            None,
+            Instant::now() + Duration::from_millis(250)
+        )
+        .unwrap());
         shell.write_all(b"SHELL-READY").unwrap();
         read_terminal_until(&mut master, &mut received, b"SHELL-READY");
         for command in [b"\x1b[?1006l".as_slice(), b"\x1b[?1049l", b"\x1b[?25h"] {
@@ -604,5 +633,125 @@ fn exit_restores_modes_after_render_panic_or_poisoned_partial_frame() {
         assert!(!received
             .windows(b"UNPAINTED-END".len())
             .any(|w| w == b"UNPAINTED-END"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn osc_shutdown_cancels_mutex_preamble_and_partial_payload_without_false_receipts() {
+    use std::sync::{mpsc, Arc};
+    for phase in ["mutex", "recovery", "control", "frame", "payload"] {
+        let (mut master, slave) = private_terminal();
+        let mut control = slave.try_clone().unwrap();
+        let mut state = State::new(slave);
+        match phase {
+            "recovery" => state.recovery = Some((b"\x18\x1b\\".to_vec(), 0)),
+            "control" => {
+                state.control = Some(PendingControl {
+                    bytes: b"\x1b[?25h".to_vec(),
+                    offset: 0,
+                })
+            }
+            "frame" => {
+                state.pending = Some(PendingFrame {
+                    id: FrameId(1),
+                    bytes: b"PENDING-FRAME".to_vec(),
+                    offset: 0,
+                    #[cfg(feature = "e2e-tests")]
+                    acknowledgement: u64::MAX,
+                })
+            }
+            _ => {}
+        }
+        if phase != "payload" {
+            block_terminal(&mut control);
+        }
+        let output = Arc::new(Mutex::new(state));
+        let held = (phase == "mutex").then(|| output.lock().unwrap());
+        let cancel = CancellationToken::new();
+        let worker_output = Arc::clone(&output);
+        let worker_cancel = cancel.clone();
+        let (blocked, observed) = mpsc::channel();
+        let (prefix, prefix_seen) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let (finished, completed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            BLOCKED_OUTPUT.with(|observer| *observer.borrow_mut() = Some(blocked));
+            let result = osc52_in(
+                &worker_output,
+                Duration::from_secs(10),
+                false,
+                &worker_cancel,
+                |writer| {
+                    if phase != "payload" {
+                        return Err(io::Error::other("cancelled preamble admitted OSC"));
+                    }
+                    writer.write_all(b"\x1b]52;c;")?;
+                    writer.flush()?;
+                    prefix.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    writer.write_all(b"PAYLOAD")
+                },
+            );
+            let _ = finished.send(result);
+        });
+        let mut received = Vec::new();
+        if phase == "payload" {
+            prefix_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+            read_terminal_until(&mut master, &mut received, b"\x1b]52;c;");
+            block_terminal(&mut control);
+            release.send(()).unwrap();
+        }
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancel.cancel();
+        let stopped = completed.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        resume_terminal(&control);
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while !worker.is_finished() && Instant::now() < deadline {
+            drain_terminal(&mut master, &mut received);
+            std::thread::yield_now();
+        }
+        worker.join().unwrap();
+        let error = stopped
+            .expect("clipboard must stop before output or mutex is released")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted, "{phase}");
+        assert!(output.lock().unwrap().completed.is_none(), "{phase}");
+        drain_terminal(&mut master, &mut received);
+        let marker = b"AFTER-CANCELLATION";
+        let mut presented = false;
+        while !presented {
+            assert!(
+                Instant::now() < deadline,
+                "{phase}: recovery did not finish"
+            );
+            drain_terminal(&mut master, &mut received);
+            presented = frame_in(&output, |_| {
+                let mut writer = Output::default();
+                writer.write_all(marker)?;
+                writer.flush()?;
+                Ok(())
+            })
+            .unwrap()
+            .presented
+            .is_some();
+        }
+        read_terminal_until(&mut master, &mut received, marker);
+        if phase == "payload" {
+            let recovery = received
+                .windows(3)
+                .position(|bytes| bytes == b"\x18\x1b\\")
+                .unwrap();
+            let later = received
+                .windows(marker.len())
+                .position(|bytes| bytes == marker)
+                .unwrap();
+            assert!(recovery < later);
+            assert!(!received
+                .windows(b"PAYLOAD".len())
+                .any(|bytes| bytes == b"PAYLOAD"));
+        }
     }
 }

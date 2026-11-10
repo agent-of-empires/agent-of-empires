@@ -194,11 +194,10 @@ transports; feedback distinguishes full desktop output, skipped OSC and failed O
 Encoding bounds every read and rejects a changed payload instead of completing a
 truncated sequence.
 
-
 App, standalone ACP attach and remote-home frames use the same terminal
 coordinator for setup, drawing, titles and teardown. Before an attached child
 owns the terminal, a suspension refuses clipboard OSC writes; it spans terminal
-mode handoff and restoration. The executor drops before terminal restoration.
+mode handoff and restoration.
 Busy handoffs are safe refusals with retry feedback, not application errors.
 Admission precedes restart preparation and editor probing or child execution.
 Admission includes the complete leave-screen control transaction before changing
@@ -209,10 +208,15 @@ is restored immediately; its result is kept while the bounded coordinator pumps
 terminal restoration before any later frame or OSC. A child is never rerun to
 complete restoration.
 
-All three terminal owners restore cooked input, cancel obsolete drawing without an
-emission receipt, and queue the final mode/title transaction behind pending controls.
-Lock admission and the final control pump share a 250 ms deadline. Permanently
-stalled output or contention past that deadline can prevent delivery before exit.
+App shutdown cancels queued and active clipboard work before restoring cooked
+input, dropping the terminal backend and joining its executor. Helpers are reaped
+on cancellation or failure; successful native clipboard owners may remain.
+OSC mutex admission, framing and payload writes observe the same cancellation.
+Interrupted framing is recovered independently of the cancelled request.
+All three terminal owners cancel obsolete drawing without an emission receipt
+and queue the final mode/title transaction behind pending controls.
+Lock admission and the final control pump share a 250 ms deadline.
+Permanently stalled output or contention past that deadline can prevent delivery before exit.
 This is bounded best-effort emission, not confirmed display-mode restoration.
 Unwritten controls disappear with the process; no detached writer races the resumed
 shell. Cooked input restoration does not wait for display output.

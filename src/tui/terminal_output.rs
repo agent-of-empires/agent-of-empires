@@ -10,6 +10,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 static OUTPUT: LazyLock<io::Result<Mutex<State>>> = LazyLock::new(|| {
     crate::process::independent_terminal_output().map(|file| Mutex::new(State::new(file)))
@@ -111,11 +112,16 @@ fn state() -> io::Result<&'static Mutex<State>> {
 struct DeadlineWriter<'a> {
     file: &'a mut File,
     deadline: Instant,
+    cancel: Option<&'a CancellationToken>,
     written: usize,
 }
 impl Write for DeadlineWriter<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let mut ready_without_progress = false;
         loop {
+            if self.cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
             let remaining = self.deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(io::ErrorKind::TimedOut.into());
@@ -127,9 +133,27 @@ impl Write for DeadlineWriter<'_> {
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    match crate::process::terminal_writable(self.file, remaining) {
+                    #[cfg(test)]
+                    observe_blocked_output();
+                    if ready_without_progress {
+                        std::thread::park_timeout(remaining.min(Duration::from_millis(1)));
+                        ready_without_progress = false;
+                        continue;
+                    }
+                    let wait = if self.cancel.is_some() {
+                        remaining.min(Duration::from_millis(10))
+                    } else {
+                        remaining
+                    };
+                    match crate::process::terminal_writable(self.file, wait) {
+                        Ok(()) => ready_without_progress = true,
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                        result => result?,
+                        Err(error)
+                            if self.cancel.is_some() && error.kind() == io::ErrorKind::TimedOut =>
+                        {
+                            continue
+                        }
+                        Err(error) => return Err(error),
                     }
                 }
                 Err(error) => return Err(error),
@@ -137,6 +161,9 @@ impl Write for DeadlineWriter<'_> {
         }
     }
     fn flush(&mut self) -> io::Result<()> {
+        if self.cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
         if Instant::now() >= self.deadline {
             Err(io::ErrorKind::TimedOut.into())
         } else {
@@ -157,13 +184,18 @@ impl State {
         }
     }
 
-    fn write_control(&mut self, deadline: Instant) -> io::Result<bool> {
+    fn write_control(
+        &mut self,
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> io::Result<bool> {
         let Some(control) = self.control.as_mut() else {
             return Ok(true);
         };
         let mut writer = DeadlineWriter {
             file: &mut self.file,
             deadline,
+            cancel,
             written: 0,
         };
         let result = writer
@@ -183,13 +215,18 @@ impl State {
         }
     }
 
-    fn write_pending(&mut self, deadline: Instant) -> io::Result<bool> {
+    fn write_pending(
+        &mut self,
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> io::Result<bool> {
         let Some(pending) = self.pending.as_mut() else {
             return Ok(true);
         };
         let mut writer = DeadlineWriter {
             file: &mut self.file,
             deadline,
+            cancel,
             written: 0,
         };
         let result = writer
@@ -216,20 +253,21 @@ impl State {
             Err(error) => {
                 let pending = self.pending.take().expect("failed frame");
                 if pending.offset != 0 {
-                    self.interrupted(std::env::var_os("TMUX").is_some());
+                    self.interrupted(std::env::var_os("TMUX").is_some(), deadline);
                 }
                 Err(error)
             }
         }
     }
 
-    fn recover(&mut self, deadline: Instant) -> io::Result<()> {
+    fn recover(&mut self, deadline: Instant, cancel: Option<&CancellationToken>) -> io::Result<()> {
         let Some((bytes, offset)) = self.recovery.as_mut() else {
             return Ok(());
         };
         let mut writer = DeadlineWriter {
             file: &mut self.file,
             deadline,
+            cancel,
             written: 0,
         };
         let result = writer
@@ -242,7 +280,7 @@ impl State {
         }
         result
     }
-    fn interrupted(&mut self, tmux: bool) {
+    fn interrupted(&mut self, tmux: bool, deadline: Instant) {
         // CAN cancels the inner string; ST closes any outer tmux DCS.
         // A separately wrapped CAN reaches terminals behind tmux passthrough.
         let mut bytes = b"\x18\x1b\\".to_vec();
@@ -252,7 +290,10 @@ impl State {
         bytes.extend_from_slice(b"\x1b[?2026l\x1b]8;;\x1b\\\x1b[0m");
         self.recovery = Some((bytes, 0));
         REDRAW.store(true, Ordering::Release);
-        let _ = self.recover(Instant::now() + Duration::from_millis(10));
+        let _ = self.recover(
+            deadline.min(Instant::now() + Duration::from_millis(10)),
+            None,
+        );
     }
 }
 
@@ -286,17 +327,17 @@ fn suspend_in(output: &Mutex<State>) -> io::Result<()> {
         return Err(io::ErrorKind::WouldBlock.into());
     }
     let deadline = Instant::now() + Duration::from_millis(5);
-    if let Err(error) = state.recover(deadline) {
+    if let Err(error) = state.recover(deadline, None) {
         return Err(if is_backpressure(&error) {
             io::ErrorKind::WouldBlock.into()
         } else {
             error
         });
     }
-    if !state.write_control(deadline)? {
+    if !state.write_control(deadline, None)? {
         return Err(io::ErrorKind::WouldBlock.into());
     }
-    if !state.write_pending(deadline)? {
+    if !state.write_pending(deadline, None)? {
         return Err(io::ErrorKind::WouldBlock.into());
     }
     state.suspended = true;
@@ -365,7 +406,7 @@ impl Suspension {
             bytes: leave,
             offset: 0,
         });
-        state.write_control(Instant::now() + Duration::from_millis(20))
+        state.write_control(Instant::now() + Duration::from_millis(20), None)
     }
 }
 
@@ -388,22 +429,26 @@ impl Drop for Suspension {
 }
 
 /// Finish output after restoring cooked input; drawing no longer owns the terminal.
-pub(crate) fn restore_after_exit(disable_mouse: bool, title: Option<&str>) -> io::Result<bool> {
+pub(crate) fn restore_after_exit(
+    disable_mouse: bool,
+    title: Option<&str>,
+    deadline: Instant,
+) -> io::Result<bool> {
     let result = (|| {
         #[cfg(test)]
         if let Some(output) = TEST_OUTPUT.with(|output| output.borrow().clone()) {
-            return restore_after_exit_in(&output, disable_mouse, title);
+            return restore_after_exit_in(&output, disable_mouse, title, deadline);
         }
-        restore_after_exit_in(state()?, disable_mouse, title)
+        restore_after_exit_in(state()?, disable_mouse, title, deadline)
     })();
     match &result {
         Ok(true) => {}
         Ok(false) => tracing::warn!(
-            target: "tui.terminal_output",
+            target: "tui.output",
             "terminal display cleanup incomplete before bounded exit"
         ),
         Err(error) => tracing::warn!(
-            target: "tui.terminal_output",
+            target: "tui.output",
             %error,
             "terminal display cleanup failed"
         ),
@@ -415,6 +460,7 @@ fn restore_after_exit_in(
     output: &Mutex<State>,
     disable_mouse: bool,
     title: Option<&str>,
+    deadline: Instant,
 ) -> io::Result<bool> {
     let mut bytes = Vec::new();
     #[cfg(unix)]
@@ -431,7 +477,6 @@ fn restore_after_exit_in(
     if let Some(title) = title {
         crossterm::queue!(&mut bytes, crossterm::terminal::SetTitle(title))?;
     }
-    let deadline = Instant::now() + Duration::from_millis(250);
     let (mut state, poisoned) = loop {
         match output.try_lock() {
             Ok(state) => break (state, false),
@@ -455,7 +500,7 @@ fn restore_after_exit_in(
     // Exit cancels obsolete drawing without acknowledging an unseen frame.
     let partial = state.pending.take().is_some_and(|frame| frame.offset != 0);
     if poisoned || partial {
-        state.interrupted(std::env::var_os("TMUX").is_some());
+        state.interrupted(std::env::var_os("TMUX").is_some(), deadline);
     }
     state.completed = None;
     if let Some(control) = state.control.as_mut() {
@@ -463,14 +508,14 @@ fn restore_after_exit_in(
     } else {
         state.control = Some(PendingControl { bytes, offset: 0 });
     }
-    if let Err(error) = state.recover(deadline) {
+    if let Err(error) = state.recover(deadline, None) {
         return if is_backpressure(&error) {
             Ok(false)
         } else {
             Err(error)
         };
     }
-    state.write_control(deadline)
+    state.write_control(deadline, None)
 }
 
 /// Capture at most one frame; retain a partial write until its own receipt is emitted.
@@ -501,17 +546,17 @@ fn frame_in(
     if state.suspended {
         return Ok(FrameOutcome::default());
     }
-    if let Err(error) = state.recover(Instant::now() + Duration::from_millis(5)) {
+    if let Err(error) = state.recover(Instant::now() + Duration::from_millis(5), None) {
         if is_backpressure(&error) {
             return Ok(FrameOutcome::default());
         }
         return Err(error.into());
     }
-    if !state.write_control(Instant::now() + Duration::from_millis(20))? {
+    if !state.write_control(Instant::now() + Duration::from_millis(20), None)? {
         return Ok(FrameOutcome::default());
     }
     if state.pending.is_some() || state.completed.is_some() {
-        state.write_pending(Instant::now() + Duration::from_millis(20))?;
+        state.write_pending(Instant::now() + Duration::from_millis(20), None)?;
         let presented = state.completed.take();
         REDRAW.store(true, Ordering::Release);
         return Ok(FrameOutcome {
@@ -544,7 +589,7 @@ fn frame_in(
         #[cfg(feature = "e2e-tests")]
         acknowledgement,
     });
-    state.write_pending(Instant::now() + Duration::from_millis(20))?;
+    state.write_pending(Instant::now() + Duration::from_millis(20), None)?;
     Ok(FrameOutcome {
         captured: Some(id),
         presented: state.completed.take(),
@@ -554,39 +599,56 @@ fn frame_in(
 pub(crate) fn osc52(
     timeout: Duration,
     tmux: bool,
+    cancel: &CancellationToken,
     operation: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
     #[cfg(test)]
     if let Some(output) = TEST_OUTPUT.with(|output| output.borrow().clone()) {
-        return osc52_in(&output, timeout, tmux, operation);
+        return osc52_in(&output, timeout, tmux, cancel, operation);
     }
-    osc52_in(state()?, timeout, tmux, operation)
+    osc52_in(state()?, timeout, tmux, cancel, operation)
 }
 
 fn osc52_in(
     output: &Mutex<State>,
     timeout: Duration,
     tmux: bool,
+    cancel: &CancellationToken,
     operation: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> io::Result<()> {
-    let mut state = output
-        .lock()
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let deadline = Instant::now() + timeout;
+    let mut state = loop {
+        if cancel.is_cancelled() {
+            return Err(io::ErrorKind::ConnectionAborted.into());
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        match output.try_lock() {
+            Ok(state) => break state,
+            Err(TryLockError::Poisoned(error)) => return Err(io::Error::other(error.to_string())),
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                observe_blocked_output();
+                std::thread::park_timeout(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    };
     if state.suspended {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
             "terminal belongs to an attached child",
         ));
     }
-    let deadline = Instant::now() + timeout;
-    state.recover(deadline)?;
-    if !state.write_control(deadline)? {
+    state.recover(deadline, Some(cancel))?;
+    if !state.write_control(deadline, Some(cancel))? {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "terminal restoration is still pending",
         ));
     }
-    if !state.write_pending(deadline)? {
+    if !state.write_pending(deadline, Some(cancel))? {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "terminal frame is still pending",
@@ -595,11 +657,12 @@ fn osc52_in(
     let mut writer = DeadlineWriter {
         file: &mut state.file,
         deadline,
+        cancel: Some(cancel),
         written: 0,
     };
     let result = operation(&mut writer).and_then(|_| writer.flush());
     if result.is_err() && writer.written != 0 {
-        state.interrupted(tmux);
+        state.interrupted(tmux, deadline);
     }
     result
 }
@@ -639,17 +702,18 @@ impl Output {
             .try_lock()
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         let deadline = Instant::now() + Duration::from_millis(20);
-        state.recover(deadline)?;
-        if !state.write_control(deadline)? {
+        state.recover(deadline, None)?;
+        if !state.write_control(deadline, None)? {
             return Err(io::ErrorKind::WouldBlock.into());
         }
-        if !state.write_pending(deadline)? {
+        if !state.write_pending(deadline, None)? {
             return Err(io::ErrorKind::WouldBlock.into());
         }
         let bytes = std::mem::take(&mut self.buffer);
         let mut writer = DeadlineWriter {
             file: &mut state.file,
             deadline,
+            cancel: None,
             written: 0,
         };
         let result = writer.write_all(&bytes).and_then(|_| writer.flush());
@@ -657,7 +721,7 @@ impl Output {
             if writer.written == 0 {
                 self.buffer = bytes;
             } else {
-                state.interrupted(std::env::var_os("TMUX").is_some());
+                state.interrupted(std::env::var_os("TMUX").is_some(), deadline);
             }
         }
         result
@@ -668,6 +732,16 @@ impl Output {
 thread_local! {
     static TEST_OUTPUT: RefCell<Option<std::sync::Arc<Mutex<State>>>> = const { RefCell::new(None) };
     static EXIT_CONTENDED: RefCell<Option<std::sync::mpsc::Sender<()>>> = const { RefCell::new(None) };
+    static BLOCKED_OUTPUT: RefCell<Option<std::sync::mpsc::Sender<()>>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn observe_blocked_output() {
+    BLOCKED_OUTPUT.with(|observer| {
+        if let Some(observer) = observer.borrow_mut().take() {
+            let _ = observer.send(());
+        }
+    });
 }
 
 #[cfg(test)]
@@ -691,9 +765,10 @@ impl TestOutput {
     pub(crate) fn osc52(
         &self,
         timeout: Duration,
+        cancel: &CancellationToken,
         operation: impl FnOnce(&mut dyn Write) -> io::Result<()>,
     ) -> io::Result<()> {
-        osc52_in(&self.0, timeout, false, operation)
+        osc52_in(&self.0, timeout, false, cancel, operation)
     }
 }
 

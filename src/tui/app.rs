@@ -98,8 +98,8 @@ struct PendingPresentation {
 }
 
 pub struct App {
-    home: HomeView,
     _clipboard: super::clipboard::Executor,
+    home: HomeView,
     tool_detection: Option<ToolDetection>,
     available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
     pending_forced_tool_detection: bool,
@@ -296,6 +296,10 @@ impl App {
 
     pub fn hyperlink_cells(&self) -> crate::tui::hyperlink::SharedHyperlinks {
         self.home.hyperlink_cells.clone()
+    }
+
+    pub(super) fn clipboard_stop_handle(&self) -> super::clipboard::StopHandle {
+        self._clipboard.stop_handle()
     }
 
     pub fn new(
@@ -3901,13 +3905,17 @@ mod tests {
         let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release, released) = std::sync::mpsc::sync_channel(1);
         let clipboard = std::thread::spawn(move || {
-            output.osc52(Duration::from_secs(5), |writer| {
-                writer.write_all(b"\x1b]52;c;")?;
-                writer.flush()?;
-                entered.send(()).unwrap();
-                released.recv_timeout(Duration::from_secs(5)).unwrap();
-                writer.write_all(b"\x07")
-            })
+            output.osc52(
+                Duration::from_secs(5),
+                &tokio_util::sync::CancellationToken::new(),
+                |writer| {
+                    writer.write_all(b"\x1b]52;c;")?;
+                    writer.flush()?;
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    writer.write_all(b"\x07")
+                },
+            )
         });
         entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         for action in [
@@ -4745,7 +4753,7 @@ mod tests {
         // Loaded old document can prepare complete copies, but cannot own a new lifecycle's input.
         let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let output = written.clone();
-        app._clipboard = crate::tui::clipboard::Executor::start(move |mut file, _| {
+        app._clipboard = crate::tui::clipboard::Executor::start(move |mut file, _, _| {
             use std::io::{Read, Seek};
             file.rewind()?;
             let mut text = String::new();

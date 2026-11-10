@@ -186,29 +186,16 @@ Large histories are processed off the UI thread and stored in temporary files.
 Only visible text and fixed-size caches stay in memory; an unusually large
 visible grapheme still needs its full bytes. A first visit at a new width may
 show preparation in progress. Scrolling and copy can revisit evicted windows;
-there is no transcript-size or application clipboard-size cutoff.
-Desktop clipboard helpers and terminal OSC 52 support can impose their own
-limits. An OSC 52 write confirms emission, not clipboard acceptance.
+there is no transcript-size cutoff. Desktop clipboard helpers receive complete
+exports without an application size cap. OSC 52 skips copies above 1 MiB
+(1,048,576 raw bytes), with explicit feedback. Larger copies require a desktop
+helper. An OSC 52 write confirms emission, not clipboard acceptance; terminals
+may impose lower limits.
 
-Clipboard requests belong to the application, not the reader view. New requests
-replace older pending preparation; admitted helper and terminal output remains
-serialized across live and retained copies. Copy while a retained window is
-loading is refused with retry feedback rather than reporting an earlier window.
-Clipboard feedback distinguishes a queued request, completed desktop output,
-and OSC 52 emission. Queuing never means the text was copied. A slow clipboard
-must not prevent input or cancellation. Terminal clipboard acceptance and
-rollback cannot be confirmed by AoE.
-A source replacement cancels a prepared copy before clipboard admission. While
-a screen frame is still unsent, drag selection cannot copy unseen rows. Busy
-terminal attachment or editor handoffs keep the application and pending input
-open with retry feedback.
-Approval and question actions require the corresponding request to have reached
-the screen; an older frame cannot authorize its unseen replacement. Draft editing
-remains available. If terminal handoff controls stall, the child is refused and
-input stays live until ordered restoration finishes. A completed child is never
-rerun just because screen restoration is delayed.
-
-
+Clipboard feedback distinguishes queued requests, completed desktop copies and
+OSC 52 emission. Queuing never means the text was copied. Copy while history is
+loading is refused with retry feedback. A source change cancels an outdated
+prepared copy.
 
 Retained tabs display at four-column stops and copy as original tabs. Distinct
 tool invocations remain distinct when an agent reuses a tool ID; replacement

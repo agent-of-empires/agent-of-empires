@@ -92,7 +92,9 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     let result = run(&mut terminal, &mut event_stream, &theme, session_id).await;
 
     disable_raw_mode()?;
-    crate::tui::terminal_output::restore_after_exit(true, None)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    drop(terminal);
+    crate::tui::terminal_output::restore_after_exit(true, None, deadline)?;
     result
 }
 
@@ -2136,12 +2138,16 @@ mod tests {
                 let (entered, observed) = std::sync::mpsc::sync_channel(1);
                 let (finish, finished) = std::sync::mpsc::sync_channel(1);
                 writer = Some(std::thread::spawn(move || {
-                    output.osc52(Duration::from_secs(5), |bytes| {
-                        bytes.write_all(b"\x1b]52;c;")?;
-                        entered.send(()).unwrap();
-                        finished.recv_timeout(Duration::from_secs(5)).unwrap();
-                        bytes.write_all(b"\x07")
-                    })
+                    output.osc52(
+                        Duration::from_secs(5),
+                        &tokio_util::sync::CancellationToken::new(),
+                        |bytes| {
+                            bytes.write_all(b"\x1b]52;c;")?;
+                            entered.send(()).unwrap();
+                            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+                            bytes.write_all(b"\x07")
+                        },
+                    )
                 }));
                 observed.recv_timeout(Duration::from_secs(2)).unwrap();
                 release = Some(finish);

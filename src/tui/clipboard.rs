@@ -8,6 +8,7 @@ use std::{
     io::{self, Read, Seek, Write},
     process::{Command, Stdio},
 };
+use tokio_util::sync::CancellationToken;
 
 static ACTIVE: Mutex<Weak<Shared>> = Mutex::new(Weak::new());
 
@@ -20,17 +21,36 @@ struct Pending {
 struct Queue {
     latest: u64,
     pending: Option<Pending>,
-    stopped: bool,
     live: Option<(u64, tokio::sync::oneshot::Receiver<io::Result<CopyReport>>)>,
 }
 struct Shared {
     queue: Mutex<Queue>,
     ready: Condvar,
+    cancel: CancellationToken,
 }
 
 pub(crate) struct Executor {
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+pub(super) struct StopHandle(Weak<Shared>);
+
+impl StopHandle {
+    pub(super) fn stop(&self) {
+        if let Some(shared) = self.0.upgrade() {
+            shared.stop();
+        }
+    }
+}
+
+impl Shared {
+    fn stop(&self) {
+        let mut queue = self.queue.lock().unwrap_or_else(|error| error.into_inner());
+        self.cancel.cancel();
+        queue.pending = None;
+        self.ready.notify_all();
+    }
 }
 impl Executor {
     pub fn new() -> io::Result<Self> {
@@ -45,17 +65,22 @@ impl Executor {
         *ACTIVE.lock().unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&self.shared);
     }
 
+    pub(super) fn stop_handle(&self) -> StopHandle {
+        StopHandle(Arc::downgrade(&self.shared))
+    }
     pub(super) fn start(
-        mut output: impl FnMut(File, Duration) -> io::Result<CopyReport> + Send + 'static,
+        mut output: impl FnMut(File, Duration, &CancellationToken) -> io::Result<CopyReport>
+            + Send
+            + 'static,
     ) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
                 latest: 0,
                 pending: None,
-                stopped: false,
                 live: None,
             }),
             ready: Condvar::new(),
+            cancel: CancellationToken::new(),
         });
         let worker = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -66,13 +91,13 @@ impl Executor {
                         .queue
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    while !queue.stopped && queue.pending.is_none() {
+                    while !worker.cancel.is_cancelled() && queue.pending.is_none() {
                         queue = worker
                             .ready
                             .wait(queue)
                             .unwrap_or_else(|error| error.into_inner());
                     }
-                    if queue.stopped {
+                    if worker.cancel.is_cancelled() {
                         break;
                     }
                     let pending = queue.pending.take().expect("clipboard request available");
@@ -81,7 +106,7 @@ impl Executor {
                     }
                     pending
                 };
-                let result = output(pending.file, pending.timeout);
+                let result = output(pending.file, pending.timeout, &worker.cancel);
                 let _ = pending.reply.send(result);
             })?;
         Ok(Self {
@@ -114,16 +139,7 @@ impl Executor {
 }
 impl Drop for Executor {
     fn drop(&mut self) {
-        {
-            let mut queue = self
-                .shared
-                .queue
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            queue.stopped = true;
-            queue.pending = None;
-            self.shared.ready.notify_one();
-        }
+        self.shared.stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -148,7 +164,7 @@ fn reserve_for(shared: &Arc<Shared>) -> io::Result<Ticket> {
         .queue
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    if queue.stopped {
+    if shared.cancel.is_cancelled() {
         return Err(io::ErrorKind::Interrupted.into());
     }
     queue.latest = queue
@@ -168,7 +184,7 @@ impl Ticket {
                 .queue
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            !queue.stopped && queue.latest == self.number
+            !shared.cancel.is_cancelled() && queue.latest == self.number
         })
     }
     pub fn submit(
@@ -184,7 +200,7 @@ impl Ticket {
             .queue
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if queue.stopped || queue.latest != self.number {
+        if shared.cancel.is_cancelled() || queue.latest != self.number {
             return Err(io::ErrorKind::Interrupted.into());
         }
         let (reply, result) = tokio::sync::oneshot::channel();
@@ -282,14 +298,24 @@ pub fn copy_to_clipboard(text: &str) -> String {
     }
 }
 
-fn copy_file_with_timeout(mut file: File, timeout: std::time::Duration) -> io::Result<CopyReport> {
+fn copy_file_with_timeout(
+    mut file: File,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> io::Result<CopyReport> {
+    if cancel.is_cancelled() {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
     let bytes = file.metadata()?.len();
-    let desktop = try_subprocess(&mut file, timeout);
+    let desktop = try_subprocess(&mut file, timeout, cancel);
+    if cancel.is_cancelled() {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
     let osc52 = if bytes > OSC52_MAX_BYTES {
         Osc52Outcome::SkippedForSize
     } else {
         let tmux = std::env::var_os("TMUX").is_some();
-        match super::terminal_output::osc52(timeout, tmux, |output| {
+        match super::terminal_output::osc52(timeout, tmux, cancel, |output| {
             write_osc52(&mut file, output, tmux, bytes)
         }) {
             Ok(()) => Osc52Outcome::Emitted,
@@ -318,10 +344,17 @@ fn copy_file_with_timeout(mut file: File, timeout: std::time::Duration) -> io::R
     })
 }
 
-fn try_subprocess(file: &mut File, timeout: std::time::Duration) -> Result<&'static str, String> {
+fn try_subprocess(
+    file: &mut File,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<&'static str, String> {
     let mut errors = String::new();
     for (command, arguments) in crate::process::clipboard_commands() {
-        match run_subprocess(command, arguments, file, timeout) {
+        if cancel.is_cancelled() {
+            return Err("clipboard output cancelled".into());
+        }
+        match run_subprocess(command, arguments, file, timeout, cancel) {
             Ok(()) => return Ok(command),
             Err(error) => {
                 if !errors.is_empty() {
@@ -342,15 +375,25 @@ fn run_subprocess(
     arguments: &[&str],
     file: &mut File,
     timeout: std::time::Duration,
+    cancel: &CancellationToken,
 ) -> io::Result<()> {
     file.rewind()?;
-    let mut child = Command::new(command)
+    let mut command = Command::new(command);
+    command
         .args(arguments)
         .stdin(file.try_clone()?)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    match crate::process::wait_with_timeout(&mut child, timeout)? {
+        .stderr(Stdio::null());
+    let status = crate::process::run_status_with_timeout_process_group(
+        &mut command,
+        timeout,
+        Some(cancel),
+        crate::process::ProcessGroupCleanup::OnFailure,
+    )?;
+    if cancel.is_cancelled() {
+        return Err(io::ErrorKind::ConnectionAborted.into());
+    }
+    match status {
         Some(status) if status.success() => Ok(()),
         Some(status) => Err(io::Error::other(format!("exit {status}"))),
         None => Err(io::Error::new(
@@ -415,6 +458,121 @@ fn sequence(
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    #[serial_test::serial]
+    fn executor_stop_reaps_held_helper_without_fallback_or_terminal_emission() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let started = root.path().join("started");
+        let calls = root.path().join("calls");
+        let gate = root.path().join("gate");
+        nix::unistd::mkfifo(
+            &gate,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        struct ReleaseGate(File);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let _ = writeln!(self.0, "release");
+            }
+        }
+        let mut release = ReleaseGate(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&gate)
+                .unwrap(),
+        );
+        let commands: Vec<_> = crate::process::clipboard_commands().collect();
+        for (command, _) in &commands {
+            let path = bin.join(command);
+            std::fs::write(&path, format!(
+                "#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' \"$0\" >> {}\nprintf '%s\\n' \"$$\" > {}\nIFS= read -r release < {}\n",
+                shell_words::quote(calls.to_str().unwrap()),
+                shell_words::quote(started.to_str().unwrap()),
+                shell_words::quote(gate.to_str().unwrap()),
+            )).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .unwrap();
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", path)]);
+        let (mut master, slave) = super::super::terminal_output::tests::private_terminal();
+        let _control = slave.try_clone().unwrap();
+        let executor = Executor::start(move |file, timeout, cancel| {
+            let (_guard, _) =
+                super::super::terminal_output::install_test_output(slave.try_clone()?);
+            copy_file_with_timeout(file, timeout, cancel)
+        })
+        .unwrap();
+        let ticket = reserve_for(&executor.shared).unwrap();
+        let mut export = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        export.write_all(b"owned export").unwrap();
+        let result = ticket
+            .submit(finalize_export(export).unwrap(), Duration::from_secs(30))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&started)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "clipboard helper did not start");
+            std::thread::yield_now();
+        };
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .unwrap();
+        let helper = crate::process::CapturedProcess::capture(pid, &birth)
+            .unwrap()
+            .unwrap();
+        executor.stop_handle().stop();
+        let (finished, stopped) = std::sync::mpsc::channel();
+        let joining = std::thread::spawn(move || {
+            drop(executor);
+            let _ = finished.send(());
+        });
+        let prompt_stop = stopped.recv_timeout(Duration::from_secs(2));
+        if prompt_stop.is_err() {
+            writeln!(release.0, "release").unwrap();
+        }
+        joining.join().unwrap();
+        prompt_stop.expect("shutdown must not wait for the retained copy's 30s timeout");
+        assert_eq!(
+            result.blocking_recv().unwrap().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert!(helper.exited().unwrap());
+        let mut status = 0;
+        // SAFETY: this was the acknowledged direct helper; no signal is sent.
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        assert_eq!(
+            std::fs::read_to_string(calls).unwrap(),
+            format!("{}\n", bin.join(commands[0].0).display())
+        );
+        let mut byte = [0];
+        assert_eq!(
+            master.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn osc52_respects_raw_byte_limit_in_plain_and_tmux_sequences() {
@@ -500,7 +658,9 @@ mod tests {
             export.write_all(&payload).unwrap();
             let mut input = finalize_export(export).unwrap();
             assert!(input.write_all(b"must not mutate").is_err());
-            let report = copy_file_with_timeout(input, Duration::from_secs(2)).unwrap();
+            let report =
+                copy_file_with_timeout(input, Duration::from_secs(2), &CancellationToken::new())
+                    .unwrap();
             assert!(matches!(report.osc52, Osc52Outcome::SkippedForSize));
             assert_eq!(report.bytes, payload.len() as u64);
             let helper = report.desktop.expect("full desktop copy completed");
@@ -519,9 +679,12 @@ mod tests {
         }
         let mut export = tempfile::NamedTempFile::new_in(root.path()).unwrap();
         export.write_all(&payload).unwrap();
-        let error =
-            copy_file_with_timeout(finalize_export(export).unwrap(), Duration::from_secs(2))
-                .unwrap_err();
+        let error = copy_file_with_timeout(
+            finalize_export(export).unwrap(),
+            Duration::from_secs(2),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
@@ -531,7 +694,7 @@ mod tests {
         let (release, gate) = std::sync::mpsc::channel();
         let written = Arc::new(Mutex::new(Vec::new()));
         let output = Arc::clone(&written);
-        let executor = Executor::start(move |mut file, _| {
+        let executor = Executor::start(move |mut file, _, _| {
             file.rewind()?;
             let mut text = String::new();
             file.read_to_string(&mut text)?;
@@ -592,7 +755,7 @@ mod tests {
 fn live_feedback_waits_for_actual_output_and_reports_failure() {
     let (entered, started) = std::sync::mpsc::channel();
     let (release, gate) = std::sync::mpsc::channel();
-    let executor = Executor::start(move |_, _| {
+    let executor = Executor::start(move |_, _, _| {
         entered.send(()).unwrap();
         gate.recv().unwrap();
         Err(io::Error::other("desktop and terminal output refused"))

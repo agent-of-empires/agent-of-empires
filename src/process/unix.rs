@@ -84,8 +84,10 @@ pub(super) fn kill_process_group(child: &Child) {
     signal_process_group(child, nix::sys::signal::Signal::SIGKILL);
 }
 
-pub(super) fn try_wait_status_hook(
+pub(super) fn try_wait_group_status(
     child: &mut Child,
+    cleanup: super::ProcessGroupCleanup,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     use nix::libc;
     // nix gates `waitid` off on macOS, so call libc directly on every Unix.
@@ -101,8 +103,14 @@ pub(super) fn try_wait_status_hook(
     if unsafe { info.si_pid() } == 0 {
         return Ok(None);
     }
+    let transferred = cleanup == super::ProcessGroupCleanup::OnFailure
+        && info.si_code == libc::CLD_EXITED
+        && unsafe { info.si_status() } == 0
+        && cancel.is_none_or(|cancel| !cancel.is_cancelled());
     // Retain the exited leader until cleanup so its group ID cannot be reused.
-    kill_process_group(child);
+    if !transferred {
+        kill_process_group(child);
+    }
     child.wait().map(Some)
 }
 

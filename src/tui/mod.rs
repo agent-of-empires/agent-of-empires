@@ -132,27 +132,13 @@ fn env_mouse_capture_allows() -> bool {
         .unwrap_or(true)
 }
 
-/// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
-/// alternate screen, bracketed paste, the kitty keyboard protocol
-/// `DISAMBIGUATE_ESCAPE_CODES` flag (so `Shift+Enter` arrives as a distinct
-/// `KeyEvent` instead of collapsing to bare CR, #2362), and (when requested)
-/// mouse capture; the `Drop` impl reverses all of it. Because it runs on drop,
-/// the terminal is restored on EVERY exit path, including a panic mid-render,
-/// where the old inline teardown was skipped and left the terminal wedged (raw
-/// mode / mouse reporting / enhancement stack stuck on). Drop is best-effort
-/// and never panics.
-///
-/// The kitty-enhancement pop depends on Rust's default `panic = "unwind"`. A future
-/// profile that sets `panic = "abort"` would skip every Drop here and leak
-/// raw mode, alt screen, paste, mouse, and the enhancement stack into the
-/// user's shell; recovery from a leaked enhancement stack is
-/// `printf '\e[<1u'`. Same exposure as a SIGKILL/SIGSEGV mid-TUI.
+/// Restore cooked input before joining application workers, including on unwind.
+/// Display cleanup is bounded best effort; aborts and fatal signals skip Drop.
 struct TerminalGuard {
-    /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
-    /// gate: under Mosh we never enable capture, so we must not disable it
-    /// either; otherwise we always disable (a mid-session settings toggle can
-    /// turn it on after startup, so we can't gate on the startup value).
+    // Mosh never captures the mouse; other terminals may toggle capture at runtime.
     disable_mouse: bool,
+    clipboard: Option<clipboard::StopHandle>,
+    terminal: Option<terminal_output::Terminal<app::TuiBackend>>,
 }
 
 impl TerminalGuard {
@@ -167,7 +153,11 @@ impl TerminalGuard {
         if enable_mouse {
             if let Err(err) = execute!(stdout, EnableMouseCapture) {
                 let _ = disable_raw_mode();
-                let _ = terminal_output::restore_after_exit(true, None);
+                let _ = terminal_output::restore_after_exit(
+                    true,
+                    None,
+                    std::time::Instant::now() + std::time::Duration::from_millis(250),
+                );
                 return Err(err.into());
             }
         }
@@ -186,15 +176,22 @@ impl TerminalGuard {
         }
         Ok(Self {
             disable_mouse: !mosh_active,
+            clipboard: None,
+            terminal: None,
         })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.stop();
+        }
         let _ = disable_raw_mode();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        drop(self.terminal.take());
         let title = host_title::take_emitted().then_some(host_title::FALLBACK_TITLE);
-        let _ = terminal_output::restore_after_exit(self.disable_mouse, title);
+        let _ = terminal_output::restore_after_exit(self.disable_mouse, title, deadline);
     }
 }
 
@@ -326,7 +323,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         startup_session_config.session_id_poller_max_threads,
     );
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
-    let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
+    let guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 
     // Config warnings have no tracing subscriber in TUI mode, so they surface
     // as a dialog. Known before `App::new` so first-run dialogs are suppressed
@@ -358,6 +355,8 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         mosh_active,
         file_watch,
     )?;
+    let mut terminal_guard = guard;
+    terminal_guard.clipboard = Some(app.clipboard_stop_handle());
     if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
@@ -366,13 +365,18 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         terminal_output::Output::default(),
         app.hyperlink_cells(),
     );
-    let mut terminal = terminal_output::Terminal::new(backend)?;
-    let result = app.run(&mut terminal).await;
+    terminal_guard.terminal = Some(terminal_output::Terminal::new(backend)?);
+    let result = app
+        .run(
+            terminal_guard
+                .terminal
+                .as_mut()
+                .expect("terminal initialized"),
+        )
+        .await;
 
     crate::session::clear_tui_heartbeat();
 
-    // `_terminal_guard` restores the terminal on drop.
-    drop(terminal);
     result
 }
 

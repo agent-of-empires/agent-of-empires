@@ -179,6 +179,14 @@ fn app_processes_input_and_exits_while_terminal_output_stays_stalled() {
         },
         0
     );
+    let mut original = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+    assert_eq!(
+        unsafe { nix::libc::tcgetattr(slave_fd, original.as_mut_ptr()) },
+        0
+    );
+    let original = unsafe { original.assume_init() };
+    let input_modes = nix::libc::ICANON | nix::libc::ECHO | nix::libc::ISIG;
+    assert_eq!(original.c_lflag & input_modes, input_modes);
     struct OwnedChild(Child);
     impl Drop for OwnedChild {
         fn drop(&mut self) {
@@ -263,5 +271,135 @@ fn app_processes_input_and_exits_while_terminal_output_stays_stalled() {
                 assert!(status.success(), "App exit failed: {status}");
             })
             .ok_or_else(|| "App exit blocked on permanently stalled terminal".into())
+    });
+    let mut restored = std::mem::MaybeUninit::<nix::libc::termios>::uninit();
+    assert_eq!(
+        unsafe { nix::libc::tcgetattr(slave_fd, restored.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(
+        unsafe { restored.assume_init() }.c_lflag & input_modes,
+        original.c_lflag & input_modes
+    );
+}
+
+#[test]
+#[parallel]
+fn retained_copy_quit_reaps_hung_helper_before_its_thirty_second_timeout() {
+    use agent_of_empires::{
+        acp::{event_store::EventStore, state::Event},
+        session::{Instance, Status},
+    };
+    require_tmux!();
+    let mut h = TuiTestHarness::new_in_tmp("retained_copy_exit");
+    h.stop_daemon_on_drop();
+    let gate = h.home_path().join("clipboard-gate");
+    nix::unistd::mkfifo(
+        &gate,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    struct ReleaseGate(std::fs::File);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            let _ = writeln!(self.0, "release");
+        }
+    }
+    let _release = ReleaseGate(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&gate)
+            .unwrap(),
+    );
+    let started = h.home_path().join("clipboard-started");
+    let bin = h.home_path().join("clipboard-bin");
+    fs::create_dir(&bin).unwrap();
+    for command in ["wl-copy", "xclip", "xsel", "pbcopy"] {
+        write_executable(&bin.join(command),
+            "#!/bin/sh\ntrap '' TERM\n/bin/cat > \"$0.copied\"\nprintf '%s\\n' \"$$\" > \"$AOE_CLIPBOARD_STARTED\"\nIFS= read -r release < \"$AOE_CLIPBOARD_GATE\"\n");
+    }
+    h.add_path_dir(&bin);
+    h.set_env("WAYLAND_DISPLAY", "aoe-clipboard-test");
+    h.set_env("AOE_CLIPBOARD_STARTED", &started);
+    h.set_env("AOE_CLIPBOARD_GATE", &gate);
+    let mut row = Instance::new("RetainedShutdown", h.project_path().to_str().unwrap());
+    row.trashed_at = Some(chrono::Utc::now());
+    row.status = Status::Stopped;
+    let id = row.id.clone();
+    fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
+    let store = EventStore::open(
+        &crate::harness::app_dir_in(h.home_path()).join("acp_events.db"),
+        0,
+    )
+    .unwrap();
+    store
+        .record(
+            &id,
+            1,
+            &Event::AgentMessageChunk {
+                text: "RETAINED-CLIPBOARD-SHUTDOWN".into(),
+                message_id: None,
+            },
+        )
+        .unwrap();
+    drop(store);
+    h.start_daemon();
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Trash (");
+    h.send_keys("End");
+    h.send_keys("Right");
+    h.wait_for("RetainedShutdown");
+    let screen = h.capture_screen();
+    let row = screen
+        .lines()
+        .position(|line| line.contains("RetainedShutdown"))
+        .unwrap() as u16
+        + 1;
+    h.send_mouse_click(0, 7, row);
+    h.wait_for("RETAINED-CLIPBOARD-SHUTDOWN");
+    h.assert_screen_contains("Trash · read-only");
+    h.send_keys("Enter");
+    h.wait_for("Esc: sessions");
+    h.send_keys("y");
+    let mut helper = None;
+    wait_until(Duration::from_secs(10), Duration::from_millis(10), || {
+        helper = fs::read_to_string(&started)
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok());
+        helper
+            .map(|_| ())
+            .ok_or_else(|| "retained copy helper has not consumed its export".into())
+    });
+    let copied = fs::read_to_string(bin.join("wl-copy.copied"))
+        .or_else(|_| fs::read_to_string(bin.join("pbcopy.copied")))
+        .unwrap();
+    assert!(copied.contains("RETAINED-CLIPBOARD-SHUTDOWN"));
+    if std::env::var_os("RECORD_E2E").is_some() {
+        fs::create_dir_all("target/e2e-recordings").unwrap();
+        fs::write(
+            "target/e2e-recordings/retained-helper-before-quit.txt",
+            h.capture_screen(),
+        )
+        .unwrap();
+    }
+    assert!(h
+        .tmux()
+        .args(["send-keys", "C-c"])
+        .status()
+        .unwrap()
+        .success());
+    h.wait_for_exit(Duration::from_secs(5));
+    let pid = helper.unwrap().to_string();
+    wait_until(Duration::from_secs(2), Duration::from_millis(10), || {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&output.stdout);
+        (!output.status.success() || state.trim().is_empty() || state.trim_start().starts_with('Z'))
+            .then_some(())
+            .ok_or_else(|| "clipboard helper survived App exit".into())
     });
 }
