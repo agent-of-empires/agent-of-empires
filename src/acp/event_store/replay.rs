@@ -20,7 +20,7 @@ pub struct ReplayPage {
     pub lowest_seq: Option<u64>,
 }
 
-/// Rows per page of a paged replay: the connection is held for one page at a time.
+/// Rows decoded per page of a snapshot replay.
 const REPLAY_PAGE_ROWS: usize = 2000;
 
 impl EventStore {
@@ -44,19 +44,36 @@ impl EventStore {
 
     /// Hand every event with `seq > since` to `visit`, oldest first, one page at a time.
     ///
-    /// The connection mutex is released between pages, so a long history never blocks other
-    /// sessions' reads and writes for the whole scan the way `replay_from` does. Returns the
-    /// last seq visited, or `since` when there was nothing to visit.
+    /// A separate read transaction keeps pages coherent across retention sweeps without
+    /// holding the writer connection. Writes after the snapshot starts are left for the
+    /// live fold. Returns the last seq visited, or `since` when nothing was visited.
     pub fn replay_each_paged(
         &self,
         session_id: &str,
         since: u64,
         mut visit: impl FnMut(u64, Event),
     ) -> u64 {
+        let reader = self.reader();
+        let Ok(snapshot) = reader.unchecked_transaction() else {
+            warn!(target: "acp.event_store", "replay snapshot unavailable for {session_id}");
+            let events = self.page_on_connection(&reader, session_id, SeqBound::After(since), Order::Asc, None).events;
+            let mut last = since;
+            for (seq, event) in events {
+                last = seq;
+                visit(seq, event);
+            }
+            return last;
+        };
         let mut cursor = since;
         let mut last = since;
         loop {
-            let page = self.replay_page(session_id, cursor, Some(REPLAY_PAGE_ROWS));
+            let page = self.page_on_connection(
+                &snapshot,
+                session_id,
+                SeqBound::After(cursor),
+                Order::Asc,
+                Some(REPLAY_PAGE_ROWS),
+            );
             for (seq, event) in page.events {
                 last = seq;
                 visit(seq, event);
@@ -65,8 +82,6 @@ impl EventStore {
                 Some(next) if page.has_more => cursor = next,
                 _ => return last,
             }
-            // Let a waiting writer take the connection before the next page.
-            std::thread::yield_now();
         }
     }
 
@@ -207,19 +222,27 @@ impl EventStore {
         limit: Option<usize>,
     ) -> ReplayPage {
         let conn = self.reader();
-        // One snapshot, so the bounds agree with the rows while writes land.
-        let snapshot = conn
-            .unchecked_transaction()
-            .map_err(|e| warn!(target: "acp.event_store", "replay snapshot for {session_id}: {e}"))
-            .ok();
-        let highest_seq = events::highest_seq(&conn, &self.schema, session_id);
-        let lowest_seq = events::lowest_seq(&conn, &self.schema, session_id);
+        let snapshot = conn.unchecked_transaction().ok();
+        let page = self.page_on_connection(&conn, session_id, bound, order, limit);
+        drop(snapshot);
+        page
+    }
+
+    fn page_on_connection(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        bound: SeqBound,
+        order: Order,
+        limit: Option<usize>,
+    ) -> ReplayPage {
+        let highest_seq = events::highest_seq(conn, &self.schema, session_id);
+        let lowest_seq = events::lowest_seq(conn, &self.schema, session_id);
         #[cfg(test)]
         tests::AFTER_BOUNDS.with(|hook| hook.take().map(|run| run()));
         // One probe row past `limit` detects `has_more` without a second query.
         let probe = limit.map(|n| n.saturating_add(1));
-        let rows = events::scan(&conn, &self.schema, session_id, bound, order, probe);
-        drop(snapshot);
+        let rows = events::scan(conn, &self.schema, session_id, bound, order, probe);
         let (events, last_scanned_seq, has_more) = decode_rows(session_id, rows, limit);
         ReplayPage {
             events,
@@ -493,10 +516,8 @@ mod tests {
         assert!(!page2.has_more);
     }
 
-    /// The scan must take the connection one page at a time: a row recorded while the first
-    /// page is visited is picked up by a later page, which one long scan could not see.
     #[test]
-    fn paged_replay_reads_each_page_under_its_own_connection() {
+    fn paged_replay_allows_writes_without_changing_its_snapshot() {
         let (_tmp, store) = open_store(100_000);
         let total = (REPLAY_PAGE_ROWS * 3 + 5) as u64;
         record_from(
@@ -514,8 +535,9 @@ mod tests {
                     .unwrap();
             }
         });
-        assert_eq!(seen, (1..=total + 1).collect::<Vec<_>>());
-        assert_eq!(last, total + 1);
+        assert_eq!(seen, (1..=total).collect::<Vec<_>>());
+        assert_eq!(last, total);
+        assert_eq!(seqs(&store.replay_from("cold", total)), [total + 1]);
         assert_eq!(store.replay_each_paged("empty", 7, |_, _| {}), 7);
     }
 
@@ -562,6 +584,80 @@ mod tests {
                 (vec![1, 2, 3], 3, Some(1))
             );
         });
+    }
+
+    #[test]
+    fn paged_replay_keeps_completed_work_coherent_during_retention() {
+        use crate::acp::control_cache::ControlStateCache;
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        use crate::session::Status;
+
+        let (_tmp, store) = open_store(1007);
+        record_from(
+            &store,
+            "cold",
+            1,
+            (1..2000).map(|_| Event::CurrentModeChanged {
+                current_mode_id: "test".into(),
+            }),
+        );
+        store
+            .record(
+                "cold",
+                2000,
+                &Event::BackgroundTaskStarted {
+                    task_id: "task".into(),
+                    tool_call_id: None,
+                    description: "test".into(),
+                    workflow: None,
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "cold",
+                2001,
+                &Event::BackgroundTaskFinished {
+                    task_id: "task".into(),
+                    ended_at: None,
+                },
+            )
+            .unwrap();
+        record_from(
+            &store,
+            "cold",
+            2002,
+            (2002..=3007).map(|_| Event::ThinkingEnded),
+        );
+        assert_eq!(
+            store.unresolved_background_task_ids("cold"),
+            Vec::<String>::new()
+        );
+        assert!(store
+            .replay_from("cold", 1999)
+            .iter()
+            .any(|(seq, _)| *seq == 2001));
+
+        let cache = ControlStateCache::new();
+        let state = cache.get_or_hydrate("cold", || {
+            let mut state =
+                AcpState::new(AcpSessionId("cold".into()), AgentName("test".into()), None);
+            let last = store.replay_each_paged("cold", 0, |seq, event| {
+                state.apply_event(seq, event).unwrap();
+                if seq == 2000 {
+                    // The ordinary write sweeps both halves after the start was folded.
+                    store.record("cold", 3008, &Event::ThinkingEnded).unwrap();
+                    assert!(!store
+                        .replay_from("cold", 1999)
+                        .iter()
+                        .any(|(seq, _)| *seq == 2001));
+                }
+            });
+            (state, last)
+        });
+        assert_eq!(state.sidebar_status(), Status::Idle);
+        cache.apply_if_cached("cold", 3008, &Event::ThinkingEnded);
+        assert_eq!(cache.sidebar_status("cold"), Some(Status::Idle));
     }
 
     #[test]

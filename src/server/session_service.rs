@@ -1762,9 +1762,9 @@ impl SessionService {
     /// afterwards, one serial task behind every session's event stream.
     ///
     /// The fold is cached because rebuilding it per call measured 68ms at 20k
-    /// events and 342ms at 100k. A cold hydrate reads the log in pages, so the
-    /// event store's connection mutex is free between them; lag recovery hydrates
-    /// every cold session and must not stall prompts to the others.
+    /// events and 342ms at 100k. Cold hydration pages through a read snapshot,
+    /// leaving the writer connection free so lag recovery cannot stall prompts
+    /// to other sessions. Retention cannot split a task's start and finish.
     pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
         use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         let (agent, model) = {
