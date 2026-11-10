@@ -2915,10 +2915,10 @@ mod tests {
     #[serial_test::serial]
     fn managed_resume_refuses_unattestable_execution_without_changing_identity() {
         let root = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
         let _omp_env = crate::session::test_support::EnvGuard::unset(
             &crate::session::capture::OMP_STORE_ENV_KEYS,
         );
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let codex_home = root.path().join("codex");
         std::fs::create_dir_all(&codex_home).unwrap();

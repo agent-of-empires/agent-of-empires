@@ -324,27 +324,9 @@ pub(crate) fn isolate_app_dir() -> AppDirGuard {
     install_env_vars(path, Some(temp_home))
 }
 
-/// Isolate the app dir for one test against a caller-owned path.
-///
-/// Same env-var installation as [`isolate_app_dir`], but the caller owns
-/// the tempdir (or any other path they wish to expose as `HOME`). The
-/// guard captures neither ownership nor lifetime of `path`; on `Drop`
-/// only the env vars are restored.
-///
-/// The typical shape is:
-///
-/// ```ignore
-/// struct TestEnv {
-///     view: HomeView,
-///     _guard: crate::session::test_support::AppDirGuard,
-///     _temp: tempfile::TempDir,
-/// }
-/// ```
-///
-/// Fields drop top-to-bottom, so `view` drops first (any reader of
-/// `HOME` runs while the guard is still live), then the guard restores
-/// env vars, then `_temp` deletes the tempdir. Declaring `_temp` before
-/// `_guard` would delete the dir while `HOME` still points at it.
+/// Isolate app storage under a caller-owned `HOME`; restore only environment variables.
+/// Apply routing-variable resets first: they may clear `HOME`.
+/// Keep `path` alive until all app readers and this guard have dropped.
 pub(crate) fn isolate_app_dir_at(path: &Path) -> AppDirGuard {
     install_env_vars(path.to_path_buf(), None)
 }
