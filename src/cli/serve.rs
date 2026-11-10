@@ -3963,6 +3963,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user, mount and PID namespaces; run with --ignored"
+    )]
     #[serial_test::serial]
     fn tui_control_inspection_keeps_the_async_executor_reactive() -> Result<()> {
         use std::io::Write;
@@ -3975,11 +3979,8 @@ mod tests {
                 "-c",
                 "import os,sys; print(os.path.realpath(sys.executable))",
             ])
-            .output();
-        let Ok(python) = python else {
-            eprintln!("python3 unavailable; skipping process-inspection fixture");
-            return Ok(());
-        };
+            .output()
+            .context("process-inspection fixture requires python3")?;
         anyhow::ensure!(
             python.status.success(),
             "python3 fixture interpreter failed"
@@ -3987,23 +3988,6 @@ mod tests {
         let python = String::from_utf8(python.stdout)?.trim().to_owned();
         #[cfg(target_os = "linux")]
         if std::env::var_os("AOE_TUI_PS_TEST_CHILD").is_none() {
-            let available = std::process::Command::new("unshare")
-                .args([
-                    "--user",
-                    "--map-root-user",
-                    "--mount",
-                    "--pid",
-                    "--fork",
-                    "--mount-proc",
-                    "true",
-                ])
-                .output();
-            if !available.is_ok_and(|output| output.status.success()) {
-                eprintln!(
-                    "private process namespace unavailable; skipping process-inspection fixture"
-                );
-                return Ok(());
-            }
             let name = format!(
                 "{}::tui_control_inspection_keeps_the_async_executor_reactive",
                 module_path!().split_once("::").unwrap().1
@@ -4018,7 +4002,7 @@ mod tests {
                     "--mount-proc",
                 ])
                 .arg(std::env::current_exe()?)
-                .args(["--exact", &name, "--nocapture"])
+                .args(["--exact", &name, "--ignored", "--nocapture"])
                 .env("AOE_TUI_PS_TEST_CHILD", "1")
                 .env("TMPDIR", "/tmp")
                 .output()?;
@@ -4028,6 +4012,8 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
             return Ok(());
         }
         #[cfg(target_os = "linux")]
