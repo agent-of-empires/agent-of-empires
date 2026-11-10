@@ -212,7 +212,12 @@ complete restoration.
 All three terminal owners restore cooked input, cancel obsolete drawing without an
 emission receipt, and queue the final mode/title transaction behind pending controls.
 Lock admission and the final control pump share a 250 ms deadline. Permanently
-stalled output or contention past that deadline can still prevent delivery before exit.
+stalled output or contention past that deadline can prevent delivery before exit.
+This is bounded best-effort emission, not confirmed display-mode restoration.
+Unwritten controls disappear with the process; no detached writer races the resumed
+shell. Cooked input restoration does not wait for display output.
+Incomplete or failed cleanup is reported through the application log, not a
+synchronous diagnostic on the stalled terminal.
 Ratatui cursor drop never invokes a synchronous stderr diagnostic.
 A direct flush that writes no bytes retains its staged command for retry. A partial
 failed command recovers terminal framing instead of replaying its written prefix.

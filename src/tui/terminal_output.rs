@@ -389,11 +389,26 @@ impl Drop for Suspension {
 
 /// Finish output after restoring cooked input; drawing no longer owns the terminal.
 pub(crate) fn restore_after_exit(disable_mouse: bool, title: Option<&str>) -> io::Result<bool> {
-    #[cfg(test)]
-    if let Some(output) = TEST_OUTPUT.with(|output| output.borrow().clone()) {
-        return restore_after_exit_in(&output, disable_mouse, title);
+    let result = (|| {
+        #[cfg(test)]
+        if let Some(output) = TEST_OUTPUT.with(|output| output.borrow().clone()) {
+            return restore_after_exit_in(&output, disable_mouse, title);
+        }
+        restore_after_exit_in(state()?, disable_mouse, title)
+    })();
+    match &result {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            target: "tui.terminal_output",
+            "terminal display cleanup incomplete before bounded exit"
+        ),
+        Err(error) => tracing::warn!(
+            target: "tui.terminal_output",
+            %error,
+            "terminal display cleanup failed"
+        ),
     }
-    restore_after_exit_in(state()?, disable_mouse, title)
+    result
 }
 
 fn restore_after_exit_in(
