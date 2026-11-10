@@ -1,4 +1,4 @@
-//! Control protocol v3 between `aoe serve` and `aoe __acp-runner`, carried
+//! Control protocol v4 between `aoe serve` and `aoe __acp-runner`, carried
 //! over `<id>.control.sock`.
 
 use anyhow::{bail, Result};
