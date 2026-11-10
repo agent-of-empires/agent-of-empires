@@ -196,7 +196,7 @@ fn apply_no_daemon_flag(
         }
         _ => return,
     };
-    let Some(invocation) = parse_launch_command(inst.get_tool_command()) else {
+    let Some(invocation) = parse_launch_command(&inst.get_tool_command()) else {
         return;
     };
     if invocation.words.first().map(String::as_str) != Some(agent.binary) {
@@ -711,11 +711,11 @@ impl Instance {
                     "sandbox executable identity is unprovable"
                 );
                 anyhow::ensure!(
-                    !Self::contains_active_shell_syntax(self.get_tool_command())
+                    !Self::contains_active_shell_syntax(&self.get_tool_command())
                         && !Self::contains_active_shell_syntax(&self.extra_args),
                     "sandbox command contains active shell syntax"
                 );
-                let parsed = parse_launch_command(self.get_tool_command())
+                let parsed = parse_launch_command(&self.get_tool_command())
                     .context("sandbox command is unparseable")?;
                 let program = execution
                     .map(|execution| execution.program.as_os_str())
@@ -800,19 +800,25 @@ impl Instance {
     }
 
     pub fn expects_shell(&self) -> bool {
-        crate::tmux::utils::is_shell_command(self.get_tool_command())
+        crate::tmux::utils::is_shell_command(&self.get_tool_command())
     }
 
-    pub fn get_tool_command(&self) -> &str {
-        if self.command.is_empty() {
+    pub fn get_tool_command(&self) -> std::borrow::Cow<'_, str> {
+        if !self.command.is_empty() {
+            return std::borrow::Cow::Borrowed(&self.command);
+        }
+        if let Some(declared) = self.declared_agent() {
+            if let Some(command) = &declared.contribution().command {
+                return std::borrow::Cow::Owned(command.clone());
+            }
+        }
+        std::borrow::Cow::Borrowed(
             crate::agents::get_agent(&self.tool)
                 .or_else(|| crate::plugin::bundled_agents::definitions()
                     .find(|agent| agent.name == self.tool))
                 .map(|a| a.binary)
-                .unwrap_or("bash")
-        } else {
-            &self.command
-        }
+                .unwrap_or("bash"),
+        )
     }
 
     /// The text searched for a user-selected `--agent NAME` flag: both the
@@ -835,6 +841,11 @@ impl Instance {
     /// command so subcommand-scoped flags (yolo, resume) parse correctly.
     fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
+            if let Some(declared) = self.declared_agent() {
+                if let Some(command) = &declared.contribution().command {
+                    return command.clone();
+                }
+            }
             crate::agents::get_agent(&self.tool)
                 .or_else(|| crate::plugin::bundled_agents::definitions()
                     .find(|agent| agent.name == self.tool))
@@ -1197,7 +1208,7 @@ impl Instance {
                         .map(|(name, _)| name.as_str()),
                 );
                 if let Some(declared) = declared.filter(|agent| {
-                    agent.contribution().command.as_deref() == Some(self.get_tool_command())
+                    self.command.is_empty() || agent.contribution().command.as_deref() == Some(self.command.as_str())
                 }) {
                     return declared
                         .with_definition(|agent| {
@@ -1563,7 +1574,7 @@ impl Instance {
             fallback_profile = self.effective_profile();
             &fallback_profile
         };
-        let program = parse_launch_command(self.get_tool_command()).and_then(|parsed| {
+        let program = parse_launch_command(&self.get_tool_command()).and_then(|parsed| {
             parsed.words.first().and_then(|word| {
                 Path::new(word)
                     .file_name()

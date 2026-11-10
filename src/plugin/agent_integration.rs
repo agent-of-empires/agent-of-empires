@@ -1222,7 +1222,7 @@ api_version = 21
 capabilities = ["session.integration"]
 [[agent_integrations]]
 tool = "omp"
-command = "omp"
+command = "OMP_MODE=plugin omp-next --verbose"
 provider_versions = ["^18"]
 replies = true
 [agent_integrations.launch]
@@ -1248,6 +1248,7 @@ mode = "native_only"
         let mut instance = Instance::new("omp-declaration", temp.path().to_str().unwrap());
         instance.tool = "omp".into();
         instance.status = crate::session::Status::Running;
+        assert!(instance.command.is_empty(), "legacy rows have no stored command");
         let fallback = || {
             let agent = crate::agents::get_agent("omp").expect("bundled fallback");
             assert_eq!(agent.oneshot_flag, Some("-p"));
@@ -1271,8 +1272,12 @@ mode = "native_only"
         }).unwrap();
         super::super::reload_registry();
         assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(instance.get_tool_command(), "OMP_MODE=plugin omp-next --verbose");
+        assert_eq!(instance.launch_executable_token().as_deref(), Some("omp-next"));
+        assert!(instance.supports_native_resume());
         let declared = instance.declared_agent().expect("approved declaration");
         declared.with_definition(|agent| {
+            assert!(instance.launch_invokes_resolved_agent_directly(agent));
             assert_eq!(agent.oneshot_flag, Some("--print"));
             assert_eq!(agent.container_env, &[("PI_CODING_AGENT_DIR", "/root/plugin-omp")]);
             assert!(matches!(agent.yolo.as_ref(), Some(crate::agents::YoloMode::CliFlag(flag)) if *flag == "--plugin-auto"));

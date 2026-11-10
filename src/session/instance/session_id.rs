@@ -706,7 +706,7 @@ impl Instance {
     ) -> Option<String> {
         let agent = agent?;
         let strategy = agent.session_support.as_ref()?.resume;
-        if words.first() != parse_launch_command(self.get_tool_command())?.words.first() {
+        if words.first() != parse_launch_command(&self.get_tool_command())?.words.first() {
             return None;
         }
         let flag_present = |flag: &str| {

@@ -443,7 +443,7 @@ impl Instance {
             let config = store.launch_configuration(std::path::Path::new(&self.project_path))?;
             let managed_codex_home = container_config::managed_codex_home(
                 &self.tool,
-                Some(self.get_tool_command()),
+                Some(&self.get_tool_command()),
                 &self.source_profile,
                 &self.id,
             )?;

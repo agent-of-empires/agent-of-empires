@@ -1481,7 +1481,7 @@ impl Instance {
         let managed_codex_home =
             crate::session::config::container_config::managed_codex_home_from_config(
                 &self.tool,
-                Some(self.get_tool_command()),
+                Some(&self.get_tool_command()),
                 &config.session,
                 &self.id,
             )?;
@@ -1777,12 +1777,12 @@ impl Instance {
                 } else {
                     self.extra_args.clone()
                 };
-                if Self::contains_active_shell_syntax(command)
+                if Self::contains_active_shell_syntax(&command)
                     || Self::contains_active_shell_syntax(&extra)
                 {
                     return None;
                 }
-                let parsed = super::launch_command::parse_launch_command(command)?;
+                let parsed = super::launch_command::parse_launch_command(&command)?;
                 let program = parsed.words.first()?;
                 let config = crate::session::config::profile_config::resolve_config_or_warn(
                     &self.effective_profile(),
@@ -1866,7 +1866,7 @@ impl Instance {
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef<'static>> {
         let config =
             crate::session::config::profile_config::resolve_config(&self.effective_profile())?;
-        Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)
+        Self::execution_agent_for(&self.tool, &self.get_tool_command(), &config.session)
     }
 
     pub(crate) fn execution_agent_for(
@@ -1932,7 +1932,7 @@ impl Instance {
             )
             .context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let mut words = super::launch_command::parse_launch_command(self.get_tool_command())
+        let mut words = super::launch_command::parse_launch_command(&self.get_tool_command())
             .context(ManagedResumeCause::UnsupportedManagedArguments)?
             .words;
         words.extend(
@@ -1972,13 +1972,13 @@ impl Instance {
                     .map(|(name, _)| name.as_str()),
             )
             .filter(|agent| {
-                agent.contribution().command.as_deref() == Some(self.get_tool_command())
+                self.command.is_empty() || agent.contribution().command.as_deref() == Some(self.command.as_str())
             }) {
                 let identity = NativeAgent::Declared(declared.clone());
                 return declared
                     .with_definition(|agent| {
                         anyhow::ensure!(
-                            !Self::contains_active_shell_syntax(self.get_tool_command())
+                            !Self::contains_active_shell_syntax(&self.get_tool_command())
                                 && self.launch_invokes_resolved_agent_directly(agent),
                             "managed conversation requires the declared direct executable"
                         );
@@ -1988,7 +1988,7 @@ impl Instance {
             }
         }
         let agent =
-            Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;
+            Self::execution_agent_for(&self.tool, &self.get_tool_command(), &config.session)?;
         self.resolve_native_execution_for(target, &config, agent, NativeAgent::Builtin(agent))
     }
 
@@ -2004,7 +2004,7 @@ impl Instance {
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut resolved_target_session_id = None;
         let mut inputs = self.native_launch_inputs(agent, config)?;
-        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())
+        let parsed = super::launch_command::parse_launch_command(&self.get_tool_command())
             .context("native program is missing")?;
         inputs.environment.extend(parsed.assignments);
         anyhow::ensure!(

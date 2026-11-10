@@ -241,7 +241,7 @@ impl Instance {
                 .filter(|(_, command)| !command.trim().is_empty())
                 .map(|(name, _)| name.as_str()),
         )
-        .filter(|agent| agent.contribution().command.as_deref() == Some(self.get_tool_command()))
+        .filter(|agent| self.command.is_empty() || agent.contribution().command.as_deref() == Some(self.command.as_str()))
     }
 
     fn declared_session_support(
@@ -351,12 +351,12 @@ impl Instance {
             self.extra_args.clone()
         };
         if raw_command.trim().is_empty()
-            || contains_active_shell_syntax(raw_command)
+            || contains_active_shell_syntax(&raw_command)
             || contains_active_shell_syntax(&launch_extra_args)
         {
             return false;
         }
-        let Some(parsed_command) = parse_launch_command(raw_command) else {
+        let Some(parsed_command) = parse_launch_command(&raw_command) else {
             return false;
         };
         let mut words = parsed_command.words;
@@ -380,7 +380,7 @@ impl Instance {
     /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
     /// on hook presence alone.
     pub(crate) fn launch_executable_token(&self) -> Option<String> {
-        let words = parse_launch_command(self.get_tool_command())?.words;
+        let words = parse_launch_command(&self.get_tool_command())?.words;
         Path::new(words.first()?)
             .file_name()?
             .to_str()
@@ -413,7 +413,7 @@ impl Instance {
         {
             return true;
         }
-        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
+        let Some(parsed_command) = parse_launch_command(&self.get_tool_command()) else {
             return false;
         };
         let mut words = parsed_command.words;
@@ -550,12 +550,12 @@ impl Instance {
             return None;
         }
         let command = self.get_tool_command();
-        if Self::contains_active_shell_syntax(command)
+        if Self::contains_active_shell_syntax(&command)
             || Self::contains_active_shell_syntax(&self.extra_args)
         {
             return None;
         }
-        let parsed = parse_launch_command(command)?;
+        let parsed = parse_launch_command(&command)?;
         let [program] = parsed.words.as_slice() else {
             return None;
         };
