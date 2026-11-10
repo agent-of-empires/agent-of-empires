@@ -1041,7 +1041,11 @@ mod tests {
         );
         runner.complete_turn();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while state.acp_event_store.has_in_flight_turn(id) {
+            while state.acp_event_store.has_in_flight_turn(id)
+                || !state.acp_event_store.replay_from(id, 0).iter().any(|(_, event)| {
+                    matches!(event, Event::AgentMessageChunk { text, .. } if text == "original producer completed")
+                })
+            {
                 rx.recv().await.unwrap();
             }
         })
