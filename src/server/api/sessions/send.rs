@@ -76,56 +76,74 @@ async fn send_terminal_message_inner(
             detail: serde_json::json!({"error": "cityhall_mode"}),
         });
     }
-    let before = service
+    let initial_namespace = state.profile_namespace.read().await;
+    let profile = service
         .instances
         .read()
         .await
         .iter()
         .find(|row| row.id == id)
-        .cloned()
+        .map(|row| row.source_profile.clone())
         .ok_or(SendKeysError::NotFound)?;
-    before.ensure_startable().map_err(SendKeysError::Blocked)?;
-    if before.is_structured() {
-        return Err(SendKeysError::StructuredView);
-    }
-    if matches!(before.status, Status::Creating | Status::Deleting) {
-        return Err(SendKeysError::Transient(before.status));
-    }
-    let original_source =
-        crate::session::Storage::open_reference(&before.source_profile).map_err(|error| {
-            terminal_send_failure(
-                &state,
-                error.context(crate::session::NativeInputError::Ownership),
+    let worker_state = state.clone();
+    let initial_id = id.to_owned();
+    let (native, before, initial_identity, mut existing_target, initial_ready) =
+        tokio::task::spawn_blocking(move || -> Result<_, SendKeysError> {
+            let error_state = worker_state.clone();
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &profile,
+                None,
             )
-        })?;
-    let initial_identity = crate::daemon::NativePreparationIdentity::from_instance(
-        &before,
-        original_source
-            .bound_profile_identity()
-            .map_err(|error| terminal_send_failure(&state, error))?,
-    );
+            .map_err(|error| terminal_send_failure(&error_state, error))?;
+            let before = native
+                .load()
+                .map_err(|error| terminal_send_failure(&error_state, error))?
+                .into_iter()
+                .find(|row| row.id == initial_id)
+                .ok_or(SendKeysError::NotFound)?;
+            before.ensure_startable().map_err(SendKeysError::Blocked)?;
+            if before.is_structured() {
+                return Err(SendKeysError::StructuredView);
+            }
+            if matches!(before.status, Status::Creating | Status::Deleting) {
+                return Err(SendKeysError::Transient(before.status));
+            }
+            let captured = (|| -> anyhow::Result<_> {
+                let identity = crate::daemon::NativePreparationIdentity::from_instance(
+                    &before,
+                    native.storage().bound_profile_identity()?,
+                );
+                let physical = super::ensure::physical_agent_target(&before)?;
+                let ready = physical.as_ref().is_some_and(|(_, _, ready)| *ready);
+                let target =
+                    physical.map(
+                        |(tmux_session, physical, _)| crate::daemon::TerminalTarget {
+                            tmux_session,
+                            physical: Some(physical),
+                            lifecycle_generation: before.lifecycle_generation,
+                            profile: before.source_profile.clone(),
+                            status: crate::daemon::TerminalTargetStatus::Alive,
+                        },
+                    );
+                Ok((identity, target, ready))
+            })()
+            .map_err(|error| terminal_send_failure(&error_state, error))?;
+            Ok((native, before, captured.0, captured.1, captured.2))
+        })
+        .await
+        .map_err(|error| terminal_send_failure(&state, error.into()))??;
     #[cfg(test)]
     super::tests::terminal_custody::pause(
         id,
         super::tests::terminal_custody::Boundary::SendInitialSnapshot,
     )
     .await;
-    let initial_namespace = state.profile_namespace.read().await;
     let initial_lock = state.instance_lock(id).await;
     let initial_guard = initial_lock.lock().await;
-    let worker_state = state.clone();
-    let (native, initial_identity, existing_target) =
+    let (native, before, initial_identity) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let mut before = before;
-            anyhow::ensure!(
-                initial_identity.matches_source(&original_source),
-                crate::session::LifecycleReservationError::Superseded
-            );
-            let native = crate::server::session_store::NativeSessionStore::open(
-                worker_state,
-                &before.source_profile,
-                None,
-            )?;
             anyhow::ensure!(
                 initial_identity.matches_source(native.storage()),
                 crate::session::LifecycleReservationError::Superseded
@@ -139,16 +157,7 @@ async fn send_terminal_message_inner(
                 initial_identity.matches(&before),
                 crate::session::LifecycleReservationError::Superseded
             );
-            let existing = super::ensure::physical_agent_target(&before)
-                .map_err(|error| error.context(crate::session::NativeInputError::Ownership))?
-                .map(|(tmux_session, physical)| crate::daemon::TerminalTarget {
-                    tmux_session,
-                    physical: Some(physical),
-                    lifecycle_generation: before.lifecycle_generation,
-                    profile: before.source_profile.clone(),
-                    status: crate::daemon::TerminalTargetStatus::Alive,
-                });
-            Ok((native, initial_identity, existing))
+            Ok((native, before, initial_identity))
         })
         .await
         .map_err(anyhow::Error::from)
@@ -156,16 +165,15 @@ async fn send_terminal_message_inner(
         .map_err(|error| terminal_send_failure(&state, error))?;
     drop(initial_guard);
     drop(initial_namespace);
-    let target = if revive {
-        let response = super::lifecycle::prepare_agent_session(
+    let mut target = if revive {
+        let response = super::lifecycle::prepare_captured_terminal_session(
             state.clone(),
             id.to_owned(),
-            Ok(Some(Json(crate::daemon::StartSessionBody {
-                size: None,
-                expected: Some(initial_identity.clone()),
-            }))),
-            super::lifecycle::AgentPreparation::Ensure,
-            None,
+            before,
+            initial_identity.clone(),
+            existing_target
+                .as_ref()
+                .and_then(|target| target.physical.clone()),
         )
         .await;
         let (parts, body) = response.into_parts();
@@ -198,8 +206,25 @@ async fn send_terminal_message_inner(
         }
         target
     } else {
-        existing_target.ok_or(SendKeysError::NotRunning)?
+        if !initial_ready {
+            return Err(SendKeysError::NotRunning);
+        }
+        existing_target.take().ok_or(SendKeysError::NotRunning)?
     };
+    if let Some(original) = existing_target {
+        if target.lifecycle_generation != original.lifecycle_generation
+            || target.profile != original.profile
+            || target.tmux_session != original.tmux_session
+            || target.physical != original.physical
+        {
+            return Err(terminal_send_failure(
+                &state,
+                crate::session::LifecycleReservationError::Superseded.into(),
+            ));
+        }
+        // Keep the pre-queue observation's custody, not a deserialized replacement Arc.
+        target.physical = original.physical;
+    }
     let revived = target.lifecycle_generation != initial_identity.lifecycle_generation;
     #[cfg(test)]
     super::tests::terminal_custody::pause(
@@ -219,14 +244,6 @@ async fn send_terminal_message_inner(
         .ok_or(SendKeysError::NotFound)?;
     let lock = service.instance_lock(id).await;
     let guard = lock.lock().await;
-    let mut instance = service
-        .instances
-        .read()
-        .await
-        .iter()
-        .find(|row| row.id == id)
-        .cloned()
-        .ok_or(SendKeysError::NotFound)?;
     let expected = crate::daemon::NativePreparationIdentity {
         created_at: initial_identity.created_at,
         lifecycle_generation: target.lifecycle_generation,
@@ -234,7 +251,13 @@ async fn send_terminal_message_inner(
         profile_identity: initial_identity.profile_identity,
         selection: initial_identity.selection,
     };
+    let input_id = id.to_owned();
     let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let mut instance = native
+            .load()?
+            .into_iter()
+            .find(|row| row.id == input_id)
+            .ok_or(crate::session::SessionGone)?;
         anyhow::ensure!(
             target.profile == expected.profile
                 && expected.matches(&instance)
