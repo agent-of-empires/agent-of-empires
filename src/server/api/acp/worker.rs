@@ -2754,11 +2754,12 @@ mod tests {
                 ("second".to_string(), vec!["image/png:cG5n".to_string()]),
             ]
         };
-        // (name, assigned before restart, replacement, expected replacement prompts,
-        // expected Stopped reasons)
+        // (name, assigned before restart, force-ended before restart, replacement,
+        // expected replacement prompts, expected Stopped reasons)
         let cases = [
             (
                 "unassigned prompts are carried over",
+                false,
                 false,
                 Replacement::Starts,
                 carried(),
@@ -2767,6 +2768,7 @@ mod tests {
             (
                 "carried prompts wait for the replacement session",
                 false,
+                false,
                 Replacement::Stalls,
                 carried(),
                 vec![],
@@ -2774,12 +2776,14 @@ mod tests {
             (
                 "assigned worker replays nothing",
                 true,
+                false,
                 Replacement::Starts,
                 vec![],
                 vec!["user_stopped"],
             ),
             (
                 "replacement fails to start",
+                false,
                 false,
                 Replacement::FailsToStart,
                 vec![],
@@ -2788,12 +2792,22 @@ mod tests {
             (
                 "redelivery fails on the first carried prompt",
                 false,
+                false,
                 Replacement::DeadConnection,
                 vec![],
                 vec!["user_stopped"],
             ),
+            (
+                "a force-ended prompt is retired, a later one is carried",
+                false,
+                true,
+                Replacement::Starts,
+                vec![("after".to_string(), vec![])],
+                vec!["user_forced"],
+            ),
         ];
-        for (name, assigned, replacement, expected_prompts, expected_stopped) in cases {
+        for (name, assigned, force_ended, replacement, expected_prompts, expected_stopped) in cases
+        {
             let _home = crate::session::test_support::isolate_app_dir();
             let mut instance = crate::session::Instance::new("restart-handoff", "/tmp/aoe-handoff");
             instance.view = crate::session::View::Structured;
@@ -2885,6 +2899,14 @@ mod tests {
                 state
                     .acp_supervisor
                     .send_prompt(&id, text, &attachments)
+                    .await
+                    .unwrap();
+            }
+            if force_ended {
+                state.acp_supervisor.force_end_turn(&id).await;
+                state
+                    .acp_supervisor
+                    .send_prompt(&id, "after", &[])
                     .await
                     .unwrap();
             }

@@ -241,6 +241,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Err(error) = delivered {
             warn!(target: "acp.supervisor", session = %session_id, %error, "force stop: cancel not delivered");
         }
+        // Held across the publish so a prompt is either ended by this Stopped
+        // and dropped here, or admitted after it and kept for a restart.
+        let mut unassigned = lock_recover(&self.unassigned_prompts);
+        if let Some(queued) = unassigned.get_mut(session_id) {
+            queued.clear();
+        }
         self.publish_next(
             session_id,
             &Event::Stopped {

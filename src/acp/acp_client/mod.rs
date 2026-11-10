@@ -370,8 +370,8 @@ impl AcpClient {
         Self::fake_for_test_dead_commands(session_id).0
     }
 
-    /// As `fake_for_test_dead_connection`, keeping the event stream open
-    /// through the returned sender.
+    /// As `fake_for_test_dead_connection`, returning the event sender; the
+    /// stream ends when the caller drops it.
     #[cfg(test)]
     pub fn fake_for_test_dead_commands(session_id: AcpSessionId) -> (Self, mpsc::Sender<Event>) {
         let (cmd_tx, _) = mpsc::channel::<ClientCmd>(16);
