@@ -137,6 +137,7 @@ impl<T> RwLockSafe<T> for RwLock<T> {
 }
 
 static REGISTRY: RwLock<Option<Arc<PluginRegistry>>> = RwLock::new(None);
+static REGISTRY_RELOAD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn registry() -> Arc<PluginRegistry> {
     if let Some(reg) = REGISTRY.read_safe().as_ref() {
@@ -159,6 +160,7 @@ pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
 }
 
 pub fn reload_registry() -> Arc<PluginRegistry> {
+    let _reload = REGISTRY_RELOAD.lock().unwrap_or_else(|error| error.into_inner());
     let config = crate::session::Config::load_or_warn();
     let reg = Arc::new(PluginRegistry::load(&config));
     *REGISTRY.write_safe() = Some(reg.clone());

@@ -1691,7 +1691,11 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                 age: crate::hooks::read_hook_status_age(&inst.id),
             }
         });
-        let status = if let Some(plan) =
+        let status = if let Some((status, _)) =
+            crate::plugin::agent_integration::owned_status(inst, tmux_session.is_pane_dead())
+        {
+            status
+        } else if let Some(plan) =
             crate::tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
         {
             let policy = plan.capture_policy();

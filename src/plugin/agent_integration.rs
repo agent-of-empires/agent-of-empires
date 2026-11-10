@@ -126,6 +126,42 @@ pub fn catalog<'a, 'b, 'c>(
     unique_candidates(candidates, builtin_names, custom_names)
 }
 
+/// An agent identity bound to one immutable registry snapshot.
+pub(crate) struct DeclaredAgent {
+    registry: std::sync::Arc<super::PluginRegistry>,
+    plugin_index: usize,
+    entry_index: usize,
+}
+
+impl DeclaredAgent {
+    pub(crate) fn contribution(&self) -> &aoe_plugin_api::agent_integration::AgentIntegrationContribution {
+        &self.registry.all()[self.plugin_index].manifest.agent_integrations[self.entry_index]
+    }
+
+    fn plugin_id(&self) -> &str {
+        self.registry.all()[self.plugin_index].id()
+    }
+}
+
+fn declared_agent<'a>(
+    registry: std::sync::Arc<super::PluginRegistry>,
+    tool: &str,
+    custom_names: impl IntoIterator<Item = &'a str>,
+) -> Option<DeclaredAgent> {
+    let (plugin_index, entry_index) = {
+        let selected = catalog(
+            &registry,
+            crate::agents::AGENTS.iter().map(|agent| agent.name),
+            custom_names,
+        ).into_iter().find(|agent| agent.tool == tool)?;
+        let plugin_index = registry.all().iter().position(|plugin| plugin.id() == selected.plugin)?;
+        let entry_index = registry.all()[plugin_index].manifest.agent_integrations.iter()
+            .position(|entry| entry.tool == tool)?;
+        (plugin_index, entry_index)
+    };
+    Some(DeclaredAgent { registry, plugin_index, entry_index })
+}
+
 /// Whether a character could spoof or rewrite displayed text: control
 /// characters (Cc) and Unicode format characters (Cf), especially the bidi
 /// controls a browser or terminal would otherwise reorder.
@@ -160,23 +196,14 @@ pub fn agent_command<'a>(
     tool: &str,
     custom_names: impl IntoIterator<Item = &'a str>,
 ) -> Option<String> {
-    let registry = super::registry();
-    catalog(
-        &registry,
-        crate::agents::AGENTS.iter().map(|agent| agent.name),
-        custom_names,
-    )
-    .into_iter()
-    .find(|agent| agent.tool == tool)
-    .map(|agent| {
-        tracing::debug!(
-            target: "plugin.agents",
-            tool,
-            plugin = agent.plugin,
-            "resolved plugin-provided agent command"
-        );
-        agent.command.to_string()
-    })
+    let agent = declared_agent(super::registry(), tool, custom_names)?;
+    tracing::debug!(
+        target: "plugin.agents",
+        tool,
+        plugin = agent.plugin_id(),
+        "resolved plugin-provided agent command"
+    );
+    agent.contribution().command.clone()
 }
 
 fn eligible(instance: &Instance) -> bool {
@@ -246,8 +273,44 @@ pub(crate) fn session_status_override(
     } else if pane_dead {
         Some(crate::session::Status::Error)
     } else {
-        status.map(session_status)
+        Some(status.map_or(crate::session::Status::Unknown, session_status))
     }
+}
+
+/// Resolve ownership and the report against one registry snapshot.
+pub(crate) fn owned_status(
+    instance: &Instance,
+    pane_dead: bool,
+) -> Option<(crate::session::Status, bool)> {
+    if !eligible(instance) {
+        return None;
+    }
+    let registry = super::registry();
+    let configured = registry.active().any(|plugin| {
+        plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == "session.integration")
+            && plugin
+                .manifest
+                .agent_integrations
+                .iter()
+                .any(|entry| entry.tool == instance.tool)
+    });
+    if !configured {
+        return None;
+    }
+    let report = if pane_dead {
+        None
+    } else {
+        provider(&registry, &instance.tool)
+            .ok()
+            .flatten()
+            .and_then(|plugin| read_report(&instance.id, &instance.tool, plugin).ok().flatten())
+    };
+    session_status_override(true, pane_dead, report.as_ref().map(|report| report.status))
+        .map(|status| (status, report.is_some()))
 }
 
 fn check_file(meta: &std::fs::Metadata) -> Result<()> {
@@ -649,6 +712,7 @@ capabilities = ["session.integration"]
 
 [[agent_integrations]]
 tool = "{tool}"
+command = "{tool}"
 provider_versions = ["^18"]
 replies = true
 "#
@@ -672,6 +736,29 @@ replies = true
             );
         })
         .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn declaration_identity_is_bound_to_its_registry_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration("acme.identity", "identity-helper");
+        let registry = super::super::reload_registry();
+        let original = declared_agent(registry, "identity-helper", std::iter::empty()).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.get_mut("acme.identity").unwrap().enabled = false;
+        }).unwrap();
+        let disabled = super::super::reload_registry();
+        assert!(declared_agent(disabled, "identity-helper", std::iter::empty()).is_none());
+        assert_eq!(original.contribution().command.as_deref(), Some("identity-helper"));
+        assert!(agent_command("identity-helper", std::iter::empty()).is_none());
     }
 
     #[test]
@@ -908,7 +995,7 @@ replies = true
     }
 
     #[test]
-    fn provider_status_maps_to_terminal_status_and_uses_native_fallback_without_report() {
+    fn provider_status_maps_to_terminal_status_and_preserves_ownership_without_report() {
         for (provider, expected) in [
             (
                 AgentIntegrationStatus::Running,
@@ -928,7 +1015,7 @@ replies = true
             );
         }
         assert_eq!(session_status_override(false, false, None), None);
-        assert_eq!(session_status_override(true, false, None), None);
+        assert_eq!(session_status_override(true, false, None), Some(crate::session::Status::Unknown));
         assert_eq!(
             session_status_override(true, true, Some(AgentIntegrationStatus::Running)),
             Some(crate::session::Status::Error)
@@ -1014,7 +1101,10 @@ replies = true
             .unwrap_err()
             .to_string()
             .contains("expired"));
-        assert_eq!(session_status_override(true, false, None), None);
+        assert_eq!(
+            session_status_override(true, false, None),
+            Some(crate::session::Status::Unknown)
+        );
         assert!(!base
             .join("host-test")
             .join(format!("integration-{}.reply.json", plugin.id()))

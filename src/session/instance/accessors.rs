@@ -403,13 +403,13 @@ impl Instance {
     pub(super) fn resolved_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
         let native = self.resolved_agent();
         let agent = native.or_else(|| self.legacy_default_selector_agent())?;
         let support = agent.session_support.as_ref()?;
-        let capture = support.capture.as_ref()?;
+        let capture = support.capture?;
         let context = if self.is_sandboxed() {
             capture.sandbox
         } else {
@@ -431,17 +431,15 @@ impl Instance {
     pub(super) fn source_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
         let capture = crate::agents::get_agent(&active.binding.agent)?
-            .session_support
-            .as_ref()?
-            .capture
-            .as_ref()?;
+            .session_support?
+            .capture?;
         let context = if active.container.is_some() {
             capture.sandbox
         } else {

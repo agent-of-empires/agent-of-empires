@@ -65,7 +65,7 @@ impl YoloMode {
     /// generations resolves to the matching arm; any other mode is itself.
     /// `None` means the generation is unknown, so neither arm can be claimed
     /// and the caller has to refuse rather than pick one for the user.
-    pub fn resolve(&'static self, generation: AgentGeneration) -> Option<&'static YoloMode> {
+    pub fn resolve(&self, generation: AgentGeneration) -> Option<&YoloMode> {
         match self {
             YoloMode::EitherGeneration { legacy, current } => match generation {
                 AgentGeneration::Legacy => Some(legacy),
@@ -217,7 +217,7 @@ impl ForkStrategy {
     /// generations resolves to the matching arm; any other is itself. `None`
     /// means the generation is unknown, so the caller has to refuse rather than
     /// pick one for the user.
-    pub fn resolve(&'static self, generation: AgentGeneration) -> Option<&'static ForkStrategy> {
+    pub fn resolve(&self, generation: AgentGeneration) -> Option<&ForkStrategy> {
         match self {
             ForkStrategy::EitherGeneration { legacy, current } => match generation {
                 AgentGeneration::Legacy => Some(legacy),
