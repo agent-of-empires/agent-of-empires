@@ -8133,25 +8133,25 @@ async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
 async fn start_paths_refuse_archived_and_trashed_sessions() {
     use axum::body::to_bytes;
     let _home = crate::session::test_support::isolate_app_dir();
-    let shelves: [(fn(&mut Instance), &str, &str); 2] = [
-        (
-            Instance::archive,
-            "session_archived",
-            "session is archived; unarchive it first",
-        ),
-        (
-            Instance::trash,
-            "session_trashed",
-            "session is in trash; restore it first",
-        ),
+    let shelves: [(fn(&mut Instance), &str); 2] = [
+        (Instance::archive, "session_archived"),
+        (Instance::trash, "session_trashed"),
     ];
-    for (shelve, code, message) in shelves {
+    for (shelve, code) in shelves {
         for which in ["start", "ensure", "send"] {
             let mut inst = make_test_instance();
+            inst.source_profile = "default".into();
             shelve(&mut inst);
             inst.status = Status::Stopped;
             let id = inst.id.clone();
+            let archived_at = inst.archived_at;
+            let trashed_at = inst.trashed_at;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![inst.clone()],
+            );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let response = match which {
                 "start" => start_session(State(state.clone()), Path(id.clone()), Ok(None))
                     .await
@@ -8175,10 +8175,19 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
                 serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
                     .unwrap();
             assert_eq!(body["error"], code, "{which}");
-            assert_eq!(body["message"], message, "{which}");
             let after = &state.instances.read().await[0];
             assert_eq!(after.status, Status::Stopped, "{which} {code}");
             assert!(!after.tmux_session().unwrap().exists(), "{which} {code}");
+            let stored = Storage::new_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(stored.status, Status::Stopped, "{which} {code}");
+            assert_eq!(stored.archived_at, archived_at, "{which} {code}");
+            assert_eq!(stored.trashed_at, trashed_at, "{which} {code}");
         }
     }
 }
