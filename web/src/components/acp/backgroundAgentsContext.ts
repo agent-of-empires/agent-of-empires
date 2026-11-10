@@ -2,10 +2,13 @@
 
 import { createContext, useContext, useMemo } from "react";
 
-import type { BackgroundAgent, WorkflowRun } from "../../lib/acpTypes";
+import type { BackgroundAgent, SubagentRecord, WorkflowRun } from "../../lib/acpTypes";
 
 export interface BackgroundAgentsContextValue {
   agents: BackgroundAgent[];
+  subagents?: SubagentRecord[];
+  /** Stops one subagent; failures surface as a session error. */
+  cancelSubagent?: (childId: string) => Promise<void>;
   workflowRuns?: Record<string, WorkflowRun>;
   backgroundTasks?: string[];
   openPane?: () => void;
@@ -17,6 +20,23 @@ export function useBackgroundAgentFor(toolCallId: string | undefined): Backgroun
   const { agents } = useContext(BackgroundAgentsContext);
   if (!toolCallId) return undefined;
   return agents.find((a) => a.toolCallId === toolCallId);
+}
+
+/** The roster record for the subagent a `Task` call spawned. */
+export function findSubagent(
+  subagents: SubagentRecord[] | undefined,
+  toolCallId: string | undefined,
+): SubagentRecord | undefined {
+  if (!toolCallId) return undefined;
+  return subagents?.find((s) => s.parent_tool_call_id === toolCallId);
+}
+
+export function useSubagentFor(toolCallId: string | undefined): SubagentRecord | undefined {
+  return findSubagent(useContext(BackgroundAgentsContext).subagents, toolCallId);
+}
+
+export function useCancelSubagent(): BackgroundAgentsContextValue["cancelSubagent"] {
+  return useContext(BackgroundAgentsContext).cancelSubagent;
 }
 
 /** Every agent a `Workflow` call launched, in launch order. */
@@ -51,7 +71,12 @@ export function useOpenBackgroundAgentsPane(): (() => void) | undefined {
 }
 
 export function isActiveAgent(agent: BackgroundAgent): boolean {
-  return agent.status === "running" || agent.status === "stalled";
+  return (
+    agent.status === "running" ||
+    agent.status === "stalled" ||
+    agent.status === "requires_action" ||
+    agent.status === "unknown"
+  );
 }
 
 export interface WorkflowPhase {

@@ -404,6 +404,7 @@ export type AcpEvent =
         ended_at: string;
       };
     }
+  | { SubagentUpdated: { subagent: SubagentRecord; at: string } }
   | { AgentMessageChunk: { text: string; message_id?: string } }
   | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
@@ -649,6 +650,8 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
+  /** Subagent roster from the ACP subagents RFD, one record per child session. */
+  subagents: SubagentRecord[];
   /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
@@ -668,7 +671,29 @@ export interface SessionNotice {
   description?: string | null;
 }
 
-export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+export type BackgroundAgentStatus =
+  | "running"
+  | "stalled"
+  | "completed"
+  | "detached"
+  | "error"
+  | "requires_action"
+  | "unknown";
+
+export type SubagentState = "running" | "requires_action" | "idle" | "unknown";
+
+/** Wire mirror of the Rust `SubagentRecord` (src/acp/state.rs). */
+export interface SubagentRecord {
+  session_id: string;
+  parent_session_id: string;
+  parent_tool_call_id?: string | null;
+  title?: string | null;
+  description?: string | null;
+  state: SubagentState;
+  stop_reason?: string | null;
+  cancel_capable: boolean;
+  model?: string | null;
+}
 
 export interface BackgroundAgentTool {
   name: string;
@@ -957,6 +982,7 @@ export function emptyAcpState(): AcpState {
     agentUnresponsive: false,
     agentOrphaned: false,
     backgroundAgents: [],
+    subagents: [],
     backgroundTasks: [],
     workflowRuns: {},
     modeSwitchFailed: null,
@@ -1378,6 +1404,24 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
           }
         : a,
     );
+    return next;
+  }
+  if ("SubagentUpdated" in event) {
+    const { subagent, at } = event.SubagentUpdated;
+    const parent = subagent.parent_tool_call_id;
+    if (parent) {
+      next.backgroundAgents = next.backgroundAgents.map((a) => {
+        if (a.toolCallId !== parent) return a;
+        if (subagent.state === "idle") {
+          const status = subagent.stop_reason === "error" ? "error" : "completed";
+          return { ...a, status, endedAt: a.endedAt ?? at };
+        }
+        return { ...a, status: subagent.state, endedAt: null };
+      });
+    }
+    const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
+    next.subagents =
+      i >= 0 ? next.subagents.map((s, idx) => (idx === i ? subagent : s)) : [...next.subagents, subagent];
     return next;
   }
   if ("BackgroundTaskStarted" in event) {

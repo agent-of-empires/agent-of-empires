@@ -2,11 +2,17 @@
 // Cards that fold several tool calls: action runs and sub-agent tasks.
 
 import { useState } from "react";
-import { Layers, Sparkles } from "lucide-react";
+import { Layers, Sparkles, Square } from "lucide-react";
 
 import { pickStr } from "../../lib/acpArgs";
-import type { BackgroundAgentStatus, ToolCall } from "../../lib/acpTypes";
-import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
+import type { BackgroundAgentStatus, SubagentRecord, ToolCall } from "../../lib/acpTypes";
+import {
+  isActiveAgent,
+  useBackgroundAgentFor,
+  useCancelSubagent,
+  useOpenBackgroundAgentsPane,
+  useSubagentFor,
+} from "./backgroundAgentsContext";
 import {
   CardChrome,
   HighlightedBlock,
@@ -111,14 +117,32 @@ const ASYNC_STATUS: Record<BackgroundAgentStatus, [Status, string]> = {
   error: ["err", "background agent error"],
   stalled: ["stopped", "stalled in background"],
   detached: ["stopped", "detached"],
+  requires_action: ["running", "Waiting on you"],
+  unknown: ["stopped", "Unknown"],
 };
+
+function subagentBadge(record: SubagentRecord): string {
+  switch (record.state) {
+    case "running":
+      return "running";
+    case "requires_action":
+      return "waiting on you";
+    case "idle":
+      return record.stop_reason ? `idle · ${record.stop_reason}` : "idle";
+    default:
+      return "unknown";
+  }
+}
 
 /** Async sub-agent launch, linked to its live Background agents record by
  *  tool-call id. Neutral until the first tailer event arrives. */
 export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   const { description } = useTaskDescription(tool);
   const agent = useBackgroundAgentFor(tool.id);
+  const record = useSubagentFor(tool.id);
+  const cancel = useCancelSubagent();
   const openPane = useOpenBackgroundAgentsPane();
+  const stoppable = !!agent && isActiveAgent(agent) && !!record?.cancel_capable && !!cancel;
 
   const [status, fallbackMeta] = agent ? ASYNC_STATUS[agent.status] : (["ok", "runs in background"] as const);
   let metaText = fallbackMeta;
@@ -138,7 +162,33 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
       startedAt={agent?.startedAt ?? tool.started_at}
       endedAt={agent?.endedAt ?? undefined}
       primary={<span className="truncate">{description}</span>}
-      meta={<span className="text-[11px] text-text-dim">{metaText}</span>}
+      meta={
+        <>
+          <span className="text-[11px] text-text-dim">{metaText}</span>
+          {stoppable && (
+            // The header is a button, so a nested one would be invalid markup.
+            <span
+              role="button"
+              tabIndex={0}
+              title="Stop this sub-agent"
+              aria-label="Stop sub-agent"
+              onClick={(e) => {
+                e.stopPropagation();
+                void cancel(record.session_id);
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                e.stopPropagation();
+                void cancel(record.session_id);
+              }}
+              className="ml-2 inline-flex items-center text-text-dim hover:text-rose-300"
+            >
+              <Square className="h-3 w-3 fill-current" strokeWidth={0} />
+            </span>
+          )}
+        </>
+      }
       expanded={false}
       onToggle={openPane}
       navigate={openPane !== undefined}
@@ -155,7 +205,9 @@ export function extractTaskResult(text: string): string {
 /** A sub-agent Task. With children it is Claude's linked Task; childless it is an
  *  off-protocol launch (opencode) that only reports a final result. */
 export function SubagentCard({ tool, result, children }: ToolCardProps & { children: ToolCardProps[] }) {
-  const { args, description } = useTaskDescription(tool);
+  const { args, description: toolDescription } = useTaskDescription(tool);
+  const record = useSubagentFor(tool.id);
+  const description = record?.title || toolDescription;
   const hasChildren = children.length > 0;
   const prompt = pickStr(args, "prompt");
   const report = result ? extractTaskResult(result.text ?? "") : "";
@@ -171,6 +223,7 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
         {...spanTimes([{ tool, result }, ...children])}
         icon={<Sparkles className={ICON} />}
         label="subagent"
+        meta={record && <span className="text-[11px] text-text-dim">{subagentBadge(record)}</span>}
         primary={
           <>
             <span className="truncate">{description}</span>

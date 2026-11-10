@@ -3152,6 +3152,8 @@
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
         "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/api.ts",
         "web/src/components/acp/CoreToolCards.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/NamedToolCards.tsx",

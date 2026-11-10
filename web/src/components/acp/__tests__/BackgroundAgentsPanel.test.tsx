@@ -2,7 +2,7 @@
 import { fireEvent, render } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import type { BackgroundAgent, WorkflowRun } from "../../../lib/acpTypes";
+import type { BackgroundAgent, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -12,10 +12,12 @@ vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedV
 const agentsMock = vi.fn<() => BackgroundAgent[]>(() => []);
 const tasksMock = vi.fn<() => string[]>(() => []);
 const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
+const subagentsMock = vi.fn<() => SubagentRecord[]>(() => []);
 vi.mock("../../../hooks/useAcpSession", () => ({
   useBackgroundAgents: () => agentsMock(),
   useBackgroundTasks: () => tasksMock(),
   useWorkflowRuns: () => runsMock(),
+  useSubagents: () => subagentsMock(),
 }));
 
 import { BackgroundAgentsPanel } from "../BackgroundAgentsPanel";
@@ -167,6 +169,61 @@ describe("BackgroundAgentsPanel", () => {
       expect(queryByRole("button", { name: /stop/i }), over.status).toBeNull();
       unmount();
     }
+  });
+
+  describe("per-agent Stop", () => {
+    const record = (over: Partial<SubagentRecord> = {}): SubagentRecord => ({
+      session_id: "child-1",
+      parent_session_id: "s-1",
+      parent_tool_call_id: "task-1",
+      state: "running",
+      cancel_capable: true,
+      ...over,
+    });
+
+    it("POSTs the child cancel route and surfaces a failure", async () => {
+      const fetchMock = vi.fn(() =>
+        Promise.resolve({ ok: false, status: 409, text: () => Promise.resolve("subagent cannot be cancelled") }),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      agentsMock.mockReturnValue([agent()]);
+      subagentsMock.mockReturnValue([record()]);
+      const { getByRole, findByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+      expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
+      expect(await findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
+      vi.unstubAllGlobals();
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("is hidden without a cancel-capable record or for an inactive agent", () => {
+      const cases: [BackgroundAgent, SubagentRecord[]][] = [
+        [agent(), []],
+        [agent(), [record({ cancel_capable: false })]],
+        [agent({ status: "completed", endedAt: new Date().toISOString() }), [record()]],
+      ];
+      for (const [a, roster] of cases) {
+        agentsMock.mockReturnValue([a]);
+        subagentsMock.mockReturnValue(roster);
+        const { queryByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+        expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+        unmount();
+      }
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("labels requires_action and unknown, with a Stop on the active ones", () => {
+      agentsMock.mockReturnValue([
+        agent({ agentId: "w", toolCallId: "t-w", status: "requires_action" }),
+        agent({ agentId: "u", toolCallId: "t-u", status: "unknown" }),
+      ]);
+      subagentsMock.mockReturnValue([record({ parent_tool_call_id: "t-w" })]);
+      const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(container.textContent).toContain("Waiting on you");
+      expect(container.textContent).toContain("Unknown");
+      expect(getAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(1);
+      subagentsMock.mockReturnValue([]);
+    });
   });
 
   it("opens a details modal showing the full prompt, result, and tools", () => {

@@ -313,6 +313,79 @@ describe("applyEvent / background agents", () => {
   });
 });
 
+describe("applyEvent / subagent roster", () => {
+  const launched: AcpEvent = {
+    BackgroundAgentLaunched: {
+      agent_id: "a1",
+      tool_call_id: "task-1",
+      description: "map backend",
+      prompt: "do it",
+      model: "m",
+      started_at: "2026-06-27T00:00:00Z",
+    },
+  };
+  const update = (state: string, at: string, over = {}): AcpEvent => ({
+    SubagentUpdated: {
+      at,
+      subagent: {
+        session_id: "child-1",
+        parent_session_id: "root",
+        parent_tool_call_id: "task-1",
+        state,
+        cancel_capable: true,
+        ...over,
+      },
+    } as Extract<AcpEvent, { SubagentUpdated: unknown }>["SubagentUpdated"],
+  });
+  const run = (...events: AcpEvent[]) => events.reduce((s, e, i) => ev(s, i + 1, e), emptyAcpState());
+
+  it("upserts the roster by child session id", () => {
+    const state = run(update("running", "t1"), update("idle", "t2", { stop_reason: "end_turn" }), {
+      SubagentUpdated: {
+        at: "t3",
+        subagent: { ...update("running", "t3").SubagentUpdated.subagent, session_id: "c2" },
+      },
+    });
+    expect(state.subagents.map((s) => [s.session_id, s.state])).toEqual([
+      ["child-1", "idle"],
+      ["c2", "running"],
+    ]);
+  });
+
+  it("maps the state onto the matching background agent, including idle then running again", () => {
+    const agentAfter = (...events: AcpEvent[]) => run(launched, ...events).backgroundAgents[0];
+    expect(agentAfter(update("requires_action", "t1"))).toMatchObject({ status: "requires_action", endedAt: null });
+    expect(agentAfter(update("unknown", "t1"))).toMatchObject({ status: "unknown", endedAt: null });
+    expect(agentAfter(update("idle", "t1", { stop_reason: "end_turn" }))).toMatchObject({
+      status: "completed",
+      endedAt: "t1",
+    });
+    expect(agentAfter(update("idle", "t1", { stop_reason: "error" }))).toMatchObject({
+      status: "error",
+      endedAt: "t1",
+    });
+    // A later idle keeps the first end time; running again reopens the agent.
+    const twice = agentAfter(update("idle", "t1"), update("idle", "t2"));
+    expect(twice.endedAt).toBe("t1");
+    expect(agentAfter(update("idle", "t1"), update("running", "t2"))).toMatchObject({
+      status: "running",
+      endedAt: null,
+    });
+  });
+
+  it("keeps requires_action and unknown agents active", () => {
+    for (const state of ["requires_action", "unknown"]) {
+      expect(isVisiblyBusy(run(launched, update(state, "t1")))).toBe(true);
+    }
+  });
+
+  it("only updates the roster when no agent matches or the parent call is absent", () => {
+    const state = run(launched, update("idle", "t1", { parent_tool_call_id: null }));
+    expect(state.backgroundAgents[0]).toMatchObject({ status: "running", endedAt: null });
+    expect(state.subagents).toHaveLength(1);
+  });
+});
+
 describe("applyEvent / workflow runs", () => {
   it("records a workflow run by its tool call and tags its agents", () => {
     const events: AcpEvent[] = [

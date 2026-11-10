@@ -28,6 +28,7 @@ import {
   emptyAcpState,
   type ActivityRow,
   type BackgroundAgent,
+  type SubagentRecord,
   type ToolCall,
   type ToolOutputBlock,
 } from "../../lib/acpTypes";
@@ -795,6 +796,29 @@ describe("SubagentCard", () => {
     expect(container.textContent).toContain("x.ts");
   });
 
+  it("shows the roster title and state badge for the matching tool call", () => {
+    const tool = makeToolCall({ id: "task-1", name: "Task", args_preview: args({ description: "investigate bug" }) });
+    const subagents: SubagentRecord[] = [
+      {
+        session_id: "child-1",
+        parent_session_id: "s",
+        parent_tool_call_id: "task-1",
+        title: "Auth audit",
+        state: "idle",
+        stop_reason: "end_turn",
+        cancel_capable: false,
+      },
+    ];
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], subagents }}>
+        <SubagentCard tool={tool} result={makeCompletion()} children={[]} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Auth audit");
+    expect(container.textContent).not.toContain("investigate bug");
+    expect(container.textContent).toContain("idle · end_turn");
+  });
+
   it("renders an off-protocol launch with its prompt and unwrapped report", () => {
     const tool = makeToolCall({
       kind: "think",
@@ -861,6 +885,62 @@ describe("AsyncSubagentCard", () => {
     );
     expect(container.textContent).toContain("3 tools · Read");
     expect(container.textContent).not.toContain("agentId");
+  });
+
+  it("shows Stop only for a cancel-capable active subagent, without opening the pane", () => {
+    const openPane = vi.fn();
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const agent: BackgroundAgent = {
+      agentId: "a1",
+      toolCallId: "task-async",
+      description: "d",
+      prompt: "",
+      model: "",
+      status: "running",
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    const record: SubagentRecord = {
+      session_id: "child-1",
+      parent_session_id: "s",
+      parent_tool_call_id: "task-async",
+      state: "running",
+      cancel_capable: true,
+    };
+    const view = (a: BackgroundAgent, r: SubagentRecord) => (
+      <BackgroundAgentsContext.Provider value={{ agents: [a], subagents: [r], cancelSubagent, openPane }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>
+    );
+    const { getByRole, queryByRole, rerender } = render(view(agent, record));
+    fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+    expect(openPane).not.toHaveBeenCalled();
+    rerender(view(agent, { ...record, cancel_capable: false }));
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+    rerender(view({ ...agent, status: "completed", endedAt: agent.startedAt }, record));
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+  });
+
+  it("labels a requires_action agent as waiting on the user", () => {
+    const agent = {
+      agentId: "a1",
+      toolCallId: "task-async",
+      status: "requires_action",
+      endedAt: null,
+    } as BackgroundAgent;
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [agent] }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Waiting on you");
   });
 
   it("opens the Sub agents pane on click", () => {
