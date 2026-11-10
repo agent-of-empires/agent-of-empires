@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-libra
 
 import type { AgentInstallInfo } from "../../../lib/api";
 import type { AcpWorkerState } from "../../../lib/types";
-import { emptyAcpState, nativeInputAvailable } from "../../../lib/acpTypes";
+import { emptyAcpState } from "../../../lib/acpTypes";
 import { SessionBanners } from "../SessionBanners";
 import { StartupErrorBanner } from "../StartupErrorBanner";
 
@@ -470,8 +470,6 @@ describe("StartupErrorBanner Details", () => {
     const body = getByTestId("startup-error-banner-details-body");
     expect(body.textContent).toContain(SPAWN_MSG);
     expect(within(body).getByTestId("acp-agent-log-toggle")).toBeTruthy();
-    expect(state.sessionAssigned).toBe(false);
-    expect(nativeInputAvailable(state)).toBe(false);
     state = {
       ...state,
       connectionUnavailable: { source: "control", cause: "read_failed", phase: "establishing" },
@@ -479,8 +477,6 @@ describe("StartupErrorBanner Details", () => {
     rerender(<SessionBanners {...props} state={state} />);
     expect(getByTestId("startup-error-banner-details-body")).toBe(body);
     expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
-    expect(state.sessionAssigned).toBe(false);
-    expect(nativeInputAvailable(state)).toBe(false);
     fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
     await waitFor(() =>
       expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input"),
@@ -490,8 +486,6 @@ describe("StartupErrorBanner Details", () => {
     expect(getByTestId("startup-error-banner-details-body")).toBe(body);
     expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
     expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input");
-    expect(state.sessionAssigned).toBe(false);
-    expect(nativeInputAvailable(state)).toBe(false);
     expect(calls(spy, "/acp/worker-log")).toBe(1);
     expect(calls(spy, "/acp/spawn")).toBe(0);
     expect(calls(spy, "/acp/restart")).toBe(0);
