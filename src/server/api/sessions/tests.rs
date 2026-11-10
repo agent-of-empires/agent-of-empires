@@ -7309,9 +7309,7 @@ pub(super) mod terminal_custody {
         }
         let root = tempfile::tempdir_in("/tmp")?;
         let _home = crate::session::test_support::isolate_app_dir_at(root.path());
-        let socket = root.path().join("tmux.sock");
-        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
-            .and_set("AOE_TMUX_SOCKET", &socket);
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"]);
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
         })?;
@@ -7337,12 +7335,12 @@ pub(super) mod terminal_custody {
              if [ \"$1\" = --version ]; then echo '1.0.0 fixture'; exit 0; fi\n\
              printf 'PID %s\\nBORN\\n' \"$$\" >> {received}\n\
              printf 'native agent booting\\n'\n\
-             tmux -S {socket} wait-for {ready_gate}\n\
+             : \"${{TMUX:?fixture requires its actual tmux pane server}}\"\n\
+             tmux wait-for {ready_gate} || exit $?\n\
              printf '%s\\n' {marker}\n\
              printf 'READY\\n' >> {received}\n\
              while IFS= read -r line; do printf '%s\\n' \"$line\" >> {received}; done\n",
             received = quote(received.to_str().unwrap()),
-            socket = quote(socket.to_str().unwrap()),
             ready_gate = quote(&ready_gate),
             marker = quote(marker),
         );
