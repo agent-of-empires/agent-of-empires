@@ -1531,10 +1531,19 @@ async fn sweep_notifies_then_respects_a_dismissal() {
 #[serial]
 async fn unchanged_sources_repair_missing_or_stale_approval() {
     let _home = isolate();
-    for (index, (capabilities, remove_grant)) in
-        [("[\"net\"]", true), ("[]", true), ("[\"net\"]", false)]
-            .into_iter()
-            .enumerate()
+    enum Damage {
+        MissingGrant,
+        ModifiedManifest,
+        PartialGrant,
+    }
+    for (index, (capabilities, damage)) in [
+        ("[\"net\"]", Damage::MissingGrant),
+        ("[]", Damage::MissingGrant),
+        ("[\"net\"]", Damage::ModifiedManifest),
+        ("[\"net\"]", Damage::PartialGrant),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let id = format!("acme.repair{index}");
         let source = tempfile::tempdir().unwrap();
@@ -1582,13 +1591,21 @@ async fn unchanged_sources_repair_missing_or_stale_approval() {
             .unwrap()
             .join(&id)
             .join("aoe-plugin.toml");
-        if remove_grant {
-            agent_of_empires::session::update_config(|config| {
-                config.plugins.get_mut(&id).unwrap().grant = None;
-            })
-            .unwrap();
-        } else {
-            std::fs::write(&installed, format!("{manifest}\n# changed locally\n")).unwrap();
+        match damage {
+            Damage::MissingGrant | Damage::PartialGrant => {
+                agent_of_empires::session::update_config(|config| {
+                    let grant = &mut config.plugins.get_mut(&id).unwrap().grant;
+                    if matches!(damage, Damage::PartialGrant) {
+                        grant.as_mut().unwrap().capabilities.clear();
+                    } else {
+                        *grant = None;
+                    }
+                })
+                .unwrap();
+            }
+            Damage::ModifiedManifest => {
+                std::fs::write(&installed, format!("{manifest}\n# changed locally\n")).unwrap();
+            }
         }
         assert!(load_registry().get(&id).unwrap().needs_reapproval());
         let before_manifest = std::fs::read(&installed).unwrap();
@@ -1626,6 +1643,10 @@ async fn unchanged_sources_repair_missing_or_stale_approval() {
         assert!(load_registry().get(&id).unwrap().active());
         assert_eq!(std::fs::read(&installed).unwrap(), manifest.as_bytes());
         let config = Config::load().unwrap();
+        assert_eq!(
+            config.plugins[&id].grant.as_ref().unwrap().capabilities,
+            serde_json::from_str::<Vec<String>>(capabilities).unwrap()
+        );
         assert_eq!(
             config.plugins[&id].source.as_deref(),
             dir.canonicalize().unwrap().to_str()

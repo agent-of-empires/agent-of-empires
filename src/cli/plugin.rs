@@ -14,6 +14,13 @@ use clap::Subcommand;
 #[error("Remote plugin inspection is not supported; use the same Daemon's /api/plugins API, or run this command on its host without --daemon-url or AOE_DAEMON_URL")]
 struct RemoteInspectionUnsupported;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Plugin job {id} failed: {error}")]
+struct PluginJobFailed {
+    id: String,
+    error: String,
+}
+
 #[derive(Subcommand)]
 pub enum PluginCommands {
     /// List every known plugin with version, validation, and state
@@ -454,7 +461,11 @@ async fn observe_job(client: &HttpClient, id: &str) -> Result<()> {
                     if !response.log.path.is_empty() {
                         eprintln!("Full log on Daemon host: {}", response.log.path);
                     }
-                    bail!("Plugin job {id} failed: {error}");
+                    return Err(PluginJobFailed {
+                        id: id.to_owned(),
+                        error,
+                    }
+                    .into());
                 }
             }
         }
@@ -523,6 +534,135 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_update_repairs_files_and_rejects_a_source_changed_after_preview() {
+        use crate::git::test_support::run_git;
+        use crate::session::test_support::EnvGuard;
+        use futures_util::FutureExt;
+
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let repositories = tempfile::tempdir().unwrap();
+        let repository = repositories.path().join("acme/repair.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        run_git(&repository, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(
+            repository.join("aoe-plugin.toml"),
+            "id = \"acme.repair\"\nname = \"Repair\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("worker.js"), b"approved worker bytes").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-qm", "fixture"]);
+
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["127.0.0.1".into()],
+            Vec::new(),
+            None,
+        );
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let mutations = submissions.clone();
+        let upstream = repository.clone();
+        let router = crate::server::test_support::build_router_for_test(state.clone()).layer(
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let submissions = mutations.clone();
+                    let upstream = upstream.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path() == "/api/plugins/acme.repair/update/apply"
+                            && submissions.fetch_add(1, Ordering::SeqCst) == 1
+                        {
+                            std::fs::write(upstream.join("worker.js"), b"changed upstream bytes")
+                                .unwrap();
+                            run_git(&upstream, &["add", "."]);
+                            run_git(&upstream, &["commit", "-qm", "changed after preview"]);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let _endpoint = EnvGuard::set(&[
+            ("AOE_DAEMON_URL", base.as_str()),
+            ("AOE_DAEMON_TOKEN", ""),
+            ("AOE_DAEMON_PASSPHRASE", ""),
+            ("AOE_UPDATE_API_BASE", &format!("{base}/metadata")),
+            (
+                "AOE_GITHUB_CLONE_BASE",
+                repositories.path().to_str().unwrap(),
+            ),
+        ]);
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let source = "gh:acme/repair@main";
+            crate::plugin::install::install(source, true, false)
+                .await
+                .unwrap();
+            crate::plugin::install::set_enabled("acme.repair", false).unwrap();
+            assert!(matches!(
+                crate::plugin::install::preview_update("acme.repair", false)
+                    .await
+                    .unwrap(),
+                UpdatePreview::NoUpdate { .. }
+            ));
+            let installed = crate::plugin::plugins_dir()
+                .unwrap()
+                .join("acme.repair/worker.js");
+            std::fs::remove_file(&installed).unwrap();
+            run_update("acme.repair", true).await.unwrap();
+            assert_eq!(std::fs::read(&installed).unwrap(), b"approved worker bytes");
+            assert_eq!(submissions.load(Ordering::SeqCst), 1);
+            let config = crate::session::Config::load().unwrap();
+            let entry = &config.plugins["acme.repair"];
+            assert!(!entry.enabled);
+            assert!(!entry.dev);
+            assert_eq!(entry.source.as_deref(), Some(source));
+            let before_entry = serde_json::to_value(entry).unwrap();
+            let lock_path = crate::session::get_app_dir().unwrap().join("plugins.lock");
+            let before_lock = std::fs::read(&lock_path).unwrap();
+
+            std::fs::remove_file(&installed).unwrap();
+            let error = run_update("acme.repair", true).await.unwrap_err();
+            let failed = error
+                .downcast_ref::<PluginJobFailed>()
+                .expect("the CLI must observe a terminal job failure");
+            let client =
+                HttpClient::new(crate::acp::client::require_daemon().await.unwrap()).unwrap();
+            assert!(matches!(
+                client.plugin_job(&failed.id).await.unwrap().job.status,
+                PluginJobStatus::Failed { .. }
+            ));
+            assert_eq!(submissions.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                std::fs::read(repository.join("worker.js")).unwrap(),
+                b"changed upstream bytes"
+            );
+            assert!(!installed.exists());
+            assert_eq!(
+                serde_json::to_value(
+                    &crate::session::Config::load().unwrap().plugins["acme.repair"]
+                )
+                .unwrap(),
+                before_entry
+            );
+            assert_eq!(std::fs::read(lock_path).unwrap(), before_lock);
+        })
+        .catch_unwind()
+        .await;
+        state.runtime.work.drain().await;
+        server.abort();
+        let _ = server.await;
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
 
     #[tokio::test]
     #[serial_test::serial]

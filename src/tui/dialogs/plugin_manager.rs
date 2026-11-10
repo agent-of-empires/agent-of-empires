@@ -2621,6 +2621,10 @@ mod daemon_update_tests {
         let receipt = effects.path().join("worker-receipt");
         let node = crate::plugin::write_fake_node(effects.path(), "node");
         let _node = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+        let _endpoint = crate::session::test_support::EnvGuard::set(&[(
+            "AOE_DAEMON_URL",
+            "http://127.0.0.1:1",
+        )]);
         let write_manifest = |version: &str, build: &str| {
             let command = serde_json::to_string(&[
                 "sh", "-c",
@@ -2698,12 +2702,6 @@ mod daemon_update_tests {
                     &version,
                     &format!("\n[[runtime.build]]\ncommand = {build_command}\n"),
                 );
-                let preview = client.preview_plugin_update("acme.tui-job").await.unwrap();
-                let fingerprint = match preview {
-                    UpdatePreview::SafeUpdate { fingerprint, .. } => fingerprint,
-                    UpdatePreview::ConsentRequired { consent, .. } => consent.fingerprint,
-                    UpdatePreview::NoUpdate { .. } => panic!("fixture must update"),
-                };
                 let installed = crate::plugin::plugins_dir().unwrap().join("acme.tui-job");
                 let mut restart_gate =
                     crate::plugin::fetch::test_gate::install(&installed, "restart");
@@ -2718,8 +2716,33 @@ mod daemon_update_tests {
                         .unwrap();
                     runtime.block_on(async move {
                         let mut dialog = PluginManagerDialog::new();
-                        dialog.update_client = Some(pinned);
-                        dialog.start_apply("acme.tui-job".into(), Some(fingerprint));
+                        let (preview_tx, preview_rx) = oneshot::channel();
+                        tokio::spawn(async move {
+                            let result = pinned
+                                .preview_plugin_update("acme.tui-job")
+                                .await
+                                .map(|preview| (pinned, preview))
+                                .map_err(|error| error.to_string());
+                            let _ = preview_tx.send(result);
+                        });
+                        dialog.pending_plugin = Some("acme.tui-job".into());
+                        dialog.pending = Some(Pending::Preview(preview_rx));
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            loop {
+                                dialog.tick();
+                                assert!(dialog.error.is_none(), "{:?}", dialog.error);
+                                if matches!(dialog.popup, Some(Popup::Review(_))) {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        dialog.handle_key(KeyEvent::new(
+                            KeyCode::Enter,
+                            crossterm::event::KeyModifiers::NONE,
+                        ));
                         loop {
                             dialog.tick();
                             if let Some(Popup::Progress(progress)) = &dialog.popup {

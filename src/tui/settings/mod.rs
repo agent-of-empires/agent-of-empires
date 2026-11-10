@@ -1441,6 +1441,7 @@ mod dirty_tracking_tests {
 
         let a = view.global_config.plugins.get("a").expect("a survives");
         assert!(!a.enabled, "the staged toggle must survive the resync");
+        assert_eq!(a.dismissed_update.as_deref(), Some("fresh-fingerprint"));
         assert!(
             a.grant.is_some(),
             "the lifecycle-written grant must win over the staged copy"
