@@ -37,7 +37,7 @@ Live web fixtures own any Daemon started by `seedFn`, including when seeding
 fails. Teardown stops that Daemon before its runners and removes the isolated
 HOME only after cleanup succeeds. A shutdown failure retains HOME for diagnosis.
 
-When adding a mutating REST route, classify it in the CityHall allow or deny table in `src/server/access.rs`. Audit its handler or declare an exact, justified exemption in `src/server/api/mod.rs`.
+When adding a mutating REST route, keep CityHall's fail-closed allow table in `src/server/access.rs` current. Exercise admission through real router requests, including malformed bodies, read-only policy, authentication and elevation precedence. Read-only attach/ensure may view existing agents but must not revive them; test that distinction instead of inspecting handler source text.
 
 Debug builds carry line tables only, and dependencies carry no debug info, to keep `target/` small across worktrees. Panics still name the file and line in this crate, but a debugger has no local values; rebuild with `RUSTFLAGS="-Cdebuginfo=2"` for a full debugging session.
 
