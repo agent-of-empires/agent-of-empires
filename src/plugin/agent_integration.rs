@@ -115,12 +115,10 @@ pub fn catalog<'a, 'b, 'c>(
             .agent_integrations
             .iter()
             .filter(move |entry| {
-                !super::bundled_agents::definitions().any(|fallback| {
-                    entry.tool.contains(fallback.name)
-                        && (entry.tool != fallback.name
-                            || plugin.manifest.api_version < 21
-                            || entry.launch.is_none())
-                })
+                // Only the fallback's own tool is gated: the bundled contract is
+                // replaced solely by an API 21 launch declaration for that name.
+                !super::bundled_agents::contains(&entry.tool)
+                    || (plugin.manifest.api_version >= 21 && entry.launch.is_some())
             })
             .filter_map(move |entry| {
                 entry
@@ -257,11 +255,6 @@ pub(crate) fn declared_agent<'a>(
     custom_names: impl IntoIterator<Item = &'a str>,
 ) -> Option<DeclaredAgent> {
     if custom_names.into_iter().any(|name| name == tool) {
-        return None;
-    }
-    if super::bundled_agents::definitions()
-        .any(|fallback| tool != fallback.name && tool.contains(fallback.name))
-    {
         return None;
     }
     if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
@@ -1440,6 +1433,55 @@ sandbox = "unsupported"
             (omp.detect_status)("plain command output"),
             crate::session::Status::Idle
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bundled_fallback_gates_only_its_own_tool_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.name-contains-omp"
+name = "Name contains omp"
+version = "1.0.0"
+api_version = 20
+[[agent_integrations]]
+tool = "prompt-helper"
+command = "prompt-helper"
+"#;
+        let dir = super::super::plugins_dir()
+            .unwrap()
+            .join("acme.name-contains-omp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.name-contains-omp".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+
+        // An unrelated tool whose name merely contains `omp` keeps its own declaration.
+        assert!(declared_agent(registry.clone(), "prompt-helper", std::iter::empty()).is_some());
+        // The fallback's own name is still gated until an API 21 launch declaration exists.
+        assert!(declared_agent(registry, "omp", std::iter::empty()).is_none());
     }
 
     #[test]
