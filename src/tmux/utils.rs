@@ -391,6 +391,33 @@ pub fn is_pane_dead(session_name: &str) -> bool {
     probe_pane(session_name) == PaneProbe::Dead
 }
 
+/// Whether any pane in any window of `session_name` may still run a process.
+/// An unreadable answer counts as live: only a confirmed absence frees the checkout.
+pub(crate) fn session_has_live_pane(session_name: &str) -> bool {
+    let target = format!("={session_name}:");
+    let mut cmd = crate::tmux::tmux_query_command();
+    cmd.args(["list-panes", "-s", "-t", &target, "-F", "#{pane_dead}"]);
+    let Ok(output) = crate::tmux::run_tmux_command_with_timeout(&mut cmd) else {
+        return true;
+    };
+    classify_live_panes(output.status.success(), &output.stdout, &output.stderr)
+}
+
+fn classify_live_panes(succeeded: bool, stdout: &[u8], stderr: &[u8]) -> bool {
+    if !succeeded {
+        let stderr = String::from_utf8_lossy(stderr);
+        let gone = tmux_no_server_running(stderr.as_bytes())
+            || stderr
+                .lines()
+                .any(|line| line.trim().starts_with("can't find session:"));
+        return !gone;
+    }
+    stdout.is_empty()
+        || String::from_utf8_lossy(stdout)
+            .lines()
+            .any(|l| l.trim() != "1")
+}
+
 pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
     let first = first_pane_id(session_name)?;
     crate::tmux::tmux_command()
@@ -1686,5 +1713,34 @@ mod pane_probe_tests {
     fn probe_pane_rejects_an_empty_session_name() {
         assert_eq!(probe_pane(""), PaneProbe::Missing);
         assert!(!is_pane_dead(""));
+    }
+
+    #[test]
+    fn live_pane_classification_fails_safe() {
+        let cases: [(&str, bool, &[u8], &[u8], bool); 8] = [
+            ("all dead", true, b"1\n1\n", b"", false),
+            ("secondary alive", true, b"1\n0\n", b"", true),
+            ("first alive", true, b"0\n1\n", b"", true),
+            ("empty success", true, b"", b"", true),
+            ("garbage output", true, b"?\n", b"", true),
+            (
+                "session gone",
+                false,
+                b"",
+                b"can't find session: x\n",
+                false,
+            ),
+            (
+                "no server",
+                false,
+                b"",
+                b"no server running on /tmp/s\n",
+                false,
+            ),
+            ("other failure", false, b"", b"boom\n", true),
+        ];
+        for (case, ok, out, err, expected) in cases {
+            assert_eq!(classify_live_panes(ok, out, err), expected, "{case}");
+        }
     }
 }
