@@ -2326,6 +2326,11 @@ impl Storage {
             .as_deref()
             .context("profile store is not bound")?
             .sessions;
+        super::purge_owners::invalidate_unpublished_checkpoint(
+            &self.sessions_path,
+            sessions.read()?.as_deref(),
+            bytes,
+        )?;
         sessions.replace_preserving_permissions(bytes)?;
         sessions.sync_parent()?;
         self.verify_bound_profile()
@@ -2461,6 +2466,15 @@ impl Storage {
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
         let (mut instances, mut groups) = self.load_bundle(policy)?;
+        let before_identities: Vec<_> = instances
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    super::purge_owners::has_historical_custody(row),
+                )
+            })
+            .collect();
         let groups_before = groups.clone();
         let observed = super::lifecycle::observing().then(|| {
             let profile = super::config::effective_profile(&self.profile);
@@ -2468,6 +2482,43 @@ impl Storage {
             (profile, before)
         });
         let result = f(&mut instances, &mut groups)?;
+        let identities_changed = before_identities.len() != instances.len()
+            || before_identities
+                .iter()
+                .zip(&instances)
+                .any(|((id, _), row)| *id != row.id);
+        let current_ids = identities_changed.then(|| {
+            instances
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let mut invalidated: Vec<_> = before_identities
+            .iter()
+            .filter(|(id, historical)| {
+                *historical
+                    || current_ids
+                        .as_ref()
+                        .is_some_and(|ids| !ids.contains(id.as_str()))
+            })
+            .map(|(id, _)| id.as_str())
+            .chain(
+                instances
+                    .iter()
+                    .filter(|row| super::purge_owners::has_historical_custody(row))
+                    .map(|row| row.id.as_str()),
+            )
+            .collect();
+        invalidated.sort_unstable();
+        invalidated.dedup();
+        super::purge_owners::invalidate_unpublished_rows(
+            app_dir_for_profile_dir(
+                self.sessions_path
+                    .parent()
+                    .context("Sessions path needs a parent")?,
+            ),
+            &invalidated,
+        )?;
 
         // Serialization failure must leave both files untouched.
         let instances_buf = serde_json::to_vec_pretty(&instances)?;
@@ -2791,6 +2842,22 @@ impl Storage {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default(),
         };
+        let moved_ids: Vec<_> = moved.iter().map(|row| row.id.as_str()).collect();
+        let source_root = app_dir_for_profile_dir(
+            self.sessions_path
+                .parent()
+                .context("Source sessions need a parent")?,
+        );
+        let target_root = app_dir_for_profile_dir(
+            target
+                .sessions_path
+                .parent()
+                .context("Target sessions need a parent")?,
+        );
+        super::purge_owners::invalidate_unpublished_rows(source_root, &moved_ids)?;
+        if source_root != target_root {
+            super::purge_owners::invalidate_unpublished_rows(target_root, &moved_ids)?;
+        }
         let journal_path = super::move_journal::record(&journal_entry, &self.sessions_path)
             .context(
                 "recording the durable move journal failed; no move effect or profile row changed",

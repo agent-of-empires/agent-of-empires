@@ -21,6 +21,8 @@ pub struct SpawnConfig {
     pub tool: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
+    /// AoE app directory whose durable ownership journal admits this publisher.
+    pub publisher_root: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     /// Request-sourced provider env, filtered by `provider_env_denyreason`.
     pub provider_env: Vec<(String, String)>,
@@ -82,6 +84,32 @@ impl SpawnConfig {
             .map(|(_, base)| base.as_str())
             .unwrap_or(&self.agent_key)
             == "prime-agent"
+    }
+
+    pub(crate) fn publisher_family(
+        &self,
+        command: &std::process::Command,
+        overrides: &[(String, String)],
+    ) -> Option<&'static str> {
+        if self.sandbox_info.is_some() || self.uses_native_prime() {
+            return None;
+        }
+        crate::acp::agent_registry::publisher_family_for_environment(
+            self.spec.publisher_family(),
+            |key| {
+                overrides
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| !value.is_empty())
+                    .unwrap_or_else(|| {
+                        command
+                            .get_envs()
+                            .find(|(name, _)| name == &key)
+                            .is_some_and(|(_, value)| value.is_some_and(|value| !value.is_empty()))
+                    })
+            },
+        )
     }
 }
 
@@ -325,12 +353,10 @@ pub(super) fn native_store_snapshot(
     command: &std::process::Command,
     overrides: &[(String, String)],
 ) -> Option<crate::session::ExecutionBinding> {
-    if config.sandbox_info.is_some()
-        || !matches!(config.agent_key.as_str(), "claude" | "claude-code")
-    {
+    if config.publisher_family(command, overrides) != Some("claude") {
         return None;
     }
-    let value = |name: &str| {
+    crate::session::capture::host_publisher_execution("claude", &config.cwd, |name| {
         overrides
             .iter()
             .rev()
@@ -338,33 +364,6 @@ pub(super) fn native_store_snapshot(
             .map(|(_, value)| value.clone())
             .or_else(|| effective_env_value(command, name))
             .filter(|value| !value.is_empty())
-    };
-    let cwd = crate::session::capture::canonicalize_allowing_missing_leaf(&config.cwd)?;
-    let exported = value("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-    let home = value("HOME").map(PathBuf::from);
-    let root = exported
-        .clone()
-        .or_else(|| home.as_ref().map(|home| home.join(".claude")))?;
-    let root = if root.is_absolute() {
-        root
-    } else {
-        cwd.join(root)
-    };
-    let store = crate::session::capture::canonicalize_allowing_missing_leaf(&root)?;
-    let exported_default_store = Some(
-        exported.is_some()
-            && home
-                .as_ref()
-                .is_some_and(|home| crate::session::capture::is_default_claude_store(&store, home)),
-    );
-    Some(crate::session::ExecutionBinding {
-        agent: "claude".into(),
-        stores: vec![store],
-        configuration: Vec::new(),
-        cwd,
-        cwd_filesystem: "host".into(),
-        filesystem: "host".into(),
-        exported_default_store,
     })
 }
 
@@ -461,6 +460,7 @@ pub(super) fn prime_runtime_for_spawn(
 
 pub(super) fn spawn_subprocess(
     config: &SpawnConfig,
+    instance_id: &str,
 ) -> Result<
     (
         tokio::process::Child,
@@ -471,8 +471,8 @@ pub(super) fn spawn_subprocess(
 > {
     // The daemon's PATH is frozen at launch, so resolve against known
     // node-manager dirs too (#1048).
-    let app_dir = crate::session::get_app_dir().ok();
-    let resolved = resolve_agent_command(&config.spec.command, app_dir.as_deref());
+    let app_dir = &config.publisher_root;
+    let resolved = resolve_agent_command(&config.spec.command, Some(app_dir));
     let (spawn_command, extra_path_dirs) = match &resolved {
         Ok(r) => (
             r.path.to_string_lossy().into_owned(),
@@ -514,6 +514,19 @@ pub(super) fn spawn_subprocess(
     );
 
     let native_store = native_store_snapshot(config, cmd.as_std(), &[]);
+    let family = config.publisher_family(cmd.as_std(), &[]);
+    let _publication = crate::session::purge_owners::ConversationReadLock::publisher(
+        app_dir,
+        instance_id,
+        crate::session::purge_owners::PublisherAdmission {
+            namespace: crate::session::purge_owners::PublisherNamespace::host(
+                family,
+                native_store.as_ref(),
+            ),
+            acp_session_id: config.stored_acp_session_id.as_deref(),
+        },
+    )
+    .map_err(|error| AcpError::Spawn(error.to_string()))?;
     let prime_runtime = prime_runtime_for_spawn(config, &spawn_command, cmd.as_std(), &[], None)?;
     if let Some(runtime) = &prime_runtime {
         let environment: Vec<_> = cmd
@@ -636,7 +649,10 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn spawn_classifies_missing_binary_and_missing_cwd() {
+        let publisher_root = tempfile::tempdir().unwrap();
+        super::super::test_helpers::initialize_publisher_root(publisher_root.path());
         let mut config = env_test_spawn_config(std::env::temp_dir());
+        config.publisher_root = publisher_root.path().to_path_buf();
         config.spec.command = "/nonexistent/agent/binary/aoe-test".into();
         let result = AcpClient::spawn(config, AcpSessionId("s-1".into())).await;
         assert!(matches!(result, Err(AcpError::Spawn(_))));
@@ -644,6 +660,7 @@ mod tests {
         // A bare adapter missing from a configured PATH names that PATH.
         let empty = tempfile::tempdir().unwrap();
         let mut config = env_test_spawn_config(std::env::temp_dir());
+        config.publisher_root = publisher_root.path().to_path_buf();
         config.spec.command = format!("aoe-test-no-such-adapter-{}", std::process::id());
         config.base_host_environment = vec![("PATH".into(), empty.path().display().to_string())];
         config.host_environment = config.base_host_environment.clone();
@@ -664,6 +681,7 @@ mod tests {
             std::env::temp_dir().join(format!("aoe-test-missing-cwd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         let mut config = env_test_spawn_config(missing.clone());
+        config.publisher_root = publisher_root.path().to_path_buf();
         config.spec.command = "/bin/true".into();
         match AcpClient::spawn(config, AcpSessionId("s-1".into())).await {
             Err(AcpError::ProjectPathMissing { path }) => assert_eq!(path, missing),
@@ -847,6 +865,7 @@ mod tests {
         let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
         let mut config = env_test_spawn_config(tmp.path().to_path_buf());
         let denied_allowlist = AgentSpec {
+            publisher_route: None,
             env_allowlist: Some(vec![
                 "OPENAI_API_KEY".into(),
                 "AOE_TOKEN".into(),
@@ -963,6 +982,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home = home.path().canonicalize().unwrap();
         let mut config = env_test_spawn_config(home.clone());
+        config.spec = crate::acp::AgentRegistry::with_defaults()
+            .get("claude")
+            .unwrap()
+            .clone();
         config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
             store: home.join(".claude"),
             exported_default_store: Some(false),
@@ -1009,6 +1032,10 @@ mod tests {
         let default = home.join(".claude");
         let other = home.join("other");
         let mut config = env_test_spawn_config(home.clone());
+        config.spec = crate::acp::AgentRegistry::with_defaults()
+            .get("claude")
+            .unwrap()
+            .clone();
         config.claude_store_pin = Some(crate::session::capture::ClaudeStorePin {
             store: default.clone(),
             exported_default_store: Some(false),
@@ -1153,5 +1180,100 @@ mod tests {
             assert_eq!(kinds, ["rate_limit:rate_limit", "stopped:rate_limited"]);
             let _ = client.shutdown().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn effective_wrapper_and_alias_routes_preserve_retained_store_exclusion(
+    ) -> anyhow::Result<()> {
+        use crate::session::{
+            ConversationBinding, ConversationProvenance, ExecutionBinding, Instance, Storage,
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        let storage = Storage::new_unwatched("test")?;
+        let old_store = temp.path().join("old-store");
+        let separate_store = temp.path().join("separate-store");
+        std::fs::create_dir_all(&old_store)?;
+        std::fs::create_dir_all(&separate_store)?;
+        let mut retained = Instance::new("retained", temp.path().to_str().unwrap());
+        retained.agent_session_id = Some("retained-native".into());
+        retained.agent_session_binding = Some(ConversationBinding {
+            session_id: "retained-native".into(),
+            execution: Some(ExecutionBinding {
+                agent: "claude".into(),
+                stores: vec![old_store.clone()],
+                configuration: Vec::new(),
+                cwd: temp.path().to_owned(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: Some(false),
+            }),
+            provenance: ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        retained.active_execution = Some(crate::session::ActiveExecution {
+            launch_id: "original".into(),
+            binding: retained.agent_session_binding.as_ref().unwrap().execution.clone().unwrap(),
+            capture: None,
+            container: None,
+        });
+        retained.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        )?;
+        retained.trash();
+        crate::session::purge_owners::seed_legacy_retained_for_test(&storage, &retained)?;
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let _path = crate::session::test_support::path_prepended(&bin);
+        for (index, agent, wrapper, store, allowed) in [
+            (0, "pi", false, &separate_store, true),
+            (1, "pi", true, &separate_store, false),
+            (2, "claude", false, &separate_store, true),
+            (3, "claude", false, &old_store, false),
+        ] {
+            let mut config = env_test_spawn_config(temp.path().to_owned());
+            config.publisher_root = root.clone();
+            config.agent_key = if agent == "claude" {
+                "operator-alias"
+            } else {
+                agent
+            }
+            .into();
+            config.spec = registry.get(agent).unwrap().clone();
+            config.host_environment =
+                vec![("CLAUDE_CONFIG_DIR".into(), store.display().to_string())];
+            if wrapper {
+                config
+                    .host_environment
+                    .push(("PI_ACP_PI_COMMAND".into(), "/operator/wrapper".into()));
+            }
+            let marker = temp.path().join(format!("spawned-{index}"));
+            let adapter = bin.join(&config.spec.command);
+            std::fs::write(
+                &adapter,
+                format!("#!/bin/sh\nprintf admitted > '{}'\n", marker.display()),
+            )?;
+            std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755))?;
+            match spawn_subprocess(&config, &format!("incoming-{index}")) {
+                Ok((mut child, _, _)) => {
+                    assert!(child.wait().await?.success());
+                    assert!(allowed, "unsafe {agent} route started");
+                    assert_eq!(std::fs::read(marker)?, b"admitted");
+                }
+                Err(error) => {
+                    assert!(!allowed, "safe {agent} route refused: {error}");
+                    assert!(!marker.exists(), "refused route started a child");
+                }
+            }
+        }
+        Ok(())
     }
 }

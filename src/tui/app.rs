@@ -3250,6 +3250,14 @@ fn spawn_background_tool(
         child_command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
 
+    let _publisher = crate::session::purge_owners::ConversationReadLock::publisher(
+        &crate::session::get_app_dir()?,
+        session_id,
+        crate::session::purge_owners::PublisherAdmission {
+            namespace: crate::session::purge_owners::PublisherNamespace::Unknown,
+            acp_session_id: None,
+        },
+    )?;
     let child = child_command.spawn().with_context(|| {
         format!(
             "spawn background tool '{}' with shell '{}'",

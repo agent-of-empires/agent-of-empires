@@ -67,14 +67,12 @@ pub struct AcpRunnerArgs {
     pub session_id: String,
     #[arg(long)]
     pub agent_name: String,
-    /// Registry key for the agent (e.g. `claude`, `codex`,
-    /// `opencode`). Persisted on the WorkerRecord so the daemon's
-    /// attach path resolves the right `AgentProfile` after a restart;
-    /// `agent_name` carries the binary command and is not a valid
-    /// profile key. Defaulted to empty so legacy daemons rolling out
-    /// the new field don't immediately break runners already in flight.
+    /// Resolved ACP registry key; `agent_name` is the executable command.
     #[arg(long, default_value = "")]
     pub agent_key: String,
+    /// Publication family attested by the spawning daemon.
+    #[arg(long, hide = true)]
+    pub publisher_family: Option<String>,
     #[arg(long)]
     pub cwd: PathBuf,
     #[arg(long)]
@@ -115,11 +113,52 @@ pub struct AcpRunnerArgs {
     pub agent_argv: Vec<String>,
 }
 
+struct RegistrationGuard {
+    _publisher: crate::session::purge_owners::ConversationReadLock,
+    _native: Option<(crate::session::Storage, crate::session::StorageFlock)>,
+}
+
 fn native_registration_guard(
     args: &AcpRunnerArgs,
-) -> Result<Option<(crate::session::Storage, crate::session::StorageFlock)>> {
+    command: &std::process::Command,
+) -> Result<RegistrationGuard> {
+    let family = crate::acp::agent_registry::publisher_family_for_environment(
+        args.publisher_family.as_deref(),
+        |key| {
+            command
+                .get_envs()
+                .find(|(name, _)| name == &key)
+                .map(|(_, value)| value.is_some_and(|value| !value.is_empty()))
+                .unwrap_or_else(|| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+        },
+    );
+    let execution = family.and_then(|family| {
+        crate::session::capture::host_publisher_execution(family, &args.cwd, |key| {
+            let mut result = std::env::var(key).ok();
+            for (name, value) in command.get_envs() {
+                if name == key {
+                    result = value.and_then(|value| value.to_str().map(str::to_owned));
+                }
+            }
+            result.filter(|value| !value.is_empty())
+        })
+    });
+    let publisher = crate::session::purge_owners::ConversationReadLock::publisher(
+        &crate::session::get_app_dir()?,
+        &args.session_id,
+        crate::session::purge_owners::PublisherAdmission {
+            namespace: crate::session::purge_owners::PublisherNamespace::host(
+                family,
+                execution.as_ref(),
+            ),
+            acp_session_id: args.stored_acp_session_id.as_deref(),
+        },
+    )?;
     let Some(expected_generation) = args.lifecycle_generation else {
-        return Ok(None);
+        return Ok(RegistrationGuard {
+            _publisher: publisher,
+            _native: None,
+        });
     };
     anyhow::ensure!(
         !args.source_profile.is_empty(),
@@ -142,7 +181,10 @@ fn native_registration_guard(
             && !row.is_idle_dormant(),
         crate::session::LifecycleReservationError::Superseded
     );
-    Ok(Some((storage, lifecycle)))
+    Ok(RegistrationGuard {
+        _publisher: publisher,
+        _native: Some((storage, lifecycle)),
+    })
 }
 
 pub async fn run(args: AcpRunnerArgs) -> Result<()> {
@@ -508,11 +550,11 @@ fn register_and_spawn_agent(
     tokio::process::ChildStdout,
     Option<tokio::process::ChildStderr>,
 )> {
-    // Stop commits either before registration or after the complete agent birth.
-    let _native_admission = native_registration_guard(args)?;
+    let command = prepare_agent_command(args)?;
+    let _admission = native_registration_guard(args, command.as_std())?;
     let listener =
         worker_registry::register_runner(record).context("registering runner ownership")?;
-    match spawn_agent(args) {
+    match spawn_agent(command) {
         Ok((child, stdin, stdout, stderr)) => Ok((listener, child, stdin, stdout, stderr)),
         Err(error) => {
             if let Err(delete_error) = worker_registry::delete(&args.session_id) {
@@ -523,14 +565,7 @@ fn register_and_spawn_agent(
     }
 }
 
-fn spawn_agent(
-    args: &AcpRunnerArgs,
-) -> Result<(
-    Child,
-    tokio::process::ChildStdin,
-    tokio::process::ChildStdout,
-    Option<tokio::process::ChildStderr>,
-)> {
+fn prepare_agent_command(args: &AcpRunnerArgs) -> Result<Command> {
     let mut argv = args.agent_argv.iter();
     let program = argv
         .next()
@@ -579,7 +614,18 @@ fn spawn_agent(
             }
         }
     }
-    let mut child = cmd.spawn().with_context(|| format!("spawning {program}"))?;
+    Ok(cmd)
+}
+
+fn spawn_agent(
+    mut command: Command,
+) -> Result<(
+    Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+    Option<tokio::process::ChildStderr>,
+)> {
+    let mut child = command.spawn().context("spawning admitted agent")?;
     let stdin = child
         .stdin
         .take()
@@ -693,6 +739,7 @@ mod tests {
     async fn native_registration_rejects_stopped_and_superseded_births_before_agent_spawn() {
         use crate::session::{Instance, Status, Storage, View};
         let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let project = tempfile::tempdir().unwrap();
         let marker = project.path().join("agent-born");
         let mut row = Instance::new("native registration", project.path().to_str().unwrap());
@@ -706,6 +753,7 @@ mod tests {
             session_id: row.id.clone(),
             agent_name: "sh".into(),
             agent_key: "claude".into(),
+            publisher_family: None,
             cwd: project.path().to_owned(),
             model: None,
             additional_dirs: Vec::new(),

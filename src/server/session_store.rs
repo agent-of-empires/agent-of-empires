@@ -683,7 +683,9 @@ impl SessionStore for NativeSessionStore {
             #[cfg(test)]
             before_adoption_for_test();
             self.storage.verify_bound_profile()?;
+            let forget_authority = crate::session::purge_owners::ForgetAuthoritySnapshot::load();
             let mut metadata = self.state.canonical_metadata.blocking_write();
+            metadata.forget_authority.adopt(forget_authority);
             let mut current = self.state.instances.blocking_write();
             for profile in &committed {
                 anyhow::ensure!(

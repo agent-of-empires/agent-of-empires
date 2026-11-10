@@ -79,6 +79,14 @@ export function trashRecoveryTargetIsCurrent(
   );
 }
 
+export function forgetTrashTargetIsCurrent(
+  session: SessionResponse | undefined,
+  target: TrashRecoveryTarget,
+  epoch: string | null,
+): boolean {
+  return session?.forget_trash?.allowed === true && trashRecoveryTargetIsCurrent(session, target, epoch);
+}
+
 /** Cleanup flags are on when any session in the workspace opts in; shared by the delete dialog and Empty Trash. */
 export function workspaceCleanupDefaults(sessions: SessionResponse[]): {
   delete_worktree: boolean;

@@ -13,7 +13,15 @@
         "web/src/components/sidebar/TrashMenu.tsx",
         "web/src/components/ForgetTrashDialog.tsx"
       ],
-      "notes": "Real-daemon Retry completes recoverable Trash and keeps unverified files protected across repeated failures. Web and TUI controls retry the failed generation again; pending reservation and files survive, and purge still refuses. A pointer press retains its original generation across concurrent Retry and cannot retarget the replacement button. Separate mouse and keyboard Forget confirmations remove only the visible record and preserve files, nonempty terminal scopes and durable cleanup ownership. Forget receipts match the request epoch and carry a positive revision. A fresh lifecycle owner refuses Retry and Forget without changing the row, reservation, journal or files. A concurrent retry closes stale confirmation before keyboard or mouse consent can issue Forget."
+      "notes": "Real-daemon Retry preserves unverified files and captured generations. Mouse and keyboard Forget work for genuinely unlaunched CLI-created sessions, removing only the visible record with a matching epoch/revision receipt. Fresh owners refuse recovery without changing custody. Identity-stable publisher-proof loss closes Forget through the root authority watcher. Published or unknown ownership remains protected; Retry and read-only inspection stay available."
+    },
+    {
+      "id": "trash.forget-capability",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/sidebar/TrashMenu.tsx"],
+      "notes": "Identity-stable loss of the daemon capability disables Forget, refuses an old pointer action and keeps Retry usable."
     },
     {
       "id": "trash.mixed-workspace-recovery",

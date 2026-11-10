@@ -39,16 +39,16 @@ pub use wire::{
     CreateProjectBody, CreateSessionBody, CreationTrustFingerprint, CreationTrustRequest,
     CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
-    ForgetTrashBody, GroupLocation, GroupSessionFailure, GroupSessionFailureCode,
-    GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval,
-    PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry,
-    RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome,
-    RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
-    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
-    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
-    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
-    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    ForgetTrashBody, ForgetTrashCapability, GroupLocation, GroupSessionFailure,
+    GroupSessionFailureCode, GroupSessionOutcome, ListSessionsQuery, MoveDirection, MoveGroupBody,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
+    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -194,6 +194,9 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         }
         Some(ApiErrorCode::NativeConversationRetained) => {
             "Conversation belongs to retained cleanup ownership. Use a proven separate native store; restarting the daemon or stopping the old process does not release ownership.".into()
+        }
+        Some(ApiErrorCode::ForgetUnbounded) => {
+            "This session may have published shared history. Keep it in Trash and use Retry.".into()
         }
         Some(ApiErrorCode::LifecycleSuperseded) => {
             "Session changed after it was selected; it may be partly processed, refresh and check before retrying".into()
@@ -1057,6 +1060,7 @@ impl DaemonClient {
                     ApiErrorCode::LifecycleLocked
                         | ApiErrorCode::TrashIncomplete
                         | ApiErrorCode::NativeConversationRetained
+                        | ApiErrorCode::ForgetUnbounded
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::SandboxMigrationDeferred

@@ -52,6 +52,23 @@ pub(super) async fn build_disk_watch_entry(
             return None;
         }
     };
+    let authority = crate::session::get_app_dir().ok().and_then(|root| {
+        state
+            .file_watch
+            .subscribe_channel(
+                WatchSpec {
+                    matcher: FileMatcher::Exact(root.join(crate::session::purge_owners::FILE_NAME)),
+                    dir: root,
+                    debounce: Some(std::time::Duration::from_millis(75)),
+                },
+                16,
+            )
+            .ok()
+    });
+    let (mut authority_rx, authority_handle) = match authority {
+        Some((rx, handle)) => (Some(rx), Some(handle)),
+        None => (None, None),
+    };
     let signal = state.disk_changed.clone();
     let profile = profile.to_owned();
     let shutdown = state.shutdown.clone();
@@ -65,7 +82,12 @@ pub(super) async fn build_disk_watch_entry(
                     ev = rx.recv() => match ev {
                         Some(_) => signal.notify_one(),
                         None => break,
-                    }
+                    },
+                    ev = async { authority_rx.as_mut().expect("guarded authority receiver").recv().await },
+                        if authority_rx.is_some() => match ev {
+                            Some(_) => signal.notify_one(),
+                            None => authority_rx = None,
+                        },
                 }
             }
             tracing::debug!(
@@ -86,6 +108,7 @@ pub(super) async fn build_disk_watch_entry(
     }
     Some(DiskWatchEntry {
         handle,
+        authority_handle,
         forwarder: join.abort_handle(),
     })
 }
@@ -136,8 +159,13 @@ impl Drop for DiskWatchBuildBarrierGuard {
 /// race a buffered `try_send`. Centralized so every teardown path keeps
 /// the same canonical order.
 pub(super) fn drop_disk_watch_entry(entry: DiskWatchEntry) {
-    let DiskWatchEntry { handle, forwarder } = entry;
+    let DiskWatchEntry {
+        handle,
+        authority_handle,
+        forwarder,
+    } = entry;
     drop(handle);
+    drop(authority_handle);
     forwarder.abort();
 }
 

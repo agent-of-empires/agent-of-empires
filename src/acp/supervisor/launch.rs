@@ -7,9 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use super::agents::{
-    apply_agent_command_override, log_wrapper_substitution, wrapper_substitution_for,
-};
+use super::agents::{log_wrapper_substitution, wrapper_substitution_for};
 use super::publish::collect_resumable_background_agent_launches;
 use super::{
     lock_recover, BroadcastSink, PendingContextReset, RestartRequestGuard, ResumeKind,
@@ -436,11 +434,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             SupervisorError::InvalidAgentCommand(format!("config load task failed: {e}"))
         })?;
         let (mut spec, spec_from_registry) = self
-            .resolve_agent_spec(&req.agent, &resolved_cfg.session, &policy)
+            .resolve_agent_spec_for_spawn(
+                &req.agent,
+                &resolved_cfg.session,
+                &policy,
+                req.agent_command_override.as_ref(),
+            )
             .await?;
-        if let Some(ovr) = &req.agent_command_override {
-            apply_agent_command_override(&req.agent, spec_from_registry, ovr, &mut spec)?;
-        }
         let wrapper_substitution = wrapper_substitution_for(
             &*self.registry.lock().await,
             &req.tool,
@@ -451,12 +451,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some((wrapper, base)) = &wrapper_substitution {
             log_wrapper_substitution(&req.session_id, &req.tool, wrapper, base);
         }
+        let publisher_root =
+            crate::session::get_app_dir().map_err(|error| AcpError::Spawn(error.to_string()))?;
         if spec.command.contains("${aoe_data_dir}") {
-            if let Ok(data_dir) = crate::session::get_app_dir() {
-                spec.command = spec
-                    .command
-                    .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
-            }
+            spec.command = spec
+                .command
+                .replace("${aoe_data_dir}", &publisher_root.to_string_lossy());
         }
 
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&req.agent);
@@ -580,6 +580,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         Ok((
             SpawnConfig {
+                publisher_root,
                 launch_lease: None,
                 agent_key: req.agent.clone(),
                 tool: req.tool.clone(),
@@ -1259,6 +1260,10 @@ pub(super) async fn before_session_env(
         if commands.is_empty() {
             return Ok(Vec::new());
         }
+        crate::session::purge_owners::consume_unpublished_before_risk(
+            &crate::session::get_app_dir()?,
+            &session_id,
+        )?;
         let hook_env: Vec<(&'static str, String)> = vec![
             ("AOE_SESSION_ID", session_id),
             ("AOE_PROFILE", profile.clone()),

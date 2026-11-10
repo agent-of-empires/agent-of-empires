@@ -996,11 +996,25 @@ pub async fn forget_trash_record(
             })
         }).await.map_err(anyhow::Error::from).and_then(|result| result);
         if let Err(error) = result {
+            if error.is::<crate::session::purge_owners::ForgetUnbounded>() {
+                return (
+                    StatusCode::CONFLICT,
+                    crate::daemon::ApiErrorCode::ForgetUnbounded.header(),
+                    Json(serde_json::json!({
+                        "error": "forget_unbounded",
+                        "message": error.to_string(),
+                    })),
+                ).into_response();
+            }
             if let Some(response) = lifecycle_rejection(&state, &error) {
                 return response;
             }
             tracing::warn!(target: "session.trash", session = %id, %error, "forget-record ownership transfer failed");
-            return persist_failed_response();
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ownership_unavailable",
+                "Forget could not be safely confirmed. Refresh this Trash record; Retry remains available.",
+            );
         }
         drop(guard);
         drop(submission);

@@ -57,6 +57,7 @@ pub(super) fn session_response_from_instance_with_plan(
         row.status
     };
     SessionResponse {
+        forget_trash: Default::default(),
         agent_pane: inst.agent_pane.clone(),
         auxiliary: inst.auxiliary.clone(),
         id: row.id.to_string(),

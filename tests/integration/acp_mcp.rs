@@ -20,15 +20,21 @@ use crate::common::{shim_path, shim_ready};
 
 /// Config with no MCP servers; callers set `mcp_servers` afterward so this
 /// helper never has to name the schema's `McpServer` type.
-fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnConfig {
+fn base_config(
+    publisher_root: &std::path::Path,
+    cwd: std::path::PathBuf,
+    record_path: &std::path::Path,
+) -> SpawnConfig {
     let shim = shim_path();
     SpawnConfig {
+        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
+            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -83,6 +89,8 @@ fn read_record(path: &std::path::Path) -> String {
 #[tokio::test]
 #[serial_test::parallel]
 async fn disabled_codex_server_does_not_reach_new_session() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -111,7 +119,7 @@ enabled = false
 
     let record_dir = tempfile::tempdir().unwrap();
     let record_path = record_dir.path().join("record.json");
-    let mut config = base_config(std::env::temp_dir(), &record_path);
+    let mut config = base_config(publisher_root, std::env::temp_dir(), &record_path);
     config.agent_key = "codex".into();
     config.mcp_servers = mcp_config::project_servers_to_acp(
         native
@@ -145,6 +153,8 @@ enabled = false
 #[tokio::test]
 #[serial_test::parallel]
 async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -152,14 +162,14 @@ async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
 
     let servers = parse_standard_mcp_servers(
         r#"{"mcpServers":{
-            "missing":{"type":"http","url":"https://missing.mcp.invalid","headers":{
-                "Authorization":"Bearer ${MISSING_TOKEN}",
-                "X-Reference":"${MISSING_TOKEN}"
-            }},
-            "resolved":{"type":"http","url":"https://resolved.mcp.invalid","headers":{
-                "Authorization":"Bearer ${GITHUB_TOKEN}"
-            }}
-        }}"#,
+        "missing":{"type":"http","url":"https://missing.mcp.invalid","headers":{
+            "Authorization":"Bearer ${MISSING_TOKEN}",
+            "X-Reference":"${MISSING_TOKEN}"
+        }},
+        "resolved":{"type":"http","url":"https://resolved.mcp.invalid","headers":{
+            "Authorization":"Bearer ${GITHUB_TOKEN}"
+        }}
+    }}"#,
     )
     .unwrap()
     .into_iter()
@@ -175,7 +185,7 @@ async fn new_session_receives_expanded_and_unresolved_mcp_auth_headers() {
     let record_dir = tempfile::tempdir().unwrap();
     let record_path = record_dir.path().join("record.json");
     let session_env = vec![("GITHUB_TOKEN".into(), "synthetic-token".into())];
-    let mut config = base_config(std::env::temp_dir(), &record_path);
+    let mut config = base_config(publisher_root, std::env::temp_dir(), &record_path);
     config
         .provider_env
         .push(("SHIM_MCP_CAPABILITY".into(), "http".into()));

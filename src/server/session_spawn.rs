@@ -280,14 +280,43 @@ pub(crate) async fn spawn_structured_session(
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
         if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
-            let rows = worker_state.instances.blocking_read();
             let source = import_binding.as_ref().and_then(|binding| binding.execution.as_ref());
+            let publication = if instance.sandbox_info.is_none() {
+                let project = std::path::Path::new(&instance.project_path);
+                let agent = runtime.block_on(worker_state.acp_supervisor.pick_agent_for_tool(
+                    &instance.tool,
+                    agent_name.as_deref(),
+                    &profile,
+                    project,
+                ));
+                let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                    &profile,
+                    project,
+                );
+                let command = crate::acp::supervisor::command_override_for_spawn(
+                    &instance.tool,
+                    &instance.command,
+                );
+                let (spec, _) = runtime.block_on(
+                    worker_state.acp_supervisor.resolve_agent_spec_for_spawn(
+                        &agent,
+                        &resolved.session,
+                        &crate::acp::agent_policy::AgentPolicy::load(),
+                        command.as_ref(),
+                    ),
+                )?;
+                let family = spec.publisher_family().filter(|family| *family != "prime-agent");
+                crate::session::purge_owners::PublisherNamespace::host(family, source)
+            } else {
+                crate::session::purge_owners::PublisherNamespace::Unknown
+            };
+            let rows = worker_state.instances.blocking_read();
             anyhow::ensure!(
                 !rows.iter().any(|row| {
                     row.acp_session_id.as_deref() == Some(import_id)
                         || row.agent_session_id.as_deref() == Some(import_id)
                 })
-                    && !cleanup_owners.blocks_acp_import(&instance.id, import_id, source),
+                    && !cleanup_owners.blocks_acp_import(&instance.id, import_id, source, publication),
                 ImportSourceAlreadyOwned
             );
         }
@@ -350,22 +379,7 @@ pub(crate) async fn spawn_structured_session(
         instance.agent_name = agent_name;
         let lock = runtime.block_on(worker_state.instance_lock(&instance.id));
         let store: &dyn SessionStore = &native;
-        let creation_guard = worker_state.session_service.register_creation(
-            &instance.id,
-            &instance.title,
-            &instance.source_profile,
-            instance.idempotency_key.as_deref(),
-        )?;
-        // One hook event feeds both progress channels: the live registry the
-        // web wizard polls by `idempotency_key`, and the session service's
-        // published creation progress.
-        let creation_progress = |event: crate::session::config::repo_config::HookProgress| {
-            if let Some(progress) = progress.as_deref() {
-                progress.record(event.clone());
-            }
-            creation_guard.hook_event(event)
-        };
-        let generation = {
+        let (generation, creation_guard) = {
             let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let _guard = lock.blocking_lock();
             native.check_available()?;
@@ -375,16 +389,31 @@ pub(crate) async fn spawn_structured_session(
                 LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
             instance.status = Status::Creating;
-            store.update(|rows, groups| {
+            let creation_guard = store.update(|rows, groups| {
+                let instance = &plan.result.instance;
                 anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
                 if cli.is_some() && crate::session::is_duplicate_session(rows.iter(), &instance.title, &instance.project_path, None) {
                     return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
                 }
+                plan.register_fresh_creation(&crate::session::get_app_dir()?)?;
+                let instance = &plan.result.instance;
+                let creation_guard = worker_state.session_service.register_creation(
+                    &instance.id,
+                    &instance.title,
+                    &instance.source_profile,
+                    instance.idempotency_key.as_deref(),
+                )?;
                 rows.push(instance.clone());
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
-                Ok(())
+                Ok(creation_guard)
             })?;
-            generation
+            (generation, creation_guard)
+        };
+        let creation_progress = |event: crate::session::config::repo_config::HookProgress| {
+            if let Some(progress) = progress.as_deref() {
+                progress.record(event.clone());
+            }
+            creation_guard.hook_event(event)
         };
         drop(identity);
         drop(namespace);

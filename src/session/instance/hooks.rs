@@ -326,6 +326,10 @@ impl Instance {
         progress: Option<&dyn Fn(crate::session::config::repo_config::HookProgress)>,
         launch_generation: Option<u64>,
     ) -> Result<()> {
+        crate::session::purge_owners::consume_unpublished_before_risk(
+            &crate::session::get_app_dir()?,
+            &self.id,
+        )?;
         let config = store.configuration(Some(store.storage().profile()))?;
         self.mint_host_session_env(&config)?;
         self.run_launch_hooks(skip_on_launch, store, progress, launch_generation)
@@ -1958,8 +1962,12 @@ mod tests {
                 .unwrap();
 
                 let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
-                let mut instance = Instance::new(&label, temp.path().to_str().unwrap());
-                instance.source_profile = profile.clone();
+                let mut instance = crate::session::test_support::unpublished_instance(
+                    &label,
+                    temp.path(),
+                    &profile,
+                )
+                .unwrap();
                 instance.command = "sleep 30".to_string();
                 storage
                     .update(|instances, _groups| {
@@ -1967,6 +1975,12 @@ mod tests {
                         Ok(())
                     })
                     .unwrap();
+                let journal = crate::session::get_app_dir()
+                    .unwrap()
+                    .join("pending-purge-owners.json");
+                let before: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                assert!(before["unpublished"].get(&instance.id).is_some());
                 let session = instance.tmux_session().unwrap();
                 if restart {
                     session
@@ -1987,6 +2001,11 @@ mod tests {
                 }
                 let hook_started = ready.exists();
                 if hook_started {
+                    let after: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                    assert!(after["unpublished"]
+                        .get(&storage.load().unwrap()[0].id)
+                        .is_none());
                     storage
                         .update(|instances, _groups| {
                             shelve(&mut instances[0]);

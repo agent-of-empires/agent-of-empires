@@ -11,18 +11,11 @@ pub async fn list_agent_sessions(
     profile: &str,
     owned: &Owned,
 ) -> Result<ImportableList, ListSessionsError> {
-    let Some(mut spec) = AgentRegistry::with_defaults().get(agent).cloned() else {
+    let Some(spec) = AgentRegistry::with_defaults().get(agent).cloned() else {
         return Err(ListSessionsError::UnknownAgent);
     };
     if !crate::cli::acp::command_present(&spec.command) {
         return Err(ListSessionsError::NotInstalled);
-    }
-    if spec.command.contains("${aoe_data_dir}") {
-        let data_dir = crate::session::get_app_dir()
-            .map_err(|e| ListSessionsError::Failed(format!("app dir: {e}")))?;
-        spec.command = spec
-            .command
-            .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
     }
     let profile_owned = profile.to_string();
     let cfg = tokio::task::spawn_blocking(move || {
@@ -35,11 +28,18 @@ pub async fn list_agent_sessions(
 
 async fn list_with_spec(
     agent: &str,
-    spec: AgentSpec,
+    mut spec: AgentSpec,
     cfg: &crate::session::Config,
     profile: &str,
     owned: &Owned,
 ) -> Result<ImportableList, ListSessionsError> {
+    let publisher_root = crate::session::get_app_dir()
+        .map_err(|e| ListSessionsError::Failed(format!("app dir: {e}")))?;
+    if spec.command.contains("${aoe_data_dir}") {
+        spec.command = spec
+            .command
+            .replace("${aoe_data_dir}", &publisher_root.to_string_lossy());
+    }
     // `session/list` touches no cwd; the spawn only needs an existing one.
     let tmp = tempfile::tempdir().map_err(|e| ListSessionsError::Failed(e.to_string()))?;
     let (base_host_environment, host_environment) = crate::acp::supervisor::host_spawn_environment(
@@ -52,6 +52,7 @@ async fn list_with_spec(
     .await
     .map_err(|e| ListSessionsError::Failed(e.to_string()))?;
     let config = SpawnConfig {
+        publisher_root,
         launch_lease: None,
         wrapper_substitution: None,
         agent_key: agent.to_string(),
@@ -106,6 +107,7 @@ done
         )
         .unwrap();
         let spec = AgentSpec {
+            publisher_route: None,
             command: "/bin/sh".into(),
             args: vec![script.to_string_lossy().into_owned()],
             description: "list env stub".into(),

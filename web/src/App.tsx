@@ -77,6 +77,7 @@ import {
   workspaceCleanupDefaults,
   hasPendingTrash,
   trashRecoveryTargetIsCurrent,
+  forgetTrashTargetIsCurrent,
   type TrashRecoveryTarget,
 } from "./lib/trashActions";
 import {
@@ -1188,7 +1189,7 @@ function AppContent({
   if (
     forgetTrashTarget &&
     (caps.readOnly ||
-      !trashRecoveryTargetIsCurrent(
+      !forgetTrashTargetIsCurrent(
         sessions.find((session) => session.id === forgetTrashTarget.id),
         forgetTrashTarget,
         runtimeEpoch,
@@ -1446,7 +1447,7 @@ function AppContent({
     (target: TrashRecoveryTarget) => {
       if (
         caps.readOnly ||
-        !trashRecoveryTargetIsCurrent(
+        !forgetTrashTargetIsCurrent(
           sessions.find((session) => session.id === target.id),
           target,
           runtimeEpoch,
@@ -1466,7 +1467,7 @@ function AppContent({
     if (!target) return;
     if (
       caps.readOnly ||
-      !trashRecoveryTargetIsCurrent(
+      !forgetTrashTargetIsCurrent(
         sessions.find((session) => session.id === target.id),
         target,
         runtimeEpoch,

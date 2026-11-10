@@ -436,6 +436,60 @@ pub(crate) fn launch_owed_handoff(
     }
 }
 
+pub(crate) fn instance_params(
+    project_path: &std::path::Path,
+    tool: &str,
+) -> crate::session::builder::InstanceParams {
+    crate::session::builder::InstanceParams {
+        title: "custom session".to_string(),
+        title_typed: false,
+        path: project_path.to_string_lossy().to_string(),
+        group: String::new(),
+        tool: tool.to_string(),
+        worktree_enabled: false,
+        worktree_branch: None,
+        create_new_branch: false,
+        base_branch: None,
+        sandbox: false,
+        sandbox_image: "ubuntu:latest".to_string(),
+        yolo_mode: false,
+        extra_env: Vec::new(),
+        before_start_hook_env: Vec::new(),
+        extra_args: String::new(),
+        command_override: String::new(),
+        extra_repo_paths: Vec::new(),
+        repo_base_branches: Vec::new(),
+        scratch: false,
+        fork_seed: None,
+        generated_name: false,
+        no_submodules: false,
+        tie_workdir_to_name: false,
+        worktree_path_id: None,
+    }
+}
+
+pub(crate) fn unpublished_instance(
+    title: &str,
+    project: &Path,
+    profile: &str,
+) -> anyhow::Result<crate::session::Instance> {
+    let root = crate::session::get_app_dir()?;
+    crate::session::purge_owners::initialize(&root)?;
+    crate::session::Storage::new_unwatched(profile)?;
+    let mut params = instance_params(project, "claude");
+    params.title = title.to_owned();
+    let mut plan = crate::session::builder::plan_instance(
+        params,
+        crate::session::builder::SandboxReadiness::InstalledOnly,
+        &[],
+        &[],
+        profile,
+    )?;
+    plan.result.instance.source_profile = profile.to_owned();
+    plan.register_fresh_creation(&root)?;
+    Ok(plan.provision().map_err(|failure| failure.error)?.instance)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

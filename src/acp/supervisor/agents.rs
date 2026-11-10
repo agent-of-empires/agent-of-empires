@@ -48,6 +48,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         Err(SupervisorError::UnknownAgent(name.into()))
     }
 
+    pub(crate) async fn resolve_agent_spec_for_spawn(
+        &self,
+        name: &str,
+        config: &crate::session::config::SessionConfig,
+        policy: &AgentPolicy,
+        command_override: Option<&AgentCommandOverride>,
+    ) -> Result<(AgentSpec, bool), SupervisorError> {
+        let (mut spec, registered) = self.resolve_agent_spec(name, config, policy).await?;
+        if let Some(command_override) = command_override {
+            apply_agent_command_override(name, registered, command_override, &mut spec)?;
+        }
+        Ok((spec, registered))
+    }
+
     /// Pick the agent name to spawn for an instance's tool.
     pub async fn pick_agent_for_tool(
         &self,
@@ -256,6 +270,7 @@ mod tests {
 
     fn spec(command: &str, args: &[&str]) -> AgentSpec {
         AgentSpec {
+            publisher_route: None,
             command: command.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             description: "test".into(),

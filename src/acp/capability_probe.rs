@@ -24,12 +24,11 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
     if !crate::cli::acp::command_present(&spec.command) {
         return Ok(false);
     }
+    let publisher_root = crate::session::get_app_dir()?;
     if spec.command.contains("${aoe_data_dir}") {
-        if let Ok(data_dir) = crate::session::get_app_dir() {
-            spec.command = spec
-                .command
-                .replace("${aoe_data_dir}", &data_dir.to_string_lossy());
-        }
+        spec.command = spec
+            .command
+            .replace("${aoe_data_dir}", &publisher_root.to_string_lossy());
     }
 
     // Throwaway absolute cwd: `session/new` requires an existing absolute
@@ -37,6 +36,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
     let tmp = tempfile::tempdir()?;
 
     let config = SpawnConfig {
+        publisher_root,
         launch_lease: None,
         wrapper_substitution: None,
         agent_key: agent.to_string(),

@@ -207,15 +207,16 @@ Web recovery lists unfinished members of mixed live/Trash workspaces separately.
 It never retries or restores a live sibling. Restore receipts keep their native
 revision so a late older Retry cannot replace the restored row.
 
-If the location cannot be verified, **Forget record…** opens a separate
-confirmation. A daemon restart or concurrent Trash transition invalidates that
-confirmation. Files remain on disk, and AoE retains runtime evidence and cleanup
-protection without running hooks or stopping processes. Retained ownership blocks
-profile rename/deletion. The forgotten session cannot be restored through Trash.
-Same-namespace native imports, captures, and launches may remain refused after
-the row disappears. Proven separate native stores remain usable; unknown
-ownership fails closed. This protection survives daemon restart and has no
-automatic expiry. Stopping the old process does not release ownership.
+**Forget record…** is available only when AoE can prove that a new session has
+never launched a publisher or acquired history. Previously launched, imported,
+historical and unknown records must stay in Trash; Retry and read-only inspection
+remain available. A refusal reason explains unavailable Forget.
+The separate confirmation becomes invalid after a daemon restart, concurrent
+Trash transition or loss of this proof. Files remain on disk and cleanup
+protection persists without hooks or process termination. The forgotten session
+cannot be restored through Trash. New never-published owners do not block other
+sessions' history stores. Older retained owners keep their original protection
+across restart, with no automatic expiry or release on process exit.
 See the [forget-record contract](api.md#post-apisessionsidtrashforget).
 
 The reader shows retained ACP history, including events

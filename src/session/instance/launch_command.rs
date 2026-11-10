@@ -952,6 +952,10 @@ impl Instance {
             );
             Ok(())
         })?;
+        crate::session::purge_owners::consume_unpublished_before_risk(
+            &crate::session::get_app_dir()?,
+            &self.id,
+        )?;
         let sandbox_context_reset = match self.resolved_agent() {
             Some(agent) => {
                 crate::migrations::v033_isolate_sandbox_content::prepare_terminal_launch_context(

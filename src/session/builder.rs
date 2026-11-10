@@ -117,6 +117,18 @@ pub struct BuildResult {
 pub(crate) struct InstancePlan {
     pub result: BuildResult,
     provisioning: Provisioning,
+    fresh_creation: Option<FreshCreation>,
+}
+
+pub(super) struct FreshCreation {
+    id: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl FreshCreation {
+    pub(super) fn identity(&self) -> (&str, chrono::DateTime<chrono::Utc>) {
+        (&self.id, self.created_at)
+    }
 }
 
 enum Provisioning {
@@ -130,8 +142,29 @@ enum Provisioning {
 }
 
 impl InstancePlan {
+    pub(crate) fn register_fresh_creation(&mut self, root: &Path) -> Result<()> {
+        if let Some(creation) = self.fresh_creation.take() {
+            if !super::purge_owners::has_historical_custody(&self.result.instance) {
+                super::purge_owners::register_unpublished(root, creation, &self.result.instance)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn provision(mut self) -> std::result::Result<BuildResult, Box<BuildFailure>> {
         let outcome = (|| -> Result<()> {
+            let needs_invalidation = self.fresh_creation.take().is_none();
+            if needs_invalidation
+                && matches!(
+                    &self.provisioning,
+                    Provisioning::Worktree { .. } | Provisioning::Workspace(_)
+                )
+            {
+                super::purge_owners::consume_unpublished_before_risk(
+                    &super::get_app_dir()?,
+                    &self.result.instance.id,
+                )?;
+            }
             match self.provisioning {
                 Provisioning::None => {}
                 Provisioning::Scratch => {
@@ -1130,6 +1163,10 @@ pub(crate) fn plan_instance(
     CleanupProtection::new([&instance])?;
 
     Ok(InstancePlan {
+        fresh_creation: Some(FreshCreation {
+            id: instance.id.clone(),
+            created_at: instance.created_at,
+        }),
         result: BuildResult {
             instance,
             created_worktree: None,
@@ -3119,35 +3156,6 @@ mod tests {
         }
     }
 
-    fn custom_agent_params(project_path: &std::path::Path, tool: &str) -> InstanceParams {
-        InstanceParams {
-            title: "custom session".to_string(),
-            title_typed: false,
-            path: project_path.to_string_lossy().to_string(),
-            group: String::new(),
-            tool: tool.to_string(),
-            worktree_enabled: false,
-            worktree_branch: None,
-            create_new_branch: false,
-            base_branch: None,
-            sandbox: false,
-            sandbox_image: "ubuntu:latest".to_string(),
-            yolo_mode: false,
-            extra_env: Vec::new(),
-            before_start_hook_env: Vec::new(),
-            extra_args: String::new(),
-            command_override: String::new(),
-            extra_repo_paths: Vec::new(),
-            repo_base_branches: Vec::new(),
-            scratch: false,
-            fork_seed: None,
-            generated_name: false,
-            no_submodules: false,
-            tie_workdir_to_name: false,
-            worktree_path_id: None,
-        }
-    }
-
     #[test]
     #[serial_test::serial]
     fn build_instance_keeps_hook_env_off_the_container_env() {
@@ -3158,7 +3166,7 @@ mod tests {
             return;
         }
         let project = tempfile::tempdir().unwrap();
-        let mut params = custom_agent_params(project.path(), "claude");
+        let mut params = crate::session::test_support::instance_params(project.path(), "claude");
         params.sandbox = true;
         params.extra_env = vec!["A=1".into()];
         params.before_start_hook_env = vec!["TOKEN".into(), "H=2".into()];
@@ -3234,7 +3242,8 @@ mod tests {
         let _home_guard = crate::session::test_support::isolate_home(temp_home.path());
         let project = tempfile::tempdir().unwrap();
         for (typed, expected) in [(true, true), (false, false)] {
-            let mut params = custom_agent_params(project.path(), "claude");
+            let mut params =
+                crate::session::test_support::instance_params(project.path(), "claude");
             params.title_typed = typed;
             let instance = build_instance(params, &[], &[], "default")
                 .unwrap()
@@ -3251,7 +3260,7 @@ mod tests {
         let project = parent.path().join("invalid-config");
         std::fs::create_dir(project.join(".agent-of-empires")).unwrap();
         std::fs::write(project.join(".agent-of-empires/config.toml"), "[worktree").unwrap();
-        let mut params = custom_agent_params(&project, "claude");
+        let mut params = crate::session::test_support::instance_params(&project, "claude");
         params.worktree_enabled = true;
         params.worktree_branch = Some("config-must-not-create".into());
         params.create_new_branch = true;
@@ -3299,7 +3308,7 @@ mod tests {
         let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
-            custom_agent_params(project.path(), "remote-claude"),
+            crate::session::test_support::instance_params(project.path(), "remote-claude"),
             &[],
             &[],
             "default",
@@ -3311,7 +3320,7 @@ mod tests {
         assert_eq!(result.instance.detect_as, "claude");
 
         let unmapped = build_instance(
-            custom_agent_params(project.path(), "remote-opencode"),
+            crate::session::test_support::instance_params(project.path(), "remote-opencode"),
             &[],
             &[],
             "default",
@@ -3322,7 +3331,7 @@ mod tests {
 
         for tool in ["remote-missing", "whitespace-agent"] {
             let Err(err) = build_instance(
-                custom_agent_params(project.path(), tool),
+                crate::session::test_support::instance_params(project.path(), tool),
                 &[],
                 &[],
                 "default",
@@ -3347,7 +3356,8 @@ mod tests {
         std::fs::create_dir_all(&app_dir).unwrap();
         std::fs::write(app_dir.join("config.toml"), "").unwrap();
 
-        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        let mut params =
+            crate::session::test_support::instance_params(std::path::Path::new(""), "claude");
         params.scratch = true;
         let result = build_instance(params.clone(), &[], &[], "default")
             .expect("scratch build must succeed without a project path");
@@ -3377,7 +3387,7 @@ mod tests {
         // GitError variants, so a string bail would surface the opaque
         // "Failed to create session" instead.
         let project = tempfile::tempdir().unwrap();
-        let mut params = custom_agent_params(project.path(), "claude");
+        let mut params = crate::session::test_support::instance_params(project.path(), "claude");
         params.worktree_enabled = true;
         params.worktree_branch = Some("feat".to_string());
         let Err(err) = build_instance(params, &[], &[], "default") else {
@@ -3615,7 +3625,7 @@ mod tests {
             provenance: crate::session::ConversationProvenance::Observed,
             transcript_path: None,
         };
-        let mut params = custom_agent_params(&project, "claude-b");
+        let mut params = crate::session::test_support::instance_params(&project, "claude-b");
         params.fork_seed = Some(crate::session::ForkSeed::Terminal {
             parent: Box::new(parent),
             child_session_id: "child-conversation".into(),
@@ -3656,7 +3666,7 @@ mod tests {
         )
         .expect("an unattributed parent is admitted");
 
-        let mut same_agent = custom_agent_params(root.path(), "claude");
+        let mut same_agent = crate::session::test_support::instance_params(root.path(), "claude");
         same_agent.command_override = "claude".into();
         same_agent.fork_seed = Some(seed.clone());
         assert_eq!(
@@ -3668,7 +3678,7 @@ mod tests {
             Some("child-uuid")
         );
 
-        let mut other_agent = custom_agent_params(root.path(), "codex");
+        let mut other_agent = crate::session::test_support::instance_params(root.path(), "codex");
         other_agent.command_override = "codex".into();
         other_agent.fork_seed = Some(seed);
         let refused = match build_instance(other_agent, &[], &[], "default") {

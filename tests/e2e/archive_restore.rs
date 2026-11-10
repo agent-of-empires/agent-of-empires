@@ -1337,6 +1337,43 @@ fn pending_trash_row(
     (value, id, sentinel)
 }
 
+fn pending_unpublished_trash_row(
+    h: &TuiTestHarness,
+    title: &str,
+    unverified: bool,
+) -> (serde_json::Value, String, std::path::PathBuf) {
+    let (template, _, sentinel) = pending_trash_row(h, title, unverified);
+    let project = template["project_path"].as_str().unwrap();
+    h.start_daemon();
+    let id = h.add_session(&[project, "-t", title, "-c", "claude"]);
+    h.run_cli_ok(&["serve", "--stop"]);
+    let rows = h.read_sessions();
+    let mut row = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id)
+        .unwrap()
+        .clone();
+    let generation = row["lifecycle_generation"]
+        .as_u64()
+        .unwrap()
+        .checked_add(1)
+        .unwrap();
+    for field in [
+        "trashed_at",
+        "trash_lifecycle_id",
+        "lifecycle_reservation",
+        "worktree_info",
+        "terminal_scopes",
+    ] {
+        row[field] = template[field].clone();
+    }
+    row["lifecycle_generation"] = serde_json::json!(generation);
+    row["lifecycle_reservation"]["generation"] = serde_json::json!(generation);
+    (row, id, sentinel)
+}
+
 fn trash_management_click(h: &mut TuiTestHarness, text: &str) {
     let (x, y) =
         crate::harness::wait_until(Duration::from_secs(5), Duration::from_millis(20), || {
@@ -1473,17 +1510,12 @@ fn trash_management_retry_finishes_or_keeps_unverified_files() {
 
 #[test]
 #[parallel]
-fn trash_forget_record_preserves_unverified_files_with_keyboard_and_mouse() {
+fn trash_forget_unpublished_record_preserves_files_with_keyboard_and_mouse() {
     require_tmux!();
     for mouse in [false, true] {
         let mut h = TuiTestHarness::new("trash_forget_record");
         h.stop_daemon_on_drop();
-        let (mut row, id, sentinel) = pending_trash_row(&h, "ForgetUnverified", true);
-        let scopes = serde_json::json!([{
-            "state": "owned",
-            "unit": format!("aoe-test-forget-{id}.scope"),
-        }]);
-        row["terminal_scopes"] = scopes.clone();
+        let (row, id, sentinel) = pending_unpublished_trash_row(&h, "ForgetUnverified", true);
         std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
         h.start_daemon();
         h.spawn_tui();
@@ -1535,7 +1567,6 @@ fn trash_forget_record_preserves_unverified_files_with_keyboard_and_mouse() {
             .find(|owner| owner["session_id"] == id)
             .unwrap();
         assert_eq!(owner["purpose"]["kind"], "retained");
-        assert_eq!(owner["purpose"]["terminal_scopes"], scopes);
     }
 }
 
@@ -1546,7 +1577,7 @@ fn trash_forget_confirmation_rejects_concurrent_retry_before_keyboard_or_mouse_c
     for mouse in [false, true] {
         let mut h = TuiTestHarness::new("trash_forget_stale");
         h.stop_daemon_on_drop();
-        let (row, id, sentinel) = pending_trash_row(&h, "ForgetStale", true);
+        let (row, id, sentinel) = pending_unpublished_trash_row(&h, "ForgetStale", true);
         let generation = row["lifecycle_generation"].as_u64().unwrap();
         std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
         h.start_daemon();
@@ -1614,7 +1645,7 @@ fn trash_forget_confirmation_expires_across_daemon_restart_with_unchanged_row() 
     for mouse in [false, true] {
         let mut h = TuiTestHarness::new("trash_forget_epoch");
         h.stop_daemon_on_drop();
-        let (original, id, sentinel) = pending_trash_row(&h, "ForgetEpoch", true);
+        let (original, id, sentinel) = pending_unpublished_trash_row(&h, "ForgetEpoch", true);
         std::fs::write(
             h.sessions_path(),
             serde_json::to_vec(std::slice::from_ref(&original)).unwrap(),

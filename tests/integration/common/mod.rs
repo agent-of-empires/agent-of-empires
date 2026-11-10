@@ -70,6 +70,13 @@ pub fn shim_node() -> Result<&'static Path, String> {
     .map_err(Clone::clone)
 }
 
+pub fn acp_publisher_root() -> TempDir {
+    let root = TempDir::new().expect("private publisher storage");
+    agent_of_empires::migrations::initialize_empty_test_storage(root.path())
+        .expect("initialize publisher ownership");
+    root
+}
+
 /// Keeps a spawned or in-process aoe off the developer's systemd user manager.
 pub const SYSTEMD_OFF: &str = "[systemd]\nenabled = false\n";
 

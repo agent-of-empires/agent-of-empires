@@ -288,6 +288,9 @@ pub(super) fn channel_sink() -> (
 pub(super) fn isolate_home() -> (crate::session::test_support::AppDirGuard, tempfile::TempDir) {
     let tmp = tempfile::TempDir::with_prefix_in("aoe-lease-", "/tmp").unwrap();
     let home = crate::session::test_support::isolate_app_dir_at(tmp.path());
+    let root = crate::session::get_app_dir().unwrap();
+    crate::session::purge_owners::initialize(&root).unwrap();
+    crate::tmux::tool_retirement::initialize(&root).unwrap();
     (home, tmp)
 }
 
@@ -369,12 +372,14 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
 
 pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
     SpawnConfig {
+        publisher_root: crate::session::get_app_dir_path().unwrap(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
+            publisher_route: None,
             command: "/bin/true".into(),
             args: vec![],
             description: "test fixture".into(),

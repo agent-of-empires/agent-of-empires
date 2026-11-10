@@ -654,6 +654,10 @@ pub(crate) fn run_create_hooks(
     if plan.on_create().is_empty() {
         return Ok(());
     }
+    crate::session::purge_owners::consume_unpublished_before_risk(
+        &crate::session::get_app_dir()?,
+        &instance.id,
+    )?;
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {

@@ -394,6 +394,13 @@ impl<'a> LockedSandboxCheckpoint<'a> {
     pub(crate) fn commit_local(self) -> Result<()> {
         for registry in self.registries {
             let bytes = serde_json::to_vec_pretty(&registry.value)?;
+            crate::session::purge_owners::invalidate_unpublished_checkpoint(
+                &registry.path,
+                crate::session::ResolvedDataFile::open(&registry.path)?
+                    .read()?
+                    .as_deref(),
+                &bytes,
+            )?;
             crate::session::atomic_write(&registry.path, &bytes)?;
             sync_parent(&registry.path)?;
         }
@@ -484,6 +491,11 @@ impl PreparedSandboxCheckpoint<'_> {
                             file.same_target(&crate::session::ResolvedDataFile::open(path)?)?,
                             "legacy registry binding changed"
                         );
+                        crate::session::purge_owners::invalidate_unpublished_checkpoint(
+                            path,
+                            file.read()?.as_deref(),
+                            bytes,
+                        )?;
                         file.replace_preserving_permissions(bytes)?;
                         file.sync_parent()?;
                         anyhow::ensure!(

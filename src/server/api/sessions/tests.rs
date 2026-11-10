@@ -1227,6 +1227,11 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
     use tower::ServiceExt;
     for case in [
         "valid",
+        "legacy",
+        "published",
+        "unverified_scopes",
+        "journal_missing",
+        "journal_malformed",
         "epoch_missing",
         "epoch_duplicate",
         "epoch_stale",
@@ -1245,12 +1250,27 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
         let project = tempfile::tempdir()?;
         let sentinel = project.path().join("kept.txt");
         std::fs::write(&sentinel, b"must survive forgetting")?;
-        let mut row = Instance::new("unfinished Trash", project.path().to_str().unwrap());
+        let mut row = if case == "legacy" {
+            Instance::new("unfinished Trash", project.path().to_str().unwrap())
+        } else {
+            crate::session::test_support::unpublished_instance(
+                "unfinished Trash",
+                project.path(),
+                "receipt",
+            )?
+        };
         row.source_profile = "receipt".into();
-        let scopes = vec![crate::process::worker_registry::ScopeOwnership::Owned {
-            unit: format!("aoe-test-forget-{}.scope", row.id),
-        }];
+        let scopes = if case == "unverified_scopes" {
+            vec![crate::process::worker_registry::ScopeOwnership::Owned {
+                unit: format!("aoe-test-forget-{}.scope", row.id),
+            }]
+        } else {
+            Vec::new()
+        };
         row.terminal_scopes = Some(scopes.clone());
+        if case == "published" {
+            row.agent_session_id = Some("recorded-native-history".into());
+        }
         let now = chrono::Utc::now();
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
@@ -1294,11 +1314,16 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
             rows.push(row);
             Ok(())
         })?;
+        let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
+        if case == "journal_missing" {
+            std::fs::remove_file(&journal_path)?;
+        } else if case == "journal_malformed" {
+            std::fs::write(&journal_path, b"{unreadable authority")?;
+        }
         *state.canonical_metadata.write().await =
             crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
         let registry_before = std::fs::read(storage.sessions_path())?;
-        let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
-        let journal_before = std::fs::read(&journal_path)?;
+        let journal_before = std::fs::read(&journal_path).ok();
         let epoch = state
             .runtime
             .publish(&state)
@@ -1361,6 +1386,19 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
             assert!(crate::session::purge_owners::CleanupOwners::load(&root)?
                 .protections()
                 .any(|owner| owner.references_path(project.path())));
+        } else if case.starts_with("journal_") {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 4096).await?;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body)?["error"],
+                "ownership_unavailable"
+            );
+            assert_eq!(
+                std::fs::read(storage.sessions_path())?,
+                registry_before,
+                "{case}"
+            );
+            assert_eq!(std::fs::read(&journal_path).ok(), journal_before, "{case}");
         } else {
             assert_eq!(response.status(), StatusCode::CONFLICT, "{case}");
             assert_eq!(
@@ -1369,6 +1407,8 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
                     crate::daemon::ApiErrorCode::RuntimeEpochMismatch.as_str()
                 } else if case == "fresh" {
                     crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
+                } else if matches!(case, "legacy" | "published" | "unverified_scopes") {
+                    crate::daemon::ApiErrorCode::ForgetUnbounded.as_str()
                 } else {
                     crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
                 },
@@ -1379,7 +1419,7 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
                 registry_before,
                 "{case}"
             );
-            assert_eq!(std::fs::read(&journal_path)?, journal_before, "{case}");
+            assert_eq!(std::fs::read(&journal_path).ok(), journal_before, "{case}");
         }
         assert_eq!(
             std::fs::read(&sentinel)?,
@@ -1430,7 +1470,7 @@ async fn interrupted_forget_tombstone_refuses_retry_and_restore_before_reservati
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let aborted: anyhow::Result<()> = storage.update(|rows, _| {
         let current = rows.iter().find(|current| current.id == row.id).unwrap();
-        crate::session::purge_owners::retain_forgotten_trash(&storage, current)?;
+        crate::session::purge_owners::seed_legacy_retained_for_test(&storage, current)?;
         anyhow::bail!("abort registry transaction after durable retained ownership");
     });
     assert!(aborted
@@ -1615,9 +1655,15 @@ async fn retained_trash_parked_conversation_refuses_import() -> anyhow::Result<(
             state.instances.write().await.clear();
             let owners = crate::session::purge_owners::CleanupOwners::load(&root)?;
             assert!(!owners.blocks_conversation("native claimant", "listed", None));
-            assert!(!owners.blocks_acp_import("unrelated claimant", "unrelated", None));
+            assert!(!owners.blocks_acp_import(
+                "unrelated claimant",
+                "unrelated",
+                None,
+                crate::session::purge_owners::PublisherNamespace::Unknown,
+            ));
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         } else {
+            crate::session::purge_owners::seed_legacy_retained_for_test(&storage, &owner)?;
             let forgotten =
                 forget_trash_record(State(state.clone()), Path(owner.id), Ok(Json(consent)))
                     .await
@@ -9059,7 +9105,9 @@ fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
         "key",
         crate::server::create_progress::CreateProgressVisibility::WebReadable,
     );
-    let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
+    let mut instance =
+        crate::session::test_support::unpublished_instance("hooked", project.path(), "default")
+            .unwrap();
 
     let storage = crate::session::Storage::new_unwatched("default").unwrap();
     let record = |event| registration.progress.record(event);
@@ -10779,6 +10827,7 @@ done
     let _env = isolate_home(tmp.path())
         .and_set("CLAUDE_CONFIG_DIR", &claude)
         .and_set("PATH", path);
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let store = claude.join("projects").join("-proj");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(
@@ -11499,6 +11548,7 @@ async fn recreate_container_removes_the_container_before_the_agent_restarts() ->
 {
     use std::os::unix::fs::PermissionsExt;
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;

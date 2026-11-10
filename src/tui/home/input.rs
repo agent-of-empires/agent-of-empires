@@ -661,6 +661,7 @@ impl HomeView {
             })
             && self.session_feed.applied_session(id).is_some_and(|row| {
                 row.profile == consent.expected_profile
+                    && row.forget_trash.allowed
                     && row.lifecycle_generation == consent.expected_generation
                     && row.trash_lifecycle_id.as_deref()
                         == Some(consent.expected_trash_lifecycle_id.as_str())
@@ -711,6 +712,18 @@ impl HomeView {
         else {
             return;
         };
+        if self
+            .session_feed
+            .applied_session(&instance.id)
+            .is_none_or(|row| !row.forget_trash.allowed)
+        {
+            let reason = self.session_feed.applied_session(&instance.id)
+                .and_then(|row| row.forget_trash.reason.as_deref())
+                .unwrap_or("Cleanup ownership proof is unavailable. Keep this record in Trash; Retry remains available.")
+                .to_owned();
+            self.info_dialog = Some(InfoDialog::new("Record Must Stay in Trash", &reason));
+            return;
+        }
         let Some(trashed_at) = instance.trashed_at else {
             return;
         };
@@ -726,7 +739,7 @@ impl HomeView {
             expected_trash_lifecycle_id: trash_id,
         };
         let message = format!(
-            "Forget the unfinished Trash record for '{}'?\n\nFiles remain on disk. AoE keeps cleanup protection and unresolved runtime ownership. This action does not stop processes or run cleanup hooks. Retained ownership blocks profile rename/deletion. You cannot restore this session through Trash afterward.",
+            "Forget the unfinished Trash record for '{}'?\n\nFiles remain on disk. AoE keeps cleanup and exact session protection. Only sessions proven never to have published shared history can be newly forgotten. This action does not stop processes or run cleanup hooks. Retained ownership blocks profile rename/deletion. You cannot restore this session through Trash afterward.",
             instance.title,
         );
         let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {

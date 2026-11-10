@@ -289,6 +289,56 @@ describe("WorkspaceSidebar Trash control", () => {
       true,
     );
   });
+
+  it("revokes Forget without changing identity or disabling Retry", async () => {
+    const onRetry = vi.fn(async () => {});
+    const onForget = vi.fn();
+    const pending: Partial<SessionResponse> = {
+      id: "pending",
+      title: "unpublished",
+      profile: "test",
+      trashed_at: TRASHED,
+      trash_lifecycle_id: "00000000-0000-4000-8000-000000000004",
+      lifecycle_generation: 4,
+      lifecycle_reservation: { op: "trash", generation: 4, at: TRASHED },
+      forget_trash: { allowed: true, reason: null },
+    };
+    const menu = (session: Partial<SessionResponse>) => (
+      <TrashMenu
+        trashedWorkspaces={[workspace("pending", [session])]}
+        trashedCount={1}
+        loaded
+        onLoad={noop}
+        runtimeEpoch="boot"
+        onRetryTrash={onRetry}
+        onForgetTrash={onForget}
+        onOpen={noop}
+        onRestore={noop}
+        onDelete={noop}
+        onEmptyTrash={noop}
+      />
+    );
+    const view = render(menu(pending));
+    click("sidebar-trash-toggle");
+    const forget = screen.getByTestId("sidebar-trash-forget") as HTMLButtonElement;
+    expect(forget.disabled).toBe(false);
+    fireEvent.pointerDown(forget);
+    view.rerender(
+      menu({
+        ...pending,
+        forget_trash: { allowed: false, reason: "Shared history must stay protected." },
+      }),
+    );
+    expect((screen.getByTestId("sidebar-trash-forget") as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Shared history must stay protected.")).toBeTruthy();
+    click("sidebar-trash-forget");
+    expect(onForget).not.toHaveBeenCalled();
+    expect((screen.getByTestId("sidebar-trash-retry") as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => {
+      click("sidebar-trash-retry");
+    });
+    expect(onRetry).toHaveBeenCalledOnce();
+  });
 });
 
 describe("WorkspaceSidebar row actions on a group slice (#4019)", () => {

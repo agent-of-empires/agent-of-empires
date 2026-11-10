@@ -898,6 +898,35 @@ pub enum RestoreOutcome {
     AlreadyRestored,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ForgetTrashCapability {
+    pub allowed: bool,
+    pub reason: Option<std::borrow::Cow<'static, str>>,
+}
+
+impl Default for ForgetTrashCapability {
+    fn default() -> Self {
+        Self::from_eligibility(crate::session::purge_owners::ForgetEligibility::Unavailable)
+    }
+}
+
+impl ForgetTrashCapability {
+    pub(crate) fn from_eligibility(
+        eligibility: crate::session::purge_owners::ForgetEligibility,
+    ) -> Self {
+        use crate::session::purge_owners::ForgetEligibility;
+        let reason = match eligibility {
+            ForgetEligibility::Allowed => None,
+            ForgetEligibility::Unbounded => Some("This session may have published shared history. Keep it in Trash and use Retry."),
+            ForgetEligibility::Unavailable => Some("Cleanup ownership proof is unavailable. Keep this record in Trash; Retry remains available."),
+        };
+        Self {
+            allowed: reason.is_none(),
+            reason: reason.map(std::borrow::Cow::Borrowed),
+        }
+    }
+}
+
 /// One session from the daemon. Only `id` is required when decoding.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionResponse {
@@ -1041,6 +1070,8 @@ pub struct SessionResponse {
     pub trash_lifecycle_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_purge_forced: Option<bool>,
+    #[serde(default)]
+    pub forget_trash: ForgetTrashCapability,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session
     /// needs attention (a finished turn the user hasn't engaged with, or a
     /// manual flag), omitted when read. The web sidebar paints an unread

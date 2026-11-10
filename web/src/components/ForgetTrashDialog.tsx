@@ -33,8 +33,8 @@ export function ForgetTrashDialog({ sessionTitle, profile, onConfirm, onCancel }
         Forget <strong>{sessionTitle}</strong> in profile <strong>{profile}</strong> without deleting its files?
       </p>
       <p className="mt-3 text-text-secondary">
-        AoE keeps cleanup ownership of its runtime and storage resources. This action does not stop processes, run
-        delete hooks, or remove files.
+        AoE keeps cleanup and exact session protection. Only sessions proven never to have published shared history can
+        be newly forgotten. This action does not stop processes, run delete hooks, or remove files.
       </p>
       <p className="mt-3 text-text-secondary">
         Retained ownership blocks profile rename/deletion. You cannot restore this session through Trash afterward.

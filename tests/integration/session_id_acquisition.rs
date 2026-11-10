@@ -77,8 +77,10 @@ impl IsolatedHome {
             _runtime_dir: runtime_dir,
             home,
         };
-        agent_of_empires::migrations::initialize_empty_test_storage()
-            .expect("initialize isolated native ownership");
+        agent_of_empires::migrations::initialize_empty_test_storage(
+            &agent_of_empires::session::get_app_dir().expect("isolated app directory"),
+        )
+        .expect("initialize isolated native ownership");
         isolated
     }
 

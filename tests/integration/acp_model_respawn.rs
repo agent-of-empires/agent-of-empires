@@ -22,6 +22,7 @@ use agent_of_empires::acp::state::{AcpSessionId, Event};
 use crate::common::{shim_path, shim_ready};
 
 fn spawn_config(
+    publisher_root: &std::path::Path,
     shim: PathBuf,
     env: Vec<(String, String)>,
     stored_acp_session_id: Option<String>,
@@ -29,12 +30,14 @@ fn spawn_config(
     default_effort: Option<String>,
 ) -> SpawnConfig {
     SpawnConfig {
+        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
+            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -125,6 +128,8 @@ async fn run(config: SpawnConfig, label: &str) -> Vec<Event> {
 #[tokio::test]
 #[serial_test::parallel]
 async fn pinned_model_and_effort_applied_on_load_and_new() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -169,6 +174,7 @@ async fn pinned_model_and_effort_applied_on_load_and_new() {
         let temp = tempfile::tempdir().expect("tempdir");
         let record_path = temp.path().join("config-option-calls.log");
         let config = spawn_config(
+            publisher_root,
             shim_path(),
             shim_env(&record_path, load, effort.is_some() || model.is_none()),
             (load && (model.is_some() || effort.is_some())).then(|| format!("stored-{label}")),
@@ -195,6 +201,8 @@ async fn pinned_model_and_effort_applied_on_load_and_new() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn pinned_model_skipped_when_already_current() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -208,6 +216,7 @@ async fn pinned_model_skipped_when_already_current() {
         let record_path = temp.path().join("config-option-calls.log");
         // The shim's initial `currentValue` is "default".
         let config = spawn_config(
+            publisher_root,
             shim_path(),
             shim_env(&record_path, true, true),
             Some("stored-model-session".into()),
@@ -225,7 +234,7 @@ async fn pinned_model_skipped_when_already_current() {
             recorded.lines().any(|line| line == format!("model={pin}")),
             expect_sent,
             "{pin}: a model the agent already reports must not be re-sent, and one \
-             it does not report must be (recorded: {recorded:?})"
+         it does not report must be (recorded: {recorded:?})"
         );
     }
 }
@@ -236,6 +245,8 @@ async fn pinned_model_skipped_when_already_current() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn default_pin_moves_a_resumed_session_off_its_transcript_model() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -246,6 +257,7 @@ async fn default_pin_moves_a_resumed_session_off_its_transcript_model() {
         let mut env = shim_env(&record_path, true, true);
         env.push(("SHIM_RESUMED_MODEL".into(), "opus".into()));
         let config = spawn_config(
+            publisher_root,
             shim_path(),
             env,
             Some("stored-transcript-session".into()),
@@ -273,6 +285,8 @@ async fn default_pin_moves_a_resumed_session_off_its_transcript_model() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn rejected_model_does_not_fail_the_spawn() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -280,6 +294,7 @@ async fn rejected_model_does_not_fail_the_spawn() {
     let temp = tempfile::tempdir().expect("tempdir");
     let record_path = temp.path().join("config-option-calls.log");
     let config = spawn_config(
+        publisher_root,
         shim_path(),
         shim_env(&record_path, true, false),
         Some("stored-model-session".into()),
@@ -309,6 +324,8 @@ async fn rejected_model_does_not_fail_the_spawn() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn reset_reapplies_the_live_model_pick() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -322,6 +339,7 @@ async fn reset_reapplies_the_live_model_pick() {
     let mut env = shim_env(&record_path, false, true);
     env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
     let config = spawn_config(
+        publisher_root,
         shim_path(),
         env,
         None,
@@ -355,7 +373,7 @@ async fn reset_reapplies_the_live_model_pick() {
             .rfind(|line| line.starts_with("thought_level")),
         Some("thought_level_v2=high"),
         "the reset must resolve the effort id from its own model switch \
-         (recorded: {recorded:?})"
+     (recorded: {recorded:?})"
     );
 }
 
@@ -367,6 +385,8 @@ async fn reset_reapplies_the_live_model_pick() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn effort_id_is_re_read_from_the_model_switch_response() {
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -376,6 +396,7 @@ async fn effort_id_is_re_read_from_the_model_switch_response() {
     let mut env = shim_env(&record_path, true, true);
     env.push(("SHIM_RENUMBER_ON_MODEL".into(), "1".into()));
     let config = spawn_config(
+        publisher_root,
         shim_path(),
         env,
         Some("stored-model-session".into()),

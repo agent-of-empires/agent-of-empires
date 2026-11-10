@@ -545,6 +545,10 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
     pub fn run_hooks(self) -> Result<Self> {
+        super::purge_owners::consume_unpublished_before_risk(
+            &super::get_app_dir()?,
+            &self.request().session_id,
+        )?;
         let config = self
             .store()
             .configuration(Some(self.store().storage().profile()))?;

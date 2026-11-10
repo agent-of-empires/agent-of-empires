@@ -55,6 +55,7 @@ export interface SessionResponse {
   snoozed_until?: string | null;
   trashed_at?: string | null;
   trash_lifecycle_id?: string | null;
+  forget_trash?: { allowed: boolean; reason: string | null };
   /** Needs attention (unreviewed finished turn or manual flag). */
   unread?: boolean;
   has_managed_worktree: boolean;

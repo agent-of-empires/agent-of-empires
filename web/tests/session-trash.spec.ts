@@ -379,7 +379,14 @@ test("mixed workspace recovery targets only its unfinished Trash member", async 
   const handle = await installTrashMocks(
     page,
     [
-      { ...shared, id: "mixed-pending", title: "pending member", trashed: true, pendingTrash: true },
+      {
+        ...shared,
+        id: "mixed-pending",
+        title: "pending member",
+        trashed: true,
+        pendingTrash: true,
+        forgetAllowed: true,
+      },
       { ...shared, id: "mixed-live", title: "live member", trashed: false },
     ],
     { groupAxis: true },
@@ -408,7 +415,14 @@ test("mixed workspace recovery targets only its unfinished Trash member", async 
 test("Forget Escape leaves the actual underlying file viewer open", async ({ page }) => {
   await installTrashMocks(page, [
     { id: "viewer-live", title: "viewer live", projectPath: "/tmp/viewer", trashed: false },
-    { id: "viewer-pending", title: "viewer pending", projectPath: "/tmp/pending", trashed: true, pendingTrash: true },
+    {
+      id: "viewer-pending",
+      title: "viewer pending",
+      projectPath: "/tmp/pending",
+      trashed: true,
+      pendingTrash: true,
+      forgetAllowed: true,
+    },
   ]);
   const file = { path: "recovery.txt" };
   await mockDiffFiles(page, diffFilesResponse([file]));
@@ -438,6 +452,7 @@ for (const welcomeSeen of [false, true]) {
         projectPath: "/tmp/pending",
         trashed: true,
         pendingTrash: true,
+        forgetAllowed: true,
       },
     ]);
     await page.addInitScript((seen) => {

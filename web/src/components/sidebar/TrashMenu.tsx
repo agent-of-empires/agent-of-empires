@@ -394,6 +394,7 @@ function TrashRow({
             <TrashRecoveryRow
               key={`${session.id}:${target.epoch}:${target.expected_generation}`}
               target={target}
+              forgetCapability={session.forget_trash}
               onRetry={onRetryTrash}
               onForget={onForgetTrash}
             />
@@ -409,10 +410,12 @@ function TrashRow({
 
 function TrashRecoveryRow({
   target,
+  forgetCapability,
   onRetry,
   onForget,
 }: {
   target: TrashRecoveryTarget;
+  forgetCapability: { allowed: boolean; reason: string | null } | undefined;
   onRetry: (target: TrashRecoveryTarget) => Promise<void>;
   onForget: (target: TrashRecoveryTarget) => void;
 }) {
@@ -451,14 +454,21 @@ function TrashRecoveryRow({
         </button>
         <button
           type="button"
-          onClick={() => onForget(target)}
-          disabled={busy}
+          onClick={() => {
+            if (forgetCapability?.allowed === true) onForget(target);
+          }}
+          disabled={busy || forgetCapability?.allowed !== true}
           className={`${DANGER} disabled:opacity-50`}
           data-testid="sidebar-trash-forget"
         >
           Forget record…
         </button>
       </div>
+      {forgetCapability?.allowed !== true && (
+        <p className="mt-1 text-xs text-text-secondary">
+          {forgetCapability?.reason ?? "Forget is unavailable. Retry remains available."}
+        </p>
+      )}
     </div>
   );
 }
