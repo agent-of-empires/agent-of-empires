@@ -273,6 +273,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             model: inst.agent_model.clone(),
             effort: None,
             effort_explicit: false,
+            model_config: Default::default(),
             // The whole point of taking the session down and bringing it back.
             stored_acp_session_id: inst.acp_session_id.clone(),
             // Threaded for the same continuity reason as the stored session id.

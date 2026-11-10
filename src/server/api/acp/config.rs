@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use crate::acp::state::ConfigOptionCategory;
+use crate::acp::state::MODEL_CONFIG_CATEGORY;
 
 use super::*;
 
@@ -100,6 +101,14 @@ async fn persist_selector(
     selector: PersistedSelector,
     value: &str,
 ) -> anyhow::Result<()> {
+    persist_with(state, id, |inst| selector.apply(inst, value.to_string())).await
+}
+
+async fn persist_with(
+    state: &Arc<AppState>,
+    id: &str,
+    apply: impl Fn(&mut crate::session::Instance),
+) -> anyhow::Result<()> {
     let _reload = state.session_service.disk_mutation_guard().await;
     let profile = {
         let instances = state.instances.read().await;
@@ -111,14 +120,14 @@ async fn persist_selector(
     crate::session::Storage::new(&profile, state.file_watch.clone())?.update(
         |instances, _groups| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                selector.apply(inst, value.to_string());
+                apply(inst);
             }
             Ok(())
         },
     )?;
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        selector.apply(inst, value.to_string());
+        apply(inst);
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -180,6 +189,7 @@ pub async fn acp_set_config_option(
         return session_not_found();
     };
     // Respawns reuse persisted selector picks.
+    let mut is_model_config = false;
     let selector = if req.config_id == "model" {
         Some(PersistedSelector::Model)
     } else {
@@ -187,7 +197,11 @@ pub async fn acp_set_config_option(
             Some(ConfigOptionCategory::Model) => Some(PersistedSelector::Model),
             Some(ConfigOptionCategory::Mode) => Some(PersistedSelector::Mode),
             Some(ConfigOptionCategory::ThoughtLevel) => Some(PersistedSelector::ThoughtLevel),
-            Some(ConfigOptionCategory::Other(_)) | None => None,
+            Some(ConfigOptionCategory::Other(c)) => {
+                is_model_config = c == MODEL_CONFIG_CATEGORY;
+                None
+            }
+            None => None,
         }
     };
     // The adapter rejects a bad effort only after the pick is stored, so an
@@ -229,6 +243,23 @@ pub async fn acp_set_config_option(
                 .acp_supervisor
                 .refresh_cached_model(&id, &req.value)
                 .await;
+        }
+    }
+    if is_model_config {
+        let (config_id, value) = (req.config_id.clone(), req.value.clone());
+        if let Err(e) = persist_with(&state, &id, |inst| {
+            inst.acp_model_config
+                .insert(config_id.clone(), value.clone());
+        })
+        .await
+        {
+            return persist_failure_response(
+                &state,
+                &id,
+                &format!("config-option pick for acp_model_config.{}", req.config_id),
+                &e,
+            )
+            .await;
         }
     }
     tracing::info!(

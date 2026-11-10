@@ -183,6 +183,7 @@ pub(crate) fn spawn_request_for(
         model: instance.agent_model.clone(),
         effort: instance.acp_effort.clone(),
         effort_explicit: instance.acp_effort.is_some(),
+        model_config: instance.acp_model_config.clone(),
         stored_acp_session_id: instance.acp_session_id.clone(),
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,

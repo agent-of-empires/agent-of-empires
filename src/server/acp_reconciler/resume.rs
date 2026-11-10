@@ -425,6 +425,7 @@ async fn build_spawn_request(
         fork_from,
         acp_mode_id,
         acp_effort,
+        acp_model_config,
         agent_model,
         agent_provider,
         claude_store_pin,
@@ -448,6 +449,7 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.acp_model_config.clone(),
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
@@ -516,6 +518,7 @@ async fn build_spawn_request(
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
+        model_config: acp_model_config,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
