@@ -1693,6 +1693,8 @@ mod tests {
         let (loaded, metadata) = cache.load(&watch);
         metadata.unwrap();
         assert!(loaded.instances.iter().any(|row| row.title == "new"));
+        // That load may have timed out with an alias worker still reading the fixture.
+        crate::server::alias_io::wait_idle_for_test("external");
         std::fs::remove_file(&alias).unwrap();
         std::fs::remove_dir_all(crate::session::get_profile_dir_path("added").unwrap()).unwrap();
         let (loaded, metadata) = cache.load(&watch);
