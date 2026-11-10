@@ -519,6 +519,65 @@ async fn idle_remote_control_message_records_and_returns_to_idle() {
     let _ = fake.agent.await;
 }
 
+/// claude-agent-acp 0.101.0+ sends `/compact` itself when a session sits idle,
+/// so no aoe prompt owns the turn. aoe must show the compaction and end the
+/// turn on its own.
+#[tokio::test]
+async fn adapter_started_idle_compaction_ends_without_a_prompt() {
+    let prompted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen_prompt = prompted.clone();
+    let mut fake = spawn_fake_connection("s-idle", move |_| {
+        seen_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+        Vec::new()
+    })
+    .await;
+
+    for update in [
+        r#"{"sessionUpdate":"compaction_update","compactionId":"c","status":"in_progress"}"#,
+        r#"{"sessionUpdate":"compaction_update","compactionId":"c","status":"completed"}"#,
+        r#"{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{"amount":0.1,"currency":"USD"}}"#,
+    ] {
+        write_line(
+            &fake.agent_write,
+            &format!(
+                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-idle","update":{update}}}}}"#
+            ),
+        )
+        .await;
+    }
+
+    // The idle grace is wall-clock, so the deadline covers it with margin.
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = fake.event_rx.recv().await {
+            let stopped = matches!(event, Event::Stopped { .. });
+            seen.push(event);
+            if stopped {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the compaction turn must reach a terminal event");
+
+    let started = seen
+        .iter()
+        .position(|e| matches!(e, Event::ConversationCompactionStarted));
+    let stopped = seen
+        .iter()
+        .position(|e| matches!(e, Event::Stopped { reason } if reason == "agent_idle"));
+    assert!(
+        started.is_some() && started < stopped,
+        "compaction then Stopped(agent_idle) expected: {seen:?}"
+    );
+    assert!(
+        !prompted.load(std::sync::atomic::Ordering::SeqCst),
+        "no aoe prompt may be in flight"
+    );
+    fake.agent.abort();
+    let _ = fake.agent.await;
+}
+
 /// A prompted turn the adapter ends normally after a rejected window parks like
 /// the error path; a cancelled turn, an already-past reset, or a window extra
 /// usage covers does not.
