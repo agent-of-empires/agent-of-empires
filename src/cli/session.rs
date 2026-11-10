@@ -2886,7 +2886,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                             "terminal handoff pane is live; close it explicitly in tmux before selecting a target");
                     }
                 } else {
-                    complete.ensure_only_preexisting_live_panes(
+                    complete.ensure_only_preexisting_panes(
                         launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
                     )?;
                 }
