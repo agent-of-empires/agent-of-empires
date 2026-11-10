@@ -341,55 +341,69 @@ pub(super) fn build_fork_flags(
 
 pub(super) struct ParsedLaunchCommand {
     pub(super) words: Vec<String>,
+    pub(super) assignments: Vec<(String, String)>,
     pub(super) executable_end: usize,
 }
 
 pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand> {
-    let words = shell_words::split(command).ok()?;
-    words.first()?;
-
-    let mut started = false;
+    let mut spans = Vec::new();
+    let mut start = None;
     let mut quote = None;
     let mut escaped = false;
     for (offset, ch) in command.char_indices() {
-        let separator = matches!(ch, ' ' | '\t' | '\n' | '\r');
-        if !started {
-            if separator {
+        if start.is_none() {
+            if ch.is_ascii_whitespace() {
                 continue;
             }
-            started = true;
+            start = Some(offset);
         }
         if escaped {
             escaped = false;
             continue;
         }
         match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '\\' => escaped = true,
-                _ => {}
-            },
-            _ => match ch {
+            Some('\'') if ch == '\'' => quote = None,
+            Some('"') if ch == '"' => quote = None,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(_) => {}
+            None => match ch {
                 '\'' | '"' => quote = Some(ch),
                 '\\' => escaped = true,
-                _ if separator => {
-                    return Some(ParsedLaunchCommand {
-                        words,
-                        executable_end: offset,
-                    });
+                _ if ch.is_ascii_whitespace() => {
+                    spans.push((start.take()?, offset));
                 }
                 _ => {}
             },
         }
     }
+    if let Some(start) = start {
+        spans.push((start, command.len()));
+    }
+    let mut words = shell_words::split(command).ok()?;
+    if spans.len() != words.len() {
+        return None;
+    }
+    let mut assignments = Vec::new();
+    for ((start, end), word) in spans.iter().zip(&words) {
+        let raw = &command[*start..*end];
+        let Some((key, _)) = raw.split_once('=') else {
+            break;
+        };
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            break;
+        }
+        let (_, value) = word.split_once('=')?;
+        assignments.push((key.to_owned(), value.to_owned()));
+    }
+    let executable_end = spans.get(assignments.len())?.1;
+    words.drain(..assignments.len());
     Some(ParsedLaunchCommand {
         words,
-        executable_end: command.len(),
+        assignments,
+        executable_end,
     })
 }
 
@@ -1704,6 +1718,30 @@ mod tests {
     use super::*;
     use crate::agents::AgentGeneration;
     use crate::session::instance::test_helpers::*;
+
+    #[test]
+    fn parses_assignments_and_quoted_executable_for_resume() {
+        let command = "TOKEN='a b' PATH=/bin '/opt/my tools/omp' --verbose";
+        let parsed = parse_launch_command(command).unwrap();
+        assert_eq!(
+            parsed.assignments,
+            [
+                ("TOKEN".into(), "a b".into()),
+                ("PATH".into(), "/bin".into())
+            ]
+        );
+        assert_eq!(parsed.words, ["/opt/my tools/omp", "--verbose"]);
+        let mut resumed = command.to_string();
+        splice_subcommand_or_append(&mut resumed, "resume", Some(parsed.executable_end));
+        assert_eq!(
+            resumed,
+            "TOKEN='a b' PATH=/bin '/opt/my tools/omp' resume --verbose"
+        );
+        let quoted = parse_launch_command("'TOKEN=value' omp").unwrap();
+        assert!(quoted.assignments.is_empty());
+        assert_eq!(quoted.words[0], "TOKEN=value");
+        assert!(parse_launch_command("TOKEN=value").is_none());
+    }
     use crate::session::test_support::EnvGuard;
 
     fn host_command(inst: &mut Instance) -> String {
