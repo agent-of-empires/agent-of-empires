@@ -667,7 +667,7 @@ pub(crate) fn remove_stores_for(
     );
     let Some(agent) = crate::session::config::container_config::resolve_active_agent(
         &instance.tool,
-        Some(instance.get_tool_command()),
+        Some(&instance.get_tool_command()),
         &config.session,
     ) else {
         return Ok((Vec::new(), 0));

@@ -238,7 +238,7 @@ impl Instance {
             }
         }
         // After every reload above, which may have replaced the tool.
-        let command = self.get_tool_command().to_owned();
+        let command = self.get_tool_command().into_owned();
         // Fence native content around runtime effects, not reentrant hooks.
         let mut content_admission =
             Some(crate::migrations::v033_isolate_sandbox_content::admit_fresh_instance(self)?);
@@ -422,7 +422,7 @@ impl Instance {
     fn container_agent_identity(&self) -> Result<String> {
         container_config::container_agent_identity(
             &self.tool,
-            Some(self.get_tool_command()),
+            Some(&self.get_tool_command()),
             &self.source_profile,
         )
         .context("cannot resolve the session's agent to check its sandbox container")
@@ -575,7 +575,7 @@ impl Instance {
             sandbox,
             container_config::ContainerAgentSelection::new(
                 &self.tool,
-                Some(self.get_tool_command()),
+                Some(&self.get_tool_command()),
             )
             .with_selected_agent(selected_agent.as_deref())
             .with_credential_fold(fold),

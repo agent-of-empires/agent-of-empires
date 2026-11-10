@@ -2582,7 +2582,7 @@ pub(crate) fn instance_roots(instance: &crate::session::Instance) -> Result<Vec<
         crate::session::config::profile_config::resolve_config(&instance.effective_profile())?;
     container_config::sandbox_content_roots(
         &instance.tool,
-        Some(instance.get_tool_command()),
+        Some(&instance.get_tool_command()),
         &config.session,
         &home,
         &instance.id,
