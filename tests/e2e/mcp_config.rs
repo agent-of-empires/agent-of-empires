@@ -715,6 +715,8 @@ fn mcp_create_session_types_a_terminal_prompt_into_the_agents_pane() {
 /// Neither a terminal `create_session` prompt nor `send` is typed into a dialog: with Claude's
 /// folder-trust question on screen the create reports `blocked_waiting`, `send` is refused with
 /// `waiting`, and the agent receives no keystroke at all, so no Enter can accept the folder.
+/// Once the session is stopped, `send` is refused with `not_running` rather than restarting the
+/// agent into the same dialog.
 #[test]
 #[parallel]
 fn mcp_never_types_into_claudes_folder_trust_dialog() {
@@ -739,7 +741,7 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
     let port = h.start_daemon();
     let url = format!("http://127.0.0.1:{port}/mcp");
 
-    block_on(async {
+    let id = block_on(async {
         let create = json!({
             "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {"name": "create_session", "arguments": {
@@ -787,6 +789,7 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
         // `tmux send-keys` returns before the pane reads the bytes, so a keystroke that did go
         // out lands within this window; nothing else types into the pane afterwards.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        id
     });
     let received = std::fs::read(&typed).expect("the recorder's file");
     assert!(
@@ -794,4 +797,68 @@ fn mcp_never_types_into_claudes_folder_trust_dialog() {
         "the dialog received keystrokes: {:?}",
         String::from_utf8_lossy(&received)
     );
+
+    h.run_cli_ok(&["session", "stop", &id]);
+    let stopped = session_row(&h.read_sessions(), &id);
+    assert_eq!(stopped["status"], "stopped", "{stopped}");
+    // A restarted fake recreates this file, so its absence afterwards shows no restart.
+    std::fs::remove_file(&typed).unwrap();
+    block_on(async {
+        // `send` must see the stop itself, not a row the daemon has yet to reload.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let list = json!({
+                "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                "params": {"name": "list_sessions", "arguments": {"state": "all"}},
+            });
+            let (_, body) = rpc(&url, &[], list).await;
+            let row = find_session(&body["result"]["structuredContent"], &id);
+            if row.is_some_and(|row| row["lifecycle_generation"] == stopped["lifecycle_generation"])
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon never saw the stop: {body}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let send = json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": {"name": "send", "arguments": {"session_id": id, "message": "1"}},
+        });
+        let (status, body) = rpc_within(&url, &[], send, std::time::Duration::from_secs(30)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["result"]["structuredContent"]["code"], "not_running",
+            "{body}"
+        );
+        // A restart started by the send would have run the fake within this window.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    });
+    assert!(!typed.exists(), "send restarted the agent into the dialog");
+    let row = session_row(&h.read_sessions(), &id);
+    assert_eq!(row["status"], "stopped", "{row}");
+    assert_eq!(
+        row["lifecycle_generation"], stopped["lifecycle_generation"],
+        "{row}"
+    );
+}
+
+fn session_row(sessions: &Value, id: &str) -> Value {
+    sessions
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+        .cloned()
+        .unwrap_or_else(|| panic!("session {id} in {sessions}"))
+}
+
+/// The session object with `id` anywhere in an MCP `list_sessions` result.
+fn find_session<'a>(value: &'a Value, id: &str) -> Option<&'a Value> {
+    match value {
+        Value::Object(map) if map.get("id").and_then(Value::as_str) == Some(id) => Some(value),
+        Value::Object(map) => map.values().find_map(|v| find_session(v, id)),
+        Value::Array(items) => items.iter().find_map(|v| find_session(v, id)),
+        _ => None,
+    }
 }

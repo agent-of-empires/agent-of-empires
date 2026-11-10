@@ -326,8 +326,9 @@ impl McpServer {
                  it there. Nothing was typed.",
             ));
         }
+        // No revival: a restarted agent can open on a dialog the check above never saw.
         if let Err(e) =
-            send_terminal_message(&self.state.session_service, &id, message.clone(), true).await
+            send_terminal_message(&self.state.session_service, &id, message.clone(), false).await
         {
             return Err(terminal_refusal(&id, e.error).await);
         }
@@ -691,10 +692,13 @@ fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
         PromptSubmitError::SessionNotFound
         | PromptSubmitError::Turn(SendTurnError::SessionNotFound) => not_found(id),
         PromptSubmitError::WorkerNotReady
-        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady)
-        | PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish) => tool_error(
+        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady) => tool_error(
             "busy",
             "The session's agent is not ready yet; try again shortly",
+        ),
+        PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish) => tool_error(
+            "send_failed",
+            "The agent stopped after the prompt was recorded; read_output before resending it",
         ),
         PromptSubmitError::Turn(SendTurnError::ResumeFailed(e)) => tool_error(
             "busy",
@@ -871,7 +875,7 @@ mod tests {
     }
 
     /// A refused revive keeps the HTTP refusal's code, so a hook approval reads as one
-    /// instead of "try again"; a full queue is retryable.
+    /// instead of "try again"; a full queue is retryable, and a prompt already recorded is not.
     #[tokio::test]
     async fn refused_terminal_sends_and_full_queues_map_like_http() {
         use axum::response::IntoResponse;
@@ -912,10 +916,21 @@ mod tests {
             let result = terminal_refusal("s", error).await;
             assert_eq!(result.structured_content.unwrap()["code"], code);
         }
-        let full = prompt_refusal(
-            "s",
-            PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, "queue is full".into()),
-        );
-        assert_eq!(full.structured_content.unwrap()["code"], "busy");
+        let prompt_cases = [
+            (
+                PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, "queue is full".into()),
+                "busy",
+            ),
+            (PromptSubmitError::WorkerNotReady, "busy"),
+            // Already in the transcript, so a retry would record it twice.
+            (
+                PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish),
+                "send_failed",
+            ),
+        ];
+        for (error, code) in prompt_cases {
+            let result = prompt_refusal("s", error);
+            assert_eq!(result.structured_content.unwrap()["code"], code);
+        }
     }
 }
