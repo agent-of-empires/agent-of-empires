@@ -528,3 +528,31 @@ fn exit_retains_mode_cleanup_across_stall_and_cancels_obsolete_drawing() {
         assert!(output.lock().unwrap().completed.is_none());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn exit_retries_transient_coordinator_contention_before_restoring_modes() {
+    let (mut master, slave) = private_terminal();
+    let output = Mutex::new(State::new(slave));
+    let held = output.lock().unwrap();
+    let (contended, observed) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let cleanup = scope.spawn(|| {
+            EXIT_CONTENDED.with(|observer| *observer.borrow_mut() = Some(contended));
+            restore_after_exit_in(&output, true, None)
+        });
+        observed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cleanup must encounter the held coordinator");
+        drop(held);
+        assert!(cleanup.join().unwrap().unwrap());
+    });
+    let mut received = Vec::new();
+    read_terminal_until(&mut master, &mut received, b"\x1b[?25h");
+    assert!(received
+        .windows(b"\x1b[?1006l".len())
+        .any(|w| w == b"\x1b[?1006l"));
+    assert!(received
+        .windows(b"\x1b[?1049l".len())
+        .any(|w| w == b"\x1b[?1049l"));
+}

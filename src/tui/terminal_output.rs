@@ -416,12 +416,26 @@ fn restore_after_exit_in(
     if let Some(title) = title {
         crossterm::queue!(&mut bytes, crossterm::terminal::SetTitle(title))?;
     }
-    let mut state = match output.try_lock() {
-        Ok(state) => state,
-        Err(TryLockError::WouldBlock) => return Ok(false),
-        Err(TryLockError::Poisoned(error)) => return Err(io::Error::other(error.to_string())),
-    };
     let deadline = Instant::now() + Duration::from_millis(250);
+    let mut state = loop {
+        match output.try_lock() {
+            Ok(state) => break state,
+            Err(TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                EXIT_CONTENDED.with(|observer| {
+                    if let Some(observer) = observer.borrow_mut().take() {
+                        let _ = observer.send(());
+                    }
+                });
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(false);
+                }
+                std::thread::park_timeout(remaining.min(Duration::from_millis(1)));
+            }
+            Err(TryLockError::Poisoned(error)) => return Err(io::Error::other(error.to_string())),
+        }
+    };
     // Exit cancels obsolete drawing without acknowledging an unseen frame.
     if state.pending.take().is_some_and(|frame| frame.offset != 0) {
         state.interrupted(std::env::var_os("TMUX").is_some());
@@ -636,6 +650,7 @@ impl Output {
 #[cfg(test)]
 thread_local! {
     static TEST_OUTPUT: RefCell<Option<std::sync::Arc<Mutex<State>>>> = const { RefCell::new(None) };
+    static EXIT_CONTENDED: RefCell<Option<std::sync::mpsc::Sender<()>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]

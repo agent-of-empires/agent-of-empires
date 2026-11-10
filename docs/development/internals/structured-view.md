@@ -204,8 +204,8 @@ complete restoration.
 
 All three terminal owners restore cooked input, cancel obsolete drawing without an
 emission receipt, and queue the final mode/title transaction behind pending controls.
-A bounded 250 ms pump permits transient backpressure to clear. Permanently stalled
-output or a busy coordinator can still prevent delivery before process exit.
+Lock admission and the final control pump share a 250 ms deadline. Permanently
+stalled output or contention past that deadline can still prevent delivery before exit.
 Ratatui cursor drop never invokes a synchronous stderr diagnostic.
 A direct flush that writes no bytes retains its staged command for retry. A partial
 failed command recovers terminal framing instead of replaying its written prefix.
