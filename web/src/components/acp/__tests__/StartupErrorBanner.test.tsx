@@ -4,7 +4,7 @@ import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-libra
 
 import type { AgentInstallInfo } from "../../../lib/api";
 import type { AcpWorkerState } from "../../../lib/types";
-import { emptyAcpState } from "../../../lib/acpTypes";
+import { applyEvent, emptyAcpState } from "../../../lib/acpTypes";
 import { SessionBanners } from "../SessionBanners";
 import { StartupErrorBanner } from "../StartupErrorBanner";
 
@@ -79,6 +79,7 @@ function renderBanner({
       sessionId="s-1"
       message={message}
       acpWorkerState={acpWorkerState}
+      canRecover
       sentStopped={sentStopped}
       onSwitchToTerminal={switchable ? onSwitchToTerminal : undefined}
     />,
@@ -449,7 +450,10 @@ describe("StartupErrorBanner Retry", () => {
 
 describe("StartupErrorBanner Details", () => {
   it("starts closed and keeps opened startup details and logs through an establishing connection loss", async () => {
-    const spy = stubApi({ info: json(claude()), log: json({ exists: true, tail: "bootstrap failed before input" }) });
+    const spy = stubApi({
+      info: json(claude({ install_allowed: true })),
+      log: json({ exists: true, tail: "bootstrap failed before input" }),
+    });
     let state = { ...emptyAcpState(), startupError: SPAWN_MSG };
     const props = {
       sessionId: "s-1",
@@ -460,8 +464,15 @@ describe("StartupErrorBanner Details", () => {
       archivedAt: null,
       snoozedUntil: null,
       dismissError: vi.fn(),
+      onSwitchToTerminal: vi.fn(),
     };
-    const { getByTestId, queryByTestId, rerender } = render(<SessionBanners {...props} state={state} />);
+    const { getByTestId, queryByTestId, findByTestId, rerender } = render(<SessionBanners {...props} state={state} />);
+    const actions = [
+      await findByTestId("startup-error-banner-install"),
+      getByTestId("startup-error-banner-retry"),
+      getByTestId("startup-error-banner-terminal"),
+    ];
+    for (const action of actions) expect(action.hasAttribute("disabled")).toBe(false);
     const toggle = getByTestId("startup-error-banner-details");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
@@ -477,6 +488,10 @@ describe("StartupErrorBanner Details", () => {
     rerender(<SessionBanners {...props} state={state} />);
     expect(getByTestId("startup-error-banner-details-body")).toBe(body);
     expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
+    for (const action of actions) {
+      expect(action.hasAttribute("disabled")).toBe(true);
+      action.click();
+    }
     fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
     await waitFor(() =>
       expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input"),
@@ -486,9 +501,71 @@ describe("StartupErrorBanner Details", () => {
     expect(getByTestId("startup-error-banner-details-body")).toBe(body);
     expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
     expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input");
+    for (const action of actions) expect(action.hasAttribute("disabled")).toBe(false);
     expect(calls(spy, "/acp/worker-log")).toBe(1);
     expect(calls(spy, "/acp/spawn")).toBe(0);
     expect(calls(spy, "/acp/restart")).toBe(0);
+    expect(calls(spy, "/acp/install-agent")).toBe(0);
+    expect(props.onSwitchToTerminal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "cold retained ownership uncertainty",
+      canRestart: true,
+      unavailable: { source: "runner_record", cause: "ownership_unconfirmed", phase: "establishing" },
+    },
+    {
+      label: "cold post-establishment connection loss",
+      canRestart: true,
+      unavailable: { source: "control", cause: "read_failed", phase: "established" },
+    },
+    { label: "read-only recovery policy", canRestart: false, unavailable: null },
+  ] as const)("keeps replayed startup diagnostics read-only during $label", async ({ canRestart, unavailable }) => {
+    const spy = stubApi({
+      info: json(claude({ install_allowed: true })),
+      log: json({ exists: true, tail: "retained startup diagnostic" }),
+    });
+    const replayed = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { AgentStartupError: { message: SPAWN_MSG } },
+    });
+    const onSwitchToTerminal = vi.fn();
+    const { getByTestId, findByTestId } = render(
+      <SessionBanners
+        sessionId="s-1"
+        state={{ ...replayed, connectionUnavailable: unavailable }}
+        startingAgent={null}
+        canRestart={canRestart}
+        acpWorkerState="running"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={vi.fn()}
+        onSwitchToTerminal={onSwitchToTerminal}
+      />,
+    );
+    for (const action of [
+      await findByTestId("startup-error-banner-install"),
+      getByTestId("startup-error-banner-retry"),
+      getByTestId("startup-error-banner-terminal"),
+    ]) {
+      expect(action.hasAttribute("disabled")).toBe(true);
+      action.click();
+    }
+    fireEvent.click(getByTestId("startup-error-banner-details"));
+    const body = getByTestId("startup-error-banner-details-body");
+    expect(body.textContent).toContain(SPAWN_MSG);
+    fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
+    await waitFor(() =>
+      expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("retained startup diagnostic"),
+    );
+    expect(calls(spy, "/acp/worker-log")).toBe(1);
+    expect(calls(spy, "/acp/spawn")).toBe(0);
+    expect(calls(spy, "/acp/restart")).toBe(0);
+    expect(calls(spy, "/acp/install-agent")).toBe(0);
+    expect(onSwitchToTerminal).not.toHaveBeenCalled();
   });
 
   const cause = SPAWN_MSG.split(": ").slice(1).join(": ");

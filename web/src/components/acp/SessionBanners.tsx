@@ -64,6 +64,7 @@ export function SessionBanners({
           sessionId={sessionId}
           message={state.startupError}
           acpWorkerState={acpWorkerState}
+          canRecover={canRestart && state.connectionUnavailable === null}
           sentStopped={state.restartStoppedSent}
           onSwitchToTerminal={onSwitchToTerminal}
         />
