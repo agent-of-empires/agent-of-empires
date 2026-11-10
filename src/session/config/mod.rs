@@ -1445,10 +1445,10 @@ pub struct SessionConfig {
     )]
     pub agent_execution_as: HashMap<String, String>,
 
-    /// ACP launch command for a custom agent, enabling it to run in the
-    /// structured acp UI (e.g., "oc-superpowers" = "ocp run sp acp").
-    /// A custom agent with an entry here is acp-capable; without one it
-    /// is tmux-only.
+    /// ACP launch command for a custom agent, so it can run in the structured
+    /// view (e.g. "oc-superpowers" = "ocp run sp acp"). Without one, a custom
+    /// agent whose `agent_detect_as` base is in the ACP registry runs that
+    /// base's adapter; otherwise it is terminal-only.
     ///
     /// Note: unlike `custom_agents` (a shell command run in a tmux pane),
     /// this value is split into argv with shell-word rules and executed
@@ -1460,7 +1460,7 @@ pub struct SessionConfig {
         widget = "list",
         web = "local_only:argv launched directly to run a custom agent in acp, a host execution surface",
         category = "Agents",
-        summary = "Only for Custom Agents above; built-in Agents already work in Structured view. Paste the second command from your Agent's docs, often labelled \"ACP\". Leave empty to use Terminal view."
+        summary = "The command that runs a Custom Agent in Structured view, often labelled \"ACP\" in its docs. Without one, a Custom Agent uses its Treat as Agent's adapter when that Agent has one, and otherwise stays in Terminal view."
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
