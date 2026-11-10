@@ -55,7 +55,8 @@ export function SessionBanners({
   onRestarted?: () => void;
 }) {
   const nativeReady = nativeInputAvailable(state);
-  const startupDiagnosticOnly = nativeReady || state.connectionUnavailable !== null;
+  // A prior current input receipt changes the diagnostic, never today's control authority.
+  const startupDiagnosticOnly = nativeReady || state.sessionAssigned;
   const variant = pickWorkerStoppedVariant({
     workerStopped: state.workerStopped,
     startupError: state.startupError,
@@ -79,6 +80,7 @@ export function SessionBanners({
           sessionId={sessionId}
           message={state.startupError}
           acpWorkerState={acpWorkerState}
+          canRecover={canRestart && state.connectionUnavailable === null}
           sentStopped={state.restartStoppedSent}
           onSwitchToTerminal={onSwitchToTerminal}
         />

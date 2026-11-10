@@ -15,6 +15,8 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **session:** Accept unchanged preexisting dead panes in a complete handoff inventory, including tmux's empty dead-pane PID, while retaining strict structural IDs, socket, server, PID, and live-birth fencing.
 - **acp:** Decline idle retirement while a worker's lifecycle or activity publication is busy, without waiting on store I/O or clearing its captured lease and restart intent.
 - **session:** Capture fresh terminal input from the canonical native row before queuing, preserving the original physical owner when a completed CLI start leads the daemon cache; keep registered readiness checks before delivery.
+- **web:** Keep startup recovery details and agent logs open across connection failures, while disabling recovery actions under current Native uncertainty or read-only policy; historical input receipts never grant current input authority.
+- **tests:** Exercise terminal custody through the real HTTP mutation task and keep constructor and migration fixtures within Unix socket path bounds.
 
 ### Security
 
