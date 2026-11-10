@@ -6,8 +6,8 @@ use agent_client_protocol::v1::schema::InitializeResponse;
 use super::state::StartupErrorDetail;
 
 /// Single source of truth for the `claude-agent-acp` minimum-version floor.
-pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.99.1";
-pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.99.1";
+pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.103.0";
+pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.103.0";
 /// Single source of truth for the `opencode` minimum-version floor.
 pub const OPENCODE_MIN_VERSION: &str = "1.16.0";
 
@@ -489,8 +489,8 @@ mod tests {
             ),
             (ClaudeAgentAcp, Some(true), "999.0.0", true),
             // Advertised but pre-opt-in: the case the floor exists for.
-            (ClaudeAgentAcp, Some(true), "0.99.0", false),
-            (ClaudeAgentAcp, Some(true), "0.99.1-alpha.1", false),
+            (ClaudeAgentAcp, Some(true), "0.102.0", false),
+            (ClaudeAgentAcp, Some(true), "0.103.0-alpha.1", false),
             (ClaudeAgentAcp, Some(false), "999.0.0", false),
             (ClaudeAgentAcp, None, "999.0.0", false),
             (ClaudeAgentAcp, Some(true), "nightly", false),
