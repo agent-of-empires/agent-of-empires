@@ -4058,14 +4058,18 @@
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
+      "specs": [
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/__tests__/SessionBanners.test.tsx"
+      ],
       "components": [
         "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
         "web/src/components/acp/StartupErrorBanner.tsx",
         "web/src/components/acp/RecoveryActionRow.tsx",
         "web/src/components/acp/signInSteps.ts"
       ],
-      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI."
+      "notes": "Auth-required startup errors name the agent's own sign-in step from signInSteps.ts: Claude gets claude auth login and ANTHROPIC_API_KEY, Codex gets codex login (codex login --device-auth in a Container) and OPENAI_API_KEY, other agents get generic sign-in copy with no Claude or Codex commands. A sandboxed Session with install off runs the command inside the container and points new Sessions at the dashboard's \"Sandbox image update available\" banner, which offers Update now to pull it or shows the command to run, never at the TUI. Cold startup and replayed startup diagnostics retain open Details and logs across current Native unavailability. Retry, Install and Switch stay disabled while unavailability is current or canRestart is false; historical input receipts never grant current Native authority."
     },
     {
       "id": "acp.startup-error-banner-actions",
