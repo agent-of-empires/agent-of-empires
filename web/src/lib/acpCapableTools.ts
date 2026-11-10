@@ -17,12 +17,14 @@ export function isAcpCapable(tool: string, flag: boolean | undefined): boolean {
   return ACP_CAPABLE_TOOLS.has(tool);
 }
 
-/** Capable and allowed by `[acp] allowed_agents`. Only an explicit `false` denies, so older servers stay usable. */
+/** Capable and allowed by `[acp] allowed_agents`. Only an explicit `false` denies, so older servers stay usable.
+ *  `acp_create_ready: true` counts as capable, since a repository alias can make an agent ACP-capable. */
 export function isAcpEligible(
   tool: string,
-  agent: { acp_capable?: boolean; acp_allowed?: boolean } | undefined,
+  agent: { acp_capable?: boolean; acp_allowed?: boolean; acp_create_ready?: boolean } | undefined,
 ): boolean {
   if (agent?.acp_allowed === false) return false;
+  if (agent?.acp_create_ready === true) return true;
   return isAcpCapable(tool, agent?.acp_capable);
 }
 

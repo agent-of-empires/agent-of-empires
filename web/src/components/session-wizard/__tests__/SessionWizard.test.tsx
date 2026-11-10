@@ -14,6 +14,7 @@ import {
   fetchIsGitRepo,
   fetchProfiles,
   fetchProjects,
+  fetchRecentProjects,
   fetchSettings,
   fetchVolumeIgnoresPreview,
   type SettingsResponse,
@@ -478,6 +479,50 @@ describe("SessionWizard rows", () => {
     // Terminal view is what an agent without Structured view gets.
     const terminal = screen.getByRole("radio", { name: "Terminal view" });
     expect(terminal.getAttribute("aria-checked")).toBe(String(disabled));
+  });
+
+  it("asks for the selected project's readiness, which counts its repository hooks", async () => {
+    // Only an answer for the project counts the repository hook that installs the adapter.
+    vi.mocked(fetchProfileAgents).mockImplementation(async (_profile, project) => [
+      agent("claude", { acp_installed: false, acp_create_ready: project?.path === "/tmp/proj" }),
+    ]);
+    renderWizard();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(fetchProfileAgents).toHaveBeenCalledWith("default", { path: "/tmp/proj", scratch: false });
+    expect(payload()).toMatchObject({ view: "structured" });
+    expect(screen.getByTestId("wizard-view-row").textContent).not.toMatch(/ACP adapter not installed/);
+  });
+
+  it("keeps Structured view selectable while the new project's readiness is pending", async () => {
+    vi.mocked(fetchRecentProjects).mockResolvedValueOnce({
+      projects: [
+        { path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" },
+        { path: "/tmp/other", display_name: "other", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" },
+      ],
+    });
+    let answerOther!: (agents: AgentInfo[]) => void;
+    vi.mocked(fetchProfileAgents).mockImplementation((_profile, project) =>
+      project?.path === "/tmp/other" ? new Promise((resolve) => (answerOther = resolve)) : Promise.resolve(noAdapter),
+    );
+    renderWizard();
+    await waitFor(() => expect(viewSwitch().disabled).toBe(true));
+    fireEvent.click(screen.getByTestId("wizard-project-row"));
+    fireEvent.click((await screen.findByText("/tmp/other")).closest("button")!);
+    // /tmp/proj's answer isn't /tmp/other's, before the fetch starts and while it is held.
+    expect(fetchProfileAgents).not.toHaveBeenCalledWith("default", { path: "/tmp/other", scratch: false });
+    expect(viewSwitch().disabled).toBe(false);
+    await waitFor(() =>
+      expect(fetchProfileAgents).toHaveBeenCalledWith("default", { path: "/tmp/other", scratch: false }),
+    );
+    expect(viewSwitch().disabled).toBe(false);
+    await act(async () => answerOther(noAdapter));
+    expect(viewSwitch().disabled).toBe(true);
+  });
+
+  it("asks a scratch create's readiness without a project path", async () => {
+    renderWizard({ scratch: true, tool: "claude" });
+    await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalledWith("default", { path: "", scratch: true }));
   });
 
   it("creates a terminal session when the adapter is missing", async () => {

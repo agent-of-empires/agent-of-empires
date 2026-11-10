@@ -1995,11 +1995,19 @@ export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null>
   return Array.isArray(agents) ? agents : null;
 }
 
-/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes. */
-export async function fetchProfileAgents(profile?: string): Promise<AgentInfo[] | "profile_not_found" | null> {
-  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes.
+ *  With a `project`, `acp_create_ready` also counts that project's repository config and hooks. */
+export async function fetchProfileAgents(
+  profile?: string,
+  project?: { path: string; scratch: boolean },
+): Promise<AgentInfo[] | "profile_not_found" | null> {
+  const params = new URLSearchParams();
+  if (profile) params.set("profile", profile);
+  if (project?.scratch) params.set("scratch", "true");
+  else if (project?.path) params.set("path", project.path);
+  const query = params.toString();
   try {
-    const res = await fetch(`/api/agents${query}`);
+    const res = await fetch(`/api/agents${query ? `?${query}` : ""}`);
     if (res.ok) return (await res.json()) as AgentInfo[];
     if (res.status !== 404) return null;
     const body = (await res.json().catch(() => null)) as { error?: unknown } | null;

@@ -12,6 +12,7 @@ function makeState(data: Partial<WizardData> = {}): WizardState {
     agents: [],
     agentsStatus: "ready",
     agentsFor: null,
+    agentsProject: null,
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -399,25 +400,27 @@ describe("SEED_PROJECT_OVERRIDES sandbox", () => {
   });
 });
 
-describe("agent list per profile", () => {
-  const claude = { name: "claude" } as WizardState["agents"][number];
+describe("agent list per profile and project", () => {
+  const claude = { name: "claude", acp_create_ready: false } as WizardState["agents"][number];
   const failed = (agentsFor: string, missing = false): Action => ({ type: "AGENTS_FAILED", agentsFor, missing });
-  // Each row starts from a list loaded for alpha.
+  // Each row starts from a list loaded for alpha in /p. `ready` is the agent's acp_create_ready.
   it.each([
-    ["alpha's list reads as itself for alpha", [], "alpha", "ready", 1],
-    ["alpha's list is still loading for beta", [], "beta", "loading", 0],
-    ["a failed load for beta drops alpha's list", [failed("beta")], "beta", "failed", 0],
-    ["a missing beta drops alpha's list", [failed("beta", true)], "beta", "missing", 0],
-    ["a failed retry for alpha keeps alpha's list", [failed("alpha")], "alpha", "failed", 1],
-    ["a missing alpha keeps alpha's list", [failed("alpha", true)], "alpha", "missing", 1],
-  ] as const)("%s", (_label, actions, profile, status, count) => {
+    ["alpha's list reads as itself for alpha", [], "alpha", "/p", "ready", 1, false],
+    ["alpha's list is still loading for beta", [], "beta", "/p", "loading", 0, undefined],
+    ["a failed load for beta drops alpha's list", [failed("beta")], "beta", "/p", "failed", 0, undefined],
+    ["a missing beta drops alpha's list", [failed("beta", true)], "beta", "/p", "missing", 0, undefined],
+    ["a failed refetch for alpha keeps alpha's list", [failed("alpha")], "alpha", "/q", "ready", 1, undefined],
+    ["a missing alpha keeps alpha's list", [failed("alpha", true)], "alpha", "/p", "missing", 1, false],
+    ["another project keeps the agents but not their readiness", [], "alpha", "/q", "ready", 1, undefined],
+  ] as const)("%s", (_label, actions, profile, project, status, count, ready) => {
     const loaded = reducer(
       { ...makeState(), agentsStatus: "loading" },
-      { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha" },
+      { type: "SET_AGENTS", agents: [claude], agentsFor: "alpha", agentsProject: "/p" },
     );
-    const view = agentsView(actions.reduce<WizardState>(reducer, loaded), profile);
+    const view = agentsView(actions.reduce<WizardState>(reducer, loaded), profile, project);
     expect(view.agentsStatus).toBe(status);
     expect(view.agents).toHaveLength(count);
+    expect(view.agents[0]?.acp_create_ready).toBe(ready);
   });
 });
 

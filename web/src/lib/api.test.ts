@@ -1064,6 +1064,17 @@ describe("fetchProfileAgents", () => {
     expect(lastCall().url).toBe("/api/agents?profile=work");
   });
 
+  it.each([
+    ["a project", "work", { path: "/r/a b", scratch: false }, "/api/agents?profile=work&path=%2Fr%2Fa+b"],
+    ["scratch, which drops the path", "work", { path: "/r/a", scratch: true }, "/api/agents?profile=work&scratch=true"],
+    ["no project", "work", { path: "", scratch: false }, "/api/agents?profile=work"],
+    ["neither", undefined, undefined, "/api/agents"],
+  ] as const)("sends %s", async (_name, profile, project, url) => {
+    fetchSpy.mockResolvedValueOnce(json([]));
+    await api.fetchProfileAgents(profile, project);
+    expect(lastCall().url).toBe(url);
+  });
+
   it("is null for fetchAgents when the profile is unknown", async () => {
     fetchSpy.mockResolvedValueOnce(json({ error: "profile_not_found" }, 404));
     expect(await api.fetchAgents("work")).toBeNull();

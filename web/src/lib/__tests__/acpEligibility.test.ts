@@ -3,7 +3,11 @@ import { acpAdapterMissing, isAcpCapable, isAcpEligible, structuredAvailable } f
 
 describe("isAcpEligible", () => {
   it("denies only on an explicit acp_allowed: false", () => {
-    const cases: [string, { acp_capable?: boolean; acp_allowed?: boolean } | undefined, boolean][] = [
+    const cases: [
+      string,
+      { acp_capable?: boolean; acp_allowed?: boolean; acp_create_ready?: boolean } | undefined,
+      boolean,
+    ][] = [
       ["claude", { acp_capable: true, acp_allowed: true }, true],
       ["claude", { acp_capable: true, acp_allowed: false }, false],
       ["claude", { acp_capable: false, acp_allowed: true }, false],
@@ -16,6 +20,10 @@ describe("isAcpEligible", () => {
       ["some-unknown-tool", undefined, false],
       ["claude", { acp_allowed: false }, false],
       ["claude", { acp_allowed: true }, true],
+      // A repository alias can make a Terminal-only agent create-ready.
+      ["aider", { acp_capable: false, acp_create_ready: true }, true],
+      ["aider", { acp_capable: false, acp_create_ready: true, acp_allowed: false }, false],
+      ["aider", { acp_capable: false, acp_create_ready: false }, false],
     ];
     for (const [tool, agent, expected] of cases) {
       expect(isAcpEligible(tool, agent), `${tool} ${JSON.stringify(agent)}`).toBe(expected);
@@ -47,7 +55,8 @@ describe("acpAdapterMissing", () => {
   it("leaves Structured view available unless the adapter is missing", () => {
     expect(structuredAvailable("claude", { acp_create_ready: false }, host)).toBe(false);
     expect(structuredAvailable("claude", { acp_create_ready: true }, host)).toBe(true);
-    expect(structuredAvailable("aider", { acp_capable: false, acp_create_ready: true }, host)).toBe(false);
+    expect(structuredAvailable("aider", { acp_capable: false, acp_create_ready: true }, host)).toBe(true);
+    expect(structuredAvailable("aider", { acp_capable: false }, host)).toBe(false);
     expect(structuredAvailable("claude", { acp_allowed: false, acp_create_ready: true }, host)).toBe(false);
     expect(structuredAvailable("claude", { acp_create_ready: false }, { ...host, sandboxEnabled: true })).toBe(true);
     expect(

@@ -127,6 +127,9 @@ const PANEL_TITLE: Record<Panel, string> = {
 
 // Hook output appears only for creates slow enough to notice.
 const PROGRESS_DELAY_MS = 800;
+const PROJECT_FETCH_DELAY_MS = 300;
+/** The agent-list project key of a scratch create; NUL can't occur in a path. */
+const SCRATCH_PROJECT = "\0scratch";
 const PROGRESS_POLL_MS = 700;
 // Retries after a dropped connection; the idempotency key makes them join the running create.
 const NETWORK_RETRIES = 3;
@@ -216,6 +219,7 @@ export function SessionWizard({
     agents: [],
     agentsStatus: "loading",
     agentsFor: null,
+    agentsProject: null,
     groups: [],
     groupsFor: null,
     profiles: [],
@@ -319,21 +323,32 @@ export function SessionWizard({
     };
   }, [state.data.profile, groupsKey]);
 
-  // A custom agent's base comes from the profile the session is created in. Like Groups, a list
-  // is read only for the profile it was fetched for, so a switch never shows the last one as ready.
+  // A list is read only for the profile it was fetched for, and its `acp_create_ready` only for
+  // the live project; until the debounced fetch answers, Structured view stays available.
   const agentsProfile = state.data.profile || servedProfile;
   const agentsKey = agentsProfile ?? "";
-  const { agents, agentsStatus } = useMemo(() => agentsView(state, agentsKey), [state, agentsKey]);
+  const projectKey = state.data.scratch ? SCRATCH_PROJECT : state.data.path;
+  const [fetchProjectKey, setFetchProjectKey] = useState(projectKey);
+  useEffect(() => {
+    const delay = setTimeout(() => setFetchProjectKey(projectKey), PROJECT_FETCH_DELAY_MS);
+    return () => clearTimeout(delay);
+  }, [projectKey]);
+  const { agents, agentsStatus } = useMemo(
+    () => agentsView(state, agentsKey, projectKey),
+    [state, agentsKey, projectKey],
+  );
   useEffect(() => {
     let alive = true;
     let retry: ReturnType<typeof setTimeout> | undefined;
+    const scratch = fetchProjectKey === SCRATCH_PROJECT;
+    const project = { path: scratch ? "" : fetchProjectKey, scratch };
     const load = (attempt: number) =>
-      void fetchProfileAgents(agentsProfile || undefined).then((list) => {
+      void fetchProfileAgents(agentsProfile || undefined, project).then((list) => {
         if (!alive) return;
         if (Array.isArray(list)) {
-          // The app-wide names describe the served profile, not the one being created in.
+          // The app-wide names describe the served profile; the project doesn't change them.
           if (agentsProfile === servedProfile) setAgentNames(list);
-          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey });
+          return dispatch({ type: "SET_AGENTS", agents: list, agentsFor: agentsKey, agentsProject: fetchProjectKey });
         }
         const missing = list === "profile_not_found";
         dispatch({ type: "AGENTS_FAILED", agentsFor: agentsKey, missing });
@@ -344,7 +359,7 @@ export function SessionWizard({
       alive = false;
       clearTimeout(retry);
     };
-  }, [agentsProfile, agentsKey, servedProfile]);
+  }, [agentsProfile, agentsKey, servedProfile, fetchProjectKey]);
 
   useEffect(() => {
     const generations = defaultsGeneration;
@@ -845,7 +860,7 @@ export function SessionWizard({
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);
-  // `agents` is the list loaded for the selected Profile, whose hooks `acp_create_ready` counts.
+  // `agents` is the list loaded for the selected Profile and project, whose hooks `acp_create_ready` counts.
   const adapterMissing = acpCapable && acpAdapterMissing(selectedAgent, d);
   const structuredOn = acpCapable && !adapterMissing && d.useStructuredView;
   const isHostOnly = selectedAgent?.host_only ?? false;
