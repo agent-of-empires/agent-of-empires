@@ -17,10 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, publish_with_next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap,
-    SharedSet, StartupFailure, Supervisor, SupervisorError, WorkerKind, Workers,
-    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, publish_with_next_seq, BroadcastSink, Launcher, PendingContextReset,
+    ResumeReservation, SeqMap, SharedSet, StartupFailure, Supervisor, SupervisorError, WorkerKind,
+    Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
