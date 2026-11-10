@@ -186,6 +186,13 @@ Published source updates are reconciled before prepared copy results. Replacemen
 cancels stale preparation while retaining the last readable window. Clipboard
 admission holds the publication read guard through ticket submission, so a source
 already published by the worker cannot be overtaken by an old prepared export.
+Both copy producers finalize a private export as an unlinked read-only file before
+submission, so helpers cannot write through inherited stdin. Desktop helpers receive
+the complete export. OSC 52 skips exports larger than 1 MiB (1,048,576 raw bytes),
+before emitting either direct or tmux-wrapped framing. Smaller exports retain both
+transports; feedback distinguishes full desktop output, skipped OSC and failed OSC.
+Encoding bounds every read and rejects a changed payload instead of completing a
+truncated sequence.
 
 
 App, standalone ACP attach and remote-home frames use the same terminal

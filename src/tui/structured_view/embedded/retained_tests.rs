@@ -797,7 +797,9 @@ async fn dropping_retained_view_keeps_original_helper_owned_before_newer_live_co
         Ok(crate::tui::clipboard::CopyReport {
             bytes: file.metadata()?.len(),
             desktop: Some("test helper"),
-            osc52_emitted: false,
+            osc52: crate::tui::clipboard::Osc52Outcome::Failed(
+                std::io::ErrorKind::Unsupported.into(),
+            ),
         })
     })
     .unwrap();
@@ -889,7 +891,9 @@ async fn source_replacement_cancels_already_prepared_copy_before_clipboard_admis
         Ok(crate::tui::clipboard::CopyReport {
             bytes: file.metadata()?.len(),
             desktop: Some("controlled helper"),
-            osc52_emitted: false,
+            osc52: crate::tui::clipboard::Osc52Outcome::Failed(
+                std::io::ErrorKind::Unsupported.into(),
+            ),
         })
     })
     .unwrap();

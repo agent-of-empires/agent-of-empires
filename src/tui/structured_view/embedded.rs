@@ -295,16 +295,7 @@ impl RetainedView {
                     {
                         return true;
                     }
-                    self.copy_message = Some(if let Some(desktop) = report.desktop {
-                        format!("Copied {} bytes via {desktop}.", report.bytes)
-                    } else if report.osc52_emitted {
-                        format!(
-                            "Emitted {} bytes via OSC 52; terminal clipboard support required.",
-                            report.bytes
-                        )
-                    } else {
-                        "No clipboard output was accepted.".into()
-                    });
+                    self.copy_message = Some(report.message());
                     changed = true;
                 }
                 Ok(Err(error)) => {

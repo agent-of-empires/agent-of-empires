@@ -201,34 +201,64 @@ impl Ticket {
 
 use base64::{engine::general_purpose::STANDARD, write::EncoderWriter};
 
+const OSC52_MAX_BYTES: u64 = 1024 * 1024;
+
+#[derive(Debug)]
+pub(crate) enum Osc52Outcome {
+    Emitted,
+    SkippedForSize,
+    Failed(io::Error),
+}
+
 #[derive(Debug)]
 pub(crate) struct CopyReport {
     pub bytes: u64,
     pub desktop: Option<&'static str>,
-    pub osc52_emitted: bool,
+    pub osc52: Osc52Outcome,
 }
 
 impl CopyReport {
-    fn message(&self) -> String {
-        if let Some(desktop) = self.desktop {
+    pub(crate) fn message(&self) -> String {
+        let mut message = if let Some(desktop) = self.desktop {
             format!("Copied {} bytes via {desktop}.", self.bytes)
-        } else if self.osc52_emitted {
+        } else if matches!(self.osc52, Osc52Outcome::Emitted) {
             format!(
                 "Emitted {} bytes via OSC 52; terminal clipboard support required.",
                 self.bytes
             )
         } else {
-            "No clipboard output was accepted.".into()
+            "No clipboard output completed.".into()
+        };
+        match &self.osc52 {
+            Osc52Outcome::Emitted => {}
+            Osc52Outcome::SkippedForSize => {
+                use std::fmt::Write;
+                let _ = write!(
+                    message,
+                    " OSC 52 skipped: payload exceeds {OSC52_MAX_BYTES} bytes."
+                );
+            }
+            Osc52Outcome::Failed(error) => {
+                use std::fmt::Write;
+                let _ = write!(message, " OSC 52 failed: {error}.");
+            }
         }
+        message
     }
+}
+
+pub(crate) fn finalize_export(file: tempfile::NamedTempFile) -> io::Result<File> {
+    let input = File::open(file.path())?;
+    file.close()?;
+    Ok(input)
 }
 
 pub fn copy_to_clipboard(text: &str) -> String {
     let result = (|| {
         let ticket = reserve()?;
-        let mut file = tempfile::tempfile()?;
+        let mut file = tempfile::NamedTempFile::new()?;
         file.write_all(text.as_bytes())?;
-        let receiver = ticket.submit(file, Duration::from_millis(500))?;
+        let receiver = ticket.submit(finalize_export(file)?, Duration::from_millis(500))?;
         let shared = ticket
             .shared
             .upgrade()
@@ -255,18 +285,36 @@ pub fn copy_to_clipboard(text: &str) -> String {
 fn copy_file_with_timeout(mut file: File, timeout: std::time::Duration) -> io::Result<CopyReport> {
     let bytes = file.metadata()?.len();
     let desktop = try_subprocess(&mut file, timeout);
-    file.rewind()?;
-    let tmux = std::env::var_os("TMUX").is_some();
-    let osc52 =
-        super::terminal_output::osc52(timeout, tmux, |output| write_osc52(&mut file, output, tmux));
-    tracing::info!(target: "tui.clipboard", bytes, desktop = ?desktop, osc52_ok = osc52.is_ok(), "clipboard output");
-    if let (Err(desktop), Err(osc52)) = (&desktop, &osc52) {
-        return Err(io::Error::other(format!("{desktop}; OSC 52: {osc52}")));
+    let osc52 = if bytes > OSC52_MAX_BYTES {
+        Osc52Outcome::SkippedForSize
+    } else {
+        let tmux = std::env::var_os("TMUX").is_some();
+        match super::terminal_output::osc52(timeout, tmux, |output| {
+            write_osc52(&mut file, output, tmux, bytes)
+        }) {
+            Ok(()) => Osc52Outcome::Emitted,
+            Err(error) => Osc52Outcome::Failed(error),
+        }
+    };
+    tracing::info!(target: "tui.clipboard", bytes, desktop = ?desktop, osc52 = ?osc52, "clipboard output");
+    if let Err(desktop) = &desktop {
+        match &osc52 {
+            Osc52Outcome::Emitted => {}
+            Osc52Outcome::SkippedForSize => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{desktop}; OSC 52 skipped: payload exceeds {OSC52_MAX_BYTES} bytes"),
+                ));
+            }
+            Osc52Outcome::Failed(error) => {
+                return Err(io::Error::other(format!("{desktop}; OSC 52: {error}")));
+            }
+        }
     }
     Ok(CopyReport {
         bytes,
         desktop: desktop.ok(),
-        osc52_emitted: osc52.is_ok(),
+        osc52,
     })
 }
 
@@ -316,25 +364,46 @@ fn write_osc52(
     input: &mut (impl Read + Seek),
     output: &mut (impl Write + ?Sized),
     in_tmux: bool,
+    bytes: u64,
 ) -> io::Result<()> {
+    if bytes > OSC52_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "OSC 52 payload exceeds the byte limit",
+        ));
+    }
     if in_tmux {
         input.rewind()?;
-        sequence(input, output, b"\x1bPtmux;\x1b\x1b]52;c;", b"\x07\x1b\\")?;
+        sequence(
+            input,
+            output,
+            bytes,
+            b"\x1bPtmux;\x1b\x1b]52;c;",
+            b"\x07\x1b\\",
+        )?;
     }
     input.rewind()?;
-    sequence(input, output, b"\x1b]52;c;", b"\x07")?;
+    sequence(input, output, bytes, b"\x1b]52;c;", b"\x07")?;
     output.flush()
 }
 fn sequence(
     input: &mut impl Read,
     output: &mut (impl Write + ?Sized),
+    bytes: u64,
     prefix: &[u8],
     suffix: &[u8],
 ) -> io::Result<()> {
     output.write_all(prefix)?;
     let result: io::Result<()> = (|| {
         let mut encoded = EncoderWriter::new(&mut *output, &STANDARD);
-        io::copy(input, &mut encoded)?;
+        let count = io::copy(&mut (&mut *input).take(bytes), &mut encoded)?;
+        let mut extra = [0];
+        if count != bytes || input.read(&mut extra)? != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "clipboard payload changed during OSC 52 output",
+            ));
+        }
         encoded.finish()?;
         Ok(())
     })();
@@ -348,20 +417,112 @@ mod tests {
     use base64::Engine;
 
     #[test]
-    fn osc52_preserves_large_utf8_in_plain_and_tmux_sequences() {
-        let text = "é界👩‍👩‍👧‍👧".repeat(65_537);
-        let encoded = STANDARD.encode(text.as_bytes());
-        for in_tmux in [false, true] {
-            let mut output = Vec::new();
-            write_osc52(&mut io::Cursor::new(text.as_bytes()), &mut output, in_tmux).unwrap();
-            let plain = format!("\x1b]52;c;{encoded}\x07");
-            let expected = if in_tmux {
-                format!("\x1bPtmux;\x1b\x1b]52;c;{encoded}\x07\x1b\\{plain}")
-            } else {
-                plain
-            };
-            assert_eq!(output, expected.as_bytes());
+    fn osc52_respects_raw_byte_limit_in_plain_and_tmux_sequences() {
+        for bytes in [OSC52_MAX_BYTES - 1, OSC52_MAX_BYTES, OSC52_MAX_BYTES + 1] {
+            let mut text = "界".repeat(bytes as usize / 3);
+            for _ in 0..bytes % 3 {
+                text.push('a');
+            }
+            for in_tmux in [false, true] {
+                let mut output = Vec::new();
+                let result = write_osc52(
+                    &mut io::Cursor::new(text.as_bytes()),
+                    &mut output,
+                    in_tmux,
+                    bytes,
+                );
+                if bytes > OSC52_MAX_BYTES {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+                    assert!(output.is_empty());
+                    continue;
+                }
+                result.unwrap();
+                let encoded = STANDARD.encode(text.as_bytes());
+                let plain = format!("\x1b]52;c;{encoded}\x07");
+                let expected = if in_tmux {
+                    format!("\x1bPtmux;\x1b\x1b]52;c;{encoded}\x07\x1b\\{plain}")
+                } else {
+                    plain
+                };
+                assert_eq!(output, expected.as_bytes());
+            }
         }
+    }
+
+    #[test]
+    fn osc52_rejects_changed_payload_without_completing_the_sequence() {
+        for text in [b"ab".as_slice(), b"abcd"] {
+            for in_tmux in [false, true] {
+                let mut output = Vec::new();
+                let error =
+                    write_osc52(&mut io::Cursor::new(text), &mut output, in_tmux, 3).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(!output.ends_with(b"\x07"));
+                assert!(!output.ends_with(b"\x07\x1b\\"));
+                assert!(output.len() <= b"\x1bPtmux;\x1b\x1b]52;c;".len() + 4);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn oversized_export_reaches_desktop_read_only_without_any_osc_output() {
+        use crate::tui::terminal_output::{install_test_output, tests::private_terminal};
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let _path = crate::session::test_support::EnvGuard::set(&[("PATH", bin.clone())]);
+        for (command, _) in crate::process::clipboard_commands() {
+            let path = bin.join(command);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\n/bin/cat > \"$0.copied\"\nif printf mutation >&0; then exit 91; fi\nexit 0\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut payload = vec![b'x'; OSC52_MAX_BYTES as usize + 1];
+        payload.extend_from_slice(b"\nDESKTOP-FULL-TAIL\0");
+        let (mut master, slave) = private_terminal();
+        let (_output_guard, _) = install_test_output(slave);
+        for tmux in [false, true] {
+            let _tmux = if tmux {
+                crate::session::test_support::EnvGuard::set(&[(
+                    "TMUX",
+                    std::path::PathBuf::from("private-test"),
+                )])
+            } else {
+                crate::session::test_support::EnvGuard::unset(&["TMUX"])
+            };
+            let mut export = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+            export.write_all(&payload).unwrap();
+            let mut input = finalize_export(export).unwrap();
+            assert!(input.write_all(b"must not mutate").is_err());
+            let report = copy_file_with_timeout(input, Duration::from_secs(2)).unwrap();
+            assert!(matches!(report.osc52, Osc52Outcome::SkippedForSize));
+            assert_eq!(report.bytes, payload.len() as u64);
+            let helper = report.desktop.expect("full desktop copy completed");
+            assert_eq!(
+                std::fs::read(bin.join(format!("{helper}.copied"))).unwrap(),
+                payload
+            );
+            let mut byte = [0];
+            assert_eq!(
+                master.read(&mut byte).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        for (command, _) in crate::process::clipboard_commands() {
+            std::fs::remove_file(bin.join(command)).unwrap();
+        }
+        let mut export = tempfile::NamedTempFile::new_in(root.path()).unwrap();
+        export.write_all(&payload).unwrap();
+        let error =
+            copy_file_with_timeout(finalize_export(export).unwrap(), Duration::from_secs(2))
+                .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -382,7 +543,7 @@ mod tests {
             Ok(CopyReport {
                 bytes: file.metadata()?.len(),
                 desktop: Some("controlled writer"),
-                osc52_emitted: false,
+                osc52: Osc52Outcome::Failed(io::ErrorKind::Unsupported.into()),
             })
         })
         .unwrap();

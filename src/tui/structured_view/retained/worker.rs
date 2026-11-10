@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, Seek},
+    io,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -306,9 +306,11 @@ fn run(
                                     "retained history changed before copy",
                                 ));
                             }
-                            let mut file = tempfile::tempfile()?;
+                            let mut file = tempfile::NamedTempFile::new()?;
                             match copy.range {
-                                CopyRange::All => window::copy_all(&document, &mut file, current)?,
+                                CopyRange::All => {
+                                    window::copy_all(&document, file.as_file_mut(), current)?
+                                }
                                 CopyRange::Selection { width, selection } => {
                                     let position = cached_index(
                                         &mut indexes,
@@ -317,9 +319,12 @@ fn run(
                                         width,
                                         current,
                                     )?;
-                                    if !indexes[position]
-                                        .copy_selection(&document, selection, &mut file, current)?
-                                    {
+                                    if !indexes[position].copy_selection(
+                                        &document,
+                                        selection,
+                                        file.as_file_mut(),
+                                        current,
+                                    )? {
                                         return Err(io::Error::new(
                                             io::ErrorKind::InvalidInput,
                                             "selection contains no text",
@@ -340,8 +345,7 @@ fn run(
                                     "retained history changed during copy",
                                 ));
                             }
-                            file.rewind()?;
-                            Ok(file)
+                            crate::tui::clipboard::finalize_export(file)
                         })();
                         let _ = copy.reply.send(result);
                         if matches!(flow, Flow::Reload) {

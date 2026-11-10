@@ -4747,7 +4747,9 @@ mod tests {
             Ok(crate::tui::clipboard::CopyReport {
                 bytes: file.metadata()?.len(),
                 desktop: Some("controlled helper"),
-                osc52_emitted: false,
+                osc52: crate::tui::clipboard::Osc52Outcome::Failed(
+                    std::io::ErrorKind::Unsupported.into(),
+                ),
             })
         })
         .unwrap();
