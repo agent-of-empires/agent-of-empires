@@ -4,6 +4,8 @@ import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-libra
 
 import type { AgentInstallInfo } from "../../../lib/api";
 import type { AcpWorkerState } from "../../../lib/types";
+import { emptyAcpState, nativeInputAvailable } from "../../../lib/acpTypes";
+import { SessionBanners } from "../SessionBanners";
 import { StartupErrorBanner } from "../StartupErrorBanner";
 
 const writeClipboard = vi.fn();
@@ -446,9 +448,20 @@ describe("StartupErrorBanner Retry", () => {
 });
 
 describe("StartupErrorBanner Details", () => {
-  it("starts closed, then holds the raw error and the agent log", async () => {
-    stubApi({ info: json(claude()) });
-    const { getByTestId, queryByTestId } = renderBanner();
+  it("starts closed and keeps opened startup details and logs through an establishing connection loss", async () => {
+    const spy = stubApi({ info: json(claude()), log: json({ exists: true, tail: "bootstrap failed before input" }) });
+    let state = { ...emptyAcpState(), startupError: SPAWN_MSG };
+    const props = {
+      sessionId: "s-1",
+      startingAgent: null,
+      canRestart: true,
+      acpWorkerState: "absent" as const,
+      trashedAt: null,
+      archivedAt: null,
+      snoozedUntil: null,
+      dismissError: vi.fn(),
+    };
+    const { getByTestId, queryByTestId, rerender } = render(<SessionBanners {...props} state={state} />);
     const toggle = getByTestId("startup-error-banner-details");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
@@ -457,6 +470,29 @@ describe("StartupErrorBanner Details", () => {
     const body = getByTestId("startup-error-banner-details-body");
     expect(body.textContent).toContain(SPAWN_MSG);
     expect(within(body).getByTestId("acp-agent-log-toggle")).toBeTruthy();
+    expect(state.sessionAssigned).toBe(false);
+    expect(nativeInputAvailable(state)).toBe(false);
+    state = {
+      ...state,
+      connectionUnavailable: { source: "control", cause: "read_failed", phase: "establishing" },
+    };
+    rerender(<SessionBanners {...props} state={state} />);
+    expect(getByTestId("startup-error-banner-details-body")).toBe(body);
+    expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
+    expect(state.sessionAssigned).toBe(false);
+    expect(nativeInputAvailable(state)).toBe(false);
+    fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
+    await waitFor(() => expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input"));
+    state = { ...state, connectionUnavailable: null };
+    rerender(<SessionBanners {...props} state={state} />);
+    expect(getByTestId("startup-error-banner-details-body")).toBe(body);
+    expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
+    expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input");
+    expect(state.sessionAssigned).toBe(false);
+    expect(nativeInputAvailable(state)).toBe(false);
+    expect(calls(spy, "/acp/worker-log")).toBe(1);
+    expect(calls(spy, "/acp/spawn")).toBe(0);
+    expect(calls(spy, "/acp/restart")).toBe(0);
   });
 
   const cause = SPAWN_MSG.split(": ").slice(1).join(": ");
