@@ -18,8 +18,8 @@ use super::launch::{
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
     lock_recover, with_publication_seq, BroadcastSink, Launcher, PendingContextReset,
-    ResumeReservation, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
-    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    ResumeReservation, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind,
+    Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::event_sender::{AcpEventData, EventScope, SdkEvent};
