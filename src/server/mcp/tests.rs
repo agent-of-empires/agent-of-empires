@@ -818,7 +818,7 @@ async fn a_keyed_retry_returns_the_first_session_and_delivers_nothing() {
 }
 
 /// Text pages stop at the last event that fits whole, so following `next_since` reads every
-/// event once; one event that alone is too big comes back truncated, and the cursor moves on.
+/// event once; one event that alone is too big comes back whole on its own page.
 #[tokio::test]
 #[serial_test::serial]
 async fn read_output_pages_text_by_rendered_size_without_skipping() {
@@ -869,7 +869,9 @@ async fn read_output_pages_text_by_rendered_size_without_skipping() {
         &[user_prompt(&"y".repeat(60_000)), user_prompt("after")],
     );
     let first = call(&app, "read_output", json!({"session_id": huge})).await;
-    assert_eq!(first["truncated"], true, "{}", first["next_since"]);
+    let whole = first["text"].as_str().unwrap();
+    assert!(whole.contains(&"y".repeat(60_000)), "{} bytes", whole.len());
+    assert!(!whole.contains("after"), "the next event shares the oversized page");
     assert_eq!(first["next_since"], 1);
     assert_eq!(first["has_more"], true);
     let next = call(&app, "read_output", json!({"session_id": huge, "since": 1})).await;

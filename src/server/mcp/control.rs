@@ -93,8 +93,8 @@ enum PromptDelivery {
     BlockedWaiting,
     /// The terminal agent did not reach its input prompt in time, so nothing was typed.
     NotReady,
-    /// The create was a retry of an earlier one with the same `idempotency_key`; the first
-    /// create handled the prompt, so nothing was done again.
+    /// The create was a retry of an earlier one with the same `idempotency_key`, so the prompt
+    /// was not attempted by this call; the first create's outcome is unknown here.
     Replayed,
     /// Typing it failed; see `prompt_error`.
     Failed,
@@ -171,10 +171,6 @@ pub(super) struct Output {
     next_since: Option<u64>,
     /// Structured view: more events follow `next_since` already.
     has_more: bool,
-    /// Structured view text: one event alone rendered past the page limit, so `text` holds only
-    /// its tail; `next_since` still moves past it.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    truncated: bool,
 }
 
 #[rmcp::tool_router(router = control_router, vis = "pub(super)")]
@@ -244,6 +240,15 @@ impl McpServer {
                          typed. `send` the prompt once it is ready.",
                         PROMPT_READY_TIMEOUT.as_secs()
                     )),
+                ),
+                PaneReadiness::NoPromptRule => (
+                    false,
+                    PromptDelivery::NotReady,
+                    Some(
+                        "This agent has no status rules that show its input prompt, so nothing \
+                         was typed. `send` the prompt instead."
+                            .to_string(),
+                    ),
                 ),
                 PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None),
                 // A session that just failed to start is not restarted behind the caller's back.
@@ -344,8 +349,10 @@ impl McpServer {
 
     #[rmcp::tool(
         description = "Read a session's output. A structured session returns its transcript \
-            since an event seq as text (up to 48 KB, ending at a whole event), or the raw \
-            events, with `next_since` to read on from without skipping anything. A terminal session returns a capture of its pane."
+            since an event seq as text, or the raw events, with `next_since` to read on from \
+            without skipping anything. A text page holds whole events up to 48 KB; one event \
+            larger than that comes back whole as the only event on its page. A terminal session \
+            returns a capture of its pane."
     )]
     async fn read_output(
         &self,
@@ -381,7 +388,6 @@ impl McpServer {
                     events: Some(events),
                     next_since: Some(page.last_scanned_seq.unwrap_or(since)),
                     has_more: page.has_more,
-                    truncated: false,
                 }));
             }
             let text_page = text_page(&page.events, since);
@@ -396,7 +402,6 @@ impl McpServer {
                 events: None,
                 next_since: Some(next_since),
                 has_more: page.has_more || text_page.cut,
-                truncated: text_page.truncated,
             }));
         }
         let lines = params.lines.unwrap_or(DEFAULT_LINES).clamp(1, 2000) as usize;
@@ -418,7 +423,6 @@ impl McpServer {
             events: None,
             next_since: None,
             has_more: false,
-            truncated: false,
         }))
     }
 }
@@ -505,13 +509,15 @@ async fn success_body(
 /// What a terminal agent's pane shows, read with the rules the status poller uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PaneReadiness {
-    /// An idle rule matched the agent's own input prompt.
+    /// A prompt-box rule matched the agent's own input prompt.
     AtPrompt,
     /// A rule matched a dialog or question waiting for a person.
     Waiting,
-    /// Neither yet: still starting, working, or nothing recognizable (an unmatched screen reads
-    /// as Idle by default, which is not evidence of the input prompt).
+    /// Neither yet: still starting, working, idle by a rule that does not see the prompt box, or
+    /// the pane could not be captured.
     NotYet,
+    /// The agent has no detection manifest, so nothing can show it is at its prompt.
+    NoPromptRule,
     /// The session is gone, stopped or failed.
     Gone,
 }
@@ -551,8 +557,7 @@ async fn wait_for_input_prompt(
 }
 
 /// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
-/// show` reads it. Agents without a manifest have no prompt rule to trust, so they never read as
-/// at their prompt.
+/// show` reads it.
 fn pane_readiness(instance: &Instance) -> PaneReadiness {
     let Ok(session) = instance.tmux_session() else {
         return PaneReadiness::Gone;
@@ -560,10 +565,17 @@ fn pane_readiness(instance: &Instance) -> PaneReadiness {
     if !session.exists() || session.is_pane_dead() {
         return PaneReadiness::Gone;
     }
-    match instance.detect_pane_now(&instance.source_profile, &session, None) {
+    readiness_of(instance.detect_pane_now(&instance.source_profile, &session, None))
+}
+
+/// Only a rule that sees the prompt box counts as at the prompt: other idle rules (a finished
+/// turn, an interrupt banner, the pane title) also hold while a dialog is on screen.
+fn readiness_of(detected: Option<(Option<Status>, &str)>) -> PaneReadiness {
+    match detected {
+        None => PaneReadiness::NoPromptRule,
         Some((Some(Status::Waiting), _)) => PaneReadiness::Waiting,
-        Some((Some(Status::Idle), rule)) if rule != "no_rule" => PaneReadiness::AtPrompt,
-        _ => PaneReadiness::NotYet,
+        Some((Some(Status::Idle), "ready_prompt" | "live_prompt_box")) => PaneReadiness::AtPrompt,
+        Some(_) => PaneReadiness::NotYet,
     }
 }
 
@@ -572,34 +584,29 @@ fn log_terminal_message_sent(id: &str, message: &str) {
     tracing::info!(target: "session.lifecycle", session = %id, len = message.len(), via = "mcp", "terminal message sent");
 }
 
-/// One `read_output` text page: the longest run of events, from `since`, whose rendering fits
-/// in [`TEXT_PAGE_BYTES`].
+/// One `read_output` text page: the longest run of whole events, from `since`, whose rendering
+/// fits in [`TEXT_PAGE_BYTES`], or the first event alone when it does not fit.
 struct TextPage {
     text: String,
     /// The last event rendered, when the page stops short of the events read.
     last_seq: Option<u64>,
     /// Fewer events were rendered than were read.
     cut: bool,
-    /// The first event alone rendered past the limit, so its text was cut to the tail.
-    truncated: bool,
 }
 
 fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage {
-    use crate::session::conversation_summary::extract_transcript_delta;
-    let render = |n: usize| extract_transcript_delta(&events[..n], since).0;
+    use crate::session::conversation_summary::render_transcript_delta;
+    let render = |n: usize| render_transcript_delta(&events[..n], since).0;
     let whole = render(events.len());
     if whole.len() <= TEXT_PAGE_BYTES {
         return TextPage {
             text: whole,
             last_seq: None,
             cut: false,
-            truncated: false,
         };
     }
     // The rendering only grows with the prefix, so the longest prefix that fits is found by
-    // bisection; at least one event is always returned so the cursor moves. A render over the cap
-    // comes back as its tail behind a "truncated" marker, which keeps it longer than the cap, so
-    // a truncated render never counts as fitting.
+    // bisection. At least one event is always returned, whole, so the cursor moves.
     let (mut fits, mut over) = (0usize, events.len());
     while over - fits > 1 {
         let mid = fits + (over - fits) / 2;
@@ -609,12 +616,11 @@ fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage
             over = mid;
         }
     }
-    let (n, truncated) = if fits == 0 { (1, true) } else { (fits, false) };
+    let n = fits.max(1);
     TextPage {
         text: render(n),
         last_seq: Some(events[n - 1].0),
         cut: n < events.len(),
-        truncated,
     }
 }
 
@@ -775,6 +781,26 @@ fn not_found(id: &str) -> CallToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_prompt_box_rule_reads_as_at_the_prompt() {
+        use PaneReadiness::*;
+        let cases = [
+            (None, NoPromptRule),
+            (Some((Some(Status::Waiting), "trust_dialog")), Waiting),
+            (Some((Some(Status::Idle), "ready_prompt")), AtPrompt),
+            (Some((Some(Status::Idle), "live_prompt_box")), AtPrompt),
+            (Some((Some(Status::Idle), "osc_title_idle")), NotYet),
+            (Some((Some(Status::Idle), "completed_turn")), NotYet),
+            (Some((Some(Status::Idle), "interrupt_banner")), NotYet),
+            (Some((Some(Status::Idle), "no_rule")), NotYet),
+            (Some((Some(Status::Running), "spinner")), NotYet),
+            (Some((None, "capture_failed")), NotYet),
+        ];
+        for (detected, want) in cases {
+            assert_eq!(readiness_of(detected), want, "{detected:?}");
+        }
+    }
 
     /// The codes a caller acts on pass through, the rest are named by status, and a
     /// plain-text body becomes the message.

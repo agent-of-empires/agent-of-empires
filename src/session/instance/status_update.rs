@@ -439,7 +439,8 @@ impl Instance {
     /// callers outside the poller (`aoe session show`, MCP). `None` when the agent has no
     /// manifest. `reuse` is a capture the caller already took and how many lines it holds; it is
     /// used when it covers the manifest's scope. Returns the detected status (`None` for an
-    /// agent-owned viewer) and the rule that decided it.
+    /// agent-owned viewer, or for a failed capture with nothing to reuse) and the rule that
+    /// decided it.
     pub(crate) fn detect_pane_now(
         &self,
         profile: &str,
@@ -458,7 +459,7 @@ impl Instance {
         let content = match (fresh.as_deref(), reuse) {
             (Some(fresh), _) => fresh,
             (None, Some((reused, _))) => reused,
-            (None, None) => "",
+            (None, None) => return Some((None, "capture_failed")),
         };
         let hook =
             crate::hooks::read_hook_status(&self.id).map(|status| tmux::detect::HookObservation {
