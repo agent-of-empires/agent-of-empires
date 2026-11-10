@@ -7765,6 +7765,8 @@ pub(super) mod terminal_custody {
     #[tokio::test]
     #[serial_test::serial]
     async fn admitted_http_send_never_retargets_a_replacement_runtime() -> anyhow::Result<()> {
+        use tower::ServiceExt;
+
         if !crate::tmux::test_helpers::tmux_available() {
             return Ok(());
         }
@@ -7811,30 +7813,38 @@ pub(super) mod terminal_custody {
             );
             let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-            let (status, original) = response_json(
-                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
-                    .await
-                    .into_response(),
-            )
-            .await?;
+            let app = crate::server::test_support::build_router_for_test(state.clone());
+            let request = |operation: &str, json: Option<serde_json::Value>| {
+                let builder = axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/sessions/{}/{operation}", row.id))
+                    .header("host", "127.0.0.1")
+                    .extension(axum::extract::ConnectInfo(
+                        crate::server::peer::ConnectionPeer::UnixOwner {
+                            uid: nix::unistd::geteuid().as_raw(),
+                        },
+                    ));
+                let (builder, body) = match json {
+                    Some(value) => (
+                        builder.header("content-type", "application/json"),
+                        axum::body::Body::from(value.to_string()),
+                    ),
+                    None => (builder, axum::body::Body::empty()),
+                };
+                builder.body(body).unwrap()
+            };
+            let (status, original) =
+                response_json(app.clone().oneshot(request("ensure", None)).await?).await?;
             assert_eq!(status, StatusCode::OK, "{original}");
             assert_eq!(original["status"], "alive");
             assert!(!original["physical"].is_null(), "{original}");
             let mut gate = Gate::install(&row.id, Boundary::SendAdmitted);
-            let old_state = state.clone();
-            let id = row.id.clone();
-            let old = tokio::spawn(async move {
-                send_message(
-                    State(old_state),
-                    Path(id),
-                    Ok(Json(SendMessageRequest {
-                        message: "OLD".into(),
-                        revive,
-                    })),
-                )
-                .await
-                .into_response()
-            });
+            let old_app = app.clone();
+            let old_request = request(
+                "send",
+                Some(serde_json::json!({"message": "OLD", "revive": revive})),
+            );
+            let old = tokio::spawn(async move { old_app.oneshot(old_request).await.unwrap() });
             gate.entered().await;
             let replacement_received = root.path().join("replacement-received");
             let replacement = replace_runtime(&state, &row.id, &replacement_received).await?;
@@ -7854,12 +7864,8 @@ pub(super) mod terminal_custody {
                 (original_pid, &original_birth),
                 "the replacement must have its own acknowledged final-process birth"
             );
-            let (status, target) = response_json(
-                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
-                    .await
-                    .into_response(),
-            )
-            .await?;
+            let (status, target) =
+                response_json(app.clone().oneshot(request("ensure", None)).await?).await?;
             assert_eq!(status, StatusCode::OK, "{target}");
             assert_ne!(target["physical"], original["physical"]);
             gate.release();
@@ -7886,12 +7892,7 @@ pub(super) mod terminal_custody {
             std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
             let (unknown_status, unknown_body) = {
                 let _path = crate::session::test_support::path_prepended(&probe_bin);
-                response_json(
-                    ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
-                        .await
-                        .into_response(),
-                )
-                .await?
+                response_json(app.clone().oneshot(request("ensure", None)).await?).await?
             };
             assert!(
                 probe_seen.exists(),
@@ -7911,16 +7912,12 @@ pub(super) mod terminal_custody {
                 &replacement_birth
             )?);
             let (fresh_status, fresh_body) = response_json(
-                send_message(
-                    State(state.clone()),
-                    Path(row.id.clone()),
-                    Ok(Json(SendMessageRequest {
-                        message: "FRESH".into(),
-                        revive,
-                    })),
-                )
-                .await
-                .into_response(),
+                app.clone()
+                    .oneshot(request(
+                        "send",
+                        Some(serde_json::json!({"message": "FRESH", "revive": revive})),
+                    ))
+                    .await?,
             )
             .await?;
             assert_eq!(fresh_status, StatusCode::OK, "{fresh_body}");
@@ -7951,12 +7948,8 @@ pub(super) mod terminal_custody {
                 replacement_pid,
                 &replacement_birth
             )?);
-            let (after_status, after) = response_json(
-                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
-                    .await
-                    .into_response(),
-            )
-            .await?;
+            let (after_status, after) =
+                response_json(app.clone().oneshot(request("ensure", None)).await?).await?;
             assert_eq!(after_status, StatusCode::OK, "{after}");
             assert_eq!(after["physical"], target["physical"]);
             assert_eq!(
