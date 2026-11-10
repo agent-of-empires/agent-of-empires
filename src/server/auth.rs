@@ -143,6 +143,8 @@ fn is_machine_endpoint(path: &str) -> bool {
 fn is_login_session_exempt(path: &str) -> bool {
     path == "/"
         || path == "/login"
+        // Page shell only: /api/setup stays session-gated, and
+        // patch_setup checks read_only and CityHall itself.
         || path == "/setup"
         || path.starts_with("/session/")
         || path.starts_with("/plugins/")
