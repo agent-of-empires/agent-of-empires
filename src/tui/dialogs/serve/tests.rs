@@ -1882,19 +1882,13 @@ async fn foreign_log_errno_does_not_invalidate_saved_port_on_launch_failure() {
     assert_eq!(std::fs::read_to_string(&port).unwrap(), "55555");
 
     let mut jobs = ServeJobs::default();
-    for reopened in [false, true] {
-        let mut view = if reopened {
-            ServeView::for_launch(
-                DashboardLaunch::Failed {
-                    target: target.clone(),
-                    failure: failure.clone(),
-                },
-                &mut jobs,
-            )
+    for (failure, reopened_target) in [(failure.clone(), None), (failure, Some(target))] {
+        let mut view = if let Some(target) = reopened_target {
+            ServeView::for_launch(DashboardLaunch::Failed { target, failure }, &mut jobs)
         } else {
             let mut view = ServeView::with_state(starting(), jobs.submitter());
             view.launch_in_flight = true;
-            view.finish_launch(Err(failure.clone()), None);
+            view.finish_launch(Err(failure), None);
             view
         };
         tokio::time::timeout(Duration::from_secs(10), async {
