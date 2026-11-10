@@ -4196,7 +4196,15 @@ mod tests {
         let (fresh, published) = p.sup.idle_observation(id).unwrap();
         assert_eq!(fresh, lease);
         assert_eq!(published, activity + 1);
-        assert_eq!(p.store.replay_from(id, 0).last().unwrap().0, published);
+        assert_eq!(
+            p.store
+                .replay_from(id, 0)
+                .expect("durable replay")
+                .last()
+                .unwrap()
+                .seq,
+            published
+        );
         assert!(matches!(
             p.sup
                 .shutdown_idle(id, (&observed, admissions), activity, stamp)
