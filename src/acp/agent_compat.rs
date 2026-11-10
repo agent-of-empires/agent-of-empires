@@ -157,7 +157,7 @@ impl StartupErrorDetail {
                 install_command,
                 ..
             } => format!(
-                "{package_name} {installed} installed; aoe requires >={required}. Run: {install_command}",
+                "{package_name} {installed} installed; aoe requires >={required}. Run: {install_command}, or `aoe acp doctor --fix`",
             ),
             Self::MissingAgentInfo {
                 expected_package,
@@ -454,12 +454,14 @@ mod tests {
             assert_eq!(got.as_ref().map(|e| e.kind()), want, "{agent:?} {info:?}");
         }
 
-        let Err(StartupError::IncompatibleAgentVersion {
+        let too_old = validate(ClaudeAgentAcp, &init(Some((CLAUDE, "0.0.0")))).unwrap_err();
+        assert!(too_old.user_message().contains("`aoe acp doctor --fix`"));
+        let StartupError::IncompatibleAgentVersion {
             installed,
             required,
             auto_install,
             ..
-        }) = validate(ClaudeAgentAcp, &init(Some((CLAUDE, "0.0.0"))))
+        } = too_old
         else {
             panic!("expected an incompatible version");
         };
