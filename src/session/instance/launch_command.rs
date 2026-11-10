@@ -806,6 +806,8 @@ impl Instance {
     pub fn get_tool_command(&self) -> &str {
         if self.command.is_empty() {
             crate::agents::get_agent(&self.tool)
+                .or_else(|| crate::plugin::bundled_agents::definitions()
+                    .find(|agent| agent.name == self.tool))
                 .map(|a| a.binary)
                 .unwrap_or("bash")
         } else {
@@ -834,6 +836,8 @@ impl Instance {
     fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
             crate::agents::get_agent(&self.tool)
+                .or_else(|| crate::plugin::bundled_agents::definitions()
+                    .find(|agent| agent.name == self.tool))
                 .map(|a| a.launch_base_command())
                 .unwrap_or_else(|| "bash".to_string())
         } else {

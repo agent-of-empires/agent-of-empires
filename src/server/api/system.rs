@@ -259,6 +259,7 @@ pub async fn list_agents(
         let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::available())
             .map(|a| {
                 let (acp_command, acp_args) =
                     acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());

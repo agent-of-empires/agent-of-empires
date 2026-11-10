@@ -3394,7 +3394,7 @@ pub struct AvailableTools {
 impl AvailableTools {
     /// Startup's local snapshot. Login shells and executable probes run later.
     pub(crate) fn detect_on_path() -> Self {
-        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        let refs: Vec<_> = crate::agents::AGENTS.iter().chain(crate::plugin::bundled_agents::available()).collect();
         let session = crate::session::config::Config::load()
             .ok()
             .map(load_session);
@@ -3408,8 +3408,7 @@ impl AvailableTools {
     }
 
     pub fn detect() -> Self {
-        let agents = crate::agents::AGENTS;
-        let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
+        let refs: Vec<_> = crate::agents::AGENTS.iter().chain(crate::plugin::bundled_agents::available()).collect();
         let found = probe_agents_available(&refs);
         let session = crate::session::config::Config::load()
             .ok()
@@ -3421,7 +3420,7 @@ impl AvailableTools {
         session: &crate::session::config::SessionConfig,
     ) -> Self {
         session.warn_custom_agent_issues();
-        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        let refs: Vec<_> = crate::agents::AGENTS.iter().chain(crate::plugin::bundled_agents::available()).collect();
         let found = probe_agents_available(&refs);
         Self::from_detected(found, true, None, false, Some(session))
     }
@@ -3430,7 +3429,7 @@ impl AvailableTools {
         cancel: &tokio_util::sync::CancellationToken,
         force: bool,
     ) -> Self {
-        let refs: Vec<_> = crate::agents::AGENTS.iter().collect();
+        let refs: Vec<_> = crate::agents::AGENTS.iter().chain(crate::plugin::bundled_agents::available()).collect();
         let found = probe_agents_available_inner(&refs, Some(cancel), force);
         let session = crate::session::config::Config::load()
             .ok()
@@ -3448,6 +3447,7 @@ impl AvailableTools {
         let agents = crate::agents::AGENTS;
         let mut available: Vec<String> = agents
             .iter()
+            .chain(crate::plugin::bundled_agents::available())
             .filter(|agent| found.contains(agent.name))
             .map(|agent| agent.name.to_string())
             .collect();

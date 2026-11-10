@@ -1882,7 +1882,8 @@ impl Instance {
         let parsed = super::launch_command::parse_launch_command(command)
             .context(ManagedResumeCause::UnsupportedManagedArguments)?;
         let program = parsed.words.first().context("empty agent command")?;
-        let direct = AGENTS.iter().find(|agent| agent.binary == program);
+        let direct = AGENTS.iter().chain(crate::plugin::bundled_agents::available())
+            .find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
             .get(tool)
@@ -1905,8 +1906,7 @@ impl Instance {
                 .file_name()
                 .and_then(|name| name.to_str());
             anyhow::ensure!(
-                !AGENTS
-                    .iter()
+                !AGENTS.iter().chain(crate::plugin::bundled_agents::available())
                     .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
                 "wrapper command names a different native agent"
             );
