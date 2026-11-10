@@ -3369,6 +3369,77 @@ mod tests {
         crate::process::worker_registry::delete(id).ok();
     }
 
+    /// The drain cuts a batch while the worker is still starting. When the worker that becomes
+    /// ready runs another agent, the batch is withheld and both rows stay queued; the next pass
+    /// cuts them for the agent that runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_batch_cut_before_readiness_is_recut_for_the_agent_that_starts() {
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        // `bridge` resets with `/new`, so `[/clear, after]` is one batch for it.
+        declare_custom_reset("/new");
+        let id = "starts-as-claude";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "bridge",
+        )])
+        .session_service
+        .clone();
+        for (n, text) in ["/clear", "after"].iter().enumerate() {
+            service
+                .enqueue_prompt(
+                    id,
+                    format!("q{n}"),
+                    text.to_string(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let starting = service.acp_supervisor.test_hold_starting(id);
+        let mut waits = service.acp_supervisor.watch_worker_waits();
+        let drain = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.drain_queued_prompts_once(id).await }
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .expect("the drain waits for the starting worker")
+                .unwrap(),
+            id
+        );
+        // The worker that becomes ready runs Claude.
+        let _live = save_agent_record(id, "claude", true);
+        let recorded = service
+            .acp_supervisor
+            .test_land_worker_cmd_recording(id, &starting)
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("the drain finishes once the worker is ready")
+            .unwrap();
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(recorded.lock().unwrap().is_empty());
+        let queued = |service: Arc<SessionService>| async move {
+            service
+                .queued_prompts_snapshot(id)
+                .await
+                .into_iter()
+                .map(|row| row.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(queued(Arc::clone(&service)).await, ["/clear", "after"]);
+
+        service.drain_queued_prompts_once(id).await;
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
+        assert_eq!(queued(Arc::clone(&service)).await, ["after"]);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
     /// A batch cut for one agent is withheld from a worker a resume started as another, so the
     /// drain leaves its rows queued and cuts them again for the agent that now runs.
     #[tokio::test]

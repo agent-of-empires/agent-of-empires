@@ -58,6 +58,35 @@ impl<S: BroadcastSink> Supervisor<S> {
             .expect("install");
     }
 
+    /// Land a command-recording worker on a start `test_hold_starting` left open, as a resume
+    /// does once its worker is ready, waking anyone waiting for it.
+    pub(crate) async fn test_land_worker_cmd_recording(
+        &self,
+        session_id: &str,
+        lease: &Lease,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let (client, _tx, cmds) =
+            AcpClient::fake_for_test_cmd_recording(AcpSessionId(format!("acp-{session_id}")));
+        let mut workers = self.workers.lock().await;
+        lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
+        self.test_finish_starting(lease);
+        workers.insert(
+            session_id.to_string(),
+            WorkerHandle {
+                client: Arc::new(client),
+                native_session_id: None,
+                drain_task: tokio::spawn(async {}),
+                restart_history: vec![],
+                kind: WorkerKind::Stdio,
+                launch_epoch: lease.epoch(),
+                lease: lease.clone(),
+            },
+        );
+        drop(workers);
+        self.worker_notify.notify_waiters();
+        cmds
+    }
+
     /// End a teardown `test_hold_stopping` left open.
     pub(crate) fn test_settle_stopping(&self, lease: &Lease) {
         lock_recover(&self.lifecycle).settle(lease, Settlement::Proven);
