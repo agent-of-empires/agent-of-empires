@@ -143,6 +143,7 @@ pub fn registry() -> Arc<PluginRegistry> {
     if let Some(reg) = REGISTRY.read_safe().as_ref() {
         return reg.clone();
     }
+    let _reload = REGISTRY_RELOAD.lock().unwrap_or_else(|error| error.into_inner());
     let mut slot = REGISTRY.write_safe();
     if let Some(reg) = slot.as_ref() {
         return reg.clone();

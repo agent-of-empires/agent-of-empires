@@ -431,8 +431,37 @@ const VIBE_NAMESPACE_ENVIRONMENT: &[&str] = &[
     "VIBE_SESSION_LOGGING__SESSION_PREFIX",
 ];
 
+pub(super) enum NativeAgent {
+    Builtin(&'static AgentDef<'static>),
+    Declared(crate::plugin::agent_integration::DeclaredAgent),
+}
+
+impl NativeAgent {
+    pub(super) fn builtin(&self) -> Option<&'static AgentDef<'static>> {
+        match self {
+            Self::Builtin(agent) => Some(*agent),
+            Self::Declared(_) => None,
+        }
+    }
+
+    pub(super) fn capture_backend(&self) -> Option<crate::agents::SessionCaptureBackend> {
+        match self {
+            Self::Builtin(agent) => agent.session_support
+                .and_then(|support| support.capture)
+                .map(|capture| capture.backend),
+            Self::Declared(agent) => agent.contribution().launch.as_ref()
+                .and_then(|launch| launch.capture.as_ref())
+                .and_then(|capture| match capture.backend {
+                    aoe_plugin_api::agent_integration::AgentCaptureBackend::Omp =>
+                        Some(crate::agents::SessionCaptureBackend::Omp),
+                    _ => None,
+                }),
+        }
+    }
+}
+
 pub(super) struct NativeExecution {
-    pub(super) agent: &'static AgentDef,
+    pub(super) agent: NativeAgent,
     pub(super) binding: ExecutionBinding,
     pub(super) routing: Vec<(String, Option<String>)>,
     pub(super) case_insensitive_routing: &'static [&'static str],
@@ -593,13 +622,13 @@ impl NativeExecution {
 }
 pub(super) struct AgentLaunchContext<'a> {
     generation: std::cell::OnceCell<crate::agents::AgentGeneration>,
-    agent: Option<&'a crate::agents::AgentDef>,
+    agent: Option<&'a crate::agents::AgentDef<'a>>,
     pub(super) host_command: Option<&'a std::process::Command>,
 }
 
 impl<'a> AgentLaunchContext<'a> {
     pub(super) fn host(
-        agent: Option<&'a crate::agents::AgentDef>,
+        agent: Option<&'a crate::agents::AgentDef<'a>>,
         host_command: Option<&'a std::process::Command>,
     ) -> Self {
         Self {
@@ -1920,8 +1949,39 @@ impl Instance {
             &self.effective_profile(),
             std::path::Path::new(&self.project_path),
         )?;
-        let agent =
-            Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;
+        if crate::agents::get_agent(&self.tool).is_none()
+            && !config.session.agent_command_override.get(&self.tool)
+                .is_some_and(|command| !command.trim().is_empty())
+        {
+            if let Some(declared) = crate::plugin::agent_integration::declared_agent(
+                crate::plugin::registry(),
+                &self.tool,
+                config.session.custom_agents.iter()
+                    .filter(|(_, command)| !command.trim().is_empty())
+                    .map(|(name, _)| name.as_str()),
+            ).filter(|agent| agent.contribution().command.as_deref() == Some(self.get_tool_command())) {
+                let identity = NativeAgent::Declared(declared.clone());
+                return declared.with_definition(|agent| {
+                    anyhow::ensure!(
+                        !Self::contains_active_shell_syntax(self.get_tool_command())
+                            && self.launch_invokes_resolved_agent_directly(agent),
+                        "managed conversation requires the declared direct executable"
+                    );
+                    self.resolve_native_execution_for(target, &config, agent, identity)
+                }).context("invalid agent declaration")?;
+            }
+        }
+        let agent = Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;
+        self.resolve_native_execution_for(target, &config, agent, NativeAgent::Builtin(agent))
+    }
+
+    fn resolve_native_execution_for(
+        &self,
+        target: Option<(&str, Option<&ConversationBinding>, bool)>,
+        config: &crate::session::config::Config,
+        agent: &AgentDef<'_>,
+        identity: NativeAgent,
+    ) -> Result<NativeExecution> {
         let session_dir = self.managed_user_argv(agent)?;
         let direct_capture = self.launch_invokes_resolved_agent_directly(agent);
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
@@ -1987,7 +2047,9 @@ impl Instance {
         let mut pi_transcript_path = None;
         let mut namespace_arguments = Vec::new();
         let mut store_override = None;
-        let mut roots = match agent.name {
+        let omp_backend = agent.session_support.and_then(|support| support.capture)
+            .is_some_and(|capture| capture.backend == crate::agents::SessionCaptureBackend::Omp);
+        let mut roots = if omp_backend { Vec::new() } else { match agent.name {
             "claude" => {
                 let recorded_execution = (inputs.container.is_none())
                     .then(|| {
@@ -2329,8 +2391,8 @@ impl Instance {
                 vec![base.join(".gemini")]
             }
             _ => bail!("the effective {} conversation namespace is not attested; managed resume and fork are refused", agent.name),
-        };
-        if agent.name != "omp" {
+        }};
+        if !omp_backend {
             for (key, path) in [
                 ("HOME", home),
                 ("XDG_CONFIG_HOME", config_home),
@@ -2349,7 +2411,7 @@ impl Instance {
             routing.push(("XDG_STATE_HOME".into(), value("XDG_STATE_HOME")));
         }
         let path = value("PATH");
-        let omp = if agent.name == "omp" {
+        let omp = if omp_backend {
             let args = if self.command.is_empty() {
                 crate::session::config::quote_model_value_in_args(&self.extra_args)
             } else {
@@ -2567,7 +2629,7 @@ impl Instance {
             && config.session.opencode_preassign_session_id
             && direct_capture;
         let mut execution = NativeExecution {
-            agent,
+            agent: identity,
             binding: ExecutionBinding {
                 agent: agent.name.into(),
                 stores,
@@ -2579,7 +2641,13 @@ impl Instance {
             },
             routing,
             case_insensitive_routing,
-            omp: omp.filter(|_| direct_capture),
+            omp: omp.filter(|_| {
+                direct_capture && agent.session_support.and_then(|support| support.capture)
+                    .is_some_and(|capture| {
+                        let context = if self.is_sandboxed() { capture.sandbox } else { capture.host };
+                        context == crate::agents::SessionCaptureContext::PaneScoped
+                    })
+            }),
             inputs,
             program,
             capture,
@@ -2771,7 +2839,7 @@ impl Instance {
     pub(crate) fn attested_carry_destination(&self) -> Result<ExecutionBinding> {
         let native = self.resolve_native_execution(None)?;
         anyhow::ensure!(
-            native.agent.name == "claude" && native.binding.filesystem == "host",
+            native.binding.agent == "claude" && native.binding.filesystem == "host",
             "conversation carry requires a host Claude launch destination"
         );
         Ok(native.binding)
@@ -2963,7 +3031,9 @@ pub(super) fn validate_managed_arguments(
             }
             if key == "--session-dir" {
                 anyhow::ensure!(
-                    matches!(agent.name, "pi" | "omp" | "prime-agent"),
+                    matches!(agent.name, "pi" | "omp" | "prime-agent")
+                        || agent.session_support.and_then(|support| support.capture)
+                            .is_some_and(|capture| capture.backend == crate::agents::SessionCaptureBackend::Omp),
                     "this agent does not support a managed session directory"
                 );
                 session_dir = Some(value.to_owned());
@@ -3068,7 +3138,7 @@ impl Instance {
             .context("native executable path is not UTF-8")?
             .to_owned();
         // A shared service may have opened a different database.
-        if execution.is_some_and(|execution| execution.agent.name == "opencode") {
+        if execution.is_some_and(|execution| execution.binding.agent == "opencode") {
             match launch_context.generation() {
                 crate::agents::AgentGeneration::Current => words.push("--standalone".into()),
                 crate::agents::AgentGeneration::Legacy => {},
@@ -3559,7 +3629,7 @@ mod tests {
         let store = inputs.physical_location(&native.join("opencode.db"));
         let cwd = inputs.physical_location(&inputs.cwd);
         let mut execution = NativeExecution {
-            agent: crate::agents::get_agent("opencode").unwrap(),
+            agent: NativeAgent::Builtin(crate::agents::get_agent("opencode").unwrap()),
             binding: ExecutionBinding {
                 agent: "opencode".into(),
                 stores: vec![store.path],
@@ -3831,7 +3901,7 @@ mod tests {
                 instance.command.clone(),
                 Some(&execution),
                 None,
-                &AgentLaunchContext::host(Some(execution.agent), None),
+                &AgentLaunchContext::host(execution.agent.builtin(), None),
             )
             .unwrap();
         let parsed = super::super::launch_command::parse_launch_command(&frozen).unwrap();
@@ -3861,6 +3931,55 @@ mod tests {
         assert!(instance.managed_user_argv(agent).is_ok());
         instance.command = "'TOKEN=value' omp".into();
         assert!(!instance.launch_invokes_resolved_agent_directly(agent));
+    }
+
+    #[test]
+    fn declared_omp_backend_uses_generic_tool_and_resume_flag() {
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(r#"
+id = "acme.capture"
+name = "Capture"
+version = "1.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "example-helper"
+command = "TOKEN=local example-helper --verbose"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+"#).unwrap();
+        let registry = std::sync::Arc::new(crate::plugin::PluginRegistry::from_test_plugins(vec![
+            crate::plugin::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: crate::plugin::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            },
+        ]));
+        let declared = crate::plugin::agent_integration::declared_agent(
+            registry, "example-helper", std::iter::empty(),
+        ).unwrap();
+        let mut instance = Instance::new("example", "/tmp");
+        instance.tool = "example-helper".into();
+        instance.command = "TOKEN=local example-helper --verbose".into();
+        declared.with_definition(|agent| {
+            assert!(instance.launch_invokes_resolved_agent_directly(agent));
+            assert!(instance.managed_user_argv(agent).is_ok());
+            assert_eq!(
+                super::super::launch_command::build_resume_flags(Some(agent), "abc123", true),
+                "--continue abc123"
+            );
+            let capture = agent.session_support.unwrap().capture.unwrap();
+            assert_eq!(capture.backend, crate::agents::SessionCaptureBackend::Omp);
+            assert_eq!(capture.sandbox, crate::agents::SessionCaptureContext::Unsupported);
+        }).unwrap();
     }
 
     #[test]

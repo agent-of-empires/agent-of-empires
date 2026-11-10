@@ -31,20 +31,20 @@ impl std::fmt::Display for HookStatus {
     }
 }
 
-pub enum DetectionMethod {
-    Which(&'static str),
-    RunWithArg(&'static str, &'static str),
+pub enum DetectionMethod<'a> {
+    Which(&'a str),
+    RunWithArg(&'a str, &'a str),
 }
 
-pub enum YoloMode {
-    CliFlag(&'static str),
-    EnvVar(&'static str, &'static str),
+pub enum YoloMode<'a> {
+    CliFlag(&'a str),
+    EnvVar(&'a str, &'a str),
     AlwaysYolo,
     /// Two generations, one contract: an agent spanning the rename declares
     /// both and `resolve` picks the one the installed build understands.
     EitherGeneration {
-        legacy: &'static YoloMode,
-        current: &'static YoloMode,
+        legacy: &'a YoloMode<'a>,
+        current: &'a YoloMode<'a>,
     },
 }
 
@@ -60,12 +60,12 @@ pub enum AgentGeneration {
     Unknown,
 }
 
-impl YoloMode {
+impl<'a> YoloMode<'a> {
     /// The mechanism the installed build understands. A mode that spans two
     /// generations resolves to the matching arm; any other mode is itself.
     /// `None` means the generation is unknown, so neither arm can be claimed
     /// and the caller has to refuse rather than pick one for the user.
-    pub fn resolve(&self, generation: AgentGeneration) -> Option<&YoloMode> {
+    pub fn resolve(&self, generation: AgentGeneration) -> Option<&YoloMode<'a>> {
         match self {
             YoloMode::EitherGeneration { legacy, current } => match generation {
                 AgentGeneration::Legacy => Some(legacy),
@@ -98,13 +98,13 @@ pub fn is_always_yolo(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeStrategy {
-    Flag(&'static str),
+pub enum ResumeStrategy<'a> {
+    Flag(&'a str),
     FlagPair {
-        existing: &'static str,
-        new_session: &'static str,
+        existing: &'a str,
+        new_session: &'a str,
     },
-    Subcommand(&'static str),
+    Subcommand(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,8 +179,8 @@ impl SessionCaptureSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionSupport {
-    pub resume: ResumeStrategy,
+pub struct SessionSupport<'a> {
+    pub resume: ResumeStrategy<'a>,
     pub capture: Option<SessionCaptureSpec>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,34 +377,35 @@ pub enum SidecarFormat {
     KimiToml,
 }
 
-pub struct AgentDef {
-    pub name: &'static str,
-    pub binary: &'static str,
+pub struct AgentDef<'a> {
+    pub name: &'a str,
+    pub binary: &'a str,
     /// Must not be combined with `ResumeStrategy::Subcommand`, which inserts after the binary.
-    pub launch_subcommand: Option<&'static str>,
-    pub aliases: &'static [&'static str],
-    pub detection: DetectionMethod,
-    pub yolo: Option<YoloMode>,
+    pub launch_subcommand: Option<&'a str>,
+    pub aliases: &'a [&'a str],
+    pub detection: DetectionMethod<'a>,
+    pub yolo: Option<YoloMode<'a>>,
     /// Set when this agent's `yolo` and `fork_strategy` each declare a legacy
     /// and a current arm, so a launch resolves both against the installed
     /// binary. Declaring it once keeps the two from disagreeing.
     pub spans_agent_generations: bool,
-    pub instruction_flag: Option<&'static str>,
+    pub instruction_flag: Option<&'a str>,
     /// One argv token placed before the prompt; never contains a `{}` placeholder.
-    pub oneshot_flag: Option<&'static str>,
+    pub oneshot_flag: Option<&'a str>,
+    pub model_flag: Option<&'a str>,
     pub set_default_command: bool,
     pub detect_status: fn(&str) -> Status,
-    pub container_env: &'static [(&'static str, &'static str)],
+    pub container_env: &'a [(&'a str, &'a str)],
     pub hook_config: Option<AgentHookConfig>,
     pub sidecar_hooks: Option<SidecarHooks>,
-    pub session_support: Option<SessionSupport>,
+    pub session_support: Option<SessionSupport<'a>>,
     pub fork_strategy: ForkStrategy,
     pub host_only: bool,
     /// Delay before Enter, for agents whose paste-burst detection swallows a fast Enter.
     pub send_keys_enter_delay_ms: u64,
-    pub ready_marker: Option<&'static str>,
-    pub install_hint: &'static str,
-    pub permission_response: Option<PermissionResponse>,
+    pub ready_marker: Option<&'a str>,
+    pub install_hint: &'a str,
+    pub permission_response: Option<PermissionResponse<'a>>,
     pub lifecycle: AgentLifecycle,
 }
 
@@ -415,10 +416,10 @@ pub enum KeyToken<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PermissionResponse {
-    pub allow: &'static [KeyToken<'static>],
-    pub allow_always: Option<&'static [KeyToken<'static>]>,
-    pub deny: &'static [KeyToken<'static>],
+pub struct PermissionResponse<'a> {
+    pub allow: &'a [KeyToken<'a>],
+    pub allow_always: Option<&'a [KeyToken<'a>]>,
+    pub deny: &'a [KeyToken<'a>],
 }
 
 const fn hook(name: &'static str, status: HookStatus) -> HookEvent {
@@ -561,11 +562,11 @@ pub(crate) const KIMI_SIDECAR_EVENTS: &[SidecarHookEvent] = &[
 ];
 
 const fn session_support(
-    resume: ResumeStrategy,
+    resume: ResumeStrategy<'static>,
     backend: SessionCaptureBackend,
     host: SessionCaptureContext,
     sandbox: SessionCaptureContext,
-) -> Option<SessionSupport> {
+) -> Option<SessionSupport<'static>> {
     Some(SessionSupport {
         resume,
         capture: Some(SessionCaptureSpec {
@@ -576,7 +577,7 @@ const fn session_support(
     })
 }
 
-const fn resume_only(resume: ResumeStrategy) -> Option<SessionSupport> {
+const fn resume_only(resume: ResumeStrategy<'static>) -> Option<SessionSupport<'static>> {
     Some(SessionSupport {
         resume,
         capture: None,
@@ -597,7 +598,7 @@ const fn json_hooks(
 }
 
 /// Defaults shared by every registry entry; each entry overrides what differs.
-const fn agent(name: &'static str, binary: &'static str, install_hint: &'static str) -> AgentDef {
+const fn agent(name: &'static str, binary: &'static str, install_hint: &'static str) -> AgentDef<'static> {
     AgentDef {
         name,
         binary,
@@ -608,6 +609,7 @@ const fn agent(name: &'static str, binary: &'static str, install_hint: &'static 
         spans_agent_generations: false,
         instruction_flag: None,
         oneshot_flag: None,
+        model_flag: None,
         set_default_command: false,
         detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
@@ -624,7 +626,7 @@ const fn agent(name: &'static str, binary: &'static str, install_hint: &'static 
     }
 }
 
-pub const AGENTS: &[AgentDef] = &[
+pub const AGENTS: &[AgentDef<'static>] = &[
     AgentDef {
         oneshot_flag: Some("-p"),
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
@@ -1008,7 +1010,7 @@ pub const AGENTS: &[AgentDef] = &[
     },
 ];
 
-impl AgentDef {
+impl AgentDef<'_> {
     /// Whether a fork can run in this context. A `ValueFlag` fork leaves the
     /// child id to the agent, so it needs a capture context that can read it.
     pub fn can_fork_in(&self, sandboxed: bool) -> bool {
@@ -1053,12 +1055,12 @@ impl AgentDef {
         }
     }
 
-    pub fn oneshot_model_flag(&self) -> Option<&'static str> {
-        match self.name {
+    pub fn oneshot_model_flag(&self) -> Option<&str> {
+        self.model_flag.or(match self.name {
             "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
-        }
+        })
     }
 
     /// Stable, non-dated aliases only: AoE pins no CLI version.
@@ -1281,7 +1283,7 @@ const CODEX_VARIADIC_OPTIONS: &[&str] = &["-i", "--image"];
 /// A flag the older generation's help lists and the current one's does not.
 const LEGACY_GENERATION_MARKER: &str = "--fork";
 
-impl AgentDef {
+impl AgentDef<'_> {
     /// Probe the executable and environment AoE itself would launch.
     pub fn detected_generation(&self) -> AgentGeneration {
         if !self.spans_agent_generations {
@@ -1529,7 +1531,7 @@ const HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 const HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
+pub fn get_agent(name: &str) -> Option<&'static AgentDef<'static>> {
     AGENTS.iter().find(|a| a.name == name)
 }
 
@@ -1651,7 +1653,7 @@ pub(crate) fn hook_install_required(agent: &AgentDef, status_hooks_enabled: bool
 }
 
 pub fn resolved_hook_events(
-    agent: &AgentDef,
+    agent: &AgentDef<'static>,
     config: &crate::session::config::Config,
 ) -> anyhow::Result<Vec<ResolvedHookEvent>> {
     let Some(hook_cfg) = &agent.hook_config else {
@@ -1677,7 +1679,7 @@ pub fn resolved_hook_events(
 }
 
 pub fn resolved_sidecar_hook_events(
-    agent: &AgentDef,
+    agent: &AgentDef<'static>,
     config: &crate::session::config::Config,
 ) -> anyhow::Result<Vec<ResolvedHookEvent>> {
     let Some(sidecar) = &agent.sidecar_hooks else {

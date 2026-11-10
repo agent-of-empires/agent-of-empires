@@ -5,10 +5,10 @@ use super::*;
 /// Map a decision to its agent-defined keystroke sequence. Pure and
 /// tmux-free so the choice-to-field mapping is unit-testable without a
 /// real pane; `execute_permission_response` is the only caller.
-pub(super) fn permission_response_tokens(
-    response: &crate::agents::PermissionResponse,
+pub(super) fn permission_response_tokens<'a>(
+    response: &crate::agents::PermissionResponse<'a>,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> Option<&'static [crate::agents::KeyToken<'static>]> {
+) -> Option<&'a [crate::agents::KeyToken<'a>]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
         Allow => Some(response.allow),
@@ -184,6 +184,55 @@ impl HomeView {
                 "Respond Failed",
                 &format!("Failed to send response: {}", e),
             ));
+        }
+    }
+
+    pub(super) fn execute_declared_permission_response(
+        &mut self,
+        session_id: &str,
+        choice: crate::tui::dialogs::PermissionResponseChoice,
+        agent: &crate::plugin::agent_integration::DeclaredAgent,
+    ) {
+        if !self.session_feed.native_interaction_available() || self.start_blocked(session_id).is_some() {
+            return;
+        }
+        let Some(inst) = self.get_instance(session_id) else { return };
+        if inst.is_structured()
+            || crate::plugin::agent_integration::replies_configured(inst)
+            || !inst.declared_agent().is_some_and(|current| current.same_identity(agent))
+        {
+            return;
+        }
+        let tmux = match crate::tmux::Session::new(&inst.id, &inst.title) {
+            Ok(session) => session,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
+                return;
+            }
+        };
+        let _input_lock = match inst.lock_for_input() {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
+                return;
+            }
+        };
+        let result = agent.while_current(|| agent.with_definition(|definition| {
+            let response = definition.permission_response?;
+            let tokens = permission_response_tokens(&response, choice)?;
+            Some(tmux.send_key_tokens(tokens))
+        })).flatten().flatten();
+        match result {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                self.info_dialog = Some(InfoDialog::new("Respond Failed", &error.to_string()));
+            }
+            None => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Response Not Sent",
+                    "The agent declaration changed or no longer permits this response.",
+                ));
+            }
         }
     }
 }

@@ -39,7 +39,7 @@ type LaunchRouting = (
 );
 
 fn prepared_fork_mints_child(
-    agent: Option<&'static crate::agents::AgentDef>,
+    agent: Option<&crate::agents::AgentDef<'_>>,
     intent: &ResumeIntent,
     context: &super::execution::AgentLaunchContext<'_>,
 ) -> bool {
@@ -52,10 +52,10 @@ fn prepared_fork_mints_child(
         })
 }
 
-fn resolved_yolo(
-    agent: &'static crate::agents::AgentDef,
+fn resolved_yolo<'a>(
+    agent: &'a crate::agents::AgentDef<'a>,
     launch_context: &super::execution::AgentLaunchContext<'_>,
-) -> Option<&'static crate::agents::YoloMode> {
+) -> Option<&'a crate::agents::YoloMode<'a>> {
     let yolo = agent.yolo.as_ref()?;
     let generation = launch_context.generation();
     match yolo.resolve(generation) {
@@ -187,7 +187,7 @@ fn apply_no_daemon_flag(
     };
     let (program, probe) = match (execution, unpinned) {
         (Some(execution), _)
-            if execution.inputs.container.is_none() && execution.agent.name == agent.name =>
+            if execution.inputs.container.is_none() && execution.binding.agent == agent.name =>
         {
             (&execution.program, execution.host_command())
         }
@@ -247,11 +247,11 @@ pub(super) fn environment_defines_path(environment: &[String]) -> bool {
 }
 
 pub(super) fn build_resume_flags(
-    tool: &str,
+    agent: Option<&crate::agents::AgentDef<'_>>,
     session_id: &str,
     is_existing_session: bool,
 ) -> String {
-    use crate::agents::{get_agent, ResumeStrategy};
+    use crate::agents::ResumeStrategy;
 
     if !is_valid_session_id(session_id) {
         tracing::warn!(target: "session.store",
@@ -260,12 +260,12 @@ pub(super) fn build_resume_flags(
         );
         return String::new();
     }
-    let Some(agent) = get_agent(tool) else {
+    let Some(agent) = agent else {
         return String::new();
     };
     let Some(support) = agent.session_support.as_ref() else {
         tracing::info!(target: "session.store",
-            tool = %tool,
+            tool = %agent.name,
             sid = %session_id,
             "session resume is disabled for this agent; stored ID left unused"
         );
@@ -424,22 +424,22 @@ pub(super) fn splice_subcommand_or_append(
 }
 
 pub(super) fn append_resume_flags(
-    tool: &str,
+    agent: Option<&crate::agents::AgentDef<'_>>,
     session_id: Option<&str>,
     is_existing_session: bool,
     cmd: &mut String,
     executable_end: usize,
     context: &str,
 ) -> bool {
-    use crate::agents::{get_agent, ResumeStrategy};
+    use crate::agents::ResumeStrategy;
 
     if let Some(session_id) = session_id {
-        let resume_part = build_resume_flags(tool, session_id, is_existing_session);
+        let resume_part = build_resume_flags(agent, session_id, is_existing_session);
         if resume_part.is_empty() {
             return false;
         }
         let subcommand_at = matches!(
-            get_agent(tool).and_then(|agent| agent.session_support.as_ref()),
+            agent.and_then(|agent| agent.session_support.as_ref()),
             Some(crate::agents::SessionSupport {
                 resume: ResumeStrategy::Subcommand(_),
                 ..
@@ -460,7 +460,7 @@ pub(super) fn append_resume_flags(
 /// web renderer handles ANSI fine. Unsetting `NO_COLOR` and advertising
 /// `TERM=xterm-256color` plus `COLORTERM=truecolor` at launch keeps color on
 /// without pinning tools to a specific `FORCE_COLOR` depth.
-fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
+fn apply_agent_launch_env(cmd: &mut String, agent: Option<&crate::agents::AgentDef<'_>>) {
     if !matches!(agent.map(|a| a.name), Some("antigravity" | "codex")) {
         return;
     }
@@ -1062,7 +1062,7 @@ impl Instance {
         }
         let require_conversation_publication = execution
             .as_ref()
-            .is_some_and(|execution| execution.agent.name == "opencode")
+            .is_some_and(|execution| execution.binding.agent == "opencode")
             && !fork_mints_child
             && self.stored_fork_child().is_some();
         Ok(PreparedLaunch {
@@ -1156,9 +1156,55 @@ impl Instance {
                 &self.extra_args,
             ))?;
         }
+        if let Some(super::execution::NativeAgent::Declared(declared)) =
+            execution.map(|execution| &execution.agent)
+        {
+            return declared.with_definition(|agent| {
+                self.build_launch_command_for_agent_in(
+                    stores, execution, unpinned, expected, Some(agent),
+                )
+            }).context("invalid agent declaration")?;
+        }
+        if execution.is_none() && crate::agents::get_agent(&self.tool).is_none() {
+            let config = crate::session::config::repo_config::resolve_config_with_repo(
+                &self.effective_profile(),
+                std::path::Path::new(&self.project_path),
+            )?;
+            if !config.session.agent_command_override.get(&self.tool)
+                .is_some_and(|command| !command.trim().is_empty())
+            {
+                let declared = crate::plugin::agent_integration::declared_agent(
+                    crate::plugin::registry(),
+                    &self.tool,
+                    config.session.custom_agents.iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                );
+                if let Some(declared) = declared.filter(|agent| {
+                    agent.contribution().command.as_deref() == Some(self.get_tool_command())
+                }) {
+                    return declared.with_definition(|agent| {
+                        self.build_launch_command_for_agent_in(
+                            stores, execution, unpinned, expected, Some(agent),
+                        )
+                    }).context("invalid agent declaration")?;
+                }
+            }
+        }
         let agent = execution
-            .map(|execution| execution.agent)
+            .and_then(|execution| execution.agent.builtin())
             .or_else(|| self.default_selector_agent());
+        self.build_launch_command_for_agent_in(stores, execution, unpinned, expected, agent)
+    }
+
+    fn build_launch_command_for_agent_in(
+        &mut self,
+        stores: CaptureStorage<'_>,
+        execution: Option<&super::execution::NativeExecution>,
+        unpinned: Option<&UnpinnedCodexLaunch>,
+        expected: &mut ConversationState,
+        agent: Option<&crate::agents::AgentDef<'_>>,
+    ) -> Result<LaunchCommandParts> {
 
         let parts = if self.is_sandboxed() {
             let fallback_container_name = execution
@@ -1399,7 +1445,7 @@ impl Instance {
     #[cfg(test)]
     fn build_host_command(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
     ) -> Result<LaunchCommandParts> {
@@ -1416,7 +1462,7 @@ impl Instance {
     fn build_host_command_in(
         &mut self,
         stores: CaptureStorage<'_>,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
         expected: &mut ConversationState,
@@ -1441,7 +1487,7 @@ impl Instance {
     #[cfg(test)]
     fn build_host_command_with_identity_extension(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
         expected: &mut ConversationState,
@@ -1460,7 +1506,7 @@ impl Instance {
     fn build_host_command_with_identity_extension_in(
         &mut self,
         stores: CaptureStorage<'_>,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&crate::agents::AgentDef<'_>>,
         identity_extension: Option<&(String, String)>,
         execution: Option<&super::execution::NativeExecution>,
         unpinned: Option<&UnpinnedCodexLaunch>,
@@ -2013,13 +2059,13 @@ mod tests {
             ("mistral", false, String::new()),
         ] {
             assert_eq!(
-                build_resume_flags(tool, sid, existing),
+                build_resume_flags(crate::agents::get_agent(tool), sid, existing),
                 expected,
                 "{tool}/{existing}"
             );
         }
-        assert_eq!(build_resume_flags("claude", "$(rm -rf /)", true), "");
-        assert_eq!(build_resume_flags("opencode", "id; echo pwned", false), "");
+        assert_eq!(build_resume_flags(crate::agents::get_agent("claude"), "$(rm -rf /)", true), "");
+        assert_eq!(build_resume_flags(crate::agents::get_agent("opencode"), "id; echo pwned", false), "");
 
         for (tool, parent, child, generation, expected) in [
             (
@@ -3968,7 +4014,7 @@ mod tests {
         let mut command = format!("{program} -- 'fix the build'");
         apply_no_daemon_flag(
             &mut command,
-            Some(execution.agent),
+            execution.agent.builtin(),
             &codex,
             Some(&execution),
             None,
@@ -3982,7 +4028,7 @@ mod tests {
         let mut command = format!("{program} -- --no-daemon");
         apply_no_daemon_flag(
             &mut command,
-            Some(execution.agent),
+            execution.agent.builtin(),
             &codex,
             Some(&execution),
             None,

@@ -3031,6 +3031,9 @@ impl HomeView {
                             PermissionResponseTarget::Terminal(session_id) => {
                                 self.execute_permission_response(&session_id, choice);
                             }
+                            PermissionResponseTarget::Declared { session_id, agent } => {
+                                self.execute_declared_permission_response(&session_id, choice, &agent);
+                            }
                             PermissionResponseTarget::Structured { session_id, nonce } => {
                                 self.resolve_structured_approval(session_id, nonce, choice);
                             }
@@ -7367,6 +7370,21 @@ impl HomeView {
             return;
         }
 
+        if let Some(agent) = inst.declared_agent() {
+            if let Some(dialog) = agent.with_definition(|definition| {
+                definition.permission_response.map(|response| {
+                    crate::tui::dialogs::PermissionResponseDialog::new(&title, response.allow_always)
+                })
+            }).flatten() {
+                self.session_dialog_target = self.selected_dialog_target();
+                self.pending_permission_response = Some(PermissionResponseTarget::Declared {
+                    session_id: id,
+                    agent,
+                });
+                self.permission_response_dialog = Some(dialog);
+                return;
+            }
+        }
         let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
         else {
             self.info_dialog = Some(InfoDialog::new(

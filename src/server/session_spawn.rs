@@ -500,6 +500,16 @@ pub(crate) async fn spawn_structured_session(
                 &resolved_config.session.agent_acp_cmd,
                 &resolved_config.session.agent_detect_as,
             );
+            if !instance.is_structured() {
+                instance.yolo_mode |= instance.declared_agent().is_some_and(|declared| {
+                    declared.contribution().launch.as_ref()
+                        .and_then(|launch| launch.yolo.as_ref())
+                        .is_some_and(|mode| matches!(
+                            mode,
+                            aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always
+                        ))
+                });
+            }
 
             if !instance.is_structured() {
                 agent_effort = None;

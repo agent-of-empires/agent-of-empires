@@ -1,11 +1,7 @@
 //! Agent-agnostic "summary of the conversation so far" for structured-view (ACP) sessions.
 
 use crate::acp::state::Event;
-use crate::agents;
-use crate::session::smart_rename::{
-    resolve_rename_tool, strip_ansi, truncate_bytes, OneshotModel, SkipReason,
-};
-use std::collections::HashMap;
+use crate::session::smart_rename::{strip_ansi, truncate_bytes, OneshotAgent, SkipReason};
 
 /// Only one summary one-shot runs at a time process-wide.
 pub const MAX_CONCURRENT: usize = 1;
@@ -39,40 +35,23 @@ const MIN_DELTA_TURNS: usize = 8;
 
 /// Resolve the agent for the summary one-shot and gate it, mirroring
 /// `smart_rename::check_eligible_resolved` but without the title / enabled gates.
-pub fn resolve_summary_agent(
+pub(crate) fn resolve_summary_agent(
     structured: bool,
     session_tool: &str,
     summary_setting: &str,
     sandboxed: bool,
     session_command: &str,
-    overrides: &HashMap<String, String>,
-) -> Result<&'static agents::AgentDef, SkipReason> {
+    config: &crate::session::config::SessionConfig,
+) -> Result<OneshotAgent, SkipReason> {
     if !structured {
         return Err(SkipReason::NotStructured);
     }
     if sandboxed {
         return Err(SkipReason::Sandboxed);
     }
-    let summary_tool = resolve_rename_tool(session_tool, summary_setting);
-    let Some(agent) = agents::get_agent(summary_tool) else {
-        return Err(SkipReason::NoOneshot);
-    };
-    if agent.oneshot_flag.is_none() {
-        return Err(SkipReason::NoOneshot);
-    }
-    // Only a command override of the resolved summary agent's own binary disqualifies it: when the
-    // summary agent is the session's own agent, the session's launch command counts; when it is a
-    // different agent, the one-shot launches that binary fresh, so the session command is
-    // irrelevant (same semantics as smart-rename).
-    let (command, override_in_cfg) = if summary_tool == session_tool {
-        (session_command, overrides.contains_key(session_tool))
-    } else {
-        ("", overrides.contains_key(summary_tool))
-    };
-    if override_in_cfg || (!command.is_empty() && command != agent.binary) {
-        return Err(SkipReason::CommandOverridden);
-    }
-    Ok(agent)
+    crate::session::smart_rename::check_eligible_with_declarations(
+        true, true, true, "", session_tool, summary_setting, false, session_command, config,
+    )
 }
 
 /// The last `ConversationSummary` in an event list: its text and the seq it
@@ -307,7 +286,7 @@ mod serve {
             &resolved.session.smart_rename_agent,
             sandboxed,
             &command,
-            &resolved.session.agent_command_override,
+            &resolved.session,
         ) {
             Ok(agent) => agent,
             Err(reason) => {
@@ -336,11 +315,7 @@ mod serve {
         // A summary reads the whole transcript and can run a bigger model turn (see
         // SUMMARY_TIMEOUT), so it uses the CLI default model rather than the cheap alias
         // smart-rename titles pin.
-        let Some(argv) = crate::session::smart_rename::build_oneshot_argv(
-            agent,
-            &prompt,
-            OneshotModel::CliDefault,
-        ) else {
+        let Some(argv) = agent.argv(&prompt, None) else {
             return;
         };
 
@@ -519,20 +494,20 @@ mod tests {
 
     #[test]
     fn resolve_summary_agent_gates() {
-        let overrides = HashMap::new();
-        assert!(resolve_summary_agent(true, "claude", "", false, "", &overrides).is_ok());
+        let config = crate::session::config::SessionConfig::default();
+        assert!(resolve_summary_agent(true, "claude", "", false, "", &config).is_ok());
         assert!(matches!(
-            resolve_summary_agent(false, "claude", "", false, "", &overrides),
+            resolve_summary_agent(false, "claude", "", false, "", &config),
             Err(SkipReason::NotStructured)
         ));
         assert!(matches!(
-            resolve_summary_agent(true, "claude", "", true, "", &overrides),
+            resolve_summary_agent(true, "claude", "", true, "", &config),
             Err(SkipReason::Sandboxed)
         ));
         assert!(matches!(
-            resolve_summary_agent(true, "cursor", "", false, "", &overrides),
+            resolve_summary_agent(true, "cursor", "", false, "", &config),
             Err(SkipReason::NoOneshot)
         ));
-        assert!(resolve_summary_agent(true, "claude", "codex", false, "", &overrides).is_ok());
+        assert!(resolve_summary_agent(true, "claude", "codex", false, "", &config).is_ok());
     }
 }
