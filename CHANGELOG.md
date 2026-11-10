@@ -16,7 +16,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **acp:** Decline idle retirement while a worker's lifecycle or activity publication is busy, without waiting on store I/O or clearing its captured lease and restart intent.
 - **session:** Capture fresh terminal input from the canonical native row before queuing, preserving the original physical owner when a completed CLI start leads the daemon cache; keep registered readiness checks before delivery.
 - **web:** Keep startup recovery details and agent logs open across connection failures, while disabling recovery actions under current Native uncertainty or read-only policy; historical input receipts never grant current input authority.
-- **tests:** Exercise terminal custody through the real HTTP mutation task and keep constructor and migration fixtures within Unix socket path bounds.
+- **tests:** Exercise terminal custody through the real HTTP mutation task, keep constructor and migration fixtures within Unix socket path bounds, and isolate plugin repositories from user Git configuration.
 - **plugins:** Keep read-only RPC dispatch small and bound asynchronous session dispatch before supervised spawning to prevent daemon stack overflows.
 
 ### Security
