@@ -969,7 +969,7 @@ async fn handle_terminal_event(
                 Ok(()) => set_toast(
                     state,
                     toast_deadline,
-                    format!("stopped subagent: {label}"),
+                    format!("stop sent to subagent: {label}"),
                     ToastKind::Info,
                 ),
                 Err(e) => set_toast(
