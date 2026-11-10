@@ -618,6 +618,61 @@ mod tests {
         }
     }
 
+    /// Only an option the catalog files under `model_config` is stored for
+    /// respawn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn model_config_pick_is_stored_for_respawn() {
+        let _tmp = isolate_app_dir();
+        let option = |id: &str, category| ConfigOptionDescriptor {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            category,
+            current_value: String::new(),
+            options: vec![],
+        };
+        crate::acp::option_catalog::record(
+            "claude",
+            &[
+                option(
+                    "fast",
+                    ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into()),
+                ),
+                option("other", ConfigOptionCategory::Other("misc".into())),
+            ],
+            "2026-07-24T00:00:00Z".to_string(),
+        )
+        .unwrap();
+
+        let mut inst = crate::session::Instance::new("claude", "/tmp");
+        inst.agent_name = Some("claude".to_string());
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        for config_id in ["other", "fast"] {
+            let resp = acp_set_config_option(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: config_id.to_string(),
+                    value: "on".to_string(),
+                })),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{config_id}");
+        }
+        let stored = state.instances.read().await[0].acp_model_config.clone();
+        assert_eq!(
+            stored.into_iter().collect::<Vec<_>>(),
+            vec![("fast".to_string(), "on".to_string())]
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn config_option_category_resolves_categories_from_catalog() {
