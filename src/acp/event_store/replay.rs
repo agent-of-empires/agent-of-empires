@@ -539,6 +539,23 @@ mod tests {
         assert_eq!(last, total);
         assert_eq!(seqs(&store.replay_from("cold", total)), [total + 1]);
         assert_eq!(store.replay_each_paged("empty", 7, |_, _| {}), 7);
+
+        std::thread::scope(|scope| {
+            let writer = store.conn();
+            let replay_store = &store;
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let replay = scope.spawn(move || {
+                let mut seen = Vec::new();
+                let last = replay_store.replay_each_paged("cold", 0, |seq, _| seen.push(seq));
+                done_tx.send((seen, last)).unwrap();
+            });
+            let completed = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(writer);
+            replay.join().unwrap();
+            let (seen, last) = completed.expect("snapshot replay must not need the writer mutex");
+            assert_eq!(seen, (1..=total + 1).collect::<Vec<_>>());
+            assert_eq!(last, total + 1);
+        });
     }
 
     #[test]
