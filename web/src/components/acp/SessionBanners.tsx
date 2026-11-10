@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import type { AcpState } from "../../lib/acpTypes";
+import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
 import { SECONDARY_BUTTON } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
@@ -39,6 +39,9 @@ export function SessionBanners({
   onSwitchToTerminal?: () => void;
   dismissError: () => void;
 }) {
+  const nativeReady = nativeInputAvailable(state);
+  // A prior current input receipt changes the diagnostic, never today's control authority.
+  const startupDiagnosticOnly = nativeReady || state.sessionAssigned;
   const variant = pickWorkerStoppedVariant({
     workerStopped: state.workerStopped,
     startupError: state.startupError,
@@ -47,19 +50,45 @@ export function SessionBanners({
     snoozedUntil,
     workerStopping: acpWorkerState === "stopping",
   });
-  const healthy = !state.startupError && !state.workerStopped && !state.workerRestarting;
+  const healthy =
+    !state.workerStopped &&
+    !state.workerRestarting &&
+    !state.connectionUnavailable &&
+    (!state.startupError || nativeReady);
   const idle = healthy && !state.turnActive;
+  const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
-      {state.startupError && (
+      {state.startupError && !startupDiagnosticOnly && (
         <StartupErrorBanner
           sessionId={sessionId}
           message={state.startupError}
           acpWorkerState={acpWorkerState}
+          canRecover={canRestart && state.connectionUnavailable === null}
           sentStopped={state.restartStoppedSent}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
+      {state.startupError && startupDiagnosticOnly && (
+        <InteractionErrorBanner message={state.startupError} onDismiss={dismissError} />
+      )}
+      {state.connectionUnavailable ? (
+        <NativeChannelNotice observation={state.connectionUnavailable} current />
+      ) : state.connectionUnavailableNotice ? (
+        <NativeChannelNotice observation={state.connectionUnavailableNotice} current={false} />
+      ) : null}
+      {state.nativeSnapshotSeq !== null &&
+        !nativeReady &&
+        !state.connectionUnavailable &&
+        !startingAgent &&
+        acpWorkerState === "running" && (
+          <div
+            className="border-b border-surface-700 px-4 py-2 text-xs text-text-muted"
+            data-testid="native-channel-unknown"
+          >
+            Native input readiness is unconfirmed. The transcript remains available.
+          </div>
+        )}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
       {variant === "snoozed" && snoozedUntil && (
@@ -106,8 +135,24 @@ export function SessionBanners({
           Monitoring a background job
         </ChipBanner>
       )}
-      {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
+      {errorMessage && <InteractionErrorBanner message={errorMessage} onDismiss={dismissError} />}
     </>
+  );
+}
+
+function NativeChannelNotice({ observation, current }: { observation: AcpConnectionUnavailability; current: boolean }) {
+  return (
+    <div
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning"
+      data-testid={current ? "native-channel-unavailable" : "native-channel-diagnostic"}
+    >
+      <div className="font-medium">{current ? "Native input unavailable" : "Previous native-channel diagnostic"}</div>
+      <div className="mt-0.5">
+        {observation.cause.replaceAll("_", " ")} ({observation.source}; {observation.phase}).
+        {current &&
+          " The retained conversation has not been replaced. Channel loss alone does not prove the process exited."}
+      </div>
+    </div>
   );
 }
 

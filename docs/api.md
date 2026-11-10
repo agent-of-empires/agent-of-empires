@@ -643,6 +643,16 @@ epoch, with matching lifecycle generation, profile, and live terminal identity.
 A successful terminal restart can still have canonical status `Starting`.
 Clients must not wait for `Idle` as an additional attachment grant.
 
+An unproved terminal launch or readiness check can return HTTP `409` with
+`aoe-error-code: launch_indeterminate` and a finite `cause`: `command_timed_out`,
+`observation_failed`, `stabilization_expired`, or `ownership_unproven`. This is
+not a ready target or a confirmed Agent exit. The response retains a mutation
+receipt when launch state was committed; no wake message or pending send is
+delivered. Clients validate any committed receipt before classifying this refusal,
+without requiring a response body. See
+[Native Session Resume](guides/session-resume.md#pinning-or-resetting-a-conversation)
+for preservation and inspection guidance.
+
 ## POST /api/sessions/{id}/send
 
 Type a message into the agent and press Enter, the same way the TUI's
@@ -762,7 +772,7 @@ attachment is delivered. Genuine authority loss or an unknown outcome remains
 blocked until reconciled.
 
 A failed launch can still commit a lifecycle generation. The finite
-`aoe-error-code` values `start_failed`, `resume_failed`, and
+`aoe-error-code` values `start_failed`, `resume_failed`, `launch_indeterminate`, and
 `managed_resume_refused`, with valid same-epoch runtime receipt headers,
 acknowledge that preparation commit, not a successful
 launch. Clients must apply its snapshot before retrying. A later send or target
@@ -770,6 +780,8 @@ probe failure can likewise retain a preparation cursor; it does not acknowledge
 message delivery. Transport loss, local request-task failure, or malformed
 mutation receipts remain unknown; effect-free daemon refusals do not acknowledge
 a commit.
+
+A `launch_indeterminate` response with a valid committed receipt is a known refusal, not an unknown RPC outcome. It stays fenced until its snapshot is applied. The TUI then displays the refusal without quarantining the row or automatically attaching, sending, or replaying input; a new operation requires explicit user submission. Readiness itself remains unconfirmed.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason.

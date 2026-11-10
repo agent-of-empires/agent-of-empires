@@ -1,4 +1,4 @@
-import type { RateLimitInfo } from "./acpTypes";
+import type { OperationErrorEvidence, RateLimitInfo } from "./acpTypes";
 import type { RepoColor } from "./repoAppearance";
 import type { AgentLifecycleInfo } from "./agentProfiles";
 import type { SchemaSettings } from "./generated/settingsKeys";
@@ -24,6 +24,7 @@ export interface SessionResponse {
   /** Last transition into Idle; unlike `last_accessed_at`, viewing does not bump it. */
   idle_entered_at: string | null;
   last_error: string | null;
+  last_error_evidence?: OperationErrorEvidence | null;
   branch: string | null;
   main_repo_path: string | null;
   /** Base branch of an AoE-created worktree; null for pre-existing or default branches. */

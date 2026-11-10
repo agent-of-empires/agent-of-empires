@@ -31,8 +31,14 @@ pub struct PromptDispatchResponse {
     pub seq: Option<u64>,
 }
 
-/// 503 for a worker that could not be resumed; the client retries.
+/// Transient resume failures are 503; typed channel refusal is not queue permission.
 fn resume_failed_response(err: &SupervisorError) -> Response {
+    if matches!(
+        err,
+        SupervisorError::Acp(AcpError::ConnectionUnavailable(_))
+    ) {
+        return supervisor_error_response("worker unavailable", err);
+    }
     let body = match err {
         SupervisorError::CapacityFull { current, limit } => {
             format!("worker_capacity_full ({current}/{limit})")
@@ -123,6 +129,7 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::SessionNotFound) => session_not_found(),
         Err(PromptSubmitError::RevivalRefused) => no_revive_refused(),
         Err(PromptSubmitError::WorkerNotReady) => worker_not_ready(),
+        Err(PromptSubmitError::AdmissionRefused(response)) => response,
         Err(PromptSubmitError::Blocked(blocked)) => {
             crate::server::api::start_blocked_response(blocked)
         }
@@ -138,6 +145,12 @@ pub async fn acp_prompt(
                 worker_not_ready()
             }
             SendTurnError::RevivalRefused => no_revive_refused(),
+            SendTurnError::Unavailable(unavailability)
+            | SendTurnError::UnavailableAfterPublish(unavailability) => (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response(),
             // Unreachable for a User caller.
             SendTurnError::NotOwner => {
                 (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
@@ -181,6 +194,7 @@ pub(crate) enum PromptSubmitError {
     SessionNotFound,
     RevivalRefused,
     WorkerNotReady,
+    AdmissionRefused(Response),
     Blocked(crate::session::StartBlocked),
     Attachments(StatusCode, String),
     QueuedPromptGone,
@@ -206,12 +220,23 @@ pub(crate) async fn submit_prompt(
     else {
         return Err(PromptSubmitError::SessionNotFound);
     };
-    let woke_idle_dormant = match state
+    let (woke_idle_dormant, resume_reservation) = match state
         .session_service
         .touch_and_wake_on_prompt(id, req.no_revive)
         .await
     {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::AdmissionRefused(response) => {
+            return Err(PromptSubmitError::AdmissionRefused(response))
+        }
+        PromptTouch::Unavailable(unavailability) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+                unavailability,
+            )));
+        }
         PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
         PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
         PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
@@ -255,6 +280,11 @@ pub(crate) async fn submit_prompt(
         .session_service
         .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
         .await;
+    if let PromptDispatch::Unavailable { unavailability } = dispatch {
+        return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+            unavailability,
+        )));
+    }
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
     if req.no_revive
@@ -268,59 +298,66 @@ pub(crate) async fn submit_prompt(
         return Err(PromptSubmitError::RevivalRefused);
     }
     if let PromptDispatch::Queued { reason } = dispatch {
-        // A fresh prompt supersedes a queued rate-limit continuation (#3028),
-        // but only once it is queued: a refusal must leave it in place (#4081 review).
+        // A fresh request supersedes pending intent only after queue admission.
         // The named row is already the parked copy; queueing again would duplicate it.
-        if let Some(row) = &queued_row {
+        let queued_id = if let Some(row) = &queued_row {
             state.session_service.clear_pending_initial_turn(id).await;
-            return Ok(PromptSubmitted {
-                dispatch,
-                queued_id: Some(row.id.clone()),
-                seq: None,
-            });
-        }
-        let prompt_id = req
-            .prompt_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        return match super::super::queue::buffer_and_enqueue(
-            state,
-            id,
-            super::super::queue::QueuedPrompt {
-                prompt_id: &prompt_id,
-                text: req.text.to_string(),
-                blobs: &attachments,
-                origin_device: None,
-                origin_plugin: origin_plugin.clone(),
-                supersede_pending_turn: true,
-            },
-        )
-        .await
-        {
-            Ok(entry) => {
-                tracing::debug!(
-                    target: "acp.queue",
-                    session = %id,
-                    ?reason,
-                    queued_id = %entry.id,
-                    "prompt queued"
-                );
-                Ok(PromptSubmitted {
-                    dispatch,
-                    queued_id: Some(entry.id),
-                    seq: None,
-                })
-            }
-            Err((status, msg)) => {
-                tracing::warn!(
-                    target: "http.api.acp",
-                    session = %id,
-                    ?reason,
-                    "prompt dispatch chose the queue but enqueue failed: {msg}"
-                );
-                Err(PromptSubmitError::Enqueue(status, msg))
+            row.id.clone()
+        } else {
+            let prompt_id = req
+                .prompt_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            match super::super::queue::buffer_and_enqueue(
+                state,
+                id,
+                super::super::queue::QueuedPrompt {
+                    prompt_id: &prompt_id,
+                    text: req.text.to_string(),
+                    blobs: &attachments,
+                    origin_device: None,
+                    origin_plugin: origin_plugin.clone(),
+                    supersede_pending_turn: true,
+                },
+            )
+            .await
+            {
+                Ok(entry) => {
+                    tracing::debug!(
+                        target: "acp.queue",
+                        session = %id,
+                        ?reason,
+                        queued_id = %entry.id,
+                        "prompt queued"
+                    );
+                    entry.id
+                }
+                Err((status, msg)) => {
+                    tracing::warn!(target: "http.api.acp", session = %id, ?reason,
+                        "prompt dispatch chose the queue but enqueue failed: {msg}");
+                    return Err(PromptSubmitError::Enqueue(status, msg));
+                }
             }
         };
+        if let Some(reservation) = resume_reservation {
+            if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
+                &state.session_service,
+                id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+                Some(reservation),
+            )
+            .await
+            {
+                // Queue acceptance already committed; retain its receipt and intent.
+                tracing::warn!(target: "http.api.acp", session = %id, %error,
+                    "queued intent retained; prepared wake was refused");
+            }
+        }
+        return Ok(PromptSubmitted {
+            dispatch,
+            queued_id: Some(queued_id),
+            seq: None,
+        });
     }
     // A named row is delivered with the bytes the daemon stored for it, never the request's.
     let attachments = match &queued_row {
@@ -355,6 +392,7 @@ pub(crate) async fn submit_prompt(
             caller,
             id,
             SendTurnRequest {
+                resume_reservation,
                 resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
                 text: req.text,
                 attachments: &attachments,
@@ -438,12 +476,23 @@ pub async fn acp_prompt_diff_comments(
     else {
         return session_not_found();
     };
-    let woke_idle_dormant = match state
+    let (woke_idle_dormant, resume_reservation) = match state
         .session_service
         .touch_and_wake_on_prompt(&id, false)
         .await
     {
-        PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Touched {
+            idle_dormant,
+            resume_reservation,
+        } => (idle_dormant, resume_reservation),
+        PromptTouch::AdmissionRefused(response) => return response,
+        PromptTouch::Unavailable(unavailability) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response();
+        }
         PromptTouch::RevivalRefused => return no_revive_refused(),
         PromptTouch::WorkerNotReady => return worker_not_ready(),
         PromptTouch::Blocked(blocked) => {
@@ -454,19 +503,25 @@ pub async fn acp_prompt_diff_comments(
         .session_service
         .prompt_dispatch_under_submission(&id, "", woke_idle_dormant, false)
         .await;
+    if matches!(dispatch, PromptDispatch::Unavailable { .. }) {
+        return (StatusCode::CONFLICT, Json(dispatch)).into_response();
+    }
     // There is no queue row for a typed review, so refuse rather than publish
     // a card the agent would then reject as busy.
     if let PromptDispatch::Queued { reason } = dispatch {
         return diff_comments_not_now(reason);
     }
     // Idle-dormant sessions and rate-limit parks are sendable with no live worker.
-    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
+    let needs_resume = resume_reservation.is_some()
+        || woke_idle_dormant
+        || !state.acp_supervisor.is_running(&id).await;
     if needs_resume {
         use crate::server::acp_reconciler::ResumeTrigger;
         match crate::server::acp_reconciler::trigger_resume_background(
             &state.session_service,
             &id,
             crate::process::worker_registry::ResumeAuthority::Explicit,
+            resume_reservation,
         )
         .await
         {
@@ -477,11 +532,7 @@ pub async fn acp_prompt_diff_comments(
     }
     // Publish only once a worker exists, or the card strands on "running" (#3172).
     if let Err(e) = state.acp_supervisor.wait_until_ready(&id).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("worker_not_ready: {e}"),
-        )
-            .into_response();
+        return resume_failed_response(&e);
     }
     state
         .acp_supervisor

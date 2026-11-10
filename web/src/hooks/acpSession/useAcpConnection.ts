@@ -40,7 +40,7 @@ type ServerMessage =
   | AcpFrame
   | { kind: "lagged"; skipped?: number }
   | { kind: "heartbeat" }
-  | { kind: "reduced_state"; state?: ReducedState; unchanged?: string[] }
+  | { kind: "reduced_state"; seq?: number; state?: ReducedState; unchanged?: string[] }
   | { kind: "transcript_snapshot"; rows?: TranscriptRow[] }
   | { kind: "transcript_delta"; delta?: TranscriptDelta };
 
@@ -280,10 +280,14 @@ export function useAcpConnection(
           void startReplay();
           return;
         case "reduced_state": {
-          const { state: reduced, unchanged } = data as { state?: ReducedState; unchanged?: string[] };
+          const {
+            state: reduced,
+            unchanged,
+            seq,
+          } = data as { seq?: number; state?: ReducedState; unchanged?: string[] };
           if (!reduced) return;
           lastActivityRef.current = Date.now();
-          dispatch({ kind: "reduced_state", state: reduced, unchanged: unchanged ?? [] });
+          dispatch({ kind: "reduced_state", state: reduced, unchanged: unchanged ?? [], seq });
           return;
         }
         case "transcript_snapshot": {
@@ -318,6 +322,7 @@ export function useAcpConnection(
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
       setStatus("connecting");
+      dispatch({ kind: "native_authority_pending" });
       void (async () => {
         // Replay is best effort and the socket's `since=` covers the gap, so a hung fetch must not block the dial.
         // On timeout the replay is aborted so a late snapshot cannot overwrite rows the socket has since updated.
@@ -363,11 +368,15 @@ export function useAcpConnection(
           setRetryCountdown(0);
         };
         ws.onerror = () => {
-          if (isCurrentDial()) setStatus("error");
+          if (isCurrentDial()) {
+            dispatch({ kind: "native_authority_pending" });
+            setStatus("error");
+          }
         };
         ws.onclose = () => {
           clearTimeout(handshakeTimer);
           if (!isCurrentDial()) return;
+          dispatch({ kind: "native_authority_pending" });
           setStatus("closed");
           wsRef.current = null;
           scheduleReconnect();

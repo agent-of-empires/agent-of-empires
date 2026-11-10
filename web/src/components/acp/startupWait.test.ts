@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { currentControlSnapshot } from "../../../tests/helpers/acpControlSnapshot";
 
 import { applyEvent, emptyAcpState, type AcpEvent } from "../../lib/acpTypes";
 import { reducer } from "../../hooks/acpSession/reducer";
@@ -23,7 +24,8 @@ describe("isNewSessionStarting", () => {
     { PromptCapabilities: { image: false, audio: false, embedded_context: false } },
     { AvailableCommandsUpdated: { commands: [] } },
   ];
-  const assigned = replay(...beforeSessionNew, { AcpSessionAssigned: { acp_session_id: "acp-1" } });
+  const prior = replay(...beforeSessionNew, { AcpSessionAssigned: { acp_session_id: "acp-1" } });
+  const ready = reducer(prior, currentControlSnapshot(prior, { ready: true }));
   const restarted = reducer(replay(...beforeSessionNew, { Stopped: { reason: "user_stopped" } }), {
     kind: "restart_started",
     epoch: 0,
@@ -72,9 +74,9 @@ describe("isNewSessionStarting", () => {
       ],
       true,
     ],
-    ["a resumed Session (its session was assigned)", [assigned, connection(), "resuming", false], false],
-    ["a reconnect after the first open", [assigned, connection({ status: "connecting" }), "running", false], false],
-    ["the Worker is running with its session assigned", [assigned, connection(), "running", false], false],
+    ["a resumed Session with a current receipt", [ready, connection(), "resuming", false], false],
+    ["a reconnect after a current receipt", [ready, connection({ status: "connecting" }), "running", false], false],
+    ["a running Worker with a current receipt", [ready, connection(), "running", false], false],
     [
       "a running Worker whose session/new hasn't answered, past initialize's events",
       [replay(...beforeSessionNew), connection(), "running", false],

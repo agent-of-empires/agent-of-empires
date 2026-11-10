@@ -249,6 +249,7 @@ impl Instance {
         self.idle_dormant_since = None;
         self.idle_entered_at = None;
         self.last_error = None;
+        self.last_error_evidence = None;
         self.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
         Ok(generation)
     }
@@ -307,6 +308,57 @@ impl Instance {
         anyhow::ensure!(committed, LifecycleReservationError::Superseded);
         self.lifecycle_reservation = None;
         self.first_launch_names_agent = false;
+        Ok(())
+    }
+
+    pub(super) fn release_indeterminate_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        probe: &resume::LaunchProbe,
+        sandbox_prior: Option<&resume::LaunchSandboxSnapshot>,
+    ) -> Result<()> {
+        let status = storage.update(|rows, _| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.id == self.id)
+                .ok_or(LifecycleReservationError::Superseded)?;
+            anyhow::ensure!(
+                row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                LifecycleReservationError::Superseded
+            );
+            if probe.expected.matches_launch_observation(row) {
+                row.capture_started_at = self.capture_started_at;
+                row.started_at = self.started_at;
+                row.launch_executable.clone_from(&self.launch_executable);
+                if let (Some(prior), Some(current), Some(stored)) = (
+                    sandbox_prior,
+                    self.sandbox_info.as_ref(),
+                    row.sandbox_info.as_mut(),
+                ) {
+                    if stored.enabled
+                        && current.enabled
+                        && stored.container_name == prior.container_name
+                        && stored.container_id == prior.container_id
+                        && stored.container_workdir == prior.workdir
+                        && current.container_name == prior.container_name
+                        && (prior.container_id.is_none()
+                            || current.container_id == prior.container_id)
+                    {
+                        stored
+                            .container_workdir
+                            .clone_from(&current.container_workdir);
+                    }
+                }
+            }
+            if row.status == Status::Creating {
+                row.status = Status::Starting;
+            }
+            row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            Ok(row.status)
+        })?;
+        self.lifecycle_reservation = None;
+        self.status = status;
         Ok(())
     }
 
@@ -538,7 +590,7 @@ impl Instance {
         {
             Ok(lock) => lock,
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         };
@@ -549,12 +601,12 @@ impl Instance {
         {
             Ok(lock) => lock,
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 return Err(error);
             }
         };
         if let Err(error) = self.reconcile_from_store(storage) {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         // The hooks ran without the lifecycle lock, so a peer may have archived or trashed the
@@ -564,7 +616,7 @@ impl Instance {
             return Err(blocked.into());
         }
         if let Err(error) = hook_result {
-            self.fail_reserved_launch(storage, generation, &error, false);
+            self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
         self.ensure_reservation_current_or_fail(storage, generation)?;
@@ -695,33 +747,40 @@ impl Instance {
         match self.ensure_reservation_current(storage, generation) {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.fail_reserved_launch(storage, generation, &error, false);
+                self.fail_reserved_launch(storage, generation, &error, None, None);
                 Err(error)
             }
         }
     }
 
-    pub(super) fn fail_reserved_launch(
+    pub(crate) fn fail_reserved_launch(
         &mut self,
         storage: &dyn crate::session::SessionStore,
         generation: u64,
         error: &anyhow::Error,
-        cleanup_pane: bool,
+        cleanup: Option<&super::resume::LaunchProbe>,
+        prior: Option<&ConversationState>,
     ) {
-        if !self
-            .reservation_is_current(storage, generation)
-            .unwrap_or(false)
-        {
+        let Ok(rows) = storage.load() else {
+            return;
+        };
+        let Some(row) = rows.iter().find(|row| row.id == self.id) else {
+            return;
+        };
+        if !row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
             return;
         }
-        let scope_failure = if cleanup_pane {
-            if let Err(error) = self.kill_clean_locked() {
-                tracing::debug!(target: "session.lifecycle", session = %self.id, %error, "pane cleanup failed");
-            }
-            self.release_scope().err()
-        } else {
-            None
-        };
+        let cleanup = cleanup.filter(|probe| {
+            !error.is::<super::kill::RuntimeRemovedCleanupFailed>()
+                && !error.is::<crate::session::NativeStoreUnavailable>()
+                && !error.is::<crate::session::SessionCommitApplied>()
+                && error.downcast_ref::<super::start::LaunchPublicationFailure>()
+                    != Some(&super::start::LaunchPublicationFailure::Unconfirmed)
+                && (probe.expected.matches_launch_observation(row)
+                    || prior.is_some_and(|prior| prior.matches(row)))
+        });
+        let scope_failure = cleanup.and_then(|probe| self.clean_failed_launch_runtime(probe).err());
+        self.last_error_evidence = None;
         self.last_error = Some(
             if let Some(refusal) = error.downcast_ref::<ManagedResumeRefused>() {
                 tracing::warn!(
@@ -873,10 +932,42 @@ mod tests {
         }
     }
 
+    fn failed_launch_birth(
+        row: &Instance,
+    ) -> (
+        crate::tmux::test_helpers::TmuxTestSession,
+        super::super::resume::LaunchProbe,
+    ) {
+        let session = row.tmux_session().unwrap();
+        let cleanup = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        session
+            .create_with_size(
+                &row.project_path,
+                Some("sleep 60"),
+                None,
+                &row.source_profile,
+            )
+            .expect("managed rollback fixture must really create its pane");
+        let observed = row
+            .capture_revival_target()
+            .unwrap()
+            .expect("managed rollback fixture must have physical birth evidence");
+        assert_eq!(observed.state, crate::tmux::utils::PaneProbe::Alive);
+        let probe = super::super::resume::LaunchProbe {
+            tmux_session: session.name().to_owned(),
+            pane: Some(observed.pane),
+            expected: row.conversation_state(),
+        };
+        (cleanup, probe)
+    }
+
     #[test]
     #[serial_test::serial]
     fn managed_refusal_retains_cleanup_diagnostics_without_public_reflection() {
         use crate::process::worker_registry::ScopeOwnership;
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
 
         for cleanup_pane in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -907,8 +998,15 @@ mod tests {
             let error =
                 anyhow::anyhow!("private-primary-diagnostic").context(ManagedResumeRefused(cause));
             let logs = crate::session::test_support::LogCapture::start();
+            let birth = cleanup_pane.then(|| failed_launch_birth(&row));
 
-            row.fail_reserved_launch(&storage, generation, &error, cleanup_pane);
+            row.fail_reserved_launch(
+                &storage,
+                generation,
+                &error,
+                birth.as_ref().map(|(_, probe)| probe),
+                None,
+            );
 
             let public = row.last_error.as_deref().unwrap();
             assert!(!public.contains(&scope_diagnostic), "{public}");
@@ -1418,6 +1516,190 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn indeterminate_release_publishes_only_cas_owned_adopted_workdir() {
+        for change in [
+            "adopted",
+            "backfilled_id",
+            "peer_workdir",
+            "peer_container",
+            "peer_name",
+            "peer_disabled",
+            "peer_conversation",
+            "runtime_container",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let mut instance =
+                Instance::new("indeterminate-workdir", root.path().to_str().unwrap());
+            instance.source_profile = "indeterminate-workdir".into();
+            let mut sandbox = crate::session::instance::test_helpers::test_sandbox(
+                "original-container",
+                Some("/recorded"),
+            );
+            sandbox.container_id = (change != "backfilled_id").then(|| "container-1".into());
+            instance.sandbox_info = Some(sandbox);
+            let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+            storage
+                .update(|rows, _| {
+                    rows.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let generation = instance
+                .acquire_lifecycle_reservation(
+                    &storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )
+                .unwrap();
+            let original = instance.sandbox_info.as_ref().unwrap();
+            let snapshot = resume::LaunchSandboxSnapshot {
+                container_name: original.container_name.clone(),
+                container_id: original.container_id.clone(),
+                workdir: original.container_workdir.clone(),
+            };
+            let probe = resume::LaunchProbe {
+                tmux_session: String::new(),
+                pane: None,
+                expected: instance.conversation_state(),
+            };
+            let current = instance.sandbox_info.as_mut().unwrap();
+            current.container_workdir = Some("/actual".into());
+            current.container_id = Some(
+                if change == "runtime_container" {
+                    "replacement"
+                } else {
+                    "container-1"
+                }
+                .into(),
+            );
+            storage
+                .update(|rows, _| {
+                    let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                    if change == "peer_conversation" {
+                        row.agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
+                    }
+                    let stored = row.sandbox_info.as_mut().unwrap();
+                    stored.extra_env = Some(vec!["PEER=preserved".into()]);
+                    stored.provider = Some("peer-provider".into());
+                    match change {
+                        "peer_workdir" => stored.container_workdir = Some("/peer".into()),
+                        "peer_container" => stored.container_id = Some("replacement".into()),
+                        "peer_name" => stored.container_name = "replacement".into(),
+                        "peer_disabled" => stored.enabled = false,
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            instance
+                .release_indeterminate_launch(&storage, generation, &probe, Some(&snapshot))
+                .unwrap();
+            let row = storage.load().unwrap().remove(0);
+            let stored = row.sandbox_info.as_ref().unwrap();
+            assert_eq!(
+                stored.container_workdir.as_deref(),
+                Some(match change {
+                    "adopted" | "backfilled_id" => "/actual",
+                    "peer_workdir" => "/peer",
+                    _ => "/recorded",
+                }),
+                "{change}"
+            );
+            assert!(matches!(
+                stored.extra_env.as_deref(),
+                Some([value]) if value == "PEER=preserved"
+            ));
+            assert_eq!(stored.provider.as_deref(), Some("peer-provider"));
+            assert_eq!(
+                stored.container_id.as_deref(),
+                if change == "peer_container" {
+                    Some("replacement")
+                } else {
+                    snapshot.container_id.as_deref()
+                }
+            );
+            assert!(row.lifecycle_reservation.is_none());
+            assert_eq!(row.lifecycle_generation, generation);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn indeterminate_creation_release_preserves_concurrent_status_and_generation() {
+        for status in [
+            Status::Creating,
+            Status::Starting,
+            Status::Running,
+            Status::Waiting,
+            Status::Error,
+            Status::Stopped,
+        ] {
+            for superseded in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+                let mut instance = Instance::new(
+                    "indeterminate-create-release",
+                    root.path().to_str().unwrap(),
+                );
+                instance.source_profile = "indeterminate-create-release".into();
+                let storage =
+                    crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+                storage
+                    .update(|rows, _| {
+                        rows.push(instance.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                let generation = instance
+                    .acquire_lifecycle_reservation(
+                        &storage,
+                        LifecycleOperation::Launch,
+                        Some(Status::Creating),
+                    )
+                    .unwrap();
+                let probe = resume::LaunchProbe {
+                    tmux_session: String::new(),
+                    pane: None,
+                    expected: instance.conversation_state(),
+                };
+                storage
+                    .update(|rows, _| {
+                        rows[0].status = status;
+                        if superseded {
+                            rows[0].lifecycle_generation += 1;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                let result =
+                    instance.release_indeterminate_launch(&storage, generation, &probe, None);
+                let stored = storage.load().unwrap().remove(0);
+                if superseded {
+                    assert!(result.unwrap_err().is::<LifecycleReservationError>());
+                    assert_eq!(stored.status, status);
+                    assert_eq!(stored.lifecycle_generation, generation + 1);
+                    assert!(stored.lifecycle_reservation.is_some());
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        stored.status,
+                        if status == Status::Creating {
+                            Status::Starting
+                        } else {
+                            status
+                        }
+                    );
+                    assert_eq!(instance.status, stored.status);
+                    assert_eq!(stored.lifecycle_generation, generation);
+                    assert!(stored.lifecycle_reservation.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn failed_launch_releases_reservation_after_status_drift() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
@@ -1456,7 +1738,7 @@ mod tests {
         inst.ensure_reservation_current_or_fail(&storage, reserved_gen)
             .unwrap();
         let error = anyhow::anyhow!("launch failed after status drift");
-        inst.fail_reserved_launch(&storage, reserved_gen, &error, false);
+        inst.fail_reserved_launch(&storage, reserved_gen, &error, None, None);
 
         let leftover = storage
             .update(|instances, _groups| {
@@ -1485,6 +1767,11 @@ mod tests {
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "lifecycle-rollback-scope";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let _socket = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", temp.path().join("tmux.sock"));
         let held_at_release = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&held_at_release);
         let _probe = crate::process::systemd::release_probe::install(move |id| {
@@ -1499,7 +1786,7 @@ mod tests {
             seen.borrow_mut().push((id.to_string(), held));
         });
         let reserved = |id: &str| {
-            let mut inst = Instance::new(id, "/tmp/test");
+            let mut inst = Instance::new(id, temp.path().to_str().unwrap());
             inst.source_profile = profile.to_string();
             storage
                 .update(|instances, _groups| {
@@ -1518,7 +1805,14 @@ mod tests {
         let error = anyhow::anyhow!("pinned launch exited");
 
         let mut rolled_back = reserved("rolled-back");
-        rolled_back.fail_reserved_launch(&storage, rolled_back.lifecycle_generation, &error, true);
+        let (_rollback_cleanup, rollback_birth) = failed_launch_birth(&rolled_back);
+        rolled_back.fail_reserved_launch(
+            &storage,
+            rolled_back.lifecycle_generation,
+            &error,
+            Some(&rollback_birth),
+            None,
+        );
         assert_eq!(
             *held_at_release.borrow(),
             [(rolled_back.id.clone(), Some(LifecycleOperation::Launch))]
@@ -1534,10 +1828,17 @@ mod tests {
         held_at_release.borrow_mut().clear();
 
         let mut kept_pane = reserved("kept-pane");
-        kept_pane.fail_reserved_launch(&storage, kept_pane.lifecycle_generation, &error, false);
+        kept_pane.fail_reserved_launch(
+            &storage,
+            kept_pane.lifecycle_generation,
+            &error,
+            None,
+            None,
+        );
         let restarted = reserved("restarted");
         restarted.kill_clean_locked().unwrap();
         let mut superseded = reserved("superseded");
+        let (_superseded_cleanup, superseded_birth) = failed_launch_birth(&superseded);
         storage
             .update(|instances, _groups| {
                 let stored = instances
@@ -1548,7 +1849,18 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        superseded.fail_reserved_launch(&storage, superseded.lifecycle_generation, &error, true);
+        superseded.fail_reserved_launch(
+            &storage,
+            superseded.lifecycle_generation,
+            &error,
+            Some(&superseded_birth),
+            None,
+        );
+        assert_eq!(
+            &superseded.capture_revival_target().unwrap().unwrap().pane,
+            superseded_birth.pane.as_ref().unwrap(),
+            "a superseding durable generation must preserve the captured physical producer"
+        );
         assert!(held_at_release.borrow().is_empty());
     }
 

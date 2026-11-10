@@ -944,50 +944,54 @@ async fn serve_connection(
             }
         };
 
-        let invocation_api = api.clone();
         let invocation_ctx = ctx.clone();
-        let invocation_deps = session_rpc.cloned();
         let params = request.params;
         let method_log = method.clone();
-        let outcome = work
-            .run("plugin.rpc", async move {
-                if crate::plugin::session_api::handles(&method) {
-                    match invocation_deps {
-                        Some(deps) => {
-                            crate::plugin::session_api::dispatch(
-                                &deps,
-                                &invocation_ctx,
-                                &method,
-                                &params,
-                            )
-                            .await
-                        }
-                        None => {
-                            let unavailable = crate::plugin::host_api::DispatchError::with_kind(
-                                codes::SERVICE_UNAVAILABLE,
-                                "service_unavailable",
-                                "session service is not available in this host",
-                            );
-                            match crate::plugin::session_api::required_capability(&method) {
-                                Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
-                                None => Err(unavailable),
-                            }
+        let outcome = if crate::plugin::session_api::handles(&method) {
+            let invocation_deps = session_rpc.cloned();
+            // Bound the heavy session future before supervised spawning, not at
+            // Tokio's final spawn after its concrete value crossed each wrapper.
+            let invocation = Box::pin(async move {
+                match invocation_deps {
+                    Some(deps) => {
+                        crate::plugin::session_api::dispatch(
+                            &deps,
+                            &invocation_ctx,
+                            &method,
+                            &params,
+                        )
+                        .await
+                    }
+                    None => {
+                        let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                            codes::SERVICE_UNAVAILABLE,
+                            "service_unavailable",
+                            "session service is not available in this host",
+                        );
+                        match crate::plugin::session_api::required_capability(&method) {
+                            Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
+                            None => Err(unavailable),
                         }
                     }
-                } else {
-                    tokio::task::spawn_blocking(move || {
-                        dispatch(&invocation_api, &invocation_ctx, &method, &params)
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(target: "plugin.host", %error, "host dispatch task failed");
-                        Err(crate::plugin::host_api::DispatchError::internal(
-                            "host dispatch task failed",
-                        ))
-                    })
                 }
+            });
+            work.run("plugin.rpc", invocation).await
+        } else {
+            let invocation_api = api.clone();
+            work.run("plugin.rpc", async move {
+                tokio::task::spawn_blocking(move || {
+                    dispatch(&invocation_api, &invocation_ctx, &method, &params)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(target: "plugin.host", %error, "host dispatch task failed");
+                    Err(crate::plugin::host_api::DispatchError::internal(
+                        "host dispatch task failed",
+                    ))
+                })
             })
-            .await;
+            .await
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {

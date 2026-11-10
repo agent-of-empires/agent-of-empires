@@ -53,10 +53,12 @@ export const HOST_STATE_VARS = new Set([
   "AOE_HOOK_ATOMIC_UMASK_CHILD_BASE",
   "AOE_PRIME_CENSUS_CHILD",
   "AOE_RUNNER_EXPIRY_CHILD",
+  "AOE_TEST_ACP_RUNNER_EXE",
   "AOE_TUI_TEST_CHILD",
   "AOE_TUI_TEST_ENTERED",
   "AOE_UDS_UMASK_TEST_CHILD",
   "AOE_UDS_UMASK_TEST_ENTERED",
+  "AOE_VT_BRIDGE_TEST_SOCKET",
   "AOE_GITHUB_CLONE_BASE", // redirects plugin clones at a host path or tree
   "AOE_OPEN_URL_TO", // appends every URL the TUI opens to a host file
   "AOE_SERVE_INSTANCE_ID", // identifies a host daemon process as this one

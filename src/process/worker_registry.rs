@@ -28,6 +28,10 @@ pub enum ScopeOwnership {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
+    /// Missing/null means unknown. Only an actual runner publication claims a
+    /// control protocol; generic records must not invent legacy capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_protocol_version: Option<u32>,
     /// Build identity of the runner that wrote the record; independent of `runner_version`.
     /// Legacy records default to "", which forces a one-time respawn.
     #[serde(default)]
@@ -59,6 +63,166 @@ pub struct WorkerRecord {
     pub detached_at: Option<u64>,
 }
 
+/// Non-destructive admission refusal, independent of native process liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRefusalReason {
+    ProtocolUnknown,
+    ProtocolIncompatible,
+    OwnershipUnconfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlAdmissionRefusal {
+    pub reason: ControlRefusalReason,
+    pub owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+    pub declared_protocol: Option<u32>,
+    pub observed_protocol: Option<u32>,
+    pub route_fingerprint: Option<[u8; 32]>,
+}
+
+impl ControlAdmissionRefusal {
+    pub fn from_record(record: &WorkerRecord, reason: ControlRefusalReason) -> Self {
+        Self {
+            reason,
+            owner: Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                record,
+            )),
+            declared_protocol: record.control_protocol_version,
+            observed_protocol: None,
+            route_fingerprint: Some(control_route_fingerprint(&expected_socket(record))),
+        }
+    }
+
+    pub fn unconfirmed(owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>) -> Self {
+        Self {
+            reason: ControlRefusalReason::OwnershipUnconfirmed,
+            owner,
+            declared_protocol: None,
+            observed_protocol: None,
+            route_fingerprint: None,
+        }
+    }
+}
+
+impl ControlAdmissionRefusal {
+    pub(crate) fn observation(self) -> crate::acp::state::AcpConnectionUnavailability {
+        use crate::acp::state::{AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource};
+        crate::acp::state::AcpConnectionUnavailability {
+            source: AcpConnectionSource::RunnerRecord,
+            cause: match self.reason {
+                ControlRefusalReason::ProtocolUnknown => AcpConnectionCause::ControlProtocolUnknown,
+                ControlRefusalReason::ProtocolIncompatible => {
+                    AcpConnectionCause::ControlProtocolIncompatible
+                }
+                ControlRefusalReason::OwnershipUnconfirmed => {
+                    AcpConnectionCause::OwnershipUnconfirmed
+                }
+            },
+            phase: AcpConnectionPhase::Establishing,
+        }
+    }
+}
+
+impl std::fmt::Display for ControlAdmissionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.reason {
+            ControlRefusalReason::ProtocolUnknown => "retained runtime control protocol is unknown",
+            ControlRefusalReason::ProtocolIncompatible => {
+                "retained runtime control protocol is incompatible"
+            }
+            ControlRefusalReason::OwnershipUnconfirmed => {
+                "retained runtime control ownership could not be confirmed"
+            }
+        })
+    }
+}
+
+/// Metadata is a prerequisite to dialing, never proof of native usability.
+pub fn control_protocol_refusal(record: &WorkerRecord) -> Option<ControlAdmissionRefusal> {
+    let reason = match record.control_protocol_version {
+        None => ControlRefusalReason::ProtocolUnknown,
+        Some(version) if version != crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION => {
+            ControlRefusalReason::ProtocolIncompatible
+        }
+        Some(_) if record.runner_identity.is_none() => ControlRefusalReason::OwnershipUnconfirmed,
+        Some(_) => return None,
+    };
+    Some(ControlAdmissionRefusal::from_record(record, reason))
+}
+
+/// An unavailable socket is not evidence that its recorded process died.
+pub(crate) fn retained_process_may_be_alive(record: &WorkerRecord) -> bool {
+    if !is_pid_alive(record.pid) {
+        return false;
+    }
+    match (
+        record.runner_identity.as_ref(),
+        crate::process::process_birth_identity(record.pid),
+    ) {
+        (Some(expected), Ok(Some(current))) => expected == &current,
+        _ => true,
+    }
+}
+
+/// Refuse unknown live ownership before reconciliation or replacement side effects.
+pub(crate) fn control_admission(
+    session_id: &str,
+) -> std::result::Result<Option<WorkerRecord>, ControlAdmissionRefusal> {
+    let guard = try_registry_lock(session_id)
+        .map_err(|_| ControlAdmissionRefusal::unconfirmed(None))?
+        .ok_or_else(|| ControlAdmissionRefusal::unconfirmed(None))?;
+    guard.control_admission()
+}
+
+fn control_admission_for_record(
+    session_id: &str,
+    record: Option<WorkerRecord>,
+) -> std::result::Result<Option<WorkerRecord>, ControlAdmissionRefusal> {
+    let record = match record {
+        Some(record) if retained_process_may_be_alive(&record) => {
+            if let Some(refusal) = control_protocol_refusal(&record) {
+                return Err(refusal);
+            }
+            return match socket_exists(&expected_socket(&record)) {
+                true => Ok(Some(record)),
+                false => Err(ControlAdmissionRefusal::from_record(
+                    &record,
+                    ControlRefusalReason::OwnershipUnconfirmed,
+                )),
+            };
+        }
+        record => record,
+    };
+    let socket = match record.as_ref() {
+        Some(record) => expected_socket(record),
+        None => socket_path_for(session_id)
+            .map(|path| crate::process::worker::control_socket_sibling(&path))
+            .map_err(|_| ControlAdmissionRefusal::unconfirmed(None))?,
+    };
+    match crate::process::worker::observe_socket_peer(&socket) {
+        Ok(None) => Ok(record),
+        Ok(Some(_)) | Err(_) => {
+            Err(ControlAdmissionRefusal::unconfirmed(record.as_ref().map(
+                crate::acp::runner_lifecycle::RunnerIdentity::from_record,
+            )))
+        }
+    }
+}
+
+pub(crate) fn control_route_fingerprint(path: &Path) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(path.as_os_str().as_encoded_bytes()).into()
+}
+
+/// A refusal is conditional on its original owner and declaration, not a worker epoch.
+pub(crate) fn refusal_still_applies(session_id: &str, refusal: &ControlAdmissionRefusal) -> bool {
+    match try_registry_lock(session_id) {
+        Ok(Some(registry)) => registry.refusal_still_applies(refusal),
+        Ok(None) | Err(_) => true,
+    }
+}
+
 impl WorkerRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -76,6 +240,7 @@ impl WorkerRecord {
     ) -> Self {
         Self {
             runner_version: RUNNER_VERSION,
+            control_protocol_version: None,
             build_version: crate::build_info::BUILD_VERSION.to_string(),
             session_id,
             pid,
@@ -117,6 +282,166 @@ pub(crate) struct StopIntent {
     token: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("worker registry admission is busy")]
+pub(crate) struct RegistryBusy;
+
+pub(crate) struct RegistryGuard<'a> {
+    session_id: &'a str,
+    _file: std::fs::File,
+}
+
+impl RegistryGuard<'_> {
+    pub(crate) fn record(&self) -> Result<Option<WorkerRecord>> {
+        load_strict_unlocked(self.session_id)
+    }
+
+    pub(crate) fn stop(&self) -> Result<Option<StopIntent>> {
+        stop_intent(self.session_id)
+    }
+
+    pub(crate) fn claim_stop(&self, observed: &StopIntent) -> Result<Option<WorkerRecord>> {
+        if self.stop()?.as_ref() != Some(observed) {
+            return Ok(None);
+        }
+        Ok(self.record()?.filter(|record| {
+            record.session_id == self.session_id
+                && record.pid == observed.pid
+                && record.generation == observed.generation
+                && record.runner_identity.is_some()
+        }))
+    }
+
+    pub(crate) fn verify_resume(
+        &self,
+        authority: ResumeAuthority,
+        observed: &Option<StopIntent>,
+    ) -> Result<()> {
+        let current = self.stop()?;
+        let record = self.record()?;
+        anyhow::ensure!(
+            &current == observed,
+            "worker stop intent changed before resume"
+        );
+        if current.is_some() {
+            anyhow::ensure!(
+                authority == ResumeAuthority::Explicit,
+                "worker stop intent fences automatic resume"
+            );
+            anyhow::ensure!(record.is_none(), "worker shutdown remains unsettled");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit_resume(
+        &self,
+        authority: ResumeAuthority,
+        observed: &Option<StopIntent>,
+    ) -> Result<()> {
+        self.verify_resume(authority, observed)?;
+        if observed.is_some() {
+            std::fs::remove_file(stop_path(self.session_id)?)?;
+            std::fs::File::open(workers_dir()?)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn control_admission(
+        &self,
+    ) -> std::result::Result<Option<WorkerRecord>, ControlAdmissionRefusal> {
+        control_admission_for_record(self.session_id, self.record().map_err(|error| {
+            warn!(target: "acp.registry", session = self.session_id, ?error, "control ownership read failed");
+            ControlAdmissionRefusal::unconfirmed(None)
+        })?)
+    }
+
+    pub(crate) fn revalidate_control_record(
+        &self,
+        frozen: &WorkerRecord,
+    ) -> std::result::Result<(), ControlAdmissionRefusal> {
+        let owner = crate::acp::runner_lifecycle::RunnerIdentity::from_record(frozen);
+        if let Some(refusal) = control_protocol_refusal(frozen) {
+            return Err(refusal);
+        }
+        match self.control_admission() {
+            Ok(Some(current))
+                if owner.owns_record(&current) && current.socket_path == frozen.socket_path =>
+            {
+                Ok(())
+            }
+            Err(refusal) if refusal.owner == Some(owner) => Err(refusal),
+            _ => Err(ControlAdmissionRefusal::unconfirmed(Some(owner))),
+        }
+    }
+
+    pub(crate) fn refusal_still_applies(&self, refusal: &ControlAdmissionRefusal) -> bool {
+        match self.record() {
+            Ok(Some(current)) => refusal.owner.is_some_and(|owner| {
+                owner.owns_record(&current)
+                    && retained_process_may_be_alive(&current)
+                    && current.control_protocol_version == refusal.declared_protocol
+                    && refusal.route_fingerprint.is_none_or(|route| {
+                        route == control_route_fingerprint(&expected_socket(&current))
+                    })
+            }),
+            Err(_) => {
+                refusal.owner.is_none()
+                    && refusal.reason == ControlRefusalReason::OwnershipUnconfirmed
+            }
+            Ok(None) => match refusal.owner {
+                Some(owner) => {
+                    is_pid_alive(owner.pid)
+                        && match crate::process::process_birth_identity(owner.pid) {
+                            Ok(Some(birth)) => Some(birth.fingerprint()) == owner.birth_fingerprint,
+                            _ => true,
+                        }
+                }
+                None => self.control_admission().is_err(),
+            },
+        }
+    }
+
+    pub(crate) fn clear_restart_for(&self, frozen: &WorkerRecord) -> Result<bool> {
+        let Some(current) = self.record()? else {
+            return Ok(false);
+        };
+        if frozen.session_id != self.session_id
+            || frozen.runner_identity.is_none()
+            || !same_runner(&current, frozen)
+            || peek_restart_marker(self.session_id) != Some(frozen.generation)
+        {
+            return Ok(false);
+        }
+        std::fs::remove_file(restart_marker_path(self.session_id)?)?;
+        Ok(true)
+    }
+
+    pub(crate) fn claim_restart_for_owner(
+        &self,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+    ) -> Result<bool> {
+        if owner.birth_fingerprint.is_none()
+            || self
+                .record()?
+                .as_ref()
+                .is_some_and(|record| !owner.owns_record(record))
+            || peek_restart_marker(self.session_id) != Some(owner.generation)
+        {
+            return Ok(false);
+        }
+        Ok(self.claim_restart() == Some(Some(owner.generation)))
+    }
+
+    pub(crate) fn claim_restart(&self) -> Option<Option<u64>> {
+        let path = restart_marker_path(self.session_id).ok()?;
+        let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
+        std::fs::rename(&path, &claim).ok()?;
+        let generation = crate::process::worker::read_restart_marker(&claim);
+        let _ = std::fs::remove_file(claim);
+        Some(generation)
+    }
+}
+
 fn stop_path(session_id: &str) -> Result<PathBuf> {
     validate_session_id(session_id)?;
     Ok(workers_dir()?.join(format!("{session_id}.stop")))
@@ -150,7 +475,7 @@ fn same_runner(current: &WorkerRecord, selected: &WorkerRecord) -> bool {
 }
 
 pub(crate) fn request_stop(selected: &WorkerRecord) -> Result<StopIntent> {
-    with_registry_lock(&selected.session_id, || {
+    with_registry_admission(&selected.session_id, || {
         let current = load_strict_unlocked(&selected.session_id)?
             .context("worker disappeared before stop admission")?;
         anyhow::ensure!(
@@ -175,28 +500,13 @@ pub(crate) fn admit_resume(
     authority: ResumeAuthority,
     observed: &Option<StopIntent>,
 ) -> Result<()> {
-    with_registry_lock(session_id, || {
-        let current = stop_intent(session_id)?;
-        let record = load_strict_unlocked(session_id)?;
-        if current.is_none() {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            authority == ResumeAuthority::Explicit && &current == observed,
-            "worker stop intent fences automatic or superseded resume"
-        );
-        anyhow::ensure!(
-            record.is_none(),
-            "worker shutdown is not settled; resume remains fenced"
-        );
-        std::fs::remove_file(stop_path(session_id)?)?;
-        std::fs::File::open(workers_dir()?)?.sync_all()?;
-        Ok(())
-    })
+    try_registry_lock(session_id)?
+        .ok_or(RegistryBusy)?
+        .admit_resume(authority, observed)
 }
 
 pub(crate) fn retire_selected(selected: &WorkerRecord) -> Result<()> {
-    with_registry_lock(&selected.session_id, || {
+    with_registry_admission(&selected.session_id, || {
         if let Some(current) = load_strict_unlocked(&selected.session_id)? {
             anyhow::ensure!(
                 same_runner(&current, selected),
@@ -207,37 +517,42 @@ pub(crate) fn retire_selected(selected: &WorkerRecord) -> Result<()> {
     })
 }
 
-pub(crate) fn register_runner(record: &WorkerRecord) -> Result<tokio::net::UnixListener> {
-    with_registry_lock(&record.session_id, || {
-        anyhow::ensure!(
-            stop_intent(&record.session_id)?.is_none(),
-            "worker launch cancelled by a stop request"
-        );
-        anyhow::ensure!(
-            load_strict_unlocked(&record.session_id)?.is_none(),
-            "previous worker ownership remains"
-        );
-        anyhow::ensure!(
-            record.runner_identity.is_some(),
-            "new runner birth identity unavailable"
-        );
-        let control = crate::process::worker::control_socket_sibling(&record.socket_path);
-        anyhow::ensure!(
-            crate::process::worker::peer_pid_from_socket(&control).is_none(),
-            "worker control socket still has a live owner"
-        );
-        if control.try_exists()? {
-            std::fs::remove_file(&control)?;
-        }
-        let listener = tokio::net::UnixListener::bind(&control)?;
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600))?;
-        if let Err(error) = save_unlocked(record) {
-            let _ = std::fs::remove_file(&control);
-            return Err(error);
-        }
-        Ok(listener)
-    })
+pub(crate) fn register_runner(
+    record: &WorkerRecord,
+    registry: &RegistryGuard<'_>,
+) -> Result<tokio::net::UnixListener> {
+    anyhow::ensure!(
+        registry.session_id == record.session_id,
+        "runner registration scope changed"
+    );
+    anyhow::ensure!(
+        stop_intent(&record.session_id)?.is_none(),
+        "worker launch cancelled by a stop request"
+    );
+    anyhow::ensure!(
+        load_strict_unlocked(&record.session_id)?.is_none(),
+        "previous worker ownership remains"
+    );
+    anyhow::ensure!(
+        record.runner_identity.is_some(),
+        "new runner birth identity unavailable"
+    );
+    let control = crate::process::worker::control_socket_sibling(&record.socket_path);
+    anyhow::ensure!(
+        crate::process::worker::peer_pid_from_socket(&control).is_none(),
+        "worker control socket still has a live owner"
+    );
+    if control.try_exists()? {
+        std::fs::remove_file(&control)?;
+    }
+    let listener = tokio::net::UnixListener::bind(&control)?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&control, std::fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = save_unlocked(record) {
+        let _ = std::fs::remove_file(&control);
+        return Err(error);
+    }
+    Ok(listener)
 }
 
 pub(crate) fn recover_worker(session_id: &str) -> Result<()> {
@@ -310,25 +625,30 @@ pub fn restart_marker_path(session_id: &str) -> Result<PathBuf> {
     crate::process::worker::restart_marker_path(&workers_dir()?, session_id)
 }
 
-pub fn mark_restart_pending(session_id: &str, generation: u64) {
-    let Ok(path) = restart_marker_path(session_id) else {
-        return;
-    };
-    // Published by rename so a claim can never see a half-written marker.
+pub fn mark_restart_pending(session_id: &str, generation: u64) -> Result<()> {
+    let _guard = try_registry_lock(session_id)?.ok_or(RegistryBusy)?;
+    let path = restart_marker_path(session_id)?;
     let staged = path.with_extension(format!("restart.tmp-{}", std::process::id()));
     if let Err(error) = std::fs::write(&staged, generation.to_string()) {
         warn!(target: "acp.registry", session = %session_id, %error, "failed to write restart marker");
-        return;
+        return Err(error.into());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600));
+        if let Err(error) =
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error.into());
+        }
     }
     if let Err(error) = std::fs::rename(&staged, &path) {
         warn!(target: "acp.registry", session = %session_id, %error, "failed to write restart marker");
-        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(staged);
+        return Err(error.into());
     }
+    Ok(())
 }
 
 pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
@@ -339,23 +659,12 @@ pub fn peek_restart_marker(session_id: &str) -> Option<u64> {
 /// Renamed aside before reading, so a marker for a newer runner written in between survives.
 /// `None` when absent; `Some(None)` when it names no generation.
 pub fn claim_restart_marker(session_id: &str) -> Option<Option<u64>> {
-    let path = restart_marker_path(session_id).ok()?;
-    let claim = path.with_extension(format!("restart.claim-{}", std::process::id()));
-    std::fs::rename(&path, &claim).ok()?;
-    let generation = crate::process::worker::read_restart_marker(&claim);
-    let _ = std::fs::remove_file(&claim);
-    Some(generation)
+    try_registry_lock(session_id).ok()??.claim_restart()
 }
 
 /// A zero marker matches only a zero identity. The file is removed either way.
 pub fn take_restart_marker(session_id: &str, generation: u64) -> bool {
     claim_restart_marker(session_id).flatten() == Some(generation)
-}
-
-pub fn clear_restart_marker(session_id: &str) {
-    if let Ok(path) = restart_marker_path(session_id) {
-        let _ = std::fs::remove_file(&path);
-    }
 }
 
 pub fn save(record: &WorkerRecord) -> Result<()> {
@@ -376,7 +685,7 @@ fn save_unlocked(record: &WorkerRecord) -> Result<()> {
         .context("publishing worker record")
 }
 
-pub(crate) fn acquire_registry_lock(session_id: &str) -> Result<std::fs::File> {
+fn open_registry_lock(session_id: &str) -> Result<std::fs::File> {
     validate_session_id(session_id)?;
     let lock_path = workers_dir()?.join(format!("{session_id}.lock"));
     let lock_file = std::fs::OpenOptions::new()
@@ -391,10 +700,64 @@ pub(crate) fn acquire_registry_lock(session_id: &str) -> Result<std::fs::File> {
         use std::os::unix::fs::PermissionsExt;
         let _ = lock_file.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
+    Ok(lock_file)
+}
+
+pub(crate) fn acquire_registry_lock(session_id: &str) -> Result<std::fs::File> {
+    let lock_file = open_registry_lock(session_id)?;
     lock_file
         .lock_exclusive()
         .with_context(|| format!("locking worker registry entry {session_id}"))?;
     Ok(lock_file)
+}
+
+pub(crate) fn try_registry_lock(session_id: &str) -> Result<Option<RegistryGuard<'_>>> {
+    let file = open_registry_lock(session_id)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(RegistryGuard {
+            session_id,
+            _file: file,
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) async fn registry_lock_until(
+    session_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<RegistryGuard<'_>> {
+    let file = open_registry_lock(session_id)?;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RegistryBusy.into());
+        }
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => {
+                return Ok(RegistryGuard {
+                    session_id,
+                    _file: file,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Err(RegistryBusy.into());
+                }
+                tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(2)))
+                    .await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn with_registry_admission<T>(
+    session_id: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let _registry = try_registry_lock(session_id)?.ok_or(RegistryBusy)?;
+    operation()
 }
 
 pub(crate) fn with_registry_lock<T>(
@@ -434,7 +797,7 @@ pub fn load(session_id: &str) -> Result<Option<WorkerRecord>> {
 /// Locked, strict read for destructive ownership decisions. Unlike [`load`],
 /// malformed or unreadable state remains an error instead of looking absent.
 pub(crate) fn load_strict(session_id: &str) -> Result<Option<WorkerRecord>> {
-    with_registry_lock(session_id, || load_strict_unlocked(session_id))
+    try_registry_lock(session_id)?.ok_or(RegistryBusy)?.record()
 }
 fn load_strict_unlocked(session_id: &str) -> Result<Option<WorkerRecord>> {
     let path = record_path(session_id)?;
@@ -965,7 +1328,7 @@ mod tests {
         assert!(admit_resume(id, ResumeAuthority::Automatic, &Some(first.clone())).is_err());
         assert!(admit_resume(id, ResumeAuthority::Explicit, &Some(first.clone())).is_err());
         let replacement = record.clone().with_generation(2);
-        assert!(register_runner(&replacement).is_err());
+        assert!(register_runner(&replacement, &try_registry_lock(id).unwrap().unwrap()).is_err());
         assert_eq!(
             crate::process::worker::peer_pid_from_socket(&control),
             Some(std::process::id())
@@ -976,7 +1339,8 @@ mod tests {
         assert!(admit_resume(id, ResumeAuthority::Explicit, &Some(first)).is_err());
         assert!(stop_requested(id));
         admit_resume(id, ResumeAuthority::Explicit, &Some(latest)).unwrap();
-        let listener = register_runner(&replacement).unwrap();
+        let listener =
+            register_runner(&replacement, &try_registry_lock(id).unwrap().unwrap()).unwrap();
         assert!(!stop_requested(id));
         assert_eq!(load(id).unwrap().unwrap().generation, 2);
         let newer = request_stop(&replacement).unwrap();
@@ -1516,10 +1880,31 @@ mod tests {
 
     #[test]
     #[serial]
+    fn restart_publication_refuses_busy_registry_without_a_late_or_silent_write() {
+        with_temp_home(|| {
+            mark_restart_pending("busy-marker", 7).unwrap();
+            let registry = try_registry_lock("busy-marker").unwrap().unwrap();
+            let error = mark_restart_pending("busy-marker", 8).unwrap_err();
+            assert!(error.is::<RegistryBusy>());
+            assert_eq!(peek_restart_marker("busy-marker"), Some(7));
+            drop(registry);
+            assert_eq!(
+                peek_restart_marker("busy-marker"),
+                Some(7),
+                "a refused publisher cannot mutate after the flock is released"
+            );
+            mark_restart_pending("busy-marker", 8).unwrap();
+            assert_eq!(claim_restart_marker("busy-marker"), Some(Some(8)));
+            assert_eq!(peek_restart_marker("busy-marker"), None);
+        });
+    }
+
+    #[test]
+    #[serial]
     fn restart_marker_authority_is_bound_to_a_generation() {
         with_temp_home(|| {
             assert!(!take_restart_marker("m", 7), "no marker, nothing to take");
-            mark_restart_pending("m", 7);
+            mark_restart_pending("m", 7).unwrap();
             assert_eq!(peek_restart_marker("m"), Some(7));
             assert!(
                 !take_restart_marker("m", 8),
@@ -1527,16 +1912,16 @@ mod tests {
             );
             assert_eq!(peek_restart_marker("m"), None, "but it is still consumed");
 
-            mark_restart_pending("m", 7);
+            mark_restart_pending("m", 7).unwrap();
             assert!(take_restart_marker("m", 7));
             assert_eq!(peek_restart_marker("m"), None);
 
-            mark_restart_pending("m", 0);
+            mark_restart_pending("m", 0).unwrap();
             assert!(
                 !take_restart_marker("m", 7),
                 "a legacy marker grants nothing to a generation it did not name"
             );
-            mark_restart_pending("m", 0);
+            mark_restart_pending("m", 0).unwrap();
             assert!(
                 take_restart_marker("m", 0),
                 "a legacy marker restarts a legacy (pre-generation) runner"
@@ -1557,9 +1942,9 @@ mod tests {
             assert!(!path.exists(), "a claim leaves nothing behind");
             assert_eq!(claim_restart_marker("m"), None, "nothing left to claim");
 
-            mark_restart_pending("m", 8);
+            mark_restart_pending("m", 8).unwrap();
             let claimed = claim_restart_marker("m");
-            mark_restart_pending("m", 9);
+            mark_restart_pending("m", 9).unwrap();
             assert_eq!(claimed, Some(Some(8)));
             assert_eq!(peek_restart_marker("m"), Some(9));
             let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
@@ -1571,7 +1956,7 @@ mod tests {
                 leftovers.is_empty(),
                 "publication leaves no staging file: {leftovers:?}"
             );
-            clear_restart_marker("m");
+            assert_eq!(claim_restart_marker("m"), Some(Some(9)));
             assert!(!path.exists());
         });
     }

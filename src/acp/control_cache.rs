@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use super::state::{AcpState, Event};
+use super::state::{AcpState, Event, NativeControlFailure, NativeEventSubject, NativeSubjectEvent};
 use crate::session::Status;
 
 /// A session's folded control state and how far it has been folded.
@@ -14,8 +14,16 @@ struct Cached {
     last_seq: u64,
 }
 
-/// Per-session slot.
-type Slot = Arc<Mutex<Option<Cached>>>;
+/// One slot for the historical fold and bounded, non-durable native facts.
+#[derive(Debug, Default)]
+struct SessionSlot {
+    cached: Option<Cached>,
+    native_scope: Option<crate::acp::state::NativeObservationScope>,
+    failed_availability: Option<(u64, NativeEventSubject)>,
+    failed_control: Option<(u64, NativeEventSubject)>,
+}
+
+type Slot = Arc<Mutex<SessionSlot>>;
 
 #[derive(Debug, Default)]
 pub struct ControlStateCache {
@@ -39,7 +47,7 @@ impl ControlStateCache {
         let mut map = lock(&self.sessions);
         Arc::clone(
             map.entry(session_id.to_string())
-                .or_insert_with(|| Arc::new(Mutex::new(None))),
+                .or_insert_with(|| Arc::new(Mutex::new(SessionSlot::default()))),
         )
     }
 
@@ -49,18 +57,26 @@ impl ControlStateCache {
     pub fn apply_if_cached(&self, session_id: &str, seq: u64, event: &Event) -> Option<Status> {
         let slot = self.slot(session_id);
         let mut guard = lock(&slot);
-        let cached = guard.as_mut()?;
+        // A profile/incarnation scope alone is not a connection verdict. Keep
+        // each historical sidebar edge unless actual native facts need projection.
+        let conditional_native = guard.failed_availability.is_some()
+            || guard.failed_control.is_some()
+            || guard.cached.as_ref().is_some_and(|cached| {
+                cached.state.native_availability.is_some()
+                    || cached.state.connection_unavailable.is_some()
+            });
+        let cached = guard.cached.as_mut()?;
         if seq == cached.last_seq {
             // Exact repeat of the seq we already folded: a benign publish
             // retry (the store reports these as primary-key collisions).
             return None;
         }
         if seq != cached.last_seq + 1 || cached.state.apply_event(seq, event.clone()).is_err() {
-            *guard = None;
+            guard.cached = None;
             return None;
         }
         cached.last_seq = seq;
-        Some(cached.state.sidebar_status())
+        (!conditional_native).then(|| cached.state.sidebar_status())
     }
 
     /// The cached fold's sidebar status, or `None` if nothing is cached. Never
@@ -69,13 +85,55 @@ impl ControlStateCache {
     pub fn sidebar_status(&self, session_id: &str) -> Option<crate::session::Status> {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
-        guard.as_ref().map(|c| c.state.sidebar_status())
+        if guard.failed_availability.is_some()
+            || guard.failed_control.is_some()
+            || guard.cached.as_ref().is_some_and(|cached| {
+                cached.state.native_availability.is_some()
+                    || cached.state.connection_unavailable.is_some()
+            })
+        {
+            return None;
+        }
+        guard.cached.as_ref().map(|c| c.state.sidebar_status())
     }
 
     /// Drop a session's fold.
     pub fn forget(&self, session_id: &str) {
         let mut map = lock(&self.sessions);
         map.remove(session_id);
+    }
+
+    /// An append failure is not durable history. Retain only its original,
+    /// bounded semantics, scoped just like a live native observation.
+    pub(crate) fn record_failed_observation(
+        &self,
+        session_id: &str,
+        seq: u64,
+        subject: Option<NativeEventSubject>,
+    ) {
+        let slot = self.slot(session_id);
+        let mut guard = lock(&slot);
+        if guard
+            .cached
+            .as_ref()
+            .is_some_and(|cached| cached.last_seq >= seq)
+        {
+            return;
+        }
+        guard.cached = None;
+        let Some(subject) = subject else { return };
+        let target = match subject.kind {
+            NativeSubjectEvent::ChannelReady
+            | NativeSubjectEvent::ChannelUnavailable(_)
+            | NativeSubjectEvent::AdmissionRefusal(_) => &mut guard.failed_availability,
+            NativeSubjectEvent::PromptDiagnostic
+            | NativeSubjectEvent::StartupDiagnostic
+            | NativeSubjectEvent::TurnEnded => &mut guard.failed_control,
+            NativeSubjectEvent::BindingObserved | NativeSubjectEvent::RuntimeObservation => return,
+        };
+        if target.is_none_or(|(previous, _)| previous < seq) {
+            *target = Some((seq, subject));
+        }
     }
 
     /// The session's control state, running `hydrate` on a miss.
@@ -86,15 +144,157 @@ impl ControlStateCache {
     ) -> AcpState {
         let slot = self.slot(session_id);
         let mut guard = lock(&slot);
-        if let Some(cached) = guard.as_ref() {
+        if let Some(cached) = guard.cached.as_ref() {
             return cached.state.clone();
         }
         let (state, last_seq) = hydrate();
-        *guard = Some(Cached {
+        guard.cached = Some(Cached {
             state: state.clone(),
             last_seq,
         });
         state
+    }
+
+    /// Bounded qualifiers only: preflight does not clone warm control payloads.
+    pub(crate) fn native_metadata(
+        &self,
+        session_id: &str,
+    ) -> Option<(Option<(u64, NativeEventSubject)>, u64)> {
+        let slot = self.slot(session_id);
+        let guard = lock(&slot);
+        guard.cached.as_ref().map(|cached| {
+            (
+                cached.state.native_availability,
+                cached.state.native_control_seq,
+            )
+        })
+    }
+
+    pub(crate) fn native_projection(
+        &self,
+        session_id: &str,
+        mut historical: Option<(u64, NativeEventSubject)>,
+        mut control_seq: u64,
+        identity: Option<(String, chrono::DateTime<chrono::Utc>, u64)>,
+        current: Option<crate::acp::state::CurrentNativeAvailability>,
+    ) -> Result<
+        crate::acp::state::NativeAvailabilityProjection,
+        crate::acp::state::NativeObservationWait,
+    > {
+        let slot = self.slot(session_id);
+        let scope = identity.and_then(|(profile, created_at, generation)| {
+            let storage = crate::session::Storage::open_reference(&profile).ok()?;
+            let context = crate::acp::state::NativeEventContext::capture_identity(
+                session_id, created_at, generation, &storage,
+            )
+            .ok()?;
+            let mut guard = lock(&slot);
+            if let Some(scope) = guard
+                .native_scope
+                .as_ref()
+                .filter(|scope| scope.context == context)
+            {
+                return Some(scope.clone());
+            }
+            let scope = crate::acp::state::NativeObservationScope {
+                context,
+                choice: None,
+                fence: crate::session::NativeInputFence::capture_route(
+                    storage.profile(),
+                    session_id,
+                    created_at,
+                    generation,
+                    false,
+                    Some(storage.bound_profile_identity().ok()?),
+                )
+                .ok()?,
+            };
+            guard.native_scope = Some(scope.clone());
+            Some(scope)
+        });
+        let Some(scope) = scope else {
+            return Ok(crate::acp::state::NativeAvailabilityProjection::default());
+        };
+        let _native_guard = match scope.fence.try_lock_observation_matching(|_| true) {
+            Ok(Some(guard)) => guard,
+            Ok(None) => return Err(crate::acp::state::NativeObservationWait::native(&scope)),
+            Err(_) => return Ok(crate::acp::state::NativeAvailabilityProjection::default()),
+        };
+        let context = Some(scope.context);
+        let current = match current {
+            Some(mut current) if Some(current.context) == context => {
+                let valid = current.refresh(session_id)?;
+                let owner_current = current.owner.is_none_or(|owner| {
+                    NativeEventSubject {
+                        context: current.context,
+                        owner: Some(owner),
+                        kind: NativeSubjectEvent::RuntimeObservation,
+                    }
+                    .owner_is_current(session_id)
+                });
+                (valid && owner_current).then_some(current)
+            }
+            _ => None,
+        };
+        let (cached_availability, cached_control_seq, failed_availability, failed_control) = {
+            let guard = lock(&slot);
+            (
+                guard
+                    .cached
+                    .as_ref()
+                    .and_then(|cached| cached.state.native_availability),
+                guard
+                    .cached
+                    .as_ref()
+                    .map_or(0, |cached| cached.state.native_control_seq),
+                guard.failed_availability,
+                guard.failed_control,
+            )
+        };
+        control_seq = control_seq.max(cached_control_seq);
+        for observed in [cached_availability, failed_availability]
+            .into_iter()
+            .flatten()
+        {
+            if historical.is_none_or(|(previous, _)| observed.0 > previous) {
+                historical = Some(observed);
+            }
+        }
+        let historical_owner_current = historical.is_some_and(|(_, subject)| {
+            if Some(subject.context) != context {
+                return false;
+            }
+            subject.owner_is_current(session_id)
+        });
+        let refusal = if context.is_some() && current.is_none() {
+            crate::process::worker_registry::control_admission(session_id).err()
+        } else {
+            None
+        };
+        let mut projection = crate::acp::state::NativeAvailabilityProjection::resolve(
+            historical,
+            context,
+            current.as_ref(),
+            historical_owner_current,
+            refusal,
+        );
+        projection.control_failure = failed_control
+            .filter(|(seq, subject)| {
+                *seq > control_seq
+                    && Some(subject.context) == context
+                    && (current
+                        .as_ref()
+                        .is_some_and(|current| current.owner == subject.owner)
+                        || subject.owner_is_current(session_id))
+            })
+            .and_then(|(seq, subject)| match subject.kind {
+                NativeSubjectEvent::PromptDiagnostic | NativeSubjectEvent::TurnEnded => {
+                    Some((seq, NativeControlFailure::Prompt))
+                }
+                NativeSubjectEvent::StartupDiagnostic => Some((seq, NativeControlFailure::Startup)),
+                _ => None,
+            });
+        Ok(projection)
     }
 
     /// Whether the session has a hydrated fold, with no locking beyond the
@@ -104,7 +304,7 @@ impl ControlStateCache {
     pub fn is_hydrated(&self, session_id: &str) -> bool {
         let slot = self.slot(session_id);
         let guard = lock(&slot);
-        guard.is_some()
+        guard.cached.is_some()
     }
 }
 

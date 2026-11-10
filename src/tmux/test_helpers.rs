@@ -57,6 +57,55 @@ pub(crate) fn only_pane_id(session_name: &str) -> String {
     id
 }
 
+/// Wait for the real agent beneath the protected-environment pane shell.
+/// A pane's command can remain `sh` while its launched child has already exec'd.
+pub(crate) fn wait_for_pane_agent_command(
+    pane_id: &str,
+    agent_pid_file: &std::path::Path,
+    expected: &str,
+) -> u32 {
+    let pane_pid = pane_field(pane_id, "#{pane_pid}")
+        .parse::<u32>()
+        .expect("pane PID");
+    let pane_birth = crate::process::process_birth_identity(pane_pid)
+        .unwrap()
+        .expect("live pane birth before agent readiness");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(pid) = std::fs::read_to_string(agent_pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            if let Some((_, argv0)) = crate::process::parent_and_argv0(pid) {
+                if std::path::Path::new(&argv0).file_name() == Some(std::ffi::OsStr::new(expected))
+                {
+                    let agent_birth = crate::process::process_birth_identity(pid)
+                        .unwrap()
+                        .expect("agent command has a real process birth");
+                    let mut ancestor = pid;
+                    while ancestor != pane_pid && ancestor > 1 {
+                        ancestor = crate::process::parent_and_argv0(ancestor)
+                            .expect("read actual agent ancestry")
+                            .0;
+                    }
+                    assert_eq!(ancestor, pane_pid, "agent must belong to this exact pane");
+                    assert!(crate::process::process_birth_is_live(pid, &agent_birth).unwrap());
+                    assert!(crate::process::process_birth_is_live(pane_pid, &pane_birth).unwrap());
+                    assert_eq!(pane_field(pane_id, "#{pane_pid}"), pane_pid.to_string());
+                    assert_eq!(pane_field(pane_id, "#{pane_dead}"), "0");
+                    return pid;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pane {pane_id} never launched a real {expected:?} agent from {}",
+            agent_pid_file.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub(crate) fn wait_for_pane_command(pane_id: &str, expected: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {

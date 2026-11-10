@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{
+    init_git_repo, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
+};
 
 /// Pushes an absolute- and a relative-href `detail-badge` per session, writes
 /// a marker on `plugin.command.invoke`, and fires a relative-href
@@ -327,21 +329,7 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
     std::fs::write(&script_path, r#"{ "turns": [] }"#).expect("write fake ACP script");
     h.install_acp_shim(&script_path);
     let project = h.project_path();
-    for args in [
-        vec!["init", "-q"],
-        vec!["commit", "--allow-empty", "-q", "-m", "init"],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&project)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("run git");
-        assert!(output.status.success(), "git {args:?} failed");
-    }
+    init_git_repo(&project);
     h.stop_daemon_on_drop();
     let port = pick_free_port();
     let port_s = port.to_string();

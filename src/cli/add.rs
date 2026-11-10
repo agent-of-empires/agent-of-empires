@@ -424,6 +424,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     rows: std::num::NonZeroU16::new(rows)?,
                 })
             }),
+            expected: None,
         };
         Some(await_launch(
             async { Ok(client.ensure_agent(&row.id, &request, &epoch).await?) },
@@ -466,7 +467,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                                 == Some(receipt.outcome.tmux_session.as_str())),
                 "Session changed before attachment; attach explicitly"
             );
-            crate::tmux::Session::from_name(&receipt.outcome.tmux_session).attach()?;
+            let physical = receipt
+                .outcome
+                .physical
+                .context("Physical terminal ownership unavailable; attach explicitly")?;
+            crate::tmux::Session::from_observation(&receipt.outcome.tmux_session, physical)
+                .attach()?;
         } else {
             println!("(session started without local attachment; use the Daemon host or dashboard to view it)");
         }
