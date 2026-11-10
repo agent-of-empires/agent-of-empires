@@ -1754,11 +1754,12 @@ impl Instance {
                     &self.effective_profile(),
                 );
                 let entries = self.resolved_host_environment_from(config.environment);
-                let (environment, raw_environment) = host_launch_environment_from(
+                let (mut environment, raw_environment) = host_launch_environment_from(
                     std::env::vars_os(),
                     &entries,
                     (agent.name == "opencode").then_some(config.session.inherit_host_environment),
                 );
+                environment.extend(parsed.assignments);
                 let path = environment
                     .get("PATH")
                     .map(std::ffi::OsStr::new)
@@ -1844,9 +1845,9 @@ impl Instance {
                 "managed conversation requires a direct native command or an explicitly declared wrapper"
             ).context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let words =
-            shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
-        let program = words.first().context("empty agent command")?;
+        let parsed = super::launch_command::parse_launch_command(command)
+            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        let program = parsed.words.first().context("empty agent command")?;
         let direct = AGENTS.iter().find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
@@ -1897,8 +1898,9 @@ impl Instance {
             )
             .context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let mut words = shell_words::split(self.get_tool_command())
-            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        let mut words = super::launch_command::parse_launch_command(self.get_tool_command())
+            .context(ManagedResumeCause::UnsupportedManagedArguments)?
+            .words;
         words.extend(
             shell_words::split(&extra).context(ManagedResumeCause::UnsupportedManagedArguments)?,
         );
@@ -1925,15 +1927,17 @@ impl Instance {
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut resolved_target_session_id = None;
         let mut inputs = self.native_launch_inputs(agent, &config)?;
+        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())
+            .context("native program is missing")?;
+        inputs.environment.extend(parsed.assignments);
         anyhow::ensure!(
             inputs.container.as_ref().is_none_or(|container| {
                 container.runtime.kind != crate::session::ContainerRuntimeName::AppleContainer
             }),
             "managed conversation requires an immutable container execution identity"
         );
-        let words = shell_words::split(self.get_tool_command())?;
         let program =
-            inputs.resolve_program(words.first().context("native program is missing")?)?;
+            inputs.resolve_program(parsed.words.first().context("native program is missing")?)?;
         anyhow::ensure!(
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
@@ -3056,7 +3060,9 @@ impl Instance {
         else {
             return Ok(command);
         };
-        let mut words = shell_words::split(&command)?;
+        let parsed = super::launch_command::parse_launch_command(&command)
+            .context("native program is missing")?;
+        let mut words = parsed.words;
         *words.first_mut().context("native program is missing")? = program
             .to_str()
             .context("native executable path is not UTF-8")?
@@ -3071,7 +3077,17 @@ impl Instance {
                 ),
             }
         }
-        Ok(shell_words::join(words))
+        if parsed.assignments.is_empty() {
+            Ok(shell_words::join(words))
+        } else {
+            let assignments = parsed
+                .assignments
+                .into_iter()
+                .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Ok(format!("{assignments} {}", shell_words::join(words)))
+        }
     }
 }
 
@@ -3781,6 +3797,70 @@ mod tests {
         ));
         assert_eq!(execution.target_session_id.as_deref(), Some(sid));
         assert_eq!(instance.agent_session_binding, Some(original));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_launch_attests_prefix_environment_and_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _config = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let store = root.path().join("store with spaces");
+        std::fs::create_dir_all(&store).unwrap();
+        let bin = root.path().join("bin");
+        let mut instance = Instance::new("prefix-attestation", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = format!(
+            "PATH={} CLAUDE_CONFIG_DIR={} 'claude'",
+            shell_words::quote(bin.to_str().unwrap()),
+            shell_words::quote(store.to_str().unwrap())
+        );
+        let execution = instance.resolve_native_execution(None).unwrap();
+        assert_eq!(
+            execution.program.canonicalize().unwrap(),
+            bin.join("claude").canonicalize().unwrap()
+        );
+        assert_eq!(execution.binding.stores, [store.canonicalize().unwrap()]);
+        let frozen = instance
+            .freeze_native_invocation(
+                instance.command.clone(),
+                Some(&execution),
+                None,
+                &AgentLaunchContext::host(Some(execution.agent), None),
+            )
+            .unwrap();
+        let parsed = super::super::launch_command::parse_launch_command(&frozen).unwrap();
+        assert_eq!(parsed.words[0], execution.program.to_str().unwrap());
+        assert_eq!(
+            parsed.assignments,
+            [
+                ("PATH".into(), bin.to_str().unwrap().into()),
+                ("CLAUDE_CONFIG_DIR".into(), store.to_str().unwrap().into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn assignments_and_quoted_executable_keep_direct_capture_identity() {
+        let mut instance = Instance::new("prefix", "/tmp");
+        instance.tool = "omp".into();
+        instance.command = "TOKEN='a b' 'omp' --verbose".into();
+        let agent = crate::agents::get_agent("omp").unwrap();
+        assert!(instance.launch_invokes_resolved_agent_directly(agent));
+        assert_eq!(
+            Instance::execution_agent_for("omp", &instance.command, &Default::default())
+                .unwrap()
+                .name,
+            "omp"
+        );
+        assert!(instance.managed_user_argv(agent).is_ok());
+        instance.command = "'TOKEN=value' omp".into();
+        assert!(!instance.launch_invokes_resolved_agent_directly(agent));
     }
 
     #[test]
