@@ -136,11 +136,11 @@ it("keeps earlier skips and confirmations as later steps are saved", async () =>
       <Harness />
     </MemoryRouter>,
   );
-  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  fireEvent.click(await enabled("Next"));
   await screen.findByRole("heading", { name: "Worktrees" });
   fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
   await screen.findByRole("heading", { name: "Sandbox" });
-  fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+  fireEvent.click(await enabled("Next"));
   await screen.findByRole("heading", { name: "Notifications and access" });
   expect(patches).toEqual([
     { confirmed_steps: ["project"] },
@@ -152,7 +152,7 @@ it("keeps earlier skips and confirmations as later steps are saved", async () =>
 it("stays on the step and reports it when keeping the defaults fails to save", async () => {
   server.use(http.patch("*/api/setup", () => HttpResponse.json({ message: "Disk full" }, { status: 500 })));
   renderPage(status(["agents"]), "/setup?step=sandbox");
-  fireEvent.click(await screen.findByRole("button", { name: "Next" }));
+  fireEvent.click(await enabled("Next"));
   expect((await screen.findByRole("alert")).textContent).toBe("Disk full");
   expect(screen.getByRole("heading", { name: "Sandbox" })).toBeTruthy();
 });
@@ -182,7 +182,7 @@ it("telemetry waits for the saved choice, then Next saves it instead of confirmi
   await act(async () => answer());
   const sharing = await screen.findByRole("radio", { name: /Share anonymous usage counts/ });
   expect((sharing as HTMLInputElement).checked).toBe(true);
-  fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  fireEvent.click(await enabled("Next"));
   await screen.findByRole("heading", { name: "Agents" });
   expect(consent).toEqual([{ enabled: true }]);
   expect(patches).toEqual([]);
