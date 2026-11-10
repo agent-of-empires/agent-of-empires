@@ -3414,6 +3414,10 @@ mod tests {
         if let Some(directory) = std::env::var_os("AOE_TEST_CONTROL_RESTORE_CHILD") {
             use std::os::unix::fs::OpenOptionsExt;
             let directory = std::path::PathBuf::from(directory);
+            let failure = directory.join("panic");
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = std::fs::write(&failure, info.to_string());
+            }));
             let _home = crate::session::test_support::isolate_app_dir_at(&directory.join("home"));
             crate::session::get_profile_dir("test").unwrap();
             let slave = std::fs::OpenOptions::new()
@@ -3450,6 +3454,7 @@ mod tests {
                     status
                 })
                 .unwrap();
+            std::fs::write(directory.join("handoff-returned"), b"ready").unwrap();
             assert!(result.success());
             assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
             assert!(app.event_stream.is_some());
@@ -3589,9 +3594,11 @@ mod tests {
         let emitted = reader.join().unwrap();
         assert!(
             status.is_some_and(|status| status.success()),
-            "child failed (paused={}, waiting_input={}, sent={sent}, input_error={input_error:?}, resume_error={resume_error:?}, kill_error={kill_error:?}): {}",
+            "child failed (paused={}, handoff_returned={}, waiting_input={}, sent={sent}, input_error={input_error:?}, resume_error={resume_error:?}, kill_error={kill_error:?}, private_child_panic={:?}): {}",
             directory.path().join("output-paused").exists(),
+            directory.path().join("handoff-returned").exists(),
             directory.path().join("waiting-input").exists(),
+            std::fs::read_to_string(directory.path().join("panic")),
             String::from_utf8_lossy(&emitted)
         );
         assert!(
