@@ -443,12 +443,15 @@ pub(crate) async fn resume_rate_limited(
     {
         return Err(SupervisorError::SpawnCancelled(id.to_owned()));
     }
-    match prepared {
+    let outcome = match prepared {
         Some(prepared) => {
-            install_prepared_continuation(state, id, &submission, prepared, outcome).await?;
+            install_prepared_continuation(state, id, &submission, prepared, outcome).await?
         }
-        None => state.session_service.clear_pending_initial_turn(id).await,
-    }
+        None => {
+            state.session_service.clear_pending_initial_turn(id).await;
+            outcome
+        }
+    };
     let handled = match outcome {
         ContinuationOutcome::Stands | ContinuationOutcome::Installed => {
             state
