@@ -1315,6 +1315,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
         Event::BackgroundAgentProgress { .. } => "background_agent_progress",
         Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
+        Event::SubagentUpdated { .. } => "subagent_updated",
         Event::BackgroundTaskStarted { .. } => "background_task_started",
         Event::BackgroundTaskFinished { .. } => "background_task_finished",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",

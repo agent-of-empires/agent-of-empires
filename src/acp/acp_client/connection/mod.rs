@@ -10,6 +10,7 @@ mod command_loop;
 mod establish;
 mod notifications;
 mod prompt;
+mod subagents;
 #[cfg(test)]
 mod tests;
 
@@ -41,7 +42,7 @@ use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::{captured_rate_limit_resets_at, classify_rate_limit_from_message};
-use super::session_identity::{SessionIngress, SessionIngressNotification};
+use super::session_identity::{RequestPolicy, SessionIngress, SessionIngressNotification};
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
@@ -116,7 +117,7 @@ macro_rules! resource_requests {
                         let (res, ingress) = (res.clone(), ingress.clone());
                         async move {
                             // A foreign session's callback performs no effect.
-                            let _guard = match ingress.request(&request.session_id).await {
+                            let _guard = match ingress.request(&request.session_id, RequestPolicy::ParentOnly).await {
                                 Ok(guard) => guard,
                                 Err(error) => return reply(responder, Err(error)),
                             };
@@ -272,7 +273,11 @@ pub(super) async fn run_connection_task<W, R>(
                       _conn| {
                     let (shared, pending) = (shared.clone(), pending.clone());
                     async move {
-                        let _guard = match shared.ingress.request(&request.session_id).await {
+                        let _guard = match shared
+                            .ingress
+                            .request(&request.session_id, RequestPolicy::ParentOrChild)
+                            .await
+                        {
                             Ok(guard) => guard,
                             Err(error) => return reply(responder, Err(error)),
                         };
@@ -303,7 +308,10 @@ pub(super) async fn run_connection_task<W, R>(
                         // Only a session-scoped elicitation carries an identity
                         // to fence on.
                         let _guard = if let ElicitationScope::Session(scope) = request.scope() {
-                            match ingress.request(&scope.session_id).await {
+                            match ingress
+                                .request(&scope.session_id, RequestPolicy::ParentOrChild)
+                                .await
+                            {
                                 Ok(guard) => Some(guard),
                                 Err(error) => return reply(responder, Err(error)),
                             }

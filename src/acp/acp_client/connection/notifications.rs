@@ -3,7 +3,7 @@
 
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
-use crate::acp::state::{BackgroundTaskLaunch, Event};
+use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
 use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionNotification, SessionUpdate,
@@ -80,6 +80,8 @@ pub(super) struct Shared {
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
+    /// Merged snapshot per subagent session; see `subagents.rs`.
+    pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     claude_home: Option<std::path::PathBuf>,
@@ -128,6 +130,7 @@ impl Shared {
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
+            subagents: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
             claude_home,
@@ -204,6 +207,23 @@ impl Shared {
         mut notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
+        // Subagent traffic never feeds the root session's dedup, compaction
+        // or watchdog state: a busy child would hold its parent's turn open.
+        let from_child = self.ingress.child_route(&notification.session_id).is_some();
+        match notification.update {
+            SessionUpdate::SubagentUpdate(update) => {
+                return self
+                    .handle_subagent_update(notification.session_id, update)
+                    .await;
+            }
+            SessionUpdate::SessionMessage(_) | SessionUpdate::SessionMessageChunk(_) => return,
+            update if from_child => {
+                return self
+                    .handle_child_notification(notification.session_id, update)
+                    .await;
+            }
+            update => notification.update = update,
+        }
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
@@ -305,7 +325,9 @@ impl Shared {
                 ..
             } = &event
             {
-                if !suppressing && !output_file.is_empty() {
+                // A subagents session gets the agent's state from its child
+                // session, so nothing tails the transcript.
+                if !suppressing && !output_file.is_empty() && !self.profile.supports_subagents {
                     spawn_tailer(
                         agent_id.clone(),
                         output_file.clone(),

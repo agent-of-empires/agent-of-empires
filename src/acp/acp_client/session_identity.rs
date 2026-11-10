@@ -1,10 +1,14 @@
 //! Native session admission, selected only by the connection lifecycle.
 
-use agent_client_protocol::v1::schema::{RequestId, SessionId, SessionNotification};
+use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::v1::schema::{
+    RequestId, SessionId, SessionNotification, SessionUpdate, SubagentUpdate,
+};
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{
     Agent, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, UntypedMessage,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StateMutex;
@@ -24,6 +28,9 @@ use crate::acp::state::{AuthStatus, AUTH_STATUS_UPDATE_METHOD};
 // Direct stdio has no detached queue and bounds its typed notification payload.
 const MAX_PENDING_UPDATES: usize = MAX_CONTROL_QUEUE_FRAMES;
 const MAX_PENDING_BYTES: usize = MAX_CONTROL_QUEUE_BYTES;
+
+// Bounds the child routes one connection can admit.
+const MAX_CHILDREN: usize = 256;
 
 // Only the daemon control reader writes this synthetic transport field.
 pub(super) const CONTROL_FRAME_BYTES_FIELD: &str = "__aoe_control_frame_bytes";
@@ -150,9 +157,66 @@ pub(super) struct SessionIngress {
 #[derive(Default)]
 struct IdentityState {
     current: Option<SessionId>,
+    /// Subagent sessions announced by an admitted session. Routing metadata
+    /// only; titles and state live in the reduced event state.
+    children: HashMap<SessionId, ChildRoute>,
     pending: Option<Establishment>,
     generation: u64,
     failed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ChildRoute {
+    pub(super) parent: SessionId,
+    pub(super) cancel_capable: bool,
+}
+
+/// Which sessions a request handler may act for.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum RequestPolicy {
+    /// Handlers that resolve paths or processes against the root session's
+    /// own workspace.
+    ParentOnly,
+    ParentOrChild,
+}
+
+/// An admitted session's `subagent_update` admits the child it names, so a
+/// child cannot be routable before its parent announced it, and an announcement
+/// cannot re-parent or loop the tree.
+fn register_child(
+    children: &mut HashMap<SessionId, ChildRoute>,
+    root: Option<&SessionId>,
+    notification: &SessionNotification,
+) {
+    let SessionUpdate::SubagentUpdate(update) = &notification.update else {
+        return;
+    };
+    let parent = &notification.session_id;
+    let child = &update.session_id;
+    if Some(parent) != root && !children.contains_key(parent) {
+        return;
+    }
+    if child == parent || Some(child) == root {
+        return;
+    }
+    match children.get(child) {
+        Some(existing) if existing.parent != *parent => return,
+        None if children.len() >= MAX_CHILDREN => return,
+        _ => {}
+    }
+    let route = children.entry(child.clone()).or_insert_with(|| ChildRoute {
+        parent: parent.clone(),
+        cancel_capable: false,
+    });
+    route.cancel_capable = cancel_capable(update, route.cancel_capable);
+}
+
+fn cancel_capable(update: &SubagentUpdate, current: bool) -> bool {
+    match &update.capabilities {
+        MaybeUndefined::Undefined => current,
+        MaybeUndefined::Null => false,
+        MaybeUndefined::Value(capabilities) => capabilities.cancel.is_some(),
+    }
 }
 
 struct Establishment {
@@ -186,6 +250,8 @@ impl std::io::Write for PendingByteCount {
 #[derive(PartialEq)]
 enum RequestAdmission {
     Reject,
+    /// A registered child asked for something only the root session may do.
+    RootOnly,
     AwaitCommit,
     Active,
 }
@@ -240,13 +306,29 @@ impl SessionIngress {
         if state.failed {
             return Err(Self::overflow_error());
         }
-        let mut updates = state
+        let pending = state
             .pending
             .take()
             .map(|pending| pending.updates)
             .unwrap_or_default();
-        updates.retain(|notification| Some(&notification.session_id) == id.as_ref());
+        // A failed reset keeps its session, so its children stay routable.
+        let mut children = if state.current == id {
+            std::mem::take(&mut state.children)
+        } else {
+            HashMap::new()
+        };
+        // Wire order: an announcement admits the child frames after it.
+        let mut updates = Vec::with_capacity(pending.len());
+        for notification in pending {
+            if Some(&notification.session_id) == id.as_ref()
+                || children.contains_key(&notification.session_id)
+            {
+                register_child(&mut children, id.as_ref(), &notification);
+                updates.push(notification);
+            }
+        }
         state.current = id;
+        state.children = children;
         drop(state);
         self.changed.notify_waiters();
         Ok(updates)
@@ -305,10 +387,26 @@ impl SessionIngress {
             pending.updates.push(notification);
             return Ok(None);
         }
-        Ok((state.current.as_ref() == Some(&notification.session_id)).then_some(notification))
+        if state.current.as_ref() != Some(&notification.session_id)
+            && !state.children.contains_key(&notification.session_id)
+        {
+            return Ok(None);
+        }
+        // Registered under the state lock so the next child frame cannot
+        // reach the fence before its route exists.
+        let IdentityState {
+            current, children, ..
+        } = &mut *state;
+        register_child(children, current.as_ref(), &notification);
+        Ok(Some(notification))
     }
 
-    fn request_admission(&self, id: &SessionId) -> RequestAdmission {
+    /// Route of a subagent session, valid while the caller holds the fence.
+    pub(super) fn child_route(&self, id: &SessionId) -> Option<ChildRoute> {
+        self.state.lock().unwrap().children.get(id).cloned()
+    }
+
+    fn request_admission(&self, id: &SessionId, policy: RequestPolicy) -> RequestAdmission {
         let state = self.state.lock().unwrap();
         if state.failed {
             return RequestAdmission::Reject;
@@ -322,6 +420,11 @@ impl SessionIngress {
         }
         if state.current.as_ref() == Some(id) {
             RequestAdmission::Active
+        } else if state.children.contains_key(id) {
+            match policy {
+                RequestPolicy::ParentOrChild => RequestAdmission::Active,
+                RequestPolicy::ParentOnly => RequestAdmission::RootOnly,
+            }
         } else {
             RequestAdmission::Reject
         }
@@ -330,21 +433,27 @@ impl SessionIngress {
     pub(super) async fn request(
         &self,
         id: &SessionId,
+        policy: RequestPolicy,
     ) -> agent_client_protocol::Result<MutexGuard<'_, ()>> {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            match self.request_admission(id) {
+            match self.request_admission(id, policy) {
                 RequestAdmission::Reject => {
                     let mut error = agent_client_protocol::Error::invalid_params();
                     error.message = "sessionId does not identify the active native session".into();
                     return Err(error);
                 }
+                RequestAdmission::RootOnly => {
+                    let mut error = agent_client_protocol::Error::invalid_params();
+                    error.message = "subagent sessions cannot make this request".into();
+                    return Err(error);
+                }
                 RequestAdmission::AwaitCommit => changed.await,
                 RequestAdmission::Active => {
                     let guard = self.fence.lock().await;
-                    if self.request_admission(id) == RequestAdmission::Active {
+                    if self.request_admission(id, policy) == RequestAdmission::Active {
                         return Ok(guard);
                     }
                     drop(guard);
@@ -536,5 +645,96 @@ mod tests {
                 assert!(ingress.route(notif("s"), None).is_err());
             }
         }
+    }
+
+    fn announce(parent: &str, child: &str) -> SessionNotification {
+        serde_json::from_value(serde_json::json!({
+            "sessionId": parent,
+            "update": { "sessionUpdate": "subagent_update", "sessionId": child },
+        }))
+        .expect("subagent_update")
+    }
+
+    async fn admitted(ingress: &SessionIngress, n: SessionNotification) -> bool {
+        ingress.notification(n, None).await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn an_announced_child_is_routed_and_an_unannounced_one_is_not() {
+        let ingress = SessionIngress::new(Some(SessionId::from("root")));
+        assert!(!admitted(&ingress, notif("c1")).await);
+        assert!(admitted(&ingress, announce("root", "c1")).await);
+        assert!(admitted(&ingress, notif("c1")).await);
+        // Grandchildren hang off an admitted child; a stranger cannot adopt one.
+        assert!(admitted(&ingress, announce("c1", "c2")).await);
+        assert!(admitted(&ingress, notif("c2")).await);
+        assert!(!admitted(&ingress, announce("stranger", "c3")).await);
+        assert!(!admitted(&ingress, notif("c3")).await);
+        // No re-parenting, self-parenting, or adopting the root.
+        for (parent, child) in [("root", "c2"), ("c1", "c1"), ("c1", "root")] {
+            admitted(&ingress, announce(parent, child)).await;
+        }
+        for (id, expected) in [("c2", Some("c1")), ("c1", Some("root")), ("root", None)] {
+            let route = ingress.child_route(&SessionId::from(id));
+            assert_eq!(
+                route.map(|r| r.parent),
+                expected.map(SessionId::from),
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_from_a_child_obey_the_policy() {
+        let ingress = SessionIngress::new(Some(SessionId::from("root")));
+        let child = SessionId::from("c1");
+        let err = |e: agent_client_protocol::Error| e.message;
+        assert!(ingress
+            .request(&child, RequestPolicy::ParentOrChild)
+            .await
+            .is_err());
+        admitted(&ingress, announce("root", "c1")).await;
+        assert!(ingress
+            .request(&child, RequestPolicy::ParentOrChild)
+            .await
+            .is_ok());
+        let refused = ingress
+            .request(&child, RequestPolicy::ParentOnly)
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err(refused), "subagent sessions cannot make this request");
+        assert!(ingress
+            .request(&SessionId::from("root"), RequestPolicy::ParentOnly)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn children_survive_a_failed_reset_and_not_a_successful_one() {
+        let root = SessionId::from("root");
+        let ingress = SessionIngress::new(Some(root.clone()));
+        admitted(&ingress, announce("root", "c1")).await;
+
+        // Wire order: a frame before its announcement is dropped, one after
+        // it is replayed.
+        ingress.begin();
+        for n in [
+            notif("c2"),
+            announce("root", "c2"),
+            notif("c2"),
+            notif("c1"),
+        ] {
+            assert!(!admitted(&ingress, n).await);
+        }
+        let replay = ingress.finish(Some(root.clone())).unwrap();
+        let ids: Vec<_> = replay.iter().map(|n| n.session_id.0.to_string()).collect();
+        assert_eq!(ids, ["root", "c2", "c1"]);
+        assert!(admitted(&ingress, notif("c1")).await);
+        assert!(admitted(&ingress, notif("c2")).await);
+
+        ingress.begin();
+        ingress.finish(Some(SessionId::from("fresh"))).unwrap();
+        assert!(!admitted(&ingress, notif("c1")).await);
     }
 }

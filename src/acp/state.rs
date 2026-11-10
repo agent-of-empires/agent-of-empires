@@ -365,6 +365,10 @@ pub enum BackgroundAgentStatus {
     Running,
     /// No transcript growth for the idle window.
     Stalled,
+    /// A subagent session is blocked on the user (RFD `requires_action`).
+    RequiresAction,
+    /// The agent cannot say what the subagent is doing (RFD `unknown`).
+    Unknown,
     Completed,
     /// The parent session ended before the agent finished.
     Detached,
@@ -431,6 +435,46 @@ pub struct WorkflowRef {
     pub run_id: String,
     pub name: String,
     pub phase: String,
+}
+
+/// Work state of a subagent session, from the ACP subagents RFD snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentState {
+    Running,
+    RequiresAction,
+    /// Ready for another prompt; `SubagentRecord::stop_reason` says why.
+    Idle,
+    /// Also the state before the agent has reported one.
+    #[default]
+    Unknown,
+}
+
+/// One subagent session announced by its parent. The event carries the whole
+/// merged snapshot, so replay is last-write-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRecord {
+    pub session_id: String,
+    pub parent_session_id: String,
+    /// The `Task`/`Agent` tool call that spawned it, from the adapter's
+    /// `_meta.<ns>.parentToolUseId`. Unset renders the child in a flat roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub state: SubagentState,
+    /// Open string: the RFD reserves values for future stop reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Whether `session/cancel` may target this child.
+    #[serde(default)]
+    pub cancel_capable: bool,
+    /// Read-only: the child's own model selector, never set by aoe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One tool call a background sub-agent made, parsed from its transcript.
@@ -533,6 +577,8 @@ pub struct AcpState {
     pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentRecord>,
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<String>,
@@ -767,6 +813,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warning: Option<String>,
         ended_at: DateTime<Utc>,
+    },
+    /// A subagent session was announced or its snapshot changed.
+    SubagentUpdated {
+        subagent: SubagentRecord,
+        at: DateTime<Utc>,
     },
     /// A background task that is not a sub-agent (Bash `run_in_background`, or
     /// a `Workflow` run) started, from the tool result's `toolResponse`. Its
@@ -1226,6 +1277,7 @@ impl AcpState {
                     }
                 }
             }
+            Event::SubagentUpdated { subagent, at } => self.apply_subagent(subagent, at),
             Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
@@ -1353,6 +1405,39 @@ impl AcpState {
         match self.background_agent(&record.agent_id) {
             Some(existing) => *existing = record,
             None => self.background_agents.push(record),
+        }
+    }
+
+    /// The RFD snapshot is authoritative for the async agent that child
+    /// belongs to, so it replaces the transcript tailer's heuristics and,
+    /// unlike them, may reopen an idle agent that was messaged again.
+    fn apply_subagent(&mut self, subagent: SubagentRecord, at: DateTime<Utc>) {
+        if let Some(tool_call_id) = subagent.parent_tool_call_id.as_deref() {
+            if let Some(agent) = self
+                .background_agents
+                .iter_mut()
+                .find(|a| a.tool_call_id == tool_call_id)
+            {
+                let (status, ended) = match subagent.state {
+                    SubagentState::Running => (BackgroundAgentStatus::Running, false),
+                    SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
+                    SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
+                    SubagentState::Idle if subagent.stop_reason.as_deref() == Some("error") => {
+                        (BackgroundAgentStatus::Error, true)
+                    }
+                    SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+                };
+                agent.status = status;
+                agent.ended_at = ended.then(|| agent.ended_at.unwrap_or(at));
+            }
+        }
+        match self
+            .subagents
+            .iter_mut()
+            .find(|s| s.session_id == subagent.session_id)
+        {
+            Some(existing) => *existing = subagent,
+            None => self.subagents.push(subagent),
         }
     }
 
@@ -2198,6 +2283,76 @@ mod tests {
             started_at: Utc::now(),
             workflow: None,
         }
+    }
+
+    fn subagent(state: SubagentState, stop_reason: Option<&str>) -> Event {
+        Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "root".into(),
+                parent_tool_call_id: Some("tc1".into()),
+                title: Some("map backend".into()),
+                description: None,
+                state,
+                stop_reason: stop_reason.map(str::to_owned),
+                cancel_capable: true,
+                model: None,
+            },
+            at: Utc::now(),
+        }
+    }
+
+    /// The RFD snapshot replaces the tailer's heuristics, and an idle child that
+    /// is messaged again runs again, which no tailer status could express.
+    #[test]
+    fn subagent_state_drives_the_async_agent_it_belongs_to() {
+        let mut s = applied([launched()]);
+        let steps = [
+            (
+                SubagentState::Running,
+                None,
+                BackgroundAgentStatus::Running,
+                true,
+            ),
+            (
+                SubagentState::RequiresAction,
+                None,
+                BackgroundAgentStatus::RequiresAction,
+                true,
+            ),
+            (
+                SubagentState::Unknown,
+                None,
+                BackgroundAgentStatus::Unknown,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("end_turn"),
+                BackgroundAgentStatus::Completed,
+                false,
+            ),
+            (
+                SubagentState::Running,
+                None,
+                BackgroundAgentStatus::Running,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("error"),
+                BackgroundAgentStatus::Error,
+                false,
+            ),
+        ];
+        for (state, reason, status, active) in steps {
+            s.apply_event(s.last_seq + 1, subagent(state, reason))
+                .unwrap();
+            assert_eq!(s.background_agents[0].status, status, "{state:?}");
+            assert_eq!(s.has_active_background_agent(), active, "{state:?}");
+        }
+        assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
+        assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
     }
 
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {
