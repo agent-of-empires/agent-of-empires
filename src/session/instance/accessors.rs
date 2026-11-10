@@ -403,7 +403,7 @@ impl Instance {
     pub(super) fn resolved_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
         let native = self.resolved_agent();
@@ -426,12 +426,12 @@ impl Instance {
         } else {
             native.is_some() && self.launch_invokes_resolved_agent_directly(agent)
         };
-        authorized.then_some((capture, context))
+        authorized.then_some((*capture, context))
     }
     pub(super) fn source_session_support(
         &self,
     ) -> Option<(
-        &'static crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
         let Some(active) = &self.active_execution else {
@@ -447,7 +447,8 @@ impl Instance {
         } else {
             capture.host
         };
-        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
+        (context != crate::agents::SessionCaptureContext::Unsupported)
+            .then_some((*capture, context))
     }
 
     /// Whether this pane's conversation id is published into its AoE hook sidecar. See
