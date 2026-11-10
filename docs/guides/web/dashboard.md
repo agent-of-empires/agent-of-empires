@@ -44,7 +44,7 @@ Completing or skipping the tour records `app_state.has_seen_web_tour` on the ser
 
 The sidebar starts in **Active** view. It shows working, starting, creating, waiting and error sessions, the current workspace and deliberately pinned or favorited workspaces. Fresh idle sessions follow the configured idle-decay window. Other idle, stopped and unknown rows are hidden from this view. The home screen's recent-session list follows the same choice; its total counter continues to describe retained sessions. Archived, snoozed and trashed rows keep their existing separate recovery controls.
 
-**All** shows the full live list again. The Active/All choice persists per browser, remains available in compact mode, and combines with text and plugin filters across every grouping axis. Switching the view never stops, archives, snoozes, trashes, deletes or resumes a session, changes its favorite or ownership, or navigates away from the current terminal. Reordering requires All view so hidden rows cannot be reordered accidentally.
+**All** shows the full live list again. The Active/All choice persists with the existing web display preferences, including their cross-browser synchronization. It remains available in compact mode and combines with text and plugin filters across every grouping axis. Switching the view never stops, archives, snoozes, trashes, deletes or resumes a session, changes its favorite or ownership, or navigates away from the current terminal. Reordering requires All view so hidden rows cannot be reordered accidentally.
 
 ## Sidebar sort
 
