@@ -1392,6 +1392,7 @@ impl AcpState {
         self.mode = SessionMode::Default;
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
+        self.subagents = Vec::new();
         self.last_agent_switch = Some(AgentSwitchInfo {
             from,
             to,
@@ -2663,11 +2664,18 @@ mod tests {
             },
         )
         .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            subagent(SubagentState::Running, None),
+        )
+        .unwrap();
+        assert_eq!(s.subagents.len(), 1);
         s.apply_event(s.last_seq.saturating_add(1), switch_agent())
             .unwrap();
         assert!(s.config_options.is_empty() && s.config_option_switch_failed.is_none());
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+        assert!(s.subagents.is_empty());
     }
 }

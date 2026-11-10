@@ -1328,6 +1328,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
     next.pendingConfigOption = null;
+    next.subagents = [];
     return next;
   }
   if ("PromptRejected" in event) {
