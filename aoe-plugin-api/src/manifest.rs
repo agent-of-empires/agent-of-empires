@@ -691,6 +691,238 @@ pub enum ManifestError {
     Invalid(Vec<String>),
 }
 
+fn declaration_word_ok(value: &str) -> bool {
+    !value.is_empty()
+        && !value.chars().any(|c| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(
+                    c,
+                    '{' | '}'
+                        | ';'
+                        | '|'
+                        | '&'
+                        | '$'
+                        | '`'
+                        | '\\'
+                        | '"'
+                        | '\''
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '#'
+                        | '!'
+                        | '~'
+                )
+        })
+}
+
+fn declaration_flag_ok(value: &str) -> bool {
+    value.len() <= 128 && value.starts_with('-') && declaration_word_ok(value)
+}
+
+fn declaration_env_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(name, "HOME" | "PATH" | "SHELL" | "USER" | "LOGNAME" | "PWD")
+        && !["AOE_", "LD_", "DYLD_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+fn declaration_value_ok(value: &str) -> bool {
+    value.len() <= 4096
+        && value.chars().all(|c| {
+            !c.is_control()
+                && unicode_general_category::get_general_category(c)
+                    != unicode_general_category::GeneralCategory::Format
+        })
+}
+
+fn validate_agent_declaration(
+    i: usize,
+    integration: &crate::agent_integration::AgentIntegrationContribution,
+    status_integration: bool,
+    check: &mut impl FnMut(bool, String),
+) {
+    use crate::agent_integration::{
+        AgentCaptureBackend, AgentCaptureContext, AgentKeyDeclaration, AgentResumeDeclaration,
+        AgentYoloDeclaration,
+    };
+    if integration.launch.is_none()
+        && integration.detection.is_none()
+        && integration.reply_fallback.is_none()
+    {
+        return;
+    }
+    check(
+        integration
+            .command
+            .as_ref()
+            .is_some_and(|command| !command.trim().is_empty()),
+        format!("agent_integrations[{i}] declarations require a non-blank command"),
+    );
+    if let Some(launch) = &integration.launch {
+        for (j, alias) in launch.aliases.iter().enumerate() {
+            check(!alias.is_empty() && alias.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_') && alias != &integration.tool && !launch.aliases[..j].contains(alias), format!("agent_integrations[{i}].launch.aliases[{j}] must be a unique lowercase agent id"));
+        }
+        for (field, flag) in [
+            ("oneshot_flag", &launch.oneshot_flag),
+            ("model_flag", &launch.model_flag),
+        ] {
+            if let Some(flag) = flag {
+                check(
+                    declaration_flag_ok(flag),
+                    format!("agent_integrations[{i}].launch.{field} must be one shell-safe flag"),
+                );
+            }
+        }
+        if let Some(template) = &launch.instruction_flag {
+            let valid = template.len() <= 256
+                && template.starts_with('-')
+                && template.matches("{}").count() == 1
+                && template.split_once("{}").is_some_and(|(before, after)| {
+                    (before.ends_with(' ') || before.ends_with('='))
+                        && (after.is_empty() || after.starts_with(' '))
+                })
+                && template
+                    .replacen("{}", "x", 1)
+                    .split(' ')
+                    .all(declaration_word_ok);
+            check(valid, format!("agent_integrations[{i}].launch.instruction_flag must contain one whole shell-safe placeholder"));
+        }
+        if let Some(yolo) = &launch.yolo {
+            let valid = match yolo {
+                AgentYoloDeclaration::Flag { flag } => declaration_flag_ok(flag),
+                AgentYoloDeclaration::Always => true,
+                AgentYoloDeclaration::Env { key, value } => {
+                    declaration_env_name_ok(key) && declaration_value_ok(value)
+                }
+            };
+            check(
+                valid,
+                format!("agent_integrations[{i}].launch.yolo is invalid"),
+            );
+        }
+        for (key, value) in &launch.container_env {
+            check(
+                declaration_env_name_ok(key) && declaration_value_ok(value),
+                format!("agent_integrations[{i}].launch.container_env[{key:?}] is invalid"),
+            );
+        }
+        if let Some(hint) = &launch.install_hint {
+            check(
+                !hint.trim().is_empty()
+                    && hint.len() <= 512
+                    && hint.chars().all(|c| {
+                        !c.is_control()
+                            && unicode_general_category::get_general_category(c)
+                                != unicode_general_category::GeneralCategory::Format
+                    }),
+                format!("agent_integrations[{i}].launch.install_hint is invalid"),
+            );
+        }
+        if let Some(resume) = &launch.resume {
+            let valid = match resume {
+                AgentResumeDeclaration::Flag { flag } => declaration_flag_ok(flag),
+                AgentResumeDeclaration::FlagPair {
+                    existing,
+                    new_session,
+                } => declaration_flag_ok(existing) && declaration_flag_ok(new_session),
+                AgentResumeDeclaration::Subcommand { command } => {
+                    !command.is_empty()
+                        && command.len() <= 64
+                        && !command.starts_with('-')
+                        && command.bytes().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                        })
+                }
+            };
+            check(
+                valid,
+                format!("agent_integrations[{i}].launch.resume is invalid"),
+            );
+        }
+        if let Some(capture) = &launch.capture {
+            check(
+                launch.resume.is_some(),
+                format!("agent_integrations[{i}].launch.capture requires resume"),
+            );
+            check(
+                capture.backend == AgentCaptureBackend::Omp
+                    && matches!(
+                        capture.host,
+                        AgentCaptureContext::PaneScoped | AgentCaptureContext::Unsupported
+                    )
+                    && matches!(
+                        capture.sandbox,
+                        AgentCaptureContext::PaneScoped | AgentCaptureContext::Unsupported
+                    ),
+                format!("agent_integrations[{i}].launch.capture combination is not supported"),
+            );
+        }
+    }
+    if integration.detection.is_some() {
+        check(
+            status_integration,
+            format!("agent_integrations[{i}].detection requires session.integration"),
+        );
+    }
+    if let Some(reply) = &integration.reply_fallback {
+        check(!integration.replies && !reply.allow.is_empty() && !reply.deny.is_empty() && reply.allow_always.as_ref().is_none_or(|keys| !keys.is_empty()), format!("agent_integrations[{i}].reply_fallback requires nonempty keys and native replies disabled"));
+        for key in reply
+            .allow
+            .iter()
+            .chain(&reply.deny)
+            .chain(reply.allow_always.iter().flatten())
+        {
+            let valid = match key {
+                AgentKeyDeclaration::Literal { value } => {
+                    !value.is_empty() && value.len() <= 32 && !value.chars().any(char::is_control)
+                }
+                AgentKeyDeclaration::Named { value } => matches!(
+                    value.as_str(),
+                    "Enter"
+                        | "Tab"
+                        | "Escape"
+                        | "Space"
+                        | "Backspace"
+                        | "Up"
+                        | "Down"
+                        | "Left"
+                        | "Right"
+                        | "Home"
+                        | "End"
+                        | "PageUp"
+                        | "PageDown"
+                        | "F1"
+                        | "F2"
+                        | "F3"
+                        | "F4"
+                        | "F5"
+                        | "F6"
+                        | "F7"
+                        | "F8"
+                        | "F9"
+                        | "F10"
+                        | "F11"
+                        | "F12"
+                ),
+            };
+            check(
+                valid,
+                format!("agent_integrations[{i}].reply_fallback contains an invalid key"),
+            );
+        }
+    }
+}
+
 impl PluginManifest {
     /// Parse and validate an `aoe-plugin.toml` document.
     pub fn from_toml_str(input: &str) -> Result<Self, ManifestError> {
@@ -995,6 +1227,7 @@ impl PluginManifest {
             .iter()
             .any(|capability| capability.as_str() == "session.integration");
         for (i, integration) in self.agent_integrations.iter().enumerate() {
+            validate_agent_declaration(i, integration, status_integration, &mut check);
             check(
                 self.api_version >= 21
                     || (integration.launch.is_none()
