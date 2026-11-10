@@ -845,6 +845,14 @@ fn validate_agent_declaration(
                 valid,
                 format!("agent_integrations[{i}].launch.resume is invalid"),
             );
+            check(
+                launch.capture.as_ref().is_some_and(|capture| {
+                    capture.backend == AgentCaptureBackend::Omp
+                        && (capture.host == AgentCaptureContext::PaneScoped
+                            || capture.sandbox == AgentCaptureContext::PaneScoped)
+                }),
+                format!("agent_integrations[{i}].launch.resume requires OMP capture in a pane-scoped context"),
+            );
         }
         if let Some(capture) = &launch.capture {
             check(

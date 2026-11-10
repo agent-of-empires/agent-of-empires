@@ -99,6 +99,14 @@ deny = [{ kind = "literal", value = "n" }]
     let errors = check(valid);
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].contains("api_version"), "{errors:?}");
+    for body in [
+        valid.replace("host = \"pane_scoped\"", "host = \"unsupported\""),
+        valid.replace("sandbox = \"pane_scoped\"", "sandbox = \"unsupported\""),
+    ] {
+        let errors = check(&body);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("api_version"), "{errors:?}");
+    }
     for (body, expected) in [
         (
             valid.replace("--instruction {}", "--instruction '{}'"),
@@ -125,6 +133,20 @@ deny = [{ kind = "literal", value = "n" }]
             "invalid key",
         ),
         (valid.replace("EXAMPLE_HOME", "HOME"), "container_env"),
+        (
+            valid.replace(
+                "[agent_integrations.launch.capture]\nbackend = \"omp\"\nhost = \"pane_scoped\"\nsandbox = \"pane_scoped\"\n",
+                "",
+            ),
+            "resume requires OMP capture",
+        ),
+        (
+            valid.replace(
+                "host = \"pane_scoped\"\nsandbox = \"pane_scoped\"",
+                "host = \"unsupported\"\nsandbox = \"unsupported\"",
+            ),
+            "resume requires OMP capture",
+        ),
         (
             valid.replace("backend = \"omp\"", "backend = \"codex\""),
             "capture combination",
