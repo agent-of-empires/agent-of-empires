@@ -1849,6 +1849,9 @@ fn launch_observations_diagnose_only_a_proven_owner_exit() {
 async fn foreign_log_errno_does_not_invalidate_saved_port_on_launch_failure() {
     let _home = crate::session::test_support::isolate_app_dir();
     let app = crate::session::get_app_dir().unwrap();
+    let _startup_exclusion = crate::cli::serve::try_lock_serve()
+        .unwrap()
+        .expect("isolated startup exclusion");
     let port = app.join("serve.last_port");
     std::fs::write(&port, "55555").unwrap();
     std::fs::write(
@@ -1862,14 +1865,49 @@ async fn foreign_log_errno_does_not_invalidate_saved_port_on_launch_failure() {
         transport: None,
         passphrase: None,
     };
-    let failed = tokio::time::timeout(
-        Duration::from_secs(10),
-        request.run("unknown-diagnostic-fixture".to_owned(), None),
-    )
-    .await
-    .unwrap();
-    assert!(failed.is_err());
-    assert_eq!(std::fs::read_to_string(port).unwrap(), "55555");
+    let target = request.target();
+    let failed = tokio::time::timeout(Duration::from_secs(10), request.run(String::new(), None))
+        .await
+        .unwrap();
+    let failure = match failed {
+        Err(failure) => failure,
+        Ok(_) => panic!("startup exclusion did not refuse the launch"),
+    };
+    assert!(failure
+        .log_tail
+        .lines
+        .iter()
+        .any(|line| line == "Address already in use"));
+    assert!(!failure.log_tail.has_process_marker);
+    assert_eq!(std::fs::read_to_string(&port).unwrap(), "55555");
+
+    let mut jobs = ServeJobs::default();
+    for reopened in [false, true] {
+        let mut view = if reopened {
+            ServeView::for_launch(
+                DashboardLaunch::Failed {
+                    target: target.clone(),
+                    failure: failure.clone(),
+                },
+                &mut jobs,
+            )
+        } else {
+            let mut view = ServeView::with_state(starting(), jobs.submitter());
+            view.launch_in_flight = true;
+            view.finish_launch(Err(failure.clone()), None);
+            view
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while view.pending.is_some() {
+                view.tick();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(view.state, ServeViewState::Error { .. }));
+        assert_eq!(std::fs::read_to_string(&port).unwrap(), "55555");
+    }
 }
 
 #[test]
