@@ -1661,8 +1661,7 @@ fn transcript_lines(
                     out.push(Line::default());
                 }
             }
-            TranscriptRowKind::EmptyOutput
-            | TranscriptRowKind::ContextReset
+            TranscriptRowKind::ContextReset
             | TranscriptRowKind::SessionCleared
             | TranscriptRowKind::Compacted
             | TranscriptRowKind::Summary

@@ -1479,13 +1479,13 @@ mod retained_tests {
             }
             state
                 .acp_event_store
-                .record(
+                .record_at(
                     &id,
                     if summary_races { 3 } else { 4 },
                     &Event::Stopped {
                         reason: "teardown complete".into(),
                     },
-                    &crate::acp::event_sender::EventMetadata::history(),
+                    chrono::Utc::now().timestamp_millis(),
                 )
                 .unwrap();
             let mut ticker = tokio::time::interval(Duration::from_millis(10));
@@ -1709,14 +1709,14 @@ mod retained_tests {
         );
         state
             .acp_event_store
-            .record(
+            .record_at(
                 &id,
                 2,
                 &Event::AgentMessageChunk {
                     text: "BACKFILLED".into(),
                     message_id: Some("backfill".into()),
                 },
-                &crate::acp::event_sender::EventMetadata::history(),
+                chrono::Utc::now().timestamp_millis(),
             )
             .unwrap();
         view.next_recheck = Instant::now();

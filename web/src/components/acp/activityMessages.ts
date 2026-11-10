@@ -157,9 +157,6 @@ export function activityToThreadMessages(
         row.asyncSubagent ?? false,
         row.output,
       );
-    } else if (row.kind === "empty_output") {
-      // A turn with no output (interactive-only slash commands) gets a muted note.
-      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(`_${row.text}_`);
     } else if (row.kind === "thinking") {
       (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendReasoning(row.text, row.messageStart);
     } else {

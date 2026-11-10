@@ -2168,6 +2168,7 @@ mod tests {
         let stopped = {
             let mut instances = state.instances.write().await;
             instances[0].status = Status::Stopped;
+            crate::server::test_support::select_retained_for_test(&mut instances[0]);
             instances[0].clone()
         };
         crate::server::test_support::seed_instances_on_disk_for_test(
@@ -2182,6 +2183,22 @@ mod tests {
             "stopped admission was attempted"
         );
         assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        {
+            let instances = state.instances.read().await;
+            assert_eq!(instances[0].lifecycle_generation, stopped.lifecycle_generation);
+            assert_eq!(instances[0].resume_intent, stopped.resume_intent);
+            assert_eq!(instances[0].acp_establishment, stopped.acp_establishment);
+        }
+        let persisted = crate::session::Storage::new_unwatched(&stopped.source_profile)
+            .unwrap()
+            .load_instances_complete()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(persisted.lifecycle_generation, stopped.lifecycle_generation);
+        assert_eq!(persisted.resume_intent, stopped.resume_intent);
+        assert_eq!(persisted.acp_establishment, stopped.acp_establishment);
 
         let response = crate::server::api::sessions::start_session(
             State(Arc::clone(&state)),

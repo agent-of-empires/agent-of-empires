@@ -3943,7 +3943,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/acp-stories/composer-controls.spec.ts"],
-      "notes": "A genuine Native cancel result closes only its original prompt. The live story retains partial Native output across reload, verifies its written-window uncertainty and refuses a fabricated per-tool completion, error or stopped projection. A temporal observation window does not establish tool authorship or outcome.",
+      "notes": "A genuine Native cancel result closes only its original prompt. The live story retains partial Native output across reload, verifies its written-window uncertainty and refuses a fabricated per-tool completion, error or stopped projection. Output diagnostics require an original result and the same uncertain Written window; historical silence, thinking, compaction, notices and steering do not invent an output diagnosis. A temporal observation window does not establish tool authorship or outcome.",
       "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {

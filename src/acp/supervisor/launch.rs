@@ -2315,6 +2315,10 @@ async fn prepare_establishment(
                 row.lifecycle_generation == generation,
                 crate::session::LifecycleReservationError::Superseded
             );
+            anyhow::ensure!(
+                row.status != crate::session::Status::Stopped && !row.is_idle_dormant(),
+                crate::session::LifecycleReservationError::Superseded
+            );
             if let Some(scope) = &original_scope {
                 anyhow::ensure!(
                     scope.context

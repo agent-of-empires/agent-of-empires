@@ -534,6 +534,11 @@ ingress; an old queued frame cannot taint a later prompt. Exact response IDs
 close only their original windows. Temporal observation is not prompt causality,
 successful RPC completion, or permission to perform a new Native effect.
 
+An output-attribution diagnostic requires an original result and a `Written`
+observation whose exact window is marked uncertain. Silence, thinking, compaction,
+notices and steering do not by themselves diagnose missing output; historical
+results retain their content without gaining temporal authorship.
+
 A positive main-prompt cancel does not prove an individual tool's outcome.
 Partial output and its recorded uncertainty survive reload without a fabricated
 tool result or terminal state.

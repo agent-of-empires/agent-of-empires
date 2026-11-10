@@ -797,7 +797,6 @@ export interface ActivityRow {
     | "user_prompt"
     | "user_diff_comments"
     | "elicitation_answered"
-    | "empty_output"
     | "context_reset"
     | "notice"
     | "advisory"

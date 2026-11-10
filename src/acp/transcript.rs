@@ -70,7 +70,6 @@ pub enum TranscriptRowKind {
     UserPrompt,
     UserDiffComments,
     ElicitationAnswered,
-    EmptyOutput,
     ContextReset,
     SessionCleared,
     Compacted,
@@ -3001,61 +3000,112 @@ mod tests {
     }
 
     #[test]
-    fn empty_output_notice_needs_an_output_less_unsteered_turn() {
-        let caps = Event::PromptCapabilities {
-            image: false,
-            audio: false,
-            embedded_context: false,
-            load_session: None,
-            steering: true,
+    fn output_diagnostics_require_an_original_result_and_matching_written_window() {
+        use crate::acp::establishment::NativeOperationCorrelation;
+        use crate::acp::event_sender::{EventMetadata, EventScope};
+        use crate::acp::protocol::{
+            AcpOperationMetadata, AcpOriginalRequestResult, AcpPromptObservation, AcpPromptWindowId,
         };
-        let runtime_error = Event::PromptRuntimeError {
-            message: "boom".into(),
-            evidence: None,
-            native_subject: None,
-        };
-        // (events between the prompt and its stop, notice expected)
+
         let cases = [
-            (vec![], true),
-            (vec![chunk("hi")], false),
-            (vec![Event::ThinkingStarted], false),
-            (vec![runtime_error], false),
-            // A typed `/compact` streams no text; its divider is the output.
-            (vec![Event::ConversationCompacted], false),
+            ("silence", vec![]),
+            ("output", vec![chunk("hi")]),
+            ("thinking", vec![Event::ThinkingStarted]),
             (
+                "error",
+                vec![Event::PromptRuntimeError {
+                    message: "boom".into(),
+                    evidence: None,
+                    native_subject: None,
+                }],
+            ),
+            ("compaction", vec![Event::ConversationCompacted]),
+            (
+                "notice",
                 vec![Event::SessionNotice {
                     severity: "error".into(),
                     title: "Compaction failed".into(),
                     description: None,
                     key: None,
                 }],
-                false,
             ),
         ];
-        for (i, (mid, notice)) in cases.into_iter().enumerate() {
-            let mut events = vec![prompt("/usage")];
-            events.extend(mid);
-            events.push(stopped("prompt_complete"));
-            assert_eq!(
-                count(&fold(events), TranscriptRowKind::EmptyOutput) == 1,
-                notice,
-                "case {i}"
+        for (label, mid) in cases {
+            let mut model = fold([prompt("/usage")]);
+            let mut seq = 2;
+            for event in mid {
+                model.apply_scoped_event(seq, &event, &EventMetadata::history());
+                seq += 1;
+            }
+            let rows_before = model.rows().len();
+            let notices_before = count(&model, TranscriptRowKind::Notice);
+            let deltas = model.apply_scoped_event(
+                seq,
+                &stopped("prompt_complete"),
+                &EventMetadata::history(),
             );
+            assert!(deltas.is_empty(), "{label}: history cannot invent an output diagnosis");
+            assert_eq!(model.rows().len(), rows_before, "{label}");
+            assert_eq!(count(&model, TranscriptRowKind::Notice), notices_before, "{label}");
         }
 
-        let m = fold([
-            caps,
+        let steered = fold([
+            Event::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                load_session: None,
+                steering: true,
+            },
             prompt("read src/acp"),
             chunk("on it"),
             prompt("just acp_client.rs"),
             stopped("prompt_complete"),
         ]);
-        assert_eq!(
-            count(&m, TranscriptRowKind::EmptyOutput),
-            0,
-            "a steered prompt keeps the turn's output"
-        );
-        assert_eq!(count(&m, TranscriptRowKind::UserPrompt), 2);
+        assert_eq!(count(&steered, TranscriptRowKind::UserPrompt), 2);
+        assert!(steered.rows().iter().any(|row| {
+            row.kind == TranscriptRowKind::Message && row.text == "on it"
+        }));
+        assert_eq!(count(&steered, TranscriptRowKind::Notice), 0);
+
+        let window = AcpPromptWindowId::new();
+        let other_window = AcpPromptWindowId::new();
+        let written = Some(AcpPromptObservation::Written { window_id: window });
+        for (label, outcome, observation, uncertainty, expected) in [
+            ("original succeeded", Some(AcpOriginalRequestResult::Succeeded), written, Some(window), true),
+            ("original failed", Some(AcpOriginalRequestResult::Failed), written, Some(window), true),
+            ("different window", Some(AcpOriginalRequestResult::Succeeded), written, Some(other_window), false),
+            ("no original result", None, written, Some(window), false),
+            ("no written observation", Some(AcpOriginalRequestResult::Succeeded), None, Some(window), false),
+            ("ambiguous observation", Some(AcpOriginalRequestResult::Succeeded), Some(AcpPromptObservation::Ambiguous), Some(window), false),
+            ("nothing written", Some(AcpOriginalRequestResult::Succeeded), Some(AcpPromptObservation::NoWrittenPrompt), Some(window), false),
+            ("no uncertainty", Some(AcpOriginalRequestResult::Succeeded), written, None, false),
+        ] {
+            let correlation = NativeOperationCorrelation::new(None);
+            let progress = EventMetadata {
+                scope: EventScope::OperationCurrent,
+                operation: Some(AcpOperationMetadata { correlation, outcome: None }),
+                prompt_observation: written,
+                ..EventMetadata::history()
+            };
+            let mut model = fold([prompt("a written operation")]);
+            model.apply_scoped_event(2, &Event::ThinkingStarted, &progress);
+            let terminal = EventMetadata {
+                operation: Some(AcpOperationMetadata { correlation, outcome }),
+                prompt_observation: observation,
+                output_uncertainty: uncertainty,
+                ..EventMetadata::history()
+            };
+            let reason = if outcome == Some(AcpOriginalRequestResult::Failed) {
+                "prompt_failed"
+            } else {
+                "prompt_complete"
+            };
+            let deltas = model.apply_scoped_event(3, &stopped(reason), &terminal);
+            let notices = if expected { 1 } else { 0 };
+            assert_eq!(deltas.len(), notices, "{label}");
+            assert_eq!(count(&model, TranscriptRowKind::Notice), notices, "{label}");
+        }
     }
 
     #[test]

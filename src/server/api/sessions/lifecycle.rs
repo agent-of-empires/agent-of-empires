@@ -4632,6 +4632,7 @@ mod durable_stop_tests {
             if target == "restart" {
                 row.view = crate::session::View::Structured;
                 row.status = Status::Running;
+                crate::server::test_support::select_retained_for_test(&mut row);
             }
             crate::server::test_support::seed_instances_on_disk_for_test(
                 "default",
