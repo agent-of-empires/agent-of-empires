@@ -202,23 +202,33 @@ fn apply_no_daemon_flag(
     if invocation.words.first().map(String::as_str) != Some(agent.binary) {
         return;
     }
-    let Ok(mut words) = shell_words::split(cmd) else {
+    insert_no_daemon_flag(cmd, agent, program, &probe);
+}
+
+fn insert_no_daemon_flag(
+    cmd: &mut String,
+    agent: &crate::agents::AgentDef,
+    program: &std::path::Path,
+    probe: &std::process::Command,
+) {
+    let Some(mut parsed) = parse_launch_command(cmd) else {
         return;
     };
+    let words = &mut parsed.words;
     if words.first().map(String::as_str) != program.to_str() {
         return;
     }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
     let options = &words[1..options_end];
-    let Some(flag) = agent.supported_no_daemon_flag(&probe, options) else {
+    let Some(flag) = agent.supported_no_daemon_flag(probe, options) else {
         return;
     };
     if options.iter().any(|w| w == flag) {
         return;
     }
     words.insert(options_end, flag.to_owned());
-    *cmd = shell_words::join(words);
+    *cmd = render_launch_command(parsed);
 }
 
 /// Write the Pi session-id extension into the app dir and return its path.
@@ -407,6 +417,20 @@ pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand>
     })
 }
 
+fn render_launch_command(parsed: ParsedLaunchCommand) -> String {
+    let command = shell_words::join(parsed.words);
+    if parsed.assignments.is_empty() {
+        return command;
+    }
+    let assignments = parsed
+        .assignments
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{assignments} {command}")
+}
+
 /// Insert a subcommand at the parsed executable boundary, or append flags.
 pub(super) fn splice_subcommand_or_append(
     cmd: &mut String,
@@ -508,13 +532,16 @@ pub(super) fn wrap_command_ignore_suspend(
 }
 
 fn pin_host_program(cmd: &mut String, snapshot: &std::process::Command) -> Result<()> {
-    let mut words = shell_words::split(cmd)?;
-    *words.first_mut().context("host program is missing")? = snapshot
+    let mut parsed = parse_launch_command(cmd).context("host program is missing")?;
+    *parsed
+        .words
+        .first_mut()
+        .context("host program is missing")? = snapshot
         .get_program()
         .to_str()
         .context("host executable path is not UTF-8")?
         .to_owned();
-    *cmd = shell_words::join(words);
+    *cmd = render_launch_command(parsed);
     Ok(())
 }
 
@@ -1741,6 +1768,21 @@ mod tests {
         assert!(quoted.assignments.is_empty());
         assert_eq!(quoted.words[0], "TOKEN=value");
         assert!(parse_launch_command("TOKEN=value").is_none());
+    }
+
+    #[test]
+    fn pinned_host_program_preserves_assignment_environment() {
+        let mut command = "AOE_PREFIX_TEST='a b' opencode".to_owned();
+        pin_host_program(&mut command, &std::process::Command::new("/usr/bin/env")).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == "AOE_PREFIX_TEST=a b"));
     }
     use crate::session::test_support::EnvGuard;
 
@@ -3949,6 +3991,21 @@ mod tests {
             "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
         );
         let codex = tool_instance("codex", project.to_str().unwrap());
+        let path = temp_home.path().join("bin/codex");
+        let program = shell_escape(path.to_str().unwrap());
+        let mut command = format!("AOE_PREFIX_TEST='a b' {program} -- 'fix the build'");
+        insert_no_daemon_flag(
+            &mut command,
+            crate::agents::get_agent("codex").unwrap(),
+            &path,
+            &std::process::Command::new(&path),
+        );
+        let parsed = parse_launch_command(&command).unwrap();
+        assert_eq!(
+            parsed.assignments,
+            [("AOE_PREFIX_TEST".into(), "a b".into())]
+        );
+        assert_eq!(&parsed.words[1..], ["--no-daemon", "--", "fix the build"]);
         if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
             let error = codex
                 .resolve_native_execution(None)
