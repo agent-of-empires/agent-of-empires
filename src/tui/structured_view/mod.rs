@@ -628,6 +628,7 @@ async fn handle_terminal_event(
                     Some(ChoicePurpose::OpenLink)
                 ),
                 has_modes: !state.transcript.available_modes.is_empty(),
+                has_toggles: state.transcript.toggles().next().is_some(),
                 has_notices: state.visible_notices().next().is_some(),
                 // Esc-to-cancel and other action gates read this: it must
                 // track only the main turn, not a display-only background
@@ -945,6 +946,10 @@ async fn handle_terminal_event(
             open_mode_picker(state);
             Ok(false)
         }
+        Intent::OpenToggles => {
+            open_toggle_picker(state);
+            Ok(false)
+        }
         Intent::AnswerElicitation => {
             start_elicitation_answer(state, toast_deadline);
             Ok(false)
@@ -1096,6 +1101,35 @@ fn open_mode_picker(state: &mut StructuredViewState) {
         options,
         selected,
         purpose: ChoicePurpose::Mode,
+    });
+}
+
+/// One row per Fast mode / Ultracode toggle; accepting flips it. A row's value
+/// is `<config_id>=<new value>`.
+fn open_toggle_picker(state: &mut StructuredViewState) {
+    let options: Vec<(String, String)> = state
+        .transcript
+        .toggles()
+        .map(|t| {
+            let (now, next) = if t.current_value == "on" {
+                ("on", "off")
+            } else {
+                ("off", "on")
+            };
+            (
+                format!("{}={next}", t.id),
+                format!("{}: {now} (Enter turns {next})", t.name),
+            )
+        })
+        .collect();
+    if options.is_empty() {
+        return;
+    }
+    state.choice = Some(ChoicePicker {
+        title: " Toggles (Enter=flip · Esc=close) ".to_string(),
+        options,
+        selected: 0,
+        purpose: ChoicePurpose::Toggle,
     });
 }
 
@@ -1283,6 +1317,24 @@ async fn accept_choice(state: &mut StructuredViewState, toast_deadline: &mut Opt
                 );
             }
         },
+        ChoicePurpose::Toggle => {
+            let Some((config_id, next)) = value.split_once('=') else {
+                return;
+            };
+            // Pessimistic: the status line follows the adapter's reported value.
+            if let Err(e) = state
+                .http
+                .set_config_option(&state.session_id, config_id, next)
+                .await
+            {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("toggle failed: {e}"),
+                    ToastKind::Error,
+                );
+            }
+        }
         // `value` is the option_id the agent offered; the server checks
         // it still belongs to the pending request.
         ChoicePurpose::Approval { nonce } => {
@@ -1882,6 +1934,7 @@ async fn wait_for_dismiss(event_stream: &mut EventStream) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
     use crate::daemon::Source;
 
     fn test_state() -> StructuredViewState {
@@ -2086,6 +2139,80 @@ mod tests {
         }
     }
 
+    fn config_option(
+        id: &str,
+        name: &str,
+        category: ConfigOptionCategory,
+        current: &str,
+        values: &[&str],
+    ) -> ConfigOptionDescriptor {
+        ConfigOptionDescriptor {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            category,
+            current_value: current.into(),
+            options: values
+                .iter()
+                .map(|v| ConfigOptionChoice {
+                    value: (*v).into(),
+                    name: (*v).into(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn toggle_picker_rows_carry_the_flipped_value_for_on_off_model_config_options() {
+        let mut state = test_state();
+        open_toggle_picker(&mut state);
+        assert!(state.choice.is_none(), "no advertised toggles: no-op");
+
+        let model_config = || ConfigOptionCategory::Other("model_config".into());
+        state.transcript.config_options = vec![
+            config_option(
+                "model",
+                "Model",
+                ConfigOptionCategory::Model,
+                "a",
+                &["a", "b"],
+            ),
+            config_option("fast", "Fast mode", model_config(), "off", &["on", "off"]),
+            config_option(
+                "ultracode",
+                "Ultracode",
+                model_config(),
+                "on",
+                &["off", "on"],
+            ),
+            config_option("tier", "Tier", model_config(), "std", &["std", "pro"]),
+            config_option(
+                "beta",
+                "Beta",
+                ConfigOptionCategory::Other("misc".into()),
+                "off",
+                &["on", "off"],
+            ),
+        ];
+        open_toggle_picker(&mut state);
+        let picker = state.choice.as_ref().expect("picker open");
+        assert!(matches!(picker.purpose, ChoicePurpose::Toggle));
+        assert_eq!(
+            picker.options,
+            vec![
+                (
+                    "fast=on".to_string(),
+                    "Fast mode: off (Enter turns on)".to_string()
+                ),
+                (
+                    "ultracode=off".to_string(),
+                    "Ultracode: on (Enter turns off)".to_string()
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn mode_picker_opens_preselecting_current_mode() {
         let mut state = test_state();
@@ -2196,7 +2323,10 @@ mod tests {
                 assert_eq!(remaining[0].field_key, "question_1");
                 assert!(answers.is_empty());
             }
-            ChoicePurpose::Mode | ChoicePurpose::OpenLink | ChoicePurpose::Approval { .. } => {
+            ChoicePurpose::Mode
+            | ChoicePurpose::Toggle
+            | ChoicePurpose::OpenLink
+            | ChoicePurpose::Approval { .. } => {
                 panic!("expected elicitation purpose")
             }
         }

@@ -141,6 +141,9 @@ pub struct ChoicePicker {
 pub enum ChoicePurpose {
     /// Accepting POSTs `session/set_mode` with the chosen mode id.
     Mode,
+    /// Accepting POSTs `session/set_config_option` with the row's
+    /// `<config_id>=<value>`, flipping a Fast mode / Ultracode toggle.
+    Toggle,
     /// A numbered plugin-link picker: the option `value` is the URL to open.
     /// Shown when an `open-ui-link` chord resolves to more than one link.
     OpenLink,

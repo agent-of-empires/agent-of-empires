@@ -29,8 +29,8 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AuthStatus, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionNotice,
-    SessionUsage,
+    AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, DiffPreview, ModeInfo,
+    PlanStepStatus, SessionNotice, SessionUsage,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -67,6 +67,9 @@ pub struct AcpTranscript {
     /// Permission modes the agent advertised (`ModesAvailable`). Drives
     /// the `m` mode picker; empty when the agent never announced any.
     pub available_modes: Vec<ModeInfo>,
+    /// Agent-advertised config options; the `model_config` on/off ones (Fast
+    /// mode, Ultracode) drive the `t` toggle picker and the status line.
+    pub config_options: Vec<ConfigOptionDescriptor>,
     /// Auth identity the agent reported for itself. `None` when it never
     /// reported, which renders as nothing rather than as logged out.
     pub auth_status: Option<AuthStatus>,
@@ -202,6 +205,13 @@ pub enum NoteKind {
 }
 
 impl AcpTranscript {
+    /// The advertised Fast mode / Ultracode style on/off options.
+    pub fn toggles(&self) -> impl Iterator<Item = &ConfigOptionDescriptor> {
+        self.config_options
+            .iter()
+            .filter(|o| o.is_model_config_toggle())
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -214,6 +224,7 @@ impl AcpTranscript {
             session_notices: Vec::new(),
             current_mode: None,
             available_modes: Vec::new(),
+            config_options: Vec::new(),
             auth_status: None,
             available_commands: Vec::new(),
             locally_resolved: Vec::new(),
@@ -329,6 +340,9 @@ impl AcpTranscript {
         }
         if !holds("available_modes") {
             self.available_modes = state.available_modes;
+        }
+        if !holds("config_options") {
+            self.config_options = state.config_options;
         }
         self.session_notices = state.session_notices;
         self.current_mode = state.current_mode_id;
@@ -682,6 +696,14 @@ mod tests {
         t.apply_reduced_state(1, full, &[]);
         assert_eq!(t.available_commands.len(), 1);
         assert_eq!(t.available_modes.len(), 1);
+        t.config_options = vec![crate::acp::state::ConfigOptionDescriptor {
+            id: "fast".into(),
+            name: "Fast mode".into(),
+            description: None,
+            category: crate::acp::state::ConfigOptionCategory::Other("model_config".into()),
+            current_value: "on".into(),
+            options: vec![],
+        }];
 
         // The next frame omits both, naming them as unchanged.
         t.apply_reduced_state(
@@ -690,8 +712,10 @@ mod tests {
             &[
                 "available_commands".to_string(),
                 "available_modes".to_string(),
+                "config_options".to_string(),
             ],
         );
+        assert_eq!(t.config_options.len(), 1, "config options survived");
         assert_eq!(t.available_commands.len(), 1, "commands survived");
         assert_eq!(t.available_modes.len(), 1, "modes survived");
 
