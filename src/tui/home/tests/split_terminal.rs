@@ -126,6 +126,37 @@ fn split_preview_layout_and_focus() {
     }
 }
 
+#[test]
+#[serial]
+fn split_thresholds_preserve_focus_and_preference() {
+    let cache = crate::tmux::SessionCacheGuard::capture();
+    let (mut env, agent, _) = split_env(false, false);
+    cache.force_present(&[agent.as_str()]);
+    env.view.split_terminal_height_percent = 30;
+    for (width, height, split) in [
+        (100, 30, true),
+        (99, 30, false),
+        (100, 29, false),
+        (120, 40, true),
+    ] {
+        let screen = render_home_to_string(&mut env.view, width, height);
+        assert_eq!(screen.contains(" Terminal ─"), split, "{width}x{height}");
+        assert!(env.view.split_terminal);
+    }
+    let agent_area = env.view.preview_area;
+    let fleet_geometry = env.view.passive_fleet_armed.clone();
+    env.view.view_mode = ViewMode::Terminal;
+    render_home_to_string(&mut env.view, 120, 40);
+    let terminal_area = env.view.preview_area;
+    assert!(agent_area.height > terminal_area.height);
+    assert_eq!(agent_area.bottom() + 1, terminal_area.y);
+    assert_eq!(env.view.passive_fleet_armed, fleet_geometry);
+    env.view.view_mode = ViewMode::Terminal;
+    render_home_to_string(&mut env.view, 99, 30);
+    assert!(matches!(env.view.view_mode, ViewMode::Terminal));
+    assert!(env.view.split_terminal);
+}
+
 /// Swapping focus hands each pane to the other worker without blanking the cache the
 /// newly focused worker inherits.
 #[test]
@@ -161,6 +192,57 @@ fn split_focus_swap_keeps_the_other_half_cached() {
         env.view.split_capture_target.as_deref(),
         Some(term.as_str())
     );
+}
+
+#[test]
+#[serial]
+fn terminal_scroll_to_tail_survives_redraw_and_target_change() {
+    let present = crate::tmux::SessionCacheGuard::capture();
+    let (mut env, agent, _) = split_env(false, true);
+    present.force_present(&[agent.as_str()]);
+    env.view.view_mode = ViewMode::Terminal;
+    render_home_to_string(&mut env.view, 120, 40);
+    let worker = env.view.preview_capture_worker.as_mut().unwrap();
+    worker.stop_for_test();
+    let cursor = crate::tmux::PaneCursor {
+        x: 0,
+        y: 2,
+        visible: true,
+        pane_height: 26,
+        history_size: 2,
+        pane_width: 61,
+        alternate_on: false,
+        mouse_tracking: false,
+        mouse_sgr: false,
+        mouse_all: false,
+        position_reliable: true,
+        composite_pane0: None,
+    };
+    let mut lines = [""; 28];
+    lines[2] = "CURSOR_TOP";
+    lines[27] = "NEWEST_TAIL";
+    worker.inject_frame_with_cursor_for_test(2000, &(lines.join("\n") + "\n"), Some(cursor));
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("CURSOR_TOP"), "{screen}");
+    assert!(!screen.contains("NEWEST_TAIL"), "{screen}");
+    let pane = env.view.preview_area;
+    for _ in 0..20 {
+        env.view.handle_scroll_down(pane.x + 1, pane.y + 1);
+    }
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("NEWEST_TAIL"), "{screen}");
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("NEWEST_TAIL"), "{screen}");
+    env.view.sync_preview_capture_worker(None);
+    render_home_to_string(&mut env.view, 120, 40);
+    env.view
+        .preview_capture_worker
+        .as_ref()
+        .unwrap()
+        .inject_frame_with_cursor_for_test(2001, &(lines.join("\n") + "\n"), Some(cursor));
+    let screen = render_home_to_string(&mut env.view, 120, 40);
+    assert!(screen.contains("CURSOR_TOP"), "{screen}");
+    assert!(!screen.contains("NEWEST_TAIL"), "{screen}");
 }
 
 #[test]
@@ -298,6 +380,7 @@ fn split_hides_info_headers_so_output_owns_each_half() {
     let mut env = seeded_env(test_home(), &[inst.clone()], true);
     env.view.select_session_by_id(&inst.id);
     env.view.split_terminal = true;
+    env.view.split_terminal_min_height = 0;
     env.view.show_preview_info = true;
     cache.force_present(&[agent.as_str(), term.as_str()]);
 

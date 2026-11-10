@@ -3,9 +3,9 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.22.1"
+version = "1.22.3"
 edition = "2021"
-rust-version = "1.89"
+rust-version = "1.95"
 authors = ["Agent of Empires Contributors"]
 description = "Terminal session manager for AI coding agents"
 # MIT throughout, except the OSC 8 emission state machine in
@@ -128,7 +128,7 @@ sha2 = "0.11"
 
 # Locking
 fs2 = "0.4"
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 # Stream utilities (for crossterm EventStream)
 futures-util = "0.3"
@@ -140,7 +140,7 @@ tempfile = "3.14"
 which = "8.0"
 
 # SQLite
-rusqlite = "0.40"
+rusqlite = "0.41"
 
 axum = { version = "0.8", features = ["ws"] }
 # hyper/TokioIo reuse the UID/PID-verified UnixStream, including builds without `web`.
@@ -200,6 +200,10 @@ schemars = { version = "1", features = ["chrono04"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource", "dir", "user", "poll", "hostname"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+core-foundation-sys = "0.8.7"
 
 [features]
 # The daemon (REST/WS API, auth, Web Push, ACP, structured view) is core: a

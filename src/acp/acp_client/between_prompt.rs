@@ -248,6 +248,14 @@ impl BetweenPromptTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::acp_client::lifecycle::classify_lifecycle_signal;
+    use agent_client_protocol::v1::schema::{SessionUpdate, ToolCall, ToolCallStatus};
+
+    fn replayed_call(id: &'static str, status: ToolCallStatus) -> ToolCall {
+        let mut tc = ToolCall::new(id, "Read");
+        tc.status = status;
+        tc
+    }
 
     const FAST: Duration = BETWEEN_PROMPT_IDLE_GRACE;
     const FLOOR: Duration = OFF_PROTOCOL_WORK_GRACE_FLOOR;
@@ -462,6 +470,31 @@ mod tests {
                 "{lifecycle:?} {wakeup:?}"
             );
         }
+    }
+
+    #[test]
+    fn tracker_replayed_terminal_tool_calls_leave_no_open_tool() {
+        // #5206: replay's terminal initial calls must not latch the floor.
+        let tracker = BetweenPromptTracker::default();
+        let claim = TerminalClaim::new();
+        for update in [
+            SessionUpdate::ToolCall(replayed_call("t1", ToolCallStatus::Completed)),
+            SessionUpdate::ToolCall(replayed_call("t2", ToolCallStatus::Failed)),
+        ] {
+            let signal = classify_lifecycle_signal(&update);
+            tracker.observe(signal.as_ref(), None, 1_000, false, &claim);
+        }
+        assert!(!tracker.work_state().is_busy());
+        assert_eq!(tracker.take_idle_fire(1_000 + ms(STALL)), Some(false));
+
+        let tracker = BetweenPromptTracker::default();
+        let signal = classify_lifecycle_signal(&SessionUpdate::ToolCall(replayed_call(
+            "t3",
+            ToolCallStatus::InProgress,
+        )));
+        tracker.observe(signal.as_ref(), None, 1_000, false, &claim);
+        assert!(tracker.work_state().is_busy());
+        assert_eq!(tracker.take_idle_fire(1_000 + ms(STALL)), None);
     }
 
     #[test]

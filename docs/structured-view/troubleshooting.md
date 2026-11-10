@@ -101,6 +101,14 @@ The same hand-off is available any time, which is how you return to the original
 
 The transcript divider reads `Switched structured view agent from <from> to <to> (manual)`, distinct from the `(rate_limited)` one the recovery flow emits.
 
+### Switching accounts manually
+
+An account is a tool name with its own `[session.agent_config_dir]` entry (see [Swapping the engine on a restart](../guides/session-resume.md#swapping-the-engine-on-a-restart)). `aoe acp switch-account <session> <tool>` restarts the worker as that account and keeps the conversation: the transcript is copied into the new account's store and the worker resumes it. The same swap is `aoe session restart <session> --tool <tool>`.
+
+- A session parked on a rate limit continues with the interrupted prompt as its next turn, once, and the park's auto-resume budget is disarmed like a manual **Try again**. The generic restart wake message is not sent. A session that is not parked gets the usual wake message.
+- `switch-account` refuses and changes nothing where the swap would start a fresh conversation: the tool runs a different agent, the agent has no known transcript layout (only Claude does), the session has no recorded conversation, or a sandboxed session still has its store move pending. `restart --tool` keeps the parking swap in those cases.
+- The first turn on the new account re-reads the whole context uncached, because the prompt cache belongs to the account.
+
 ## `/clear` collapsed earlier turns
 
 `/clear` wipes the model's context on the adapter side but preserves the visible transcript: the view appends a "Conversation cleared" divider, resets the plan, mode, approvals, and usage, then folds everything above the divider behind a `Show N earlier turns` banner. The slash palette and mode picker stay populated.

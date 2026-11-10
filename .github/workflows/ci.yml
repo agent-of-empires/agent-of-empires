@@ -17,6 +17,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Killswitch: repo variable RUNS_ON_DISABLED=true sends RunsOn jobs to
+  # GitHub-hosted runners and keeps kache off AWS (e.g. during an AWS outage).
+  RUNS_ON_DISABLED: ${{ vars.RUNS_ON_DISABLED }}
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
 
 permissions:
   contents: read
@@ -44,7 +50,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-clippy-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -98,7 +104,7 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-msrv-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -171,7 +177,7 @@ jobs:
   docs:
     # Also the skill check: both build xtask.
     name: Docs
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-docs-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 25
     permissions:
       contents: read
@@ -184,6 +190,10 @@ jobs:
       - uses: ./.github/actions/kache
         with:
           manifest-key: docs
+      - name: Build xtask and workspace member tests
+        run: |
+          cargo build -p xtask
+          cargo test -p xtask -p aoe-plugin-api --no-run
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
       # The workspace declares no `default-members`, so every other `cargo
@@ -303,7 +313,7 @@ jobs:
 
   nix-build:
     name: Nix Build
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 45
     # Builds the default (aoe) crate through crane. Nix Eval only evaluates
     # derivations, so a flake recipe that compiles nowhere (a bad source filter,
@@ -371,7 +381,7 @@ jobs:
 
   nix-build-web:
     name: Nix Build Web
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}/runner=8cpu-linux-x64/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-nix-build-web-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
     # is offline. Path-gated so Rust-only PRs keep fast feedback.
@@ -438,6 +448,9 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: website/package-lock.json
-      - name: Install and build
+      - name: Install dependencies
         working-directory: website
-        run: npm install && npm run build
+        run: npm install
+      - name: Build
+        working-directory: website
+        run: npm run build
