@@ -559,11 +559,11 @@ pub(crate) async fn start_server(
         // Approval pushes are dispatched from `acp_event_listener`, which subscribes to the
         // broadcast that ChannelSink::publish feeds and has `Arc<AppState>` in scope
         // without a closure dance through the supervisor.
-        let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
-            tx: acp_events_tx.clone(),
-            event_store: acp_event_store.clone(),
-            control_cache: acp_control_cache.clone(),
-        });
+        let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink::new(
+            acp_events_tx.clone(),
+            acp_event_store.clone(),
+            acp_control_cache.clone(),
+        ));
         let supervisor = std::sync::Arc::new(
             crate::acp::supervisor::Supervisor::with_capacity(
                 sink,

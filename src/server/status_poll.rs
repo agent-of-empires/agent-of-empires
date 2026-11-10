@@ -425,7 +425,34 @@ pub(super) async fn status_poll_loop(
         Arc<std::collections::HashMap<String, super::reload::SandboxHealth>>,
     >,
 ) {
+    status_poll_loop_observed(
+        state,
+        health,
+        #[cfg(test)]
+        None,
+    )
+    .await;
+}
+
+pub(super) async fn status_poll_loop_observed(
+    state: Arc<AppState>,
+    health: tokio::sync::watch::Receiver<
+        Arc<std::collections::HashMap<String, super::reload::SandboxHealth>>,
+    >,
+    #[cfg(test)] completed: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+) {
+    #[cfg(test)]
+    struct TickCompleted(Option<tokio::sync::mpsc::UnboundedSender<()>>);
+    #[cfg(test)]
+    impl Drop for TickCompleted {
+        fn drop(&mut self) {
+            if let Some(sender) = &self.0 {
+                let _ = sender.send(());
+            }
+        }
+    }
     let mut first = true;
+    let mut sessions_cache = super::reload::ProfileSessionsCache::default();
     loop {
         if !first {
             let period = if state.runtime.has_subscribers() {
@@ -440,6 +467,8 @@ pub(super) async fn status_poll_loop(
             }
         }
         first = false;
+        #[cfg(test)]
+        let _completed = TickCompleted(completed.clone());
         let namespace = state.profile_namespace.read().await;
         let reload_lane = state.reload_lane.lock().await;
         let snapshot_guard = state.session_service.disk_reload_guard().await;
@@ -473,8 +502,7 @@ pub(super) async fn status_poll_loop(
         let file_watch_for_poll = state.file_watch.clone();
         let sandbox_health = health.borrow().clone();
         let updated = tokio::task::spawn_blocking(move || {
-            let (mut loaded, mut metadata) =
-                super::reload::load_profiles_for_reload(&file_watch_for_poll);
+            let (mut loaded, mut metadata) = sessions_cache.load(&file_watch_for_poll);
             drop(snapshot_guard);
             seed_tick_tracking(&mut loaded.instances, &prev_tracking);
             crate::tmux::refresh_session_cache();
@@ -537,7 +565,7 @@ pub(super) async fn status_poll_loop(
                 &supplementary_prev,
                 pane_metadata.as_ref().ok(),
             );
-            (loaded, metadata, live_structured_worker_records(), prev)
+            (loaded, metadata, live_structured_worker_records(), prev, sessions_cache)
         })
         .await;
 
@@ -551,11 +579,13 @@ pub(super) async fn status_poll_loop(
                         profiles: Vec::new(),
                     })
                     .await;
+                sessions_cache = super::reload::ProfileSessionsCache::default();
                 continue;
             }
         };
         {
-            let (mut loaded, metadata, live_worker_records, prev) = updated;
+            let (mut loaded, metadata, live_worker_records, prev, returned_cache) = updated;
+            sessions_cache = returned_cache;
             let instances = &mut loaded.instances;
             let unread_enabled = crate::session::unread_enabled();
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =

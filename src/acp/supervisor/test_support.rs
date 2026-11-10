@@ -276,11 +276,11 @@ pub(super) fn channel_sink() -> (
     let tmp = tempfile::TempDir::new().unwrap();
     let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
     let (tx, rx) = broadcast::channel(16);
-    let sink = Arc::new(ChannelSink {
+    let sink = Arc::new(ChannelSink::new(
         tx,
-        event_store: event_store.clone(),
-        control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    });
+        event_store.clone(),
+        Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+    ));
     (sink, event_store, rx, tmp)
 }
 

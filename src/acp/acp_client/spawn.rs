@@ -1218,7 +1218,13 @@ mod tests {
         });
         retained.active_execution = Some(crate::session::ActiveExecution {
             launch_id: "original".into(),
-            binding: retained.agent_session_binding.as_ref().unwrap().execution.clone().unwrap(),
+            binding: retained
+                .agent_session_binding
+                .as_ref()
+                .unwrap()
+                .execution
+                .clone()
+                .unwrap(),
             capture: None,
             container: None,
         });
