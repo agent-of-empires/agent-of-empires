@@ -201,7 +201,15 @@ fn register_child(
     }
     match children.get(child) {
         Some(existing) if existing.parent != *parent => return,
-        None if children.len() >= MAX_CHILDREN => return,
+        None if children.len() >= MAX_CHILDREN => {
+            tracing::warn!(
+                target: "acp.protocol",
+                child = %child.0,
+                limit = MAX_CHILDREN,
+                "subagent route limit reached; ignoring announcement"
+            );
+            return;
+        }
         _ => {}
     }
     let route = children.entry(child.clone()).or_insert_with(|| ChildRoute {
