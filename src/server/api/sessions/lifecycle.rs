@@ -4279,7 +4279,7 @@ async fn prepare_agent_session_inner(
     drop(guard);
     drop(submission);
     drop(namespace);
-    if let Some(reservation) = resume_reservation.take() {
+    let resume_triggered = if let Some(reservation) = resume_reservation.take() {
         match crate::server::acp_reconciler::trigger_resume_background(
             &state.session_service,
             &id,
@@ -4288,13 +4288,15 @@ async fn prepare_agent_session_inner(
         )
         .await
         {
-            Ok(crate::server::acp_reconciler::ResumeTrigger::Started) => {}
+            Ok(crate::server::acp_reconciler::ResumeTrigger::Started) => true,
             Ok(_) => return StatusCode::CONFLICT.into_response(),
             Err(error) => {
                 return crate::server::api::acp::supervisor_error_response("start failed", &error);
             }
         }
-    }
+    } else {
+        false
+    };
     if preparation == AgentPreparation::Restart {
         let Some((generation, profile)) = restart_identity else {
             return StatusCode::CONFLICT.into_response();
@@ -4373,7 +4375,7 @@ async fn prepare_agent_session_inner(
             response
         }
     } else {
-        if structured {
+        if structured && !resume_triggered {
             state.acp_supervisor.request_respawn(&id);
         }
         if outcome.is_some() || structured {

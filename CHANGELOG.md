@@ -18,7 +18,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **web:** Keep startup recovery details and agent logs open across connection failures, while disabling recovery actions under current Native uncertainty or read-only policy; historical input receipts never grant current input authority.
 - **tests:** Exercise terminal custody through the real HTTP mutation task, keep constructor and migration fixtures within Unix socket path bounds, and isolate plugin repositories from user Git configuration.
 - **plugins:** Keep read-only RPC dispatch small and bound asynchronous session dispatch before supervised spawning to prevent daemon stack overflows.
-- **acp:** Reject stopped or dormant launch preparation before arming an establishment, preserve retained selections in explicit-start and sandbox fixtures, and keep output diagnostics tied to qualified written windows rather than historical silence.
+- **acp:** Reject stopped or dormant launch preparation before arming an establishment, do not enqueue a redundant respawn after direct structured Start, preserve retained selections in explicit-start and sandbox fixtures, and keep output diagnostics tied to qualified written windows rather than historical silence.
 
 ### Security
 
