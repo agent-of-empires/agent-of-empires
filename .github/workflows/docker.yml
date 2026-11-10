@@ -53,7 +53,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ inputs.tag != 'nightly' && '{{is_default_branch}}' || 'false' }}
+            type=raw,value=latest,enable=${{ inputs.tag != 'nightly' && github.ref == 'refs/heads/main' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push
@@ -101,7 +101,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ inputs.tag != 'nightly' && '{{is_default_branch}}' || 'false' }}
+            type=raw,value=latest,enable=${{ inputs.tag != 'nightly' && github.ref == 'refs/heads/main' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       - name: Build and push
