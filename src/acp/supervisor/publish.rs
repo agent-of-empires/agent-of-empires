@@ -3,8 +3,8 @@
 use tracing::info;
 
 use super::{
-    publish_with_next_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor,
-    WorkerKind,
+    publish_next_persisted, publish_with_next_seq, BroadcastSink, PromptDisposition,
+    PublishedPrompt, SeqMap, Supervisor, WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
@@ -13,10 +13,7 @@ use crate::acp::state::{BackgroundAgentStatus, Event};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
-        publish_with_next_seq(&self.next_seqs, session_id, |seq| {
-            self.sink.publish(session_id, seq, event);
-            seq
-        })
+        publish_next_persisted(self.sink.as_ref(), &self.next_seqs, session_id, event).0
     }
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
@@ -34,21 +31,26 @@ impl<S: BroadcastSink> Supervisor<S> {
         expected_seq: u64,
     ) -> bool {
         let counter = super::session_seq(&self.next_seqs, session_id);
-        super::sink::blocking_io(|| {
+        let persisted = super::sink::blocking_io(|| {
             let mut last = super::lock_recover(&counter);
             if *last != expected_seq {
-                return false;
+                return None;
             }
             *last = last.saturating_add(1);
-            self.sink.publish(
+            Some(self.sink.queue_persisted(
                 session_id,
                 *last,
                 &Event::Stopped {
                     reason: reason.to_string(),
                 },
-            );
-            true
-        })
+            ))
+        });
+        let Some(persisted) = persisted else {
+            return false;
+        };
+        // A failed save is already broadcast as an AgentStartupError.
+        persisted.wait();
+        true
     }
 
     pub fn publish_agent_switched(
@@ -161,16 +163,16 @@ impl<S: BroadcastSink> Supervisor<S> {
                 synthesized,
                 origin_plugin,
             };
-            if !self.sink.publish_persisted(session_id, seq, &event) {
-                // Roll back so refs never point at blobs that were not published.
-                self.sink.delete_attachments_for_seq(session_id, seq);
-                return None;
-            }
-            Some(seq)
+            Some((seq, self.sink.queue_persisted(session_id, seq, &event)))
         });
-        let Some(seq) = published else {
+        let Some((seq, persisted)) = published else {
             return unrecorded;
         };
+        if !persisted.wait() {
+            // Roll back so refs never point at blobs that were not published.
+            self.sink.delete_attachments_for_seq(session_id, seq);
+            return unrecorded;
+        }
         if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, &Event::SessionCleared);
         }
@@ -250,16 +252,15 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     warning: &str,
 ) {
     for task_id in sink.unresolved_background_task_ids(session_id) {
-        publish_with_next_seq(next_seqs, session_id, |seq| {
-            sink.publish(
-                session_id,
-                seq,
-                &Event::BackgroundTaskFinished {
-                    task_id,
-                    ended_at: Some(chrono::Utc::now()),
-                },
-            )
-        });
+        publish_next_persisted(
+            sink,
+            next_seqs,
+            session_id,
+            &Event::BackgroundTaskFinished {
+                task_id,
+                ended_at: Some(chrono::Utc::now()),
+            },
+        );
     }
     let stale_ids = sink.unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
@@ -283,20 +284,19 @@ fn publish_background_agent_detached<S: BroadcastSink>(
     agent_id: String,
     warning: &str,
 ) {
-    publish_with_next_seq(next_seqs, session_id, |seq| {
-        sink.publish(
-            session_id,
-            seq,
-            &Event::BackgroundAgentCompleted {
-                agent_id,
-                status: BackgroundAgentStatus::Detached,
-                tools: Vec::new(),
-                result: None,
-                warning: Some(warning.to_string()),
-                ended_at: chrono::Utc::now(),
-            },
-        )
-    });
+    publish_next_persisted(
+        sink,
+        next_seqs,
+        session_id,
+        &Event::BackgroundAgentCompleted {
+            agent_id,
+            status: BackgroundAgentStatus::Detached,
+            tools: Vec::new(),
+            result: None,
+            warning: Some(warning.to_string()),
+            ended_at: chrono::Utc::now(),
+        },
+    );
 }
 
 /// The attach-path counterpart of [`detach_orphaned_background_agents_on`]:
@@ -334,9 +334,7 @@ pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     session_id: &str,
 ) {
     let publish = |event: Event| {
-        publish_with_next_seq(next_seqs, session_id, |seq| {
-            sink.publish(session_id, seq, &event)
-        })
+        publish_next_persisted(sink, next_seqs, session_id, &event);
     };
     let approvals = sink.unresolved_approval_nonces(session_id);
     if !approvals.is_empty() {

@@ -17,9 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, publish_with_next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap,
-    SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, publish_next_persisted, publish_with_next_seq, BroadcastSink, Launcher,
+    PendingContextReset, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -112,9 +112,12 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
-            self.sink.publish(&self.session_id, seq, &event)
-        });
+        publish_next_persisted(
+            self.sink.as_ref(),
+            &self.next_seqs,
+            &self.session_id,
+            &event,
+        );
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {

@@ -16,6 +16,13 @@ pub trait BroadcastSink: Send + Sync + 'static {
         self.publish(session_id, seq, event);
         true
     }
+    /// Queue an event for the durable store without waiting for it. Callers
+    /// holding a session's seq lock wait on the receipt after releasing it.
+    fn queue_persisted(&self, session_id: &str, seq: u64, event: &Event) -> Persisted {
+        Persisted(Receipt::Ready(
+            self.publish_persisted(session_id, seq, event),
+        ))
+    }
     /// Publish an event pumped from a worker, tagged with that worker's generation.
     fn publish_from_worker(&self, session_id: &str, seq: u64, event: &Event, _generation: u64) {
         self.publish(session_id, seq, event);
@@ -59,6 +66,24 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn delete_attachments_for_seq(&self, _session_id: &str, _seq: u64) {}
 }
 
+/// Whether a queued publication reached the durable store.
+#[must_use = "wait for the store, or say why the outcome is not needed"]
+pub struct Persisted(Receipt);
+
+enum Receipt {
+    Ready(bool),
+    Pending(std::sync::mpsc::Receiver<bool>),
+}
+
+impl Persisted {
+    pub fn wait(self) -> bool {
+        match self.0 {
+            Receipt::Ready(stored) => stored,
+            Receipt::Pending(wait) => blocking_io(|| wait.recv()).unwrap_or(false),
+        }
+    }
+}
+
 /// Publications queued for the writer thread. A worker's drain blocks only
 /// when this many are waiting, so a slow save does not stall its socket.
 const WRITE_QUEUE_CAPACITY: usize = 4096;
@@ -69,6 +94,8 @@ pub struct ChannelSink {
     persister: Arc<Persister>,
     jobs: Option<std::sync::mpsc::SyncSender<Job>>,
     writer: Option<std::thread::JoinHandle<()>>,
+    #[cfg(test)]
+    flushes: std::sync::atomic::AtomicUsize,
 }
 
 struct Persister {
@@ -131,6 +158,8 @@ impl ChannelSink {
             persister,
             jobs: writer.is_some().then_some(jobs),
             writer,
+            #[cfg(test)]
+            flushes: Default::default(),
         }
     }
 
@@ -156,6 +185,9 @@ impl ChannelSink {
 
     /// Wait until every earlier publication is stored and broadcast.
     pub(super) fn flush(&self) {
+        #[cfg(test)]
+        self.flushes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (done, wait) = std::sync::mpsc::sync_channel(1);
         self.submit(Job::Flush(done));
         let _ = blocking_io(|| wait.recv());
@@ -182,6 +214,12 @@ impl super::Supervisor<ChannelSink> {
     #[cfg(test)]
     pub(crate) fn test_run_on_writer(&self, run: impl FnOnce() + Send + 'static) {
         self.sink.submit(Job::Test(Box::new(run)));
+    }
+
+    /// Flushes requested so far, so a test can tell a reader is waiting on the writer.
+    #[cfg(test)]
+    pub(crate) fn test_flushes(&self) -> usize {
+        self.sink.flushes.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -218,6 +256,10 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
+        self.queue_persisted(session_id, seq, event).wait()
+    }
+
+    fn queue_persisted(&self, session_id: &str, seq: u64, event: &Event) -> Persisted {
         let (done, wait) = std::sync::mpsc::sync_channel(1);
         self.submit(Job::Publish(Box::new(Publication {
             session_id: session_id.to_string(),
@@ -226,7 +268,7 @@ impl BroadcastSink for ChannelSink {
             worker_generation: None,
             persisted: Some(done),
         })));
-        blocking_io(|| wait.recv()).unwrap_or(false)
+        Persisted(Receipt::Pending(wait))
     }
 
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
@@ -413,6 +455,85 @@ mod tests {
         }
         assert!(sink.publish_persisted("writer-panic", 3, &Event::ThinkingStarted));
         assert_eq!(store.highest_seq("writer-panic"), 3);
+    }
+
+    /// Holds the writer until the returned sender fires.
+    fn stall_writer(sink: &ChannelSink) -> std::sync::mpsc::SyncSender<()> {
+        use std::time::Duration;
+
+        let (entered, ready) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        sink.submit(Job::Test(Box::new(move || {
+            entered.send(()).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        })));
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        release
+    }
+
+    /// A sync publisher must wait for a stalled save outside the session's seq
+    /// lock, or the worker drain blocks on that lock and stops reading (#5251).
+    #[test]
+    fn a_stalled_sync_publish_leaves_the_seq_lock_to_the_drain() {
+        use std::time::{Duration, Instant};
+
+        let (sink, store, _rx, _tmp) = channel_sink();
+        let sup = Arc::new(super::super::Supervisor::new(Arc::clone(&sink)));
+        let release = stall_writer(&sink);
+        let publisher = {
+            let sup = Arc::clone(&sup);
+            std::thread::spawn(move || sup.publish_next("stalled", &Event::ThinkingStarted))
+        };
+        let counter = super::super::session_seq(&sup.next_seqs, "stalled");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !counter.try_lock().is_ok_and(|seq| *seq == 1) {
+            assert!(
+                Instant::now() < deadline,
+                "the seq lock stayed held while the publisher waited for the writer"
+            );
+            std::thread::yield_now();
+        }
+        // What the drain does for each worker frame.
+        let drained = super::super::publish_with_next_seq(&sup.next_seqs, "stalled", |seq| {
+            sink.publish_from_worker("stalled", seq, &Event::ThinkingEnded, 1);
+            seq
+        });
+        assert_eq!(drained, 2);
+        assert!(!publisher.is_finished(), "the save is still stalled");
+        release.send(()).unwrap();
+        assert_eq!(publisher.join().unwrap(), 1);
+        sink.flush();
+        let stored: Vec<_> = store
+            .replay_from("stalled", 0)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(stored, [1, 2]);
+    }
+
+    #[test]
+    fn dropping_the_sink_stores_queued_publications() {
+        use std::time::Duration;
+
+        let (sink, store, _rx, _tmp) = channel_sink();
+        let release = stall_writer(&sink);
+        sink.publish_from_worker("shutdown", 1, &Event::ThinkingStarted, 1);
+        let (dropped, done) = std::sync::mpsc::sync_channel(1);
+        let dropper = std::thread::spawn(move || {
+            drop(sink);
+            dropped.send(()).unwrap();
+        });
+        // Drop may only return once the writer has run what was queued.
+        if done.recv_timeout(Duration::from_millis(200)).is_ok() {
+            assert_eq!(
+                store.highest_seq("shutdown"),
+                1,
+                "drop returned before the queued save"
+            );
+        }
+        release.send(()).unwrap();
+        dropper.join().unwrap();
+        assert_eq!(store.highest_seq("shutdown"), 1);
     }
 
     #[test]

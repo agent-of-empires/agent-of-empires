@@ -354,7 +354,8 @@ mod tests {
                 .unwrap();
         });
         ready.await.unwrap();
-        let mut attach = tokio::spawn({
+        let flushes = state.acp_supervisor.test_flushes();
+        let attach = tokio::spawn({
             let state = Arc::clone(&state);
             let id = id.clone();
             let repo = not_a_repo.path().to_path_buf();
@@ -368,12 +369,20 @@ mod tests {
                 .await
             }
         });
-        let early = tokio::time::timeout(Duration::from_millis(100), &mut attach).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while state.acp_supervisor.test_flushes() == flushes {
+            assert!(
+                !attach.is_finished(),
+                "attachment decided without waiting for the queued stop"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "attachment never waited on the writer"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(!attach.is_finished(), "the queued stop is still held");
         release.send(()).unwrap();
-        assert!(
-            early.is_err(),
-            "attachment decided before the queued stop was written: {early:?}"
-        );
         let outcome = tokio::time::timeout(Duration::from_secs(5), attach)
             .await
             .unwrap()
