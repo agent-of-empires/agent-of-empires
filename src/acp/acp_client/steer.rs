@@ -1,7 +1,7 @@
 //! Mid-turn steering: the request wire form and the outcomes an agent can
 //! return when it is asked to take new input.
 
-use agent_client_protocol::schema::v1::{ContentBlock, SessionId};
+use agent_client_protocol::v1::schema::{ContentBlock, SessionId};
 use agent_client_protocol::JsonRpcRequest;
 use serde::{Deserialize, Serialize};
 
@@ -80,7 +80,7 @@ mod tests {
     use crate::acp::acp_client::test_helpers::reset_fake_spawn_config;
     use crate::acp::acp_client::AcpClient;
     use crate::acp::state::{AcpSessionId, Event};
-    use agent_client_protocol::schema::v1::TextContent;
+    use agent_client_protocol::v1::schema::TextContent;
 
     /// The wire contract (#2805): a typo in `sessionId` or the `_meta` opt-in
     /// silently degrades a racing steer to `startedNewTurn`, with no error.

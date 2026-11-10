@@ -703,7 +703,8 @@ impl PluginManagerDialog {
         }
     }
 
-    /// Toggle live, reconciling daemon workers or falling back to a config write.
+    /// Keep displayed enable-state unchanged until the operation succeeds.
+    /// An RPC error can leave the remote outcome unknown.
     fn start_toggle(&mut self) {
         if self.pending.is_some() {
             return;
@@ -1998,7 +1999,11 @@ impl PluginManagerDialog {
                     ),
                     Span::styled(
                         format!("{:<10}", row.validation),
-                        Style::default().fg(theme.dimmed),
+                        Style::default().fg(if row.validation == "dev" {
+                            theme.waiting
+                        } else {
+                            theme.dimmed
+                        }),
                     ),
                     Span::styled(format!("{:<14}", state.0), Style::default().fg(state.1)),
                 ];
@@ -2282,7 +2287,9 @@ mod mouse_tests {
                 agent_integrations: vec![
                     aoe_plugin_api::agent_integration::AgentIntegrationContribution {
                         tool: "session-helper".into(),
+                        provider_versions: Vec::new(),
                         command: Some("TOKEN=local session-helper --flag".into()),
+                        replies: false,
                     },
                 ],
                 fingerprint: "fingerprint".into(),
@@ -2305,7 +2312,9 @@ mod mouse_tests {
             agent_integrations: vec![
                 aoe_plugin_api::agent_integration::AgentIntegrationContribution {
                     tool: "session-helper".into(),
+                    provider_versions: Vec::new(),
                     command: Some("x\u{1b}[2Jtail".into()),
+                    replies: false,
                 },
             ],
             manifest_hash: "sha256:hash".into(),

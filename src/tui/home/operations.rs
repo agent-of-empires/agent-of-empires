@@ -410,10 +410,15 @@ impl HomeView {
         Ok(())
     }
 
-    pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
-        let Some(id) = self.selected_session.clone() else {
+    pub(super) fn submit_session_delete(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
+        if self.reconcile_delete_confirmation() {
             return Ok(());
-        };
+        }
+        let pending = self
+            .unified_delete_dialog
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Delete confirmation is no longer available"))?;
+        let id = pending.target.session_id.clone();
         if self.restart_in_flight.contains(&id) {
             self.info_dialog = Some(InfoDialog::new(
                 "Restart in progress",
@@ -421,30 +426,12 @@ impl HomeView {
             ));
             return Ok(());
         }
-        let mut body = crate::daemon::DeleteSessionBody {
-            delete_worktree: options.delete_worktree,
-            delete_branch: options.delete_branch,
-            delete_sandbox: options.delete_sandbox,
-            force_delete: options.force_delete,
-            keep_scratch: options.keep_scratch,
-            ..Default::default()
-        };
-        if let Some(row) = self.session_feed.applied_session(&id) {
-            if let Some(stamp) = row.trashed_at.as_ref() {
-                body.expected_trash = true;
-                body.expected_trashed_at =
-                    Some(chrono::DateTime::parse_from_rfc3339(stamp)?.with_timezone(&chrono::Utc));
-                body.expected_generation = Some(row.lifecycle_generation);
-                body.expected_trash_lifecycle_id = Some(
-                    row.trash_lifecycle_id
-                        .as_ref()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Canonical trash identity is not available")
-                        })?
-                        .clone(),
-                );
-            }
-        }
+        let mut body = pending.request.clone();
+        body.delete_worktree = options.delete_worktree;
+        body.delete_branch = options.delete_branch;
+        body.delete_sandbox = options.delete_sandbox;
+        body.force_delete = options.force_delete;
+        body.keep_scratch = options.keep_scratch;
         self.session_feed
             .submit_request(id, crate::tui::session_feed::SessionRequest::Purge(body))
     }
@@ -612,6 +599,7 @@ impl HomeView {
         new_name: &str,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.selected_is_trashed(), "Trash sessions are read-only");
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -667,6 +655,7 @@ impl HomeView {
         new_profile: Option<&str>,
         rename_branch: bool,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.selected_is_trashed(), "Trash sessions are read-only");
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
@@ -860,10 +849,18 @@ impl HomeView {
     ///
     /// The daemon commits the trash reservation, teardown and relocation; UI follows its receipt fence.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        let Some(instance) = self
+            .get_instance(id)
+            .filter(|instance| !instance.is_trashed())
+        else {
+            return;
+        };
+        let generation = instance.lifecycle_generation;
         if let Err(error) = self.session_feed.submit_request(
             id.to_owned(),
             crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
                 kill_pane: true,
+                expected_generation: Some(generation),
             }),
         ) {
             self.info_dialog = Some(InfoDialog::new(
@@ -1040,6 +1037,20 @@ impl HomeView {
                 .filter(|i| self.org_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
+            // Status headers key on the status's API spelling, the same key
+            // `build_flat_items_by_status` rewrites `group_path` to.
+            crate::session::config::GroupByMode::Status => self
+                .instances
+                .values()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| super::rows::status_group_key(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
             // Manual groups nest, so a session belongs when its path matches exactly or
             // sits beneath the group; scoped to the owning profile the same way
             // `delete_selected_group` does.
@@ -1057,10 +1068,18 @@ impl HomeView {
         }
     }
 
-    /// Queue the whole group's archive before submitting any row. The daemon
-    /// tears down each pane and publishes its committed state.
+    /// Queue the group's archive before submitting any row.
     pub(super) fn archive_selected_group(&mut self) -> anyhow::Result<()> {
-        let ids = self.active_sessions_in_selected_group();
+        // Preserve the membership counted by the prompt.
+        let ids = match self.pending_archive_group_ids.take() {
+            Some(ids) => ids,
+            None => self.active_sessions_in_selected_group(),
+        };
+        // Removed and trashed sessions are no longer eligible.
+        let ids: Vec<String> = ids
+            .into_iter()
+            .filter(|id| self.instances.get(id).is_some_and(|i| !i.is_trashed()))
+            .collect();
         if ids.is_empty() {
             return Ok(());
         }

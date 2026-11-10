@@ -4,7 +4,7 @@ import { pluginSortSpecs } from "../lib/pluginUi";
 import type { ProjectInfo, RepoGroup, Workspace } from "../lib/types";
 import type { RuntimeCursor, SessionMutation } from "../lib/api";
 import { SidebarSystemHealth } from "./SystemHealthStrip";
-import type { SidebarAxis } from "../lib/sidebarAxis";
+import { axisDrawsRepoHeaders, type SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
   type NestedSidebarGroup,
@@ -19,6 +19,7 @@ import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { useServerDown } from "../lib/connectionState";
 import type { SidebarSortMode } from "../lib/sidebarSort";
 import { useSidebarTriage } from "../hooks/useSidebarTriage";
+import { sessionWorkspaces } from "../lib/sessionWorkspace";
 import { ProjectsSection } from "./ProjectsSection";
 import { FoldChevron, PlusIcon, StrokeIcon } from "./icons";
 import { usePersistedFlag } from "./usePersistedFlag";
@@ -31,7 +32,8 @@ import {
   makeRowFilter,
   renderedOrder,
   sunkViews,
-  uniqueWorkspaces,
+  visibleOrgRepos,
+  visibleSubgroups,
 } from "./sidebar/filterGroups";
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
@@ -56,12 +58,18 @@ interface Props {
   orgGroups: OrgNestedGroup[];
   /** Workspaces whose every session is trashed, computed by the parent from the unsliced list. */
   trashedWorkspaces?: Workspace[];
+  /** Trashed sessions the daemon holds; the rows load on demand, so this keeps the Trash control visible before then. */
+  trashedCount?: number;
+  trashLoaded?: boolean;
+  onLoadTrash?: () => void;
   onToggleSubgroup: (repoId: string, groupPath: string) => void;
   onToggleOrg: (orgId: string) => void;
   onToggleOrgRepo: (orgId: string, repoId: string) => void;
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
+  /** The session the URL currently points at; lets an expanded sibling row tell it apart from the rest of its group. */
+  activeSessionId: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string, sessionId: string | null) => void;
@@ -99,7 +107,17 @@ interface Props {
 }
 
 export function WorkspaceSidebar(props: Props) {
-  const { groups, nestedGroups, orgGroups, trashedWorkspaces = [], activeId, open, readOnly, axis } = props;
+  const {
+    groups,
+    nestedGroups,
+    orgGroups,
+    trashedWorkspaces = [],
+    activeId,
+    activeSessionId,
+    open,
+    readOnly,
+    axis,
+  } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
   const compact = webSettings.sidebarCompact;
@@ -143,18 +161,55 @@ export function WorkspaceSidebar(props: Props) {
   const isNested = axis === "repo+group";
   const isOrgAxis = axis === "org";
 
-  const allWorkspaces = useMemo(() => uniqueWorkspaces(groups), [groups]);
-  const triage = useSidebarTriage(allWorkspaces);
-  const orderedIds = useMemo(
-    () => renderedOrder(filteredGroups, hasFilter, sunkExpanded),
-    [filteredGroups, hasFilter, sunkExpanded],
-  );
+  // An expanded sibling keeps its own optimistic override, which has to reconcile against its one session,
+  // also after its siblings are gone. The status axis repeats a workspace per bucket, so the records come
+  // from every slice of every axis plus their session children.
+  const triageWorkspaces = useMemo(() => {
+    const slices = [groups, ...nestedGroups.map((n) => n.subgroups), ...orgGroups.map((o) => o.repos)]
+      .flat()
+      .flatMap((g) => g.workspaces.map((v) => v.workspace));
+    return [...slices, ...sessionWorkspaces(slices)];
+  }, [groups, nestedGroups, orgGroups]);
+  const triage = useSidebarTriage(triageWorkspaces);
+  // Rows, not workspaces: the status axis renders a workspace once per bucket, and each row's
+  // actions belong to its own session. Filtering keeps the selection, so ranges use `filtered`.
+  const [orderedIds, rows] = useMemo(() => {
+    const filteredAll = isNested
+      ? filteredNested.flatMap((ng) => ng.subgroups)
+      : isOrgAxis
+        ? filteredOrgGroups.flatMap((og) => og.repos)
+        : filteredGroups;
+    // A collapsed repo or org hides its children, so a range must skip the rows it hides.
+    const rendered = isNested
+      ? visibleSubgroups(filteredNested, hasFilter)
+      : isOrgAxis
+        ? visibleOrgRepos(filteredOrgGroups, hasFilter)
+        : filteredGroups;
+    const every = isNested
+      ? nestedGroups.flatMap((ng) => ng.subgroups)
+      : isOrgAxis
+        ? orgGroups.flatMap((og) => og.repos)
+        : groups;
+    return [renderedOrder(rendered, hasFilter, sunkExpanded, filteredAll), every.flatMap((g) => g.workspaces)] as const;
+  }, [
+    isNested,
+    isOrgAxis,
+    groups,
+    nestedGroups,
+    orgGroups,
+    filteredGroups,
+    filteredNested,
+    filteredOrgGroups,
+    hasFilter,
+    sunkExpanded,
+  ]);
   const selection = useSidebarSelection({
-    allWorkspaces,
+    rows,
     orderedIds,
     triage,
     readOnly,
     activeId,
+    activeSessionId,
     onSelect: props.onSelect,
   });
   const { onBulkArchive } = selection;
@@ -176,6 +231,7 @@ export function WorkspaceSidebar(props: Props) {
     readOnly,
     offline,
     displayedActiveId: selection.displayedActiveId,
+    displayedActiveSessionId: selection.displayedActiveSessionId,
     onNew: props.onNew,
     onCreateSession: props.onCreateSession,
     onUpdateAppearance: props.onUpdateRepoAppearance,
@@ -184,20 +240,28 @@ export function WorkspaceSidebar(props: Props) {
     onEditProjectSettings: props.onEditProjectSettings,
     onArchiveGroup,
     rowProps: (v: SidebarWorkspaceView) => ({
+      rowKey: v.key,
       workspace: v.workspace,
       observedById: props.observedById,
       runtimeEpoch: props.runtimeEpoch,
       onSessionMutation: props.onSessionMutation,
-      isActive: v.workspace.id === selection.displayedActiveId,
-      isSelected: selection.isSelected(v.workspace.id),
+      isActive:
+        v.workspace.id === selection.displayedActiveId &&
+        (selection.displayedActiveSessionId == null ||
+          v.workspace.sessions.some((s) => s.id === selection.displayedActiveSessionId)),
+      isSelected: selection.isSelected(v.key),
       onActivate: selection.handleRowActivate,
+      ...(v.workspace.sessions.length > 1 && {
+        activeSessionId: props.activeSessionId,
+        optimisticFor: triage.optimisticFor,
+      }),
       onDelete: props.onDeleteSession,
       onStop: props.onStopSession,
       onStart: props.onStartSession,
       onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
-      optimistic: triage.optimisticFor(v.workspace.id),
+      optimistic: triage.optimisticFor(v.workspace),
       onPinToggle: triage.pinToggle,
       onArchiveToggle: triage.archiveToggle,
       onSnooze: triage.snooze,
@@ -354,6 +418,7 @@ export function WorkspaceSidebar(props: Props) {
           {(props.canManageProjects ?? true) && (
             <ProjectsSection
               projects={props.savedProjects}
+              drawsRepoHeaders={axisDrawsRepoHeaders(axis)}
               query={q}
               readOnly={readOnly}
               offline={offline}
@@ -389,9 +454,12 @@ export function WorkspaceSidebar(props: Props) {
         <SidebarSystemHealth />
 
         <div className="border-t border-surface-700/20 p-2 max-md:pb-[max(0.5rem,env(safe-area-inset-bottom))] flex items-center gap-1">
-          {trashedWorkspaces.length > 0 && (
+          {(trashedWorkspaces.length > 0 || (props.trashedCount ?? 0) > 0) && (
             <TrashMenu
               trashedWorkspaces={trashedWorkspaces}
+              trashedCount={props.trashedCount ?? 0}
+              loaded={props.trashLoaded ?? true}
+              onLoad={() => props.onLoadTrash?.()}
               readOnly={readOnly}
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}

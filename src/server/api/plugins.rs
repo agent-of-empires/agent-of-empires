@@ -301,7 +301,10 @@ pub async fn plugin_commands(State(state): State<std::sync::Arc<AppState>>) -> R
 
 /// `GET /api/plugins/ui-state`: the plugin host's aggregated UI-state snapshot
 /// Includes worker slots, notifications, and active plugin pages.
-pub async fn plugin_ui_state(State(state): State<std::sync::Arc<AppState>>) -> Response {
+pub async fn plugin_ui_state(
+    State(state): State<std::sync::Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
@@ -320,7 +323,31 @@ pub async fn plugin_ui_state(State(state): State<std::sync::Arc<AppState>>) -> R
         None => empty(),
     };
     body["pages"] = json!(pages);
-    Json(body).into_response()
+    // The snapshot is ordered, so equal state serializes to equal bytes. `no-cache` makes the browser revalidate
+    // and reuse its stored body on a 304.
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    let etag = format!("\"{:016x}\"", {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        hasher.finish()
+    });
+    let validators = [
+        (axum::http::header::ETAG, etag.clone()),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "private, no-cache".into(),
+        ),
+    ];
+    if crate::server::runtime::if_none_match(&headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, validators).into_response();
+    }
+    (
+        validators,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response()
 }
 
 /// `GET /api/plugins/updates`: which installed external plugins have an update
@@ -737,6 +764,12 @@ pub async fn set_plugin_enabled(
                 host.reconcile(&crate::plugin::registry()).await;
             }
             list_plugins(State(state)).await
+        }
+        Ok(Err(e)) if e.is::<crate::daemon::lifecycle::TransactionBusy>() => {
+            super::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::LifecycleLocked,
+                format!("{e:#}"),
+            )
         }
         Ok(Err(e)) => {
             tracing::warn!(target: "plugin.host", %plugin, enabled, error = %format!("{e:#}"), "plugin toggle failed");
@@ -1484,6 +1517,33 @@ id = "voice"
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn unchanged_ui_state_answers_not_modified_without_a_body() {
+        use axum::http::{header, HeaderMap, HeaderValue};
+        let _app_dir = AppDirEnvGuard::new();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let first = plugin_ui_state(State(state.clone()), HeaderMap::new()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let etag = first.headers()[header::ETAG].clone();
+        let mut revalidate = HeaderMap::new();
+        revalidate.insert(header::IF_NONE_MATCH, etag.clone());
+
+        let again = plugin_ui_state(State(state.clone()), revalidate).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(again.headers()[header::ETAG], etag);
+        assert!(axum::body::to_bytes(again.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let mut stale = HeaderMap::new();
+        stale.insert(header::IF_NONE_MATCH, HeaderValue::from_static("\"other\""));
+        let changed = plugin_ui_state(State(state), stale).await;
+        assert_eq!(changed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn an_active_plugins_page_is_delivered_through_the_real_route() {
         use tower::ServiceExt;
         let _app_dir = AppDirEnvGuard::new();
@@ -1544,6 +1604,7 @@ id = "voice"
                 "icon": null,
                 "url": "/api/plugins/acme.board/pages/board",
                 "capabilities": [],
+                "deep_link": false,
             }])
         );
     }

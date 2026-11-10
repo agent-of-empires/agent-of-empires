@@ -183,7 +183,7 @@ fn purge_aside(inst: &Instance) -> Option<PathBuf> {
 /// A row is orphaned once its checkout is gone and no lifecycle operation, such as a purge that
 /// may restore it, has it reserved.
 fn is_orphaned_session(inst: &Instance, now: chrono::DateTime<chrono::Utc>) -> bool {
-    if inst.has_fresh_lifecycle_reservation(now) {
+    if inst.has_fresh_lifecycle_reservation(now) || inst.has_pending_trash() {
         return false;
     }
     if inst.worktree_info.is_some() {
@@ -238,7 +238,22 @@ pub(crate) fn find_orphaned_worktrees(
         .iter()
         .flat_map(|inst| {
             let aside = purge_aside(inst).map(|aside| aside.to_string_lossy().into_owned());
-            std::iter::once(inst.project_path.clone()).chain(aside)
+            let holding = inst
+                .has_pending_trash()
+                .then(|| {
+                    let original = inst
+                        .pre_trash_project_path
+                        .as_deref()
+                        .unwrap_or(&inst.project_path);
+                    crate::session::trash::trash_holding_path(Path::new(original), &inst.id)?
+                        .canonicalize()
+                        .ok()
+                        .map(|path| path.to_string_lossy().into_owned())
+                })
+                .flatten();
+            std::iter::once(inst.project_path.clone())
+                .chain(aside)
+                .chain(holding)
         })
         .collect();
     Ok(partition_orphaned_worktrees(
@@ -294,6 +309,49 @@ pub(crate) fn remove_orphaned_worktrees(
         }
     }
     removed
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_PROFILE_LISTING: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Removes the confirmed worktrees that no session in any profile sits on or inside. The rows are
+/// read, and the removal done, while every store is locked, so no session can adopt a path in
+/// between. Fails closed: if a store cannot be read, nothing is removed.
+pub(crate) fn remove_confirmed_worktrees(
+    git_wt: &GitWorktree,
+    orphans: &[WorktreeEntry],
+    purging: &HashSet<PathBuf>,
+) -> Result<usize> {
+    let _transition = crate::session::StorageTransition::acquire()?;
+    let storages = crate::session::list_profiles()?
+        .iter()
+        .map(|profile| Storage::open_unwatched(profile))
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_PROFILE_LISTING.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+    crate::session::with_storages_locked(&storages, || {
+        let mut session_paths = Vec::new();
+        for storage in &storages {
+            for inst in storage.load_instances_complete()? {
+                let path = PathBuf::from(&inst.project_path);
+                session_paths.extend(path.canonicalize().ok());
+                session_paths.push(path);
+            }
+        }
+        let (kept, free): (Vec<_>, Vec<_>) = orphans
+            .iter()
+            .cloned()
+            .partition(|wt| session_paths.iter().any(|path| path.starts_with(&wt.path)));
+        for wt in &kept {
+            eprintln!("✗ Skipped {}: a session now uses it", wt.path.display());
+        }
+        Ok(remove_orphaned_worktrees(git_wt, &free, purging))
+    })?
 }
 
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
@@ -389,7 +447,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
         let main_repo = GitWorktree::find_main_repo(&current_dir)?;
         let git_wt = GitWorktree::new(main_repo)?;
 
-        removed_count += remove_orphaned_worktrees(&git_wt, &orphaned_worktrees, &purging);
+        removed_count += remove_confirmed_worktrees(&git_wt, &orphaned_worktrees, &purging)?;
     }
 
     println!("\n✓ Cleanup complete: {} items removed", removed_count);
@@ -513,6 +571,160 @@ mod tests {
         assert_eq!(remove_orphaned_sessions(&storage, &orphans).unwrap(), 1);
         let left = storage.load().unwrap();
         assert_eq!(ids(&left), ["restored", "locked", "reserved"]);
+    }
+
+    /// A session created on, or inside, a listed candidate after listing keeps its checkout.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_spares_candidates_a_session_adopted_after_listing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let git_wt = GitWorktree::new(repo.clone()).unwrap();
+        let mut paths = Vec::new();
+        for name in ["inside", "equal", "free"] {
+            let path = tmp.path().join(name);
+            git_wt.create_worktree(name, &path, true, None).unwrap();
+            paths.push(path.canonicalize().unwrap());
+        }
+
+        let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
+        assert_eq!(orphans.len(), 3);
+        let purging = purging_paths(&orphans);
+
+        let nested = paths[0].join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        for (profile, path) in [("one", &nested), ("two", &paths[1])] {
+            Storage::new_unwatched(profile)
+                .unwrap()
+                .update(|instances, _groups| {
+                    instances.push(Instance::new("adopted", path.to_str().unwrap()));
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let removed = remove_confirmed_worktrees(&git_wt, &orphans, &purging).unwrap();
+        assert_eq!(removed, 1);
+        assert!(paths[0].exists() && paths[1].exists());
+        assert!(!paths[2].exists());
+    }
+
+    /// Cleanup holds the catalogue lock across the profile listing, so a profile cannot be created
+    /// after the listing and go unread.
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_blocks_profile_creation_after_listing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("home"));
+        Storage::new_unwatched("main").unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&repo)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let git_wt = GitWorktree::new(repo).unwrap();
+        let path = tmp.path().join("wt");
+        git_wt.create_worktree("wt", &path, true, None).unwrap();
+        let (orphans, _) = find_orphaned_worktrees(&[], &git_wt).unwrap();
+
+        let app_dir = crate::session::get_app_dir().unwrap();
+        let creator_blocked = std::rc::Rc::new(std::cell::Cell::new(None));
+        let seen = creator_blocked.clone();
+        AFTER_PROFILE_LISTING.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let creator = crate::session::try_acquire_storage_flock(
+                    &app_dir,
+                    crate::migrations::v027_isolate_sandbox_stores::LOCK,
+                )
+                .unwrap();
+                seen.set(Some(creator.is_none()));
+            }));
+        });
+        remove_confirmed_worktrees(&git_wt, &orphans, &HashSet::new()).unwrap();
+        assert_eq!(creator_blocked.get(), Some(true));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cleanup_keeps_unfinished_trash_row_and_moved_checkout() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("main");
+        let worktree = root.path().join("worktree");
+        let repo = git2::Repository::init(&main).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree = repo
+            .find_tree(repo.index().unwrap().write_tree().unwrap())
+            .unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+        let git = GitWorktree::new(main.clone()).unwrap();
+        git.create_worktree("unfinished-trash", &worktree, true, None)
+            .unwrap();
+        std::fs::write(worktree.join("payload"), b"retained").unwrap();
+        let mut row = Instance::new("unfinished trash", worktree.to_str().unwrap());
+        row.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "unfinished-trash".into(),
+            main_repo_path: main.to_string_lossy().into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        row.try_acquire_lifecycle_reservation(
+            crate::session::LifecycleOperation::Trash,
+            Instance::LIFECYCLE_RESERVATION_TTL,
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        row.trash();
+        let mut uncommitted = row.clone();
+        assert!(matches!(
+            crate::session::trash::relocate_worktree_to_trash(&mut uncommitted),
+            crate::session::trash::RelocateOutcome::Relocated { .. },
+        ));
+        let storage = Storage::new_unwatched("cleanup").unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(row.clone());
+                Ok(())
+            })
+            .unwrap();
+        let before = std::fs::read(storage.sessions_path()).unwrap();
+        assert!(find_orphaned_sessions(std::slice::from_ref(&row)).is_empty());
+        assert_eq!(
+            remove_orphaned_sessions(&storage, std::slice::from_ref(&row)).unwrap(),
+            0
+        );
+        let (orphans, _) = find_orphaned_worktrees(std::slice::from_ref(&row), &git).unwrap();
+        assert!(!orphans
+            .iter()
+            .any(|entry| entry.path == Path::new(&uncommitted.project_path)));
+        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(Path::new(&uncommitted.project_path).join("payload")).unwrap(),
+            b"retained"
+        );
     }
 
     #[test]

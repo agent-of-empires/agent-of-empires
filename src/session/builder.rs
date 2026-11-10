@@ -96,6 +96,10 @@ pub struct InstanceParams {
     /// One-shot fork seed. When `Some`, the freshly-built instance is set up
     /// to fork its parent on first launch instead of starting fresh.
     pub fork_seed: Option<crate::session::ForkSeed>,
+    pub generated_name: bool,
+    pub no_submodules: bool,
+    pub tie_workdir_to_name: bool,
+    pub worktree_path_id: Option<String>,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -622,6 +626,18 @@ impl WorkspacePlan {
     }
 }
 
+/// Why [`build_instance`] refused before doing any work, typed so a remote
+/// caller can name the cause without the text.
+#[derive(Debug, thiserror::Error)]
+pub enum BuildRefusal {
+    #[error("Container runtime is not installed. Please install a supported runtime to use sandbox mode.")]
+    RuntimeNotInstalled,
+    #[error("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.")]
+    RuntimeNotRunning,
+    #[error("Project path does not exist: {0}")]
+    WorkingDirMissing(String),
+}
+
 /// Build an instance with all setup (worktree resolution, sandbox config).
 ///
 /// This does NOT start the instance or create Docker containers - that happens
@@ -633,22 +649,28 @@ pub fn build_instance(
     existing_branches: &[&str],
     profile: &str,
 ) -> Result<BuildResult> {
-    plan_instance(params, existing_titles, existing_branches, profile)?
-        .provision()
-        .map_err(|failure| {
-            let protection = CleanupProtection::default();
-            if let Some(worktree) = &failure.result.created_worktree {
-                cleanup_created_worktree(worktree, "worktree", &protection);
-            }
-            if let Some(workspace) = &failure.result.instance.workspace_info {
-                cleanup_workspace(
-                    workspace,
-                    &failure.result.created_workspace_worktrees,
-                    &protection,
-                );
-            }
-            failure.error
-        })
+    plan_instance(
+        params,
+        SandboxReadiness::RequireRunning,
+        existing_titles,
+        existing_branches,
+        profile,
+    )?
+    .provision()
+    .map_err(|failure| {
+        let protection = CleanupProtection::default();
+        if let Some(worktree) = &failure.result.created_worktree {
+            cleanup_created_worktree(worktree, "worktree", &protection);
+        }
+        if let Some(workspace) = &failure.result.instance.workspace_info {
+            cleanup_workspace(
+                workspace,
+                &failure.result.created_workspace_worktrees,
+                &protection,
+            );
+        }
+        failure.error
+    })
 }
 
 /// A checkout marked for purging is about to be removed, so no new session may take it.
@@ -659,8 +681,49 @@ pub(crate) fn ensure_not_purging(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn generated_worktree_title(
+    path: &Path,
+    branch: &str,
+    create_new_branch: bool,
+    config: &super::Config,
+    existing_titles: &[&str],
+    path_id: &str,
+) -> Result<String> {
+    let git = GitWorktree::find_main_repo(path).and_then(GitWorktree::new)?;
+    let branch = git_sanitize_branch_name(branch);
+    let attaching = !create_new_branch
+        && git
+            .list_worktrees()?
+            .iter()
+            .any(|entry| entry.branch.as_deref() == Some(branch.as_str()));
+    let template = if GitWorktree::is_bare_repo(&git.repo_path) {
+        &config.worktree.bare_repo_path_template
+    } else {
+        &config.worktree.path_template
+    };
+    civilizations::generate_random_title_filtered(existing_titles, |candidate| {
+        !attaching
+            && git
+                .compute_path(
+                    &super::worktree_edit::worktree_leaf_from_title(candidate),
+                    template,
+                    path_id,
+                )
+                .is_ok_and(|path| path.exists())
+    })
+    .ok_or_else(|| {
+        anyhow::anyhow!("Could not generate a unique worktree name; pass --title instead")
+    })
+}
+
+pub(crate) enum SandboxReadiness {
+    RequireRunning,
+    InstalledOnly,
+}
+
 pub(crate) fn plan_instance(
     params: InstanceParams,
+    sandbox_readiness: SandboxReadiness,
     existing_titles: &[&str],
     existing_branches: &[&str],
     profile: &str,
@@ -689,10 +752,12 @@ pub(crate) fn plan_instance(
     if params.sandbox {
         let runtime = containers::get_container_runtime();
         if !runtime.is_available() {
-            bail!("Container runtime is not installed. Please install a supported runtime to use sandbox mode.");
+            return Err(BuildRefusal::RuntimeNotInstalled.into());
         }
-        if !runtime.is_daemon_running() {
-            bail!("Container runtime daemon is not running. Please start a supported runtime to use sandbox mode.");
+        if matches!(sandbox_readiness, SandboxReadiness::RequireRunning)
+            && !runtime.is_daemon_running()
+        {
+            return Err(BuildRefusal::RuntimeNotRunning.into());
         }
     }
 
@@ -702,7 +767,10 @@ pub(crate) fn plan_instance(
     } else {
         std::path::PathBuf::from(&params.path)
     };
-    let config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
+    let mut config = super::config::repo_config::resolve_config_with_repo(profile, &config_path)?;
+    if params.no_submodules {
+        config.worktree.init_submodules = false;
+    }
 
     let mut final_path = if params.scratch {
         // Scratch paths depend on the instance ID.
@@ -726,13 +794,40 @@ pub(crate) fn plan_instance(
         params.create_new_branch,
         params.scratch,
     );
-    let final_title = resolve_title(
-        &params.title,
-        params.worktree_branch.as_deref(),
-        params.worktree_enabled,
-        existing_titles,
-        &taken_branches,
-    )?;
+    anyhow::ensure!(
+        !params.generated_name || params.worktree_enabled,
+        "Generated names require a worktree branch"
+    );
+    let worktree_path_id = if params.worktree_enabled {
+        let id = params
+            .worktree_path_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        anyhow::ensure!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "Invalid worktree path identity"
+        );
+        id
+    } else {
+        String::new()
+    };
+    let final_title = if params.generated_name && params.title.trim().is_empty() {
+        generated_worktree_title(
+            Path::new(&params.path),
+            params.worktree_branch.as_deref().unwrap_or_default(),
+            params.create_new_branch,
+            &config,
+            existing_titles,
+            &worktree_path_id[..8],
+        )?
+    } else {
+        resolve_title(
+            &params.title,
+            params.worktree_branch.as_deref(),
+            params.worktree_enabled,
+            existing_titles,
+            &taken_branches,
+        )?
+    };
     let branch_source = resolve_worktree_branch(
         params.worktree_enabled,
         params.worktree_branch.as_deref(),
@@ -844,8 +939,18 @@ pub(crate) fn plan_instance(
                         base_branch: None,
                     });
                 } else {
-                    let session_id = uuid::Uuid::new_v4().to_string();
-                    let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                    let leaf = if params.generated_name
+                        || (params.tie_workdir_to_name && config.session.tie_workdir_to_name)
+                    {
+                        super::worktree_edit::worktree_leaf_from_title(&final_title)
+                    } else {
+                        branch.clone()
+                    };
+                    let worktree_path =
+                        git_wt.compute_path(&leaf, template, &worktree_path_id[..8])?;
+                    if worktree_path.exists() {
+                        return Err(GitError::WorktreeAlreadyExists(worktree_path).into());
+                    }
 
                     provisioning = Provisioning::Worktree {
                         create_new_branch: false,
@@ -862,8 +967,14 @@ pub(crate) fn plan_instance(
                     });
                 }
             } else {
-                let session_id = uuid::Uuid::new_v4().to_string();
-                let worktree_path = git_wt.compute_path(branch, template, &session_id[..8])?;
+                let leaf = if params.generated_name
+                    || (params.tie_workdir_to_name && config.session.tie_workdir_to_name)
+                {
+                    super::worktree_edit::worktree_leaf_from_title(&final_title)
+                } else {
+                    branch.clone()
+                };
+                let worktree_path = git_wt.compute_path(&leaf, template, &worktree_path_id[..8])?;
 
                 if worktree_path.exists() {
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
@@ -907,7 +1018,7 @@ pub(crate) fn plan_instance(
     if !params.scratch && matches!(provisioning, Provisioning::None) {
         let final_path_buf = PathBuf::from(&final_path);
         if !final_path_buf.exists() {
-            bail!("Project path does not exist: {}", final_path);
+            return Err(BuildRefusal::WorkingDirMissing(final_path.to_string()).into());
         }
         if !final_path_buf.is_dir() {
             bail!("Project path is not a directory: {}", final_path);
@@ -938,8 +1049,7 @@ pub(crate) fn plan_instance(
     if let Some(notice) =
         crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
     {
-        // Non-blocking: deprecated agents still launch; every support path
-        // is unchanged. The warning only informs.
+        warnings.push(format!("{} is {notice}", params.tool));
         tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
     }
     instance.worktree_info = worktree_info;
@@ -1205,6 +1315,7 @@ pub mod structured {
             }
         }
     }
+    impl std::error::Error for StructuredChoiceError {}
 
     /// The session a structured-view choice is checked for.
     pub struct StructuredChoice<'a> {
@@ -1235,9 +1346,6 @@ pub mod structured {
         trust_hooks: Option<bool>,
     ) -> bool {
         use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
-        let prepares = |hooks: &crate::session::HooksConfig| {
-            !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
-        };
         if prepares(profile_hooks) {
             return true;
         }
@@ -1251,6 +1359,10 @@ pub mod structured {
             }
             _ => false,
         }
+    }
+
+    fn prepares(hooks: &crate::session::HooksConfig) -> bool {
+        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -1320,8 +1432,7 @@ pub mod structured {
             "" => config.session.resolve_tool_command(choice.tool),
             command => command.to_string(),
         };
-        if let Some(ovr) =
-            crate::server::acp_reconciler::command_override_for_spawn(choice.tool, &command)
+        if let Some(ovr) = crate::acp::supervisor::command_override_for_spawn(choice.tool, &command)
         {
             crate::acp::supervisor::apply_agent_command_override(
                 agent,
@@ -1353,11 +1464,14 @@ pub mod structured {
     }
 
     /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
-    /// list. There is no project to search from, so relative PATH entries pass.
+    /// list. There is no project to search from, so relative PATH entries pass. With
+    /// `count_profile_hooks`, `config`'s own hooks may install the adapter first; the
+    /// repository's depend on the project.
     pub fn adapter_installed(
         agent: &str,
         config: &crate::session::Config,
         host_environment: &[(String, String)],
+        count_profile_hooks: bool,
     ) -> bool {
         let choice = StructuredChoice {
             tool: agent,
@@ -1365,7 +1479,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
-            preparation_hooks: &|| false,
+            preparation_hooks: &|| count_profile_hooks && prepares(&config.hooks),
         };
         validate_structured_choice_with(
             &choice,
@@ -2015,6 +2129,54 @@ mod tests {
                     "{label}: asked about hooks for a reachable adapter"
                 );
             }
+        }
+    }
+
+    /// Only the create-ready answer counts the profile's own preparation hooks, as the create
+    /// check does; the strict one reports whether the adapter runs now.
+    #[test]
+    #[serial_test::serial]
+    fn adapter_installed_counts_profile_preparation_hooks_only_when_asked() {
+        use crate::session::HooksConfig;
+        let _home = crate::session::test_support::isolate_app_dir();
+        // Absolute, so no PATH is searched: a relative entry in the caller's PATH would pass.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-adapter");
+        let hook = || vec!["npm install".to_string()];
+        for (label, hooks, create_ready) in [
+            ("no hooks", HooksConfig::default(), false),
+            (
+                "on_create",
+                HooksConfig {
+                    on_create: hook(),
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "on_launch",
+                HooksConfig {
+                    on_launch: hook(),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ] {
+            let mut config = crate::session::Config::default();
+            config
+                .session
+                .agent_acp_cmd
+                .insert("fake".into(), missing.display().to_string());
+            config.hooks = hooks;
+            assert!(
+                !structured::adapter_installed("fake", &config, &[], false),
+                "{label}: strict"
+            );
+            assert_eq!(
+                structured::adapter_installed("fake", &config, &[], true),
+                create_ready,
+                "{label}: create-ready"
+            );
         }
     }
 
@@ -2979,6 +3141,10 @@ mod tests {
             repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         }
     }
 
@@ -3251,6 +3417,10 @@ mod tests {
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),
             }),
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         };
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()
@@ -3326,6 +3496,10 @@ mod tests {
                 child_session_id: "child-conversation".into(),
                 unattributed_parent_agent: None,
             }),
+            generated_name: false,
+            no_submodules: false,
+            tie_workdir_to_name: false,
+            worktree_path_id: None,
         };
         let inst = build_instance(params, &[], &[], "default")
             .unwrap()

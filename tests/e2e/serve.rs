@@ -83,7 +83,8 @@ fn login_status_required(port: u16, token: &str) -> Result<bool, String> {
     })
 }
 
-fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
+/// Requires token mode with a passphrase; neither gate may bypass the other.
+pub(super) fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
@@ -91,25 +92,27 @@ fn assert_original_passphrase_login(h: &TuiTestHarness, passphrase: &str) {
     let (port, token) = serve_url_parts(&url).expect("successor endpoint");
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
-        let response = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
             .build()
-            .unwrap()
-            .post(format!("http://127.0.0.1:{port}/api/login"))
-            .bearer_auth(token)
-            .json(&serde_json::json!({
-                "passphrase": passphrase,
-                "device_binding_secret": URL_SAFE_NO_PAD.encode([0x5Au8; 32]),
-            }))
-            .send()
-            .await
-            .expect("successor login response");
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::OK,
-            "successor rejected the original passphrase"
-        );
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/api/login");
+        let body = serde_json::json!({
+            "passphrase": passphrase,
+            "device_binding_secret": URL_SAFE_NO_PAD.encode([0x5Au8; 32]),
+        });
+        for (bearer, expected) in [
+            (None, reqwest::StatusCode::UNAUTHORIZED),
+            (Some(token.as_str()), reqwest::StatusCode::OK),
+        ] {
+            let mut request = client.post(&url).json(&body);
+            if let Some(token) = bearer {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.expect("successor login response");
+            assert_eq!(response.status(), expected);
+        }
     });
 }
 
@@ -157,7 +160,7 @@ fn wait_for_login_status(h: &TuiTestHarness) -> bool {
 }
 
 /// Re-execute Local flows with no interface connected to the host network.
-fn isolated_local_network() -> bool {
+pub(super) fn isolated_local_network() -> bool {
     #[cfg(target_os = "linux")]
     {
         const MARKER: &str = "AOE_LOCAL_NETWORK_TEST";
@@ -784,6 +787,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
                 path: owner.project_path.clone(),
                 profile: Some("default".into()),
                 scratch: false,
+                generated_worktree_branch: None,
+                create_new_branch: false,
             };
             let review = sdk.review_creation_trust(&request, &epoch).await.unwrap();
             let wire = serde_json::to_string(&review).unwrap();
@@ -801,7 +806,9 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
             )
             .unwrap();
             assert!(matches!(sdk.create_session(&borrower_body, &epoch).await,
-                Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. }) if body.is_empty()));
+                Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationTrustChanged), body, .. })
+                    if !["secret-before-review", "secret-after-review", "secret-header"]
+                        .iter().any(|secret| body.contains(secret))));
             assert!(!app.join("trusted_repos.toml").exists());
             let repo = git2::Repository::open(&source).unwrap();
             assert!(repo
@@ -835,7 +842,8 @@ if grep -Fq 'hooks_hash = "{hash}"' {trust:?}; then printf approved > {trust_see
             };
             let (result, ()) = tokio::join!(sdk.create_session(&borrower_body, &epoch), cancel);
             assert!(
-                matches!(&result, Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationCancelled), body, .. }) if body.is_empty())
+                matches!(&result, Err(DaemonClientError::Status { status, code: Some(ApiErrorCode::CreationCancelled), .. }) if *status == reqwest::StatusCode::CONFLICT),
+                "{result:?}"
             );
             result
         } else {
@@ -982,7 +990,13 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
     };
     let (result, ()) = tokio::join!(sdk.create_session(&body, &epoch), cancel);
     assert!(
-        matches!(&result, Err(DaemonClientError::Status { code: Some(ApiErrorCode::CreationCancelled), body, .. }) if body.is_empty()),
+        matches!(
+            &result,
+            Err(DaemonClientError::Status {
+                code: Some(ApiErrorCode::CreationCancelled),
+                ..
+            })
+        ),
         "expected a cancelled creation, got {result:?}"
     );
 
@@ -1018,12 +1032,9 @@ async fn cancelled_creation_is_gone_from_the_first_read_after_the_failure() {
 #[tokio::test]
 #[parallel]
 async fn native_creation_progress_reports_phases_to_the_local_stream() {
-    use agent_of_empires::{
-        acp::client::DaemonEndpoint,
-        daemon::{
-            ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
-            RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
-        },
+    use agent_of_empires::daemon::{
+        ApiErrorCode, CreateSessionBody, CreationPhase, CreationProgress, DaemonClient,
+        DaemonEndpoint, RuntimeConnection, RuntimeEvent, RUNTIME_EPOCH_HEADER,
     };
     const PHASE_TIMEOUT: Duration = Duration::from_secs(20);
     require_tmux!();
@@ -1084,7 +1095,7 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
         .timeout(PHASE_TIMEOUT * 5)
         .build()
         .unwrap();
-    let endpoint = DaemonEndpoint::local_unix(socket);
+    let endpoint = DaemonEndpoint::local_unix(socket, None);
     let mut connection = RuntimeConnection::connect(&endpoint, None).await.unwrap();
     assert!(
         connection.creation_progress().is_empty(),
@@ -1112,7 +1123,9 @@ async fn native_creation_progress_reports_phases_to_the_local_stream() {
                             return entry.clone();
                         }
                     }
-                    RuntimeEvent::Snapshot(_) | RuntimeEvent::OwnerDiagnostics(_) => {}
+                    RuntimeEvent::Snapshot(_)
+                    | RuntimeEvent::Sandbox(_)
+                    | RuntimeEvent::OwnerDiagnostics(_) => {}
                 }
             }
         })
@@ -2390,6 +2403,7 @@ fn migration_contention_does_not_block_runtime_publication() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let app = crate::harness::app_dir_in(h.home_path());
     let rows_path = app.join("profiles/default/sessions.json");
     let mut rows: Vec<serde_json::Value> =
@@ -2532,6 +2546,7 @@ exit 0
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let app = crate::harness::app_dir_in(h.home_path());
     let rows_path = app.join("profiles/default/sessions.json");
     let mut rows: Vec<serde_json::Value> =
@@ -2633,6 +2648,7 @@ fn read_only_terminal_view_does_not_create_shell() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let app = crate::harness::app_dir_in(h.home_path());
     let rows: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(app.join("profiles/default/sessions.json")).unwrap())
@@ -2849,6 +2865,116 @@ fn cli_serve_restart_replays_launch_state() {
         String::from_utf8_lossy(&stop.stdout),
         String::from_utf8_lossy(&stop.stderr),
     );
+}
+
+/// Refusing a disabled TCP replay must preserve the current owner and credentials.
+/// A retained launch remains recoverable after the policy permits TCP again.
+#[cfg(feature = "web")]
+#[test]
+#[parallel]
+fn cli_serve_disabled_web_replay_preserves_owner_and_credentials() {
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("disabled_web_replay");
+    h.remove_env("AOE_SERVE_PASSPHRASE");
+    h.remove_env("AOE_CITYHALL_MODE");
+    h.stop_daemon_on_drop();
+    let passphrase = "retained-web-policy-passphrase";
+
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    let port = h.start_daemon_with(&["--passphrase", passphrase]);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    let predecessor = daemon_pid(&h).unwrap();
+    h.run_cli_err(&["serve", "--restart"]);
+    assert_eq!(daemon_pid(&h), Some(predecessor));
+    assert_original_passphrase_login(&h, passphrase);
+
+    h.run_cli_ok(&["serve", "--rollback"]);
+    h.run_cli_err(&["mcp", "config"]);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    h.run_cli_ok(&["serve", "--restart"]);
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
+    h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+    h.run_cli_ok(&["serve", "--stop"]);
+
+    h.start_daemon_with(&["--passphrase", passphrase]);
+    let app = app_dir_in(h.home_path());
+    let version_path = app.join(".schema_version");
+    let version = std::fs::read(&version_path).unwrap();
+    std::fs::write(&version_path, "39").unwrap();
+    let workers = app.join("acp-workers");
+    block_workers_dir(&workers);
+    h.run_cli_err(&["serve", "--restart"]);
+    std::fs::remove_file(&workers).unwrap();
+    std::fs::create_dir(&workers).unwrap();
+    std::fs::write(&version_path, version).unwrap();
+    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    let predecessor = daemon_pid(&h).unwrap();
+
+    h.run_cli_err(&["serve", "--rollback"]);
+    assert_eq!(daemon_pid(&h), Some(predecessor));
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
+    h.run_cli_err(&["mcp", "config"]);
+
+    h.run_cli_ok(&["plugin", "enable", "aoe.web"]);
+    h.run_cli_ok(&["serve", "--rollback"]);
+    assert_original_passphrase_login(&h, passphrase);
+}
+
+#[cfg(feature = "web")]
+#[test]
+#[parallel]
+fn cli_serve_web_toggle_rejects_active_lifecycle_transaction() {
+    require_tmux!();
+    if !isolated_local_network() {
+        return;
+    }
+    let mut h = TuiTestHarness::new_in_tmp("web_toggle_lifecycle");
+    h.stop_daemon_on_drop();
+    h.start_daemon_with(&[]);
+    let app = app_dir_in(h.home_path());
+    let before = std::fs::read(app.join("config.toml")).unwrap();
+    let transaction = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(app.join("daemon/transaction.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&transaction).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let client = reqwest::Client::builder()
+            .unix_socket(app.join("daemon/api.sock"))
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = client
+            .post("http://localhost/api/plugins/aoe.web/enabled")
+            .json(&serde_json::json!({ "enabled": false }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            agent_of_empires::daemon::ApiErrorCode::from_headers(
+                response.status(),
+                response.headers(),
+                false,
+            ),
+            Some(agent_of_empires::daemon::ApiErrorCode::LifecycleLocked),
+        );
+    });
+    let error = h.run_cli_err(&["--no-autostart", "plugin", "disable", "aoe.web"]);
+    assert!(error.contains("HTTP 409"), "{error}");
+    assert!(error.contains("busy"), "{error}");
+    assert!(!error.contains("aoe serve --stop"), "{error}");
+    assert_eq!(std::fs::read(app.join("config.toml")).unwrap(), before);
+    drop(transaction);
+    h.run_cli_ok(&["plugin", "disable", "aoe.web"]);
+    h.run_cli_ok(&["--no-autostart", "profile", "list"]);
 }
 
 #[test]

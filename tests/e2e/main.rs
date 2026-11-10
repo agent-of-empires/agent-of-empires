@@ -29,6 +29,7 @@ mod custom_order_tui;
 mod daemon_config;
 mod diagnostics_strip;
 mod errors;
+mod fake_agent;
 mod filewatch_config_malformed;
 mod filewatch_config_profile_switch;
 mod filewatch_tui_dynamic_profile;
@@ -59,6 +60,9 @@ mod profile_picker;
 mod project_registry;
 mod purge_restore_race;
 mod remote_home_e2e;
+#[cfg(target_os = "linux")]
+mod remove_structured_runner;
+mod restart_structured;
 mod resume_fallback;
 mod sandbox;
 mod send_structured_e2e;

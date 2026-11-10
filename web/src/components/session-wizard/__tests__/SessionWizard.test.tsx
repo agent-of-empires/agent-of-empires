@@ -2,11 +2,12 @@
 
 import { StrictMode, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
+import { initialData } from "../wizardReducer";
 import {
-  fetchAgents,
+  fetchProfileAgents,
   fetchCreateProgress,
   fetchDockerStatus,
   fetchGroups,
@@ -14,11 +15,14 @@ import {
   fetchProfiles,
   fetchProjects,
   fetchSettings,
+  fetchVolumeIgnoresPreview,
   type SettingsResponse,
 } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
+import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
+import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -33,10 +37,11 @@ vi.mock("../../../lib/api", () => ({
   fetchCreateProgress: vi.fn().mockResolvedValue(null),
   fetchCreateBootId: vi.fn().mockResolvedValue("boot-1"),
   fetchSettings: vi.fn().mockResolvedValue({}),
+  fetchProfileAgents: vi.fn().mockResolvedValue([]),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
   fetchGroups: vi.fn().mockResolvedValue([]),
-  fetchDockerStatus: vi.fn().mockResolvedValue({ available: false }),
+  fetchDockerStatus: vi.fn().mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" }),
   fetchProfiles: vi.fn().mockResolvedValue([]),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue([]),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
@@ -67,6 +72,8 @@ const INSTRUCTION_KEY = "aoe-new-session-last-instruction";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // clearAllMocks keeps queued answers, and a test can leave some unread.
+  vi.mocked(fetchProfileAgents).mockReset().mockResolvedValue([]);
   localStorage.clear();
   createSession.mockResolvedValue({ ok: true, session: { id: "s1" } });
   reviewCreationTrust.mockResolvedValue({
@@ -134,7 +141,7 @@ describe("SessionWizard native import late defaults", () => {
             resolveSettings = resolve;
           }),
       );
-      vi.mocked(fetchAgents).mockResolvedValueOnce([agent("claude", { acp_installed: true })]);
+      vi.mocked(fetchProfileAgents).mockResolvedValueOnce([agent("claude", { acp_installed: true })]);
       renderWizard({ path: "/tmp/proj", worktreeEnabled: true, sandboxEnabled: true });
       fireEvent.click(screen.getByText("Project"));
       fireEvent.click(await screen.findByRole("button", { name: "Import session" }));
@@ -183,6 +190,7 @@ describe("SessionWizard structured view payload", () => {
   });
 
   it.each([
+    ["auto", "structured"],
     ["terminal", "terminal"],
     ["structured", "structured"],
     ["off", "terminal"],
@@ -197,7 +205,7 @@ describe("SessionWizard structured view payload", () => {
   it("hides the View row when structured_view is off", async () => {
     vi.mocked(fetchSettings).mockResolvedValueOnce({ acp: { structured_view: "off" } } as never);
     renderWizard();
-    await screen.findByRole("switch", { name: "Auto-approve actions" });
+    await screen.findByRole("switch", { name: "Yolo mode" });
     await waitFor(() => expect(screen.queryByTestId("wizard-view-row")).toBeNull());
   });
 
@@ -218,6 +226,28 @@ describe("SessionWizard structured view payload", () => {
       agent_model: "openai/gpt-5.5",
       agent_effort: "high",
     });
+  });
+
+  it("drops the previous agent's model and effort after switching agent", async () => {
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      session: { default_tool: "opencode" },
+      acp: { acp_defaults: { opencode: { model: "openai/gpt-5.5", effort: "high" } } },
+      sandbox: {},
+    } as never);
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([
+      agent("opencode", { acp_installed: true }),
+      agent("claude", { acp_installed: true }),
+    ]);
+    renderWizard({ path: "/tmp/proj" });
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("opencode"));
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    fireEvent.click(await screen.findByRole("button", { name: /^claude/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload().tool).toBe("claude");
+    expect(payload().agent_model).toBeUndefined();
+    expect(payload().agent_effort).toBeUndefined();
   });
 });
 
@@ -382,7 +412,7 @@ describe("SessionWizard rows", () => {
     ["sandbox_enabled", "Sandbox unavailable: settl runs on the host only"],
     ["worktree_enabled", "Worktree unavailable: settl runs on the host only"],
   ])("refuses a host-only agent with a seeded %s project override", async (field, message) => {
-    vi.mocked(fetchAgents).mockResolvedValueOnce([agent("settl", { host_only: true })]);
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([agent("settl", { host_only: true })]);
     vi.mocked(fetchProjects).mockResolvedValueOnce([
       {
         name: "proj",
@@ -405,7 +435,7 @@ describe("SessionWizard rows", () => {
     ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
     ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
   ])("gates the structured view for %s", async (tool, agents, disabled, summary) => {
-    if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
+    if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce(agents);
     renderWizard({ path: "/tmp/proj", tool });
     await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
     expect(screen.getByTestId("wizard-view-row").textContent).toMatch(summary);
@@ -434,7 +464,7 @@ describe("SessionWizard rows", () => {
     [undefined, "Run in a safe container", "Docker is not running"],
     [[agent("settl", { host_only: true })], "Create a worktree", "settl runs on the host only"],
   ])("a blocked switch left on shows on and turns off: %#", async (agents, name, reason) => {
-    if (agents) vi.mocked(fetchAgents).mockResolvedValueOnce(agents);
+    if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce(agents);
     const tool = agents ? "settl" : "claude";
     renderWizard({ path: "/tmp/proj", tool, sandboxEnabled: true, worktreeEnabled: true });
     const toggle = () => screen.getByRole("switch", { name }) as HTMLButtonElement;
@@ -518,7 +548,7 @@ describe("SessionWizard rows", () => {
       const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
       try {
         renderWizard();
-        fireEvent.click(await screen.findByRole("switch", { name: "Auto-approve actions" }));
+        fireEvent.click(await screen.findByRole("switch", { name: "Yolo mode" }));
         fireEvent.click(screen.getByText("Profile"));
         fireEvent.click(screen.getByRole("radio", { name: /work/ }));
         expect(confirmSpy).toHaveBeenCalled();
@@ -774,6 +804,53 @@ describe("SessionWizard unknown create outcome", () => {
     renderWizard();
     expect(screen.queryByText(/may still be created/)).toBeNull();
   });
+
+  const REFUSED = {
+    ok: false,
+    error: "boom",
+    failure: { code: "create_failed", stage: "preparing", message: "boom", reference: null },
+  };
+
+  it("a wizard reopened from a failure sends its own form, not a closed wizard's unresolved create", async () => {
+    const { key } = await launchInBackgroundAndClose();
+    const restore = { data: { ...initialData, path: "/tmp/other", tool: "claude" }, failure: REFUSED.failure };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    expect(screen.queryByText(/may still be created/)).toBeNull();
+    const before = createSession.mock.calls.length;
+    createSession.mockResolvedValue({ ok: true, session: { id: "s2" } });
+    const tryAgain = () => screen.getByTestId("create-failure-try_again") as HTMLButtonElement;
+    await waitFor(() => expect(tryAgain().disabled).toBe(false));
+    fireEvent.click(tryAgain());
+    await waitFor(() =>
+      expect(createSession.mock.calls.slice(before).map(([body]) => body.path)).toContain("/tmp/other"),
+    );
+    const sent = createSession.mock.calls.slice(before).find(([body]) => body.path === "/tmp/other")![0];
+    expect(sent.idempotency_key).not.toBe(key);
+  });
+
+  it("an adopted create refused in the background toasts plainly, since there is no form to reopen", async () => {
+    await launchInBackgroundAndClose();
+    const action = vi.fn();
+    toastBus.handler = { ...toastBus.handler!, action };
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValue(new Promise((r) => (finish = r)));
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        onCreatedInBackground={vi.fn()}
+        onReopenFailure={vi.fn()}
+        prefill={{ path: "/tmp/other", tool: "claude" }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText(/may still be created/)).toBeTruthy());
+    await launch();
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    await act(async () => finish(REFUSED));
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith("Session was not created: boom"));
+    expect(action).not.toHaveBeenCalled();
+  });
 });
 
 describe("SessionWizard served-profile authority", () => {
@@ -792,7 +869,7 @@ describe("SessionWizard served-profile authority", () => {
     open("Profile");
     fireEvent.click(screen.getByRole("radio", { name: profile === "" ? /Server default/ : new RegExp(profile) }));
     await waitFor(() =>
-      expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe(
+      expect(screen.getByRole("switch", { name: "Yolo mode" }).getAttribute("aria-checked")).toBe(
         profile === "Beta" ? "true" : "false",
       ),
     );
@@ -850,7 +927,7 @@ describe("SessionWizard served-profile authority", () => {
     await waitFor(() => expect(screen.getByText("Profile")).toBeTruthy());
     await chooseProfile("Beta");
     await act(async () => seed.resolve(settings("Alpha")));
-    expect(screen.getByRole("switch", { name: "Auto-approve actions" }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("switch", { name: "Yolo mode" }).getAttribute("aria-checked")).toBe("true");
     await launch();
     expect(payload()).toMatchObject({ profile: "Beta", yolo_mode: true });
     cleanup();
@@ -901,7 +978,7 @@ describe("SessionWizard served-profile authority", () => {
     await waitFor(() => expect(retryButton.hasAttribute("disabled")).toBe(false));
     expect(screen.getByText(/Launch session/).closest("button")!.disabled).toBe(true);
     expect(fetchSettings).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("switch", { name: "Auto-approve actions" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
     fireEvent.click(retryButton);
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalled());
@@ -963,9 +1040,9 @@ describe("SessionWizard served-profile authority", () => {
 describe("SessionWizard Docker readiness", () => {
   const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
   const pendingProbe = () => {
-    let answer!: (v: { available: boolean; runtime: string | null }) => void;
+    let answer!: (v: DockerStatusResponse) => void;
     vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
-    return (available: boolean) => answer({ available, runtime: null });
+    return (available: boolean) => answer({ available, runtime: "docker", runtime_name: "Docker" });
   };
 
   it("enables Launch without waiting for Docker when the sandbox is off", async () => {
@@ -1067,6 +1144,584 @@ describe("SessionWizard Group field", () => {
   });
 });
 
+describe("SessionWizard Yolo mode", () => {
+  const yolo = () => screen.getByRole("switch", { name: "Yolo mode" }) as HTMLButtonElement;
+  const yoloRow = () => screen.getByTestId("wizard-yolo-row").textContent ?? "";
+  const pickAgent = (name: string) => {
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${name}`) }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+  };
+
+  it("states what each value does", async () => {
+    renderWizard();
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().disabled).toBe(false);
+    fireEvent.click(yolo());
+    expect(yoloRow()).toContain("skips permission prompts");
+  });
+
+  it("locks on for an agent that always runs in Yolo mode, and gives the value back after", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValue([
+      agent("claude"),
+      agent("pi", { always_yolo: true, acp_capable: false }),
+    ]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    expect(yolo().disabled).toBe(true);
+    expect(yolo().getAttribute("aria-checked")).toBe("true");
+
+    pickAgent("claude");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().getAttribute("aria-checked")).toBe("false");
+    expect(yolo().disabled).toBe(false);
+
+    pickAgent("pi");
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
+  });
+
+  it("keeps a profile's Yolo mode default for an agent that can turn it off", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValue([
+      agent("claude"),
+      agent("pi", { always_yolo: true, acp_capable: false }),
+    ]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: true }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    pickAgent("claude");
+    await waitFor(() => expect(yoloRow()).toContain("skips permission prompts"));
+    expect(yolo().getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("locks on for a custom agent with its own adapter only in the view that runs its always-Yolo base", async () => {
+    // A structured session runs own-pi's adapter; a terminal one runs the Pi CLI it detects as.
+    const ownPi = agent("own-pi", { kind: "custom", always_yolo: true, acp_always_yolo: false });
+    vi.mocked(fetchProfileAgents).mockResolvedValue([agent("claude"), ownPi]);
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "own-pi" });
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().disabled).toBe(false);
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
+    await waitFor(() => expect(yoloRow()).toContain("always on for own-pi"));
+    expect(yolo().disabled).toBe(true);
+    fireEvent.click(screen.getByRole("radio", { name: "Structured view" }));
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+  });
+
+  const AGENTS = [agent("claude"), agent("pi", { always_yolo: true, acp_capable: false })];
+  const launchButton = () => screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+
+  it("reads a custom agent's Yolo mode from the profile it creates in", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([
+      { name: "alpha", is_default: true },
+      { name: "beta", is_default: false },
+    ]);
+    // Alpha's `wrapper` runs Pi and Beta's runs Claude. Beta's first answer is held.
+    const wrapper = (always_yolo: boolean) => [
+      agent("claude"),
+      agent("wrapper", {
+        kind: "custom",
+        always_yolo,
+        acp_always_yolo: always_yolo,
+        display_name: always_yolo ? "Pi wrapper" : "Claude wrapper",
+      }),
+    ];
+    let answerBeta: (agents: AgentInfo[]) => void = () => {};
+    let betaCalls = 0;
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) => {
+      if (profile !== "beta") return Promise.resolve(wrapper(true));
+      return betaCalls++ === 0 ? new Promise((resolve) => (answerBeta = resolve)) : Promise.resolve(wrapper(false));
+    });
+    const pickProfile = (name: string) => {
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: new RegExp(name) }));
+    };
+    renderWizard({ path: "/tmp/proj", tool: "wrapper" }, "alpha");
+    await waitFor(() => expect(yoloRow()).toContain("always on for wrapper"));
+
+    pickProfile("beta");
+    await waitFor(() => expect(yoloRow()).toContain("checking the agent…"));
+    expect(launchButton().disabled).toBe(true);
+    pickProfile("alpha");
+    await waitFor(() => expect(yoloRow()).toContain("always on for wrapper"));
+    // Beta's late answer is for a profile no longer selected.
+    await act(async () => answerBeta(wrapper(false)));
+    expect(yoloRow()).toContain("always on for wrapper");
+
+    pickProfile("beta");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    expect(yolo().disabled).toBe(false);
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ profile: "beta", tool: "wrapper", yolo_mode: false });
+    // The app-wide names stay the served profile's; read before the hook's own load answers.
+    expect(renderHook(() => useAgentDisplayNames()).result.current("wrapper")).toBe("Pi wrapper");
+  });
+
+  it("waits for the agent list before promising prompts or launching", async () => {
+    let answer: (agents: typeof AGENTS) => void = () => {};
+    vi.mocked(fetchProfileAgents).mockReturnValue(new Promise((resolve) => (answer = resolve)));
+    vi.mocked(fetchSettings).mockResolvedValueOnce({ session: { yolo_mode_default: false }, sandbox: {} } as never);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await waitFor(() => expect(fetchSettings).toHaveBeenCalled());
+    // Let the profile defaults settle, which alone used to enable Launch.
+    await act(async () => {});
+    expect(yoloRow()).toContain("checking the agent…");
+    expect(yoloRow()).not.toContain("asks before running commands");
+    expect(launchButton().disabled).toBe(true);
+
+    await act(async () => answer(AGENTS));
+    expect(yoloRow()).toContain("always on for pi");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
+  });
+
+  it("retries a failed agent list, keeping Launch off until it loads", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce(null).mockResolvedValue(AGENTS);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await screen.findByText(/Couldn't load the agent list/);
+    expect(yoloRow()).toContain("checking the agent…");
+    expect(launchButton().disabled).toBe(true);
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"), { timeout: 3000 });
+    expect(fetchProfileAgents).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ tool: "pi", yolo_mode: false });
+  });
+
+  it("stops retrying a profile the Daemon doesn't have, and loads the next one chosen", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.mocked(fetchProfiles).mockResolvedValueOnce([
+        { name: "gone", is_default: true },
+        { name: "beta", is_default: false },
+      ]);
+      vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+        Promise.resolve(profile === "gone" ? "profile_not_found" : AGENTS),
+      );
+      renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+      await screen.findByText('The profile "gone" no longer exists. Choose another profile to launch.');
+      expect(launchButton().disabled).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(60_000));
+      expect(vi.mocked(fetchProfileAgents).mock.calls.filter(([p]) => p === "gone")).toHaveLength(1);
+
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
+      await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+      expect(screen.queryByText(/no longer exists/)).toBeNull();
+      await waitFor(() => expect(launchButton().disabled).toBe(false));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("offers the Profile row for a deleted served Profile with one Profile left", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([{ name: "default", is_default: true }]);
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+      Promise.resolve(profile === "gone" ? "profile_not_found" : AGENTS),
+    );
+    renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+    await screen.findByText(/The profile "gone" no longer exists/);
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /^default/ }));
+    await waitFor(() => expect(yoloRow()).toContain("always on for pi"));
+    expect(screen.queryByText(/no longer exists/)).toBeNull();
+    await waitFor(() => expect(launchButton().disabled).toBe(false));
+  });
+
+  it("keeps the Profile row hidden for one Profile while its agent list fails", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValue([{ name: "default", is_default: true }]);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(null);
+    renderWizard({ path: "/tmp/proj", tool: "pi" });
+    await screen.findByText(/Couldn't load the agent list/);
+    expect(screen.queryByText("Profile")).toBeNull();
+  });
+
+  it("names a deleted Profile even when its project lookup failed too", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValue("profile_not_found");
+    vi.mocked(fetchProjects).mockResolvedValue(null);
+    renderWizard({ path: "/tmp/proj", tool: "pi" }, "gone");
+    await waitFor(() => expect(fetchProjects).toHaveBeenCalledWith({ profile: "gone" }));
+    await act(async () => {});
+    expect(screen.getByText('The profile "gone" no longer exists. Choose another profile to launch.')).toBeTruthy();
+    expect(screen.queryByText(/Could not load this project's settings/)).toBeNull();
+  });
+
+  it("drops the last Profile's agents when the next one's list fails", async () => {
+    vi.mocked(fetchProfiles).mockResolvedValueOnce([
+      { name: "alpha", is_default: true },
+      { name: "beta", is_default: false },
+    ]);
+    vi.mocked(fetchProfileAgents).mockImplementation((profile) =>
+      Promise.resolve(profile === "alpha" ? [agent("claude"), agent("aider")] : null),
+    );
+    const agentButton = () => screen.queryByRole("button", { name: /^aider/ });
+    renderWizard({ path: "/tmp/proj", tool: "claude" }, "alpha");
+    await waitFor(() => expect(yoloRow()).toContain("asks before running commands"));
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    expect(agentButton()).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    fireEvent.click(screen.getByText("Profile"));
+    fireEvent.click(screen.getByRole("radio", { name: /beta/ }));
+    await screen.findByText(/Couldn't load the agent list/);
+    fireEvent.click(screen.getByTestId("wizard-agent-row"));
+    expect(agentButton()).toBeNull();
+  });
+
+  it("launches a name-only form without the agent list", async () => {
+    // The retry never answers, so the list stays failed.
+    vi.mocked(fetchProfileAgents)
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(new Promise(() => {}));
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
+    await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(screen.queryByText(/Couldn't load the agent list/)).toBeNull();
+  });
+});
+
+describe("SessionWizard Container runtime", () => {
+  const down = (runtime: string, runtime_name: string) => () =>
+    Promise.resolve({ available: false, runtime, runtime_name });
+  it.each<[string, () => Promise<unknown>, string]>([
+    ["Docker", down("docker", "Docker"), "Docker is not running"],
+    ["Podman", down("podman", "Podman"), "Podman is not running"],
+    ["Apple Container", down("apple_container", "Apple Container"), "Apple Container is not running"],
+    // fetchDockerStatus never rejects: a failed request resolves to this fallback.
+    [
+      "a failed status request",
+      () => Promise.resolve({ available: false, runtime: null, runtime_name: null }),
+      "Container runtime is not running",
+    ],
+  ])("names %s when it isn't running, in the row and the launch error", async (_label, status, message) => {
+    vi.mocked(fetchDockerStatus).mockImplementationOnce(status as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
+    await waitFor(() => expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain(message));
+    await launch();
+    expect(await screen.findByText(`Sandbox unavailable: ${message}. Turn it off to launch.`)).toBeTruthy();
+    expect(createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("SessionWizard create failures", () => {
+  const failure = (code: string, stage: string | null, message: string) => ({
+    ok: false,
+    error: message,
+    failure: { code, stage, message, reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1" },
+  });
+  const UNAVAILABLE = failure(
+    "sandbox_unavailable",
+    "starting_container",
+    "Docker isn't running, so the Sandbox can't start. Start Docker, then try again.",
+  );
+  const box = () => screen.getByTestId("create-failure");
+  // A failed case must not leave a queued Docker answer for the next one.
+  afterEach(() => {
+    vi.mocked(fetchDockerStatus)
+      .mockReset()
+      .mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchCreateProgress).mockResolvedValue(null);
+  });
+  const sandboxed = () => {
+    vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchVolumeIgnoresPreview).mockResolvedValue(null);
+    return renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
+  };
+
+  it("Retry asks the Container runtime again and, still down, makes Launch without Sandbox the way forward", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    await screen.findByTestId("create-failure");
+    await waitFor(() => expect(document.activeElement).toBe(box()));
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain("couldn't start");
+    vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: false, runtime: "docker", runtime_name: "Docker" });
+    const checks = vi.mocked(fetchDockerStatus).mock.calls.length;
+
+    fireEvent.click(screen.getByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(fetchDockerStatus).toHaveBeenCalledTimes(checks + 1));
+    const actions = await waitFor(() => {
+      const buttons = Array.from(box().querySelectorAll("button")).map((b) => b.textContent);
+      expect(buttons[0]).toBe("Launch without Sandbox");
+      return buttons;
+    });
+    expect(actions.slice(0, 2)).toEqual(["Launch without Sandbox", "Retry"]);
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain("Docker is not running");
+    expect(createSession).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["on the first Retry", [true]],
+    ["after a Retry that found it still down", [false, true]],
+  ])("Retry resends under a new key once the Container runtime answers %s", async (_label, answers) => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    for (const available of answers) {
+      vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available, runtime: "docker", runtime_name: "Docker" });
+      const checks = vi.mocked(fetchDockerStatus).mock.calls.length;
+      fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+      await waitFor(() => expect(fetchDockerStatus).toHaveBeenCalledTimes(checks + 1));
+    }
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(1).sandbox).toBe(payload(0).sandbox);
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+  });
+
+  it.each(["Launch", "close"])("while Retry re-checks the runtime, %s sends no second create", async (during) => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    let answer!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    const checks = vi.mocked(fetchDockerStatus).mock.calls.length;
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(fetchDockerStatus).toHaveBeenCalledTimes(checks + 1));
+
+    if (during === "Launch") {
+      const button = screen.getByText(/Launch session/).closest("button") as HTMLButtonElement;
+      expect(button.disabled).toBe(true);
+      fireEvent.click(button);
+      fireEvent.keyDown(window, { key: "Enter", metaKey: true });
+      fireEvent.keyDown(window, { key: "Enter", ctrlKey: true });
+      await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+      // Retry's own resend is the only one.
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledTimes(2);
+    } else {
+      cleanup();
+      await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("turning the Sandbox off by hand takes down the box and the row's cue", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    await screen.findByTestId("create-failure");
+    fireEvent.click(screen.getByRole("switch", { name: "Run in a safe container" }));
+    expect(screen.queryByTestId("create-failure")).toBeNull();
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).not.toContain("couldn't start");
+    expect(createSession).toHaveBeenCalledOnce();
+  });
+
+  it("Launch without Sandbox sends the Session on the host under a fresh key", async () => {
+    createSession.mockResolvedValueOnce(
+      failure("sandbox_image_pull_failed", "starting_container", "Couldn't pull the Sandbox image ghcr.io/x/y:1."),
+    );
+    sandboxed();
+    await launch();
+    expect((await screen.findByTestId("create-failure")).textContent).toContain("ghcr.io/x/y:1");
+    fireEvent.click(screen.getByTestId("create-failure-launch_without_sandbox"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(0).sandbox).toBeTruthy();
+    expect(payload(1).sandbox).toBeFalsy();
+    expect(payload(1).idempotency_key).toBeTruthy();
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+  });
+
+  it("a failed hook shows the message as sent and its last output, with no Sandbox action", async () => {
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
+    vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "running_hooks", hook: null, output: ["npm ERR! 404"] });
+    sandboxed();
+    await launch();
+    await waitFor(() => expect(fetchCreateProgress).toHaveBeenCalled(), { timeout: 3000 });
+    await act(async () => {});
+    await act(async () => finish(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1.")));
+    const shown = await screen.findByTestId("create-failure");
+    expect(shown.textContent).toContain("An on_create hook exited with code 1.");
+    expect(screen.getByTestId("create-failure-output").textContent).toContain("npm ERR! 404");
+    expect(screen.queryByTestId("create-failure-launch_without_sandbox")).toBeNull();
+    expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
+  });
+
+  /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard.
+   *  `whileSending` runs after Launch, before the progress view replaces the form. */
+  const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude", whileSending?: () => void) => {
+    const toastAction = vi.fn();
+    toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
+    let finish!: (r: unknown) => void;
+    createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
+    const onReopenFailure = vi.fn();
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        onCreatedInBackground={vi.fn()}
+        onReopenFailure={onReopenFailure}
+        prefill={{ path: "/tmp/proj", tool }}
+      />,
+    );
+    await launch();
+    whileSending?.();
+    fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+    await act(async () => finish(sent));
+    await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+    toastBus.handler = null;
+    const [message, label, reopen] = toastAction.mock.calls[0]!;
+    reopen();
+    cleanup();
+    return { message, label, restore: onReopenFailure.mock.calls[0]![0] };
+  };
+
+  it("a background failure toasts its title and reference, and Reopen restores the box", async () => {
+    const sent = failure(
+      "working_dir_missing",
+      "preparing",
+      "The Working directory doesn't exist where the Daemon runs.",
+    );
+    const { message, label, restore } = await backgroundFailure(sent);
+    expect(message).toBe(
+      "Session was not created: The Working directory is missing. Reference 3f9c1a2b… · in debug.log",
+    );
+    expect(label).toBe("Reopen");
+    expect(restore.failure).toEqual(sent.failure);
+    expect(restore.data.path).toBe("/tmp/proj");
+
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    expect(box().textContent).toContain("The Working directory is missing");
+    expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
+    fireEvent.click(screen.getByTestId("create-failure-choose_project"));
+    expect(screen.getByText("Back")).toBeTruthy();
+  });
+
+  it("Reopen restores the form as sent, not an edit made while the create ran", async () => {
+    const title = () => document.getElementById("wizard-title") as HTMLInputElement;
+    const { restore } = await backgroundFailure(UNAVAILABLE, "claude", () => {
+      fireEvent.change(title(), { target: { value: "edited while sending" } });
+      expect(title().value).toBe("edited while sending");
+    });
+    expect(payload().title).toBeUndefined();
+    expect(restore.data.title).toBe("");
+  });
+
+  // Try again sends the form as it stands, so it waits for the same loads as Launch.
+  it.each(["a switched Profile's defaults", "a reopened custom Agent's metadata"])(
+    "Try again waits for %s, then sends the resolved form",
+    async (pending) => {
+      const tryAgain = () => screen.getByTestId("create-failure-try_again") as HTMLButtonElement;
+      const helper = agent("helper", { kind: "custom" });
+      let release!: () => void;
+      if (pending === "a switched Profile's defaults") {
+        vi.mocked(fetchProfiles).mockResolvedValueOnce([
+          { name: "default", is_default: true },
+          { name: "work", is_default: false },
+        ]);
+        createSession.mockResolvedValueOnce(failure("create_failed", "preparing", "boom"));
+        renderWizard();
+        await launch();
+        await screen.findByTestId("create-failure");
+        let answer!: (v: never) => void;
+        vi.mocked(fetchSettings).mockReturnValueOnce(new Promise((r) => (answer = r)));
+        fireEvent.click(screen.getByText("Profile"));
+        fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+        await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+        release = () => answer({} as never);
+      } else {
+        vi.mocked(fetchProfileAgents).mockResolvedValueOnce([helper]);
+        const { restore } = await backgroundFailure(failure("create_failed", "preparing", "boom"), "helper");
+        expect(payload(0).view).toBe("structured");
+        let answer!: (v: AgentInfo[]) => void;
+        vi.mocked(fetchProfileAgents).mockReturnValueOnce(new Promise((r) => (answer = r)));
+        render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+        release = () => answer([helper]);
+      }
+      const sent = createSession.mock.calls.length;
+      await waitFor(() => expect(tryAgain().disabled).toBe(true));
+      fireEvent.click(tryAgain());
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledTimes(sent);
+
+      await act(async () => release());
+      await waitFor(() => expect(tryAgain().disabled).toBe(false));
+      fireEvent.click(tryAgain());
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(sent + 1));
+      expect(payload(sent)).toMatchObject(
+        pending === "a switched Profile's defaults" ? { profile: "work" } : { tool: "helper", view: "structured" },
+      );
+    },
+  );
+
+  it.each([
+    ["up", true, "Retry"],
+    ["still down", false, "Launch without Sandbox"],
+  ])(
+    "Retry sends nothing when the form changed while it re-checked the runtime, which answered %s",
+    async (_label, available, primary) => {
+      createSession.mockResolvedValueOnce(UNAVAILABLE);
+      sandboxed();
+      await launch();
+      let answer!: (v: DockerStatusResponse) => void;
+      vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+      fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+      fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
+      await act(async () => answer({ available, runtime: "docker", runtime_name: "Docker" }));
+      await act(async () => {});
+      expect(createSession).toHaveBeenCalledOnce();
+      expect(box().querySelector("button")?.textContent).toBe(primary);
+    },
+  );
+
+  it("a restored failure still says why its actions wait while the agent list fails", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValue(null);
+    const restore = {
+      data: { ...initialData, path: "/tmp/proj", tool: "claude" },
+      failure: failure("create_failed", "preparing", "boom").failure,
+    };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    expect(box().textContent).toContain("boom");
+    expect(await screen.findByText(/Couldn't load the agent list/)).toBeTruthy();
+  });
+
+  it("a runtime check that answers late can't overwrite Retry's newer one", async () => {
+    let mount!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus)
+      .mockReturnValueOnce(new Promise((r) => (mount = r)))
+      .mockResolvedValueOnce({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchVolumeIgnoresPreview).mockResolvedValue(null);
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    const restore = {
+      data: { ...initialData, path: "/tmp/proj", tool: "claude", sandboxEnabled: true },
+      failure: UNAVAILABLE.failure,
+    };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    await act(async () => mount({ available: false, runtime: "docker", runtime_name: "Docker" }));
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).not.toContain("is not running");
+  });
+
+  it("a Retry that finds the runtime back up offers Retry again even when the form changed", async () => {
+    createSession.mockResolvedValueOnce(UNAVAILABLE);
+    sandboxed();
+    await launch();
+    vi.mocked(fetchDockerStatus).mockResolvedValueOnce({ available: false, runtime: "docker", runtime_name: "Docker" });
+    fireEvent.click(await screen.findByTestId("create-failure-retry_runtime"));
+    await waitFor(() => expect(box().querySelector("button")?.textContent).toBe("Launch without Sandbox"));
+    let answer!: (v: DockerStatusResponse) => void;
+    vi.mocked(fetchDockerStatus).mockReturnValueOnce(new Promise((r) => (answer = r)));
+    fireEvent.click(screen.getByTestId("create-failure-retry_runtime"));
+    fireEvent.click(screen.getByRole("switch", { name: "Yolo mode" }));
+    await act(async () => answer({ available: true, runtime: "docker", runtime_name: "Docker" }));
+    await act(async () => {});
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(box().querySelector("button")?.textContent).toBe("Retry");
+  });
+});
+
 describe("SessionWizard View row", () => {
   const radio = (name: string) => screen.getByRole("radio", { name }) as HTMLButtonElement;
   const selected = () => (radio("Structured view").getAttribute("aria-checked") === "true" ? "structured" : "terminal");
@@ -1081,7 +1736,7 @@ describe("SessionWizard View row", () => {
     ["Structured view", "structured"],
     ["Terminal view", "terminal"],
   ])("gives %s back after an agent that can't run Structured view", async (choice, expected) => {
-    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(AGENTS);
     renderWizard();
     await waitFor(() => expect(radio("Structured view").disabled).toBe(false));
     fireEvent.click(radio(choice));
@@ -1097,7 +1752,7 @@ describe("SessionWizard View row", () => {
     ["clicking Terminal view", () => fireEvent.click(radio("Terminal view"))],
     ["an arrow key", () => fireEvent.keyDown(radio("Terminal view"), { key: "ArrowLeft" })],
   ])("re-picking the forced Terminal view by %s keeps Structured view for later", async (_label, repick) => {
-    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(AGENTS);
     renderWizard();
     await waitFor(() => expect(selected()).toBe("structured"));
     pickAgent("aider");
@@ -1109,7 +1764,7 @@ describe("SessionWizard View row", () => {
   });
 
   it("arrow keys move the selection and skip a disabled option", async () => {
-    vi.mocked(fetchAgents).mockResolvedValue(AGENTS);
+    vi.mocked(fetchProfileAgents).mockResolvedValue(AGENTS);
     renderWizard();
     await waitFor(() => expect(selected()).toBe("structured"));
     expect(radio("Structured view").tabIndex).toBe(0);

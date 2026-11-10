@@ -43,10 +43,13 @@ fn is_serve_daemon_child(cli: &Cli) -> bool {
     matches!(cli.command, Some(Commands::Serve(ref args)) if args.daemon_child)
 }
 
-/// With the `aoe.web` plugin disabled, starting `aoe serve` is an unknown subcommand;
-/// the lifecycle verbs stay usable.
+/// Reject disabled Web starts while keeping lifecycle controls available.
 fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
-    cli::graft::serve_start_blocked(cli, cli::graft::web_disabled()).then(|| {
+    if !cli::graft::serve_start_blocked(cli, true) {
+        return None;
+    }
+    let config = agent_of_empires::session::Config::load_or_warn();
+    cli::graft::serve_start_blocked(cli, cli::graft::web_disabled(&config)).then(|| {
         Cli::command().error(
             clap::error::ErrorKind::InvalidSubcommand,
             "unrecognized subcommand 'serve'",
@@ -386,6 +389,10 @@ async fn run(
         Some(Commands::Update(args)) => return exit_zero(cli::update::run(args).await),
         Some(Commands::Migrate(args)) => return exit_zero(cli::migrate::run(&args).await),
 
+        Some(Commands::Add(args)) => {
+            let profile = cli.profile.as_deref().unwrap_or_default();
+            return exit_zero(cli::add::run(profile, *args).await);
+        }
         Some(Commands::Stop { .. }) => return exit_zero(cli::killall::stop_trap()),
         // Before the startup lock and migrations: see `cli::serve::run_control`.
         Some(Commands::Serve(ref args)) => {
@@ -430,7 +437,6 @@ async fn run(
     }
 
     let result = match cli.command {
-        Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::Ps(args)) => cli::ps::run(&profile, profile_explicit, args).await,
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,

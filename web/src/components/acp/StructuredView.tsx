@@ -38,6 +38,7 @@ import { ToolExpansionProvider } from "./ToolExpansion";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { useTranscriptScroll } from "./useTranscriptScroll";
 import { WorkingSpinner } from "./WorkingSpinner";
+import type { ShellMode } from "../PairedTerminal";
 
 type WorkerState = "absent" | "resuming" | "running" | "stopping";
 
@@ -77,6 +78,10 @@ interface Props {
   onOpenAgentsPane?: () => void;
   /** Opens the switch-view confirmation; omitted on a read-only server. */
   onSwitchToTerminal?: () => void;
+  /** Shows this Session's paired shell; omitted where the terminal can't be used. */
+  onOpenTerminal?: (mode: ShellMode) => void;
+  /** Whether the server lets the dashboard restart the Agent. */
+  canRestartAgent?: boolean;
 }
 
 const STARTER_PROMPTS = [
@@ -266,6 +271,9 @@ function AcpChrome({
         onSwitchToTerminal={view.onSwitchToTerminal}
         dismissError={ctx.dismissError}
         startingAgent={startingAgent}
+        canRestart={!!view.canRestartAgent}
+        onRestarted={ctx.markRestartStarted}
+        onRestartFailed={ctx.markRestartFailed}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -413,6 +421,8 @@ function ComposerDock({
   const { state, status } = ctx;
   const connecting =
     acpWorkerState === "running" && status !== "open" && !state.workerStopped && !state.workerRestarting;
+  const agentName = useAgentDisplayNames();
+  const signInAgent = state.agent ?? acpAgent ?? view.tool;
   const clearAliases = useClearAliases();
   const compactAliases = useCompactAliases();
   // The Daemon's solo commands: they run as their own turn, never steered into one.
@@ -521,6 +531,14 @@ function ComposerDock({
           setConfigOption={ctx.setConfigOption}
           sessionUsage={state.sessionUsage}
           authStatus={state.authStatus}
+          signIn={{
+            sessionId,
+            agent: signInAgent,
+            agentName: agentName(signInAgent),
+            sandboxed: !!view.isSandboxed,
+            onOpenTerminal: view.onOpenTerminal,
+            canRestart: !!view.canRestartAgent,
+          }}
           availableCommands={state.availableCommands}
           connected={status === "open" && !state.workerStopped && !state.workerRestarting}
           turnActive={state.turnActive}

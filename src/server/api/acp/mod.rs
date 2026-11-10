@@ -39,6 +39,7 @@ pub use view::{acp_disable, acp_enable};
 pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
 };
+pub(in crate::server::api) use worker::rate_limit_resume_probe;
 pub use worker::{
     get_option_catalog, list_acp_agents, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
     switch_acp_provider,
@@ -191,7 +192,7 @@ pub(crate) fn spawn_request_for(
         source_profile: Some(instance.source_profile.clone()),
         yolo_mode: instance.yolo_mode,
         acp_mode_id: instance.acp_mode_id.clone(),
-        agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
+        agent_command_override: crate::acp::supervisor::command_override_for_spawn(
             &instance.tool,
             &instance.command,
         ),

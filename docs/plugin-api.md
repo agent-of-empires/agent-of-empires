@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `19`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `20`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 19
+api_version = 20
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,15 +30,17 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `19`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `20`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
-| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none. |
+| `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Optional agent launch metadata. Requires `api_version >= 19`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
+
+Provider-native integrations connect a plugin to status and prompt replies for a terminal agent, separately from ACP and worker RPCs. The host owns session creation, approvals, and lifecycle. The user chooses each response; declaring an integration does not approve tools automatically.
 
 An agent integration declares an optional launch command for an agent tool. Active plugins with a command contribute that tool to AoE's agent picker and CLI when its name is unique across plugin declarations and does not match a configured custom agent. Built-in names and aliases retain precedence under AoE's case-insensitive substring resolver, so a plugin tool containing any such token is omitted from the catalog and a warning names the plugin ID and tool.
 
@@ -47,18 +49,36 @@ Available plugin agents can be selected with `session.default_tool`. Discovery c
 `command` is a launch line, not a shell script. Up to and including the executable it may contain only literal words separated by spaces or tabs: optional `NAME=value` assignments with valid environment names, followed by the executable. Quotes, backslashes, `$`, backticks, `~`, `#`, empty words, invalid assignment names, and anything the launch shell would act on in that prefix (`;`, `&`, `|`, parentheses, redirections, globs, braces, and whitespace such as a newline) are rejected when the manifest is validated, because discovery cannot reproduce a shell's expansion and field splitting closely enough to agree with the launch. The same rule refuses an executable beginning with `-`, which `env` would read as its own option. Arguments after the executable are passed through untouched and may use any syntax; the agent receives them from the shell exactly as written.
 
 ```toml
+capabilities = ["session.integration"]
+
 [[agent_integrations]]
 tool = "session-helper"
+provider_versions = ["^1.2"]
 command = "session-helper"
+replies = true
 ```
 
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `tool` | string | yes | Lowercase agent id; each tool may appear only once per plugin. |
+| `provider_versions` | array of strings | conditional | Required for every entry when the manifest declares `session.integration`, including launch-only entries in a mixed manifest; nonempty valid alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one. Omit only when the manifest declares no `session.integration` (launch-only agents). |
 | `command` | string | no | Launch command: optional literal `NAME=value` assignments, then the executable, then free-form agent arguments. |
+| `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
 
 Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI prompts show each tool and its exact command. Updates require approval when they add an agent integration or change a launch command; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
+The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
+For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
+
+### Report and reply files
+
+The provider writes `integration-<plugin id>.json` in the session's private hook directory, `/tmp/aoe-hooks-<effective uid>/<instance id>/`. AoE reads that report and writes `integration-<plugin id>.reply.json` in the same directory after the user responds. Both files must be regular files owned by the host's effective uid with exact mode `0600`; reports are limited to 64 KiB and rejected when their modification time is more than 15 seconds old or in the future. Providers should refresh reports at least every 15 seconds. `writer_pid` must identify a live process while the report is consumed.
+
+AoE owns report validation and reply creation. The provider owns reading and removing its reply file after processing it; AoE replaces it on the next response and removes the per-instance directory during hook-status cleanup. This is a same-user trust boundary: file ownership and a live `writer_pid` do not authenticate a provider against another process running as the same uid. When `replies = false`, AoE drops any prompt from the report and does not offer provider-native replies.
+
+The snapshot's `revision` changes only when the prompt changes, not when runtime status changes. Single-choice questions require exactly one selected option or a nonblank custom answer. Enter selects the highlighted option for an unanswered single-choice question before advancing or submitting; custom answers and multi-choice selections are preserved. The response dialog stays open for incomplete answers. While editing a custom answer, the viewport follows the input cursor.
+
+Shell-hook sidecars and native-plugin reports remain distinct transports. Native reports retain their heartbeat and live-writer checks; shell hooks keep their existing freshness and publisher rules. Both reuse hardened host I/O and the established guarded session-identity persistence path where applicable. Declaring launch or reply metadata does not install hooks or companion extensions.
 
 ## Plugin id
 
@@ -91,6 +111,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.prompt` | Delivering a turn to a session the plugin created via `sessions.turn.send`, and the initial turn on `sessions.create` (`api_version >= 9`). |
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
+| `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -351,6 +372,7 @@ id = "my_pane"
 | `title` | string | page only | Page name shown in the dashboard. Required on a `page`. |
 | `icon` | string | no | Page only. A [lucide](https://lucide.dev/icons/) kebab-case icon name. |
 | `entry` | string | page only | Plugin-relative path to the page's `.html` file. Required on a `page`. See [Pages](#pages). |
+| `deep_link` | bool | no | Page only; requires `api_version >= 20`. Opts the page in to receive the `?link=` value of its dashboard URL. See [Deep links](#deep-links). |
 
 | Slot | Scope | Renders |
 |---|---|---|
@@ -408,9 +430,10 @@ Error codes: `unknown_method`, `invalid_params` (also an `id` that `sessions.lis
 
 The dashboard pushes `{ "aoeBridge": 1, "event", "data" }` messages, with no `id`:
 
-- `context`, once after `ready`: `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion" }`.
+- `context`, after `ready`, and again whenever `readOnly` or `cityhall` changes while the page is open (for example once the dashboard learns the server is writable): `{ "readOnly", "cityhall", "pluginId", "pageId", "bridgeVersion", "link" }`. `link` is the page's [deep link](#deep-links) value, or `null`; hosts without deep links omit it.
 - `theme`, after `ready` and on every theme change: `{ "appearance": "dark" | "light", "cssVars": { "--name": "value" } }`, the dashboard's resolved CSS variables.
 - `selection`, after `ready` and whenever it changes: `{ "sessionId" }`, the session split view shows below the page, or `null`.
+- `link`, whenever the deep link changes while the page is open: `{ "link" }`, the new value or `null`.
 
 When the frame loads a second document, because the page reloaded or navigated itself, the dashboard removes the frame and offers to reopen it. A minimal client:
 
@@ -446,13 +469,23 @@ request({ method: "ready", params: { nonce: location.hash.slice(1) } }, (m) => p
   .then((sessions) => console.log(sessions));
 ```
 
+#### Deep links
+
+A page with `deep_link = true` can be opened on one item: `/plugins/{id}/{page_id}?link={value}`. The dashboard, not the page URL, takes the value: the frame URL still refuses a query string, and the value reaches the page only as `context.link` after `ready` and as later `link` pushes. `value` is 1 to 128 characters of `A-Z a-z 0-9 - _ . ~`, so it never needs escaping; anything else, or a page without `deep_link`, yields `null`.
+
+The value is opaque to the host and chosen by the plugin, for example an item id. Treat it as untrusted input: look the item up yourself, and show the plain page for an unknown value. It never grants anything, and the dashboard's login is unchanged: a user who is not signed in sees the sign-in screen at the same URL, then the page.
+
+With `api_version >= 20`, `ui.notify` takes an optional `link: { "page", "value" }` naming one of the plugin's own pages with `deep_link = true`; the host builds the URL above, so clicking the toast in the web dashboard opens the page on that item. The toast keeps its `tone`, and the TUI shows it without a link. A page that is undeclared or lacks `deep_link`, or a malformed value, is rejected with `invalid_params`. For a message sent outside aoe, use the absolute URL on the dashboard's own origin.
+
 ### Badge payload
 
-`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge.
+`status-bar`, `header-start`, `row-badge` and `detail-badge` take either one badge, `{ text?, icon?, tone?, href?, tooltip? }` (`status-bar`, `header-start` and `detail-badge` require `text` or `items`), or an `items` list of such badges that replaces the top-level fields. `items: []` clears the badge. Row badges also accept `presentation?` on the badge and its items, as described below.
 
 `status-bar`, `header-start` and `detail-badge` also take an integer `order`, default 0, lowest first; ties keep plugin id then entry id order. In the terminal UI they render as text and tone in the status line, `header-start` first; icons, tooltips and links are web only.
 
-`row-badge` items on terminal session rows render every item with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links.
+`row-badge` items on terminal session rows render items with `text` or `tooltip`, using `tooltip` when `text` is absent. With no `items` list, the top-level `row-badge` uses `tooltip` as a fallback label for missing `text`. `row-column` renders text only; the TUI omits icons and links. The status strip is right-aligned. In the local session list, it appears before the activity age when enabled, and its bounded lane considers one item per plugin before considering a second item from any plugin. Items may be truncated or omitted when space runs out.
+
+For a row badge or its individual items, set `presentation` to `"glyph"` when the TUI `text` is a glyph. The default is `"text"`; both values are accepted explicitly. A glyph uses one separator cell and text uses two. Tooltip fallback always uses text spacing. The `icon` field is web-only and does not determine terminal spacing. In remote home, the gap between the status strip and project path remains two cells.
 
 In the web dashboard, give items a shared `group` to collapse them into one chip that shows one item at a time. Clicking or tapping it advances to the next item and wraps around, for example a usage badge cycling `5h`, `7d` and `opus` values:
 

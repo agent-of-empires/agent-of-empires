@@ -77,6 +77,10 @@ pub struct AgentInfo {
     pub display_name: String,
     pub binary: String,
     pub host_only: bool,
+    /// The agent always runs in Yolo mode in a terminal session, so the wizard locks the switch on.
+    pub always_yolo: bool,
+    /// The same for a structured session, which can run a custom agent's own adapter instead.
+    pub acp_always_yolo: bool,
     pub installed: bool,
     pub install_hint: String,
     /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
@@ -89,9 +93,15 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// Whether a non-sandboxed structured create would find this agent's ACP adapter
-    /// (the create check, with no project to search relative PATH entries from, so they count).
+    /// Whether this agent's ACP adapter resolves on the host now, for the served profile with no
+    /// sandbox. Relative PATH entries and a host `before_session` hook count, as for a spawn;
+    /// preparation hooks (`on_create`/`on_launch`) don't. The wizard's Import tab and the usage
+    /// limit banner's installed alternatives read it: both run the adapter before those hooks.
     pub acp_installed: bool,
+    /// Whether a non-sandboxed structured create in the served profile will accept this agent:
+    /// the adapter resolves, or the profile's own `on_create`/`on_launch` hooks may install it
+    /// first. The repository's hooks depend on the project, so they are left to the create.
+    pub acp_create_ready: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
     /// fact (an ACP adapter exists for this agent) that an operator policy does
@@ -160,36 +170,81 @@ fn build_custom_agent_infos(
                 && !command.trim().is_empty()
                 && crate::agents::get_agent(name).is_none()
         })
-        .map(|(name, _command)| AgentInfo {
-            lifecycle: crate::agents::AgentLifecycle::Active,
-            kind: "custom".to_string(),
-            name: name.clone(),
-            display_name: name.clone(),
-            binary: name.clone(),
-            host_only: false,
-            installed: true,
-            install_hint: "Configured custom agent".to_string(),
-            oneshot_capable: false,
-            acp_capable: agent_acp_cmd
+        .map(|(name, _command)| {
+            let own_adapter = agent_acp_cmd
                 .get(name)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
-                || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
-            acp_allowed: policy.allows(name),
-            // Set by `list_agents`, which holds the config the probe needs.
-            acp_installed: false,
-            // Custom agents' command values are deliberately never
-            // serialized here; they can hold hostnames or secrets.
-            acp_command: None,
-            acp_args: Vec::new(),
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok());
+            let base = crate::acp::inherited_acp_base(name, agent_detect_as);
+            AgentInfo {
+                lifecycle: crate::agents::AgentLifecycle::Active,
+                kind: "custom".to_string(),
+                name: name.clone(),
+                display_name: name.clone(),
+                binary: name.clone(),
+                host_only: false,
+                always_yolo: crate::acp::runs_always_yolo(
+                    name,
+                    crate::session::View::Terminal,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
+                acp_always_yolo: crate::acp::runs_always_yolo(
+                    name,
+                    crate::session::View::Structured,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
+                installed: true,
+                install_hint: "Configured custom agent".to_string(),
+                oneshot_capable: false,
+                acp_capable: own_adapter || base.is_some(),
+                acp_allowed: policy.allows(name),
+                // Set by `list_agents`, which holds the config the probe needs.
+                acp_installed: false,
+                acp_create_ready: false,
+                // Custom agents' command values are deliberately never
+                // serialized here; they can hold hostnames or secrets.
+                acp_command: None,
+                acp_args: Vec::new(),
+            }
         })
         .collect();
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     entries
 }
 
-pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentInfo>> {
+#[derive(Deserialize)]
+pub struct AgentsQuery {
+    profile: Option<String>,
+}
+
+/// `GET /api/agents[?profile=]`: the agents as the profile resolves them, so the
+/// wizard reads a custom agent's base from the profile it creates in.
+pub async fn list_agents(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<AgentsQuery>,
+) -> Result<Json<Vec<AgentInfo>>, axum::response::Response> {
     let _namespace = state.profile_namespace.read().await;
-    let profile = state.served_profile().to_string();
+    let profile = match query.profile.filter(|p| !p.is_empty()) {
+        Some(name) => {
+            let known = state
+                .canonical_metadata
+                .read()
+                .await
+                .profiles
+                .iter()
+                .any(|p| p.name == name);
+            if !known {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "profile_not_found",
+                    format!("Profile '{name}' doesn't exist."),
+                ));
+            }
+            name
+        }
+        None => state.served_profile().to_string(),
+    };
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = &config.session.custom_agents;
@@ -215,12 +270,15 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                         .to_string(),
                     binary: a.binary.to_string(),
                     host_only: a.host_only,
+                    always_yolo: crate::agents::is_always_yolo(a.name),
+                    acp_always_yolo: crate::agents::is_always_yolo(a.name),
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
                     lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: false,
+                    acp_create_ready: false,
                     acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
@@ -243,11 +301,24 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                 display_name: integration.tool.to_string(),
                 binary: integration.tool.to_string(),
                 host_only: false,
+                always_yolo: crate::acp::runs_always_yolo(
+                    integration.tool,
+                    crate::session::View::Terminal,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
+                acp_always_yolo: crate::acp::runs_always_yolo(
+                    integration.tool,
+                    crate::session::View::Structured,
+                    agent_acp_cmd,
+                    agent_detect_as,
+                ),
                 installed: available.iter().any(|name| name == integration.tool),
                 install_hint: format!("Provided by AoE plugin {}", integration.plugin),
                 oneshot_capable: false,
                 acp_capable: false,
                 acp_installed: false,
+                acp_create_ready: false,
                 acp_allowed: policy.allows(integration.tool),
                 acp_command: None,
                 acp_args: Vec::new(),
@@ -263,20 +334,32 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         let host_environment =
             crate::session::environment::resolve_host_environment_pairs(&config.environment);
         for agent in agents.iter_mut().filter(|a| a.acp_capable) {
-            agent.acp_installed = crate::session::builder::structured::adapter_installed(
-                &agent.name,
-                &config,
-                &host_environment,
-            );
+            let check = |count_profile_hooks| {
+                crate::session::builder::structured::adapter_installed(
+                    &agent.name,
+                    &config,
+                    &host_environment,
+                    count_profile_hooks,
+                )
+            };
+            // An installed adapter is create-ready, so the hooked check runs only when it isn't.
+            let installed = check(false);
+            agent.acp_create_ready = installed || check(true);
+            agent.acp_installed = installed;
         }
         agents
     })
     .await
-    .unwrap_or_else(|e| {
+    // An empty list would read as "no agents", so the client retries instead.
+    .map_err(|e| {
         tracing::error!("list_agents task failed: {e}");
-        Vec::new()
-    });
-    Json(result)
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Couldn't list the agents.",
+        )
+    })?;
+    Ok(Json(result))
 }
 
 // --- Settings ---
@@ -1978,33 +2061,34 @@ pub async fn system_health(State(state): State<Arc<AppState>>) -> axum::response
 #[derive(Serialize)]
 pub struct DockerStatus {
     pub available: bool,
+    /// The configured runtime's config value (`docker`, `podman`,
+    /// `apple_container`), also when it is down.
     pub runtime: Option<String>,
+    /// Its display name ("Apple Container"), for messages that name it.
+    pub runtime_name: Option<&'static str>,
 }
 
 pub async fn docker_status() -> Json<DockerStatus> {
     let result = tokio::task::spawn_blocking(|| {
         let runtime = crate::containers::get_container_runtime();
         let available = runtime.is_available() && runtime.is_daemon_running();
-        let runtime_name = if available {
-            let config = crate::session::Config::load_or_warn();
-            Some(
+        let config = crate::session::Config::load_or_warn();
+        DockerStatus {
+            available,
+            runtime_name: Some(runtime.display_name()),
+            runtime: Some(
                 serde_json::to_value(config.sandbox.container_runtime)
                     .ok()
                     .and_then(|v| v.as_str().map(String::from))
                     .unwrap_or_else(|| "docker".to_string()),
-            )
-        } else {
-            None
-        };
-        DockerStatus {
-            available,
-            runtime: runtime_name,
+            ),
         }
     })
     .await
     .unwrap_or(DockerStatus {
         available: false,
         runtime: None,
+        runtime_name: None,
     });
     Json(result)
 }
@@ -2318,7 +2402,7 @@ async fn commit_profile_owned(
     mutation: crate::daemon::ProfileMutation,
 ) -> axum::response::Response {
     use crate::daemon::{ProfileMutation, ReloadFailureCode, RuntimeHealth};
-    use crate::server::reload::{load_all_profiles, merge_loaded_rows};
+    use crate::server::reload::{load_configuration_profiles, merge_loaded_rows};
 
     let transaction = tokio::select! {
         _ = state.shutdown.cancelled() => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2343,9 +2427,6 @@ async fn commit_profile_owned(
             "The profile served by this daemon cannot be deleted",
         );
     }
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     let creation_active = match &mutation {
         ProfileMutation::Rename { name, .. } | ProfileMutation::Delete { name, .. } => {
             state.session_service.has_profile_creation(name)
@@ -2369,7 +2450,7 @@ async fn commit_profile_owned(
             transaction,
             identity,
         )?;
-        let loaded = load_all_profiles(&file_watch).map(|_| ());
+        let loaded = load_configuration_profiles(&file_watch).map(|loaded| loaded.native_health());
         Ok::<_, anyhow::Error>((catalogue, loaded, reload))
     })
     .await
@@ -2382,12 +2463,17 @@ async fn commit_profile_owned(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    if let Err(error) = preflight {
-        state.mark_reload_failure(error.health).await;
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
+    let preflight_health = match preflight {
+        Ok(health) => health,
+        Err(error) => {
+            state.mark_reload_failure(error.health).await;
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
     let publication = state.publication.write().await;
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
+    if *state.canonical_health.read().await != RuntimeHealth::Healthy
+        && preflight_health == RuntimeHealth::Healthy
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     let file_watch = state.file_watch.clone();
@@ -2405,7 +2491,7 @@ async fn commit_profile_owned(
                 .map(|_| ()),
             ProfileMutation::SetDefault(body) => catalogue.set_default(&body.name),
         };
-        let loaded = load_all_profiles(&file_watch);
+        let loaded = load_configuration_profiles(&file_watch);
         #[cfg(test)]
         {
             let pause = {
@@ -2449,6 +2535,7 @@ async fn commit_profile_owned(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let health = loaded.native_health();
     let suppressed =
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
     merge_loaded_rows(
@@ -2458,7 +2545,12 @@ async fn commit_profile_owned(
         &suppressed,
     );
     *state.canonical_metadata.write().await = loaded.metadata;
-    *state.canonical_health.write().await = RuntimeHealth::Healthy;
+    state
+        .runtime_read_cache
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inventory = loaded.inventory;
+    *state.canonical_health.write().await = health;
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3586,11 +3678,105 @@ mod tests {
         );
     }
 
-    /// `acp_installed` follows the structured create check, so a custom
-    /// agent counts when its adapter is on the configured `environment` PATH.
+    #[test]
+    fn a_custom_agent_is_always_yolo_only_in_the_views_that_run_an_always_yolo_base() {
+        let custom = custom_agents(&[
+            ("my-pi", "pi --profile work"),
+            ("own-pi", "pi"),
+            ("my-claude", "claude"),
+            ("my-settl", "settl"),
+        ]);
+        let detect_as = custom_agents(&[
+            ("my-pi", "pi"),
+            ("own-pi", "pi"),
+            ("my-claude", "claude"),
+            ("my-settl", "settl"),
+        ]);
+        let acp = custom_agents(&[("own-pi", "own-pi-acp")]);
+        let entries = build_custom_agent_infos(&custom, &acp, &detect_as, &unrestricted());
+        // (terminal, structured): a terminal session runs the base CLI, a structured one its adapter.
+        for (name, expected) in [
+            ("my-pi", (true, true)),
+            ("own-pi", (true, false)),
+            ("my-claude", (false, false)),
+            ("my-settl", (true, false)),
+        ] {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            assert_eq!(
+                (entry.always_yolo, entry.acp_always_yolo),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// The wizard names the runtime that isn't running, so it's reported
+    /// whether or not it's available.
     #[tokio::test]
     #[serial_test::serial]
-    async fn acp_installed_matches_the_structured_create_check() {
+    async fn docker_status_names_the_configured_runtime() {
+        use crate::session::config::ContainerRuntimeName;
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (runtime, value, display) in [
+            (ContainerRuntimeName::Docker, "docker", "Docker"),
+            (ContainerRuntimeName::Podman, "podman", "Podman"),
+            (
+                ContainerRuntimeName::AppleContainer,
+                "apple_container",
+                "Apple Container",
+            ),
+        ] {
+            crate::session::config::update_config(|c| c.sandbox.container_runtime = runtime)
+                .unwrap();
+            let Json(status) = docker_status().await;
+            assert_eq!(status.runtime.as_deref(), Some(value), "{display}");
+            assert_eq!(status.runtime_name, Some(display));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agents_resolve_the_requested_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for (profile, base) in [("alpha", "pi"), ("beta", "claude")] {
+            crate::session::create_profile(profile).unwrap();
+            std::fs::write(
+                crate::session::config::profile_config::get_profile_config_path(profile).unwrap(),
+                format!(
+                    "[session.custom_agents]\nwrapper = \"{base}\"\n\n[session.agent_detect_as]\nwrapper = \"{base}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        for (profile, always_yolo) in [("alpha", true), ("beta", false)] {
+            let query = AgentsQuery {
+                profile: Some(profile.into()),
+            };
+            let Ok(Json(agents)) =
+                list_agents(State(state.clone()), axum::extract::Query(query)).await
+            else {
+                panic!("{profile}: list_agents failed");
+            };
+            let wrapper = agents.iter().find(|a| a.name == "wrapper").unwrap();
+            assert_eq!(wrapper.always_yolo, always_yolo, "{profile}");
+        }
+        let unknown = AgentsQuery {
+            profile: Some("gone".into()),
+        };
+        let Err(response) = list_agents(State(state), axum::extract::Query(unknown)).await else {
+            panic!("an unknown profile must not list agents");
+        };
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Both fields follow the structured create check, so a custom agent counts when its
+    /// adapter is on the configured `environment` PATH. A profile hook makes a missing adapter
+    /// create-ready but never installed, which the Import tab relies on.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_installed_and_create_ready_match_the_structured_create_check() {
         use std::os::unix::fs::PermissionsExt;
         let _home = crate::session::test_support::isolate_app_dir();
         let bin = tempfile::tempdir().unwrap();
@@ -3618,15 +3804,53 @@ mod tests {
             config.environment = vec![format!("PATH={}", bin.path().display())];
         })
         .unwrap();
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let Json(agents) = list_agents(State(state)).await;
-        for (name, installed) in [("on-path", true), ("missing", false), ("terminal", false)] {
-            let agent = agents.iter().find(|a| a.name == name).unwrap();
-            assert_eq!(agent.acp_installed, installed, "{name}");
-            assert_eq!(agent.display_name, name);
+        // (agent, installed, create-ready) without hooks, then with a profile on_create hook.
+        let passes = [
+            (
+                false,
+                [
+                    ("on-path", true, true),
+                    ("missing", false, false),
+                    ("terminal", false, false),
+                ],
+            ),
+            (
+                true,
+                [
+                    ("on-path", true, true),
+                    ("missing", false, true),
+                    ("terminal", false, false),
+                ],
+            ),
+        ];
+        for (hooked, rows) in passes {
+            if hooked {
+                crate::session::config::update_config(|config| {
+                    config.hooks.on_create = vec!["npm install".into()];
+                })
+                .unwrap();
+            }
+            let state = crate::server::test_support::build_test_app_state(Vec::new());
+            let Ok(Json(agents)) = list_agents(
+                State(state),
+                axum::extract::Query(AgentsQuery { profile: None }),
+            )
+            .await
+            else {
+                panic!("list_agents failed");
+            };
+            for (name, installed, create_ready) in rows {
+                let agent = agents.iter().find(|a| a.name == name).unwrap();
+                assert_eq!(agent.acp_installed, installed, "{name} (hook: {hooked})");
+                assert_eq!(
+                    agent.acp_create_ready, create_ready,
+                    "{name} (hook: {hooked})"
+                );
+                assert_eq!(agent.display_name, name);
+            }
+            let claude = agents.iter().find(|a| a.name == "claude").unwrap();
+            assert_eq!(claude.display_name, "Claude Code");
         }
-        let claude = agents.iter().find(|a| a.name == "claude").unwrap();
-        assert_eq!(claude.display_name, "Claude Code");
     }
 
     #[test]

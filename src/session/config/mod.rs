@@ -196,6 +196,11 @@ pub struct PluginConfig {
     /// when no update has been dismissed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dismissed_update: Option<String>,
+
+    /// Installed with `--dev` from a local directory: may claim a reserved
+    /// namespace, is never featured, and is refused under remote exposure.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dev: bool,
 }
 
 /// A user's approval of an external plugin's requested capabilities, pinned to
@@ -230,6 +235,7 @@ impl Default for PluginConfig {
             settings: toml::Table::new(),
             grant: None,
             dismissed_update: None,
+            dev: false,
         }
     }
 }
@@ -432,7 +438,7 @@ pub struct AcpConfig {
     #[setting(
         label = "Structured view",
         widget = "select",
-        options = "off:Off,terminal:Terminal view,structured:Structured view"
+        options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view"
     )]
     pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
@@ -789,6 +795,7 @@ pub enum GroupByMode {
     Manual,
     Project,
     Org,
+    Status,
 }
 
 impl GroupByMode {
@@ -796,7 +803,8 @@ impl GroupByMode {
         match self {
             GroupByMode::Manual => GroupByMode::Project,
             GroupByMode::Project => GroupByMode::Org,
-            GroupByMode::Org => GroupByMode::Manual,
+            GroupByMode::Org => GroupByMode::Status,
+            GroupByMode::Status => GroupByMode::Manual,
         }
     }
 
@@ -805,6 +813,7 @@ impl GroupByMode {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Status => "Status",
         }
     }
 
@@ -814,6 +823,7 @@ impl GroupByMode {
             GroupByMode::Manual => 'm',
             GroupByMode::Project => 'p',
             GroupByMode::Org => 'g',
+            GroupByMode::Status => 's',
         }
     }
 }
@@ -937,6 +947,10 @@ pub struct AppStateConfig {
     /// group record, so their collapse state has nowhere else to live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_group_collapsed: Vec<String>,
+
+    /// Collapsed paths of the status-mode sidebar folders, alongside `org_group_collapsed`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_group_collapsed: Vec<String>,
 
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
@@ -1078,6 +1092,45 @@ pub struct SessionConfig {
         tui_only
     )]
     pub sidebar_position: SidebarPosition,
+
+    /// Percentage of split preview rows allocated to the paired terminal.
+    #[serde(default = "default_split_terminal_height_percent")]
+    #[setting(
+        label = "Split Terminal Height (%)",
+        widget = "number",
+        min = 1,
+        max = 99,
+        validate = "range:1:99",
+        tui_only,
+        global_only
+    )]
+    pub split_terminal_height_percent: u16,
+
+    /// Minimum whole-window width for the paired terminal split.
+    #[serde(default = "default_split_terminal_min_width")]
+    #[setting(
+        label = "Split Terminal Minimum Width",
+        widget = "number",
+        min = 0,
+        max = 1000,
+        validate = "range:0:1000",
+        tui_only,
+        global_only
+    )]
+    pub split_terminal_min_width: u16,
+
+    /// Minimum whole-window height for the paired terminal split.
+    #[serde(default = "default_split_terminal_min_height")]
+    #[setting(
+        label = "Split Terminal Minimum Height",
+        widget = "number",
+        min = 0,
+        max = 1000,
+        validate = "range:0:1000",
+        tui_only,
+        global_only
+    )]
+    pub split_terminal_min_height: u16,
 
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
@@ -1900,9 +1953,10 @@ pub enum NewSessionMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredView {
+    #[default]
+    Auto,
     Off,
     Terminal,
-    #[default]
     Structured,
 }
 
@@ -2005,6 +2059,9 @@ impl Default for SessionConfig {
             pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             sidebar_position: SidebarPosition::default(),
+            split_terminal_height_percent: default_split_terminal_height_percent(),
+            split_terminal_min_width: default_split_terminal_min_width(),
+            split_terminal_min_height: default_split_terminal_min_height(),
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -2054,6 +2111,18 @@ impl Default for SessionConfig {
             tie_workdir_to_name: true,
         }
     }
+}
+
+fn default_split_terminal_height_percent() -> u16 {
+    50
+}
+
+fn default_split_terminal_min_width() -> u16 {
+    100
+}
+
+fn default_split_terminal_min_height() -> u16 {
+    30
 }
 
 fn default_snooze_duration_minutes() -> u32 {
@@ -3143,7 +3212,7 @@ pub struct SystemdSettings {
     #[setting(label = "Use systemd scopes", widget = "toggle", global_only)]
     pub enabled: bool,
 
-    /// Slice for the session scopes; must end in `.slice`. `{profile}` expands to the escaped profile name. Applies after an aoe restart.
+    /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
     #[serde(default = "default_systemd_slice")]
     #[setting(
         label = "Systemd slice",
@@ -3732,23 +3801,14 @@ pub fn load_config() -> Result<Option<Config>> {
     Ok(Some(Config::load()?))
 }
 
-/// Atomically read-modify-write the global `config.toml`.
+/// Atomically read-modify-write global `config.toml`, excluding `app_state`.
 ///
-/// Loads a *fresh* [`Config`] from disk inside a process-wide mutex plus a
-/// cross-process `flock`, applies `f`, then writes `config.toml` back out.
-/// Any field `f` does not touch is preserved from the fresh on-disk copy, so
-/// a concurrent writer's unrelated edits survive: the fresh load itself is
-/// the merge, because `f` only mutates the fields it cares about and
-/// everything else already reflects the current on-disk state.
+/// Loads fresh config under a process mutex and cross-process flock so
+/// unrelated edits survive. Registered Web enable-state changes also require
+/// the namespace lifecycle transaction; a busy transition refuses the save.
 ///
-/// `app_state` is always stripped from the written table; it is persisted
-/// separately in `state.toml` (see [`update_app_state`]). Mutating
-/// `config.app_state` inside `f` has no durable effect here.
-///
-/// Whatever `f` leaves `config` in gets written to disk, even if `f` mutates
-/// `config` and then returns an error (e.g. via `?` partway through). There is
-/// no rollback: a caller that wants "no error, no mutation" must check its
-/// error condition and return before touching `config`, not after.
+/// Closure errors do not undo edits. Validate before mutating when an edit
+/// must be all-or-nothing.
 pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let _mu = config_save_lock()
         .lock()
@@ -3757,7 +3817,22 @@ pub fn update_config<R>(f: impl FnOnce(&mut Config) -> R) -> Result<R> {
     let _flock = super::storage::acquire_storage_flock(&app_dir, CONFIG_LOCK_FILENAME)?;
 
     let mut config = Config::load()?;
+    let web_was_disabled = config
+        .plugins
+        .get("aoe.web")
+        .is_some_and(|plugin| !plugin.enabled);
     let result = f(&mut config);
+    let web_is_disabled = config
+        .plugins
+        .get("aoe.web")
+        .is_some_and(|plugin| !plugin.enabled);
+    let _transaction = if web_was_disabled != web_is_disabled
+        && crate::plugin::registry().get("aoe.web").is_some()
+    {
+        Some(crate::daemon::lifecycle::Transaction::try_acquire()?)
+    } else {
+        None
+    };
 
     let mut table = toml::Table::try_from(&config)?;
     table.remove("app_state");
@@ -3910,20 +3985,8 @@ fn shell_quote_value(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// Quote a shell-active `--model` / `-m` VALUE inside a free-form extra-args
-/// string, leaving every other token exactly as the user wrote it.
-///
-/// `extra_args` is spliced into the launch command verbatim, so a model id
-/// carrying shell metacharacters aborts the whole line before the agent
-/// starts. A context-window suffix does exactly that: `--model claude-x[1m]`
-/// dies under zsh with `no matches found: claude-x[1m]`, status 1, and the
-/// pane is dead at launch with nothing to show for it.
-///
-/// Quoting only the model value keeps the rest of `extra_args` usable as the
-/// caller's own argv, where shell syntax may well be intended. Untouched
-/// regions (including their original whitespace) are copied byte-for-byte
-/// rather than round-tripped through a tokenize/rejoin, which would collapse
-/// runs of whitespace elsewhere in the string.
+/// Quote model values without changing other shell words or their whitespace.
+/// Quoted text and escaped separators stay within their original argument.
 pub fn quote_model_value_in_args(args: &str) -> String {
     let mut out = String::with_capacity(args.len());
     let mut rest = args;
@@ -3935,7 +3998,36 @@ pub fn quote_model_value_in_args(args: &str) -> String {
         if rest.is_empty() {
             break;
         }
-        let tok_len = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let mut quote = None;
+        let mut escaped = false;
+        let tok_len = rest
+            .char_indices()
+            .find_map(|(offset, ch)| {
+                if escaped {
+                    escaped = false;
+                    return None;
+                }
+                match quote {
+                    Some('\'') => {
+                        if ch == '\'' {
+                            quote = None;
+                        }
+                    }
+                    Some('"') => match ch {
+                        '"' => quote = None,
+                        '\\' => escaped = true,
+                        _ => {}
+                    },
+                    _ => match ch {
+                        '\'' | '"' => quote = Some(ch),
+                        '\\' => escaped = true,
+                        _ if ch.is_whitespace() => return Some(offset),
+                        _ => {}
+                    },
+                }
+                None
+            })
+            .unwrap_or(rest.len());
         let tok = &rest[..tok_len];
         let assigned_model_value = tok.split_once('=').and_then(|(lhs, value)| {
             if (lhs == "--model" || lhs == "-m") && !value.is_empty() {
@@ -3965,7 +4057,7 @@ mod model_value_quoting_tests {
     use super::*;
 
     #[test]
-    fn only_an_unquoted_context_window_model_value_is_quoted() {
+    fn model_quoting_respects_shell_word_boundaries() {
         let cases = [
             ("--model claude-x[1m]", "--model 'claude-x[1m]'"),
             ("--model=claude-x[1m]", "--model='claude-x[1m]'"),
@@ -3984,6 +4076,18 @@ mod model_value_quoting_tests {
             ("--model \"gpt-5\"", "--model \"gpt-5\""),
             ("--flag1   --flag2", "--flag1   --flag2"),
             ("--model 'claude-x[1m]'", "--model 'claude-x[1m]'"),
+            (
+                "--append-system-prompt 'Use --model $(id) now'",
+                "--append-system-prompt 'Use --model $(id) now'",
+            ),
+            (
+                r#"--append-system-prompt "Use --model $(id) now""#,
+                r#"--append-system-prompt "Use --model $(id) now""#,
+            ),
+            (
+                r"--append-system-prompt Use\ --model\ \$\(id\)",
+                r"--append-system-prompt Use\ --model\ \$\(id\)",
+            ),
             ("--model", "--model"),
             ("", ""),
         ];
@@ -4813,6 +4917,56 @@ mod tests {
         );
     }
 
+    /// Missing Web entries mean enabled. Refuse effective state changes atomically,
+    /// without blocking unrelated writes or writes that preserve that state.
+    #[cfg(feature = "web")]
+    #[test]
+    #[serial_test::serial]
+    fn web_plugin_changes_do_not_cross_lifecycle_transactions() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _registry = crate::plugin::ReloadRegistryOnDrop;
+        crate::plugin::reload_registry();
+        for initial in [None, Some(false)] {
+            update_config(|config| match initial {
+                Some(enabled) => {
+                    config.plugins.entry("aoe.web".into()).or_default().enabled = enabled;
+                }
+                None => {
+                    config.plugins.remove("aoe.web");
+                }
+            })
+            .unwrap();
+            let before = std::fs::read(config_path().unwrap()).unwrap();
+            let transaction = crate::daemon::lifecycle::Transaction::acquire_blocking_for(
+                std::time::Duration::ZERO,
+            )
+            .unwrap();
+            let enabled = initial.unwrap_or(true);
+            let result = update_config(|config| {
+                config.plugins.entry("aoe.web".into()).or_default().enabled = !enabled;
+                config.session.confirm_delete = !config.session.confirm_delete;
+            });
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(config_path().unwrap()).unwrap(), before);
+            let minutes = if enabled { 47 } else { 48 };
+            update_config(|config| {
+                config.plugins.entry("aoe.web".into()).or_default().enabled = enabled;
+                config.session.snooze_duration_minutes = minutes;
+            })
+            .unwrap();
+            assert_eq!(
+                Config::load().unwrap().session.snooze_duration_minutes,
+                minutes,
+            );
+            drop(transaction);
+            update_config(|config| {
+                config.plugins.entry("aoe.web".into()).or_default().enabled = !enabled;
+            })
+            .unwrap();
+            assert_eq!(Config::load().unwrap().plugins["aoe.web"].enabled, !enabled);
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn update_config_and_app_state_concurrent_increments_lose_no_updates() {
@@ -4878,7 +5032,10 @@ mod tests {
     fn systemd_settings_defaults() {
         let cfg = Config::default();
         assert!(cfg.systemd.enabled);
-        assert_eq!(cfg.systemd.slice, "background-aoe-{profile}.slice");
+        assert_eq!(
+            cfg.systemd.slice,
+            "background-aoe-{profile}-{session}.slice"
+        );
         assert!(cfg.systemd.survive_daemon_restart);
         assert_eq!(cfg.systemd.memory_max, None);
         assert_eq!(cfg.systemd.tasks_max, 0);

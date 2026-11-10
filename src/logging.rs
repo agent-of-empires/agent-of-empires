@@ -1097,6 +1097,57 @@ mod tests {
         });
     }
 
+    /// The `transport_actor=trace` directive only works while the SDK emits
+    /// from that exact module path.
+    #[tokio::test]
+    async fn sdk_transport_trace_target_matches_the_filter_directive() {
+        use agent_client_protocol::v1::schema::CancelNotification;
+        use agent_client_protocol::{ByteStreams, Client};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncReadExt;
+        use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Targets(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Targets {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(event.metadata().target().into());
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Targets(seen.clone())),
+        );
+        let (ours, mut peer) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(ours);
+        Client
+            .v1()
+            .connect_with(
+                ByteStreams::new(write.compat_write(), read.compat()),
+                async |cx| {
+                    cx.send_notification(CancelNotification::new("s"))?;
+                    let mut sent = [0u8; 1];
+                    peer.read_exact(&mut sent).await.unwrap();
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t == "agent_client_protocol::jsonrpc::transport_actor"));
+    }
+
     #[test]
     fn filter_string_applies_trace_overlays() {
         let cfg = |level, acp_trace, terminal_trace| LogConfig {

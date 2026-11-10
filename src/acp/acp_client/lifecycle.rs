@@ -2,7 +2,7 @@
 
 use crate::acp::agent_profiles;
 use crate::acp::state::Event;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CompactionStatus, ContentBlock, SessionUpdate, ToolCallContent, ToolCallStatus,
 };
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -76,15 +76,32 @@ pub(super) fn classify_lifecycle_signal(update: &SessionUpdate) -> Option<Lifecy
         SessionUpdate::AgentThoughtChunk(_)
         | SessionUpdate::Plan(_)
         | SessionUpdate::CompactionSummaryChunk(_) => Some(LifecycleSignal::Progress),
-        SessionUpdate::ToolCall(tc) => Some(LifecycleSignal::ToolStarted {
-            id: tc.tool_call_id.0.to_string(),
-            is_background_task: tc
-                .raw_input
-                .as_ref()
-                .and_then(|v| v.get("run_in_background"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        }),
+        SessionUpdate::ToolCall(tc) => {
+            let id = tc.tool_call_id.0.to_string();
+            // Replay reports a final status on the initial call (#5206); a
+            // `ToolStarted` here would never be closed.
+            Some(match tc.status {
+                ToolCallStatus::Completed => LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: true,
+                    off_protocol_work: detect_off_protocol_work_completed(&tc.content),
+                },
+                ToolCallStatus::Failed => LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: false,
+                    off_protocol_work: None,
+                },
+                _ => LifecycleSignal::ToolStarted {
+                    id,
+                    is_background_task: tc
+                        .raw_input
+                        .as_ref()
+                        .and_then(|v| v.get("run_in_background"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                },
+            })
+        }
         SessionUpdate::ToolCallUpdate(update) => {
             let id = update.tool_call_id.0.to_string();
             Some(match update.fields.status {
@@ -92,7 +109,9 @@ pub(super) fn classify_lifecycle_signal(update: &SessionUpdate) -> Option<Lifecy
                 Some(ToolCallStatus::Completed) => LifecycleSignal::ToolCompleted {
                     id,
                     succeeded: true,
-                    off_protocol_work: detect_off_protocol_work_completed(&update.fields.content),
+                    off_protocol_work: detect_off_protocol_work_completed(
+                        update.fields.content.as_deref().unwrap_or_default(),
+                    ),
                 },
                 Some(ToolCallStatus::Failed) => LifecycleSignal::ToolCompleted {
                     id,
@@ -212,11 +231,10 @@ pub(super) async fn forward_lifecycle_signals(
 /// Matches SDK markers only at line starts so echoed output does not extend
 /// watchdog grace.
 pub(super) fn detect_off_protocol_work_completed(
-    content: &Option<Vec<ToolCallContent>>,
+    content: &[ToolCallContent],
 ) -> Option<OffProtocolWorkKind> {
     content
         .iter()
-        .flatten()
         .filter_map(|block| match block {
             ToolCallContent::Content(c) => match &c.content {
                 ContentBlock::Text(t) => Some(t.text.as_str()),
@@ -267,7 +285,7 @@ pub(super) fn wakeup_lifecycle_signal_from_update(
 mod tests {
     use super::*;
     use crate::acp::acp_client::test_helpers::{compaction_chunk, compaction_update, text_chunk};
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         Content, ToolCall, ToolCallUpdate, ToolCallUpdateFields,
     };
 
@@ -413,6 +431,42 @@ mod tests {
             }
         }
 
+        // #5206: a terminal initial call completes; it never starts.
+        for (status, text, want_ok, want_work) in [
+            (ToolCallStatus::Completed, "ok", true, None),
+            (
+                ToolCallStatus::Completed,
+                "Async agent launched successfully. agentId: a1",
+                true,
+                Some(OffProtocolWorkKind::AsyncAgent),
+            ),
+            (ToolCallStatus::Failed, "boom", false, None),
+        ] {
+            let mut tc = ToolCall::new("tc-replay", "Read");
+            tc.status = status;
+            tc.content = vec![ToolCallContent::Content(Content::new(text))];
+            match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
+                Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded,
+                    off_protocol_work,
+                }) => {
+                    assert_eq!(id, "tc-replay");
+                    assert_eq!(succeeded, want_ok, "{text}");
+                    assert_eq!(off_protocol_work, want_work, "{text}");
+                }
+                other => panic!("expected ToolCompleted, got {other:?}"),
+            }
+        }
+        for status in [ToolCallStatus::Pending, ToolCallStatus::InProgress] {
+            let mut tc = ToolCall::new("tc-live", "Read");
+            tc.status = status;
+            assert!(matches!(
+                classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)),
+                Some(LifecycleSignal::ToolStarted { .. })
+            ));
+        }
+
         for (input, expected) in [
             (
                 serde_json::json!({ "command": "npm i", "run_in_background": true }),
@@ -516,14 +570,16 @@ mod tests {
             (None, None),
         ];
         for (text, expected) in cases {
-            let content = text.map(|t| vec![ToolCallContent::Content(Content::new(t))]);
+            let content: Vec<_> = text
+                .map(|t| ToolCallContent::Content(Content::new(t)))
+                .into_iter()
+                .collect();
             assert_eq!(
                 detect_off_protocol_work_completed(&content),
                 expected,
                 "{text:?}"
             );
         }
-        assert!(detect_off_protocol_work_completed(&Some(vec![])).is_none());
     }
 
     /// #3190: a per-connection claim left a second turn with no terminal.

@@ -10,7 +10,7 @@ Install Node.js 22 or newer (`brew install node`, `apt install nodejs`, `nvm ins
 
 ### An adapter is missing or too old
 
-aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude login` if you have not.
+aoe refuses to start a session whose adapter is below the version floor and reports the exact requirement. Install the official adapter (`npm install -g @agentclientprotocol/claude-agent-acp@latest`), then `claude auth login` if you have not.
 
 `aoe-agent` ships inside the `aoe` binary and installs into the data dir on demand: `aoe acp doctor --fix --adapter aoe-agent`. It needs Node 22.6+. An `aoe` upgrade that changes its bundled sources makes an installed copy stale, and sessions refuse it until `doctor --fix` reinstalls it.
 
@@ -66,6 +66,7 @@ Some adapters finish a turn, stream the final message and end-of-turn usage, but
 
 - Read `aoe acp logs --session <id>`, or **Open agent log** on the red startup-error banner.
 - Check the connection chrome at the top of the view for reconnect status.
+- A new session whose agent hasn't started after 30 seconds offers **Restart** on its startup line, which replaces the start in progress. A message you sent while it was starting is stopped; send it again once the agent is ready.
 - A repeatedly-failing worker is parked with a red "session parked" banner: retry from the dashboard or run `aoe acp restart <session>`.
 
 The view auto-reconnects with exponential backoff if the WebSocket drops and resumes the transcript where it left off. The banner counts the attempts and offers a manual **Reconnect** once they are exhausted; returning the tab to the foreground reconnects immediately.
@@ -99,6 +100,14 @@ The same hand-off is available any time, which is how you return to the original
 - **CLI**: `aoe acp switch-agent <session> <target>` (`aoe acp agents` lists the target keys; `--model <name>` overrides the model it starts with). A custom agent with an `agent_acp_cmd` is a valid target even though neither surface lists it.
 
 The transcript divider reads `Switched structured view agent from <from> to <to> (manual)`, distinct from the `(rate_limited)` one the recovery flow emits.
+
+### Switching accounts manually
+
+An account is a tool name with its own `[session.agent_config_dir]` entry (see [Swapping the engine on a restart](../guides/session-resume.md#swapping-the-engine-on-a-restart)). `aoe acp switch-account <session> <tool>` restarts the worker as that account and keeps the conversation: the transcript is copied into the new account's store and the worker resumes it. The same swap is `aoe session restart <session> --tool <tool>`.
+
+- A session parked on a rate limit continues with the interrupted prompt as its next turn, once, and the park's auto-resume budget is disarmed like a manual **Try again**. The generic restart wake message is not sent. A session that is not parked gets the usual wake message.
+- `switch-account` refuses and changes nothing where the swap would start a fresh conversation: the tool runs a different agent, the agent has no known transcript layout (only Claude does), the session has no recorded conversation, or a sandboxed session still has its store move pending. `restart --tool` keeps the parking swap in those cases.
+- The first turn on the new account re-reads the whole context uncached, because the prompt cache belongs to the account.
 
 ## `/clear` collapsed earlier turns
 

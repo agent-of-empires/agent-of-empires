@@ -19,6 +19,8 @@ const BUTTON =
  *  changing either, so the pair holds in every state. */
 const PRIMARY = `${BUTTON} bg-status-error text-text-on-status-error hover:ring-2 hover:ring-status-error/50`;
 
+export const SECONDARY_BUTTON = `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`;
+
 /** The recovery buttons both startup error surfaces show, primary first, and the
  *  install's failure and npm output under them. */
 export function RecoveryActionRow({
@@ -42,11 +44,7 @@ export function RecoveryActionRow({
             disabled={action.disabled}
             title={action.title}
             aria-describedby={action.describedBy}
-            className={
-              action === primary
-                ? `${PRIMARY} w-full sm:w-auto`
-                : `${BUTTON} border border-surface-700 bg-surface-800 text-text-primary hover:bg-surface-700`
-            }
+            className={action === primary ? `${PRIMARY} w-full sm:w-auto` : SECONDARY_BUTTON}
           >
             {action.label}
           </button>

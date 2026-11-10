@@ -127,6 +127,27 @@ fn project_grouping_hides_by_its_own_groups() {
     assert!(header_text(&env.view, "loose").contains("loose (0/1)"));
 }
 
+/// Status grouping derives its groups from each session's status, so hiding stopped keeps an
+/// empty Stopped header that still counts its rows, and a session in no manual group is not exempt.
+#[test]
+#[serial]
+fn status_grouping_hides_stopped_sessions_and_keeps_the_header() {
+    let mut env = env_with_stopped(false);
+    env.view.apply_group_by(GroupByMode::Status);
+    assert!(header_text(&env.view, "Stopped").contains("Stopped (5)"));
+    assert!(header_text(&env.view, "Idle").contains("Idle (1)"));
+
+    press_y(&mut env);
+    assert_eq!(session_titles(&env.view), vec!["util-live".to_string()]);
+    assert!(
+        header_text(&env.view, "Stopped").contains("Stopped (0/5)"),
+        "a status whose sessions are all hidden keeps its header"
+    );
+
+    press_y(&mut env);
+    assert!(header_text(&env.view, "Stopped").contains("Stopped (5)"));
+}
+
 /// Attention sort lists sessions without groups, and archived sessions keep their own section,
 /// so neither loses a row.
 #[test]
@@ -670,18 +691,7 @@ async fn restoring_a_session_the_filter_hides_selects_its_own_header() {
         if trash {
             let state = native_state(&["test"]).await;
             apply_published(&mut env.view, &state).await;
-            super::pickers_groups_sort::settle_row_command(
-                &state,
-                &mut env.view,
-                &id,
-                SessionRequest::Trash(Default::default()),
-                |view| {
-                    view.trash_session_by_id(&id);
-                    Ok(())
-                },
-            )
-            .await
-            .unwrap();
+            super::pickers_groups_sort::settle_trash(&state, &mut env.view, &id).await;
             press_y(&mut env);
             select_session(&mut env, "util-stopped-a");
             super::pickers_groups_sort::settle_row_command(

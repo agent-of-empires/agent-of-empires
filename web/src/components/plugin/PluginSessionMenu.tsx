@@ -64,7 +64,7 @@ function ScopedMenu({ request, workspaces, readOnly, handlers, observedById, run
       key={request.key}
       request={request}
       workspace={workspace}
-      optimistic={triage.optimisticFor(workspace.id)}
+      optimistic={triage.optimisticFor(workspace)}
       readOnly={readOnly}
       observedById={observedById}
       runtimeEpoch={runtimeEpoch}
