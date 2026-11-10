@@ -7,7 +7,7 @@ export function DashboardUpdateBanner({ version }: { version: string }) {
       className="bg-brand-600/10 border-b border-brand-600/30 px-4 py-2 flex items-center justify-center gap-3 text-xs font-mono text-brand-300 animate-fade-in"
     >
       <span className="w-1.5 h-1.5 rounded-full bg-brand-400 shrink-0" />
-      <span>{version ? `Dashboard updated to v${version}.` : "Dashboard updated."}</span>
+      <span>Dashboard updated to v{version}.</span>
       <button
         type="button"
         onClick={() => window.location.reload()}
