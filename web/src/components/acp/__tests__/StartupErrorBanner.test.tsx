@@ -482,7 +482,9 @@ describe("StartupErrorBanner Details", () => {
     expect(state.sessionAssigned).toBe(false);
     expect(nativeInputAvailable(state)).toBe(false);
     fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
-    await waitFor(() => expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input"));
+    await waitFor(() =>
+      expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input"),
+    );
     state = { ...state, connectionUnavailable: null };
     rerender(<SessionBanners {...props} state={state} />);
     expect(getByTestId("startup-error-banner-details-body")).toBe(body);
