@@ -546,824 +546,833 @@ pub(super) async fn security_headers(
 }
 
 #[cfg(test)]
-mod tests { use super::*; use crate::server::test_helpers::vecs; use crate::server::test_support; #[tokio::test] #[serial_test::serial] async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() { use tower::ServiceExt;
-for (structured, native_peer, group_request, expected) in [
-    (true, false, false, axum::http::StatusCode::OK),
-    (false, true, false, axum::http::StatusCode::FORBIDDEN),
-    (true, true, false, axum::http::StatusCode::FORBIDDEN),
-    (false, true, true, axum::http::StatusCode::FORBIDDEN),
-] {
-    let _home = crate::session::test_support::isolate_app_dir();
-    let mut a = crate::session::Instance::new("first", "/tmp/first");
-    let mut b = crate::session::Instance::new("second", "/tmp/second");
-    for row in [&mut a, &mut b] {
-        row.source_profile = "default".into();
-        row.group_path = "work".into();
-        row.status = crate::session::Status::Stopped;
+mod tests {
+    use super::*;
+    use crate::server::test_helpers::vecs;
+    use crate::server::test_support;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cityhall_reorder_preserves_native_rows_and_allows_structured_ordering() {
+        use tower::ServiceExt;
+        for (structured, native_peer, group_request, expected) in [
+            (true, false, false, axum::http::StatusCode::OK),
+            (false, true, false, axum::http::StatusCode::FORBIDDEN),
+            (true, true, false, axum::http::StatusCode::FORBIDDEN),
+            (false, true, true, axum::http::StatusCode::FORBIDDEN),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut a = crate::session::Instance::new("first", "/tmp/first");
+            let mut b = crate::session::Instance::new("second", "/tmp/second");
+            for row in [&mut a, &mut b] {
+                row.source_profile = "default".into();
+                row.group_path = "work".into();
+                row.status = crate::session::Status::Stopped;
+            }
+            a.sort_index = Some(0);
+            b.sort_index = Some(1);
+            if !native_peer {
+                a.view = crate::session::View::Structured;
+            }
+            if structured {
+                b.view = crate::session::View::Structured;
+            }
+            let storage = crate::session::Storage::new_unwatched("default").unwrap();
+            storage
+                .update(|rows, _| {
+                    *rows = vec![a.clone(), b.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let before = std::fs::read(storage.sessions_path()).unwrap();
+            let state = test_support::build_test_app_state_with_policy_configured(
+                vec![a.clone(), b.clone()],
+                vec!["localhost".into()],
+                Vec::new(),
+                None,
+                |state| state.cityhall_mode = true,
+            );
+            test_support::refresh_canonical_metadata_for_test(&state).await;
+            let body = if group_request {
+                serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
+            } else {
+                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","direction":"up"})
+            };
+            let response = test_support::build_router_for_test(state)
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/reorder")
+                        .header("host", "localhost")
+                        .header("content-type", "application/json")
+                        .extension(axum::extract::ConnectInfo(
+                            "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
+                        ))
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                expected,
+                "structured={structured}, native_peer={native_peer}, group={group_request}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            if expected == axum::http::StatusCode::OK {
+                let mut rows = storage.load().unwrap();
+                rows.sort_by_key(|row| row.sort_index);
+                assert_eq!(
+                    rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+                    [b.id.as_str(), a.id.as_str()]
+                );
+            } else {
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+            }
+        }
     }
-    a.sort_index = Some(0);
-    b.sort_index = Some(1);
-    if !native_peer {
-        a.view = crate::session::View::Structured;
+    #[test]
+    fn strip_host_port_variants() {
+        assert_eq!(strip_host_port("localhost:8080"), "localhost");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(strip_host_port("[::1]:8080"), "::1");
+        assert_eq!(strip_host_port("[::1]"), "::1");
+        assert_eq!(strip_host_port("::1"), "::1");
+        assert_eq!(strip_host_port("example.com"), "example.com");
     }
-    if structured {
-        b.view = crate::session::View::Structured;
-    }
-    let storage = crate::session::Storage::new_unwatched("default").unwrap();
-    storage
-        .update(|rows, _| {
-            *rows = vec![a.clone(), b.clone()];
-            Ok(())
-        })
-        .unwrap();
-    let before = std::fs::read(storage.sessions_path()).unwrap();
-    let state = test_support::build_test_app_state_with_policy_configured(
-        vec![a.clone(), b.clone()],
-        vec!["localhost".into()],
-        Vec::new(),
-        None,
-        |state| state.cityhall_mode = true,
-    );
-    test_support::refresh_canonical_metadata_for_test(&state).await;
-    let body = if group_request {
-        serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
-    } else {
-        serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","direction":"up"})
-    };
-    let response = test_support::build_router_for_test(state)
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/api/reorder")
-                .header("host", "localhost")
-                .header("content-type", "application/json")
-                .extension(axum::extract::ConnectInfo(
-                    "127.0.0.1:5555".parse::<std::net::SocketAddr>().unwrap(),
-                ))
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    assert_eq!(
-        status,
-        expected,
-        "structured={structured}, native_peer={native_peer}, group={group_request}: {}",
-        String::from_utf8_lossy(&bytes)
-    );
-    if expected == axum::http::StatusCode::OK {
-        let mut rows = storage.load().unwrap();
-        rows.sort_by_key(|row| row.sort_index);
+
+    #[test]
+    fn host_from_url_extracts_bare_host() {
         assert_eq!(
-            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            [b.id.as_str(), a.id.as_str()]
+            host_from_url("https://x.trycloudflare.com").as_deref(),
+            Some("x.trycloudflare.com")
         );
-    } else {
-        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-    }
-} } #[test]
-fn strip_host_port_variants() {
-    assert_eq!(strip_host_port("localhost:8080"), "localhost");
-    assert_eq!(strip_host_port("localhost"), "localhost");
-    assert_eq!(strip_host_port("127.0.0.1:8080"), "127.0.0.1");
-    assert_eq!(strip_host_port("[::1]:8080"), "::1");
-    assert_eq!(strip_host_port("[::1]"), "::1");
-    assert_eq!(strip_host_port("::1"), "::1");
-    assert_eq!(strip_host_port("example.com"), "example.com");
-}
-
-#[test]
-fn host_from_url_extracts_bare_host() {
-    assert_eq!(
-        host_from_url("https://x.trycloudflare.com").as_deref(),
-        Some("x.trycloudflare.com")
-    );
-    assert_eq!(
-        host_from_url("https://foo.ts.net/path?x=1").as_deref(),
-        Some("foo.ts.net")
-    );
-    assert_eq!(
-        host_from_url("https://Foo.TS.net").as_deref(),
-        Some("foo.ts.net")
-    );
-    assert_eq!(host_from_url(""), None);
-}
-
-#[test]
-fn host_in_allowlist_passes() {
-    assert_eq!(
-        evaluate_access(Some("localhost"), None, &vecs(&["localhost"]), &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn host_not_in_allowlist_403() {
-    assert_eq!(
-        evaluate_access(Some("evil.com"), None, &vecs(&["localhost"]), &[]),
-        AccessDecision::DenyHost
-    );
-}
-
-#[test]
-fn host_port_stripped_before_match() {
-    assert_eq!(
-        evaluate_access(Some("localhost:8080"), None, &vecs(&["localhost"]), &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn host_ipv6_bracketed_port_stripped() {
-    assert_eq!(
-        evaluate_access(Some("[::1]:8080"), None, &vecs(&["::1"]), &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn host_match_is_case_insensitive() {
-    assert_eq!(
-        evaluate_access(Some("LOCALHOST"), None, &vecs(&["localhost"]), &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn missing_host_denied() {
-    assert_eq!(
-        evaluate_access(None, None, &vecs(&["localhost"]), &[]),
-        AccessDecision::DenyMissingHost
-    );
-}
-
-#[test]
-fn origin_absent_is_exempt() {
-    assert_eq!(
-        evaluate_access(
-            Some("localhost"),
-            None,
-            &vecs(&["localhost"]),
-            &vecs(&["http://localhost:8080"])
-        ),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn origin_in_allowlist_passes() {
-    assert_eq!(
-        evaluate_access(
-            Some("localhost"),
-            Some("http://localhost:8080"),
-            &vecs(&["localhost"]),
-            &vecs(&["http://localhost:8080"])
-        ),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn origin_not_in_allowlist_403() {
-    assert_eq!(
-        evaluate_access(
-            Some("localhost"),
-            Some("https://evil.com"),
-            &vecs(&["localhost"]),
-            &vecs(&["http://localhost:8080"])
-        ),
-        AccessDecision::DenyOrigin
-    );
-}
-
-#[test]
-fn origin_match_is_case_insensitive() {
-    assert_eq!(
-        evaluate_access(
-            Some("localhost"),
-            Some("https://X.TryCloudflare.com"),
-            &vecs(&["localhost"]),
-            &vecs(&["https://x.trycloudflare.com"])
-        ),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn null_origin_is_denied() {
-    assert_eq!(
-        evaluate_access(
-            Some("localhost"),
-            Some("null"),
-            &vecs(&["localhost"]),
-            &vecs(&["http://localhost:8080"])
-        ),
-        AccessDecision::DenyOrigin
-    );
-}
-
-#[test]
-fn userinfo_host_is_denied() {
-    assert_eq!(
-        evaluate_access(Some("user@localhost"), None, &vecs(&["localhost"]), &[]),
-        AccessDecision::DenyHost
-    );
-}
-
-#[test]
-fn wildcard_bind_defaults_to_localhost_trio() {
-    let (h, _o) = resolve_access_policy("0.0.0.0", 8080, &[], &[], None);
-    // The static allowlist is still just the trio; a wildcard bind adds no
-    // routable *name*. A HOSTNAME is still denied without --allowed-host.
-    assert_eq!(h, vecs(&["localhost", "127.0.0.1", "::1"]));
-    assert_eq!(
-        evaluate_access(Some("my-box.local"), None, &h, &[]),
-        AccessDecision::DenyHost
-    );
-    // But a LAN IP literal is trusted unconditionally (Pattern A: an IP
-    // cannot be DNS-rebound), so by-IP access works with no flag.
-    assert_eq!(
-        evaluate_access(Some("192.168.1.5"), None, &h, &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn is_trusted_ip_literal_accepts_routable_rejects_special() {
-    for good in [
-        "127.0.0.1",
-        "192.168.1.5",
-        "10.0.0.9",
-        "100.68.123.45", // tailnet CGNAT
-        "::1",
-        "2001:db8::1",
-        "fd00::1",            // ULA
-        "::ffff:192.168.1.5", // IPv4-mapped routable: canonicalized, then trusted
-    ] {
-        assert!(is_trusted_ip_literal(good), "{good} should be trusted");
-    }
-    for bad in [
-        "0.0.0.0",
-        "::",
-        "169.254.169.254", // cloud metadata (v4 link-local)
-        "fe80::1",         // v6 link-local
-        "224.0.0.1",       // multicast
-        "ff02::1",
-        "::ffff:169.254.169.254", // IPv4-mapped metadata: canonicalized, then excluded
-        "::ffff:0.0.0.0",         // IPv4-mapped unspecified
-        "::ffff:224.0.0.1",       // IPv4-mapped multicast
-        "example.com",
-        "my-box",
-        "",
-    ] {
-        assert!(!is_trusted_ip_literal(bad), "{bad} must not be trusted");
-    }
-}
-
-#[test]
-fn is_untrusted_ip_literal_flags_only_excluded_literals() {
-    for excluded in [
-        "0.0.0.0",
-        "::",
-        "169.254.169.254",
-        "fe80::1",
-        "224.0.0.1",
-        "ff02::1",
-        "::ffff:169.254.169.254",
-    ] {
-        assert!(
-            is_untrusted_ip_literal(excluded),
-            "{excluded} is an IP literal the gate excludes"
-        );
-    }
-    // Routable/loopback literals pass, and hostnames are not IP literals at
-    // all, so both must clear the validators.
-    for allowed in [
-        "127.0.0.1",
-        "::1",
-        "192.168.1.5",
-        "100.68.123.45",
-        "2001:db8::1",
-        "aoe.example.com",
-        "my-box",
-        "",
-    ] {
-        assert!(
-            !is_untrusted_ip_literal(allowed),
-            "{allowed} must not be flagged as an untrusted IP literal"
-        );
-    }
-}
-
-#[test]
-fn ip_literal_host_allowed_without_flag() {
-    let allow = vecs(&["localhost"]);
-    assert_eq!(
-        evaluate_access(Some("192.168.1.5:8080"), None, &allow, &[]),
-        AccessDecision::Allow
-    );
-    assert_eq!(
-        evaluate_access(Some("[2001:db8::5]:8080"), None, &allow, &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn ip_literal_origin_requires_same_host_authority() {
-    let allow = vecs(&["localhost"]);
-    for (host, origin) in [
-        ("192.168.1.5:8080", "http://192.168.1.5:8080"),
-        ("[2001:db8::5]:8080", "http://[2001:db8::5]:8080"),
-    ] {
         assert_eq!(
-            evaluate_access(Some(host), Some(origin), &allow, &[]),
+            host_from_url("https://foo.ts.net/path?x=1").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(
+            host_from_url("https://Foo.TS.net").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(host_from_url(""), None);
+    }
+
+    #[test]
+    fn host_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(Some("localhost"), None, &vecs(&["localhost"]), &[]),
             AccessDecision::Allow
         );
     }
-    for (host, origin) in [
-        ("192.168.1.5:8080", "http://192.168.1.6:8080"),
-        ("192.168.1.5:8080", "http://192.168.1.5:9090"),
-        ("192.168.1.5:8080", "https://192.168.1.5:8080"),
-        ("192.168.1.5", "http://192.168.1.5:8080"),
-        ("[2001:db8::5]:8080", "http://[2001:db8::6]:8080"),
-    ] {
+
+    #[test]
+    fn host_not_in_allowlist_403() {
         assert_eq!(
-            evaluate_access(Some(host), Some(origin), &allow, &[]),
-            AccessDecision::DenyOrigin,
-            "host {host}, origin {origin}"
+            evaluate_access(Some("evil.com"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
         );
     }
-}
 
-#[test]
-fn same_authority_normalizes_default_ports_and_ipv6() {
-    let allow = vecs(&["example.com", "::1"]);
-    for (host, origin) in [
-        ("example.com", "https://example.com:443"),
-        ("example.com:80", "http://example.com"),
-        ("[::1]", "http://[::1]:80"),
-        ("[::1]:8080", "http://[::1]:8080"),
-    ] {
+    #[test]
+    fn host_port_stripped_before_match() {
         assert_eq!(
-            evaluate_access(Some(host), Some(origin), &allow, &[]),
-            AccessDecision::Allow,
-            "host {host}, origin {origin}"
+            evaluate_access(Some("localhost:8080"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
         );
     }
-}
 
-#[test]
-fn excluded_ip_literals_still_denied() {
-    let allow = vecs(&["localhost"]);
-    for bad in ["0.0.0.0", "169.254.169.254", "fe80::1"] {
+    #[test]
+    fn host_ipv6_bracketed_port_stripped() {
         assert_eq!(
-            evaluate_access(Some(bad), None, &allow, &[]),
-            AccessDecision::DenyHost,
-            "{bad}"
+            evaluate_access(Some("[::1]:8080"), None, &vecs(&["::1"]), &[]),
+            AccessDecision::Allow
         );
     }
-    // An unlisted hostname origin must not slip through the IP exemption.
-    assert_eq!(
-        evaluate_access(
-            Some("192.168.1.5"),
-            Some("https://evil.com"),
-            &allow,
-            &vecs(&["http://localhost:8080"])
-        ),
-        AccessDecision::DenyOrigin
-    );
-}
 
-#[test]
-fn concrete_bind_host_is_allowed() {
-    let (h, o) = resolve_access_policy("192.168.1.5", 8080, &[], &[], None);
-    assert!(h.contains(&"192.168.1.5".to_string()));
-    assert!(o.contains(&"http://192.168.1.5:8080".to_string()));
-}
-
-#[test]
-fn explicit_host_flag_extends_allowlist() {
-    let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
-    assert!(h.contains(&"aoe.example.com".to_string()));
-    assert!(o.contains(&"https://aoe.example.com".to_string()));
-    assert!(o.contains(&"https://aoe.example.com:8080".to_string()));
-}
-
-#[test]
-fn remote_tunnel_host_auto_injected() {
-    let (h, _o) =
-        resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
-    assert!(h.contains(&"x.trycloudflare.com".to_string()));
-    assert_eq!(
-        evaluate_access(Some("x.trycloudflare.com"), None, &h, &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn tunnel_origin_auto_injected() {
-    let (h, o) =
-        resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
-    assert!(o.contains(&"https://x.trycloudflare.com".to_string()));
-    assert_eq!(
-        evaluate_access(
-            Some("x.trycloudflare.com"),
-            Some("https://x.trycloudflare.com"),
-            &h,
-            &o
-        ),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn tailscale_host_auto_injected() {
-    let (h, o) =
-        resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("host.tailnet.ts.net"));
-    assert!(h.contains(&"host.tailnet.ts.net".to_string()));
-    assert!(o.contains(&"https://host.tailnet.ts.net".to_string()));
-}
-
-#[test]
-fn explicit_origin_flag_normalized() {
-    let (_h, o) = resolve_access_policy(
-        "127.0.0.1",
-        8080,
-        &[],
-        &vecs(&[
-            "https://aoe.example.com:8443",
-            "https://trail.example.com/",
-            "https://std.example.com:443",
-        ]),
-        None,
-    );
-    assert!(o.contains(&"https://aoe.example.com:8443".to_string()));
-    assert!(o.contains(&"https://trail.example.com".to_string()));
-    assert!(!o.contains(&"https://trail.example.com/".to_string()));
-    assert!(o.contains(&"https://std.example.com".to_string()));
-}
-
-#[test]
-fn norm_origin_canonicalizes_to_browser_form() {
-    assert_eq!(norm_origin("https://x/"), "https://x");
-    assert_eq!(norm_origin("https://x:443"), "https://x");
-    assert_eq!(norm_origin("http://x:80"), "http://x");
-    assert_eq!(norm_origin("https://x:8443"), "https://x:8443");
-    assert_eq!(norm_origin("http://x:443"), "http://x:443");
-    assert_eq!(norm_origin("HTTPS://X"), "https://x");
-    assert_eq!(norm_origin("https://[::1]:443"), "https://[::1]");
-}
-
-#[test]
-fn norm_origin_strips_trailing_fqdn_dot() {
-    assert_eq!(norm_origin("https://example.com."), "https://example.com");
-    assert_eq!(
-        norm_origin("https://example.com.:443"),
-        "https://example.com"
-    );
-    assert_eq!(norm_origin("http://example.com.:80"), "http://example.com");
-    assert_eq!(
-        norm_origin("https://example.com.:8443"),
-        "https://example.com:8443"
-    );
-    // Symmetric with the Host gate.
-    assert_eq!(
-        norm_origin("https://example.com."),
-        format!("https://{}", norm_host("example.com."))
-    );
-}
-
-#[test]
-fn origin_default_port_matches_portless_allowlist() {
-    let (_h, o) =
-        resolve_access_policy("127.0.0.1", 8080, &vecs(&["proxy.example.com"]), &[], None);
-    assert_eq!(
-        evaluate_access(
-            Some("proxy.example.com"),
-            Some("https://proxy.example.com:443"),
-            &vecs(&["proxy.example.com"]),
-            &o
-        ),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn norm_host_strips_trailing_dot() {
-    assert_eq!(norm_host("example.com."), "example.com");
-    assert_eq!(norm_host("example.com.:8080"), "example.com");
-    assert_eq!(norm_host("[::1]:8080"), "::1");
-}
-
-#[test]
-fn trailing_dot_host_matches_allowlist() {
-    let (h, _o) =
-        resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com."]), &[], None);
-    assert!(h.contains(&"aoe.example.com".to_string()));
-    assert_eq!(
-        evaluate_access(Some("aoe.example.com."), None, &h, &[]),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn trailing_dot_origin_matches_allowlist() {
-    let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
-    assert_eq!(
-        evaluate_access(
-            Some("aoe.example.com."),
-            Some("https://aoe.example.com."),
-            &h,
-            &o
-        ),
-        AccessDecision::Allow
-    );
-}
-
-#[test]
-fn wildcard_bind_ipv6_forms_default_to_trio() {
-    for wild in ["::", "[::]"] {
-        let (h, _o) = resolve_access_policy(wild, 8080, &[], &[], None);
+    #[test]
+    fn host_match_is_case_insensitive() {
         assert_eq!(
-            h,
-            vecs(&["localhost", "127.0.0.1", "::1"]),
-            "wildcard {wild}"
+            evaluate_access(Some("LOCALHOST"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
         );
     }
-}
 
-#[tokio::test]
-async fn access_policy_rejects_unlisted_host_at_router() {
-    use tower::ServiceExt;
-    let state = test_support::build_test_app_state_with_policy(
-        Vec::new(),
-        vecs(&["localhost"]),
-        vecs(&["http://localhost:8080"]),
-        None,
-    );
-    let app = test_support::build_router_for_test(state);
-    let req = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "evil.com")
-        .extension(axum::extract::ConnectInfo(
+    #[test]
+    fn missing_host_denied() {
+        assert_eq!(
+            evaluate_access(None, None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyMissingHost
+        );
+    }
+
+    #[test]
+    fn origin_absent_is_exempt() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                None,
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("http://localhost:8080"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://evil.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn origin_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://X.TryCloudflare.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["https://x.trycloudflare.com"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn null_origin_is_denied() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("null"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn userinfo_host_is_denied() {
+        assert_eq!(
+            evaluate_access(Some("user@localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_defaults_to_localhost_trio() {
+        let (h, _o) = resolve_access_policy("0.0.0.0", 8080, &[], &[], None);
+        // The static allowlist is still just the trio; a wildcard bind adds no
+        // routable *name*. A HOSTNAME is still denied without --allowed-host.
+        assert_eq!(h, vecs(&["localhost", "127.0.0.1", "::1"]));
+        assert_eq!(
+            evaluate_access(Some("my-box.local"), None, &h, &[]),
+            AccessDecision::DenyHost
+        );
+        // But a LAN IP literal is trusted unconditionally (Pattern A: an IP
+        // cannot be DNS-rebound), so by-IP access works with no flag.
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn is_trusted_ip_literal_accepts_routable_rejects_special() {
+        for good in [
+            "127.0.0.1",
+            "192.168.1.5",
+            "10.0.0.9",
+            "100.68.123.45", // tailnet CGNAT
+            "::1",
+            "2001:db8::1",
+            "fd00::1",            // ULA
+            "::ffff:192.168.1.5", // IPv4-mapped routable: canonicalized, then trusted
+        ] {
+            assert!(is_trusted_ip_literal(good), "{good} should be trusted");
+        }
+        for bad in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254", // cloud metadata (v4 link-local)
+            "fe80::1",         // v6 link-local
+            "224.0.0.1",       // multicast
+            "ff02::1",
+            "::ffff:169.254.169.254", // IPv4-mapped metadata: canonicalized, then excluded
+            "::ffff:0.0.0.0",         // IPv4-mapped unspecified
+            "::ffff:224.0.0.1",       // IPv4-mapped multicast
+            "example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(!is_trusted_ip_literal(bad), "{bad} must not be trusted");
+        }
+    }
+
+    #[test]
+    fn is_untrusted_ip_literal_flags_only_excluded_literals() {
+        for excluded in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(
+                is_untrusted_ip_literal(excluded),
+                "{excluded} is an IP literal the gate excludes"
+            );
+        }
+        // Routable/loopback literals pass, and hostnames are not IP literals at
+        // all, so both must clear the validators.
+        for allowed in [
+            "127.0.0.1",
+            "::1",
+            "192.168.1.5",
+            "100.68.123.45",
+            "2001:db8::1",
+            "aoe.example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(
+                !is_untrusted_ip_literal(allowed),
+                "{allowed} must not be flagged as an untrusted IP literal"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_literal_host_allowed_without_flag() {
+        let allow = vecs(&["localhost"]);
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(Some("[2001:db8::5]:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn ip_literal_origin_requires_same_host_authority() {
+        let allow = vecs(&["localhost"]);
+        for (host, origin) in [
+            ("192.168.1.5:8080", "http://192.168.1.5:8080"),
+            ("[2001:db8::5]:8080", "http://[2001:db8::5]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::Allow
+            );
+        }
+        for (host, origin) in [
+            ("192.168.1.5:8080", "http://192.168.1.6:8080"),
+            ("192.168.1.5:8080", "http://192.168.1.5:9090"),
+            ("192.168.1.5:8080", "https://192.168.1.5:8080"),
+            ("192.168.1.5", "http://192.168.1.5:8080"),
+            ("[2001:db8::5]:8080", "http://[2001:db8::6]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::DenyOrigin,
+                "host {host}, origin {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_authority_normalizes_default_ports_and_ipv6() {
+        let allow = vecs(&["example.com", "::1"]);
+        for (host, origin) in [
+            ("example.com", "https://example.com:443"),
+            ("example.com:80", "http://example.com"),
+            ("[::1]", "http://[::1]:80"),
+            ("[::1]:8080", "http://[::1]:8080"),
+        ] {
+            assert_eq!(
+                evaluate_access(Some(host), Some(origin), &allow, &[]),
+                AccessDecision::Allow,
+                "host {host}, origin {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn excluded_ip_literals_still_denied() {
+        let allow = vecs(&["localhost"]);
+        for bad in ["0.0.0.0", "169.254.169.254", "fe80::1"] {
+            assert_eq!(
+                evaluate_access(Some(bad), None, &allow, &[]),
+                AccessDecision::DenyHost,
+                "{bad}"
+            );
+        }
+        // An unlisted hostname origin must not slip through the IP exemption.
+        assert_eq!(
+            evaluate_access(
+                Some("192.168.1.5"),
+                Some("https://evil.com"),
+                &allow,
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn concrete_bind_host_is_allowed() {
+        let (h, o) = resolve_access_policy("192.168.1.5", 8080, &[], &[], None);
+        assert!(h.contains(&"192.168.1.5".to_string()));
+        assert!(o.contains(&"http://192.168.1.5:8080".to_string()));
+    }
+
+    #[test]
+    fn explicit_host_flag_extends_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert!(o.contains(&"https://aoe.example.com".to_string()));
+        assert!(o.contains(&"https://aoe.example.com:8080".to_string()));
+    }
+
+    #[test]
+    fn remote_tunnel_host_auto_injected() {
+        let (h, _o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(h.contains(&"x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("x.trycloudflare.com"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tunnel_origin_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(o.contains(&"https://x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(
+                Some("x.trycloudflare.com"),
+                Some("https://x.trycloudflare.com"),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tailscale_host_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("host.tailnet.ts.net"));
+        assert!(h.contains(&"host.tailnet.ts.net".to_string()));
+        assert!(o.contains(&"https://host.tailnet.ts.net".to_string()));
+    }
+
+    #[test]
+    fn explicit_origin_flag_normalized() {
+        let (_h, o) = resolve_access_policy(
+            "127.0.0.1",
+            8080,
+            &[],
+            &vecs(&[
+                "https://aoe.example.com:8443",
+                "https://trail.example.com/",
+                "https://std.example.com:443",
+            ]),
+            None,
+        );
+        assert!(o.contains(&"https://aoe.example.com:8443".to_string()));
+        assert!(o.contains(&"https://trail.example.com".to_string()));
+        assert!(!o.contains(&"https://trail.example.com/".to_string()));
+        assert!(o.contains(&"https://std.example.com".to_string()));
+    }
+
+    #[test]
+    fn norm_origin_canonicalizes_to_browser_form() {
+        assert_eq!(norm_origin("https://x/"), "https://x");
+        assert_eq!(norm_origin("https://x:443"), "https://x");
+        assert_eq!(norm_origin("http://x:80"), "http://x");
+        assert_eq!(norm_origin("https://x:8443"), "https://x:8443");
+        assert_eq!(norm_origin("http://x:443"), "http://x:443");
+        assert_eq!(norm_origin("HTTPS://X"), "https://x");
+        assert_eq!(norm_origin("https://[::1]:443"), "https://[::1]");
+    }
+
+    #[test]
+    fn norm_origin_strips_trailing_fqdn_dot() {
+        assert_eq!(norm_origin("https://example.com."), "https://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:443"),
+            "https://example.com"
+        );
+        assert_eq!(norm_origin("http://example.com.:80"), "http://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:8443"),
+            "https://example.com:8443"
+        );
+        // Symmetric with the Host gate.
+        assert_eq!(
+            norm_origin("https://example.com."),
+            format!("https://{}", norm_host("example.com."))
+        );
+    }
+
+    #[test]
+    fn origin_default_port_matches_portless_allowlist() {
+        let (_h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &vecs(&["proxy.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("proxy.example.com"),
+                Some("https://proxy.example.com:443"),
+                &vecs(&["proxy.example.com"]),
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn norm_host_strips_trailing_dot() {
+        assert_eq!(norm_host("example.com."), "example.com");
+        assert_eq!(norm_host("example.com.:8080"), "example.com");
+        assert_eq!(norm_host("[::1]:8080"), "::1");
+    }
+
+    #[test]
+    fn trailing_dot_host_matches_allowlist() {
+        let (h, _o) =
+            resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com."]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("aoe.example.com."), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn trailing_dot_origin_matches_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("aoe.example.com."),
+                Some("https://aoe.example.com."),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_ipv6_forms_default_to_trio() {
+        for wild in ["::", "[::]"] {
+            let (h, _o) = resolve_access_policy(wild, 8080, &[], &[], None);
+            assert_eq!(
+                h,
+                vecs(&["localhost", "127.0.0.1", "::1"]),
+                "wildcard {wild}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_unlisted_host_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_cross_authority_ip_origin_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost", "192.168.1.5"]),
+            vecs(&["http://192.168.1.5:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "192.168.1.5:8080")
+            .header("origin", "http://192.168.1.6:8080")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
             "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
-        ))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-}
+        ));
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    }
 
-#[tokio::test]
-async fn access_policy_rejects_cross_authority_ip_origin_at_router() {
-    use tower::ServiceExt;
-    let state = test_support::build_test_app_state_with_policy(
-        Vec::new(),
-        vecs(&["localhost", "192.168.1.5"]),
-        vecs(&["http://192.168.1.5:8080"]),
-        None,
-    );
-    let app = test_support::build_router_for_test(state);
-    let mut req = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "192.168.1.5:8080")
-        .header("origin", "http://192.168.1.6:8080")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    req.extensions_mut().insert(axum::extract::ConnectInfo(
-        "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
-    ));
-    let response = app.oneshot(req).await.unwrap();
-    assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
-}
+    #[tokio::test]
+    async fn access_policy_runs_before_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
+                Some("secret-token".to_string()),
+            )
+        };
 
-#[tokio::test]
-async fn access_policy_runs_before_auth() {
-    use tower::ServiceExt;
-    let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
-    let make_state = || {
-        test_support::build_test_app_state_with_policy(
+        let app = test_support::build_router_for_test(make_state());
+        let mut bad = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        bad.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(bad).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an unlisted Host must 403 before auth can 401"
+        );
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut good = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("authorization", "Bearer secret-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        good.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(good).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "a listed Host over plain HTTP reaches auth and the handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_off_host_reaches_auth_without_tls_gate() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        for (peer, proto) in [
+            ("127.0.0.1:5555", None),
+            ("127.0.0.1:5555", Some("http")),
+            ("203.0.113.7:5555", None),
+            ("203.0.113.7:5555", Some("http")),
+            ("203.0.113.7:5555", Some("https")),
+        ] {
+            let state = test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vecs(&["localhost"]),
+                Vec::new(),
+                None,
+                |state| state.behind_tunnel = true,
+            );
+            let mut request = axum::http::Request::builder()
+                .uri("/api/login/status")
+                .header("host", "localhost");
+            if let Some(proto) = proto {
+                request = request.header("x-forwarded-proto", proto);
+            }
+            let mut request = request.body(axum::body::Body::empty()).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().unwrap(),
+            ));
+            let response = test_support::build_router_for_test(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{peer} with {proto:?} must not be gated by transport"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_body_is_generic_for_host_and_origin() {
+        use tower::ServiceExt;
+        async fn body_of(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
+                None,
+            )
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let host_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let host_body = body_of(app.oneshot(host_deny).await.unwrap()).await;
+
+        let app = test_support::build_router_for_test(make_state());
+        let origin_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "https://evil.com")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let origin_body = body_of(app.oneshot(origin_deny).await.unwrap()).await;
+
+        assert!(!host_body.contains("evil.com"));
+        assert_eq!(
+            host_body, origin_body,
+            "both deny reasons must return an identical, non-leaking body"
+        );
+    }
+
+    #[tokio::test]
+    async fn listed_origin_passes_gate_to_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy_configured(
             Vec::new(),
             vecs(&["localhost"]),
             vecs(&["http://localhost:8080"]),
             Some("secret-token".to_string()),
-        )
-    };
-
-    let app = test_support::build_router_for_test(make_state());
-    let mut bad = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "evil.com")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    bad.extensions_mut()
-        .insert(axum::extract::ConnectInfo(remote));
-    let resp = app.oneshot(bad).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::FORBIDDEN,
-        "an unlisted Host must 403 before auth can 401"
-    );
-
-    let app = test_support::build_router_for_test(make_state());
-    let mut good = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "localhost")
-        .header("authorization", "Bearer secret-token")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    good.extensions_mut()
-        .insert(axum::extract::ConnectInfo(remote));
-    let resp = app.oneshot(good).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::OK,
-        "a listed Host over plain HTTP reaches auth and the handler"
-    );
-}
-
-#[tokio::test]
-async fn plain_http_off_host_reaches_auth_without_tls_gate() {
-    use axum::http::StatusCode;
-    use tower::ServiceExt;
-    for (peer, proto) in [
-        ("127.0.0.1:5555", None),
-        ("127.0.0.1:5555", Some("http")),
-        ("203.0.113.7:5555", None),
-        ("203.0.113.7:5555", Some("http")),
-        ("203.0.113.7:5555", Some("https")),
-    ] {
-        let state = test_support::build_test_app_state_with_policy_configured(
-            Vec::new(),
-            vecs(&["localhost"]),
-            Vec::new(),
-            None,
             |state| state.behind_tunnel = true,
         );
-        let mut request = axum::http::Request::builder()
-            .uri("/api/login/status")
-            .header("host", "localhost");
-        if let Some(proto) = proto {
-            request = request.header("x-forwarded-proto", proto);
-        }
-        let mut request = request.body(axum::body::Body::empty()).unwrap();
-        request.extensions_mut().insert(axum::extract::ConnectInfo(
-            peer.parse::<std::net::SocketAddr>().unwrap(),
-        ));
-        let response = test_support::build_router_for_test(state)
-            .oneshot(request)
-            .await
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "http://localhost:8080")
+            .header("x-forwarded-proto", "https")
+            .body(axum::body::Body::empty())
             .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "{peer} with {proto:?} must not be gated by transport"
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a listed Origin must pass the gate and reach auth"
         );
     }
-}
 
-#[tokio::test]
-async fn denied_body_is_generic_for_host_and_origin() {
-    use tower::ServiceExt;
-    async fn body_of(resp: axum::response::Response) -> String {
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
+    #[tokio::test]
+    async fn access_policy_authority_fallback_allows_listed() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vecs(&["x.trycloudflare.com"]),
+            Vec::new(),
+            Some("secret-token".to_string()),
+            |state| state.behind_tunnel = true,
+        );
+        let app = test_support::build_router_for_test(state);
+        // Absolute-form URI + no Host header: access_policy falls back to
+        // request.uri().authority() (the HTTP/2 :authority path).
+        let mut req = axum::http::Request::builder()
+            .uri("http://x.trycloudflare.com/api/sessions")
+            .header("x-forwarded-proto", "https")
+            .body(axum::body::Body::empty())
             .unwrap();
-        String::from_utf8(bytes.to_vec()).unwrap()
+        assert!(req.headers().get(axum::http::header::HOST).is_none());
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an :authority in the allowlist passes the gate and reaches auth"
+        );
     }
-    let make_state = || {
-        test_support::build_test_app_state_with_policy(
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_rejects_unlisted() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
             Vec::new(),
             vecs(&["localhost"]),
-            vecs(&["http://localhost:8080"]),
+            Vec::new(),
             None,
-        )
-    };
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("http://evil.trycloudflare.com/api/sessions")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
 
-    let app = test_support::build_router_for_test(make_state());
-    let host_deny = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "evil.com")
-        .extension(axum::extract::ConnectInfo(
-            "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
-        ))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let host_body = body_of(app.oneshot(host_deny).await.unwrap()).await;
-
-    let app = test_support::build_router_for_test(make_state());
-    let origin_deny = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "localhost")
-        .header("origin", "https://evil.com")
-        .extension(axum::extract::ConnectInfo(
-            "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
-        ))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let origin_body = body_of(app.oneshot(origin_deny).await.unwrap()).await;
-
-    assert!(!host_body.contains("evil.com"));
-    assert_eq!(
-        host_body, origin_body,
-        "both deny reasons must return an identical, non-leaking body"
-    );
-}
-
-#[tokio::test]
-async fn listed_origin_passes_gate_to_auth() {
-    use tower::ServiceExt;
-    let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
-    let state = test_support::build_test_app_state_with_policy_configured(
-        Vec::new(),
-        vecs(&["localhost"]),
-        vecs(&["http://localhost:8080"]),
-        Some("secret-token".to_string()),
-        |state| state.behind_tunnel = true,
-    );
-    let app = test_support::build_router_for_test(state);
-    let mut req = axum::http::Request::builder()
-        .uri("/api/sessions")
-        .header("host", "localhost")
-        .header("origin", "http://localhost:8080")
-        .header("x-forwarded-proto", "https")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(remote));
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::UNAUTHORIZED,
-        "a listed Origin must pass the gate and reach auth"
-    );
-}
-
-#[tokio::test]
-async fn access_policy_authority_fallback_allows_listed() {
-    use tower::ServiceExt;
-    let remote: std::net::SocketAddr = "127.0.0.1:5555".parse().unwrap();
-    let state = test_support::build_test_app_state_with_policy_configured(
-        Vec::new(),
-        vecs(&["x.trycloudflare.com"]),
-        Vec::new(),
-        Some("secret-token".to_string()),
-        |state| state.behind_tunnel = true,
-    );
-    let app = test_support::build_router_for_test(state);
-    // Absolute-form URI + no Host header: access_policy falls back to
-    // request.uri().authority() (the HTTP/2 :authority path).
-    let mut req = axum::http::Request::builder()
-        .uri("http://x.trycloudflare.com/api/sessions")
-        .header("x-forwarded-proto", "https")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    assert!(req.headers().get(axum::http::header::HOST).is_none());
-    req.extensions_mut()
-        .insert(axum::extract::ConnectInfo(remote));
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        axum::http::StatusCode::UNAUTHORIZED,
-        "an :authority in the allowlist passes the gate and reaches auth"
-    );
-}
-
-#[tokio::test]
-async fn access_policy_authority_fallback_rejects_unlisted() {
-    use tower::ServiceExt;
-    let state = test_support::build_test_app_state_with_policy(
-        Vec::new(),
-        vecs(&["localhost"]),
-        Vec::new(),
-        None,
-    );
-    let app = test_support::build_router_for_test(state);
-    let req = axum::http::Request::builder()
-        .uri("http://evil.trycloudflare.com/api/sessions")
-        .extension(axum::extract::ConnectInfo(
-            "203.0.113.7:5555".parse::<std::net::SocketAddr>().unwrap(),
-        ))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
-}
-
-#[test]
-fn csp_parses_as_valid_header_value() {
-    // Catches typos that would make the header unparseable.
-    // security_headers() calls `.parse().unwrap()` at request time;
-    // this test surfaces any regression at `cargo test` time instead.
-    let parsed: axum::http::HeaderValue = CSP.parse().expect("CSP must parse");
-    let rendered = parsed.to_str().expect("CSP must be ASCII");
-    // Spot-check load-bearing directives so a future edit that
-    // accidentally drops one fails loudly.
-    for needle in [
+    #[test]
+    fn csp_parses_as_valid_header_value() {
+        // Catches typos that would make the header unparseable.
+        // security_headers() calls `.parse().unwrap()` at request time;
+        // this test surfaces any regression at `cargo test` time instead.
+        let parsed: axum::http::HeaderValue = CSP.parse().expect("CSP must parse");
+        let rendered = parsed.to_str().expect("CSP must be ASCII");
+        // Spot-check load-bearing directives so a future edit that
+        // accidentally drops one fails loudly.
+        for needle in [
         "default-src 'self'",
         "script-src 'self' 'wasm-unsafe-eval'",
         "img-src 'self' data: blob: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
@@ -1375,4 +1384,5 @@ fn csp_parses_as_valid_header_value() {
             "CSP is missing required directive fragment `{needle}`"
         );
     }
-} }
+    }
+}

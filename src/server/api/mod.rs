@@ -394,261 +394,273 @@ pub(super) fn validate_profile_name(name: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests { use super::*; #[tokio::test] #[serial_test::serial] async fn native_mutation_admission_preserves_body_and_elevation_precedence() { use axum::http::{Method, Request};
-use base64::Engine;
-use tower::ServiceExt;
+mod tests {
+    use super::*;
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_mutation_admission_preserves_body_and_elevation_precedence() {
+        use axum::http::{Method, Request};
+        use base64::Engine;
+        use tower::ServiceExt;
 
-let home = tempfile::tempdir().unwrap();
-let _home = crate::session::test_support::isolate_app_dir_at(home.path());
-let state = crate::server::test_support::build_test_app_state_with_policy_configured(
-    Vec::new(),
-    vec!["localhost".into()],
-    Vec::new(),
-    None,
-    |state| state.read_only = true,
-);
-let app = crate::server::test_support::build_router_for_test(state);
-for (method, path) in [
-    (Method::POST, "/api/sessions/creation-trust"),
-    (Method::POST, "/api/sessions/missing/creation/cancel"),
-    (Method::PATCH, "/api/sessions/missing/favorite"),
-    (Method::PATCH, "/api/sessions/missing/access"),
-    (Method::POST, "/api/sessions/missing/purge/abandon"),
-    (Method::POST, "/api/sessions/missing/start"),
-    (Method::POST, "/api/sessions/missing/send"),
-    (Method::POST, "/api/sessions/missing/restart"),
-    (Method::POST, "/api/sessions/missing/restart-for-update"),
-    (Method::POST, "/api/sessions/missing/tools/ensure"),
-    (Method::POST, "/api/sessions/missing/auxiliary/stop"),
-    (Method::POST, "/api/sessions/missing/acp/switch-agent"),
-    (Method::PATCH, "/api/sessions/missing"),
-    (Method::DELETE, "/api/sessions/missing"),
-    (Method::POST, "/api/sessions/missing/trash"),
-    (Method::POST, "/api/plugins/commands/missing/invoke"),
-    (Method::POST, "/api/sessions/empty-trash"),
-    (Method::POST, "/api/groups"),
-    (Method::PATCH, "/api/groups"),
-    (Method::DELETE, "/api/groups"),
-    (Method::PATCH, "/api/groups/collapse"),
-    (Method::POST, "/api/reorder"),
-    (Method::DELETE, "/api/workspaces"),
-    (Method::POST, "/api/plugins/missing/enabled"),
-    (Method::POST, "/api/plugins/missing/worker/restart"),
-    (Method::POST, "/api/plugins/missing/uninstall"),
-    (Method::POST, "/api/plugins/install/preview"),
-    (Method::POST, "/api/plugins/install"),
-    (Method::POST, "/api/plugins/missing/update/apply"),
-    (Method::POST, "/api/plugins/missing/update/dismiss"),
-    (Method::PATCH, "/api/theme"),
-    (Method::POST, "/api/sandbox/image-pull"),
-    (Method::POST, "/api/sandbox/image-dismiss"),
-] {
-    let mut request = Request::builder()
-        .method(method.clone())
-        .uri(path)
-        .header("host", "localhost")
-        .header("content-type", "application/json")
-        .body(axum::body::Body::from("{"))
-        .unwrap();
-    request.extensions_mut().insert(axum::extract::ConnectInfo(
-        crate::server::peer::ConnectionPeer::UnixOwner {
-            uid: nix::unistd::geteuid().as_raw(),
-        },
-    ));
-    let response = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
-    assert_eq!(
-        response.headers()[crate::daemon::ERROR_CODE_HEADER],
-        "read_only",
-        "{method} {path}"
-    );
-    let bytes = axum::body::to_bytes(response.into_body(), 1024)
-        .await
-        .unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["error"], "read_only", "{method} {path}");
-}
-
-let mut request = Request::builder()
-    .method(Method::POST)
-    .uri("/api/sessions/missing/ensure")
-    .header("host", "localhost")
-    .header("content-type", "application/json")
-    .body(axum::body::Body::from("{"))
-    .unwrap();
-request.extensions_mut().insert(axum::extract::ConnectInfo(
-    crate::server::peer::ConnectionPeer::UnixOwner {
-        uid: nix::unistd::geteuid().as_raw(),
-    },
-));
-let response = app.clone().oneshot(request).await.unwrap();
-assert_eq!(response.status(), StatusCode::NOT_FOUND, "read-only ensure permits viewing but cannot find the missing session");
-
-let login_manager =
-    std::sync::Arc::new(crate::server::login::LoginManager::new(Some("test")));
-let binding = [0x42; 32];
-let session = login_manager
-    .create_session(&binding, "127.0.0.1", "plugin-pane-policy")
-    .await;
-assert!(!login_manager.is_elevated(&session).await);
-let binding_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binding);
-for (read_only, authenticated, status, code) in [
-    (false, false, StatusCode::UNAUTHORIZED, "login_required"),
-    (false, true, StatusCode::SERVICE_UNAVAILABLE, "no_host"),
-    (true, true, StatusCode::FORBIDDEN, "read_only"),
-] {
-    let state = crate::server::test_support::build_test_app_state_with_policy_configured(
-        Vec::new(),
-        vec!["localhost".into()],
-        vec!["http://localhost:8080".into()],
-        None,
-        |state| {
-            state.read_only = read_only;
-            state.login_manager = login_manager.clone();
-            state.plugin_host = None;
-        },
-    );
-    let app = crate::server::test_support::build_router_for_test(state);
-    let mut request = Request::builder()
-        .method(Method::POST)
-        .uri("/api/plugins/missing/action")
-        .header("host", "localhost")
-        .header("origin", "http://localhost:8080")
-        .header("content-type", "application/json");
-    if authenticated {
-        request = request
-            .header("cookie", format!("aoe_session={session}"))
-            .header("x-aoe-device-binding", &binding_header);
-    }
-    let mut request = request
-        .body(axum::body::Body::from(
-            r#"{"method":"github.refresh","params":{}}"#,
-        ))
-        .unwrap();
-    request.extensions_mut().insert(axum::extract::ConnectInfo(
-        crate::server::peer::ConnectionPeer::Tcp(([127, 0, 0, 1], 12345).into()),
-    ));
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(
-        response.status(),
-        status,
-        "read_only={read_only}, auth={authenticated}"
-    );
-    let bytes = axum::body::to_bytes(response.into_body(), 1024)
-        .await
-        .unwrap();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(
-        body["error"], code,
-        "read_only={read_only}, auth={authenticated}"
-    );
-} } #[test]
-fn validate_no_shell_injection_rejects_every_metacharacter() {
-    for input in [
-        "name;command",
-        "name&command",
-        "name|command",
-        "$(command)",
-        "`command`",
-        "path(1)",
-        "path)",
-        "path{a,b}",
-        "path}",
-        "name<input",
-        "name>output",
-        "name\ncommand",
-        "name\rcommand",
-        "path\\name",
-        "\"quoted\"",
-        "it's",
-        "name!0",
-        "name#comment",
-        "path/*",
-        "name?",
-        "path[0",
-        "path]",
-        "~root",
-        "name\targ",
-        "name\0arg",
-    ] {
-        let result = validate_no_shell_injection(input, "field");
-        assert!(
-            result.is_err(),
-            "validate_no_shell_injection should reject {:?} but accepted {:?}",
-            input,
-            input
+        let home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
+        let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+            Vec::new(),
+            vec!["localhost".into()],
+            Vec::new(),
+            None,
+            |state| state.read_only = true,
         );
-    }
-}
+        let app = crate::server::test_support::build_router_for_test(state);
+        for (method, path) in [
+            (Method::POST, "/api/sessions/creation-trust"),
+            (Method::POST, "/api/sessions/missing/creation/cancel"),
+            (Method::PATCH, "/api/sessions/missing/favorite"),
+            (Method::PATCH, "/api/sessions/missing/access"),
+            (Method::POST, "/api/sessions/missing/purge/abandon"),
+            (Method::POST, "/api/sessions/missing/start"),
+            (Method::POST, "/api/sessions/missing/send"),
+            (Method::POST, "/api/sessions/missing/restart"),
+            (Method::POST, "/api/sessions/missing/restart-for-update"),
+            (Method::POST, "/api/sessions/missing/tools/ensure"),
+            (Method::POST, "/api/sessions/missing/auxiliary/stop"),
+            (Method::POST, "/api/sessions/missing/acp/switch-agent"),
+            (Method::PATCH, "/api/sessions/missing"),
+            (Method::DELETE, "/api/sessions/missing"),
+            (Method::POST, "/api/sessions/missing/trash"),
+            (Method::POST, "/api/plugins/commands/missing/invoke"),
+            (Method::POST, "/api/sessions/empty-trash"),
+            (Method::POST, "/api/groups"),
+            (Method::PATCH, "/api/groups"),
+            (Method::DELETE, "/api/groups"),
+            (Method::PATCH, "/api/groups/collapse"),
+            (Method::POST, "/api/reorder"),
+            (Method::DELETE, "/api/workspaces"),
+            (Method::POST, "/api/plugins/missing/enabled"),
+            (Method::POST, "/api/plugins/missing/worker/restart"),
+            (Method::POST, "/api/plugins/missing/uninstall"),
+            (Method::POST, "/api/plugins/install/preview"),
+            (Method::POST, "/api/plugins/install"),
+            (Method::POST, "/api/plugins/missing/update/apply"),
+            (Method::POST, "/api/plugins/missing/update/dismiss"),
+            (Method::PATCH, "/api/theme"),
+            (Method::POST, "/api/sandbox/image-pull"),
+            (Method::POST, "/api/sandbox/image-dismiss"),
+        ] {
+            let mut request = Request::builder()
+                .method(method.clone())
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{"))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::UnixOwner {
+                    uid: nix::unistd::geteuid().as_raw(),
+                },
+            ));
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            assert_eq!(
+                response.headers()[crate::daemon::ERROR_CODE_HEADER],
+                "read_only",
+                "{method} {path}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"], "read_only", "{method} {path}");
+        }
 
-/// #2624: real-world session titles/groups (imported from Claude Code
-/// summaries) routinely contain apostrophes, question marks, and other
-/// shell metacharacters that are harmless for a display label.
-#[test]
-fn display_label_accepts_common_punctuation() {
-    for value in [
-        "I've read @filename?",
-        "I'm testing this out",
-        "Goal: fix the parser",
-        "What's next?",
-        "Fix [draft] (wip) ~ #123",
-        "work/claude/imports",
-    ] {
-        assert!(
-            validate_display_label(value, "title").is_ok(),
-            "should accept {:?}",
-            value
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/sessions/missing/ensure")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{"))
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            crate::server::peer::ConnectionPeer::UnixOwner {
+                uid: nix::unistd::geteuid().as_raw(),
+            },
+        ));
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "read-only ensure permits viewing but cannot find the missing session"
         );
+
+        let login_manager =
+            std::sync::Arc::new(crate::server::login::LoginManager::new(Some("test")));
+        let binding = [0x42; 32];
+        let session = login_manager
+            .create_session(&binding, "127.0.0.1", "plugin-pane-policy")
+            .await;
+        assert!(!login_manager.is_elevated(&session).await);
+        let binding_header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(binding);
+        for (read_only, authenticated, status, code) in [
+            (false, false, StatusCode::UNAUTHORIZED, "login_required"),
+            (false, true, StatusCode::SERVICE_UNAVAILABLE, "no_host"),
+            (true, true, StatusCode::FORBIDDEN, "read_only"),
+        ] {
+            let state = crate::server::test_support::build_test_app_state_with_policy_configured(
+                Vec::new(),
+                vec!["localhost".into()],
+                vec!["http://localhost:8080".into()],
+                None,
+                |state| {
+                    state.read_only = read_only;
+                    state.login_manager = login_manager.clone();
+                    state.plugin_host = None;
+                },
+            );
+            let app = crate::server::test_support::build_router_for_test(state);
+            let mut request = Request::builder()
+                .method(Method::POST)
+                .uri("/api/plugins/missing/action")
+                .header("host", "localhost")
+                .header("origin", "http://localhost:8080")
+                .header("content-type", "application/json");
+            if authenticated {
+                request = request
+                    .header("cookie", format!("aoe_session={session}"))
+                    .header("x-aoe-device-binding", &binding_header);
+            }
+            let mut request = request
+                .body(axum::body::Body::from(
+                    r#"{"method":"github.refresh","params":{}}"#,
+                ))
+                .unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                crate::server::peer::ConnectionPeer::Tcp(([127, 0, 0, 1], 12345).into()),
+            ));
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                status,
+                "read_only={read_only}, auth={authenticated}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["error"], code,
+                "read_only={read_only}, auth={authenticated}"
+            );
+        }
+    }
+    #[test]
+    fn validate_no_shell_injection_rejects_every_metacharacter() {
+        for input in [
+            "name;command",
+            "name&command",
+            "name|command",
+            "$(command)",
+            "`command`",
+            "path(1)",
+            "path)",
+            "path{a,b}",
+            "path}",
+            "name<input",
+            "name>output",
+            "name\ncommand",
+            "name\rcommand",
+            "path\\name",
+            "\"quoted\"",
+            "it's",
+            "name!0",
+            "name#comment",
+            "path/*",
+            "name?",
+            "path[0",
+            "path]",
+            "~root",
+            "name\targ",
+            "name\0arg",
+        ] {
+            let result = validate_no_shell_injection(input, "field");
+            assert!(
+                result.is_err(),
+                "validate_no_shell_injection should reject {:?} but accepted {:?}",
+                input,
+                input
+            );
+        }
+    }
+
+    /// #2624: real-world session titles/groups (imported from Claude Code
+    /// summaries) routinely contain apostrophes, question marks, and other
+    /// shell metacharacters that are harmless for a display label.
+    #[test]
+    fn display_label_accepts_common_punctuation() {
+        for value in [
+            "I've read @filename?",
+            "I'm testing this out",
+            "Goal: fix the parser",
+            "What's next?",
+            "Fix [draft] (wip) ~ #123",
+            "work/claude/imports",
+        ] {
+            assert!(
+                validate_display_label(value, "title").is_ok(),
+                "should accept {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn display_label_rejects_control_characters() {
+        for value in [
+            "bad\nname",
+            "bad\rname",
+            "bad\tname",
+            "bad\u{1b}name",
+            "bad\0name",
+        ] {
+            assert!(
+                validate_display_label(value, "title").is_err(),
+                "should reject {:?}",
+                value
+            );
+        }
+    }
+
+    /// `is_control()` alone misses Cf-category bidi override/isolate chars;
+    /// unblocked, they let a title's rendered order differ from what's
+    /// stored (Trojan-Source-style spoofing).
+    #[test]
+    fn display_label_rejects_bidi_control_characters() {
+        for &c in BIDI_CONTROL_CHARS {
+            let value = format!("bad{}name", c);
+            assert!(
+                validate_display_label(&value, "title").is_err(),
+                "should reject {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn profile_name_rejects_path_traversal() {
+        assert!(validate_profile_name("../etc").is_err());
+        assert!(validate_profile_name("foo/bar").is_err());
+        assert!(validate_profile_name("..").is_err());
+        assert!(validate_profile_name(".hidden").is_err());
+        assert!(validate_profile_name("").is_err());
+        assert!(validate_profile_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn profile_name_accepts_valid_names() {
+        assert!(validate_profile_name("default").is_ok());
+        assert!(validate_profile_name("work").is_ok());
+        assert!(validate_profile_name("my-profile").is_ok());
+        assert!(validate_profile_name("profile_2").is_ok());
+        assert!(validate_profile_name("A").is_ok());
     }
 }
-
-#[test]
-fn display_label_rejects_control_characters() {
-    for value in [
-        "bad\nname",
-        "bad\rname",
-        "bad\tname",
-        "bad\u{1b}name",
-        "bad\0name",
-    ] {
-        assert!(
-            validate_display_label(value, "title").is_err(),
-            "should reject {:?}",
-            value
-        );
-    }
-}
-
-/// `is_control()` alone misses Cf-category bidi override/isolate chars;
-/// unblocked, they let a title's rendered order differ from what's
-/// stored (Trojan-Source-style spoofing).
-#[test]
-fn display_label_rejects_bidi_control_characters() {
-    for &c in BIDI_CONTROL_CHARS {
-        let value = format!("bad{}name", c);
-        assert!(
-            validate_display_label(&value, "title").is_err(),
-            "should reject {:?}",
-            value
-        );
-    }
-}
-
-#[test]
-fn profile_name_rejects_path_traversal() {
-    assert!(validate_profile_name("../etc").is_err());
-    assert!(validate_profile_name("foo/bar").is_err());
-    assert!(validate_profile_name("..").is_err());
-    assert!(validate_profile_name(".hidden").is_err());
-    assert!(validate_profile_name("").is_err());
-    assert!(validate_profile_name(&"a".repeat(65)).is_err());
-}
-
-#[test]
-fn profile_name_accepts_valid_names() {
-    assert!(validate_profile_name("default").is_ok());
-    assert!(validate_profile_name("work").is_ok());
-    assert!(validate_profile_name("my-profile").is_ok());
-    assert!(validate_profile_name("profile_2").is_ok());
-    assert!(validate_profile_name("A").is_ok());
-} }
