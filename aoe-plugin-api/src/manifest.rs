@@ -691,11 +691,17 @@ pub enum ManifestError {
     Invalid(Vec<String>),
 }
 
+fn declaration_character_ok(c: char) -> bool {
+    !c.is_control()
+        && unicode_general_category::get_general_category(c)
+            != unicode_general_category::GeneralCategory::Format
+}
+
 fn declaration_word_ok(value: &str) -> bool {
     !value.is_empty()
         && !value.chars().any(|c| {
             c.is_whitespace()
-                || c.is_control()
+                || !declaration_character_ok(c)
                 || matches!(
                     c,
                     '{' | '}'
@@ -737,12 +743,7 @@ fn declaration_env_name_ok(name: &str) -> bool {
 }
 
 fn declaration_value_ok(value: &str) -> bool {
-    value.len() <= 4096
-        && value.chars().all(|c| {
-            !c.is_control()
-                && unicode_general_category::get_general_category(c)
-                    != unicode_general_category::GeneralCategory::Format
-        })
+    value.len() <= 4096 && value.chars().all(declaration_character_ok)
 }
 
 fn validate_agent_declaration(
@@ -820,11 +821,7 @@ fn validate_agent_declaration(
             check(
                 !hint.trim().is_empty()
                     && hint.len() <= 512
-                    && hint.chars().all(|c| {
-                        !c.is_control()
-                            && unicode_general_category::get_general_category(c)
-                                != unicode_general_category::GeneralCategory::Format
-                    }),
+                    && hint.chars().all(declaration_character_ok),
                 format!("agent_integrations[{i}].launch.install_hint is invalid"),
             );
         }
@@ -884,7 +881,9 @@ fn validate_agent_declaration(
         {
             let valid = match key {
                 AgentKeyDeclaration::Literal { value } => {
-                    !value.is_empty() && value.len() <= 32 && !value.chars().any(char::is_control)
+                    !value.is_empty()
+                        && value.len() <= 32
+                        && value.chars().all(declaration_character_ok)
                 }
                 AgentKeyDeclaration::Named { value } => matches!(
                     value.as_str(),

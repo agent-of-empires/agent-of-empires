@@ -108,6 +108,22 @@ deny = [{ kind = "literal", value = "n" }]
             valid.replace("--instruction {}", "--instruction {}suffix"),
             "instruction_flag",
         ),
+        (
+            valid.replace("oneshot_flag = \"-p\"", "oneshot_flag = \"-p\u{202e}\""),
+            "oneshot_flag",
+        ),
+        (
+            valid.replace("--instruction {}", "--instruction\u{200b} {}"),
+            "instruction_flag",
+        ),
+        (
+            valid.replace("flag = \"--resume\"", "flag = \"--resume\u{200b}\""),
+            "launch.resume",
+        ),
+        (
+            valid.replace("value = \"n\"", "value = \"n\u{202e}\""),
+            "invalid key",
+        ),
         (valid.replace("EXAMPLE_HOME", "HOME"), "container_env"),
         (
             valid.replace("backend = \"omp\"", "backend = \"codex\""),
