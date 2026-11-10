@@ -262,6 +262,9 @@ pub struct AvailableCommand {
     pub description: String,
     #[serde(default)]
     pub accepts_input: bool,
+    /// Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
 }
 
 /// Semantic category of an ACP `SessionConfigOption`; unknown values round-trip as `Other`.
@@ -2434,6 +2437,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: true,
+                        input_hint: None,
                     }],
                 },
                 Event::ModesAvailable {

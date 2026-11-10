@@ -571,6 +571,12 @@ fn render_slash_picker(
         &matches,
         |cmd| {
             let mut spans = vec![Span::raw(format!("/{}", cmd.name))];
+            if let Some(hint) = &cmd.input_hint {
+                spans.push(Span::styled(
+                    format!(" {hint}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
             if !cmd.description.is_empty() {
                 spans.push(Span::styled(
                     format!("  {}", cmd.description),
@@ -2336,6 +2342,7 @@ mod tests {
             name: name.to_string(),
             description: desc.to_string(),
             accepts_input: false,
+            input_hint: None,
         }
     }
 
@@ -2743,6 +2750,15 @@ mod tests {
         assert!(state.slash_picker_open());
         let dump = render_dump(&state, 80, 24);
         assert!(dump.contains("Commands") && dump.contains("/compact") && dump.contains('▶'));
+
+        let mut state = test_state();
+        state.focus = Focus::Composer;
+        let mut mcp = cmd("mcp", "MCP servers");
+        mcp.input_hint = Some("[reconnect|enable|disable]".into());
+        state.transcript.available_commands = vec![mcp];
+        state.composer.insert_str("/mc");
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("/mcp [reconnect|enable|disable]"), "{dump:?}");
 
         // A short terminal must keep the selected last row on screen.
         let mut state = test_state();

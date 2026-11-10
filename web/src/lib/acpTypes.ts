@@ -93,6 +93,8 @@ export interface AvailableCommand {
   description: string;
   /** The command takes free-form arguments after the name. */
   accepts_input: boolean;
+  /** Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`. */
+  input_hint?: string;
 }
 
 /** Unknown categories arrive as bare strings (Rust `Other` is untagged). */

@@ -2274,6 +2274,7 @@ mod tests {
                     name: (*name).into(),
                     description: String::new(),
                     accepts_input: false,
+                    input_hint: None,
                 })
                 .collect();
             state.composer.insert_str("/c");

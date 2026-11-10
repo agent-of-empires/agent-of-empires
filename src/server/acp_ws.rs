@@ -885,6 +885,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: false,
+                        input_hint: None,
                     }],
                 },
             ),

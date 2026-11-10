@@ -562,6 +562,7 @@ mod tests {
                     name: "review".into(),
                     description: "Review".into(),
                     accepts_input: true,
+                    input_hint: None,
                 }],
             },
             Event::PlanUpdated {
@@ -668,6 +669,7 @@ mod tests {
                     name: "review".into(),
                     description: "Review".into(),
                     accepts_input: false,
+                    input_hint: None,
                 }],
             },
             Event::ModesAvailable {
