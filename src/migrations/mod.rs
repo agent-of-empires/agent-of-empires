@@ -302,7 +302,7 @@ pub fn current_schema_version() -> u32 {
 
 /// Seed current ownership journals in a fresh, isolated integration fixture.
 /// Historical migrations may touch host paths outside HOME and must not run here.
-#[cfg(feature = "e2e-tests")]
+#[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub fn initialize_empty_test_storage() -> Result<()> {
     let root = crate::session::get_app_dir()?;
