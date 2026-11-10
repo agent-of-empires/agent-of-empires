@@ -99,8 +99,10 @@ main() {
     version=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            --channel) channel="${2:-}"; shift 2 ;;
-            --version) version="${2:-}"; shift 2 ;;
+            --channel|--version)
+                [ $# -ge 2 ] || { usage >&2; error "Missing value for $1"; }
+                if [ "$1" = --channel ]; then channel="$2"; else version="$2"; fi
+                shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) usage >&2; error "Unknown argument: $1" ;;
         esac
