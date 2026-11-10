@@ -1191,6 +1191,43 @@ mod tests {
             .is_err());
     }
 
+    /// A runner from the other side of a protocol bump fails the attach with a
+    /// readable mismatch error, not a decode failure.
+    #[tokio::test]
+    async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            accept_hello(
+                &listener,
+                "old",
+                control_protocol::CONTROL_PROTOCOL_VERSION - 1,
+            )
+            .await
+        });
+        let (event_tx, _) = mpsc::channel::<Event>(1);
+        let error = connect(
+            &control,
+            "old",
+            event_tx,
+            Arc::new(TerminalClaim::new()),
+            false,
+        )
+        .await
+        .err()
+        .expect("a version mismatch must fail the attach")
+        .to_string();
+        assert!(error.contains("runner Hello mismatch"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "protocol v{}",
+                control_protocol::CONTROL_PROTOCOL_VERSION - 1
+            )),
+            "{error}"
+        );
+        let _ = fake.await;
+    }
+
     /// An oversized reverse response becomes a bounded error and the
     /// connection stays usable.
     #[tokio::test]

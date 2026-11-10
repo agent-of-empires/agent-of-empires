@@ -206,6 +206,64 @@ mod tests {
         }
     }
 
+    /// An announcement without the cancel capability publishes a child that
+    /// cannot be stopped; a later one that carries it flips the snapshot and
+    /// the route together.
+    #[tokio::test]
+    async fn cancel_capability_flips_when_a_later_update_carries_it() {
+        let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+        let (event_tx, mut events) = mpsc::channel(16);
+        let (lifecycle_tx, _lifecycle) = mpsc::channel(16);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &CLAUDE,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            ingress.clone(),
+            None,
+        );
+        let update = |capabilities: serde_json::Value| {
+            serde_json::json!({
+                "sessionId": "root",
+                "update": {
+                    "sessionUpdate": "subagent_update",
+                    "sessionId": "child",
+                    "state": { "state": "running" },
+                    "capabilities": capabilities,
+                },
+            })
+        };
+        feed(&ingress, &shared, update(serde_json::json!({}))).await;
+        assert!(
+            !ingress
+                .child_route(&"child".to_string().into())
+                .unwrap()
+                .cancel_capable
+        );
+        feed(
+            &ingress,
+            &shared,
+            update(serde_json::json!({ "cancel": {} })),
+        )
+        .await;
+        assert!(
+            ingress
+                .child_route(&"child".to_string().into())
+                .unwrap()
+                .cancel_capable
+        );
+        drop(shared);
+
+        let mut flags = Vec::new();
+        while let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await {
+            flags.push(subagent.cancel_capable);
+        }
+        assert_eq!(flags, [false, true]);
+    }
+
     /// A child's tool calls nest under the Agent card that spawned it, while
     /// its messages and lifecycle never reach the root session's transcript.
     #[tokio::test]
