@@ -380,6 +380,8 @@ impl Session {
         Some(info)
     }
 
+    /// Starts the cancel escalation grace once and returns its deadline; a
+    /// repeated cancel keeps the original deadline.
     pub(super) async fn request_cancel(&self) -> Instant {
         let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
         {

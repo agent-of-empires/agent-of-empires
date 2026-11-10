@@ -380,7 +380,7 @@ impl Session {
                 })
                 .await;
         }
-        // Confirmed replay must finish despite backpressure or the attempt deadline.
+        // Confirmed replay must finish despite backpressure or the reattach attempt deadline.
         // Same-id assignment clears a sticky UI error without a server-side reset.
         let id = SessionId::from(runner);
         self.shared.commit_session(id.clone()).await?;

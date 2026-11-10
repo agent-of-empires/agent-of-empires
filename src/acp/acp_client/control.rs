@@ -240,6 +240,9 @@ impl DaemonControlClient {
             .send_modify(|replayed| *replayed += 1);
     }
 
+    /// Releases the oldest settled completion when the crate reaches its marker.
+    /// A local outcome goes to its waiter; an adopted one is returned only
+    /// while this client still owns the adopted turn.
     pub(super) fn deliver_prompt_completion(
         &self,
         _: PromptCompletedMarker,

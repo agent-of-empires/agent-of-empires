@@ -244,6 +244,8 @@ impl Session {
         Ok(())
     }
 
+    /// Ends an adopted turn with the runner's reported outcome. Returns `false`
+    /// when the turn was already superseded, ended or claimed elsewhere.
     async fn finish_adopted_turn(
         &self,
         outcome: crate::acp::control_protocol::PromptOutcome,

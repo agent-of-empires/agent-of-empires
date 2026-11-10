@@ -612,6 +612,8 @@ impl<S: BroadcastSink> Drain<S> {
         true
     }
 
+    /// Installs a reattached client only if the lease and runner identity are
+    /// still current and no stop was requested; otherwise releases it.
     async fn install_reattached(
         &self,
         lease: &Lease,
