@@ -73,6 +73,8 @@ The host matches status integrations to terminal sessions and rejects missing, m
 
 These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. When a plugin is absent or disabled, built-in OMP and its pane detection and capture behavior remain available.
 
+Launch flags, instruction templates, environment values, install hints, and literal reply keys reject control and Unicode format characters.
+
 ```toml
 capabilities = ["session.integration"]
 
