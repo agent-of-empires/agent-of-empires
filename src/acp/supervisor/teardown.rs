@@ -1461,13 +1461,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if let Some(observed) = fence.observed {
             let current = lifecycle.running(session_id).map(|(lease, _)| lease);
-            let activity = self
-                .next_seqs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(session_id)
-                .copied()
-                .unwrap_or(0);
+            let activity = super::try_activity_seq(&self.next_seqs, session_id)
+                .ok_or(SupervisorError::RegistryBusy)?;
             if current.as_ref() != Some(observed)
                 || fence.activity_seq != Some(activity)
                 || fence.admissions != Some(observed.admissions())
@@ -3875,6 +3870,90 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn idle_observation_declines_a_gated_activity_publication_without_retiring_its_lease() {
+        let (_home, _tmp) = isolate_home();
+        let mut p = parked(|event| matches!(event, Event::BackgroundTaskStarted { .. }));
+        let id = "idle-busy-activity";
+        let identity = attested_test_identity(8873, 18);
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(identity.pid);
+        Arc::get_mut(&mut p.sup)
+            .expect("the parked fixture has one supervisor owner")
+            .process_control = control.clone();
+        save_attested_test_record(id, identity.pid, identity.generation);
+        let lease = p
+            .sup
+            .test_install_runner(
+                id,
+                runner_config(worker_registry::socket_path_for(id).unwrap()),
+                Some(identity),
+            )
+            .await;
+        lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+        let mut row = crate::session::Instance::new(id, "/tmp/idle-busy-activity");
+        row.id = id.to_owned();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = crate::session::Status::Idle;
+        let stamp = chrono::Utc::now();
+        row.idle_dormant_since = Some(stamp);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        p.sup.test_bind_native_scope(&lease, &row);
+        worker_registry::mark_restart_pending(id, identity.generation).unwrap();
+        let (observed, activity) = p.sup.idle_observation(id).unwrap();
+        let admissions = lease.admissions();
+        let producer = {
+            let sup = Arc::clone(&p.sup);
+            std::thread::spawn(move || {
+                super::super::publish_with_next_seq(&sup.next_seqs, id, |seq| {
+                    sup.sink.publish_persisted(
+                        id,
+                        seq,
+                        &Event::BackgroundTaskStarted {
+                            task_id: "actual-gated-activity".into(),
+                            tool_call_id: None,
+                            description: "activity".into(),
+                            workflow: None,
+                        },
+                    )
+                })
+            })
+        };
+        p.entered().await;
+        let lifecycle_available = p.sup.lifecycle.try_lock().is_ok();
+        let while_publishing = p.sup.idle_observation(id);
+        let refused = p
+            .sup
+            .shutdown_idle(id, (&observed, admissions), activity, stamp)
+            .await;
+        p.release_and_wait().await;
+        assert!(producer.join().unwrap(), "the gated event was actually persisted");
+        assert!(lifecycle_available, "this producer holds only its activity cell");
+        assert!(while_publishing.is_none(), "busy activity must not look idle");
+        assert!(matches!(refused, Err(SupervisorError::RegistryBusy)));
+        assert_eq!(p.sup.current_lease(id).as_ref(), Some(&lease));
+        assert_eq!(
+            lock_recover(&p.sup.lifecycle).phase(id),
+            crate::acp::runner_lifecycle::WorkerPhase::Running
+        );
+        assert_eq!(worker_registry::peek_restart_marker(id), Some(identity.generation));
+        let (fresh, published) = p.sup.idle_observation(id).unwrap();
+        assert_eq!(fresh, lease);
+        assert_eq!(published, activity + 1);
+        assert_eq!(p.store.replay_from(id, 0).last().unwrap().0, published);
+        assert!(matches!(
+            p.sup
+                .shutdown_idle(id, (&observed, admissions), activity, stamp)
+                .await,
+            Err(SupervisorError::Superseded(_))
+        ));
+        assert_eq!(p.sup.current_lease(id).as_ref(), Some(&lease));
+        assert_eq!(worker_registry::peek_restart_marker(id), Some(identity.generation));
+        assert!(control.signals().is_empty(), "neither refused stop may signal the runner");
+    }
+
     /// Publication holds its owner through persistence, before the reaper's final sweep.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
@@ -3915,6 +3994,10 @@ mod tests {
         assert!(
             p.sup.lifecycle.try_lock().is_err(),
             "publication retains its lifecycle fence"
+        );
+        assert!(
+            p.sup.idle_observation(id).is_none(),
+            "idle observation must not wait on the real worker publication's lifecycle fence"
         );
 
         let reaper = {

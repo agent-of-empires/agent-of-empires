@@ -790,15 +790,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub(crate) fn idle_observation(&self, session_id: &str) -> Option<(Lease, u64)> {
-        let lifecycle = lock_recover(&self.lifecycle);
+        let lifecycle = match self.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
         let (lease, _) = lifecycle.running(session_id)?;
-        let activity = self
-            .next_seqs
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(session_id)
-            .copied()
-            .unwrap_or(0);
+        let activity = try_activity_seq(&self.next_seqs, session_id)?;
         Some((lease, activity))
     }
 
@@ -1057,6 +1055,24 @@ impl<S: BroadcastSink> Supervisor<S> {
             cancellation.cancel();
         }
     }
+}
+
+/// Idle observation must not wait for another publisher's durable store I/O.
+fn try_activity_seq(next_seqs: &SeqMap, session_id: &str) -> Option<u64> {
+    let sessions = match next_seqs.try_lock() {
+        Ok(sessions) => sessions,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let Some(counter) = sessions.get(session_id) else {
+        return Some(0);
+    };
+    let activity = match counter.try_lock() {
+        Ok(activity) => activity,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(*activity)
 }
 
 fn session_seq(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<u64>> {

@@ -13,6 +13,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **session:** Reject stale capture snapshots before they reserve a restarted or replaced session, preserving its lifecycle generation and newly selected conversation.
 - **session:** Publish daemon capture commits through the canonical store before releasing Capture ownership; retain the existing global fail-closed metadata-health policy when a profile cannot open.
 - **session:** Accept unchanged preexisting dead panes in a complete handoff inventory, including tmux's empty dead-pane PID, while retaining strict structural IDs, socket, server, PID, and live-birth fencing.
+- **acp:** Decline idle retirement while a worker's lifecycle or activity publication is busy, without waiting on store I/O or clearing its captured lease and restart intent.
 
 ### Security
 
