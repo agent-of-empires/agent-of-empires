@@ -1514,6 +1514,7 @@ async fn retained_trash_parked_conversation_refuses_import() -> anyhow::Result<(
         let retained = home.path().join("retained");
         std::fs::create_dir_all(&project)?;
         std::fs::create_dir_all(&retained)?;
+        let project = project.canonicalize()?;
         let history = claude.join("projects").join("-import-project");
         std::fs::create_dir_all(&history)?;
         std::fs::write(
