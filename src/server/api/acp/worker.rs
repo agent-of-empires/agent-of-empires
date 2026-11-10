@@ -63,7 +63,10 @@ fn rate_limit_resume_marker_resets_at(
     )
 }
 
-async fn rate_limit_resume_probe(state: &AppState, id: &str) -> Option<DateTime<Utc>> {
+pub(in crate::server::api) async fn rate_limit_resume_probe(
+    state: &AppState,
+    id: &str,
+) -> Option<DateTime<Utc>> {
     let store = Arc::clone(&state.acp_event_store);
     let id_for_probe = id.to_string();
     tokio::task::spawn_blocking(move || {

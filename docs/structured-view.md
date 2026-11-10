@@ -142,7 +142,7 @@ It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `-
 
 ## Choosing the view per session
 
-- **Web wizard and TUI dialog:** default to the structured view; set [`acp.structured_view`](guides/configuration.md) to `terminal` to preselect the terminal, or `off` to hide the option. Pick **Terminal** in the wizard's **View** row, or turn off the **Structured** field in the TUI (shown for ACP-capable tools), to get the terminal view.
+- **Web wizard and TUI dialog:** `acp.structured_view = "auto"` defaults to structured in the web wizard and terminal in the TUI. Set it to `terminal` or `structured` to preselect that view in both, or `off` to hide the option. The per-session choice wins.
 - **CLI:** defaults to the terminal view; opt in with `--structured-view` or `--agent`.
 - Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (requires a healthy runtime; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session, the conversation is kept in both directions only when AoE can resolve a shared native store. A terminal switch whose store cannot be resolved, or which the structured worker does not share, is refused with HTTP 409 and `set-session-id --store` recovery guidance. Every other agent starts fresh on the target surface.
 
@@ -151,6 +151,50 @@ If the agent cannot resume a prior conversation, the transcript reports a contex
 Non-ACP tools always run in the terminal view.
 
 See the [local Daemon workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
+
+In the native TUI, wrapping and copying keep Unicode grapheme clusters intact
+across ANSI style changes. A cluster uses its first code point's style.
+
+### Inspecting Trash in the TUI
+
+Select a session in the expanded **Trash** section to read its retained ACP
+transcript. Inspection never starts an agent or prepares a terminal or tool pane,
+regardless of the session's current view or click preference.
+
+Scroll with the mouse wheel. Without reader focus, use **Earlier/Later** in the
+footer or **Shift+PageUp/PageDown**. Press **Enter** to focus the reader and use
+**Up/Down**, **PageUp/PageDown**, and **Home/End**. Drag over text to copy it.
+**Esc** returns to the session list. Restore and permanent deletion remain
+separate management actions shown in the footer.
+
+Opening **System Health** releases reader keyboard focus. Press **Enter** to
+return to the selected Trash transcript.
+
+Tool arguments, structured changes, and retained text output are shown without
+the active view's preview limits, including successful calls. Scroll and drag to
+copy their full retained text. Media stays represented by descriptive placeholders.
+Text retained before a media-only completion remains readable beside those
+placeholders.
+Unfinished text snapshots remain readable even when their start or completion
+event is unavailable. They are labeled **completion unavailable**, not marked
+successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
+
+The reader refreshes available content automatically and preserves focus and
+scroll position. Read failures keep the last loaded content visible with an
+error. Content, size, or theme changes clear the previous text selection.
+Reopen the reader after in-place edits to already retained events.
+
+Dialogs close when their target session changes or disappears. Trash context
+menus reject actions if the original session, profile, or lifecycle generation
+changes. Restore and permanent deletion never target a replacement selection.
+
+The reader shows retained ACP history, including events
+recorded before a switch to terminal view. Missing or unreadable event ranges
+trigger a global incomplete-history warning, even when no readable transcript
+rows remain. The reader does not import native agent history files: their formats
+and availability vary by agent and execution environment.
+Missing content and read failures are shown without restarting the agent.
+Destroyed tmux scrollback cannot be recovered by this reader.
 
 ### Launch command and session naming
 

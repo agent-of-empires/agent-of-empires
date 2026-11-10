@@ -65,7 +65,7 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
   let heldGets = 0;
-  await page.route("**/api/sessions", async (route) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, async (route) => {
     if (route.request().method() === "GET") {
       heldGets++;
       await gate;

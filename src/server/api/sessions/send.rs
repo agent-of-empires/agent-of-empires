@@ -533,9 +533,36 @@ fn default_output_format() -> String {
     "text".to_string()
 }
 
-enum CaptureError {
+pub(crate) enum CaptureError {
     NotRunning,
     Tmux(anyhow::Error),
+    /// The blocking capture task panicked.
+    Panicked(String),
+}
+
+/// The last `lines` lines of a terminal session's pane, with ANSI escapes stripped
+/// unless `ansi`.
+pub(crate) async fn capture_terminal_output(
+    instance: crate::session::Instance,
+    lines: usize,
+    ansi: bool,
+) -> Result<String, CaptureError> {
+    tokio::task::spawn_blocking(move || -> Result<String, CaptureError> {
+        let tmux_session = instance.tmux_session().map_err(CaptureError::Tmux)?;
+        if !tmux_session.exists() {
+            return Err(CaptureError::NotRunning);
+        }
+        let raw = tmux_session
+            .capture_pane(lines)
+            .map_err(CaptureError::Tmux)?;
+        if ansi {
+            Ok(raw)
+        } else {
+            Ok(crate::tmux::utils::strip_ansi(&raw))
+        }
+    })
+    .await
+    .unwrap_or_else(|e| Err(CaptureError::Panicked(e.to_string())))
 }
 
 pub async fn read_output(
@@ -568,24 +595,8 @@ pub async fn read_output(
         return bare_not_found();
     };
 
-    let capture_result = tokio::task::spawn_blocking(move || -> Result<String, CaptureError> {
-        let tmux_session = instance.tmux_session().map_err(CaptureError::Tmux)?;
-        if !tmux_session.exists() {
-            return Err(CaptureError::NotRunning);
-        }
-        let raw = tmux_session
-            .capture_pane(lines)
-            .map_err(CaptureError::Tmux)?;
-        if want_ansi {
-            Ok(raw)
-        } else {
-            Ok(crate::tmux::utils::strip_ansi(&raw))
-        }
-    })
-    .await;
-
-    match capture_result {
-        Ok(Ok(content)) => (
+    match capture_terminal_output(instance, lines, want_ansi).await {
+        Ok(content) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "id": id,
@@ -595,12 +606,12 @@ pub async fn read_output(
             })),
         )
             .into_response(),
-        Ok(Err(CaptureError::NotRunning)) => (
+        Err(CaptureError::NotRunning) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "session_not_running"})),
         )
             .into_response(),
-        Ok(Err(CaptureError::Tmux(e))) => {
+        Err(CaptureError::Tmux(e)) => {
             tracing::error!(target: "http.api.sessions", "read_output: tmux error for {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -608,7 +619,7 @@ pub async fn read_output(
             )
                 .into_response()
         }
-        Err(e) => {
+        Err(CaptureError::Panicked(e)) => {
             tracing::error!(target: "http.api.sessions", "read_output: blocking task panicked for {id}: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

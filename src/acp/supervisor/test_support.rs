@@ -84,6 +84,11 @@ impl<S: BroadcastSink> Supervisor<S> {
             .epoch()
     }
 
+    /// Admit a prompt without storing it, as `publish_user_prompt` does first.
+    pub(crate) fn test_note_admission(&self, session_id: &str) {
+        lock_recover(&self.lifecycle).note_admission(session_id);
+    }
+
     /// Occupy a slot with a fake worker already carrying what a real drain
     /// publishes before the assigned frame reaches the listener: the
     /// agent-assigned id, and the store the launch observed (#4127).
