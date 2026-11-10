@@ -1,11 +1,12 @@
 import type { RepoColor } from "./repoAppearance";
-import type { ProjectInfo, RepoGroup, SessionResponse, Workspace, WorkspaceStatus } from "./types";
+import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace, WorkspaceStatus } from "./types";
 import { isSessionActive } from "./session";
 import {
   compareWorkspacesByPluginSort,
   compareWorkspacesForComputedSortMode,
   type PluginSortContext,
   type SidebarSortMode,
+  statusAttentionRank,
   workspaceIsSunk,
 } from "./sidebarSort";
 import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
@@ -31,7 +32,7 @@ export interface SidebarWorkspaceView {
 
 export interface SidebarGroup {
   id: string;
-  kind: "repo" | "sessionGroup" | "org";
+  kind: "repo" | "sessionGroup" | "org" | "status";
   displayName: string;
   defaultDisplayName: string;
   alias: string | null;
@@ -100,6 +101,16 @@ function groupDisplayName(path: string): string {
   return path.split("/").join(" / ");
 }
 
+function workspaceComparator(opts: {
+  sortMode: SidebarSortMode;
+  pluginSort?: PluginSortContext;
+  pluginAttention?: ReadonlySet<string>;
+}): (a: Workspace, b: Workspace) => number {
+  return opts.pluginSort
+    ? compareWorkspacesByPluginSort(opts.pluginSort)
+    : compareWorkspacesForComputedSortMode(opts.sortMode, opts.pluginAttention);
+}
+
 // Split workspaces by per-session `group_path`; a workspace spanning groups appears once per group.
 export function buildSessionGroups(
   workspaces: Workspace[],
@@ -113,9 +124,7 @@ export function buildSessionGroups(
     isCollapsed: (groupId: string, groupPath: string) => boolean;
   },
 ): SidebarGroup[] {
-  const compareWorkspace = opts.pluginSort
-    ? compareWorkspacesByPluginSort(opts.pluginSort)
-    : compareWorkspacesForComputedSortMode(opts.sortMode, opts.pluginAttention);
+  const compareWorkspace = workspaceComparator(opts);
   const byGroup = new Map<string, SidebarWorkspaceView[]>();
   const order: string[] = [];
 
@@ -180,6 +189,71 @@ export function buildSessionGroups(
   });
 
   return groups;
+}
+
+export const statusGroupId = (status: string) => `status:${status}`;
+
+// Split workspaces by the status of each session; a workspace spanning statuses appears once per status.
+export function buildStatusGroups(
+  workspaces: Workspace[],
+  opts: {
+    idleDecayWindowMs: number;
+    sortMode: SidebarSortMode;
+    pluginSort?: PluginSortContext;
+    pluginAttention?: ReadonlySet<string>;
+    isCollapsed: (groupId: string) => boolean;
+  },
+): SidebarGroup[] {
+  const compareWorkspace = workspaceComparator(opts);
+  const byStatus = new Map<SessionStatus, SidebarWorkspaceView[]>();
+
+  for (const ws of workspaces) {
+    const sessionsByStatus = new Map<SessionStatus, SessionResponse[]>();
+    for (const session of ws.sessions) {
+      const existing = sessionsByStatus.get(session.status);
+      if (existing) existing.push(session);
+      else sessionsByStatus.set(session.status, [session]);
+    }
+
+    for (const [status, sessions] of sessionsByStatus) {
+      const sliced: Workspace = {
+        ...ws,
+        sessions,
+        status: sessions.some((s) => isSessionActive(s, opts.idleDecayWindowMs)) ? "active" : "idle",
+      };
+      const view: SidebarWorkspaceView = { key: `${status}::${ws.id}`, workspace: sliced };
+      const bucket = byStatus.get(status);
+      if (bucket) bucket.push(view);
+      else byStatus.set(status, [view]);
+    }
+  }
+
+  // The Attention sort's order, shared with the TUI and the Board's cards; ties fall
+  // back to the status spelling so unknown statuses still get a stable place.
+  const buckets = [...byStatus.entries()].sort(
+    ([a], [b]) => statusAttentionRank(a) - statusAttentionRank(b) || a.localeCompare(b),
+  );
+
+  return buckets.map(([status, views]) => {
+    views.sort((a, b) => compareWorkspace(a.workspace, b.workspace));
+    const id = statusGroupId(status);
+    return {
+      id,
+      kind: "status",
+      displayName: status,
+      defaultDisplayName: status,
+      alias: null,
+      color: null,
+      remoteOwnerKey: null,
+      workspaces: views,
+      status: views.some((v) => v.workspace.status === "active") ? "active" : "idle",
+      collapsed: opts.isCollapsed(id),
+      capabilities: { appearance: false, reorder: false, create: "generic" },
+      registeredProjects: [],
+      pinned: false,
+      pinnedEmpty: false,
+    };
+  });
 }
 
 export function sidebarGroupHasLiveWorkspace(group: SidebarGroup): boolean {

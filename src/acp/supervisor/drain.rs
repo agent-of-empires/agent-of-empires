@@ -17,9 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, publish_with_next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap,
-    SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, publish_next_persisted, publish_with_next_seq, BroadcastSink, Launcher,
+    PendingContextReset, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -112,9 +112,12 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
-            self.sink.publish(&self.session_id, seq, &event)
-        });
+        publish_next_persisted(
+            self.sink.as_ref(),
+            &self.next_seqs,
+            &self.session_id,
+            &event,
+        );
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
@@ -1441,6 +1444,48 @@ mod tests {
                 .count();
             assert_eq!(crash_messages, usize::from(expect_crash_message), "{id}");
         }
+    }
+
+    /// A runner drops its control channel when a frame write takes over 2 s,
+    /// so a stalled save must not stop the drain reading the next frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_event_save_does_not_stop_the_drain_reading_frames() {
+        let (sink, store, _rx, tmp) = channel_sink();
+        let sup = Supervisor::new(Arc::clone(&sink));
+        let id = "s-stalled-save";
+        let lease = sup.test_install_stdio(id).await;
+        let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(64);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let frames = 256;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..frames {
+                inbound_tx.send(Event::ThinkingStarted).await.unwrap();
+            }
+        })
+        .await;
+        blocker.execute_batch("COMMIT").unwrap();
+        sent.expect("the drain must keep reading frames while a save is stalled");
+
+        // Closing the stream lets the drain take every frame before the flush.
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must end once its stream closes")
+            .unwrap();
+        sink.flush();
+        let stored: Vec<u64> = store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, event)| matches!(event, Event::ThinkingStarted))
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(
+            stored,
+            (1..=frames).collect::<Vec<u64>>(),
+            "every frame is stored once, in order"
+        );
     }
 
     #[tokio::test]

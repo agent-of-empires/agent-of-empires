@@ -68,17 +68,63 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "BackgroundTaskFinished",
 ];
 
+/// Idle read connections kept open; concurrent reads beyond this open more.
+const MAX_IDLE_READERS: usize = 4;
+
 /// SQLite-backed structured view event log.
 pub struct EventStore {
     conn: Mutex<Connection>,
     /// Independent file-backed reader; private databases share `conn`.
     read_conn: Option<Mutex<Connection>>,
+    readers: Mutex<Vec<Connection>>,
+    db_path: std::path::PathBuf,
     schema: events::Schema,
     max_events_per_session: usize,
     #[cfg(test)]
     retained_read_gate: Mutex<Option<test_support::RetainedReadGate>>,
     #[cfg(any(test, debug_assertions))]
     _temp_directory: Option<tempfile::TempDir>,
+}
+
+fn open_reader(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open read-only handle at {}", db_path.display()))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .context("set query_only=ON on read handle")?;
+    conn.busy_timeout(std::time::Duration::from_millis(1000))
+        .context("set busy_timeout on read handle")?;
+    Ok(conn)
+}
+
+/// A pooled read connection, or the writer's when none could be opened.
+enum ReadConn<'a> {
+    Pooled(&'a EventStore, Option<Connection>),
+    Writer(MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Pooled(_, conn) => conn.as_ref().expect("held until drop"),
+            Self::Writer(guard) => guard,
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let Self::Pooled(store, conn) = self {
+            let mut idle = store.readers.lock().unwrap_or_else(|p| p.into_inner());
+            if idle.len() < MAX_IDLE_READERS {
+                idle.extend(conn.take());
+            }
+        }
+    }
 }
 
 impl EventStore {
@@ -96,18 +142,7 @@ impl EventStore {
         let read_conn = if private_database {
             None
         } else {
-            let reader = Connection::open_with_flags(
-                db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-            )
-            .with_context(|| format!("open read-only event handle at {}", db_path.display()))?;
-            reader
-                .pragma_update(None, "query_only", "ON")
-                .context("set query_only=ON on event reader")?;
-            reader
-                .busy_timeout(std::time::Duration::from_millis(1000))
-                .context("set busy_timeout on event reader")?;
-            Some(Mutex::new(reader))
+            Some(Mutex::new(open_reader(db_path)?))
         };
         debug!(
             target: "acp.event_store",
@@ -118,6 +153,8 @@ impl EventStore {
         Ok(Self {
             conn: Mutex::new(conn),
             read_conn,
+            readers: Mutex::new(Vec::new()),
+            db_path: db_path.to_path_buf(),
             schema,
             max_events_per_session,
             #[cfg(test)]
@@ -148,6 +185,20 @@ impl EventStore {
             .unwrap_or(&self.conn)
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+    /// A connection for read-only queries that does not wait on writes.
+    fn reader(&self) -> ReadConn<'_> {
+        if self.read_conn.is_none() {
+            return ReadConn::Writer(self.conn());
+        }
+        let idle = self.readers.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        match idle.map_or_else(|| open_reader(&self.db_path), Ok) {
+            Ok(conn) => ReadConn::Pooled(self, Some(conn)),
+            Err(e) => {
+                warn!(target: "acp.event_store", "read handle unavailable; reading on the writer: {e:#}");
+                ReadConn::Writer(self.conn())
+            }
+        }
     }
 
     /// Append one event (a duplicate seq is ignored), then prune past the retention cap.
@@ -190,6 +241,12 @@ impl EventStore {
     }
 
     /// Record with an explicit `created_at` (ms epoch) for recency-sensitive tests.
+    /// Hold the writer connection, as a slow save does.
+    #[cfg(test)]
+    pub(crate) fn hold_writer(&self) -> MutexGuard<'_, Connection> {
+        self.conn()
+    }
+
     #[cfg(test)]
     pub(crate) fn record_at(
         &self,
@@ -212,7 +269,7 @@ impl EventStore {
 
     /// Highest seq stored for `session_id`, or 0.
     pub fn highest_seq(&self, session_id: &str) -> u64 {
-        let max = events::highest_seq(&self.conn(), &self.schema, session_id);
+        let max = events::highest_seq(&self.reader(), &self.schema, session_id);
         trace!(
             target: "acp.event_store",
             session = %session_id,
@@ -224,7 +281,7 @@ impl EventStore {
 
     /// Lowest seq still stored for `session_id`, or `None` when nothing is.
     pub fn lowest_seq(&self, session_id: &str) -> Option<u64> {
-        let min = events::lowest_seq(&self.conn(), &self.schema, session_id);
+        let min = events::lowest_seq(&self.reader(), &self.schema, session_id);
         trace!(
             target: "acp.event_store",
             session = %session_id,
