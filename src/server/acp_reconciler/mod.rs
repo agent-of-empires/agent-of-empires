@@ -2203,6 +2203,7 @@ mod tests {
         assert_eq!(persisted.resume_intent, stopped.resume_intent);
         assert_eq!(persisted.acp_establishment, stopped.acp_establishment);
 
+        let mut publications = state.acp_events_tx.subscribe();
         let response = crate::server::api::sessions::start_session(
             State(Arc::clone(&state)),
             Path(id.to_string()),
@@ -2212,11 +2213,41 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         tick.run(&state).await;
+        let startup = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = publications.recv().await.expect("actual startup publication");
+                if frame.session_id == id
+                    && matches!(frame.event.as_ref(), Event::AgentStartupError { .. })
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("the explicit background attempt reports its real startup failure");
+        let Event::AgentStartupError { message, .. } = startup.event.as_ref() else {
+            unreachable!("selected the actual startup failure");
+        };
+        let expected_error = crate::acp::supervisor::SupervisorError::UnknownAgent(
+            stopped.agent_name.clone().expect("the fixture selects an unknown agent"),
+        )
+        .to_string();
+        assert!(
+            message.contains(&expected_error),
+            "explicit start must reach agent resolution, not a selection refusal: {message}"
+        );
         assert_eq!(
             test_fixtures::startup_errors(&state, id),
             1,
             "explicit start must retry the fake agent without a queued prompt"
         );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.acp_supervisor.worker_state(id).await != AcpWorkerState::Absent {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the explicit construction settles before checking the no-loop tick");
         tick.run(&state).await;
         assert_eq!(
             test_fixtures::startup_errors(&state, id),
