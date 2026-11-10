@@ -247,7 +247,7 @@ impl TranscriptModel {
     }
 
     /// Observe prefix lifecycle and context without rows, advancing the replay watermark.
-    pub fn observe_prior(
+    pub(crate) fn observe_prior(
         &mut self,
         seq: u64,
         event: &Event,
