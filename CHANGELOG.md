@@ -12,7 +12,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **session:** Keep OMP confirmation bindings identical in memory and storage while advancing only the matching launch's capture witness.
 - **session:** Reject stale capture snapshots before they reserve a restarted or replaced session, preserving its lifecycle generation and newly selected conversation.
 - **session:** Publish daemon capture commits through the canonical store before releasing Capture ownership; retain the existing global fail-closed metadata-health policy when a profile cannot open.
-- **session:** Accept unchanged preexisting dead panes in a complete handoff inventory, including tmux's empty dead-pane PID, while retaining strict structural IDs, socket, server, PID, and live-birth fencing.
 - **session:** Capture fresh terminal input from the canonical native row before queuing, preserving the original physical owner when a completed CLI start leads the daemon cache; keep registered readiness checks before delivery.
 
 ### Security
