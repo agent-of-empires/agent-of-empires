@@ -92,7 +92,7 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
 }
 
 /// Reconstruct the transcript for events with seq greater than `since_seq` into a compact,
-/// agent-readable form, keeping the last [`MAX_INPUT_BYTES`].
+/// agent-readable form, keeping the last `MAX_INPUT_BYTES`.
 pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {
     let (mut out, snapshot_seq, new_turns) = render_transcript_delta(events, since_seq);
     if out.len() > MAX_INPUT_BYTES {

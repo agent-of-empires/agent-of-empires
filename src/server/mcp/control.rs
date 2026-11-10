@@ -17,7 +17,7 @@ use crate::server::api::sessions::{
 };
 use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 use crate::server::session_service::{SendTurnError, SessionCaller};
-use crate::session::{Instance, Status, View};
+use crate::session::{Instance, Status, View, CAPTURE_FAILED_RULE};
 
 /// Transcript events read per `read_output` call; the caller pages on with `next_since`.
 const READ_PAGE: usize = 2000;
@@ -232,7 +232,7 @@ impl McpServer {
                             .to_string(),
                     ),
                 ),
-                PaneReadiness::NotYet => (
+                PaneReadiness::NotYet | PaneReadiness::Unreadable => (
                     false,
                     PromptDelivery::NotReady,
                     Some(format!(
@@ -327,8 +327,9 @@ impl McpServer {
         if self.terminal_pane_waiting(&id).await {
             return Err(tool_error(
                 "waiting",
-                "The agent is waiting on a dialog or question in its terminal; a person answers \
-                 it there. Nothing was typed.",
+                "The agent is waiting on a dialog or question in its terminal, or its pane could \
+                 not be read, so nothing was typed. A person answers a dialog there; retry once \
+                 the pane can be read.",
             ));
         }
         // No revival: a restarted agent can open on a dialog the check above never saw.
@@ -439,7 +440,8 @@ impl McpServer {
     }
 
     /// Whether a terminal session's pane shows a dialog or question waiting on a person, read
-    /// once, without waiting. A check that fails to run counts as waiting, so `send` refuses.
+    /// once, without waiting. A check that fails to run, or a pane that cannot be captured,
+    /// counts as waiting, so `send` refuses.
     async fn terminal_pane_waiting(&self, id: &str) -> bool {
         let instance = self
             .state
@@ -452,7 +454,7 @@ impl McpServer {
         let Some(instance) = instance else {
             return false;
         };
-        tokio::task::spawn_blocking(move || pane_readiness(&instance) == PaneReadiness::Waiting)
+        tokio::task::spawn_blocking(move || refuses_send(pane_readiness(&instance)))
             .await
             .unwrap_or(true)
     }
@@ -518,6 +520,8 @@ enum PaneReadiness {
     NotYet,
     /// The agent has no detection manifest, so nothing can show it is at its prompt.
     NoPromptRule,
+    /// The pane could not be captured, so nothing is known about it.
+    Unreadable,
     /// The session is gone, stopped or failed.
     Gone,
 }
@@ -540,16 +544,11 @@ async fn wait_for_input_prompt(
         let Some(instance) = instance else {
             return PaneReadiness::Gone;
         };
-        if matches!(
-            instance.status,
-            Status::Error | Status::Stopped | Status::Deleting
-        ) {
-            return PaneReadiness::Gone;
-        }
         let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
             .await
             .unwrap_or(PaneReadiness::NotYet);
-        if readiness != PaneReadiness::NotYet || tokio::time::Instant::now() >= deadline {
+        let settled = !matches!(readiness, PaneReadiness::NotYet | PaneReadiness::Unreadable);
+        if settled || tokio::time::Instant::now() >= deadline {
             return readiness;
         }
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
@@ -557,8 +556,15 @@ async fn wait_for_input_prompt(
 }
 
 /// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
-/// show` reads it.
+/// show` reads it. A stopped session is `Gone` before any capture, whose failure would read as
+/// `Unreadable`.
 fn pane_readiness(instance: &Instance) -> PaneReadiness {
+    if matches!(
+        instance.status,
+        Status::Error | Status::Stopped | Status::Deleting
+    ) {
+        return PaneReadiness::Gone;
+    }
     let Ok(session) = instance.tmux_session() else {
         return PaneReadiness::Gone;
     };
@@ -568,11 +574,20 @@ fn pane_readiness(instance: &Instance) -> PaneReadiness {
     readiness_of(instance.detect_pane_now(&instance.source_profile, &session, None))
 }
 
+/// MCP `send` types nowhere a person may be needed: a dialog, or a pane it could not read.
+fn refuses_send(readiness: PaneReadiness) -> bool {
+    matches!(
+        readiness,
+        PaneReadiness::Waiting | PaneReadiness::Unreadable
+    )
+}
+
 /// Only a rule that sees the prompt box counts as at the prompt: other idle rules (a finished
 /// turn, an interrupt banner, the pane title) also hold while a dialog is on screen.
 fn readiness_of(detected: Option<(Option<Status>, &str)>) -> PaneReadiness {
     match detected {
         None => PaneReadiness::NoPromptRule,
+        Some((_, CAPTURE_FAILED_RULE)) => PaneReadiness::Unreadable,
         Some((Some(Status::Waiting), _)) => PaneReadiness::Waiting,
         Some((Some(Status::Idle), "ready_prompt" | "live_prompt_box")) => PaneReadiness::AtPrompt,
         Some(_) => PaneReadiness::NotYet,
@@ -785,20 +800,30 @@ mod tests {
     #[test]
     fn only_a_prompt_box_rule_reads_as_at_the_prompt() {
         use PaneReadiness::*;
+        // (detected, readiness, whether MCP `send` refuses it)
         let cases = [
-            (None, NoPromptRule),
-            (Some((Some(Status::Waiting), "trust_dialog")), Waiting),
-            (Some((Some(Status::Idle), "ready_prompt")), AtPrompt),
-            (Some((Some(Status::Idle), "live_prompt_box")), AtPrompt),
-            (Some((Some(Status::Idle), "osc_title_idle")), NotYet),
-            (Some((Some(Status::Idle), "completed_turn")), NotYet),
-            (Some((Some(Status::Idle), "interrupt_banner")), NotYet),
-            (Some((Some(Status::Idle), "no_rule")), NotYet),
-            (Some((Some(Status::Running), "spinner")), NotYet),
-            (Some((None, "capture_failed")), NotYet),
+            (None, NoPromptRule, false),
+            (Some((Some(Status::Waiting), "trust_dialog")), Waiting, true),
+            (Some((Some(Status::Idle), "ready_prompt")), AtPrompt, false),
+            (
+                Some((Some(Status::Idle), "live_prompt_box")),
+                AtPrompt,
+                false,
+            ),
+            (Some((Some(Status::Idle), "osc_title_idle")), NotYet, false),
+            (Some((Some(Status::Idle), "completed_turn")), NotYet, false),
+            (
+                Some((Some(Status::Idle), "interrupt_banner")),
+                NotYet,
+                false,
+            ),
+            (Some((Some(Status::Idle), "no_rule")), NotYet, false),
+            (Some((Some(Status::Running), "spinner")), NotYet, false),
+            (Some((None, CAPTURE_FAILED_RULE)), Unreadable, true),
         ];
-        for (detected, want) in cases {
+        for (detected, want, refused) in cases {
             assert_eq!(readiness_of(detected), want, "{detected:?}");
+            assert_eq!(refuses_send(want), refused, "{want:?}");
         }
     }
 

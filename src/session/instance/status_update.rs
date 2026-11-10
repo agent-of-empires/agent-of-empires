@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// The rule [`Instance::detect_pane_now`] reports when the pane could not be captured.
+pub(crate) const CAPTURE_FAILED_RULE: &str = "capture_failed";
+
+/// The pane text to detect on: the fresh capture, else the caller's. `None` when neither
+/// exists, so a failed capture decides nothing rather than reading as an empty screen.
+fn detection_content<'a>(
+    fresh: Option<&'a str>,
+    reuse: Option<(&'a str, usize)>,
+) -> Option<&'a str> {
+    fresh.or(reuse.map(|(reused, _)| reused))
+}
+
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 fn skip_capture(
     activity: Option<i64>,
@@ -456,10 +468,8 @@ impl Instance {
             Some((_, lines)) if policy.scope.can_reuse(lines) => None,
             _ => session.capture_pane(policy.scope.lines()).ok(),
         };
-        let content = match (fresh.as_deref(), reuse) {
-            (Some(fresh), _) => fresh,
-            (None, Some((reused, _))) => reused,
-            (None, None) => return Some((None, "capture_failed")),
+        let Some(content) = detection_content(fresh.as_deref(), reuse) else {
+            return Some((None, CAPTURE_FAILED_RULE));
         };
         let hook =
             crate::hooks::read_hook_status(&self.id).map(|status| tmux::detect::HookObservation {
@@ -638,6 +648,19 @@ mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_failed_capture_falls_back_to_the_callers_or_to_nothing() {
+        let cases = [
+            (Some("fresh"), None, Some("fresh")),
+            (Some("fresh"), Some(("reused", 40)), Some("fresh")),
+            (None, Some(("reused", 40)), Some("reused")),
+            (None, None, None),
+        ];
+        for (fresh, reuse, want) in cases {
+            assert_eq!(detection_content(fresh, reuse), want, "{fresh:?} {reuse:?}");
+        }
+    }
 
     #[test]
     fn skip_capture_requires_an_unchanged_pane_captured_past_its_activity_second() {

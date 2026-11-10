@@ -871,7 +871,10 @@ async fn read_output_pages_text_by_rendered_size_without_skipping() {
     let first = call(&app, "read_output", json!({"session_id": huge})).await;
     let whole = first["text"].as_str().unwrap();
     assert!(whole.contains(&"y".repeat(60_000)), "{} bytes", whole.len());
-    assert!(!whole.contains("after"), "the next event shares the oversized page");
+    assert!(
+        !whole.contains("after"),
+        "the next event shares the oversized page"
+    );
     assert_eq!(first["next_since"], 1);
     assert_eq!(first["has_more"], true);
     let next = call(&app, "read_output", json!({"session_id": huge, "since": 1})).await;
