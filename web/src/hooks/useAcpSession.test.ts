@@ -329,6 +329,19 @@ describe("persisted state hydration", () => {
   });
 });
 
+describe("restart bookkeeping", () => {
+  it("records a restart's start and failure against the current epoch", async () => {
+    const { result } = await openSession("sess-restart");
+    act(() => result.current.markRestartStarted(0));
+    expect(result.current.state).toMatchObject({ restartInFlight: true, restartFailure: null });
+    act(() => result.current.markRestartFailed(0, "boom"));
+    expect(result.current.state.restartFailure).toBe("boom");
+    // An acknowledgement for an epoch that already moved on is ignored.
+    act(() => result.current.markRestartFailed(9, "stale"));
+    expect(result.current.state.restartFailure).toBe("boom");
+  });
+});
+
 describe("lightweight control projection", () => {
   it("keeps full background-agent details through reconnect without replayed agent events", async () => {
     const sid = "sess-web-agents";

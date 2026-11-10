@@ -568,9 +568,6 @@ export interface AcpState {
   restartInFlight: boolean;
   /** Counts restarts ended by assignment, startup error or another stop, so a late acknowledgement is ignored. */
   restartEpoch: number;
-  /** A restart stopped the sent prompt and it hasn't been sent again. Kept here because the restart's stop
-   *  unmounts the startup line before the restart answers. Not persisted. */
-  restartStoppedSent: boolean;
   /** Why a restart failed after its stop, which unmounts the startup line; the stopped banner shows it. Not persisted. */
   restartFailure: string | null;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
@@ -917,7 +914,6 @@ export function emptyAcpState(): AcpState {
     sessionAssigned: false,
     restartInFlight: false,
     restartEpoch: 0,
-    restartStoppedSent: false,
     restartFailure: null,
     oldestSeq: 0,
     lagged: false,
@@ -1196,7 +1192,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("UserPromptSent" in event) {
-    next.restartStoppedSent = false;
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);

@@ -55,8 +55,8 @@ export type Action =
   | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
-  | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
-  | { kind: "restart_failed"; epoch: number; message: string; stoppedSent: boolean }
+  | { kind: "restart_started"; epoch: number }
+  | { kind: "restart_failed"; epoch: number; message: string }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -282,26 +282,19 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "dismiss_primer":
       return { ...state, contextPrimerAvailable: null };
     case "restart_started":
-      // The restart already ended when `epoch` moved on; its replacement's stops are real, but its stop still stopped the sent prompt.
-      if (action.epoch !== state.restartEpoch)
-        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+      // The restart already ended when `epoch` moved on; its replacement's stops are real.
+      if (action.epoch !== state.restartEpoch) return state;
       // The stop this restart caused may already be applied; it isn't the Worker stopping.
       return {
         ...state,
         workerStopped: false,
         workerRestarting: false,
         restartInFlight: true,
-        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
         restartFailure: null,
       };
     case "restart_failed":
-      if (action.epoch !== state.restartEpoch)
-        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
-      return {
-        ...state,
-        restartFailure: action.message,
-        restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
-      };
+      if (action.epoch !== state.restartEpoch) return state;
+      return { ...state, restartFailure: action.message };
     case "dismiss_compaction_reminder":
       return { ...state, compactionReminderDismissed: state.sessionUsage };
     case "dismiss_rejected_prompt":

@@ -50,6 +50,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
             respawned_in_place: Arc::clone(&self.respawned_in_place),
+            unassigned_prompts: Arc::clone(&self.unassigned_prompts),
         };
         crate::task_util::spawn_supervised(
             "supervisor.drain",
@@ -73,6 +74,7 @@ struct Drain<S> {
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
+    unassigned_prompts: super::UnassignedPrompts,
 }
 
 impl<S> Drain<S> {
@@ -181,6 +183,7 @@ impl<S: BroadcastSink> Drain<S> {
                 },
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
                 Event::AcpSessionAssigned { acp_session_id } => {
+                    lock_recover(&self.unassigned_prompts).remove(&self.session_id);
                     if let Some(pending) = self.context_reset.take() {
                         publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
                             self.sink.publish_from_worker(
@@ -664,6 +667,9 @@ impl<S: BroadcastSink> Drain<S> {
                         handle.client = Arc::clone(&client);
                         handle.lease = respawn_lease.clone();
                         handle.native_session_id = None;
+                        lock_recover(&self.unassigned_prompts)
+                            .entry(self.session_id.clone())
+                            .or_default();
                         None
                     }
                     None => Some(InstallError::Stale),

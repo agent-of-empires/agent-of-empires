@@ -670,6 +670,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             self.detach_orphaned_background_agents(session_id);
             (Vec::new(), Vec::new())
         };
+        {
+            let mut unassigned = lock_recover(&self.unassigned_prompts);
+            if matches!(kind, WorkerKind::Attached) {
+                unassigned.remove(session_id);
+            } else {
+                unassigned.insert(session_id.to_string(), Vec::new());
+            }
+        }
         if context_reset.is_some() {
             lock_recover(&self.pending_context_resets).insert(session_id.to_string());
         }

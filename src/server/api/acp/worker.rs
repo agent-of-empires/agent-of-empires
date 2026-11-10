@@ -383,9 +383,10 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         return response;
     }
 
+    let stop_reason = state.acp_supervisor.restart_stop_reason(&id);
     let stop_request = state
         .acp_supervisor
-        .begin_stop_request(&id, "user_stopped", None, false)
+        .begin_stop_request(&id, stop_reason, None, false)
         .await;
     let was_resuming = stop_request.cancelled_launch();
     // A running worker must finish its current submission before restart
@@ -405,13 +406,20 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     };
     // The stop request shares the installation gate, so a launch either gets
     // cancelled here or is observed as running and stopped after the barrier.
+    let mut handoff = PromptHandoff::new(&state, &id);
     if was_resuming {
-        if let Err(e) = state
+        match state
             .acp_supervisor
-            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+            .shutdown_and_wait_for_restart(
+                &id,
+                stop_reason,
+                std::time::Duration::from_secs(5),
+                &restart,
+            )
             .await
         {
-            return supervisor_error_response("restart shutdown failed", &e);
+            Ok(prompts) => handoff.prompts.extend(prompts),
+            Err(e) => return supervisor_error_response("restart shutdown failed", &e),
         }
     }
 
@@ -466,13 +474,22 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         );
     }
     // Running workers are stopped only after the submission barrier is held.
+    // Re-read the reason: a prompt admitted while waiting on the barrier may
+    // have enqueued itself since the early read.
     if !was_resuming {
-        if let Err(e) = state
+        let stop_reason = state.acp_supervisor.restart_stop_reason(&id);
+        match state
             .acp_supervisor
-            .shutdown_and_wait_for_restart(&id, std::time::Duration::from_secs(5), &restart)
+            .shutdown_and_wait_for_restart(
+                &id,
+                stop_reason,
+                std::time::Duration::from_secs(5),
+                &restart,
+            )
             .await
         {
-            return supervisor_error_response("restart shutdown failed", &e);
+            Ok(prompts) => handoff.prompts.extend(prompts),
+            Err(e) => return supervisor_error_response("restart shutdown failed", &e),
         }
     }
     if restart.is_cancelled() {
@@ -599,6 +616,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         );
     }
     drop(exclusion);
+    handoff.hold_new_prompts().await;
     match state
         .acp_supervisor
         .spawn_for_restart(
@@ -608,13 +626,62 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
         )
         .await
     {
-        Ok(()) => Json(SpawnAcpResponse {
-            session_id: id,
-            agent,
-            status: "running",
-        })
-        .into_response(),
+        Ok(()) => {
+            if !restart.is_cancelled() {
+                handoff.deliver().await;
+            }
+            Json(SpawnAcpResponse {
+                session_id: id,
+                agent,
+                status: "running",
+            })
+            .into_response()
+        }
         Err(e) => supervisor_error_response("restart spawn failed", &e),
+    }
+}
+
+/// Prompts accepted before the old worker's session existed. Their turns stay
+/// open across the restart; any that are not redelivered end as stopped.
+struct PromptHandoff {
+    supervisor: Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    id: String,
+    prompts: Vec<crate::acp::supervisor::UnassignedPrompt>,
+    /// Keeps newer prompts behind the carried ones until delivery finishes.
+    gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl PromptHandoff {
+    fn new(state: &AppState, id: &str) -> Self {
+        Self {
+            supervisor: Arc::clone(&state.acp_supervisor),
+            id: id.to_string(),
+            prompts: Vec::new(),
+            gate: None,
+        }
+    }
+
+    async fn hold_new_prompts(&mut self) {
+        if !self.prompts.is_empty() {
+            self.gate = Some(self.supervisor.hold_prompts_for_handoff(&self.id).await);
+        }
+    }
+
+    async fn deliver(&mut self) {
+        let prompts = std::mem::take(&mut self.prompts);
+        if let Err(error) = self.supervisor.redeliver_prompts(&self.id, prompts).await {
+            tracing::warn!(target: "server.acp", session = %self.id, %error,
+                "restart could not redeliver queued prompts");
+            self.supervisor.publish_stopped_after_handoff(&self.id);
+        }
+    }
+}
+
+impl Drop for PromptHandoff {
+    fn drop(&mut self) {
+        if !self.prompts.is_empty() {
+            self.supervisor.publish_stopped_after_handoff(&self.id);
+        }
     }
 }
 
@@ -2660,6 +2727,374 @@ mod tests {
             .expect("stopped replacement releases restart")
             .expect("restart task panicked");
         assert_eq!(restart_response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_hands_prompts_accepted_before_session_assignment_to_the_replacement() {
+        #[derive(Clone, Copy)]
+        enum Replacement {
+            Starts,
+            // Holds its prompts until its session is assigned.
+            Stalls,
+            FailsToStart,
+            // Starts, but every command fails.
+            DeadConnection,
+        }
+        let image = || crate::acp::event_store::AttachmentBlob {
+            id: "att-1".into(),
+            kind: crate::daemon::PromptAttachmentKind::Image,
+            mime_type: "image/png".into(),
+            name: None,
+            data: b"png".to_vec(),
+        };
+        let carried = || {
+            vec![
+                ("first".to_string(), vec![]),
+                ("second".to_string(), vec!["image/png:cG5n".to_string()]),
+            ]
+        };
+        // (name, assigned before restart, force-ended before restart, replacement,
+        // expected replacement prompts, expected Stopped reasons)
+        let cases = [
+            (
+                "unassigned prompts are carried over",
+                false,
+                false,
+                Replacement::Starts,
+                carried(),
+                vec![],
+            ),
+            (
+                "carried prompts wait for the replacement session",
+                false,
+                false,
+                Replacement::Stalls,
+                carried(),
+                vec![],
+            ),
+            (
+                "assigned worker replays nothing",
+                true,
+                false,
+                Replacement::Starts,
+                vec![],
+                vec!["user_stopped"],
+            ),
+            (
+                "replacement fails to start",
+                false,
+                false,
+                Replacement::FailsToStart,
+                vec![],
+                vec!["user_stopped"],
+            ),
+            (
+                "redelivery fails on the first carried prompt",
+                false,
+                false,
+                Replacement::DeadConnection,
+                vec![],
+                vec!["user_stopped"],
+            ),
+            (
+                "a force-ended prompt is retired, a later one is carried",
+                false,
+                true,
+                Replacement::Starts,
+                vec![("after".to_string(), vec![])],
+                vec!["user_forced"],
+            ),
+        ];
+        for (name, assigned, force_ended, replacement, expected_prompts, expected_stopped) in cases
+        {
+            let _home = crate::session::test_support::isolate_app_dir();
+            let mut instance = crate::session::Instance::new("restart-handoff", "/tmp/aoe-handoff");
+            instance.view = crate::session::View::Structured;
+            instance.agent_name = Some("claude".into());
+            instance.source_profile = "default".into();
+            let id = instance.id.clone();
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![instance.clone()],
+            );
+
+            let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let first_events = Arc::new(std::sync::Mutex::new(None));
+            let replacement_events = Arc::new(std::sync::Mutex::new(None));
+            let replacement_prompts = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let replacement_received = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let released = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            if matches!(replacement, Replacement::Stalls) {
+                released.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            let launcher: crate::acp::supervisor::Launcher = {
+                let released = Arc::clone(&released);
+                let first_events = Arc::clone(&first_events);
+                let replacement_prompts = Arc::clone(&replacement_prompts);
+                let replacement_received = Arc::clone(&replacement_received);
+                let replacement_events = Arc::clone(&replacement_events);
+                Arc::new(move |_config, session_id| {
+                    let released = Arc::clone(&released);
+                    let launch = launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let first_events = Arc::clone(&first_events);
+                    let replacement_prompts = Arc::clone(&replacement_prompts);
+                    let replacement_received = Arc::clone(&replacement_received);
+                    let replacement_events = Arc::clone(&replacement_events);
+                    Box::pin(async move {
+                        use crate::acp::acp_client::{AcpClient, AcpError};
+                        if launch == 0 {
+                            let (client, events) = AcpClient::fake_for_test_prompt_recording(
+                                session_id,
+                                Arc::default(),
+                                Arc::default(),
+                                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                            );
+                            *first_events.lock().unwrap() = Some(events);
+                            return Ok(client);
+                        }
+                        match replacement {
+                            Replacement::Starts | Replacement::Stalls => {
+                                let (client, events) = AcpClient::fake_for_test_prompt_recording(
+                                    session_id,
+                                    replacement_prompts,
+                                    replacement_received,
+                                    released,
+                                );
+                                *replacement_events.lock().unwrap() = Some(events);
+                                Ok(client)
+                            }
+                            Replacement::FailsToStart => {
+                                Err(AcpError::Spawn("replacement refused".into()))
+                            }
+                            Replacement::DeadConnection => {
+                                let (client, events) =
+                                    AcpClient::fake_for_test_dead_commands(session_id);
+                                *replacement_events.lock().unwrap() = Some(events);
+                                Ok(client)
+                            }
+                        }
+                    })
+                })
+            };
+            let state = crate::server::test_support::build_test_app_state_with_launcher(
+                vec![instance],
+                launcher,
+            );
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let spawned = spawn_acp(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(SpawnAcpRequest {
+                    agent: None,
+                    model: None,
+                    additional_dirs: Vec::new(),
+                    provider_env: Vec::new(),
+                })),
+            )
+            .await
+            .into_response();
+            assert!(spawned.status().is_success(), "{name}: initial spawn");
+            for (text, attachments) in [("first", vec![]), ("second", vec![image()])] {
+                state
+                    .acp_supervisor
+                    .send_prompt(&id, text, &attachments)
+                    .await
+                    .unwrap();
+            }
+            if force_ended {
+                state.acp_supervisor.force_end_turn(&id).await;
+                state
+                    .acp_supervisor
+                    .send_prompt(&id, "after", &[])
+                    .await
+                    .unwrap();
+            }
+            if assigned {
+                let events = first_events.lock().unwrap().clone().expect("first worker");
+                events
+                    .send(crate::acp::state::Event::AcpSessionAssigned {
+                        acp_session_id: "native".into(),
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while !state
+                        .acp_event_store
+                        .replay_from(&id, 0)
+                        .iter()
+                        .any(|(_, e)| {
+                            matches!(e, crate::acp::state::Event::AcpSessionAssigned { .. })
+                        })
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{name}: drain never observed the assignment"));
+            }
+
+            let response = restart_acp(
+                State(Arc::clone(&state)),
+                Path(id.clone()),
+                Ok(Json(SpawnAcpRequest {
+                    agent: None,
+                    model: None,
+                    additional_dirs: Vec::new(),
+                    provider_env: Vec::new(),
+                })),
+            )
+            .await
+            .into_response();
+            let expect_ok = !matches!(replacement, Replacement::FailsToStart);
+            assert_eq!(response.status().is_success(), expect_ok, "{name}");
+
+            if matches!(replacement, Replacement::Starts | Replacement::Stalls) {
+                // Commands are FIFO, so the flush acks after every carried prompt arrived.
+                state.acp_supervisor.test_flush_worker_commands(&id).await;
+            }
+            if matches!(replacement, Replacement::Stalls) {
+                assert!(
+                    replacement_prompts.lock().unwrap().is_empty(),
+                    "{name}: prompt ran before the session was assigned"
+                );
+                assert_eq!(
+                    *replacement_received.lock().unwrap(),
+                    expected_prompts,
+                    "{name}: carried prompts reach the adapter once and in order"
+                );
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                let events = replacement_events
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("replacement worker");
+                events
+                    .send(crate::acp::state::Event::AcpSessionAssigned {
+                        acp_session_id: "native-2".into(),
+                    })
+                    .await
+                    .unwrap();
+                state.acp_supervisor.test_flush_worker_commands(&id).await;
+            }
+            assert_eq!(
+                *replacement_prompts.lock().unwrap(),
+                expected_prompts,
+                "{name}"
+            );
+            let stopped: Vec<String> = state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .into_iter()
+                .filter_map(|(_, e)| match e {
+                    crate::acp::state::Event::Stopped { reason } => Some(reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(stopped, expected_stopped, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_carries_a_prompt_admitted_while_it_waits_on_the_submission_barrier() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut instance = crate::session::Instance::new("restart-late", "/tmp/aoe-restart-late");
+        instance.view = crate::session::View::Structured;
+        instance.agent_name = Some("claude".into());
+        instance.source_profile = "default".into();
+        let id = instance.id.clone();
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![instance.clone()],
+        );
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Dropping an event sender would end the worker.
+        let event_senders = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launcher: crate::acp::supervisor::Launcher = {
+            let received = Arc::clone(&received);
+            Arc::new(move |_config, session_id| {
+                let replacement = launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+                let received = Arc::clone(&received);
+                let event_senders = Arc::clone(&event_senders);
+                Box::pin(async move {
+                    let log = if replacement {
+                        received
+                    } else {
+                        Arc::default()
+                    };
+                    let (client, events) =
+                        crate::acp::acp_client::AcpClient::fake_for_test_prompt_recording(
+                            session_id,
+                            Arc::default(),
+                            log,
+                            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                        );
+                    event_senders.lock().unwrap().push(events);
+                    Ok(client)
+                })
+            })
+        };
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![instance],
+            launcher,
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let request = || SpawnAcpRequest {
+            agent: None,
+            model: None,
+            additional_dirs: Vec::new(),
+            provider_env: Vec::new(),
+        };
+        let spawned = spawn_acp(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(request())),
+        )
+        .await
+        .into_response();
+        assert!(spawned.status().is_success(), "initial spawn");
+
+        let submission = state.session_service.prompt_submission(&id).await;
+        let mut claims = state.session_service.watch_submission_claims();
+        let restarting = {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            tokio::spawn(async move {
+                restart_acp(State(state), Path(id), Ok(Json(request())))
+                    .await
+                    .into_response()
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(3), claims.recv())
+            .await
+            .expect("restart reaches the submission barrier");
+        // The restart read its stop reason before this prompt existed.
+        state
+            .acp_supervisor
+            .send_prompt(&id, "late", &[])
+            .await
+            .unwrap();
+        drop(submission);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), restarting)
+            .await
+            .expect("restart completes")
+            .expect("restart task panicked");
+        assert!(response.status().is_success());
+
+        state.acp_supervisor.test_flush_worker_commands(&id).await;
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec![("late".to_string(), vec![])]
+        );
+        let stopped = state
+            .acp_event_store
+            .replay_from(&id, 0)
+            .into_iter()
+            .filter(|(_, e)| matches!(e, crate::acp::state::Event::Stopped { .. }))
+            .count();
+        assert_eq!(stopped, 0, "the carried prompt's turn must not be stopped");
     }
 
     #[tokio::test]

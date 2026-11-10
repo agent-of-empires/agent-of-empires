@@ -7,7 +7,8 @@ use tracing::{debug, info, warn};
 
 use super::launch::{apply_mode, set_spawn_model};
 use super::{
-    lock_recover, BroadcastSink, Supervisor, SupervisorError, WorkerKind, WORKER_READY_TIMEOUT,
+    lock_recover, BroadcastSink, Supervisor, SupervisorError, UnassignedPrompt, WorkerKind,
+    RESTART_HANDOFF_STOP_REASON, WORKER_READY_TIMEOUT,
 };
 use crate::acp::acp_client::{AcpClient, AcpError, ResetSessionOutcome};
 use crate::acp::approvals::{ApprovalDecision, Nonce};
@@ -100,8 +101,79 @@ impl<S: BroadcastSink> Supervisor<S> {
         text: &str,
         attachments: &[AttachmentBlob],
     ) -> Result<(), SupervisorError> {
+        let gate = lock_recover(&self.handoff_gates).get(session_id).cloned();
+        if let Some(gate) = gate {
+            drop(gate.lock().await);
+        }
+        self.send_prompt_ungated(session_id, text, attachments)
+            .await
+    }
+
+    async fn send_prompt_ungated(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[AttachmentBlob],
+    ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.send_prompt(text, attachments).await?;
+        if let Some(queued) = lock_recover(&self.unassigned_prompts).get_mut(session_id) {
+            queued.push(UnassignedPrompt {
+                text: text.to_string(),
+                attachments: attachments.to_vec(),
+            });
+        }
+        if let Err(error) = client.send_prompt(text, attachments).await {
+            if let Some(queued) = lock_recover(&self.unassigned_prompts).get_mut(session_id) {
+                queued.pop();
+            }
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn take_unassigned_prompts(&self, session_id: &str) -> Vec<UnassignedPrompt> {
+        lock_recover(&self.unassigned_prompts)
+            .remove(session_id)
+            .unwrap_or_default()
+    }
+
+    /// Hold new prompts for the session until the guard drops, so a restart's
+    /// carried prompts reach the replacement first.
+    pub(crate) async fn hold_prompts_for_handoff(
+        &self,
+        session_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = Arc::clone(
+            lock_recover(&self.handoff_gates)
+                .entry(session_id.to_string())
+                .or_default(),
+        );
+        gate.lock_owned().await
+    }
+
+    /// Why a restart stops the worker: `RESTART_HANDOFF_STOP_REASON` when prompts await
+    /// carrying, which defers their `Stopped` to the restart.
+    pub(crate) fn restart_stop_reason(&self, session_id: &str) -> &'static str {
+        let carrying = lock_recover(&self.unassigned_prompts)
+            .get(session_id)
+            .is_some_and(|queued| !queued.is_empty());
+        if carrying {
+            RESTART_HANDOFF_STOP_REASON
+        } else {
+            "user_stopped"
+        }
+    }
+
+    /// Forward prompts a restart carried over, in order, to the replacement worker.
+    pub(crate) async fn redeliver_prompts(
+        &self,
+        session_id: &str,
+        prompts: Vec<UnassignedPrompt>,
+    ) -> Result<(), SupervisorError> {
+        for prompt in prompts {
+            self.send_prompt_ungated(session_id, &prompt.text, &prompt.attachments)
+                .await?;
+        }
         Ok(())
     }
 
@@ -168,6 +240,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if let Err(error) = delivered {
             warn!(target: "acp.supervisor", session = %session_id, %error, "force stop: cancel not delivered");
+        }
+        // Held across the publish so a prompt is either ended by this Stopped
+        // and dropped here, or admitted after it and kept for a restart.
+        let mut unassigned = lock_recover(&self.unassigned_prompts);
+        if let Some(queued) = unassigned.get_mut(session_id) {
+            queued.clear();
         }
         self.publish_next(
             session_id,

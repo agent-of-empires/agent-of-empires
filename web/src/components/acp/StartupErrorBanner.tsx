@@ -144,14 +144,11 @@ export function StartupErrorBanner({
   sessionId,
   message,
   acpWorkerState,
-  sentStopped = false,
   onSwitchToTerminal,
 }: {
   sessionId: string;
   message: string;
   acpWorkerState: AcpWorkerState;
-  /** A restart stopped the sent message and it hasn't been sent again. */
-  sentStopped?: boolean;
   /** Opens the switch-view confirmation; omitted where the Session can't switch. */
   onSwitchToTerminal?: () => void;
 }) {
@@ -253,11 +250,6 @@ export function StartupErrorBanner({
         secondary={[...(canInstall ? [retryAction] : []), ...switchAction]}
         install={install}
       />
-      {sentStopped && (
-        <div data-testid="startup-error-banner-sent-stopped" className="mt-2 text-xs text-text-subtle">
-          The message you sent was stopped. Send it again once {name} is ready.
-        </div>
-      )}
       {retryState === "ok" && (
         <div className="mt-2 text-xs text-text-subtle">Retrying. Events will appear when {name} starts.</div>
       )}
