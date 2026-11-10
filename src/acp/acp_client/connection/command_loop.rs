@@ -66,6 +66,8 @@ pub(super) struct Session {
 
 impl Session {
     pub(super) async fn send_cancel(&self) -> Result<(), agent_client_protocol::Error> {
+        #[cfg(test)]
+        let _gate = self.shared.cancel_send_gate.read().await;
         match self.control.as_ref() {
             Some(control) => {
                 control.cancel().await;
@@ -173,8 +175,9 @@ impl Session {
                         && shared.prompt_in_flight.load(Ordering::Relaxed)
                         && !shared.terminal_claim.claimed()
                     {
-                        self.send_cancel().await?;
+                        // Arm first: a control loss during the send keeps the deadline.
                         self.request_cancel().await;
+                        self.send_cancel().await?;
                         continue;
                     }
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");

@@ -476,7 +476,7 @@ impl<S: BroadcastSink> Drain<S> {
                 (recovery.loss, recovery.attempts)
             }
             Some(recovery) => {
-                self.report_control_loss(recovery.loss);
+                self.report_control_loss(&client, recovery.loss);
                 return None;
             }
             None => (observed?, 0),
@@ -490,17 +490,18 @@ impl<S: BroadcastSink> Drain<S> {
                 Some(inbound)
             }
             None => {
-                self.report_control_loss(loss);
+                self.report_control_loss(&client, loss);
                 None
             }
         }
     }
 
-    fn report_control_loss(&self, loss: ControlLoss) {
+    fn report_control_loss(&self, client: &AcpClient, loss: ControlLoss) {
         if worker_registry::stop_requested(&self.session_id) {
             return;
         }
-        if loss.turn_in_flight {
+        // A completion published before the channel closed already ended the turn.
+        if client.claim_lost_turn(loss) {
             self.publish(Event::Stopped {
                 reason: "runner_control_lost".into(),
             });

@@ -356,6 +356,13 @@ async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
         })
         .await
         .expect("the transport must close while terminal publication is backpressured");
+        // EOF may still snapshot the turn as active; if recovery then fails,
+        // the fallback must not end the claimed turn a second time.
+        let loss = control::ControlLoss {
+            turn_in_flight: true,
+            ..first.control_loss().unwrap()
+        };
+        assert!(!first.claim_lost_turn(loss));
         let mut terminals = 0;
         let mut rate_limits = 0;
         timeout(Duration::from_secs(5), async {
@@ -385,6 +392,19 @@ async fn terminal_publication_survives_eof_while_the_event_channel_is_full() {
         assert_eq!(rate_limits, usize::from(limited));
         next.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn unfinished_lost_turn_is_claimed_once_by_the_fallback() {
+    let _env = crate::session::test_support::EnvGuard::read_lock();
+    let mut runner = Runner::new();
+    let mut first = runner.attach(false).await;
+    first.send_prompt("run", &[]).await.unwrap();
+    assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
+    runner.disconnect(&mut first).await;
+    let loss = first.control_loss().unwrap();
+    assert!(first.claim_lost_turn(loss));
+    assert!(!first.claim_lost_turn(loss), "one terminal per turn");
 }
 
 #[tokio::test]
@@ -433,6 +453,80 @@ async fn cancelling_turn_recovers_with_only_the_original_grace_remaining() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// A control loss while the first cancel is still being sent keeps its
+/// escalation: the recovered turn ends at the original deadline.
+#[tokio::test]
+async fn cancel_armed_before_its_send_survives_control_loss_mid_send() {
+    #[derive(Debug, Clone, Copy)]
+    enum Cancel {
+        Local,
+        Adopted,
+        SilentOrphan,
+    }
+    for case in [Cancel::Local, Cancel::Adopted, Cancel::SilentOrphan] {
+        let _env = match case {
+            Cancel::SilentOrphan => crate::session::test_support::EnvGuard::set(&[
+                ("AOE_SILENT_ORPHAN_GRACE_MS", "50"),
+                ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "10"),
+            ]),
+            Cancel::Local | Cancel::Adopted => crate::session::test_support::EnvGuard::read_lock(),
+        };
+        let mut runner = Runner::new();
+        let mut first = runner.attach(matches!(case, Cancel::Adopted)).await;
+        let state = Arc::clone(&first.reattach.as_ref().unwrap().state);
+        let gate = state.cancel_send_gate.write().await;
+        if !matches!(case, Cancel::Adopted) {
+            first.send_prompt("run", &[]).await.unwrap();
+            assert!(matches!(runner.frame().await, ControlBody::Prompt { .. }));
+        }
+        match case {
+            Cancel::SilentOrphan => {
+                runner
+                    .send(ControlBody::Notify {
+                        method: "session/update".into(),
+                        params: serde_json::json!({"sessionId": "native", "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "progress"}
+                        }}),
+                    })
+                    .await;
+            }
+            Cancel::Local | Cancel::Adopted => first.cancel_prompt().await.unwrap(),
+        }
+        let deadline = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(deadline) = *state.cancel_deadline.lock().unwrap() {
+                    return deadline;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{case:?}: no deadline while the cancel send is held"));
+        while let Ok(frame) = runner.frames.try_recv() {
+            assert!(
+                !matches!(frame, ControlBody::Cancel),
+                "{case:?}: the held cancel must not reach the runner"
+            );
+        }
+        // Only the Tokio cancellation timer affects the grace assertion.
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::resume();
+        runner.disconnect(&mut first).await;
+        drop(gate);
+        let mut next = runner.recover(&first, true).await;
+        next.test_flush_commands().await;
+        assert!(
+            tokio::time::timeout_at(deadline - Duration::from_millis(1), next.next_event())
+                .await
+                .is_err(),
+            "{case:?}: recovery must retain the remaining grace"
+        );
+        assert_eq!(stopped(&mut next).await, "agent_unresponsive", "{case:?}");
+    }
 }
 
 #[tokio::test]

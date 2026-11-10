@@ -151,6 +151,9 @@ struct SessionState {
     terminal_claim: Arc<TerminalClaim>,
     cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
     rate_limit_rejections: Arc<std::sync::Mutex<HashMap<String, i64>>>,
+    /// Holding its write lock stalls every cancel send.
+    #[cfg(test)]
+    cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl Default for SessionState {
@@ -160,6 +163,8 @@ impl Default for SessionState {
             terminal_claim: Arc::new(TerminalClaim::new()),
             cancel_deadline: Arc::default(),
             rate_limit_rejections: Arc::default(),
+            #[cfg(test)]
+            cancel_send_gate: Arc::default(),
         }
     }
 }
@@ -776,6 +781,16 @@ impl AcpClient {
     /// Set once the runner side ended this client's control channel.
     pub(crate) fn control_loss(&self) -> Option<control::ControlLoss> {
         self.control_loss.as_ref()?.get().copied()
+    }
+
+    /// Claims the terminal of the turn `loss` left in flight. `false` when no
+    /// turn was in flight or a path that survived the loss already published it.
+    pub(crate) fn claim_lost_turn(&self, loss: control::ControlLoss) -> bool {
+        loss.turn_in_flight
+            && self
+                .reattach
+                .as_ref()
+                .is_none_or(|spec| spec.state.terminal_claim.claim())
     }
 
     /// Dial the same runner again after [`Self::control_loss`]. Ready before

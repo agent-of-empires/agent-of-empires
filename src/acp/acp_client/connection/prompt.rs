@@ -412,11 +412,12 @@ impl Session {
         match cmd {
             Some(ClientCmd::Cancel) => {
                 info!(target: "acp.protocol", "sending session/cancel during in-flight prompt");
-                self.send_cancel().await?;
-                // Only the first cancel arms escalation and tells the UI.
+                // Only the first cancel arms escalation and tells the UI. Arm it
+                // before the send, so a control loss during it keeps the deadline.
                 if !turn.flags.cancelling {
                     turn.start_cancel_grace(self.request_cancel().await);
                 }
+                self.send_cancel().await?;
             }
             Some(ClientCmd::ForceStop) => {
                 warn!(
@@ -564,6 +565,12 @@ impl Session {
                 "silent-orphan watchdog fired: no progress past grace and no in-flight tools; sending session/cancel"
             );
             turn.flags.prompt_orphaned = true;
+            // Armed before the send, like a user cancel, without telling the UI.
+            if !turn.flags.cancelling {
+                let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
+                *self.shared.cancel_deadline.lock().unwrap() = Some(deadline);
+                turn.start_cancel_grace(deadline);
+            }
             if let Err(err) = self.send_cancel().await {
                 warn!(
                     target: "acp.protocol",
@@ -575,11 +582,6 @@ impl Session {
                 return Flow::Break;
             }
             turn.flags.orphan_cancel_sent = true;
-            if !turn.flags.cancelling {
-                let deadline = Instant::now() + CANCEL_ESCALATION_GRACE;
-                *self.shared.cancel_deadline.lock().unwrap() = Some(deadline);
-                turn.start_cancel_grace(deadline);
-            }
         }
         let next = Instant::now() + turn.orphan_check_period;
         turn.orphan_check.as_mut().reset(next);

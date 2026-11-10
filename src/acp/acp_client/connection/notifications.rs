@@ -71,6 +71,8 @@ pub(super) struct Shared {
     /// non-rejected status is removed (#3028, #3152).
     pub(super) rate_limit_rejections: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     pub(super) cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    #[cfg(test)]
+    pub(super) cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
     pub(super) adopted_completion_tx: watch::Sender<Option<PromptOutcome>>,
     /// A stored-session rejection already emitted its context reset.
     pub(super) context_reset_emitted: AtomicBool,
@@ -122,6 +124,8 @@ impl Shared {
             between_prompt: BetweenPromptTracker::default(),
             rate_limit_rejections: state.rate_limit_rejections.clone(),
             cancel_deadline: state.cancel_deadline.clone(),
+            #[cfg(test)]
+            cancel_send_gate: state.cancel_send_gate.clone(),
             adopted_completion_tx: watch::channel(None).0,
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
