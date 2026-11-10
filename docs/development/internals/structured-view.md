@@ -116,6 +116,9 @@ and checks the resolved namespace before native preassignment, fork or adoption.
 The prepared launch retains that guard through spawn; Prime refresh reuses it.
 Admission resolves the same effective profile as the borrowed capture store,
 including rows without an explicit source profile.
+Final SID publication propagates ownership-lock errors before publishing the tmux
+environment or starting capture. A launch cannot acknowledge an unpublished SID
+after lock contention or an I/O failure.
 An unresolved namespace for a native-capable publisher fails closed before
 side-effectful preparation; ordinary shell commands are not native publishers.
 

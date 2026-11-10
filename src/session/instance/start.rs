@@ -1126,7 +1126,7 @@ impl Instance {
             }
             desired
         });
-        let outcome = self.persist_session_id_with_storage(storage, expected);
+        let outcome = self.persist_session_id_with_storage(storage, expected)?;
         if desired.is_some_and(|desired| {
             !matches!(outcome, SidPersistOutcome::Published) || !desired.matches(self)
         }) {

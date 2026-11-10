@@ -202,7 +202,7 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         expected: &ConversationState,
-    ) -> SidPersistOutcome {
+    ) -> Result<SidPersistOutcome> {
         let expected_prior_intent = expected.intent.clone();
         let new_sid = self.agent_session_id.clone();
         if self
@@ -210,16 +210,12 @@ impl Instance {
             .as_deref()
             .is_some_and(|sid| !is_valid_session_id(sid))
         {
-            return SidPersistOutcome::Skip;
+            return Ok(SidPersistOutcome::Skip);
         }
-        let _conversation_lock = match new_sid
+        let _conversation_lock = new_sid
             .as_deref()
             .map(|sid| ConversationReadLock::acquire(storage.storage(), sid))
-            .transpose()
-        {
-            Ok(guard) => guard,
-            Err(_) => return SidPersistOutcome::Skip,
-        };
+            .transpose()?;
         // Cleared and Fork are one-shot launch directives. Use stays durable
         // only when no pane-scoped capture backend can observe a later `/new`;
         // capture-backed agents hand ownership back to their poller.
@@ -369,7 +365,7 @@ impl Instance {
             Ok(SidWrite::Applied)
         });
 
-        match outcome {
+        Ok(match outcome {
             Ok(SidWrite::Applied) => {
                 // Outside the flock: a live cleared holder may still advertise
                 // the taken sid via AOE_CAPTURED_SESSION_ID, which
@@ -451,7 +447,7 @@ impl Instance {
                 );
                 SidPersistOutcome::Skip
             }
-        }
+        })
     }
 
     #[cfg(test)]
@@ -465,6 +461,7 @@ impl Instance {
             return SidPersistOutcome::Skip;
         };
         self.persist_session_id_with_storage(&storage, expected)
+            .expect("SID ownership lock must be available")
     }
 
     /// Publish the child without changing the Fork target still being validated.
@@ -1363,7 +1360,8 @@ mod tests {
         live.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
         live.identity_publisher_launched = true;
         assert_eq!(
-            live.persist_session_id_with_storage(&storage, &expected),
+            live.persist_session_id_with_storage(&storage, &expected)
+                .unwrap(),
             SidPersistOutcome::Published
         );
         let disk = storage.load().unwrap();
@@ -1404,7 +1402,9 @@ mod tests {
         let mut refused = pinned.clone();
         refused.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
         assert_eq!(
-            refused.persist_session_id_with_storage(&storage, &expected),
+            refused
+                .persist_session_id_with_storage(&storage, &expected)
+                .unwrap(),
             SidPersistOutcome::Published
         );
         assert_eq!(disk_sid(profile, &pinned.id), None);
@@ -1431,7 +1431,9 @@ mod tests {
             ..launcher.conversation_state()
         };
         assert_eq!(
-            stale.persist_session_id_with_storage(&storage, &stale_expected),
+            stale
+                .persist_session_id_with_storage(&storage, &stale_expected)
+                .unwrap(),
             SidPersistOutcome::Published
         );
         assert_eq!(disk_sid(profile, &launcher.id), None);
@@ -1508,7 +1510,7 @@ mod tests {
             &storage,
             &expected_state(&inst.tool, None, ResumeIntent::Default),
         );
-        assert_eq!(outcome, SidPersistOutcome::Published);
+        assert_eq!(outcome.unwrap(), SidPersistOutcome::Published);
         let loaded = storage.load().unwrap();
         assert_eq!(
             (loaded.len(), loaded[0].agent_session_id.clone()),
@@ -1539,7 +1541,8 @@ mod tests {
             .unwrap();
         inst.identity_publisher_launched = true;
         assert_eq!(
-            inst.persist_session_id_with_storage(&storage, &expected),
+            inst.persist_session_id_with_storage(&storage, &expected)
+                .unwrap(),
             SidPersistOutcome::Published
         );
         let disk = storage.load().unwrap();
@@ -2103,6 +2106,63 @@ mod tests {
                 assert_eq!(captured_env(tmux.name()).as_deref(), want_env, "{label}");
                 assert_eq!(inst.agent_session_id.as_deref(), want_sid, "{label}");
                 assert_eq!(inst.resume_intent, want_intent, "{label}");
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn finalize_launch_rejects_unavailable_sid_lock_before_publication() {
+            if no_tmux() {
+                return;
+            }
+            for busy in [true, false] {
+                let profile = "finalize-sid-lock";
+                let mut inst = make_inst(profile, "preassigned-opencode");
+                inst.tool = "opencode".into();
+                let (_temp, _home, storage) = seeded(profile, &[&inst]);
+                let expected = inst.conversation_state();
+                let before = std::fs::read(storage.sessions_path()).unwrap();
+                let tmux = TmuxSession::create(&inst.id, &inst.title);
+                let (lock, lock_path) =
+                    crate::session::AnchoredDir::open(&crate::session::get_app_dir().unwrap())
+                        .unwrap()
+                        .bind_file(".retained-publisher-admission".as_ref())
+                        .unwrap()
+                        .open_sidecar()
+                        .unwrap();
+                let held = if busy {
+                    let file = lock;
+                    fs2::FileExt::try_lock_exclusive(&file).unwrap();
+                    Some(file)
+                } else {
+                    drop(lock);
+                    std::fs::remove_file(&lock_path).unwrap();
+                    std::fs::create_dir(&lock_path).unwrap();
+                    None
+                };
+                inst.agent_session_id = Some(VALID_SID.into());
+                let error = inst
+                    .finalize_launch_with_store(tmux.name(), &storage, &expected, None, false)
+                    .unwrap_err();
+                if busy {
+                    assert!(error.is::<ConversationOwnershipBusy>(), "{error:#}");
+                } else {
+                    assert_eq!(
+                        error.downcast_ref::<nix::errno::Errno>(),
+                        Some(&nix::errno::Errno::EISDIR),
+                        "{error:#}"
+                    );
+                }
+                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
+                assert_eq!(captured_env(tmux.name()), None);
+                drop(held);
+                if !busy {
+                    std::fs::remove_dir(&lock_path).unwrap();
+                }
+                inst.finalize_launch_with_store(tmux.name(), &storage, &expected, None, false)
+                    .unwrap();
+                assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(VALID_SID));
+                assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
             }
         }
     }
