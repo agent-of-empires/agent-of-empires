@@ -125,14 +125,14 @@ pub(super) async fn establish(
     }
     let init: InitializeResponse = match ctx.control.as_ref() {
         Some(control) => {
-            let params = serde_json::to_value(build_initialize_request())
+            let params = serde_json::to_value(build_initialize_request(shared.profile))
                 .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
             serde_json::from_value(control.initialize(params).await?)
                 .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
         }
         None => {
             connection
-                .send_request(build_initialize_request())
+                .send_request(build_initialize_request(shared.profile))
                 .block_task()
                 .await?
         }
