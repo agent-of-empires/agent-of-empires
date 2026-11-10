@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -115,6 +115,9 @@ pub enum ControlBody {
     Prompt { request: serde_json::Value },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel,
+    /// Cancel one subagent session's work (`session/cancel` addressed to the
+    /// child id). The turn of the root session keeps running.
+    CancelSession { session_id: String },
     /// A client-to-agent request the runner does not own: `session/set_mode`,
     /// `session/set_config_option`, `session/delete`, `_session/steering`,
     /// or a conversation-reset `session/new`.

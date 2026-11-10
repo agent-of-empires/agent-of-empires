@@ -280,6 +280,12 @@ impl DaemonControlClient {
     pub(super) async fn cancel(&self) {
         let _ = self.send(ControlBody::Cancel).await;
     }
+
+    pub(super) async fn cancel_session(&self, session_id: String) -> bool {
+        self.send(ControlBody::CancelSession { session_id })
+            .await
+            .is_ok()
+    }
 }
 
 /// Dial and validate one v3 runner control socket. Retry only startup races;

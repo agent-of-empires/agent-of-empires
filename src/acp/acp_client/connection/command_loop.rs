@@ -77,6 +77,27 @@ impl Session {
         }
     }
 
+    /// A subagent session only honours `session/cancel` when it announced the
+    /// capability; the root turn is unaffected either way.
+    pub(super) async fn cancel_child(&self, session_id: String) -> bool {
+        let child = SessionId::from(session_id.clone());
+        if !self
+            .shared
+            .ingress
+            .child_route(&child)
+            .is_some_and(|route| route.cancel_capable)
+        {
+            return false;
+        }
+        match self.control.as_ref() {
+            Some(control) => control.cancel_session(session_id).await,
+            None => self
+                .connection
+                .send_notification(CancelNotification::new(child))
+                .is_ok(),
+        }
+    }
+
     pub(super) fn dispatch_config_option(
         &mut self,
         config_id: String,
@@ -146,6 +167,12 @@ impl Session {
                     if self.run_prompt(blocks).await? {
                         break;
                     }
+                }
+                Some(ClientCmd::CancelChild {
+                    session_id,
+                    respond_to,
+                }) => {
+                    let _ = respond_to.send(self.cancel_child(session_id).await);
                 }
                 Some(ClientCmd::Cancel) => {
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");

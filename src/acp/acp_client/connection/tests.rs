@@ -604,3 +604,141 @@ async fn prompted_turn_ending_on_a_rejected_window_parks() {
         let _ = fake.agent.await;
     }
 }
+
+/// A child cancel reaches the agent addressed to the child and only when the
+/// child announced `cancel`; the root turn's cancel stays a separate command.
+#[tokio::test]
+async fn child_cancel_targets_the_child_and_requires_the_capability() {
+    let (daemon_write, agent_read) = tokio::io::duplex(1024 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(1024 * 1024);
+    let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+    let cancels = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let agent = tokio::spawn({
+        let (agent_write, cancels) = (agent_write.clone(), cancels.clone());
+        async move {
+            let mut reader = BufReader::new(agent_read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let id = &msg["id"];
+                match msg.get("method").and_then(|m| m.as_str()) {
+                    Some("initialize") => {
+                        write_line(&agent_write, &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                        )).await;
+                    }
+                    Some("session/new") => {
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"root"}}}}"#
+                            ),
+                        )
+                        .await;
+                        for (child, caps) in
+                            [("c-yes", r#","capabilities":{"cancel":{}}"#), ("c-no", "")]
+                        {
+                            write_line(&agent_write, &format!(
+                                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"root","update":{{"sessionUpdate":"subagent_update","sessionId":"{child}","state":{{"state":"running"}}{caps}}}}}}}"#
+                            )).await;
+                        }
+                    }
+                    Some("session/cancel") => cancels
+                        .lock()
+                        .unwrap()
+                        .push(msg["params"]["sessionId"].as_str().unwrap().to_string()),
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "root".to_string(),
+            sandbox: None,
+        },
+        mode: ConnectMode::Fresh {
+            stored_acp_session_id: None,
+            seed_history_replay: false,
+            prior_conversation: false,
+            fork_from: None,
+        },
+        ready_tx,
+        profile: &crate::acp::agent_profiles::CLAUDE,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    ready_rx.await.unwrap().expect("handshake ok");
+
+    // Both announcements are observed before any cancel is sent.
+    let mut announced = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while announced < 2 {
+            if let Some(Event::SubagentUpdated { .. }) = event_rx.recv().await {
+                announced += 1;
+            }
+        }
+    })
+    .await
+    .expect("both subagents announced");
+
+    let mut sent = Vec::new();
+    for child in ["c-yes", "c-no", "unknown"] {
+        let (respond_to, answer) = oneshot::channel();
+        cmd_tx
+            .send(ClientCmd::CancelChild {
+                session_id: child.to_string(),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        sent.push(answer.await.unwrap());
+    }
+    assert_eq!(sent, [true, false, false]);
+
+    // The root cancel is a sentinel: the agent reads in order, so everything
+    // sent before it has been recorded once it shows up.
+    cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !cancels.lock().unwrap().contains(&"root".to_string()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("root cancel reaches the agent");
+    assert_eq!(*cancels.lock().unwrap(), ["c-yes", "root"]);
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
