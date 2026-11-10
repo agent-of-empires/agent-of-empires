@@ -556,3 +556,48 @@ fn exit_retries_transient_coordinator_contention_before_restoring_modes() {
         .windows(b"\x1b[?1049l".len())
         .any(|w| w == b"\x1b[?1049l"));
 }
+
+#[cfg(unix)]
+#[test]
+#[serial_test::serial]
+fn exit_restores_modes_after_render_panic_or_poisoned_partial_frame() {
+    for partial in [false, true] {
+        let (mut master, slave) = private_terminal();
+        let mut shell = slave.try_clone().unwrap();
+        let output = Mutex::new(State::new(slave));
+        if partial {
+            frame_in(&output, |_| {
+                let mut writer = Output::default();
+                writer.write_all(&vec![b'x'; 1024 * 1024])?;
+                writer.write_all(b"UNPAINTED-END")?;
+                writer.flush()?;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if partial {
+                let _held = output.lock().unwrap();
+                panic!("interrupted pending output");
+            }
+            let _ = frame_in(&output, |_| {
+                let mut writer = Output::default();
+                writer.write_all(b"UNPAINTED-END").unwrap();
+                writer.flush().unwrap();
+                panic!("render failure");
+            });
+        }));
+        assert!(panic.is_err());
+        let mut received = Vec::new();
+        drain_terminal(&mut master, &mut received);
+        assert!(restore_after_exit_in(&output, true, None).unwrap());
+        shell.write_all(b"SHELL-READY").unwrap();
+        read_terminal_until(&mut master, &mut received, b"SHELL-READY");
+        for command in [b"\x1b[?1006l".as_slice(), b"\x1b[?1049l", b"\x1b[?25h"] {
+            assert!(received.windows(command.len()).any(|w| w == command));
+        }
+        assert!(!received
+            .windows(b"UNPAINTED-END".len())
+            .any(|w| w == b"UNPAINTED-END"));
+    }
+}

@@ -417,9 +417,9 @@ fn restore_after_exit_in(
         crossterm::queue!(&mut bytes, crossterm::terminal::SetTitle(title))?;
     }
     let deadline = Instant::now() + Duration::from_millis(250);
-    let mut state = loop {
+    let (mut state, poisoned) = loop {
         match output.try_lock() {
-            Ok(state) => break state,
+            Ok(state) => break (state, false),
             Err(TryLockError::WouldBlock) => {
                 #[cfg(test)]
                 EXIT_CONTENDED.with(|observer| {
@@ -433,11 +433,13 @@ fn restore_after_exit_in(
                 }
                 std::thread::park_timeout(remaining.min(Duration::from_millis(1)));
             }
-            Err(TryLockError::Poisoned(error)) => return Err(io::Error::other(error.to_string())),
+            Err(TryLockError::Poisoned(error)) => break (error.into_inner(), true),
         }
     };
+    FRAME.with(|frame| *frame.borrow_mut() = None);
     // Exit cancels obsolete drawing without acknowledging an unseen frame.
-    if state.pending.take().is_some_and(|frame| frame.offset != 0) {
+    let partial = state.pending.take().is_some_and(|frame| frame.offset != 0);
+    if poisoned || partial {
         state.interrupted(std::env::var_os("TMUX").is_some());
     }
     state.completed = None;

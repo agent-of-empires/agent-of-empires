@@ -209,6 +209,8 @@ stalled output or contention past that deadline can still prevent delivery befor
 Ratatui cursor drop never invokes a synchronous stderr diagnostic.
 A direct flush that writes no bytes retains its staged command for retry. A partial
 failed command recovers terminal framing instead of replaying its written prefix.
+Exit cleanup recovers poisoned output custody and discards an unsubmitted capture;
+ordinary rendering still refuses poisoned state.
 
 The OS layer independently opens and verifies the TTY descriptor. Duplicating
 stdout is not safe because duplicated descriptors share `O_NONBLOCK`.
