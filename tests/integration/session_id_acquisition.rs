@@ -77,7 +77,26 @@ impl IsolatedHome {
             _runtime_dir: runtime_dir,
             home,
         };
-        agent_of_empires::migrations::run_migrations().expect("bootstrap isolated native storage");
+        let bootstrap = Command::new(env!("CARGO_BIN_EXE_aoe"))
+            .arg("migrate")
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", isolated.path())
+            .env("XDG_CONFIG_HOME", isolated.path().join(".config"))
+            .env("XDG_DATA_HOME", isolated.path().join(".local/share"))
+            .env("XDG_CACHE_HOME", isolated.path().join(".cache"))
+            .env("XDG_RUNTIME_DIR", isolated._runtime_dir.path())
+            .env("DBUS_SESSION_BUS_ADDRESS", "")
+            .env("AOE_TMUX_SOCKET", tmux_socket())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .current_dir(isolated.path())
+            .output()
+            .expect("bootstrap isolated native storage");
+        assert!(
+            bootstrap.status.success(),
+            "isolated bootstrap failed: {}",
+            String::from_utf8_lossy(&bootstrap.stderr)
+        );
         isolated
     }
 
@@ -570,4 +589,19 @@ fn extract_session_id_refuses_a_nested_agent_under_a_renamed_launch() {
         let _ = std::fs::remove_dir_all(base.join(&id));
         assert_eq!(written.as_deref(), writes.then_some(sid), "{case}");
     }
+}
+
+#[test]
+#[serial]
+fn native_fixture_bootstrap_leaves_external_agent_config_untouched() {
+    let external = tempfile::tempdir().unwrap();
+    let config = external.path().join("config.toml");
+    let legacy = "[[hooks.SessionStart]]\n\
+                  [[hooks.SessionStart.hooks]]\n\
+                  type = \"command\"\n\
+                  command = \"exit 0 # aoe-hooks\"\n";
+    std::fs::write(&config, legacy).unwrap();
+    let _outside = EnvRestore::set("CODEX_HOME", external.path());
+    let _private = IsolatedHome::new();
+    assert_eq!(std::fs::read_to_string(config).unwrap(), legacy);
 }
