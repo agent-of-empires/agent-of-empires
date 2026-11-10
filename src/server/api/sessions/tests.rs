@@ -7302,7 +7302,8 @@ pub(super) mod terminal_custody {
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
-    async fn fresh_http_send_uses_native_cli_start_before_daemon_cache_reload() -> anyhow::Result<()> {
+    async fn fresh_http_send_uses_native_cli_start_before_daemon_cache_reload() -> anyhow::Result<()>
+    {
         if !crate::tmux::test_helpers::tmux_available() {
             return Ok(());
         }
@@ -7346,18 +7347,25 @@ pub(super) mod terminal_custody {
             marker = quote(marker),
         );
         let _agent = crate::session::test_support::install_login_shell_path_command(
-            root.path(), "opencode", &script,
+            root.path(),
+            "opencode",
+            &script,
         );
         let name = crate::tmux::Session::generate_name(&original.id, &original.title);
         let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
         crate::server::test_support::seed_instances_on_disk_for_test(
-            "default", vec![original.clone()],
+            "default",
+            vec![original.clone()],
         );
         let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         run_native_cli(&["session", "start", &original.id]).await?;
         let born = await_line(&received, "BORN").await;
-        let pid: u32 = born.lines().find_map(|line| line.strip_prefix("PID ")).unwrap().parse()?;
+        let pid: u32 = born
+            .lines()
+            .find_map(|line| line.strip_prefix("PID "))
+            .unwrap()
+            .parse()?;
         let birth = crate::process::process_birth_identity(pid)?
             .expect("the original final Native receiver is alive");
         let storage = crate::session::Storage::open_reference("default")?;
@@ -7368,18 +7376,24 @@ pub(super) mod terminal_custody {
             original.lifecycle_generation,
             "the completed real CLI start has not been adopted by the daemon cache"
         );
-        let (physical, presence, _) = crate::tmux::utils::observe_pane(
-            &name, &crate::tmux::TmuxCommandDeadline::new(),
-        )?.expect("the CLI-created original pane");
+        let (physical, presence, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("the CLI-created original pane");
         assert_eq!(presence, crate::tmux::utils::PaneProbe::Alive);
         let mut gate = Gate::install(&original.id, Boundary::SendAdmitted);
         let sending_state = state.clone();
         let id = original.id.clone();
         let sending = tokio::spawn(async move {
             send_message(
-                State(sending_state), Path(id),
-                Ok(Json(SendMessageRequest { message: "FRESH-ONLY".into(), revive: true })),
-            ).await.into_response()
+                State(sending_state),
+                Path(id),
+                Ok(Json(SendMessageRequest {
+                    message: "FRESH-ONLY".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response()
         });
         gate.entered().await;
         let capture = || -> anyhow::Result<String> {
@@ -7399,24 +7413,39 @@ pub(super) mod terminal_custody {
             .args(["wait-for", "-S", &ready_gate])
             .status()?;
         anyhow::ensure!(released.success());
-        let (status, response) = response_json(
-            tokio::time::timeout(Duration::from_secs(10), sending).await??,
-        ).await?;
+        let (status, response) =
+            response_json(tokio::time::timeout(Duration::from_secs(10), sending).await??).await?;
         assert_eq!(status, StatusCode::OK, "{response}");
         let delivered = await_line(&received, "FRESH-ONLY").await;
-        assert_eq!(delivered.lines().filter(|line| *line == "FRESH-ONLY").count(), 1);
+        assert_eq!(
+            delivered
+                .lines()
+                .filter(|line| *line == "FRESH-ONLY")
+                .count(),
+            1
+        );
         assert_eq!(delivered.lines().filter(|line| *line == "BORN").count(), 1);
         assert!(crate::process::process_birth_is_live(pid, &birth)?);
-        let (after, after_presence, _) = crate::tmux::utils::observe_pane(
-            &name, &crate::tmux::TmuxCommandDeadline::new(),
-        )?.expect("the same original pane after input");
+        let (after, after_presence, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("the same original pane after input");
         assert_eq!(after_presence, crate::tmux::utils::PaneProbe::Alive);
-        assert_eq!(after, physical, "the fresh send must not retarget or respawn");
-        assert_eq!(storage.load_instances_complete()?[0].lifecycle_generation, started.lifecycle_generation);
+        assert_eq!(
+            after, physical,
+            "the fresh send must not retarget or respawn"
+        );
+        assert_eq!(
+            storage.load_instances_complete()?[0].lifecycle_generation,
+            started.lifecycle_generation
+        );
         let ready = capture()?;
         assert!(
-            ready.find("FRESH-ONLY").expect("the tty echoed the actual input")
-                > ready.find(marker).expect("the registered marker was really printed"),
+            ready
+                .find("FRESH-ONLY")
+                .expect("the tty echoed the actual input")
+                > ready
+                    .find(marker)
+                    .expect("the registered marker was really printed"),
             "input must follow the original producer's registered readiness marker: {ready}"
         );
         Ok(())

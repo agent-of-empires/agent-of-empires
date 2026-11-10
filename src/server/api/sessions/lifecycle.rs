@@ -2875,7 +2875,11 @@ pub(super) async fn prepare_agent_session(
     prepare_agent_session_inner(
         state,
         id,
-        AgentPreparationInput { body, captured: None, physical: None },
+        AgentPreparationInput {
+            body,
+            captured: None,
+            physical: None,
+        },
         preparation,
         restart,
         None,
@@ -2918,7 +2922,11 @@ pub(crate) async fn recovery_restart(
     prepare_agent_session_inner(
         state,
         id,
-        AgentPreparationInput { body: Ok(None), captured: None, physical: None },
+        AgentPreparationInput {
+            body: Ok(None),
+            captured: None,
+            physical: None,
+        },
         AgentPreparation::Restart,
         Some(Arc::new(crate::daemon::RestartSessionBody {
             bound_hooks: true,
@@ -2939,7 +2947,11 @@ async fn prepare_agent_session_inner(
     expected_generation: Option<u64>,
     restart_origin: RestartOrigin,
 ) -> axum::response::Response {
-    let AgentPreparationInput { body, captured, physical: mut captured_physical } = input;
+    let AgentPreparationInput {
+        body,
+        captured,
+        physical: mut captured_physical,
+    } = input;
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
     }

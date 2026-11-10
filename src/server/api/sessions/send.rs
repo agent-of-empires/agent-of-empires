@@ -116,15 +116,16 @@ async fn send_terminal_message_inner(
                 );
                 let physical = super::ensure::physical_agent_target(&before)?;
                 let ready = physical.as_ref().is_some_and(|(_, _, ready)| *ready);
-                let target = physical.map(|(tmux_session, physical, _)| {
-                    crate::daemon::TerminalTarget {
-                        tmux_session,
-                        physical: Some(physical),
-                        lifecycle_generation: before.lifecycle_generation,
-                        profile: before.source_profile.clone(),
-                        status: crate::daemon::TerminalTargetStatus::Alive,
-                    }
-                });
+                let target =
+                    physical.map(
+                        |(tmux_session, physical, _)| crate::daemon::TerminalTarget {
+                            tmux_session,
+                            physical: Some(physical),
+                            lifecycle_generation: before.lifecycle_generation,
+                            profile: before.source_profile.clone(),
+                            status: crate::daemon::TerminalTargetStatus::Alive,
+                        },
+                    );
                 Ok((identity, target, ready))
             })()
             .map_err(|error| terminal_send_failure(&error_state, error))?;
@@ -170,7 +171,9 @@ async fn send_terminal_message_inner(
             id.to_owned(),
             before,
             initial_identity.clone(),
-            existing_target.as_ref().and_then(|target| target.physical.clone()),
+            existing_target
+                .as_ref()
+                .and_then(|target| target.physical.clone()),
         )
         .await;
         let (parts, body) = response.into_parts();
