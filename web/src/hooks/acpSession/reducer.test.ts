@@ -206,7 +206,10 @@ describe("prompt queue", () => {
     const pending = (...ids: string[]) =>
       run(empty(), ...ids.map((id): Action => ({ kind: "user_prompt", id, text: id })));
 
-    const idle = reducer(pending("p1", "p2"), { kind: "transcript_snapshot", rows: [row("p1", ["p2"])] });
+    const idle = reducer(pending("p1", "p2", "p3"), {
+      kind: "transcript_snapshot",
+      rows: [row("p1", ["p2", "p3"])],
+    });
     expect(idle.inflightPromptIds).toEqual([]);
     expect(idle.optimisticRows).toEqual([]);
     expect(idle.turnActive).toBe(false);

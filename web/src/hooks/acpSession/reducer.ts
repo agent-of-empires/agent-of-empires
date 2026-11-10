@@ -112,9 +112,10 @@ function pruneOptimisticRows(state: AcpState): AcpState {
 // even when the live event that would have settled them was missed.
 function settleServerPrompts(state: AcpState, rows: readonly ActivityRow[]): AcpState {
   if (state.optimisticRows.length === 0 && state.inflightPromptIds.length === 0) return state;
-  return rows
-    .flatMap((r) => (r.kind === "user_prompt" ? [r.id, ...(r.mergedPromptIds ?? [])] : []))
-    .reduce(rollbackOptimisticPrompt, state);
+  const serverIds = new Set(
+    rows.flatMap((r) => (r.kind === "user_prompt" ? [r.id, ...(r.mergedPromptIds ?? [])] : [])),
+  );
+  return retireQueuedOptimistics(state, serverIds);
 }
 
 function withServerRows(state: AcpState, activity: ActivityRow[]): AcpState {
