@@ -109,18 +109,29 @@ impl PreparedContinuation {
         _submission: &tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<ContinuationOutcome, SupervisorError> {
         let rows = state.instances.read().await;
-        let row = rows.iter().find(|row| self.session_id == id && row.id == id
-            && row.created_at == self.created_at && row.terminal_handoff.is_none())
+        let row = rows
+            .iter()
+            .find(|row| {
+                self.session_id == id
+                    && row.id == id
+                    && row.created_at == self.created_at
+                    && row.terminal_handoff.is_none()
+            })
             .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
-        Ok(if self.prompt.is_some()
-            && queue_supersedes(row.queued_prompts.iter().filter_map(row_minted_at_ms), self.limit_at_ms)
-        {
-            ContinuationOutcome::SupersededByQueue
-        } else if self.prompt.is_some() {
-            ContinuationOutcome::Installed
-        } else {
-            ContinuationOutcome::Stands
-        })
+        Ok(
+            if self.prompt.is_some()
+                && queue_supersedes(
+                    row.queued_prompts.iter().filter_map(row_minted_at_ms),
+                    self.limit_at_ms,
+                )
+            {
+                ContinuationOutcome::SupersededByQueue
+            } else if self.prompt.is_some() {
+                ContinuationOutcome::Installed
+            } else {
+                ContinuationOutcome::Stands
+            },
+        )
     }
 }
 
@@ -153,18 +164,31 @@ pub(crate) async fn resolve_continuation(
     };
     let limit_at_ms = if prompt.is_some() {
         query_control(
-            &state.acp_event_store, id, "rate-limit supersession",
+            &state.acp_event_store,
+            id,
+            "rate-limit supersession",
             |store, id| Ok(store.latest_rate_limit_event(id)?.map(|(_, at)| at)),
-        ).await?
+        )
+        .await?
     } else {
         None
     };
     #[cfg(test)]
     state.session_service.await_install_barrier(id).await;
-    let created_at = state.instances.read().await.iter()
+    let created_at = state
+        .instances
+        .read()
+        .await
+        .iter()
         .find(|row| row.id == id && row.terminal_handoff.is_none())
-        .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?.created_at;
-    Ok(PreparedContinuation { session_id: id.to_owned(), created_at, prompt, limit_at_ms })
+        .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?
+        .created_at;
+    Ok(PreparedContinuation {
+        session_id: id.to_owned(),
+        created_at,
+        prompt,
+        limit_at_ms,
+    })
 }
 
 #[cfg(test)]
@@ -185,13 +209,10 @@ pub(crate) async fn install_prepared_continuation(
     prepared: PreparedContinuation,
     outcome: ContinuationOutcome,
 ) -> Result<ContinuationOutcome, SupervisorError> {
-    if prepared.session_id != id || !state
-        .instances
-        .read()
-        .await
-        .iter()
-        .any(|row| row.id == id && row.created_at == prepared.created_at
-            && row.terminal_handoff.is_none())
+    if prepared.session_id != id
+        || !state.instances.read().await.iter().any(|row| {
+            row.id == id && row.created_at == prepared.created_at && row.terminal_handoff.is_none()
+        })
     {
         return Err(SupervisorError::SpawnCancelled(id.to_owned()));
     }
@@ -200,9 +221,13 @@ pub(crate) async fn install_prepared_continuation(
             state.session_service.clear_pending_initial_turn(id).await;
         }
         ContinuationOutcome::Installed => {
-            let (text, attachments) = prepared.prompt
+            let (text, attachments) = prepared
+                .prompt
                 .ok_or(SupervisorError::ControlStateUnavailable)?;
-            state.session_service.set_pending_initial_turn(id, text, attachments).await;
+            state
+                .session_service
+                .set_pending_initial_turn(id, text, attachments)
+                .await;
         }
         ContinuationOutcome::Stands => {}
     }
@@ -371,12 +396,19 @@ pub(crate) async fn resume_rate_limited(
         }
         ContinuationOutcome::SupersededByQueue
     } else {
-        prepared.as_ref().ok_or(SupervisorError::ControlStateUnavailable)?
-            .outcome(state, id, &submission).await?
+        prepared
+            .as_ref()
+            .ok_or(SupervisorError::ControlStateUnavailable)?
+            .outcome(state, id, &submission)
+            .await?
     };
     let manual = matches!(kind, QuotaResume::Manual);
-    if !state.instances.read().await.iter().any(|row|
-        row.id == id && row.lifecycle_generation == generation && is_resumable(row))
+    if !state
+        .instances
+        .read()
+        .await
+        .iter()
+        .any(|row| row.id == id && row.lifecycle_generation == generation && is_resumable(row))
     {
         return Err(SupervisorError::SpawnCancelled(id.to_owned()));
     }
@@ -389,15 +421,18 @@ pub(crate) async fn resume_rate_limited(
         return Err(crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailable).into());
     }
     if manual
-    || matches!(outcome, ContinuationOutcome::Stands | ContinuationOutcome::Installed)
-{
-    if manual && park.cap_reached {
-        resume_at = Utc::now();
+        || matches!(
+            outcome,
+            ContinuationOutcome::Stands | ContinuationOutcome::Installed
+        )
+    {
+        if manual && park.cap_reached {
+            resume_at = Utc::now();
+        }
+        state
+            .acp_supervisor
+            .publish_rate_limit_auto_resumed(id, resume_at, manual)?;
     }
-    state
-        .acp_supervisor
-        .publish_rate_limit_auto_resumed(id, resume_at, manual)?;
-}
     super::resume::ensure_rate_limit_worker(state, id, authority, false).await?;
     let control = state
         .session_service
@@ -1084,70 +1119,156 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn quota_publication_io_failure_installs_no_worker_or_new_pending_turn() {
-        with_managed(|scope| Box::pin(async move {
-            for pending in [false, true] {
-                let mut live = managed_control_session(scope, if pending {
-                    "quota-io-existing-pending"
-                } else {
-                    "quota-io-no-pending"
-                }).await;
-                let id = live.id().to_owned();
-                enable_auto_resume(true);
-                live.park("original interrupted work").await;
-                live.make_quota_due();
-                if pending {
-                    live.state.session_service.set_pending_initial_turn(
-                        &id, "existing pending work".into(), Vec::new(),
-                    ).await;
-                }
-                let park = known_park(&live.state, &id);
-                let budget = live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
-                let original = crate::process::worker_registry::load_strict(&id).unwrap().unwrap();
-                live.client = scope.adopt_with(live.client, false, || async {
-                assert!(!live.state.acp_supervisor.is_running(&id).await);
-                assert!(crate::process::worker_registry::retained_process_may_be_alive(&original));
-                let requests = live.native.requests();
-                let frontier = live.state.acp_event_store.highest_seq(&id);
-                assert_eq!(live.state.instances.read().await.iter()
-                    .find(|row| row.id == id).unwrap().pending_initial_turn.as_ref()
-                    .map(|turn| turn.text.as_str()), pending.then_some("existing pending work"));
-                live.state.acp_event_store.test_conn().execute_batch(
+        with_managed(|scope| {
+            Box::pin(async move {
+                for pending in [false, true] {
+                    let mut live = managed_control_session(
+                        scope,
+                        if pending {
+                            "quota-io-existing-pending"
+                        } else {
+                            "quota-io-no-pending"
+                        },
+                    )
+                    .await;
+                    let id = live.id().to_owned();
+                    enable_auto_resume(true);
+                    live.park("original interrupted work").await;
+                    live.make_quota_due();
+                    if pending {
+                        live.state
+                            .session_service
+                            .set_pending_initial_turn(
+                                &id,
+                                "existing pending work".into(),
+                                Vec::new(),
+                            )
+                            .await;
+                    }
+                    let park = known_park(&live.state, &id);
+                    let budget = live
+                        .state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap();
+                    let original = crate::process::worker_registry::load_strict(&id)
+                        .unwrap()
+                        .unwrap();
+                    live.client = scope
+                        .adopt_with(live.client, false, || async {
+                            assert!(!live.state.acp_supervisor.is_running(&id).await);
+                            assert!(
+                                crate::process::worker_registry::retained_process_may_be_alive(
+                                    &original
+                                )
+                            );
+                            let requests = live.native.requests();
+                            let frontier = live.state.acp_event_store.highest_seq(&id);
+                            assert_eq!(
+                                live.state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .pending_initial_turn
+                                    .as_ref()
+                                    .map(|turn| turn.text.as_str()),
+                                pending.then_some("existing pending work")
+                            );
+                            live.state.acp_event_store.test_conn().execute_batch(
                     "CREATE TEMP TRIGGER fail_quota_publication BEFORE INSERT ON acp_events
                      WHEN NEW.discriminant = 'RateLimitAutoResumed'
                      BEGIN SELECT RAISE(ABORT, 'genuine quota publication IO failure'); END;"
                 ).unwrap();
-                for kind in [QuotaResume::Manual, QuotaResume::Automatic { park_seq: park.seq }] {
-                    let submission = live.state.session_service.prompt_submission(&id).await;
-                    let result = resume_rate_limited(&live.state, &id, submission, kind).await;
-                    assert!(matches!(result, Err(SupervisorError::NativeStoreUnavailable)), "{result:?}");
-                    assert!(!live.state.acp_supervisor.is_running(&id).await,
+                            for kind in [
+                                QuotaResume::Manual,
+                                QuotaResume::Automatic { park_seq: park.seq },
+                            ] {
+                                let submission =
+                                    live.state.session_service.prompt_submission(&id).await;
+                                let result =
+                                    resume_rate_limited(&live.state, &id, submission, kind).await;
+                                assert!(
+                                    matches!(result, Err(SupervisorError::NativeStoreUnavailable)),
+                                    "{result:?}"
+                                );
+                                assert!(!live.state.acp_supervisor.is_running(&id).await,
                         "failed durable publication must precede any worker installation");
-                    assert_eq!(live.state.instances.read().await.iter()
-                        .find(|row| row.id == id).unwrap().pending_initial_turn.as_ref()
-                        .map(|turn| turn.text.as_str()), pending.then_some("existing pending work"));
-                    let profile = live.state.instances.read().await.iter()
-                        .find(|row| row.id == id).unwrap().source_profile.clone();
-                    let durable = crate::session::Storage::open_unwatched(&profile).unwrap()
-                        .load_instances_complete().unwrap().into_iter().find(|row| row.id == id).unwrap();
-                    assert_eq!(durable.pending_initial_turn.as_ref().map(|turn| turn.text.as_str()),
-                        pending.then_some("existing pending work"),
-                        "genuine SQL refusal must preserve durable pending intent too");
-                    assert_eq!(live.native.requests(), requests,
+                                assert_eq!(
+                                    live.state
+                                        .instances
+                                        .read()
+                                        .await
+                                        .iter()
+                                        .find(|row| row.id == id)
+                                        .unwrap()
+                                        .pending_initial_turn
+                                        .as_ref()
+                                        .map(|turn| turn.text.as_str()),
+                                    pending.then_some("existing pending work")
+                                );
+                                let profile = live
+                                    .state
+                                    .instances
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap()
+                                    .source_profile
+                                    .clone();
+                                let durable = crate::session::Storage::open_unwatched(&profile)
+                                    .unwrap()
+                                    .load_instances_complete()
+                                    .unwrap()
+                                    .into_iter()
+                                    .find(|row| row.id == id)
+                                    .unwrap();
+                                assert_eq!(
+                                    durable
+                                        .pending_initial_turn
+                                        .as_ref()
+                                        .map(|turn| turn.text.as_str()),
+                                    pending.then_some("existing pending work"),
+                                    "genuine SQL refusal must preserve durable pending intent too"
+                                );
+                                assert_eq!(live.native.requests(), requests,
                         "failed publication must neither attach nor deliver autonomous input");
-                    assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
-                    assert_eq!(live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap(), budget);
-                    assert_eq!(known_park(&live.state, &id).seq, park.seq);
-                    assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
-                    let retained = crate::process::worker_registry::load_strict(&id).unwrap().unwrap();
-                    assert_eq!(retained.pid, original.pid);
-                    assert!(crate::process::worker_registry::retained_process_may_be_alive(&retained));
+                                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                                assert_eq!(
+                                    live.state
+                                        .acp_event_store
+                                        .rate_limit_redelivery_streak(&id)
+                                        .unwrap(),
+                                    budget
+                                );
+                                assert_eq!(known_park(&live.state, &id).seq, park.seq);
+                                assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                                let retained = crate::process::worker_registry::load_strict(&id)
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(retained.pid, original.pid);
+                                assert!(
+                                    crate::process::worker_registry::retained_process_may_be_alive(
+                                        &retained
+                                    )
+                                );
+                            }
+                            live.state
+                                .acp_event_store
+                                .test_conn()
+                                .execute_batch("DROP TRIGGER fail_quota_publication")
+                                .unwrap();
+                        })
+                        .await;
+                    live.client.ready().await;
+                    live.client.stop_session().await;
                 }
-                live.state.acp_event_store.test_conn().execute_batch("DROP TRIGGER fail_quota_publication").unwrap();
-                }).await;
-                live.client.ready().await;
-                live.client.stop_session().await;
-            }
-        })).await;
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1313,68 +1434,117 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn native_loss_during_continuation_preparation_does_not_publish_a_resume() {
-        with_managed(|scope| Box::pin(async move {
-            for automatic in [false, true] {
-                let mut live = managed_control_session(scope, "quota-loss-during-prepare").await;
-                let id = live.id().to_owned();
-                enable_auto_resume(true);
-                live.park("preserve original work").await;
-                live.make_quota_due();
-                live.state.session_service.set_pending_initial_turn(
-                    &id, "existing pending work".into(), Vec::new(),
-                ).await;
-                if !automatic {
-                let submission = live.state.session_service.prompt_submission(&id).await;
-                live.state.session_service.enqueue_prompt(
-                    &id, "retained-queue".into(), "queued work must remain".into(),
-                    Vec::new(), None, None,
-                ).await.unwrap();
-                drop(submission);
+        with_managed(|scope| {
+            Box::pin(async move {
+                for automatic in [false, true] {
+                    let mut live =
+                        managed_control_session(scope, "quota-loss-during-prepare").await;
+                    let id = live.id().to_owned();
+                    enable_auto_resume(true);
+                    live.park("preserve original work").await;
+                    live.make_quota_due();
+                    live.state
+                        .session_service
+                        .set_pending_initial_turn(&id, "existing pending work".into(), Vec::new())
+                        .await;
+                    if !automatic {
+                        let submission = live.state.session_service.prompt_submission(&id).await;
+                        live.state
+                            .session_service
+                            .enqueue_prompt(
+                                &id,
+                                "retained-queue".into(),
+                                "queued work must remain".into(),
+                                Vec::new(),
+                                None,
+                                None,
+                            )
+                            .await
+                            .unwrap();
+                        drop(submission);
+                    }
+                    let park_seq = known_park(&live.state, &id).seq;
+                    let frontier = live.state.acp_event_store.highest_seq(&id);
+                    let budget = live
+                        .state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap();
+                    let requests = live.native.requests();
+                    let lease = live.state.acp_supervisor.current_lease(&id).unwrap();
+                    let before = live
+                        .state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    let mut barrier = live.state.session_service.arm_install_barrier();
+                    let state = live.state.clone();
+                    let target = id.clone();
+                    let release_task = tokio::spawn(async move {
+                        let submission = state.session_service.prompt_submission(&target).await;
+                        let kind = if automatic {
+                            QuotaResume::Automatic { park_seq }
+                        } else {
+                            QuotaResume::Manual
+                        };
+                        resume_rate_limited(&state, &target, submission, kind).await
+                    });
+                    let (observed, release) =
+                        tokio::time::timeout(Duration::from_secs(10), barrier.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(observed, id);
+                    live.client.actual().test_observe_native_loss();
+                    release.send(()).unwrap();
+                    let result = release_task.await.unwrap();
+                    assert!(
+                        matches!(
+                            result,
+                            Err(SupervisorError::Acp(
+                                crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
+                            ))
+                        ),
+                        "{result:?}"
+                    );
+                    let after = live
+                        .state
+                        .instances
+                        .read()
+                        .await
+                        .iter()
+                        .find(|row| row.id == id)
+                        .unwrap()
+                        .clone();
+                    assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
+                    assert_eq!(
+                        live.state
+                            .acp_event_store
+                            .rate_limit_redelivery_streak(&id)
+                            .unwrap(),
+                        budget
+                    );
+                    assert_eq!(known_park(&live.state, &id).seq, park_seq);
+                    assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
+                    assert_eq!(
+                        serde_json::to_value(after.pending_initial_turn).unwrap(),
+                        serde_json::to_value(before.pending_initial_turn).unwrap()
+                    );
+                    assert_eq!(
+                        serde_json::to_value(after.queued_prompts).unwrap(),
+                        serde_json::to_value(before.queued_prompts).unwrap()
+                    );
+                    assert_eq!(live.native.requests(), requests);
+                    assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
+                    drop(barrier);
                 }
-                let park_seq = known_park(&live.state, &id).seq;
-                let frontier = live.state.acp_event_store.highest_seq(&id);
-                let budget = live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
-                let requests = live.native.requests();
-                let lease = live.state.acp_supervisor.current_lease(&id).unwrap();
-                let before = live.state.instances.read().await.iter()
-                    .find(|row| row.id == id).unwrap().clone();
-                let mut barrier = live.state.session_service.arm_install_barrier();
-                let state = live.state.clone();
-                let target = id.clone();
-                let release_task = tokio::spawn(async move {
-                    let submission = state.session_service.prompt_submission(&target).await;
-                    let kind = if automatic {
-                        QuotaResume::Automatic { park_seq }
-                    } else {
-                        QuotaResume::Manual
-                    };
-                    resume_rate_limited(&state, &target, submission, kind).await
-                });
-                let (observed, release) = tokio::time::timeout(
-                    Duration::from_secs(10), barrier.recv(),
-                ).await.unwrap().unwrap();
-                assert_eq!(observed, id);
-                live.client.actual().test_observe_native_loss();
-                release.send(()).unwrap();
-                let result = release_task.await.unwrap();
-                assert!(matches!(result, Err(SupervisorError::Acp(
-                    crate::acp::acp_client::AcpError::ConnectionUnavailable(_)
-                ))), "{result:?}");
-                let after = live.state.instances.read().await.iter()
-                    .find(|row| row.id == id).unwrap().clone();
-                assert_eq!(live.state.acp_event_store.highest_seq(&id), frontier);
-                assert_eq!(live.state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap(), budget);
-                assert_eq!(known_park(&live.state, &id).seq, park_seq);
-                assert_eq!(auto_resumed_breadcrumbs(&live.state, &id), 0);
-                assert_eq!(serde_json::to_value(after.pending_initial_turn).unwrap(),
-                    serde_json::to_value(before.pending_initial_turn).unwrap());
-                assert_eq!(serde_json::to_value(after.queued_prompts).unwrap(),
-                    serde_json::to_value(before.queued_prompts).unwrap());
-                assert_eq!(live.native.requests(), requests);
-                assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
-                drop(barrier);
-            }
-        })).await;
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1475,7 +1645,8 @@ mod tests {
         let (text, attachments) = resolve_continuation(&state, id)
             .await
             .unwrap()
-            .prompt.expect("known agent continuation");
+            .prompt
+            .expect("known agent continuation");
         assert_eq!(text, AGENT_TURN_CONTINUATION);
         assert!(attachments.is_empty());
         state
@@ -1495,7 +1666,11 @@ mod tests {
             .acp_event_store
             .record(id, 5, &host_stop, &EventMetadata::host(&host_stop))
             .unwrap();
-        assert!(resolve_continuation(&state, id).await.unwrap().prompt.is_none());
+        assert!(resolve_continuation(&state, id)
+            .await
+            .unwrap()
+            .prompt
+            .is_none());
         assert_eq!(
             state
                 .acp_event_store

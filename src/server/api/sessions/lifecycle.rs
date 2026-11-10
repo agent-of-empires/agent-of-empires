@@ -2953,7 +2953,8 @@ pub(super) async fn continue_interrupted_prompt(
     let selected = if explicit_wake {
         None
     } else {
-        let prepared = prepared.ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?;
+        let prepared =
+            prepared.ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?;
         let outcome = prepared.outcome(state, id, submission).await?;
         Some((prepared, outcome))
     };
@@ -2975,14 +2976,10 @@ pub(super) async fn continue_interrupted_prompt(
         .iter()
         .any(|row| row.id == id && row.pending_initial_turn.is_some());
     use crate::server::acp_reconciler::ContinuationOutcome;
-    let (prepared, outcome) = selected
-        .ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?;
+    let (prepared, outcome) =
+        selected.ok_or(crate::acp::supervisor::SupervisorError::ControlStateUnavailable)?;
     let outcome = crate::server::acp_reconciler::install_prepared_continuation(
-        state,
-        id,
-        submission,
-        prepared,
-        outcome,
+        state, id, submission, prepared, outcome,
     )
     .await?;
     Ok(pending_before
@@ -3470,18 +3467,27 @@ async fn prepare_agent_session_inner(
         _ => {}
     }
     let quota = if let Some(body) = restart.as_ref().filter(|body| {
-        instance.is_structured() && body.tool.as_deref().is_some_and(|tool|
-            tool != instance.tool && matches!(
-                crate::session::conversation_carry::classify(
-                    &instance, body.profile.as_deref().unwrap_or(&instance.source_profile), tool,
-                ),
-                crate::session::conversation_carry::ToolSwap::KeepConversation(_)
-            ))
+        instance.is_structured()
+            && body.tool.as_deref().is_some_and(|tool| {
+                tool != instance.tool
+                    && matches!(
+                        crate::session::conversation_carry::classify(
+                            &instance,
+                            body.profile.as_deref().unwrap_or(&instance.source_profile),
+                            tool,
+                        ),
+                        crate::session::conversation_carry::ToolSwap::KeepConversation(_)
+                    )
+            })
     }) {
         let marker = match crate::server::api::acp::rate_limit_resume_probe(&state, &id).await {
             Ok(crate::acp::event_store::ControlKnowledge::Known(marker)) => marker,
-            Ok(crate::acp::event_store::ControlKnowledge::Indeterminate) =>
-                return structured_lifecycle_error(&state, crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into()),
+            Ok(crate::acp::event_store::ControlKnowledge::Indeterminate) => {
+                return structured_lifecycle_error(
+                    &state,
+                    crate::acp::supervisor::SupervisorError::ControlStateUnavailable.into(),
+                )
+            }
             Err(error) => return structured_lifecycle_error(&state, error.into()),
         };
         match marker {
@@ -3494,7 +3500,10 @@ async fn prepare_agent_session_inner(
                         Err(error) => return structured_lifecycle_error(&state, error.into()),
                     }
                 };
-                Some(PreparedQuotaRestart { resets_at, continuation })
+                Some(PreparedQuotaRestart {
+                    resets_at,
+                    continuation,
+                })
             }
             None => None,
         }
@@ -5817,73 +5826,138 @@ mod restart_wake_tests {
     #[serial_test::serial]
     async fn explicit_restart_keeps_existing_pending_when_quota_publication_fails() {
         use crate::acp::supervisor::test_support::managed::with_managed;
-        with_managed(|scope| Box::pin(async move {
-            let mut live = crate::server::test_support::managed_control_session(
-                scope, "restart-quota-publication-io",
-            ).await;
-            live.park("original interrupted work").await;
-            let id = live.id().to_owned();
-            let state = live.state.clone();
-            state.session_service.set_pending_initial_turn(
-                &id, "existing pending work".into(), Vec::new(),
-            ).await;
-            let resets_at = match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
-                .await.unwrap()
-            {
-                crate::acp::event_store::ControlKnowledge::Known(Some(resets_at)) => resets_at,
-                marker => panic!("expected the original quota marker, got {marker:?}"),
-            };
-            // A real restart retires the original before reserving a replacement; detaching
-            // alone correctly refuses Spawn while that retained physical owner stays alive.
-            live.client.shutdown().await.unwrap();
-            let requests = live.native.requests();
-            let frontier = state.acp_event_store.highest_seq(&id);
-            let budget = state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap();
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(
+                    scope,
+                    "restart-quota-publication-io",
+                )
+                .await;
+                live.park("original interrupted work").await;
+                let id = live.id().to_owned();
+                let state = live.state.clone();
+                state
+                    .session_service
+                    .set_pending_initial_turn(&id, "existing pending work".into(), Vec::new())
+                    .await;
+                let resets_at = match crate::server::api::acp::rate_limit_resume_probe(&state, &id)
+                    .await
+                    .unwrap()
+                {
+                    crate::acp::event_store::ControlKnowledge::Known(Some(resets_at)) => resets_at,
+                    marker => panic!("expected the original quota marker, got {marker:?}"),
+                };
+                // A real restart retires the original before reserving a replacement; detaching
+                // alone correctly refuses Spawn while that retained physical owner stays alive.
+                live.client.shutdown().await.unwrap();
+                let requests = live.native.requests();
+                let frontier = state.acp_event_store.highest_seq(&id);
+                let budget = state
+                    .acp_event_store
+                    .rate_limit_redelivery_streak(&id)
+                    .unwrap();
                 assert!(!state.acp_supervisor.is_running(&id).await);
                 let preparation_state = state.clone();
                 let target = id.clone();
                 let (native, started, generation) = tokio::task::spawn_blocking(move || {
                     let runtime = tokio::runtime::Handle::current();
-                    let mut started = runtime.block_on(preparation_state.instances.read()).iter()
-                        .find(|row| row.id == target).unwrap().clone();
+                    let mut started = runtime
+                        .block_on(preparation_state.instances.read())
+                        .iter()
+                        .find(|row| row.id == target)
+                        .unwrap()
+                        .clone();
                     let native = crate::server::session_store::NativeSessionStore::open(
-                        preparation_state, &started.source_profile, Some(target),
-                    ).unwrap();
-                    let generation = started.acquire_lifecycle_reservation(
-                        &native, LifecycleOperation::Launch, Some(Status::Starting),
-                    ).unwrap();
+                        preparation_state,
+                        &started.source_profile,
+                        Some(target),
+                    )
+                    .unwrap();
+                    let generation = started
+                        .acquire_lifecycle_reservation(
+                            &native,
+                            LifecycleOperation::Launch,
+                            Some(Status::Starting),
+                        )
+                        .unwrap();
                     native.adopt_runtime_fields(&started).unwrap();
                     (native, started, generation)
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 state.acp_event_store.test_conn().execute_batch(
                     "CREATE TEMP TRIGGER fail_explicit_restart_quota BEFORE INSERT ON acp_events
                      WHEN NEW.discriminant = 'RateLimitAutoResumed'
                      BEGIN SELECT RAISE(ABORT, 'genuine explicit restart quota IO failure'); END;"
                 ).unwrap();
-                let response = finish_structured_restart(&state, &id, StructuredRestartLaunch {
-                    generation, started, native, hooks: Ok(()), account_swap: true,
-                    carry: None, wake: Some("explicit replacement wake".into()),
-                    reservation: None, reason: "user",
-                    quota: Some(PreparedQuotaRestart { resets_at, continuation: None }),
-                }).await;
+                let response = finish_structured_restart(
+                    &state,
+                    &id,
+                    StructuredRestartLaunch {
+                        generation,
+                        started,
+                        native,
+                        hooks: Ok(()),
+                        account_swap: true,
+                        carry: None,
+                        wake: Some("explicit replacement wake".into()),
+                        reservation: None,
+                        reason: "user",
+                        quota: Some(PreparedQuotaRestart {
+                            resets_at,
+                            continuation: None,
+                        }),
+                    },
+                )
+                .await;
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                let current = state.instances.read().await.iter()
-                    .find(|row| row.id == id).unwrap().clone();
-                assert!(current.launch_is_finalized(),
-                    "post-hook generation must finalize before the refused breadcrumb");
-                assert_eq!(current.pending_initial_turn.as_ref().map(|turn| turn.text.as_str()),
-                    Some("existing pending work"));
+                let current = state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                assert!(
+                    current.launch_is_finalized(),
+                    "post-hook generation must finalize before the refused breadcrumb"
+                );
+                assert_eq!(
+                    current
+                        .pending_initial_turn
+                        .as_ref()
+                        .map(|turn| turn.text.as_str()),
+                    Some("existing pending work")
+                );
                 let durable = crate::session::Storage::open_unwatched(&current.source_profile)
-                    .unwrap().load().unwrap().into_iter().find(|row| row.id == id).unwrap();
-                assert_eq!(serde_json::to_value(durable.pending_initial_turn).unwrap(),
-                    serde_json::to_value(current.pending_initial_turn).unwrap());
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(durable.pending_initial_turn).unwrap(),
+                    serde_json::to_value(current.pending_initial_turn).unwrap()
+                );
                 assert!(!state.acp_supervisor.is_running(&id).await);
                 assert_eq!(state.acp_event_store.highest_seq(&id), frontier);
-                assert_eq!(state.acp_event_store.rate_limit_redelivery_streak(&id).unwrap(), budget);
+                assert_eq!(
+                    state
+                        .acp_event_store
+                        .rate_limit_redelivery_streak(&id)
+                        .unwrap(),
+                    budget
+                );
                 assert_eq!(live.native.requests(), requests);
-                state.acp_event_store.test_conn().execute_batch(
-                    "DROP TRIGGER fail_explicit_restart_quota",
-                ).unwrap();
-        })).await;
+                state
+                    .acp_event_store
+                    .test_conn()
+                    .execute_batch("DROP TRIGGER fail_explicit_restart_quota")
+                    .unwrap();
+            })
+        })
+        .await;
     }
 }
