@@ -92,10 +92,24 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   expect(status).not.toBe("error");
   await expect(page.getByText(PROMPT)).toBeVisible();
   await expect(composer).toBeEnabled();
+  // The prompt reaches the replacement once, and the turn must finish before the log is read.
+  await expect.poll(deliveries, { timeout: 15_000 }).toBe(1);
+  await expect(stopButton).toHaveCount(0, { timeout: 15_000 });
+  const readEvents = async () =>
+    (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
+      ({ event }) => event,
+    );
+  await expect
+    .poll(
+      async () =>
+        (await readEvents()).some((e) => (e.Stopped as { reason?: string } | undefined)?.reason === "prompt_complete"),
+      {
+        timeout: 15_000,
+      },
+    )
+    .toBe(true);
   // The event log is the check: the carried prompt is sent once and its turn is never stopped by a restart.
-  const events = (JSON.parse(await replayJson(serve.baseUrl, session!.id)) as { event: Record<string, unknown> }[]).map(
-    ({ event }) => event,
-  );
+  const events = await readEvents();
   const sent = events.filter((e) => (e.UserPromptSent as { text?: string } | undefined)?.text === PROMPT);
   expect(sent).toHaveLength(1);
   const after = events.slice(events.indexOf(sent[0]!) + 1);
@@ -103,6 +117,4 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const stopped = after.filter((e) => "Stopped" in e);
   expect(stopped).not.toContainEqual({ Stopped: { reason: "user_stopped" } });
   expect(stopped[0]).toEqual({ Stopped: { reason: "prompt_complete" } });
-  await expect.poll(deliveries, { timeout: 15_000 }).toBe(1);
-  await expect(stopButton).toHaveCount(0);
 });
