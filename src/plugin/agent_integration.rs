@@ -1007,6 +1007,45 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn omp_fallback_remains_available_without_an_active_status_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let mut instance = Instance::new("omp-fallback", temp.path().to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.status = crate::session::Status::Running;
+
+        let assert_fallback = || {
+            assert_eq!(instance.get_tool_command(), "omp");
+            assert_eq!(owned_status(&instance, false), None);
+            let agent = instance.status_agent().expect("built-in OMP");
+            assert_eq!((agent.detect_status)("plain command output"), crate::session::Status::Idle);
+            assert_eq!(
+                agent.session_support.unwrap().capture.unwrap().backend,
+                crate::agents::SessionCaptureBackend::Omp
+            );
+        };
+
+        super::super::reload_registry();
+        assert_fallback();
+        install_test_integration("acme.omp-owner", "omp");
+        super::super::reload_registry();
+        assert_eq!(instance.get_tool_command(), "omp");
+        assert_eq!(owned_status(&instance, false), Some((crate::session::Status::Unknown, false)));
+        crate::session::update_config(|config| {
+            config.plugins.get_mut("acme.omp-owner").unwrap().enabled = false;
+        }).unwrap();
+        super::super::reload_registry();
+        assert_fallback();
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn api21_generic_capture_stops_when_plugin_is_disabled_without_removing_omp() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
