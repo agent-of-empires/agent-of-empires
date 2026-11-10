@@ -7,7 +7,7 @@ import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { sessionRowChromeClass } from "../../lib/sessionRowChrome";
 import { useSessionColorsEnabled } from "../../lib/sessionColors";
 import { useSidebarCompact } from "../../lib/sidebarCompact";
-import { EMPTY_OPTIMISTIC, type OptimisticTriage } from "../../lib/sidebarOptimistic";
+import { EMPTY_OPTIMISTIC, type OptimisticTriage, type RowOptimistic } from "../../lib/sidebarOptimistic";
 import { sessionWorkspace } from "../../lib/sessionWorkspace";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
@@ -27,6 +27,8 @@ const NAVIGATE_ONLY: ClickModifiers = { metaKey: false, ctrlKey: false, shiftKey
 const SINGLE_SCOPE: RowContextScope = { kind: "single" };
 
 export interface SessionRowProps extends SessionActionHandlers {
+  /** Identity of this rendered row; a workspace split across buckets has one per bucket. */
+  rowKey: string;
   workspace: Workspace;
   observedById: Record<string, RuntimeCursor>;
   runtimeEpoch: string | null;
@@ -41,11 +43,11 @@ export interface SessionRowProps extends SessionActionHandlers {
   /** Only passed to rows that can expand, so a navigation does not re-render every other row. */
   activeSessionId?: string | null;
   /** Looks up an expanded sibling's own optimistic triage; only passed to rows that can expand. */
-  optimisticFor?: (workspaceId: string) => OptimisticTriage;
+  optimisticFor?: (workspace: Workspace) => RowOptimistic;
 }
 
 export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
-  const { workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
+  const { rowKey, workspace, isActive, isSelected, onActivate, readOnly, indented, bulkApi } = props;
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const sessionColorsEnabled = useSessionColorsEnabled();
   const compact = useSidebarCompact();
@@ -69,7 +71,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<SessionMenuState>(openedAtRef);
-  const openMenuAt = (x: number, y: number) => openMenu({ x, y, scope: bulkApi.prepareScope(workspace) });
+  const openMenuAt = (x: number, y: number) => openMenu({ x, y, scope: bulkApi.prepareScope(rowKey) });
   const longPress = useLongPress(!!sessionId && !isDeleting, (x, y) => {
     openedAtRef.current = Date.now();
     openMenuAt(x, y);
@@ -158,7 +160,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
           if (e.button !== 0 || e.altKey) return;
           e.preventDefault();
           if (isDeleting || longPress.fired.current) return;
-          onActivate(workspace.id, e, navigationSessionId);
+          onActivate(rowKey, e, navigationSessionId);
         }}
         onContextMenu={(e) => {
           if (isDeleting) return;
@@ -294,7 +296,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
                 isSelected={false}
                 onActivate={activateSibling}
                 bulkApi={siblingBulkApi}
-                optimistic={props.optimisticFor?.(sibling.id) ?? EMPTY_OPTIMISTIC}
+                optimistic={props.optimisticFor?.(sibling) ?? EMPTY_OPTIMISTIC}
               />
             );
           })}

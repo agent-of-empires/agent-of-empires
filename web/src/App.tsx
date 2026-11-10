@@ -33,6 +33,7 @@ import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { SCRATCH_GROUP_ID, useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
+import { useStatusGroups } from "./hooks/useStatusGroups";
 import { useAttentionJump } from "./hooks/useAttentionJump";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
 import { useOrgGroups } from "./hooks/useOrgGroups";
@@ -559,6 +560,14 @@ function AppContent({
     pluginSort,
     pluginAttention,
   );
+  // The status axis groups by execution status instead of by where a session
+  // lives, so it owns its own grouping and collapse state.
+  const { groups: statusGroups, toggleGroupCollapsed: toggleStatusGroupCollapsed } = useStatusGroups(
+    workspaces,
+    sidebarSortMode,
+    pluginSort,
+    pluginAttention,
+  );
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
@@ -579,15 +588,18 @@ function AppContent({
     toggleRepoCollapsed: toggleOrgRepoCollapsed,
   } = useOrgGroups(repoGroups);
 
-  // The sidebar render path consumes one honest model (SidebarGroup): the
-  // repo axis maps in via an adapter, the user-group axis is already in
-  // that shape. Collapse routing follows the active axis so the two
-  // axes keep independent collapse state. See #1234.
-  const sidebarGroups = useMemo(
-    () => (sidebarAxis === "group" ? sessionGroups : repoGroups.map(repoGroupToSidebarGroup)),
-    [sidebarAxis, sessionGroups, repoGroups],
-  );
-  const toggleSidebarGroup = sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
+  // Collapse state is independent for each grouping axis.
+  const sidebarGroups = useMemo(() => {
+    if (sidebarAxis === "status") return statusGroups;
+    if (sidebarAxis === "group") return sessionGroups;
+    return repoGroups.map(repoGroupToSidebarGroup);
+  }, [sidebarAxis, statusGroups, sessionGroups, repoGroups]);
+  const toggleSidebarGroup =
+    sidebarAxis === "status"
+      ? toggleStatusGroupCollapsed
+      : sidebarAxis === "group"
+        ? toggleGroupCollapsed
+        : toggleRepoCollapsed;
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the

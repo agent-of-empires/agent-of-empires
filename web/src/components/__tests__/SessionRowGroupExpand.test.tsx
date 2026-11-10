@@ -115,7 +115,7 @@ describe("expanding a shared-worktree row into its sessions", () => {
 
     fireEvent.contextMenu(rows()[0]!);
     expect(bulkApi.prepareScope).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(bulkApi.prepareScope).mock.calls[0]![0].id).toBe("w");
+    expect(bulkApi.prepareScope).toHaveBeenCalledWith("w");
 
     fireEvent.contextMenu(rows()[2]!);
     expect(bulkApi.prepareScope).toHaveBeenCalledTimes(1);
