@@ -2068,6 +2068,15 @@ mod tests {
                     let store = scope.state.acp_event_store.clone();
                     let prefix = store.highest_seq(&client.id);
                     let storage = crate::session::Storage::open_reference("test").unwrap();
+                    let mut preceding_lifecycle = if profile_writer {
+                        Some((
+                            storage.sessions_path().parent().unwrap().join(
+                                format!(".instance-lifecycle-{}.lock", client.id)),
+                            storage.acquire_instance_lifecycle_lock(&client.id).unwrap(),
+                        ))
+                    } else {
+                        None
+                    };
                     let native = if profile_writer {
                         crate::session::acquire_storage_flock(storage.sessions_path().parent().unwrap(), crate::session::STORAGE_LOCK_FILENAME).unwrap()
                     } else {
@@ -2130,7 +2139,21 @@ mod tests {
                         else { format!(".instance-lifecycle-{}.lock", client.id) });
                     tokio::time::timeout(Duration::from_secs(10),
                         tokio::task::spawn_blocking(move || {
-                            while contended_rx.recv()? != held_path {}
+                            loop {
+                                let reported_path = contended_rx.recv()?;
+                                if preceding_lifecycle.as_ref()
+                                    .is_some_and(|(path, _)| path == &reported_path)
+                                {
+                                    drop(preceding_lifecycle.take());
+                                }
+                                if reported_path == held_path {
+                                    if profile_writer {
+                                        assert!(preceding_lifecycle.is_none(),
+                                            "profile contention follows the actual lifecycle wait");
+                                    }
+                                    break;
+                                }
+                            }
                             Ok::<(), std::sync::mpsc::RecvError>(())
                         }))
                         .await.expect("the captured diagnostic reaches the held flock")

@@ -946,7 +946,7 @@ impl Storage {
 #[cfg(test)]
 fn report_lock_contention_for_test(path: &Path, shared_flock: bool) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
-        if let Some(sender) = slot.borrow_mut().take() {
+        if let Some(sender) = slot.borrow().as_ref() {
             let _ = sender.send(path.to_path_buf());
         }
     });
