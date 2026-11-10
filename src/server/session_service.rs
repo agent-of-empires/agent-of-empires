@@ -366,6 +366,9 @@ pub(crate) enum SendTurnError {
     /// coming; retryable, and nothing was published, so the transcript is
     /// not left with a prompt no agent ever received. See #1748 and #3172.
     WorkerNotReady,
+    /// Pre-publish: the ready worker runs a different agent from the one the turn was classified
+    /// for (a resume picked another agent). Nothing was published; retryable.
+    AgentChanged,
     /// Pre-publish: `no_revive` was set and delivering this turn would have
     /// required resuming a worker that is not currently running.
     RevivalRefused,
@@ -430,6 +433,7 @@ impl std::fmt::Display for SendTurnError {
             Self::ModeApplication(e) => write!(f, "mode application failed: {e}"),
             Self::ResumeFailed(e) => write!(f, "worker resume failed: {e}"),
             Self::WorkerNotReady | Self::WorkerLostAfterPublish => write!(f, "worker not ready"),
+            Self::AgentChanged => write!(f, "the ready worker runs another agent"),
             Self::RevivalRefused => write!(f, "no_revive: reviving a stopped worker is required"),
             Self::Send(e) => write!(f, "prompt forward failed: {e}"),
         }
@@ -998,13 +1002,13 @@ impl SessionService {
     }
 
     /// [`Self::send_turn`], publishing with `classified_as` when the caller already cut the
-    /// turn with a profile, else with [`Self::agent_profile`] once the worker is ready.
+    /// turn for an agent, else with [`Self::agent_profile`] once the worker is ready.
     async fn send_classified_turn(
         self: &Arc<Self>,
         caller: &SessionCaller,
         id: &str,
         turn: SendTurnRequest<'_>,
-        classified_as: Option<&'static crate::acp::agent_profiles::AgentProfile>,
+        classified_as: Option<crate::acp::supervisor::Classified>,
     ) -> Result<Option<u64>, SendTurnError> {
         let SendTurnRequest {
             resume_authority,
@@ -1081,9 +1085,26 @@ impl SessionService {
         {
             return Err(SendTurnError::RevivalRefused);
         }
-        let classified_as = match classified_as {
-            Some(profile) => Some(profile),
-            None => self.agent_profile(id, Some(text)).await,
+        let profile = match classified_as {
+            // A turn cut for one agent must not reach a worker a resume started as another.
+            Some(cut) => {
+                let receiving = self.acp_supervisor.worker_agent_key(id).await;
+                if receiving.as_deref().is_some_and(|agent| agent != cut.agent) {
+                    tracing::info!(
+                        target: "acp.queue",
+                        session = %id,
+                        cut_for = %cut.agent,
+                        receiving = ?receiving,
+                        "the ready worker runs another agent; withholding the turn"
+                    );
+                    return Err(SendTurnError::AgentChanged);
+                }
+                Some(cut.profile)
+            }
+            None => self
+                .agent_profile(id, Some(text))
+                .await
+                .map(|classified| classified.profile),
         };
         // Persist the admitted turn before forwarding it to the agent.
         let published = self
@@ -1095,7 +1116,7 @@ impl SessionService {
                 prompt_id,
                 synthesized,
                 caller.message_origin().map(str::to_string),
-                classified_as,
+                profile,
             )
             .await;
         let outcome = match published.disposition {
@@ -1928,10 +1949,10 @@ impl SessionService {
 
         // Leading batch up to a clear or compact boundary. Publication reuses this profile, so a
         // settings change during delivery cannot reclassify a row the batch already cut.
-        let Some(profile) = self.agent_profile(id, None).await else {
+        let Some(classified) = self.agent_profile(id, None).await else {
             return;
         };
-        let (sub, combined) = queue_drain_batch(&queue, profile);
+        let (sub, combined) = queue_drain_batch(&queue, classified.profile);
         let caller = match &sub[0].origin_plugin {
             Some(plugin_id) => SessionCaller::PluginMessage {
                 plugin_id: plugin_id.clone(),
@@ -1983,7 +2004,7 @@ impl SessionService {
                     synthesized: false,
                     no_revive: false,
                 },
-                Some(profile),
+                Some(classified),
             )
             .await
         {
@@ -2240,19 +2261,19 @@ impl SessionService {
     async fn is_solo_command(&self, id: &str, text: &str) -> bool {
         self.agent_profile(id, Some(text))
             .await
-            .is_some_and(|profile| profile.is_solo_command(text))
+            .is_some_and(|classified| classified.profile.is_solo_command(text))
     }
 
-    /// The profile that classifies the session's prompts: its worker's agent, else the agent its
-    /// next spawn picks. Queue boundaries, solo-command holds, publication and the advertised
+    /// The agent and profile that classify the session's prompts: its worker's agent, else the
+    /// agent its next spawn picks. Queue boundaries, solo-command holds, publication and the advertised
     /// aliases share this identity. Given `text` that cannot match a declared reset alias, a
     /// worker's profile skips the configuration read. `None` for an unknown session.
     pub(crate) async fn agent_profile(
         &self,
         id: &str,
         text: Option<&str>,
-    ) -> Option<&'static crate::acp::agent_profiles::AgentProfile> {
-        use crate::acp::supervisor::SessionAgent;
+    ) -> Option<crate::acp::supervisor::Classified> {
+        use crate::acp::supervisor::{Classified, SessionAgent};
         let (next, source_profile, project_path) = {
             let instances = self.instances.read().await;
             let inst = instances.iter().find(|i| i.id == id)?;
@@ -2270,12 +2291,16 @@ impl SessionService {
                 if text
                     .is_some_and(|t| !crate::acp::agent_profiles::could_be_declared_alias(t)) =>
             {
-                return Some(crate::acp::agent_profiles::resolve(&key));
+                let profile = crate::acp::agent_profiles::resolve(&key);
+                return Some(Classified {
+                    agent: key,
+                    profile,
+                });
             }
             Some(key) => SessionAgent::Worker(key),
             None => next,
         };
-        Some(agent.profile(&source_profile, &project_path).await)
+        Some(agent.classify(&source_profile, &project_path).await)
     }
 
     /// See [`crate::acp::dispatch::WorkerLiveness::rate_limit_parked`].
@@ -2746,6 +2771,7 @@ pub(crate) fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::supervisor::test_support::save_agent_record;
 
     fn plugin_instance(plugin_id: &str, key: &str, payload_hash: &str) -> Instance {
         let mut inst = Instance::new("scheduled", "/tmp/aoe-2897-project");
@@ -3186,24 +3212,6 @@ mod tests {
         .unwrap();
     }
 
-    /// Record `agent` as the worker the session runs, as a spawn does.
-    fn record_worker_agent(id: &str, agent: &str) {
-        let record = crate::process::worker_registry::WorkerRecord::new(
-            id.into(),
-            std::process::id(),
-            crate::process::worker_registry::socket_path_for(id).unwrap(),
-            agent.into(),
-            agent.into(),
-            "/tmp".into(),
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-            None,
-        );
-        crate::process::worker_registry::save(&record).unwrap();
-    }
-
     fn structured_idle_row(id: &str, tool: &str) -> Instance {
         let mut row = Instance::new(id, &format!("/tmp/aoe-{id}"));
         row.id = id.into();
@@ -3228,11 +3236,14 @@ mod tests {
                 row
             },
             structured_idle_row("runs-claude", "claude"),
+            structured_idle_row("dead-bridge", "claude"),
         ];
         let service = crate::server::test_support::build_test_app_state(rows)
             .session_service
             .clone();
-        record_worker_agent("runs-bridge", "bridge");
+        let _live = save_agent_record("runs-bridge", "bridge", true);
+        // An unclean death leaves the record behind; the next spawn picks Claude.
+        save_agent_record("dead-bridge", "bridge", false);
         // (session, text, solo)
         let cases = [
             ("runs-bridge", "/new", true),
@@ -3244,12 +3255,16 @@ mod tests {
             ("explicit-bridge", "/clear", false),
             ("runs-claude", "/clear", true),
             ("runs-claude", "/new", false),
+            ("dead-bridge", "/clear", true),
+            ("dead-bridge", "/new", false),
         ];
         for (id, text, solo) in cases {
             assert_eq!(service.is_solo_command(id, text).await, solo, "{id} {text}");
         }
         assert!(service.agent_profile("missing", None).await.is_none());
-        crate::process::worker_registry::delete("runs-bridge").ok();
+        for id in ["runs-bridge", "dead-bridge"] {
+            crate::process::worker_registry::delete(id).ok();
+        }
     }
 
     #[tokio::test]
@@ -3283,7 +3298,7 @@ mod tests {
                 .acp_supervisor
                 .test_insert_worker_cmd_recording(id)
                 .await;
-            record_worker_agent(id, "bridge");
+            let _live = save_agent_record(id, "bridge", true);
             for (n, text) in queued.iter().enumerate() {
                 service
                     .enqueue_prompt(
@@ -3327,7 +3342,7 @@ mod tests {
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
-        record_worker_agent(id, "bridge");
+        let _live = save_agent_record(id, "bridge", true);
         let cut_with = service.agent_profile(id, None).await.unwrap();
         // The setting changes after the cut: `/new` now resets.
         declare_custom_reset("/new");
@@ -3351,6 +3366,50 @@ mod tests {
             .expect("the turn is delivered");
         service.acp_supervisor.test_flush_worker_commands(id).await;
         assert_eq!(*recorded.lock().unwrap(), ["prompt"]);
+        crate::process::worker_registry::delete(id).ok();
+    }
+
+    /// A batch cut for one agent is withheld from a worker a resume started as another, so the
+    /// drain leaves its rows queued and cuts them again for the agent that now runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_turn_cut_for_one_agent_is_withheld_from_a_worker_running_another() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let id = "resumed-as-claude";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "claude",
+        )])
+        .session_service
+        .clone();
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _live = save_agent_record(id, "claude", true);
+        let cut_for_bridge = crate::acp::supervisor::Classified {
+            agent: "bridge".into(),
+            profile: &crate::acp::agent_profiles::CUSTOM_NEW,
+        };
+        let outcome = service
+            .send_classified_turn(
+                &SessionCaller::User,
+                id,
+                SendTurnRequest {
+                    resume_authority: crate::process::worker_registry::ResumeAuthority::Automatic,
+                    text: "/clear\n\nafter",
+                    attachments: &[],
+                    woke_idle_dormant: false,
+                    prompt_id: None,
+                    synthesized: false,
+                    no_revive: false,
+                },
+                Some(cut_for_bridge),
+            )
+            .await;
+        assert!(matches!(outcome, Err(SendTurnError::AgentChanged)));
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(!service.fold_control_state(id).await.turn_active);
         crate::process::worker_registry::delete(id).ok();
     }
 

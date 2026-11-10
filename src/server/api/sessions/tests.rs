@@ -4254,24 +4254,14 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
     let state = crate::server::test_support::build_test_app_state(vec![
         mk("next-bridge", "bridge", true),
         mk("runs-bridge", "claude", true),
+        mk("dead-bridge", "claude", true),
         mk("claude", "claude", true),
         mk("cursor", "cursor", true),
         mk("terminal-bridge", "bridge", false),
     ]);
-    let record = crate::process::worker_registry::WorkerRecord::new(
-        "runs-bridge".into(),
-        std::process::id(),
-        crate::process::worker_registry::socket_path_for("runs-bridge").unwrap(),
-        "bridge".into(),
-        "bridge".into(),
-        "/tmp".into(),
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-        None,
-    );
-    crate::process::worker_registry::save(&record).unwrap();
+    let _live =
+        crate::acp::supervisor::test_support::save_agent_record("runs-bridge", "bridge", true);
+    crate::acp::supervisor::test_support::save_agent_record("dead-bridge", "bridge", false);
 
     let advertised: Vec<_> = project_sessions(&state)
         .await
@@ -4290,12 +4280,15 @@ async fn list_sessions_advertises_the_running_agents_reset_command() {
         [
             row("next-bridge", &["/new"], &[]),
             row("runs-bridge", &["/new"], &[]),
+            row("dead-bridge", &["/clear"], &["/compact"]),
             row("claude", &["/clear"], &["/compact"]),
             row("cursor", &[], &[]),
             row("terminal-bridge", &[], &[]),
         ]
     );
-    crate::process::worker_registry::delete("runs-bridge").ok();
+    for id in ["runs-bridge", "dead-bridge"] {
+        crate::process::worker_registry::delete(id).ok();
+    }
 }
 
 #[tokio::test]

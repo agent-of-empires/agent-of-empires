@@ -152,6 +152,13 @@ pub(crate) enum SessionAgent {
     },
 }
 
+/// The agent a turn was classified for and the profile that classified it.
+#[derive(Debug, Clone)]
+pub(crate) struct Classified {
+    pub(crate) agent: String,
+    pub(crate) profile: &'static crate::acp::agent_profiles::AgentProfile,
+}
+
 impl SessionAgent {
     /// The agent's profile under resolved configuration, with any declared reset alias.
     pub(crate) fn profile_with(
@@ -159,7 +166,15 @@ impl SessionAgent {
         registry: &AgentRegistry,
         config: &crate::session::config::Config,
     ) -> &'static crate::acp::agent_profiles::AgentProfile {
-        let key = match self {
+        self.classify_with(registry, config).profile
+    }
+
+    fn classify_with(
+        &self,
+        registry: &AgentRegistry,
+        config: &crate::session::config::Config,
+    ) -> Classified {
+        let agent = match self {
             Self::Worker(key) => key.clone(),
             Self::Next { tool, explicit } => crate::acp::pick_acp_agent_name(
                 registry,
@@ -169,24 +184,32 @@ impl SessionAgent {
                 explicit.as_deref(),
             ),
         };
-        crate::acp::agent_profiles::resolve_with_config(&key, &config.session)
+        let profile = crate::acp::agent_profiles::resolve_with_config(&agent, &config.session);
+        Classified { agent, profile }
     }
 
-    /// [`Self::profile_with`] for a session whose configuration resolves from `profile` and
-    /// `project_path`. A built-in worker skips the configuration read.
-    pub(crate) async fn profile(
-        self,
-        profile: &str,
-        project_path: &Path,
-    ) -> &'static crate::acp::agent_profiles::AgentProfile {
+    /// [`Self::profile_with`], naming the agent, for a session whose configuration resolves
+    /// from `profile` and `project_path`. A built-in worker skips the configuration read.
+    pub(crate) async fn classify(self, profile: &str, project_path: &Path) -> Classified {
         use crate::acp::agent_profiles::{is_builtin, resolve};
         let fallback = match &self {
-            Self::Worker(key) if is_builtin(key) => return resolve(key),
-            Self::Worker(key) => resolve(key),
-            Self::Next { .. } => &crate::acp::agent_profiles::DEFAULT,
+            Self::Worker(key) if is_builtin(key) => {
+                return Classified {
+                    agent: key.clone(),
+                    profile: resolve(key),
+                }
+            }
+            Self::Worker(key) => Classified {
+                agent: key.clone(),
+                profile: resolve(key),
+            },
+            Self::Next { tool, .. } => Classified {
+                agent: tool.clone(),
+                profile: &crate::acp::agent_profiles::DEFAULT,
+            },
         };
         with_resolved_config(profile, project_path, move |cfg| {
-            self.profile_with(&AgentRegistry::with_defaults(), &cfg)
+            self.classify_with(&AgentRegistry::with_defaults(), &cfg)
         })
         .await
         .unwrap_or(fallback)

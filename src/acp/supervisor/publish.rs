@@ -117,6 +117,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// daemon-queued rate-limit continuation rather than text the user just
     /// typed, which the transcript renders no row for (#4040). `classified_as`
     /// is the profile a caller already cut the turn with; `None` looks it up.
+    // Each argument is a separate field of the recorded event or of how it is routed, and the
+    // callers pass them positionally from different sources; a struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     pub async fn publish_user_prompt_with_attachments(
         &self,
@@ -225,12 +227,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             return resolve(&agent_key);
         }
         super::SessionAgent::Worker(agent_key)
-            .profile(&source_profile.unwrap_or_default(), &cwd)
+            .classify(&source_profile.unwrap_or_default(), &cwd)
             .await
+            .profile
     }
 
     /// The registry key, source profile and cwd of the session's live runner, else of its
-    /// registry record.
+    /// registry record while that record's runner is alive. A dead runner's record says
+    /// nothing about the agent the next spawn runs.
     async fn worker_agent(
         &self,
         session_id: &str,
@@ -244,12 +248,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                 ));
             }
         }
-        match crate::process::worker_registry::load(session_id) {
-            Ok(Some(record)) if !record.agent_key.is_empty() => {
-                Some((record.agent_key, record.source_profile, record.cwd))
-            }
-            _ => None,
-        }
+        let session_id = session_id.to_string();
+        tokio::task::spawn_blocking(move || live_record_agent(&session_id))
+            .await
+            .ok()
+            .flatten()
+            .map(|record| (record.agent_key, record.source_profile, record.cwd))
     }
 
     /// The session's worker agent key; see [`Self::worker_agent`].
@@ -279,12 +283,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let recorded = tokio::task::spawn_blocking(move || {
             unresolved
                 .into_iter()
-                .filter_map(|id| match crate::process::worker_registry::load(&id) {
-                    Ok(Some(record)) if !record.agent_key.is_empty() => {
-                        Some((id, record.agent_key))
-                    }
-                    _ => None,
-                })
+                .filter_map(|id| live_record_agent(&id).map(|record| (id, record.agent_key)))
                 .collect::<Vec<_>>()
         })
         .await
@@ -457,6 +456,16 @@ pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     }
 }
 
+/// The session's registry record, if it names an agent and its runner is alive.
+fn live_record_agent(session_id: &str) -> Option<crate::process::worker_registry::WorkerRecord> {
+    crate::process::worker_registry::load(session_id)
+        .ok()
+        .flatten()
+        .filter(|record| {
+            !record.agent_key.is_empty() && crate::process::worker_registry::is_record_live(record)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;
@@ -589,9 +598,17 @@ mod tests {
         for (session_id, agent, text, disposition, cleared) in cases {
             let dir = worker_registry::workers_dir().unwrap();
             let socket = dir.join(format!("{session_id}.sock"));
+            // A record counts only while its runner's control socket exists.
+            let mut _live = None;
             match agent {
                 Some(("", "")) => {}
                 Some((name, key)) => {
+                    _live = Some(
+                        std::os::unix::net::UnixListener::bind(
+                            crate::process::worker::control_socket_sibling(&socket),
+                        )
+                        .unwrap(),
+                    );
                     let mut record = worker_record(session_id, std::process::id(), socket);
                     record.agent_name = name.into();
                     record.agent_key = key.into();
@@ -696,16 +713,7 @@ inherits-claude = "claude"
         ];
         for (n, (key, text, disposition, cleared)) in cases.into_iter().enumerate() {
             let session_id = format!("alias-{n}");
-            let dir = worker_registry::workers_dir().unwrap();
-            let mut record = worker_record(
-                &session_id,
-                std::process::id(),
-                dir.join(format!("{session_id}.sock")),
-            );
-            record.agent_name = key.into();
-            record.agent_key = key.into();
-            record.cwd = std::env::temp_dir();
-            worker_registry::save(&record).unwrap();
+            let _live = save_agent_record(&session_id, key, true);
 
             let sink = VecSink::new();
             let sup = Supervisor::new(sink.clone());

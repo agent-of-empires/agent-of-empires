@@ -419,6 +419,26 @@ pub(super) fn worker_record(session_id: &str, pid: u32, socket: PathBuf) -> Work
     )
 }
 
+/// Record `agent` as the session's runner. A live record keeps its control socket bound for as
+/// long as the returned listener lives; a dead one has no socket, as after an unclean death.
+pub(crate) fn save_agent_record(
+    session_id: &str,
+    agent: &str,
+    live: bool,
+) -> Option<std::os::unix::net::UnixListener> {
+    let socket = worker_registry::socket_path_for(session_id).unwrap();
+    let mut record = worker_record(session_id, std::process::id(), socket.clone());
+    record.agent_name = agent.into();
+    record.agent_key = agent.into();
+    worker_registry::save(&record).unwrap();
+    live.then(|| {
+        std::os::unix::net::UnixListener::bind(crate::process::worker::control_socket_sibling(
+            &socket,
+        ))
+        .unwrap()
+    })
+}
+
 pub(crate) fn save_record(session_id: &str, pid: u32, generation: u64) {
     let socket = worker_registry::socket_path_for(session_id).unwrap();
     let mut record = worker_record(session_id, pid, socket).with_generation(generation);
