@@ -12,7 +12,10 @@ export function SortableSessionRow({
   rowKey,
   dragDisabled,
   ...props
-}: Omit<ComponentProps<typeof SessionRow>, "indented"> & { rowKey?: string; dragDisabled?: boolean }) {
+}: Omit<ComponentProps<typeof SessionRow>, "indented" | "rowKey"> & {
+  rowKey?: string;
+  dragDisabled?: boolean;
+}) {
   const dragOff = !!props.readOnly || !!dragDisabled;
   const { listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: rowKey ?? props.workspace.id,
@@ -34,7 +37,7 @@ export function SortableSessionRow({
       aria-roledescription={dragOff ? undefined : "Press and hold to reorder"}
       className={liftClass(isDragging)}
     >
-      <SessionRow {...props} indented />
+      <SessionRow rowKey={rowKey ?? props.workspace.id} {...props} indented />
     </div>
   );
 }
