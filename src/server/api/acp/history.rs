@@ -18,6 +18,8 @@ const WORKER_LOG_DEFAULT_TAIL: usize = 200;
 const WORKER_LOG_MAX_TAIL: usize = 2000;
 /// Read window cap so a runaway log cannot pin the daemon.
 const WORKER_LOG_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+/// A modal rereads task output every couple of seconds, so its window is far smaller than a log's.
+const TASK_OUTPUT_MAX_READ_BYTES: u64 = 256 * 1024;
 
 const MAX_LISTED_FILES: usize = 5000;
 
@@ -158,17 +160,21 @@ pub(crate) fn read_log_tail(
     tail: usize,
 ) -> std::io::Result<(Vec<String>, bool, bool)> {
     match std::fs::File::open(path) {
-        Ok(file) => read_tail(file, tail),
+        Ok(file) => read_tail(file, tail, WORKER_LOG_MAX_READ_BYTES),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), false, false)),
         Err(e) => Err(e),
     }
 }
 
-fn read_tail(mut file: std::fs::File, tail: usize) -> std::io::Result<(Vec<String>, bool, bool)> {
+fn read_tail(
+    mut file: std::fs::File,
+    tail: usize,
+    max_bytes: u64,
+) -> std::io::Result<(Vec<String>, bool, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let len = file.metadata()?.len();
-    let read_from = len.saturating_sub(WORKER_LOG_MAX_READ_BYTES);
-    let truncated = len > WORKER_LOG_MAX_READ_BYTES;
+    let read_from = len.saturating_sub(max_bytes);
+    let truncated = len > max_bytes;
 
     // The first line is partial unless the window starts right after a newline.
     let prev_is_newline = if truncated && read_from > 0 {
@@ -247,7 +253,8 @@ pub async fn acp_task_output(
 /// byte window.
 fn read_task_tail(file: std::fs::File) -> std::io::Result<(Vec<String>, bool, bool)> {
     // One extra line tells whether the line cap cut the output too.
-    let (mut lines, truncated, exists) = read_tail(file, TASK_OUTPUT_TAIL_LINES + 1)?;
+    let (mut lines, truncated, exists) =
+        read_tail(file, TASK_OUTPUT_TAIL_LINES + 1, TASK_OUTPUT_MAX_READ_BYTES)?;
     let cut = lines.len() > TASK_OUTPUT_TAIL_LINES;
     if cut {
         lines.remove(0);
@@ -285,13 +292,17 @@ fn open_task_output(
     use nix::fcntl::{open, openat, OFlag};
     use nix::sys::stat::{fstat, Mode, SFlag};
     if !is_plain_id(session_id) || !is_plain_id(task_id) {
+        tracing::debug!(target: "acp", "task output: rejected non-plain session or task id");
         return None;
     }
     let dir_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
-    let root_fd = open(root, dir_flags, Mode::empty()).ok()?;
+    let root_fd = open(root, dir_flags, Mode::empty())
+        .inspect_err(|e| tracing::debug!(target: "acp", root = %root.display(), "task output: cannot open root: {e}"))
+        .ok()?;
     // Another user's or a shared-writable root could serve forged output.
     let root_stat = fstat(&root_fd).ok()?;
     if root_stat.st_uid != nix::unistd::getuid().as_raw() || root_stat.st_mode & 0o022 != 0 {
+        tracing::debug!(target: "acp", root = %root.display(), "task output: root owned by another user or group/world writable");
         return None;
     }
     let file_name = format!("{task_id}.output");
@@ -313,7 +324,11 @@ fn open_task_output(
         )
         .ok()?;
         let kind = SFlag::from_bits_truncate(fstat(&file_fd).ok()?.st_mode as _) & SFlag::S_IFMT;
-        (kind == SFlag::S_IFREG).then(|| std::fs::File::from(file_fd))
+        if kind != SFlag::S_IFREG {
+            tracing::debug!(target: "acp", "task output: leaf is not a regular file");
+            return None;
+        }
+        Some(std::fs::File::from(file_fd))
     })
 }
 
@@ -608,6 +623,19 @@ mod tests {
         assert!(truncated, "the line cap cut the output");
         assert_eq!(lines.len(), TASK_OUTPUT_TAIL_LINES);
         assert_eq!(lines.first().map(String::as_str), Some("l1000"));
+    }
+
+    #[test]
+    fn task_output_tail_is_bounded_by_the_small_byte_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.output");
+        let line = "x".repeat(99) + "\n";
+        let count = (TASK_OUTPUT_MAX_READ_BYTES as usize / line.len()) * 2;
+        std::fs::write(&path, line.repeat(count)).unwrap();
+
+        let (lines, truncated, _) = read_task_tail(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(truncated, "the file exceeds the task output window");
+        assert!(lines.len() * line.len() <= TASK_OUTPUT_MAX_READ_BYTES as usize);
     }
 
     #[test]

@@ -10,6 +10,8 @@ import type { BackgroundShell } from "../../lib/acpTypes";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 const OUTPUT_POLL_MS = 2000;
+// Failed reads retried after the shell ended, before the modal gives up.
+const MAX_RETRIES_AFTER_FINISH = 5;
 
 export function BackgroundShells({ sessionId }: { sessionId: string }) {
   const shells = useBackgroundShells(sessionId);
@@ -57,7 +59,7 @@ function ShellGroup({
             className={`h-2 w-2 shrink-0 rounded-full ${s.finished ? "bg-text-dim/60" : "bg-status-waiting animate-pulse"}`}
           />
           <Terminal className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{s.command || s.taskId}</span>
+          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{s.command || "(command unavailable)"}</span>
           <span className="shrink-0 text-[11px] text-text-dim">{s.finished ? "done" : "running"}</span>
           <Maximize2 className="h-3.5 w-3.5 shrink-0 text-text-dim" />
         </button>
@@ -115,11 +117,13 @@ function ShellDetailModal({
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let retries = 0;
     const read = async () => {
       const next = await fetchTaskOutput(sessionId, shell.taskId);
       if (cancelled) return;
       if (next) setOut(next);
       setFailed(!next);
+      if (!next && shell.finished && ++retries > MAX_RETRIES_AFTER_FINISH) return;
       if (!next || !shell.finished) timer = setTimeout(read, OUTPUT_POLL_MS);
     };
     void read();

@@ -208,6 +208,23 @@ describe("BackgroundAgentsPanel shell dialog", () => {
     }
   });
 
+  it("stops retrying a finished shell whose output never loads", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell({ finished: true })]);
+      taskOutputMock.mockReset();
+      taskOutputMock.mockResolvedValue(null);
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await act(() => vi.advanceTimersByTimeAsync(30_000));
+      expect(taskOutputMock).toHaveBeenCalledTimes(6);
+      expect(document.body.textContent).toContain("Could not load output.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("polls a running shell one read at a time and stops once it finishes", async () => {
     vi.useFakeTimers();
     try {

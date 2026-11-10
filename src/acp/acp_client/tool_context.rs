@@ -105,7 +105,11 @@ pub(super) fn shell_command(cache: &ToolContextCache, tool_call_id: &str) -> Opt
     let end = (0..=MAX_COMMAND_BYTES.min(command.len()))
         .rev()
         .find(|&i| command.is_char_boundary(i))?;
-    Some(command[..end].to_string())
+    let mut capped = command[..end].to_string();
+    if end < command.len() {
+        capped.push('…');
+    }
+    Some(capped)
 }
 
 pub(super) fn update_tool_context_cache(
@@ -214,7 +218,8 @@ mod tests {
             Some("npm run dev")
         );
         let capped = shell_command(&cache, "tc-2").unwrap();
-        assert!(capped.len() <= 16 * 1024 && capped.chars().all(|c| c == 'é'));
+        assert!(capped.len() <= 16 * 1024 + '…'.len_utf8() && capped.ends_with('…'));
+        assert!(capped.trim_end_matches('…').chars().all(|c| c == 'é'));
         assert_eq!(shell_command(&cache, "tc-3"), None);
         assert_eq!(shell_command(&cache, "missing"), None);
     }
