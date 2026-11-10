@@ -3717,10 +3717,12 @@ fn retained_trash_context_menu_keeps_opening_epoch() {
 async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_files() {
     use super::pickers_groups_sort::receipt_cursor;
     use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
-    for action in [
-        "Restore selected Trash",
-        "Retry selected unfinished",
-        "Forget selected unfinished",
+    for (action, fresh) in [
+        ("Restore selected Trash", false),
+        ("Retry selected unfinished", false),
+        ("Forget selected unfinished", false),
+        ("Retry selected unfinished", true),
+        ("Forget selected unfinished", true),
     ] {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
@@ -3729,14 +3731,25 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         let sentinel = path.join("recovery-sentinel");
         std::fs::write(&sentinel, b"keep recovery files").unwrap();
         let restore = action.starts_with("Restore");
+        let scopes = if action.starts_with("Forget") {
+            vec![crate::process::worker_registry::ScopeOwnership::Owned {
+                unit: format!("aoe-test-forget-{id}.scope"),
+            }]
+        } else {
+            Vec::new()
+        };
         env.view.mutate_instance(&id, |row| {
-            row.terminal_scopes = Some(Vec::new());
+            row.terminal_scopes = Some(scopes.clone());
             row.project_path = path.to_string_lossy().into_owned();
             if !restore {
                 row.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now() - chrono::Duration::hours(1),
+                    if fresh {
+                        chrono::Utc::now()
+                    } else {
+                        chrono::Utc::now() - chrono::Duration::hours(1)
+                    },
                 )
                 .unwrap();
             }
@@ -3749,6 +3762,12 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         env.view.rebuild_flat_items();
         env.view.select_session_by_id(&id);
         let epoch = env.view.session_feed.applied_epoch().unwrap().to_owned();
+        let storage = Storage::open_unwatched("test").unwrap();
+        let registry_before = std::fs::read(storage.sessions_path()).unwrap();
+        let journal_path = crate::session::get_app_dir()
+            .unwrap()
+            .join(crate::session::purge_owners::FILE_NAME);
+        let journal_before = std::fs::read(&journal_path).unwrap();
         let mut capture = env.view.session_feed.capture_request_driver_for_test();
         env.view.handle_key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
@@ -3797,8 +3816,28 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
             request_epoch,
         )
         .await;
+        if fresh {
+            assert_eq!(status, axum::http::StatusCode::CONFLICT);
+            assert_eq!(
+                headers[crate::daemon::ERROR_CODE_HEADER],
+                crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
+            );
+            captured.finish(Err(value.to_string()));
+            env.view.apply_session_feed();
+            apply_published(&mut env.view, &state).await;
+            assert!(env.view.session_feed.can_submit(&id));
+            assert_eq!(
+                std::fs::read(storage.sessions_path()).unwrap(),
+                registry_before
+            );
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+            assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
+            continue;
+        }
         assert!(status.is_success(), "{action}: {status} {value}");
         let cursor = receipt_cursor(&headers);
+        assert_eq!(cursor.epoch, epoch);
+        assert!(cursor.revision > 0);
         match &captured.request {
             SessionRequest::Restore => captured.finish(Ok(SessionCommandOutcome::Restored(
                 crate::daemon::MutationReceipt {
@@ -3825,6 +3864,18 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
             )
             .unwrap()
             .retains_session(&id));
+            let journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
+            let owner = journal["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|owner| owner["session_id"] == id)
+                .unwrap();
+            assert_eq!(
+                owner["purpose"]["terminal_scopes"],
+                serde_json::to_value(&scopes).unwrap()
+            );
         } else {
             let row = rows.iter().find(|row| row.id == id).unwrap();
             assert_eq!(row.is_trashed(), !restore);

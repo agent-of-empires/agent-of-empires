@@ -1247,7 +1247,10 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
         std::fs::write(&sentinel, b"must survive forgetting")?;
         let mut row = Instance::new("unfinished Trash", project.path().to_str().unwrap());
         row.source_profile = "receipt".into();
-        row.terminal_scopes = Some(Vec::new());
+        let scopes = vec![crate::process::worker_registry::ScopeOwnership::Owned {
+            unit: format!("aoe-test-forget-{}.scope", row.id),
+        }];
+        row.terminal_scopes = Some(scopes.clone());
         let now = chrono::Utc::now();
         row.try_acquire_lifecycle_reservation(
             crate::session::LifecycleOperation::Trash,
@@ -1332,9 +1335,28 @@ async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> 
             .await?;
         if case == "valid" {
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{case}");
-            assert!(response
-                .headers()
-                .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
+            assert_eq!(
+                response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
+                epoch
+            );
+            assert!(
+                response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
+                    .to_str()?
+                    .parse::<u64>()?
+                    > 0
+            );
+            let journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&journal_path)?)?;
+            let owner = journal["owners"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|owner| owner["session_id"] == id)
+                .unwrap();
+            assert_eq!(
+                owner["purpose"]["terminal_scopes"],
+                serde_json::to_value(&scopes)?
+            );
             assert!(storage.load()?.is_empty());
             assert!(crate::session::purge_owners::CleanupOwners::load(&root)?
                 .protections()

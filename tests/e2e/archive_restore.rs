@@ -1478,7 +1478,12 @@ fn trash_forget_record_preserves_unverified_files_with_keyboard_and_mouse() {
     for mouse in [false, true] {
         let mut h = TuiTestHarness::new("trash_forget_record");
         h.stop_daemon_on_drop();
-        let (row, id, sentinel) = pending_trash_row(&h, "ForgetUnverified", true);
+        let (mut row, id, sentinel) = pending_trash_row(&h, "ForgetUnverified", true);
+        let scopes = serde_json::json!([{
+            "state": "owned",
+            "unit": format!("aoe-test-forget-{id}.scope"),
+        }]);
+        row["terminal_scopes"] = scopes.clone();
         std::fs::write(h.sessions_path(), serde_json::to_vec(&[row]).unwrap()).unwrap();
         h.start_daemon();
         h.spawn_tui();
@@ -1523,11 +1528,14 @@ fn trash_forget_record_preserves_unverified_files_with_keyboard_and_mouse() {
             .unwrap(),
         )
         .unwrap();
-        assert!(journal["owners"]
+        let owner = journal["owners"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|owner| { owner["session_id"] == id && owner["purpose"]["kind"] == "retained" }));
+            .find(|owner| owner["session_id"] == id)
+            .unwrap();
+        assert_eq!(owner["purpose"]["kind"], "retained");
+        assert_eq!(owner["purpose"]["terminal_scopes"], scopes);
     }
 }
 
