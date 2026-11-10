@@ -1112,7 +1112,7 @@ pub async fn force_smart_rename(
         std::path::Path::new(&project_path),
     );
     let config = &resolved.session;
-    if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
+    if let Err(reason) = crate::session::smart_rename::check_eligible_with_declarations(
         true,
         true,
         true,
@@ -1121,7 +1121,7 @@ pub async fn force_smart_rename(
         &config.smart_rename_agent,
         sandboxed,
         &command,
-        &config.agent_command_override,
+        config,
     ) {
         return api_error(StatusCode::CONFLICT, reason.as_str(), reason.user_message());
     }
@@ -1274,7 +1274,7 @@ pub async fn summarize_session(
         &config.session.smart_rename_agent,
         sandboxed,
         &command,
-        &config.session.agent_command_override,
+        &config.session,
     ) {
         use crate::session::smart_rename::SkipReason;
         let (status, message) = match reason {

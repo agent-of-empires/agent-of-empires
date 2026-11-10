@@ -2140,7 +2140,7 @@ pub(crate) fn resolve_active_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     resolve_executed_agent(tool, command, session_config).or_else(|| {
         // Legacy status-only provisioning never grants native conversation authority.
         if session_config.agent_execution_as.contains_key(tool) {
@@ -2157,7 +2157,7 @@ fn resolve_executed_agent(
     tool: &str,
     command: Option<&str>,
     session_config: &super::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     let command = command
         .or_else(|| session_config.custom_agents.get(tool).map(String::as_str))
         .or_else(|| crate::agents::get_agent(tool).map(|agent| agent.binary))
@@ -2543,11 +2543,38 @@ pub(crate) fn build_container_config(
     let project_path = Path::new(project_path_str);
     let profile_config = &launch_config.profile;
     let profile_session_config = &profile_config.session;
-    let active_agent = resolve_active_agent(
-        agent_selection.tool,
-        agent_selection.command,
-        profile_session_config,
-    );
+    let plugin_agent = if crate::agents::get_agent(agent_selection.tool).is_none()
+        && !profile_session_config
+            .agent_command_override
+            .get(agent_selection.tool)
+            .is_some_and(|command| !command.trim().is_empty())
+    {
+        crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            agent_selection.tool,
+            profile_session_config
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
+        .filter(|agent| {
+            agent_selection
+                .command
+                .is_none_or(|command| agent.contribution().command.as_deref() == Some(command))
+        })
+    } else {
+        None
+    };
+    let active_agent = if plugin_agent.is_none() {
+        resolve_active_agent(
+            agent_selection.tool,
+            agent_selection.command,
+            profile_session_config,
+        )
+    } else {
+        None
+    };
     let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
     // A workspace mounts its own dir plus every main repo, a bare-repo worktree
@@ -2593,6 +2620,13 @@ pub(crate) fn build_container_config(
         });
     }
     validate_managed_container_environment(&environment, active_agent, CONTAINER_HOME)?;
+    if let Some(agent) = &plugin_agent {
+        agent
+            .with_definition(|agent| {
+                validate_managed_container_environment(&environment, Some(agent), CONTAINER_HOME)
+            })
+            .transpose()?;
+    }
     if !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
         if let Some(codex_home) = managed_codex_home_from_config(
             agent_selection.tool,
@@ -2981,6 +3015,24 @@ pub(crate) fn build_container_config(
                 });
             }
         }
+    }
+    if let Some(agent) = &plugin_agent {
+        agent.with_definition(|agent| {
+            for &(key, value) in agent.container_env {
+                environment.push(EnvEntry::Literal {
+                    key: key.to_owned(),
+                    value: value.to_owned(),
+                });
+            }
+            if yolo.enabled {
+                if let Some(crate::agents::YoloMode::EnvVar(key, value)) = agent.yolo.as_ref() {
+                    environment.push(EnvEntry::Literal {
+                        key: (*key).to_owned(),
+                        value: (*value).to_owned(),
+                    });
+                }
+            }
+        });
     }
 
     // The agent registry distinguishes approval gates from startup-only trust prompts.

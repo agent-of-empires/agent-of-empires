@@ -2843,7 +2843,7 @@ fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
     Some((words.into_iter().map(str::to_owned).collect(), assignments))
 }
 
-fn plugin_command_on_path(command: &str) -> bool {
+pub(crate) fn plugin_command_on_path(command: &str) -> bool {
     let Some((words, assignments)) = plugin_command_parts(command) else {
         return false;
     };
@@ -3241,8 +3241,8 @@ pub(crate) fn invalidate_agent_availability() {
 /// Names from `agents` that the memo already answers, plus the ones it does
 /// not know about yet. Split under a single read lock.
 fn partition_cached_agents<'a>(
-    agents: &[&'a crate::agents::AgentDef],
-) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef>) {
+    agents: &[&'a crate::agents::AgentDef<'a>],
+) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef<'a>>) {
     let mut found = HashSet::new();
     let mut uncached = Vec::new();
     let cache = AGENT_AVAILABILITY.read().ok();

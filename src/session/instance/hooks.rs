@@ -124,7 +124,7 @@ pub(crate) fn host_hook_agent(
     tool_name: &str,
     command: &str,
     session: &crate::session::config::SessionConfig,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     Instance::execution_agent_for(tool_name, command, session)
         .ok()
         .or_else(|| crate::agents::get_agent(tool_name))
@@ -159,7 +159,7 @@ pub(crate) fn host_hook_disclosure_config_with_repo(
 /// is what the launch exports to the agent, so it is what the agent reads.
 fn host_hook_config_path(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef,
+    agent: &'static crate::agents::AgentDef<'static>,
     home: &std::path::Path,
     session_config: &crate::session::config::SessionConfig,
     host_environment: &[String],
@@ -204,7 +204,7 @@ fn routed_settings_path(
 /// decide the paths.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef,
+    agent: &'static crate::agents::AgentDef<'static>,
     config: &crate::session::config::Config,
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
@@ -488,7 +488,7 @@ impl Instance {
 
     fn ensure_disclosed_host_hook_path(
         &self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&'static crate::agents::AgentDef<'static>>,
     ) -> Result<()> {
         let Some(agent) = agent else {
             return Ok(());
@@ -559,7 +559,7 @@ impl Instance {
     /// keeps resolving its config directory from the environment.
     fn routed_hook_root(
         &self,
-        agent: &'static crate::agents::AgentDef,
+        agent: &'static crate::agents::AgentDef<'static>,
     ) -> Option<std::path::PathBuf> {
         let (_, binding, _) = self.conversation_target()?;
         let binding = binding.filter(|binding| binding.is_known())?;
@@ -572,7 +572,7 @@ impl Instance {
     /// Install optional status hooks and mandatory authoritative identity hooks.
     pub(super) fn install_agent_status_hooks(
         &mut self,
-        agent: Option<&'static crate::agents::AgentDef>,
+        agent: Option<&'static crate::agents::AgentDef<'static>>,
     ) {
         self.identity_publisher_launched = false;
         let config = crate::session::config::profile_config::resolve_config_or_warn(
@@ -624,7 +624,7 @@ impl Instance {
     /// settings file written here is the file the agent reads.
     fn install_host_hooks(
         &self,
-        agent: &'static crate::agents::AgentDef,
+        agent: &'static crate::agents::AgentDef<'static>,
         home: &Path,
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
@@ -685,7 +685,7 @@ impl Instance {
     /// `session.pre_trust_agent_folders`. The path is canonicalized because
     /// agents key trust on the resolved directory, not the symlink used to
     /// reach it.
-    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef>) {
+    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef<'static>>) {
         if self.is_sandboxed() {
             return;
         }
@@ -908,7 +908,7 @@ pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBu
 }
 
 fn resolved_host_hook_events(
-    agent: &'static crate::agents::AgentDef,
+    agent: &'static crate::agents::AgentDef<'static>,
     config: &crate::session::config::Config,
     status_hooks_enabled: bool,
 ) -> Option<Vec<crate::agents::ResolvedHookEvent>> {

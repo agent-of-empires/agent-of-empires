@@ -220,6 +220,8 @@ pub struct NewSessionDialog {
     /// runs in Yolo mode in the chosen view.
     pub(super) agent_acp_cmd: std::collections::HashMap<String, String>,
     pub(super) agent_detect_as: std::collections::HashMap<String, String>,
+    pub(super) custom_agents: std::collections::HashMap<String, String>,
+    pub(super) agent_command_override: std::collections::HashMap<String, String>,
     pub(super) workspace_repos: Vec<String>,
     pub(super) workspace_repos_expanded: bool,
     pub(super) workspace_repo_selected_index: usize,
@@ -625,6 +627,8 @@ impl NewSessionDialog {
             structured_capable,
             agent_acp_cmd: config.session.agent_acp_cmd.clone(),
             agent_detect_as: config.session.agent_detect_as.clone(),
+            custom_agents: config.session.custom_agents.clone(),
+            agent_command_override: config.session.agent_command_override.clone(),
             extra_env,
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -964,12 +968,17 @@ impl NewSessionDialog {
     /// A path's repo config changes the agent only through `agent_detect_as`. When it does,
     /// re-read whether the agent can run structured and re-check the Yolo lock.
     fn refresh_path_agent_config(&mut self, config: &crate::session::Config) {
-        if config.session.agent_detect_as == self.agent_detect_as {
+        if config.session.agent_detect_as == self.agent_detect_as
+            && config.session.custom_agents == self.custom_agents
+            && config.session.agent_command_override == self.agent_command_override
+        {
             return;
         }
         let was_locked = self.selected_tool_always_yolo();
         let before = self.field_indices();
         self.agent_detect_as = config.session.agent_detect_as.clone();
+        self.custom_agents = config.session.custom_agents.clone();
+        self.agent_command_override = config.session.agent_command_override.clone();
         self.structured_capable = !self.terminal_fork()
             && compute_structured_capable(&self.available_tools[self.tool_index], config);
         self.apply_structured_default();
@@ -998,6 +1007,21 @@ impl NewSessionDialog {
         } else {
             crate::session::View::Terminal
         };
+        if view == crate::session::View::Terminal {
+            if let Some(agent) = self.selected_declared_agent() {
+                return agent
+                    .contribution()
+                    .launch
+                    .as_ref()
+                    .and_then(|launch| launch.yolo.as_ref())
+                    .is_some_and(|mode| {
+                        matches!(
+                            mode,
+                            aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always
+                        )
+                    });
+            }
+        }
         crate::acp::runs_always_yolo(
             &self.available_tools[self.tool_index],
             view,
@@ -1009,6 +1033,32 @@ impl NewSessionDialog {
     fn selected_tool_host_only(&self) -> bool {
         let tool_name = &self.available_tools[self.tool_index];
         crate::agents::get_agent(tool_name).is_some_and(|a| a.host_only)
+            || self.selected_declared_agent().is_some_and(|agent| {
+                agent
+                    .contribution()
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.host_only)
+            })
+    }
+
+    fn selected_declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+        let tool = &self.available_tools[self.tool_index];
+        if self
+            .agent_command_override
+            .get(tool)
+            .is_some_and(|command| !command.trim().is_empty())
+        {
+            return None;
+        }
+        crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            tool,
+            self.custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
     }
 
     /// Index of the path field, which precedes title. Shifts by one when the
@@ -1120,6 +1170,8 @@ impl NewSessionDialog {
             !self.terminal_fork() && compute_structured_capable(selected_tool, &config);
         self.agent_acp_cmd = config.session.agent_acp_cmd.clone();
         self.agent_detect_as = config.session.agent_detect_as.clone();
+        self.custom_agents = config.session.custom_agents.clone();
+        self.agent_command_override = config.session.agent_command_override.clone();
         self.apply_structured_default();
         self.tool_config_mode = false;
         self.tool_config_focused_field = 0;
@@ -1187,6 +1239,8 @@ impl NewSessionDialog {
             structured_capable: false,
             agent_acp_cmd: config.session.agent_acp_cmd.clone(),
             agent_detect_as: config.session.agent_detect_as.clone(),
+            custom_agents: config.session.custom_agents.clone(),
+            agent_command_override: config.session.agent_command_override.clone(),
             extra_env: Vec::new(),
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -1270,6 +1324,8 @@ impl NewSessionDialog {
             structured_capable: false,
             agent_acp_cmd: Default::default(),
             agent_detect_as: Default::default(),
+            custom_agents: Default::default(),
+            agent_command_override: Default::default(),
             extra_env: Vec::new(),
             extra_env_overridden: false,
             env_list_expanded: false,
@@ -2236,6 +2292,8 @@ impl NewSessionDialog {
             !self.terminal_fork() && compute_structured_capable(tool, &config);
         self.agent_acp_cmd = config.session.agent_acp_cmd.clone();
         self.agent_detect_as = config.session.agent_detect_as.clone();
+        self.custom_agents = config.session.custom_agents.clone();
+        self.agent_command_override = config.session.agent_command_override.clone();
         self.apply_structured_default();
     }
 

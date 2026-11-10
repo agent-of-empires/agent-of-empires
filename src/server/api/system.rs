@@ -295,18 +295,38 @@ pub async fn list_agents(
                 .map(|(name, _)| name.as_str()),
         );
         for integration in plugin_agents {
+            let launch = registry
+                .get(integration.plugin)
+                .and_then(|owner| {
+                    owner
+                        .manifest
+                        .agent_integrations
+                        .iter()
+                        .find(|entry| entry.tool == integration.tool)
+                })
+                .and_then(|entry| entry.launch.as_ref());
             agents.push(AgentInfo {
                 kind: "plugin".to_string(),
                 name: integration.tool.to_string(),
                 display_name: integration.tool.to_string(),
-                binary: integration.tool.to_string(),
-                host_only: false,
-                always_yolo: crate::acp::runs_always_yolo(
-                    integration.tool,
-                    crate::session::View::Terminal,
-                    agent_acp_cmd,
-                    agent_detect_as,
-                ),
+                binary: aoe_plugin_api::agent_integration::launch_prefix(integration.command)
+                    .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
+                    .unwrap_or_else(|| integration.tool.to_owned()),
+                host_only: launch.is_some_and(|launch| launch.host_only),
+                always_yolo: launch
+                    .and_then(|launch| launch.yolo.as_ref())
+                    .is_some_and(|yolo| {
+                        matches!(
+                            yolo,
+                            aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always
+                        )
+                    })
+                    || crate::acp::runs_always_yolo(
+                        integration.tool,
+                        crate::session::View::Terminal,
+                        agent_acp_cmd,
+                        agent_detect_as,
+                    ),
                 acp_always_yolo: crate::acp::runs_always_yolo(
                     integration.tool,
                     crate::session::View::Structured,
@@ -314,8 +334,10 @@ pub async fn list_agents(
                     agent_detect_as,
                 ),
                 installed: available.iter().any(|name| name == integration.tool),
-                install_hint: format!("Provided by AoE plugin {}", integration.plugin),
-                oneshot_capable: false,
+                install_hint: launch
+                    .and_then(|launch| launch.install_hint.clone())
+                    .unwrap_or_else(|| format!("Provided by AoE plugin {}", integration.plugin)),
+                oneshot_capable: launch.is_some_and(|launch| launch.oneshot_flag.is_some()),
                 acp_capable: false,
                 acp_installed: false,
                 acp_create_ready: false,

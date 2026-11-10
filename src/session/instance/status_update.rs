@@ -258,20 +258,16 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
-        let integration_configured = crate::plugin::agent_integration::configured(self);
-        let integration_snapshot = integration_configured
-            .then(|| crate::plugin::agent_integration::snapshot(self))
-            .flatten();
-        if let Some(status) = crate::plugin::agent_integration::session_status_override(
-            integration_configured,
-            is_dead,
-            integration_snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.status),
-        ) {
+        if let Some((status, reported)) =
+            crate::plugin::agent_integration::owned_status(self, is_dead)
+        {
             self.status = status;
             self.detection.pending = None;
-            self.detection.rule = Some("agent_integration");
+            self.detection.rule = Some(if reported {
+                "agent_integration"
+            } else {
+                "agent_integration_unavailable"
+            });
             if self.status == Status::Error {
                 if is_dead {
                     self.explain_error_from_pane(&session);

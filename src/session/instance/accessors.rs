@@ -207,11 +207,66 @@ impl Instance {
     }
 
     /// Native execution identity; explicit targets never trust status aliases.
-    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
+        if self.declared_agent().is_some() {
+            return None;
+        }
         self.execution_agent().ok()
     }
 
-    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(crate) fn declared_agent(&self) -> Option<crate::plugin::agent_integration::DeclaredAgent> {
+        if crate::agents::get_agent(&self.tool).is_some() {
+            return None;
+        }
+        let config = crate::session::config::repo_config::resolve_config_with_repo(
+            &self.effective_profile(),
+            Path::new(&self.project_path),
+        )
+        .ok()?;
+        if config
+            .session
+            .agent_command_override
+            .get(&self.tool)
+            .is_some_and(|command| !command.trim().is_empty())
+        {
+            return None;
+        }
+        crate::plugin::agent_integration::declared_agent(
+            crate::plugin::registry(),
+            &self.tool,
+            config
+                .session
+                .custom_agents
+                .iter()
+                .filter(|(_, command)| !command.trim().is_empty())
+                .map(|(name, _)| name.as_str()),
+        )
+        .filter(|agent| agent.contribution().command.as_deref() == Some(self.get_tool_command()))
+    }
+
+    fn declared_session_support(
+        &self,
+        sandboxed: bool,
+    ) -> Option<(
+        crate::agents::SessionCaptureSpec,
+        crate::agents::SessionCaptureContext,
+    )> {
+        self.declared_agent()?
+            .with_definition(|agent| {
+                let capture = agent.session_support?.capture?;
+                let context = if sandboxed {
+                    capture.sandbox
+                } else {
+                    capture.host
+                };
+                (context != crate::agents::SessionCaptureContext::Unsupported
+                    && self.launch_invokes_resolved_agent_directly(agent))
+                .then_some((capture, context))
+            })
+            .flatten()
+    }
+
+    pub(crate) fn status_agent(&self) -> Option<&'static crate::agents::AgentDef<'static>> {
         self.resolved_agent()
             .or_else(|| crate::agents::get_agent(&self.tool))
             .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
@@ -234,7 +289,7 @@ impl Instance {
     pub(super) fn resolved_agent_in(
         &self,
         config: &crate::session::config::SessionConfig,
-    ) -> Option<&'static crate::agents::AgentDef> {
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(self.effective_detect_as_in(config)))
     }
@@ -406,10 +461,15 @@ impl Instance {
         crate::agents::SessionCaptureSpec,
         crate::agents::SessionCaptureContext,
     )> {
+        if self.declared_agent().is_some() {
+            return self.declared_session_support(self.is_sandboxed());
+        }
         let native = self.resolved_agent();
-        let agent = native.or_else(|| self.legacy_default_selector_agent())?;
+        let Some(agent) = native.or_else(|| self.legacy_default_selector_agent()) else {
+            return self.declared_session_support(self.is_sandboxed());
+        };
         let support = agent.session_support.as_ref()?;
-        let capture = support.capture.as_ref()?;
+        let capture = support.capture?;
         let context = if self.is_sandboxed() {
             capture.sandbox
         } else {
@@ -426,7 +486,7 @@ impl Instance {
         } else {
             native.is_some() && self.launch_invokes_resolved_agent_directly(agent)
         };
-        authorized.then_some((*capture, context))
+        authorized.then_some((capture, context))
     }
     pub(super) fn source_session_support(
         &self,
@@ -437,18 +497,21 @@ impl Instance {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
+        if crate::agents::get_agent(&active.binding.agent).is_none() {
+            if active.binding.agent != self.tool {
+                return None;
+            }
+            return self.declared_session_support(active.container.is_some());
+        }
         let capture = crate::agents::get_agent(&active.binding.agent)?
-            .session_support
-            .as_ref()?
-            .capture
-            .as_ref()?;
+            .session_support?
+            .capture?;
         let context = if active.container.is_some() {
             capture.sandbox
         } else {
             capture.host
         };
-        (context != crate::agents::SessionCaptureContext::Unsupported)
-            .then_some((*capture, context))
+        (context != crate::agents::SessionCaptureContext::Unsupported).then_some((capture, context))
     }
 
     /// Whether this pane's conversation id is published into its AoE hook sidecar. See
@@ -469,7 +532,9 @@ impl Instance {
     }
 
     /// Bare wrappers can receive fresh-session selectors without attesting execution.
-    pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(super) fn legacy_default_selector_agent(
+        &self,
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         if matches!(
             self.resume_intent,
             ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
@@ -520,7 +585,9 @@ impl Instance {
         Some(agent)
     }
 
-    pub(super) fn default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+    pub(super) fn default_selector_agent(
+        &self,
+    ) -> Option<&'static crate::agents::AgentDef<'static>> {
         self.resolved_agent()
             .or_else(|| self.legacy_default_selector_agent())
     }
@@ -538,6 +605,15 @@ impl Instance {
     }
 
     pub fn supports_native_resume(&self) -> bool {
+        if let Some(declared) = self.declared_agent() {
+            return declared
+                .with_definition(|agent| {
+                    agent.session_support.is_some()
+                        && self.launch_invokes_resolved_agent_directly(agent)
+                        && self.managed_user_argv(agent).is_ok()
+                })
+                .unwrap_or(false);
+        }
         let native = self.resolved_agent();
         let Some(agent) = native.or_else(|| self.legacy_default_selector_agent()) else {
             return false;
@@ -904,7 +980,7 @@ pub(crate) fn resolved_agent_for(
     profile: &str,
     tool: &str,
     detect_as: &str,
-) -> Option<&'static crate::agents::AgentDef> {
+) -> Option<&'static crate::agents::AgentDef<'static>> {
     crate::agents::get_agent(tool).or_else(|| {
         crate::agents::get_agent(&tmux::status_rules::effective_detect_as(
             profile, tool, detect_as,

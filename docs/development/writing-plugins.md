@@ -47,6 +47,8 @@ A worker requests only the grants it uses. `runtime.worker` is required to run a
 
 Agent integrations are optional contributions, not worker RPCs. They require `api_version >= 19`; launch, detection, and reply-fallback extensions require API 21 and a host that implements them. Provider-native status and replies also require `session.integration`. When declared, `session.integration` requires valid, nonempty `provider_versions` on every integration entry. See [Agent integrations](../plugin-api.md#agent-integrations) for the launch grammar, supported capture declarations, and communication contract.
 
+An active provider owns terminal status: an unavailable or invalid report produces Unknown. When the provider is disabled or absent, normal pane detection remains available.
+
 The install approval lists each declared tool, launch command, and agent declaration. Updates that add or change an integration require approval again; removals alone do not. The command runs as the host user only when a user launches that agent.
 
 ## The worker

@@ -219,7 +219,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
     // indicator cannot drift from the runtime gate.
     {
         use crate::session::smart_rename::{
-            check_eligible_resolved, resolve_smart_rename_config, SmartRenameState,
+            check_eligible_with_declarations, resolve_smart_rename_config, SmartRenameState,
         };
         use std::collections::HashSet;
         let inflight: HashSet<String> = state
@@ -251,7 +251,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 session_cfg,
             );
             let cfg = resolve_smart_rename_config(session_cfg, smart_rename_override);
-            let eligible = check_eligible_resolved(
+            let eligible = check_eligible_with_declarations(
                 inst.is_structured(),
                 cfg.setting_on,
                 false,
@@ -260,7 +260,7 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 cfg.rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                cfg.overrides,
+                session_cfg,
             )
             .is_ok();
             if eligible {
