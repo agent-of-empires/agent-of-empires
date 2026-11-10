@@ -783,6 +783,13 @@ impl AcpClient {
         self.control_loss.as_ref()?.get().copied()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_terminal_claimed(&self) -> bool {
+        self.reattach
+            .as_ref()
+            .is_some_and(|spec| spec.state.terminal_claim.claimed())
+    }
+
     /// Claims the terminal of the turn `loss` left in flight. `false` when no
     /// turn was in flight or a path that survived the loss already published it.
     pub(crate) fn claim_lost_turn(&self, loss: control::ControlLoss) -> bool {

@@ -2783,6 +2783,186 @@ mod tests {
         control_channel_loss_case(ControlLossCase::RefusedResume).await;
     }
 
+    /// A completion claimed and queued behind a full event channel when the
+    /// control channel closes still ends the turn once if recovery is
+    /// unavailable: no `runner_control_lost` follows its `prompt_complete`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unrecoverable_loss_after_a_queued_completion_publishes_one_terminal() {
+        use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::sync::oneshot;
+
+        struct Runner(std::process::Child);
+        impl Drop for Runner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let (_home, tmp) = isolate_home();
+        let id = "s-queued-completion-loss";
+        let native = "native-queued-completion";
+        let socket = tmp.path().join("runner.sock");
+        // A live, unstopped record, so only the missing identity rules out recovery.
+        let runner = Runner(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        worker_registry::save(
+            &worker_registry::WorkerRecord::new(
+                id.into(),
+                runner.0.id(),
+                socket.clone(),
+                "test-agent-acp".into(),
+                "test-agent".into(),
+                tmp.path().into(),
+                None,
+                vec![],
+                vec![],
+                Some(native.into()),
+                None,
+            )
+            .with_generation(7),
+        )
+        .unwrap();
+        let listener =
+            tokio::net::UnixListener::bind(crate::process::worker::control_socket_sibling(&socket))
+                .unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (fill_tx, fill_rx) = oneshot::channel::<usize>();
+        let (sever_tx, sever_rx) = oneshot::channel::<()>();
+        let peer = tokio::spawn(async move {
+            let write = |body| control_protocol::encode_frame(&body).unwrap();
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(&write(ControlBody::Hello {
+                    control_protocol_version: control_protocol::CONTROL_PROTOCOL_VERSION,
+                    session_id: id.into(),
+                }))
+                .await
+                .unwrap();
+            while let Ok(Some(frame)) = control_protocol::read_frame(&mut stream).await {
+                let reply = match frame {
+                    ControlBody::Initialize { .. } => ControlBody::Initialized {
+                        result: serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
+                    },
+                    ControlBody::ResumeSession => ControlBody::SessionReady {
+                        acp_session_id: native.into(),
+                        result: serde_json::json!({}),
+                    },
+                    ControlBody::Prompt { .. } => ControlBody::PromptStarted { prompt_req_id: 77 },
+                    _ => continue,
+                };
+                let prompted = matches!(reply, ControlBody::PromptStarted { .. });
+                stream.write_all(&write(reply)).await.unwrap();
+                if prompted {
+                    break;
+                }
+            }
+            started_tx.send(()).unwrap();
+            for n in 0..fill_rx.await.unwrap() {
+                let chunk = ControlBody::Notify {
+                    method: "session/update".into(),
+                    params: serde_json::json!({"sessionId": native, "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": format!("queued-{n}")}
+                    }}),
+                };
+                stream.write_all(&write(chunk)).await.unwrap();
+            }
+            let completed = ControlBody::PromptCompleted {
+                prompt_req_id: 77,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            };
+            stream.write_all(&write(completed)).await.unwrap();
+            sever_rx.await.unwrap();
+        });
+
+        let mut client = AcpClient::attach(
+            socket.clone(),
+            tmp.path().into(),
+            vec![],
+            native.into(),
+            false,
+            AcpSessionId(id.into()),
+            None,
+            "test-agent".into(),
+            None,
+            Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut inbound = client.take_inbound().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(inbound.recv().await, Some(Event::AcpSessionAssigned { .. })) {}
+        })
+        .await
+        .unwrap();
+        client.test_flush_commands().await;
+        client.send_prompt("run", &[]).await.unwrap();
+        started_rx.await.unwrap();
+        fill_tx.send(inbound.max_capacity()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.test_terminal_claimed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completion claims its terminal behind the full channel");
+        assert_eq!(inbound.len(), inbound.max_capacity());
+        sever_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.control_loss().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the reader records the loss");
+        assert!(
+            client.control_loss().unwrap().turn_in_flight,
+            "EOF snapshots the claimed turn as active"
+        );
+
+        let sink = VecSink::new();
+        let launches = Arc::new(AtomicUsize::new(0));
+        let sup = Supervisor::new(sink.clone()).with_launcher(Arc::new({
+            let launches = Arc::clone(&launches);
+            move |_, _| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(AcpError::Spawn("replacement refused".into())) })
+            }
+        }));
+        let kind = WorkerKind::Runner {
+            spawn_config: Box::new(runner_config(socket.clone())),
+        };
+        // No recorded runner identity: same-runner recovery is unavailable.
+        let lease = sup.test_install_handle(id, client, kind, None).await;
+        let drain = sup.start_drain_task(id.into(), lease, inbound, None);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain settles after the fallback")
+            .unwrap();
+        assert_eq!(stopped_reasons(&sink, id), ["prompt_complete"]);
+        assert!(sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, event)| matches!(event, Event::AgentStartupError { .. })));
+        assert_eq!(launches.load(Ordering::SeqCst), 1, "fallback replacement");
+        peer.abort();
+        drop(runner);
+    }
+
     fn recovery_test_drain(supervisor: &Supervisor<VecSink>, id: &str) -> Drain<VecSink> {
         Drain {
             session_id: id.into(),
