@@ -254,7 +254,11 @@ impl Shared {
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
+        // A chunk while an AoE prompt is in flight echoes it (#5224). Idle, it
+        // is a Remote Control message from another client.
+        let user_echo = prompt_active || !local_prompt_signals;
         let mut events = if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
+            && user_echo
             && !self.seed_user_replay.load(Ordering::Relaxed)
         {
             Vec::new()
@@ -395,7 +399,11 @@ mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, TextContent};
 
-    async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
+    async fn user_echo_events(
+        seed_user_replay: bool,
+        prompt_in_flight: bool,
+        local_prompt_signals: bool,
+    ) -> Vec<Event> {
         let (event_tx, mut event_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let shared = Shared::new(
@@ -404,7 +412,7 @@ mod tests {
             &crate::acp::agent_profiles::CLAUDE,
             lifecycle_tx,
             Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(prompt_in_flight)),
             None,
             Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
             None,
@@ -416,7 +424,7 @@ mod tests {
         shared
             .handle_notification(
                 SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk)),
-                true,
+                local_prompt_signals,
             )
             .await;
         drop(shared);
@@ -428,12 +436,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_message_chunk_records_only_while_seeding_import_replay() {
-        // Live echo is already recorded locally (#5224); import replay is not.
-        assert!(user_echo_events(false).await.is_empty());
-        assert!(matches!(
-            user_echo_events(true).await.as_slice(),
-            [Event::UserPromptSent { text, .. }] if text == "hello"
-        ));
+    async fn user_message_chunk_records_replay_and_remote_messages_only() {
+        // Echo of an AoE prompt is already recorded locally (#5224).
+        assert!(user_echo_events(false, true, true).await.is_empty());
+        // Replayed update committed with the session belongs to no live message.
+        assert!(user_echo_events(false, false, false).await.is_empty());
+        // Import replay and an idle Remote Control message are recorded.
+        for (seed, in_flight) in [(true, true), (true, false), (false, false)] {
+            assert!(
+                matches!(
+                    user_echo_events(seed, in_flight, true).await.as_slice(),
+                    [Event::UserPromptSent { text, .. }] if text == "hello"
+                ),
+                "seed={seed} in_flight={in_flight}"
+            );
+        }
     }
 }
