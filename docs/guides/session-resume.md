@@ -6,6 +6,9 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 Physical launch and pane adoption decisions probe the exact tmux name live.
 A cached tmux session snapshot cannot suppress recreation of a missing pane.
+Launch admission uses a fresh marked Agent inventory, not the display resolver's title-derived fallback. Multiple candidates, including corpses or a candidate with the derived name, refuse admission before a new launch reservation. Launch paths recheck uniqueness after hooks and before physical birth; a missing selected target does not authorize substitution. Display and auxiliary name resolution retain their separate policies.
+
+Capture handoffs transfer only live watchers serving the same tool and execution. A missing or stopped launch snapshot cannot replace a compatible running canonical watcher, including when Pi publishes a new transcript path during a probe. A compatible live offered watcher still takes priority. Stopped handles remain available to their own final drain; capture pacing stays separate from watcher adoption. Capture continuity does not establish Native readiness or physical ownership.
 
 ## Automatic capture matrix
 
@@ -114,7 +117,33 @@ This records an assertion about the intended native target, separately from any 
 
 When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call.
 
-Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
+An inconclusive resume or fresh-pinned probe, a missing created-pane identity on a fresh launch, or an unknown query of an existing pane returns `launch_indeterminate`, never ready success. Observation errors and stabilization expiry prove neither death nor loaded history.
+
+AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. The observed sandbox workdir is retained unless a concurrent change supersedes its container context. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
+
+An indeterminate creation still finalizes its idempotency key: its durable status changes from `Creating` to `Starting`, never to ready. A keyed retry returns that same session without another launch. If durable finalization fails, the request reports unavailable; the existing lifecycle work queue can finalize only that same generation after storage recovers. A concurrent status or launch generation is not overwritten. A later ensure rechecks live-pane readiness, using the existing shell and command-override exemptions. Hook readiness must match the active launch, conversation ID and execution binding; another launch's status cannot authorize input.
+
+Post-hook creation failures release namespace, submission and mutation guards before rollback cleanup re-enters them.
+
+An ACP account restart keeps its quota breadcrumb and interrupted-turn selection inside the same prompt-submission guard.
+
+A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
+
+This exclusive-occupancy check also protects later revival and direct-start replacement. The tmux command rechecks immutable pane/server identity and topology atomically before any process-tree signalling or scope release. A legacy corpse does not acquire an invented process PID. A peer split immediately before removal refuses revival; explicit Stop retains its separate authority.
+
+A live-pane teardown authorization requires the pane to remain live with the exact captured PID; it cannot consume a later corpse. Corpse cleanup does not capture new process handles. Exclusive occupancy also excludes windows linked into another session, including grouped sessions.
+
+Revival takes the pane state, PID, physical IDs and server birth from one captured observation before acquiring process handles; it does not combine separate name-based and cached batch lookups.
+
+Some tmux versions display a corpse's previous PID, while others hide it. Revival preserves that observed value for its dead-pane guard without capturing or signalling it as a live process.
+
+Launch admission carries that same physical observation across pre-launch hooks. Readiness checks and each input effect revalidate the captured target instead of substituting a name lookup or status label. Refused-publication cleanup still requires the owned launch generation and one of the operation's captured conversation states; it never rewrites the captured PID or rolls back a peer's selected context.
+
+Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. A matching OMP confirmation can consume an explicit pin during stabilization without changing the captured launch owner. Capturing a different ID clears the marker; an explicit `set-session-id` assertion or a successful launch can also clear it.
+
+An accepted OMP pin confirmation also converges the local launch intent, so the first subsequent capture can record a different conversation. An empty outgoing launch poller does not erase a compatible canonical poller installed during adoption.
+
+Reloads retain the compatible row's capture-repair pacing and managed-start retry deadline even when it has no poller handle. They use the existing tool-and-execution handoff guards, not the separate relaunch reset policy.
 
 On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
 
@@ -123,6 +152,18 @@ AoE reports this fresh result only after the new association, or the cleared ass
 To retry the original conversation through the restart cascade, first restore its original configuration and store, then run `aoe session set-session-id <session> <native-id>`, using `--store` with the exact store or transcript where required. That assertion clears the failure marker. An intentional configured-fresh restart remains available; use the empty-ID command below for a one-shot fresh conversation.
 
 Direct `aoe session start` keeps its separate policy: it may retry a previously failed ID when native execution and target validation succeed. It performs that shared preflight before replacing an ordinary dead pane, but does not run the cascade's final resume probe. A successful start therefore does not prove that the native conversation loaded.
+
+Terminal handoff additionally requires a physical receipt captured after pane creation and persisted under its owned launch generation before finalizing projection cleanup. A prepared launch payload, environment marker or healthy process is not a birth receipt. Missing evidence preserves the actual terminal, pending handoff and retained projection across maintenance and restart.
+
+To recover an unproven terminal handoff, close its exact pane explicitly in tmux first. Then use `aoe session set-session-id <session> <native-id> --store /absolute/native/store`, or `aoe session set-session-id <session> ""` to select fresh. The command refuses a live pane, an unproven corpse, an incomplete tmux inventory or an original structured worker whose retirement is unproven. After confirmed absence, it records a new target generation without attesting the old birth. Retry the terminal-view switch to launch that target once and finish projection cleanup. Selecting a target neither recovers nor deletes the original native history.
+
+Recovery inventories every pane on the captured physical socket, without AoE-name, pane-index or first-window filtering. Renaming a pane or moving it between windows does not prove that it closed. Before dispatch, a durable census records pre-existing panes, including proven dead peers without a live birth; live peers require a captured birth. That negative evidence permits peers with unchanged pane IDs, PIDs and birth identities to remain after an unrecorded launch is explicitly closed; it never attests the launch itself. Missing legacy scope evidence, new or changed peers, and incomplete inspections refuse target selection rather than guessing that a missing receipt means absence.
+
+The recovery command separately checks the strict current Native registry and control-socket peer, the captured Original retirement, and the target's recorded scope obligations. A replaced Native identity, a live owned scope or an unknown inspection refuses selection; recovery never stops an unrelated new peer. An empty pane inventory is not Native process-retirement authority.
+
+An unscoped launch has no recorded cgroup proof. The command cannot verify shutdown of an unregistered Native agent or arbitrary detached subprocess outside its captured ownership. If such work may survive closing the pane, externally settle that exact execution and retain independent evidence before selecting another target. `set-session-id` does not attest this external prerequisite, upgrade missing evidence or authorize killing those processes.
+
+A direct-start indeterminate refusal releases only its captured, still-owned Launch reservation, without cleanup or changes to the pending handoff. After an unrelated split is removed, an immediate explicit retry is not held by that refused start. A superseding generation keeps its own reservation; failed release preserves the refusal and runtime rather than granting teardown authority.
 
 An explicit pin or fork that migration left unqualified resumes against the store current configuration resolves. Agents that resolve their store or transcript before that check still refuse, for the reasons listed in [Supported managed contexts](#supported-managed-contexts). An armed pin is the exception to the rule above: no capture qualifies the binding it names.
 

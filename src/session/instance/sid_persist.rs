@@ -120,7 +120,7 @@ pub(crate) fn persist_session_to_storage(
             return CaptureCommit::unapplied(SidWrite::Failed);
         }
     };
-    persist_session_with_storage(&storage, instance_id, observation, expected)
+    persist_session_with_storage(&storage, instance_id, observation, expected, None)
 }
 
 impl Instance {
@@ -132,17 +132,24 @@ impl Instance {
         instance_id: &str,
         session_id: &str,
         generation: &str,
+        selection: Option<&mut [u8; 32]>,
     ) -> Result<CaptureCommit> {
         if !is_valid_session_id(session_id) {
             return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         }
-        storage.update(|instances, _groups| {
+        let mut next_selection = None;
+        let committed = storage.update(|instances, _groups| {
             let Some(instance) = instances
                 .iter_mut()
                 .find(|instance| instance.id == instance_id)
             else {
                 return Err(LifecycleReservationError::Superseded.into());
             };
+            if let Some(expected) = selection.as_deref() {
+                if instance.native_preparation_selection()? != *expected {
+                    return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
+                }
+            }
             let intent_matches = matches!(
                 &instance.resume_intent,
                 ResumeIntent::Use(pinned) if pinned == session_id
@@ -163,11 +170,20 @@ impl Instance {
                 return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
             }
             instance.resume_intent = ResumeIntent::Default;
+            if selection.is_some() {
+                next_selection = Some(instance.native_preparation_selection()?);
+            }
             Ok(CaptureCommit {
                 outcome: SidWrite::Applied,
                 failed_sid: instance.resume_probe_failed_sid.clone(),
             })
-        })
+        })?;
+        if committed.outcome == SidWrite::Applied {
+            if let (Some(selection), Some(next)) = (selection, next_selection) {
+                *selection = next;
+            }
+        }
+        Ok(committed)
     }
 
     pub(super) fn persist_session_id_with_storage(
@@ -220,6 +236,15 @@ impl Instance {
             else {
                 return Ok(SidWrite::Failed);
             };
+            if self.lifecycle_reservation_is_owned(
+                LifecycleOperation::Launch,
+                self.lifecycle_generation,
+            ) && !instances[index].lifecycle_reservation_is_owned(
+                LifecycleOperation::Launch,
+                self.lifecycle_generation,
+            ) {
+                return Ok(SidWrite::Skipped);
+            }
             if !expected.matches(&instances[index]) {
                 return Ok(SidWrite::Skipped);
             }
@@ -489,6 +514,7 @@ pub(super) fn persist_session_with_storage(
     instance_id: &str,
     observation: &crate::session::poller::SessionIdObservation,
     expected: &ConversationState,
+    selection: Option<&mut [u8; 32]>,
 ) -> CaptureCommit {
     use crate::session::poller::SessionIdGuard;
     let session_id = observation.sid.as_str();
@@ -499,6 +525,7 @@ pub(super) fn persist_session_with_storage(
         return CaptureCommit::unapplied(SidWrite::Skipped);
     }
     let binding = observation.conversation_binding();
+    let mut next_selection = None;
     let result = storage.update(|instances, _groups| {
         let Some(index) = instances
             .iter()
@@ -507,6 +534,11 @@ pub(super) fn persist_session_with_storage(
             return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         };
         let instance = &instances[index];
+        if let Some(expected) = selection.as_deref() {
+            if instance.native_preparation_selection()? != *expected {
+                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
+            }
+        }
         if !expected.matches(instance)
             || matches!(instance.resume_intent, ResumeIntent::Fork { .. })
         {
@@ -586,13 +618,23 @@ pub(super) fn persist_session_with_storage(
             instance.resume_intent = ResumeIntent::Default;
             instance.resume_binding = None;
         }
+        if selection.is_some() {
+            next_selection = Some(instance.native_preparation_selection()?);
+        }
         Ok(CaptureCommit {
             outcome: SidWrite::Applied,
             failed_sid: instance.resume_probe_failed_sid.clone(),
         })
     });
     match result {
-        Ok(outcome) => outcome,
+        Ok(outcome) => {
+            if outcome.outcome == SidWrite::Applied {
+                if let (Some(selection), Some(next)) = (selection, next_selection) {
+                    *selection = next;
+                }
+            }
+            outcome
+        }
         Err(error) => {
             tracing::warn!(target: "session.store", "Cannot persist captured conversation: {error}");
             CaptureCommit::unapplied(SidWrite::Failed)
@@ -666,6 +708,159 @@ mod tests {
             .agent_session_id
     }
 
+    #[test]
+    #[serial]
+    fn capture_selection_witness_requires_an_applied_confirmed_cas() {
+        struct CommitThenFail<'a>(&'a Storage);
+        impl crate::session::SessionStore for CommitThenFail<'_> {
+            fn storage(&self) -> &Storage {
+                self.0
+            }
+            fn load(&self) -> Result<Vec<Instance>> {
+                crate::session::SessionStore::load(self.0)
+            }
+            fn check_available(&self) -> Result<()> {
+                crate::session::SessionStore::check_available(self.0)
+            }
+            fn configuration(
+                &self,
+                profile: Option<&str>,
+            ) -> Result<crate::session::config::Config> {
+                crate::session::SessionStore::configuration(self.0, profile)
+            }
+            fn commit(&self, mutation: &mut crate::session::SessionMutation<'_>) -> Result<()> {
+                crate::session::SessionStore::commit(self.0, mutation)?;
+                Err(crate::session::SessionCommitApplied.into())
+            }
+            fn managed_capture_store_is_exclusive(
+                &self,
+                current: &Instance,
+                backend: crate::agents::SessionCaptureBackend,
+                current_store: &std::path::Path,
+            ) -> Result<bool> {
+                crate::session::SessionStore::managed_capture_store_is_exclusive(
+                    self.0,
+                    current,
+                    backend,
+                    current_store,
+                )
+            }
+            fn commit_sandbox_checkpoint(
+                &self,
+                checkpoint: crate::migrations::v027_isolate_sandbox_stores::LockedSandboxCheckpoint<
+                    '_,
+                >,
+            ) -> Result<()> {
+                crate::session::SessionStore::commit_sandbox_checkpoint(self.0, checkpoint)
+            }
+            fn migrate_sandbox_store(
+                &self,
+                id: &str,
+                runtime: &crate::containers::ContainerRuntime,
+            ) -> Result<()> {
+                crate::session::SessionStore::migrate_sandbox_store(self.0, id, runtime)
+            }
+        }
+        const BEFORE: &str = "22f13307-461c-4161-908e-95a247fac750";
+        for case in ["applied", "foreign-before-cas", "pinned", "applied-io"] {
+            let mut inst = make_inst("capture-selection-witness", case);
+            inst.tool = "pi".into();
+            inst.agent_session_id = Some(BEFORE.into());
+            if case == "pinned" {
+                inst.resume_intent = ResumeIntent::Use(BEFORE.into());
+            }
+            let (_temp, _home, storage) = seeded("capture-selection-witness", &[&inst]);
+            let mut witness = inst.native_preparation_selection().unwrap();
+            let original = witness;
+            if case == "foreign-before-cas" {
+                storage
+                    .update(|rows, _| {
+                        rows[0].extra_args = "--peer-selection".into();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let path = format!("/tmp/transcript_{VALID_SID}.jsonl");
+            let observed = crate::session::poller::SessionIdObservation::instance_sidecar(
+                VALID_SID.into(),
+                Some(path),
+            );
+            let failing = CommitThenFail(&storage);
+            let store: &dyn crate::session::SessionStore = if case == "applied-io" {
+                &failing
+            } else {
+                &storage
+            };
+            let commit = persist_session_with_storage(
+                store,
+                &inst.id,
+                &observed,
+                &inst.conversation_state(),
+                Some(&mut witness),
+            );
+            let durable = storage.load().unwrap().remove(0);
+            match case {
+                "applied" => {
+                    assert_eq!(commit.outcome, SidWrite::Applied);
+                    assert_ne!(witness, original);
+                    assert_eq!(witness, durable.native_preparation_selection().unwrap());
+                }
+                "foreign-before-cas" => {
+                    assert_eq!(commit.outcome, SidWrite::Skipped);
+                    assert_eq!(witness, original);
+                    assert_eq!(durable.agent_session_id.as_deref(), Some(BEFORE));
+                    assert_eq!(durable.extra_args, "--peer-selection");
+                }
+                "pinned" => {
+                    assert_eq!(commit.outcome, SidWrite::PinnedForeign);
+                    assert_eq!(witness, original);
+                    assert_eq!(durable.resume_intent, ResumeIntent::Use(BEFORE.into()));
+                }
+                "applied-io" => {
+                    assert_eq!(commit.outcome, SidWrite::Failed);
+                    assert_eq!(witness, original);
+                    assert_eq!(durable.agent_session_id.as_deref(), Some(VALID_SID));
+                    assert_ne!(witness, durable.native_preparation_selection().unwrap());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn launch_publication_preserves_a_newer_same_sid_generation() {
+        let profile = "superseded-launch-publication";
+        let mut instance = make_inst(profile, "superseded");
+        instance.agent_session_id = Some(VALID_SID.into());
+        let (_temp, _home, storage) = seeded(profile, &[&instance]);
+        let generation = instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let expected = instance.conversation_state();
+        storage
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                row.lifecycle_generation += 1;
+                row.lifecycle_reservation = None;
+                row.status = Status::Running;
+                row.resume_probe_failed_sid = Some(VALID_SID.into());
+                Ok(())
+            })
+            .unwrap();
+        let _ = instance.persist_session_id_with_storage(&storage, &expected);
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.lifecycle_generation, generation + 1);
+        assert!(stored.lifecycle_reservation.is_none());
+        assert_eq!(stored.status, Status::Running);
+        assert_eq!(stored.agent_session_id.as_deref(), Some(VALID_SID));
+        assert_eq!(stored.resume_probe_failed_sid.as_deref(), Some(VALID_SID));
+        assert_eq!(stored.conversation_state(), expected);
+    }
     #[test]
     #[serial]
     fn fork_publication_advances_finalization_without_overwriting_peer_changes() {
@@ -772,7 +967,8 @@ mod tests {
         let observed =
             crate::session::poller::SessionIdObservation::instance_sidecar(VALID_SID.into(), None);
         assert_eq!(
-            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected).outcome,
+            persist_session_with_storage(&storage, &snapshot.id, &observed, &expected, None)
+                .outcome,
             SidWrite::Skipped
         );
         assert!(storage.load().unwrap()[0].agent_session_id.is_none());
@@ -848,7 +1044,8 @@ mod tests {
             let expected = inst.conversation_state();
 
             assert_eq!(
-                persist_session_with_storage(&storage, &inst.id, &observed, &expected).outcome,
+                persist_session_with_storage(&storage, &inst.id, &observed, &expected, None)
+                    .outcome,
                 SidWrite::Applied,
                 "{case}"
             );
@@ -886,8 +1083,14 @@ mod tests {
         let expected = inst.conversation_state();
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(OTHER_SID), &expected)
-                .outcome,
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation(OTHER_SID),
+                &expected,
+                None
+            )
+            .outcome,
             SidWrite::PinnedForeign
         );
         let disk = storage.load().unwrap();
@@ -895,8 +1098,14 @@ mod tests {
         assert_eq!(disk[0].resume_intent, ResumeIntent::Use(VALID_SID.into()));
 
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(VALID_SID), &expected)
-                .outcome,
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation(VALID_SID),
+                &expected,
+                None
+            )
+            .outcome,
             SidWrite::Applied,
             "the pin must still accept its own conversation"
         );
@@ -953,6 +1162,7 @@ mod tests {
                 &claimant.id,
                 &observed,
                 &claimant.conversation_state(),
+                None,
             )
             .outcome,
             SidWrite::Skipped,
@@ -1052,6 +1262,7 @@ mod tests {
                 &claimant.id,
                 &observation(sid),
                 &claimant.conversation_state(),
+                None,
             )
             .outcome,
             SidWrite::OwnershipConflict
@@ -1150,6 +1361,7 @@ mod tests {
                     &claimant.id,
                     &observed,
                     &claimant.conversation_state(),
+                    None,
                 )
                 .outcome,
                 SidWrite::OwnershipConflict,
@@ -1198,6 +1410,7 @@ mod tests {
                 &claimant.id,
                 &observed,
                 &claimant.conversation_state(),
+                None,
             )
             .outcome,
             SidWrite::Applied,
@@ -1476,7 +1689,8 @@ mod tests {
                 &storage,
                 &inst.id,
                 &observation,
-                &inst.conversation_state()
+                &inst.conversation_state(),
+                None,
             )
             .outcome,
             SidWrite::Applied
@@ -1511,8 +1725,14 @@ mod tests {
         let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
         let expected = storage.load().unwrap()[0].conversation_state();
         assert_eq!(
-            persist_session_with_storage(&storage, &inst.id, &observation(next_sid), &expected)
-                .outcome,
+            persist_session_with_storage(
+                &storage,
+                &inst.id,
+                &observation(next_sid),
+                &expected,
+                None
+            )
+            .outcome,
             SidWrite::Applied
         );
         assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(next_sid));

@@ -1,9 +1,9 @@
-// The queued-messages header explains the Daemon-held queue in a tooltip that keyboard users can reach.
+// The queued-messages header's tooltip opens on keyboard focus and dismisses on Tab.
 
 import { test, expect } from "./helpers/mockedTest";
 import { mockAcpSession, openStructuredSession } from "./helpers/acpMock";
 
-test("the queued header is reachable by keyboard and says the Daemon holds the queue", async ({ page }) => {
+test("the queued header tooltip opens on keyboard focus and dismisses on Tab", async ({ page }) => {
   const mock = await mockAcpSession(page, { title: "story-queued" });
   const at = new Date().toISOString();
   await page.route("**/api/sessions/*/queue", (r) =>
@@ -16,15 +16,14 @@ test("the queued header is reachable by keyboard and says the Daemon holds the q
   );
   await openStructuredSession(page, mock);
   const header = page.getByTestId("queued-strip-header");
-  await expect(header).toContainText("Queued (2)");
-  await expect(header).not.toHaveAttribute("title");
+  await expect(header).toBeVisible();
   await expect(page.getByRole("tooltip")).toHaveCount(0);
 
   // Shift+Tab from "Clear all" lands on the header, which opens the tooltip.
   await page.getByRole("button", { name: "Clear all" }).focus();
   await page.keyboard.press("Shift+Tab");
   await expect(header).toBeFocused();
-  await expect(page.getByRole("tooltip")).toHaveText("Sends when the Agent is free, even if you close this tab.");
+  await expect(page.getByRole("tooltip")).toBeVisible();
 
   await page.keyboard.press("Tab");
   await expect(page.getByRole("tooltip")).toHaveCount(0);

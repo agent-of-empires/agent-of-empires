@@ -24,6 +24,50 @@ fn before_adoption_for_test() {
     });
 }
 
+#[cfg(test)]
+type FailedCommitCallback = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+static AFTER_FAILED_COMMIT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u64, u64), FailedCommitCallback>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+pub(crate) struct FailedCommitObserver((u64, u64));
+
+#[cfg(test)]
+impl FailedCommitObserver {
+    pub(crate) fn install(storage: &Storage, callback: impl FnOnce() + Send + 'static) -> Self {
+        let profile = storage
+            .bound_profile_identity()
+            .expect("real bound profile");
+        assert!(AFTER_FAILED_COMMIT
+            .lock()
+            .unwrap()
+            .insert(profile, Box::new(callback))
+            .is_none());
+        Self(profile)
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailedCommitObserver {
+    fn drop(&mut self) {
+        AFTER_FAILED_COMMIT.lock().unwrap().remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+fn after_failed_commit_for_test(storage: &Storage) {
+    let profile = storage
+        .bound_profile_identity()
+        .expect("the failed write kept its bound profile");
+    let callback = AFTER_FAILED_COMMIT.lock().unwrap().remove(&profile);
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 // The caller retains namespace and operation exclusion on a blocking worker.
 pub(crate) struct NativeSessionStore {
     storage: Storage,
@@ -89,7 +133,7 @@ impl NativeSessionStore {
     }
 
     fn check_source(&self) -> Result<()> {
-        ensure_healthy(&self.state)?;
+        self.check_physical_source()?;
         if let Some((id, _, _, _)) = &self.launch_identity {
             let rows = self.state.instances.blocking_read();
             self.validate_launch_identity(&rows)?;
@@ -99,6 +143,11 @@ impl NativeSessionStore {
                 crate::session::LifecycleReservationError::Superseded
             );
         }
+        Ok(())
+    }
+
+    fn check_physical_source(&self) -> Result<()> {
+        ensure_healthy(&self.state)?;
         self.storage.verify_bound_profile().map_err(|error| {
             let publication = self.state.publication.blocking_write();
             mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
@@ -211,7 +260,8 @@ impl NativeSessionStore {
             .find(|row| row.id == instance.id)
             .ok_or(crate::session::LifecycleReservationError::Superseded)?;
         anyhow::ensure!(
-            row.lifecycle_generation == instance.lifecycle_generation
+            row.created_at == instance.created_at
+                && row.lifecycle_generation == instance.lifecycle_generation
                 && row.source_profile == instance.source_profile
                 && row.title == instance.title,
             crate::session::LifecycleReservationError::Superseded
@@ -367,12 +417,17 @@ impl NativeSessionStore {
         })
     }
 
-    fn commit_with_status(
+    fn commit_canonical(
         &self,
         mutation: &mut SessionMutation<'_>,
         status: super::reload::StatusCommit,
+        validate_launch: bool,
     ) -> Result<()> {
-        self.check_source()?;
+        if validate_launch {
+            self.check_source()?;
+        } else {
+            self.check_physical_source()?;
+        }
         let reload = self
             .runtime
             .block_on(self.state.session_service.disk_reload_guard());
@@ -388,7 +443,12 @@ impl NativeSessionStore {
         };
         let mut rejected = false;
         let result = transition.update_with_snapshot(&self.storage, |rows, groups| {
-            self.validate_launch_identity(rows)
+            let admissible = if validate_launch {
+                self.validate_launch_identity(rows)
+            } else {
+                Ok(())
+            };
+            admissible
                 .and_then(|()| mutation(rows, groups))
                 .inspect_err(|_| rejected = true)
         });
@@ -397,6 +457,15 @@ impl NativeSessionStore {
             Err(error) => {
                 if !rejected {
                     mark_profile_failure(&self.state, self.storage.profile(), &error, &publication);
+                }
+                #[cfg(test)]
+                {
+                    // A real reload may heal health before the caller adopts runtime state.
+                    // Release exactly the locks the failed commit would drop on return.
+                    drop(transition);
+                    drop(publication);
+                    drop(reload);
+                    after_failed_commit_for_test(&self.storage);
                 }
                 return Err(error);
             }
@@ -444,11 +513,14 @@ impl NativeSessionStore {
             .block_on(self.state.session_service.disk_reload_guard());
         let transition = self.storage.acquire_write_transition();
         let publication = self.state.publication.blocking_write();
+        let mut status_changed = false;
         let committed = transition.and_then(|transition| {
             self.storage.verify_bound_profile()?;
             transition.update_with_snapshot(&self.storage, |rows, _| {
                 if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    let previous = row.status;
                     settle(row);
+                    status_changed = row.status != previous;
                 }
                 Ok(())
             })
@@ -465,7 +537,10 @@ impl NativeSessionStore {
             .block_on(super::reload::adopt_committed_profiles(
                 &self.state,
                 [(self.storage.profile(), rows, groups)],
-                |_| None,
+                |changed_id| {
+                    (status_changed && changed_id == id)
+                        .then_some(super::reload::StatusCommit::Lifecycle)
+                },
                 &reload,
                 &publication,
             ))
@@ -486,19 +561,19 @@ impl SessionStore for NativeSessionStore {
     fn release_lifecycle_reservation(
         &self,
         id: &str,
-        operation: crate::session::LifecycleOperation,
+        release: crate::session::LifecycleRelease,
         generation: u64,
         lifecycle: Option<crate::session::StorageFlock>,
     ) -> Result<()> {
         self.settle_lifecycle_reservation(id, lifecycle, |row| {
-            row.release_lifecycle_reservation_if_owned(operation, generation);
+            release.apply(row, generation);
         })
     }
 
     fn defer_lifecycle_release(
         self,
         id: String,
-        operation: crate::session::LifecycleOperation,
+        release: crate::session::LifecycleRelease,
         generation: u64,
         lifecycle: Option<crate::session::StorageFlock>,
     ) {
@@ -516,7 +591,7 @@ impl SessionStore for NativeSessionStore {
             };
             let _namespace = (namespace, fresh_namespace);
             let result = tokio::task::spawn_blocking(move || {
-                self.release_lifecycle_reservation(&id, operation, generation, None)
+                self.release_lifecycle_reservation(&id, release, generation, None)
             }).await;
             match result {
                 Ok(Ok(())) => {}
@@ -581,13 +656,23 @@ impl SessionStore for NativeSessionStore {
     }
 
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
-        self.commit_with_status(mutation, super::reload::StatusCommit::Lifecycle)
+        self.commit_canonical(mutation, super::reload::StatusCommit::Lifecycle, true)
     }
 
     fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
-        self.commit_with_status(mutation, super::reload::StatusCommit::LaunchReady)
+        self.commit_canonical(mutation, super::reload::StatusCommit::LaunchReady, true)
     }
 
+    fn commit_metadata_checkpoint(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        // Metadata uses the original bound handles, never a profile-name reopen.
+        // Do not wait on namespace exclusion while the caller holds its native fence.
+        let _namespace = self
+            .state
+            .profile_namespace
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("native metadata namespace is busy"))?;
+        self.commit_canonical(mutation, super::reload::StatusCommit::Lifecycle, false)
+    }
     fn migrate_sandbox_store(
         &self,
         id: &str,
@@ -862,6 +947,185 @@ fn mark_checkpoint_failure(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runtime_adoption_retains_pi_capture_after_probe_path_changes() {
+        use crate::session::poller::{PollerSpawn, SessionPoller};
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(2);
+        let file_watch = crate::file_watch::FileWatchService::new().unwrap();
+        let sid = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        for relaunch in [false, true] {
+            for offer in ["empty", "stopped", "running", "foreign-empty"] {
+                let mut row = Instance::new("pi adoption", root.path().to_str().unwrap());
+                row.source_profile = "test".into();
+                row.tool = "pi".into();
+                row.agent_session_id = Some(sid.into());
+                row.mark_pi_extension_launched_for_test();
+                // This legacy capture fixture asserts metadata continuity, not Native authority.
+                assert!(row.active_execution.is_none());
+                let generation = row.lifecycle_generation;
+                let source = row.pi_sidecar_source().unwrap();
+                let directory = crate::hooks::ensure_instance_dir_path(&row.id).unwrap();
+                std::fs::write(directory.join("session_id"), format!("{sid}\n")).unwrap();
+                let paths: Vec<_> = ["before", "during", "after"]
+                    .into_iter()
+                    .map(|phase| {
+                        let path = root.path().join(phase).join(format!("{phase}_{sid}.jsonl"));
+                        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        std::fs::write(
+                            &path,
+                            format!("{{\"type\":\"session\",\"id\":\"{sid}\"}}\n"),
+                        )
+                        .unwrap();
+                        path.canonicalize().unwrap().to_string_lossy().into_owned()
+                    })
+                    .collect();
+                std::fs::write(directory.join("session_path"), &paths[0]).unwrap();
+                row.pi_session_path = Some(paths[0].clone());
+                let tmux = row.tmux_session().unwrap();
+                let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux.name());
+                tmux.create(root.path().to_str().unwrap(), Some("exec cat"), "test")
+                    .unwrap();
+                let spawn = || {
+                    let mut poller = SessionPoller::new(tmux.name().into(), "pi".into(), None);
+                    let read = crate::session::capture::pi_sidecar_poll_fn(
+                        row.id.clone(),
+                        source.clone(),
+                        None,
+                    );
+                    assert_eq!(
+                        poller.start_observations(
+                            row.id.clone(),
+                            Box::new(move |_| read()),
+                            Box::new(|_| {}),
+                            None,
+                        ),
+                        PollerSpawn::Spawned
+                    );
+                    poller
+                        .wait_for_observation_for_test(Duration::from_secs(10))
+                        .unwrap();
+                    assert!(poller.pending_observation_matches(|observation| {
+                        observation.sid == sid
+                            && observation.pi_session_path.as_ref() == Some(&paths[0])
+                    }));
+                    Arc::new(Mutex::new(poller))
+                };
+                let mut started = row.clone();
+                let offered = matches!(offer, "stopped" | "running").then(spawn);
+                if offer == "stopped" {
+                    offered.as_ref().unwrap().lock().unwrap().stop();
+                }
+                started.capture_poller.set_handle(offered.clone());
+                let canonical = spawn();
+                let blocker = (offer != "running").then(spawn);
+                // Both real observer threads occupy the private budget. Let the production
+                // repair path produce a real backoff before installing the canonical watcher.
+                assert!(!row.reconcile_capture_poller(&crate::tmux::LiveSessionSnapshot::new()));
+                assert_eq!(row.capture_poller.repair().deferrals(), 1);
+                let canonical_pacing = row.capture_poller.repair().clone();
+                if let Some(blocker) = blocker {
+                    blocker.lock().unwrap().stop();
+                }
+                row.capture_poller.set_handle(Some(canonical.clone()));
+                let before = started.clone();
+                if offer == "foreign-empty" {
+                    started.tool = "claude".into();
+                }
+                crate::server::test_support::seed_instances_on_disk_for_test(
+                    "test",
+                    vec![row.clone()],
+                );
+                let watcher = file_watch.clone();
+                let state = crate::server::test_support::build_test_app_state_configured(
+                    vec![row],
+                    move |state| state.file_watch = watcher,
+                );
+                crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+                // The real Pi publisher changes its path after the launch snapshot was captured.
+                std::fs::write(directory.join("session_path"), &paths[1]).unwrap();
+                canonical
+                    .lock()
+                    .unwrap()
+                    .wait_for_observation_for_test(Duration::from_secs(10))
+                    .unwrap();
+                let publish = state.clone();
+                tokio::task::spawn_blocking(move || {
+                    let store = NativeSessionStore::open(publish, "test", Some(started.id.clone()))
+                        .unwrap();
+                    if relaunch {
+                        store
+                            .update_runtime_fields(&started, |row| {
+                                row.merge_post_restart_with_baseline(&before, &started)
+                            })
+                            .unwrap();
+                    } else {
+                        store.adopt_runtime_fields(&started).unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+                let expected = if offer == "running" {
+                    offered.as_ref().unwrap()
+                } else {
+                    &canonical
+                };
+                let retained = {
+                    let rows = state.instances.read().await;
+                    let row = &rows[0];
+                    assert_eq!(row.lifecycle_generation, generation);
+                    assert!(row.active_execution.is_none());
+                    assert_eq!(row.agent_session_id.as_deref(), Some(sid));
+                    assert_eq!(row.tool, "pi");
+                    if offer == "running" && !relaunch {
+                        assert_eq!(row.capture_poller.repair().deferrals(), 0);
+                    } else {
+                        assert_eq!(row.capture_poller.repair(), &canonical_pacing);
+                    }
+                    row.capture_poller.handle().unwrap().clone()
+                };
+                assert!(
+                    Arc::ptr_eq(&retained, expected),
+                    "relaunch={relaunch} offer={offer}"
+                );
+                assert!(retained.lock().unwrap().is_running());
+                // Queue a second real path after adoption; no injected result or timing sleep.
+                if offer == "running" {
+                    retained
+                        .lock()
+                        .unwrap()
+                        .wait_for_observation_for_test(Duration::from_secs(10))
+                        .unwrap();
+                }
+                std::fs::write(directory.join("session_path"), &paths[2]).unwrap();
+                {
+                    let mut poller = retained.lock().unwrap();
+                    poller
+                        .wait_for_observation_for_test(Duration::from_secs(10))
+                        .unwrap();
+                    assert!(poller.pending_observation_matches(|observation| {
+                        observation.sid == sid
+                            && observation.pi_session_path.as_ref() == Some(&paths[2])
+                            && observation.execution.is_none()
+                    }));
+                }
+                canonical.lock().unwrap().stop();
+                if let Some(offered) = offered {
+                    offered.lock().unwrap().stop();
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial_test::serial]
     fn creation_boundary_preserves_negotiated_acp_capability() {
@@ -940,6 +1204,7 @@ mod tests {
                     state
                         .acp_events_tx
                         .send(AcpBroadcastFrame {
+                            native_subject: None,
                             session_id: id.clone(),
                             seq: 1,
                             event: Arc::new(Event::PromptCapabilities {
@@ -1046,6 +1311,7 @@ mod tests {
                         seq: 1,
                         event: Arc::new(event),
                         worker_generation: None,
+                        native_subject: None,
                         sidebar_status: None,
                     })
                     .unwrap();
@@ -1094,6 +1360,7 @@ mod tests {
                         seq: 2,
                         event: Arc::new(event),
                         worker_generation: None,
+                        native_subject: None,
                         sidebar_status,
                     })
                     .unwrap();
@@ -1141,6 +1408,80 @@ mod tests {
             assert_eq!(persisted[0].lifecycle_generation, 8);
             assert_eq!(persisted[0].status, Status::Stopped);
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retained_metadata_checkpoint_ignores_only_launch_title_admission() -> Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut original = Instance::new("original title", "/tmp");
+        original.source_profile = "default".into();
+        original.view = crate::session::View::Structured;
+        original.fork_pending = Some("original-parent".into());
+        original.import_pending = Some(true);
+        let id = original.id.clone();
+        let storage = Storage::new_unwatched("default")?;
+        storage.update(|rows, _| {
+            *rows = vec![original.clone()];
+            Ok(())
+        })?;
+        let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (launch, ()) =
+            NativeSessionStore::open_for_launch(state.clone(), &original, ()).await?;
+        let state_for_commit = state.clone();
+        let checkpoint_id = id.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let context =
+                crate::acp::state::NativeEventContext::capture(&original, launch.storage())?;
+            let selection = original.conversation_state();
+            let canonical = NativeSessionStore::open(state_for_commit, "default", None)?;
+            canonical.commit(&mut |rows, _| {
+                rows.iter_mut()
+                    .find(|row| row.id == checkpoint_id)
+                    .unwrap()
+                    .title = "renamed while fork pending".into();
+                Ok(())
+            })?;
+            assert!(
+                launch.commit(&mut |_, _| Ok(())).is_err(),
+                "launch admission must remain title-fenced"
+            );
+            launch.commit_metadata_checkpoint(&mut |rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == checkpoint_id).unwrap();
+                anyhow::ensure!(
+                    crate::acp::state::NativeEventContext::capture(row, launch.storage())?
+                        == context
+                        && selection.matches_checkpoint(row)
+                        && row.acp_session_id == original.acp_session_id
+                        && row.fork_pending == original.fork_pending
+                        && row.import_pending == original.import_pending
+                );
+                row.fork_pending = None;
+                row.import_pending = None;
+                Ok(())
+            })?;
+            assert!(
+                launch.load().is_err(),
+                "metadata checkpoint must not relax later launch reads"
+            );
+            let rows = launch.storage().load()?;
+            let row = rows.iter().find(|row| row.id == checkpoint_id).unwrap();
+            assert_eq!(row.title, "renamed while fork pending");
+            assert_eq!(row.acp_session_id, original.acp_session_id);
+            assert!(row.fork_pending.is_none() && row.import_pending.is_none());
+            Ok(())
+        })
+        .await??;
+        let rows = state.instances.read().await;
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.title, "renamed while fork pending");
+        assert!(
+            row.acp_session_id.is_none()
+                && row.fork_pending.is_none()
+                && row.import_pending.is_none()
+        );
+        Ok(())
     }
 
     #[test]

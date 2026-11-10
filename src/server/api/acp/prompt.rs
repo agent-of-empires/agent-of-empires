@@ -31,8 +31,14 @@ pub struct PromptDispatchResponse {
     pub seq: Option<u64>,
 }
 
-/// 503 for a worker that could not be resumed; the client retries.
+/// Transient resume failures are 503; typed channel refusal is not queue permission.
 fn resume_failed_response(err: &SupervisorError) -> Response {
+    if matches!(
+        err,
+        SupervisorError::Acp(AcpError::ConnectionUnavailable(_))
+    ) {
+        return supervisor_error_response("worker unavailable", err);
+    }
     let body = match err {
         SupervisorError::CapacityFull { current, limit } => {
             format!("worker_capacity_full ({current}/{limit})")
@@ -138,6 +144,12 @@ pub async fn acp_prompt(
                 worker_not_ready()
             }
             SendTurnError::RevivalRefused => no_revive_refused(),
+            SendTurnError::Unavailable(unavailability)
+            | SendTurnError::UnavailableAfterPublish(unavailability) => (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response(),
             // Unreachable for a User caller.
             SendTurnError::NotOwner => {
                 (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
@@ -212,6 +224,11 @@ pub(crate) async fn submit_prompt(
         .await
     {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Unavailable(unavailability) => {
+            return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+                unavailability,
+            )));
+        }
         PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
         PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
         PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
@@ -255,6 +272,11 @@ pub(crate) async fn submit_prompt(
         .session_service
         .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
         .await;
+    if let PromptDispatch::Unavailable { unavailability } = dispatch {
+        return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+            unavailability,
+        )));
+    }
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
     if req.no_revive
@@ -444,6 +466,13 @@ pub async fn acp_prompt_diff_comments(
         .await
     {
         PromptTouch::Touched { idle_dormant } => idle_dormant,
+        PromptTouch::Unavailable(unavailability) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response();
+        }
         PromptTouch::RevivalRefused => return no_revive_refused(),
         PromptTouch::WorkerNotReady => return worker_not_ready(),
         PromptTouch::Blocked(blocked) => {
@@ -454,6 +483,9 @@ pub async fn acp_prompt_diff_comments(
         .session_service
         .prompt_dispatch_under_submission(&id, "", woke_idle_dormant, false)
         .await;
+    if matches!(dispatch, PromptDispatch::Unavailable { .. }) {
+        return (StatusCode::CONFLICT, Json(dispatch)).into_response();
+    }
     // There is no queue row for a typed review, so refuse rather than publish
     // a card the agent would then reject as busy.
     if let PromptDispatch::Queued { reason } = dispatch {
@@ -477,11 +509,7 @@ pub async fn acp_prompt_diff_comments(
     }
     // Publish only once a worker exists, or the card strands on "running" (#3172).
     if let Err(e) = state.acp_supervisor.wait_until_ready(&id).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("worker_not_ready: {e}"),
-        )
-            .into_response();
+        return resume_failed_response(&e);
     }
     state
         .acp_supervisor

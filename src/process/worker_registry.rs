@@ -28,6 +28,10 @@ pub enum ScopeOwnership {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub runner_version: u32,
+    /// Missing/null means unknown. Only an actual runner publication claims a
+    /// control protocol; generic records must not invent legacy capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_protocol_version: Option<u32>,
     /// Build identity of the runner that wrote the record; independent of `runner_version`.
     /// Legacy records default to "", which forces a one-time respawn.
     #[serde(default)]
@@ -59,6 +63,198 @@ pub struct WorkerRecord {
     pub detached_at: Option<u64>,
 }
 
+/// Non-destructive admission refusal, independent of native process liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlRefusalReason {
+    ProtocolUnknown,
+    ProtocolIncompatible,
+    OwnershipUnconfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlAdmissionRefusal {
+    pub reason: ControlRefusalReason,
+    pub owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
+    pub declared_protocol: Option<u32>,
+    pub observed_protocol: Option<u32>,
+    pub route_fingerprint: Option<[u8; 32]>,
+}
+
+impl ControlAdmissionRefusal {
+    pub fn from_record(record: &WorkerRecord, reason: ControlRefusalReason) -> Self {
+        Self {
+            reason,
+            owner: Some(crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                record,
+            )),
+            declared_protocol: record.control_protocol_version,
+            observed_protocol: None,
+            route_fingerprint: Some(control_route_fingerprint(&expected_socket(record))),
+        }
+    }
+
+    pub fn unconfirmed(owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>) -> Self {
+        Self {
+            reason: ControlRefusalReason::OwnershipUnconfirmed,
+            owner,
+            declared_protocol: None,
+            observed_protocol: None,
+            route_fingerprint: None,
+        }
+    }
+}
+
+impl ControlAdmissionRefusal {
+    pub(crate) fn observation(self) -> crate::acp::state::AcpConnectionUnavailability {
+        use crate::acp::state::{AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource};
+        crate::acp::state::AcpConnectionUnavailability {
+            source: AcpConnectionSource::RunnerRecord,
+            cause: match self.reason {
+                ControlRefusalReason::ProtocolUnknown => AcpConnectionCause::ControlProtocolUnknown,
+                ControlRefusalReason::ProtocolIncompatible => {
+                    AcpConnectionCause::ControlProtocolIncompatible
+                }
+                ControlRefusalReason::OwnershipUnconfirmed => {
+                    AcpConnectionCause::OwnershipUnconfirmed
+                }
+            },
+            phase: AcpConnectionPhase::Establishing,
+        }
+    }
+}
+
+impl std::fmt::Display for ControlAdmissionRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self.reason {
+            ControlRefusalReason::ProtocolUnknown => "retained runtime control protocol is unknown",
+            ControlRefusalReason::ProtocolIncompatible => {
+                "retained runtime control protocol is incompatible"
+            }
+            ControlRefusalReason::OwnershipUnconfirmed => {
+                "retained runtime control ownership could not be confirmed"
+            }
+        })
+    }
+}
+
+/// Metadata is a prerequisite to dialing, never proof of native usability.
+pub fn control_protocol_refusal(record: &WorkerRecord) -> Option<ControlAdmissionRefusal> {
+    let reason = match record.control_protocol_version {
+        None => ControlRefusalReason::ProtocolUnknown,
+        Some(version) if version != crate::acp::control_protocol::CONTROL_PROTOCOL_VERSION => {
+            ControlRefusalReason::ProtocolIncompatible
+        }
+        Some(_) if record.runner_identity.is_none() => ControlRefusalReason::OwnershipUnconfirmed,
+        Some(_) => return None,
+    };
+    Some(ControlAdmissionRefusal::from_record(record, reason))
+}
+
+/// An unavailable socket is not evidence that its recorded process died.
+pub(crate) fn retained_process_may_be_alive(record: &WorkerRecord) -> bool {
+    if !is_pid_alive(record.pid) {
+        return false;
+    }
+    match (
+        record.runner_identity.as_ref(),
+        crate::process::process_birth_identity(record.pid),
+    ) {
+        (Some(expected), Ok(Some(current))) => expected == &current,
+        _ => true,
+    }
+}
+
+/// Refuse unknown live ownership before reconciliation or replacement side effects.
+pub(crate) fn control_admission(
+    session_id: &str,
+) -> std::result::Result<Option<WorkerRecord>, ControlAdmissionRefusal> {
+    let record = load_strict(session_id).map_err(|error| {
+        warn!(target: "acp.registry", session = session_id, ?error, "control ownership read failed");
+        ControlAdmissionRefusal::unconfirmed(None)
+    })?;
+    let record = match record {
+        Some(record) if retained_process_may_be_alive(&record) => {
+            if let Some(refusal) = control_protocol_refusal(&record) {
+                return Err(refusal);
+            }
+            return match socket_exists(&expected_socket(&record)) {
+                true => Ok(Some(record)),
+                false => Err(ControlAdmissionRefusal::from_record(
+                    &record,
+                    ControlRefusalReason::OwnershipUnconfirmed,
+                )),
+            };
+        }
+        record => record,
+    };
+    let socket = match record.as_ref() {
+        Some(record) => expected_socket(record),
+        None => socket_path_for(session_id)
+            .map(|path| crate::process::worker::control_socket_sibling(&path))
+            .map_err(|_| ControlAdmissionRefusal::unconfirmed(None))?,
+    };
+    match crate::process::worker::observe_socket_peer(&socket) {
+        Ok(None) => Ok(record),
+        Ok(Some(_)) | Err(_) => {
+            Err(ControlAdmissionRefusal::unconfirmed(record.as_ref().map(
+                crate::acp::runner_lifecycle::RunnerIdentity::from_record,
+            )))
+        }
+    }
+}
+
+/// Recheck the frozen admission target after waits, without adopting its replacement.
+pub(crate) fn revalidate_control_record(
+    frozen: &WorkerRecord,
+) -> std::result::Result<(), ControlAdmissionRefusal> {
+    let owner = crate::acp::runner_lifecycle::RunnerIdentity::from_record(frozen);
+    if let Some(refusal) = control_protocol_refusal(frozen) {
+        return Err(refusal);
+    }
+    match control_admission(&frozen.session_id) {
+        Ok(Some(current))
+            if owner.owns_record(&current) && current.socket_path == frozen.socket_path =>
+        {
+            Ok(())
+        }
+        Err(refusal) if refusal.owner == Some(owner) => Err(refusal),
+        _ => Err(ControlAdmissionRefusal::unconfirmed(Some(owner))),
+    }
+}
+
+pub(crate) fn control_route_fingerprint(path: &Path) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(path.as_os_str().as_encoded_bytes()).into()
+}
+
+/// A refusal is conditional on its original owner and declaration, not a worker epoch.
+pub(crate) fn refusal_still_applies(session_id: &str, refusal: &ControlAdmissionRefusal) -> bool {
+    match load_strict(session_id) {
+        Ok(Some(current)) => refusal.owner.is_some_and(|owner| {
+            owner.owns_record(&current)
+                && retained_process_may_be_alive(&current)
+                && current.control_protocol_version == refusal.declared_protocol
+                && refusal.route_fingerprint.is_none_or(|route| {
+                    route == control_route_fingerprint(&expected_socket(&current))
+                })
+        }),
+        Err(_) => {
+            refusal.owner.is_none() && refusal.reason == ControlRefusalReason::OwnershipUnconfirmed
+        }
+        Ok(None) => match refusal.owner {
+            Some(owner) => {
+                is_pid_alive(owner.pid)
+                    && match crate::process::process_birth_identity(owner.pid) {
+                        Ok(Some(birth)) => Some(birth.fingerprint()) == owner.birth_fingerprint,
+                        _ => true,
+                    }
+            }
+            None => control_admission(session_id).is_err(),
+        },
+    }
+}
+
 impl WorkerRecord {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -76,6 +272,7 @@ impl WorkerRecord {
     ) -> Self {
         Self {
             runner_version: RUNNER_VERSION,
+            control_protocol_version: None,
             build_version: crate::build_info::BUILD_VERSION.to_string(),
             session_id,
             pid,

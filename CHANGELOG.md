@@ -4,6 +4,20 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## Unreleased
+
+### Bug Fixes
+
+- **session:** Preserve live restarts and applied-but-unconfirmed launches. Accept a final Pi or Prime capture only when its own durable compare-and-set advances the admitted selection; retain concurrent pins and hook changes.
+- **session:** Keep OMP confirmation bindings identical in memory and storage while advancing only the matching launch's capture witness.
+- **session:** Reject stale capture snapshots before they reserve a restarted or replaced session, preserving its lifecycle generation and newly selected conversation.
+- **session:** Publish daemon capture commits through the canonical store before releasing Capture ownership; retain the existing global fail-closed metadata-health policy when a profile cannot open.
+- **session:** Capture fresh terminal input from the canonical native row before queuing, preserving the original physical owner when a completed CLI start leads the daemon cache; keep registered readiness checks before delivery.
+
+### Security
+
+- **sqlite:** Upgrade rusqlite to 0.41 so vendored builds use SQLite 3.54 or newer, fixing uninitialized-memory disclosure from crafted database/WAL pairs ([RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459)). Builds using system SQLite require a patched system library.
+
 ## [1.22.3](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.22.3) - 2026-11-08
 
 

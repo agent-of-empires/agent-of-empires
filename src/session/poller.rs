@@ -747,6 +747,20 @@ impl SessionPoller {
         }
     }
 
+    /// Wait for a real producer result without consuming its sticky consumer mailbox.
+    #[cfg(test)]
+    pub(crate) fn wait_for_observation_for_test(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<(), std::sync::mpsc::RecvTimeoutError> {
+        let receiver = self
+            .result_rx
+            .as_ref()
+            .ok_or(std::sync::mpsc::RecvTimeoutError::Disconnected)?;
+        self.pending_observation = Some(receiver.recv_timeout(timeout)?);
+        Ok(())
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn inject_test_update(&self, instance_id: &str, session_id: &str) {
         self.result_tx

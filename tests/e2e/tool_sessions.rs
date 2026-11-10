@@ -666,6 +666,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         .ensure_tool(
             &row.id,
             &agent_of_empires::daemon::EnsureToolBody {
+                expected: None,
                 tool_name: "..".into(),
                 size: None,
                 adoption: None,
@@ -699,6 +700,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         .ensure_tool(
             &row.id,
             &agent_of_empires::daemon::EnsureToolBody {
+                expected: None,
                 tool_name: "..".into(),
                 size: None,
                 adoption: None,
@@ -767,6 +769,7 @@ async fn native_auxiliary_ensure_uses_fresh_context_and_refuses_purge() {
         .ensure_tool(
             &row.id,
             &agent_of_empires::daemon::EnsureToolBody {
+                expected: None,
                 tool_name: "..".into(),
                 size: None,
                 adoption: None,

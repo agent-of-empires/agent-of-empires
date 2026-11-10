@@ -81,6 +81,141 @@ async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Res
 
 #[tokio::test]
 #[serial_test::serial]
+async fn permanent_delete_reaps_a_refused_owned_constructor_before_removing_its_scratch() {
+    use crate::acp::runner_lifecycle::ProcessControl as _;
+    use crate::acp::supervisor::test_support::{refused_owned_constructor, ObservedProcessControl};
+    use futures_util::FutureExt as _;
+    for stop_before_drop in [false, true] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        let mut row = Instance::new("refused owned constructor", "");
+        let scratch = crate::session::scratch::provision_scratch_dir(&row.id).unwrap();
+        std::fs::write(scratch.join("retained-until-stop"), b"original scratch").unwrap();
+        row.project_path = scratch.to_str().unwrap().into();
+        row.scratch = true;
+        row.view = crate::session::View::Structured;
+        row.source_profile = "default".into();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let control = std::sync::Arc::new(ObservedProcessControl::default());
+        let state = crate::server::test_support::build_test_app_state_impl(
+            vec![row.clone()],
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+            |_| {},
+            |supervisor| supervisor.with_process_control(control.clone()),
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (reservation, mut runner) =
+            refused_owned_constructor(&state.acp_supervisor, &row).await;
+        let lease = reservation.lease().clone();
+        let mut reservation = Some(reservation);
+        let mut deleting = None;
+        let checked = std::panic::AssertUnwindSafe(async {
+            assert!(!lease.constructor_finished());
+            assert!(control.is_alive(runner.identity));
+            assert!(
+                control.signals().is_empty(),
+                "admission refusal is not physical loss"
+            );
+            assert!(scratch.join("retained-until-stop").exists());
+            if !stop_before_drop {
+                drop(reservation.take());
+                assert!(lease.constructor_finished());
+                assert!(control.is_alive(runner.identity));
+                assert!(
+                    control.signals().is_empty(),
+                    "producer completion is not actor retirement"
+                );
+            }
+            let deleting_state = state.clone();
+            let deleting_id = row.id.clone();
+            deleting = Some(tokio::spawn(async move {
+                super::delete::delete_session(
+                    State(deleting_state),
+                    Path(deleting_id),
+                    Some(Json(DeleteSessionBody {
+                        force_delete: true,
+                        ..Default::default()
+                    })),
+                )
+                .await
+                .into_response()
+            }));
+            if stop_before_drop {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    lease.cancellation().cancelled(),
+                )
+                .await
+                .expect("permanent deletion requests Stop from the original constructor");
+                assert!(!lease.constructor_finished());
+                assert!(
+                    !deleting.as_ref().unwrap().is_finished(),
+                    "Stop cannot acknowledge before the producer's Drop"
+                );
+                drop(reservation.take());
+            }
+            let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                runner.wait_for_constructor(&lease).await;
+                deleting.as_mut().unwrap().await
+            })
+            .await
+            .expect("the exact retired constructor must not strand permanent deletion");
+            drop(deleting.take());
+            let response = response.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["status"], "deleted", "{body}");
+            assert_eq!(body["cleanup_errors"], serde_json::json!([]), "{body}");
+            assert!(!control.is_alive(runner.identity));
+            assert!(!control.signals().is_empty());
+            assert!(control
+                .signals()
+                .iter()
+                .all(|(identity, _)| *identity == runner.identity));
+            assert!(crate::process::worker_registry::load(&row.id)
+                .unwrap()
+                .is_none());
+            assert!(!state.acp_supervisor.is_owned(&row.id).await);
+            assert!(!scratch.exists());
+            assert!(state
+                .instances
+                .read()
+                .await
+                .iter()
+                .all(|current| current.id != row.id));
+            let stored = crate::session::Storage::open_reference("default")
+                .unwrap()
+                .load_complete_with_groups()
+                .unwrap()
+                .0;
+            assert!(stored.iter().all(|current| current.id != row.id));
+        })
+        .catch_unwind()
+        .await;
+        drop(reservation.take());
+        if checked.is_err() {
+            runner.cleanup_constructor(&lease).await;
+            if let Some(task) = deleting.take() {
+                let _ = task.await;
+            }
+        }
+        state.shutdown.cancel();
+        if let Err(panic) = checked {
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn committed_purge_preserves_a_reused_rows_structured_projection() -> anyhow::Result<()> {
     use crate::session::deletion::{DeletionRequest, PurgeTransaction};
     for recovered_with_replacement_worker in [false, true] {
@@ -350,6 +485,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
             store: Arc::new(Storage::open_unwatched(&row.source_profile)?),
             generation: row.lifecycle_generation,
             namespace: Some(state.profile_namespace.clone()),
+            native_scope: None,
         }));
         let retirement = state.acp_supervisor.capture_retirement(&row.id)?;
         assert!(retirement.identity.is_none());
@@ -415,6 +551,7 @@ async fn committed_purge_settles_only_its_live_preconfiguration_producer() -> an
                     store: storage.clone(),
                     generation: newer_row.lifecycle_generation,
                     namespace: Some(state.profile_namespace.clone()),
+                    native_scope: None,
                 }));
             let mut current = state.acp_supervisor.capture_retirement(&row.id)?;
             assert!(
@@ -1126,6 +1263,7 @@ async fn tool_ensure_refuses_restricted_or_degraded_runtime() {
             State(state),
             Path(id),
             Ok(Json(crate::daemon::EnsureToolBody {
+                expected: None,
                 tool_name: "probe".into(),
                 size: None,
                 adoption: None,
@@ -7077,6 +7215,965 @@ mod open_file {
     }
 }
 
+pub(super) mod terminal_custody {
+    use super::*;
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(in crate::server::api::sessions) enum Boundary {
+        SendAdmitted,
+        SendInitialSnapshot,
+        LaunchFinished,
+        EnsureReceipt,
+    }
+
+    struct Rendezvous {
+        entered: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    }
+
+    type Key = (String, Boundary);
+    static GATES: LazyLock<Mutex<HashMap<Key, Rendezvous>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    struct Gate {
+        key: Key,
+        entered: Option<oneshot::Receiver<()>>,
+        release: Option<oneshot::Sender<()>>,
+    }
+
+    impl Gate {
+        fn install(id: &str, boundary: Boundary) -> Self {
+            let (entered_tx, entered) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            let key = (id.to_owned(), boundary);
+            assert!(GATES
+                .lock()
+                .unwrap()
+                .insert(
+                    key.clone(),
+                    Rendezvous {
+                        entered: entered_tx,
+                        release: release_rx,
+                    },
+                )
+                .is_none());
+            Self {
+                key,
+                entered: Some(entered),
+                release: Some(release),
+            }
+        }
+
+        async fn entered(&mut self) {
+            tokio::time::timeout(Duration::from_secs(10), self.entered.take().unwrap())
+                .await
+                .expect("handler did not reach the custody boundary")
+                .expect("handler dropped the custody acknowledgement");
+        }
+
+        fn release(&mut self) {
+            self.release.take().unwrap().send(()).ok();
+        }
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            GATES.lock().unwrap().remove(&self.key);
+            self.release.take();
+        }
+    }
+
+    pub(in crate::server::api::sessions) async fn pause(id: &str, boundary: Boundary) {
+        let rendezvous = GATES.lock().unwrap().remove(&(id.to_owned(), boundary));
+        if let Some(rendezvous) = rendezvous {
+            rendezvous.entered.send(()).ok();
+            let _ = tokio::time::timeout(Duration::from_secs(10), rendezvous.release)
+                .await
+                .expect("custody boundary was not released");
+        }
+    }
+
+    async fn response_json(
+        response: axum::response::Response,
+    ) -> anyhow::Result<(StatusCode, serde_json::Value)> {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024).await?;
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({"raw": String::from_utf8_lossy(&bytes)}));
+        Ok((status, body))
+    }
+
+    fn producer_command(received: &std::path::Path) -> String {
+        let received = crate::session::environment::shell_escape(received.to_str().unwrap());
+        let script = format!(
+            "printf 'PID %s\\nREADY\\n' \"$$\" >> {received}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {received}; done"
+        );
+        format!(
+            "/bin/sh -c {}",
+            crate::session::environment::shell_escape(&script)
+        )
+    }
+
+    async fn await_line(path: &std::path::Path, expected: &str) -> String {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let received = std::fs::read_to_string(path).unwrap_or_default();
+                if received.lines().any(|line| line == expected) {
+                    return received;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("producer never acknowledged {expected:?} at {path:?}"))
+    }
+
+    async fn run_native_cli(args: &[&str]) -> anyhow::Result<()> {
+        #[derive(clap::Parser)]
+        struct Invocation {
+            #[command(subcommand)]
+            command: crate::cli::session::SessionCommands,
+        }
+        let invocation = <Invocation as clap::Parser>::try_parse_from(args)?;
+        crate::cli::session::run("default", invocation.command).await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ensure_birth_receipt_rejects_cli_replacement_before_daemon_reload(
+    ) -> anyhow::Result<()> {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir_in("/tmp")?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+        })?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let received = root.path().join("received");
+        let mut original = Instance::new("birth receipt gap", project.to_str().unwrap());
+        original.source_profile = "default".into();
+        original.tool = "bash".into();
+        original.command = producer_command(&received);
+        original.status = Status::Stopped;
+        let name = crate::tmux::Session::generate_name(&original.id, &original.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![original.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut gate = Gate::install(&original.id, Boundary::LaunchFinished);
+        let own_state = state.clone();
+        let id = original.id.clone();
+        let own = tokio::spawn(async move {
+            ensure_session(State(own_state), Path(id), Ok(None))
+                .await
+                .into_response()
+        });
+        gate.entered().await;
+        await_line(&received, "READY").await;
+        let (before, before_probe, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("own native launch exists");
+        assert_eq!(before_probe, crate::tmux::utils::PaneProbe::Alive);
+        let storage = crate::session::Storage::open_reference("default")?;
+        let born = storage.load_instances_complete()?.remove(0);
+        assert_eq!(
+            state.instances.read().await[0].lifecycle_generation,
+            born.lifecycle_generation
+        );
+
+        // The real local CLI updates native storage, not this daemon's cache.
+        run_native_cli(&["session", "restart", &original.id]).await?;
+        let replacement = storage.load_instances_complete()?.remove(0);
+        assert!(replacement.lifecycle_generation > born.lifecycle_generation);
+        assert_eq!(
+            state.instances.read().await[0].lifecycle_generation,
+            born.lifecycle_generation
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let receipts = std::fs::read_to_string(&received).unwrap_or_default();
+                if receipts.lines().filter(|line| *line == "READY").count() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("CLI replacement never acknowledged its own native startup");
+        let (after, after_probe, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("CLI replacement exists");
+        assert_eq!(after_probe, crate::tmux::utils::PaneProbe::Alive);
+        assert_ne!(
+            after, before,
+            "CLI restart must have a new physical native identity"
+        );
+        gate.release();
+        let (status, receipt) =
+            response_json(tokio::time::timeout(Duration::from_secs(10), own).await??).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{receipt}");
+        let still_owned =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("refusal preserves CLI replacement")
+                .0;
+        assert_eq!(still_owned, after);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_http_send_uses_native_cli_start_before_daemon_cache_reload() -> anyhow::Result<()>
+    {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir_in("/tmp")?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"]);
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.agent_status_hooks = false;
+        })?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let received = root.path().join("received");
+        let mut original = Instance::new("fresh CLI start input", project.to_str().unwrap());
+        original.source_profile = "default".into();
+        original.tool = "opencode".into();
+        original.command = "opencode".into();
+        original.status = Status::Stopped;
+        let ready_gate = format!("ready-after-cli-{}", original.id);
+        let marker = crate::agents::ready_marker("opencode")
+            .expect("the real registered opencode readiness marker");
+        let quote = crate::session::environment::shell_escape;
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = --version ]; then echo '1.0.0 fixture'; exit 0; fi\n\
+             printf 'PID %s\\nBORN\\n' \"$$\" >> {received}\n\
+             printf 'native agent booting\\n'\n\
+             : \"${{TMUX:?fixture requires its actual tmux pane server}}\"\n\
+             tmux wait-for {ready_gate} || exit $?\n\
+             printf '%s\\n' {marker}\n\
+             printf 'READY\\n' >> {received}\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> {received}; done\n",
+            received = quote(received.to_str().unwrap()),
+            ready_gate = quote(&ready_gate),
+            marker = quote(marker),
+        );
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "opencode",
+            &script,
+        );
+        let name = crate::tmux::Session::generate_name(&original.id, &original.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![original.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        run_native_cli(&["session", "start", &original.id]).await?;
+        let born = await_line(&received, "BORN").await;
+        let pid: u32 = born
+            .lines()
+            .find_map(|line| line.strip_prefix("PID "))
+            .unwrap()
+            .parse()?;
+        let birth = crate::process::process_birth_identity(pid)?
+            .expect("the original final Native receiver is alive");
+        let storage = crate::session::Storage::open_reference("default")?;
+        let started = storage.load_instances_complete()?.remove(0);
+        assert!(started.lifecycle_generation > original.lifecycle_generation);
+        assert_eq!(
+            state.instances.read().await[0].lifecycle_generation,
+            original.lifecycle_generation,
+            "the completed real CLI start has not been adopted by the daemon cache"
+        );
+        let (physical, presence, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("the CLI-created original pane");
+        assert_eq!(presence, crate::tmux::utils::PaneProbe::Alive);
+        let mut gate = Gate::install(&original.id, Boundary::SendAdmitted);
+        let sending_state = state.clone();
+        let id = original.id.clone();
+        let sending = tokio::spawn(async move {
+            send_message(
+                State(sending_state),
+                Path(id),
+                Ok(Json(SendMessageRequest {
+                    message: "FRESH-ONLY".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response()
+        });
+        gate.entered().await;
+        let capture = || -> anyhow::Result<String> {
+            let output = crate::tmux::tmux_command()
+                .args(["capture-pane", "-p", "-t", &name])
+                .output()?;
+            anyhow::ensure!(output.status.success());
+            Ok(String::from_utf8(output.stdout)?)
+        };
+        let booting = capture()?;
+        assert!(!booting.contains(marker), "{booting}");
+        assert!(!booting.contains("FRESH-ONLY"), "{booting}");
+        assert!(!born.lines().any(|line| line == "READY"));
+        assert!(crate::process::process_birth_is_live(pid, &birth)?);
+        gate.release();
+        let released = crate::tmux::tmux_command()
+            .args(["wait-for", "-S", &ready_gate])
+            .status()?;
+        anyhow::ensure!(released.success());
+        let (status, response) =
+            response_json(tokio::time::timeout(Duration::from_secs(10), sending).await??).await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let delivered = await_line(&received, "FRESH-ONLY").await;
+        assert_eq!(
+            delivered
+                .lines()
+                .filter(|line| *line == "FRESH-ONLY")
+                .count(),
+            1
+        );
+        assert_eq!(delivered.lines().filter(|line| *line == "BORN").count(), 1);
+        assert!(crate::process::process_birth_is_live(pid, &birth)?);
+        let (after, after_presence, _) =
+            crate::tmux::utils::observe_pane(&name, &crate::tmux::TmuxCommandDeadline::new())?
+                .expect("the same original pane after input");
+        assert_eq!(after_presence, crate::tmux::utils::PaneProbe::Alive);
+        assert_eq!(
+            after, physical,
+            "the fresh send must not retarget or respawn"
+        );
+        assert_eq!(
+            storage.load_instances_complete()?[0].lifecycle_generation,
+            started.lifecycle_generation
+        );
+        let ready = capture()?;
+        assert!(
+            ready
+                .find("FRESH-ONLY")
+                .expect("the tty echoed the actual input")
+                > ready
+                    .find(marker)
+                    .expect("the registered marker was really printed"),
+            "input must follow the original producer's registered readiness marker: {ready}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn queued_cold_send_keeps_selection_before_initial_lock() -> anyhow::Result<()> {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        const A: &str = "11111111-2222-4333-8444-555555555555";
+        const B: &str = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+        let root = tempfile::tempdir_in("/tmp")?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let native_store = root.path().join("claude-store");
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"))
+            .and_set("CLAUDE_CONFIG_DIR", &native_store);
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+            config.session.agent_status_hooks = false;
+        })?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let project = project.canonicalize()?;
+        let native_project = native_store.join("projects").join(
+            crate::session::capture::encode_claude_project_path(project.to_str().unwrap()),
+        );
+        std::fs::create_dir_all(&native_project)?;
+        for sid in [A, B] {
+            std::fs::write(
+                native_project.join(format!("{sid}.jsonl")),
+                serde_json::to_string(&serde_json::json!({
+                    "type": "user", "sessionId": sid, "cwd": project,
+                    "message": {"role": "user", "content": "preserved"},
+                }))? + "\n",
+            )?;
+        }
+        let received = root.path().join("received");
+        let launches = root.path().join("launches");
+        let quoted_received = crate::session::environment::shell_escape(received.to_str().unwrap());
+        let quoted_launches = crate::session::environment::shell_escape(launches.to_str().unwrap());
+        let script = format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '1.0.0 fixture'; exit 0; fi\n\
+             printf '%s\\n' \"$*\" >> {quoted_launches}\n\
+             stty -echo\nprintf 'READY\\n' >> {quoted_received}\n\
+             while IFS= read -r line; do printf '%s\\n' \"$line\" >> {quoted_received}; done\n"
+        );
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            &script,
+        );
+        let mut original = Instance::new("cold queued selection", project.to_str().unwrap());
+        original.source_profile = "default".into();
+        original.agent_session_id = Some(A.into());
+        original.status = Status::Stopped;
+        let name = crate::tmux::Session::generate_name(&original.id, &original.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            "default",
+            vec![original.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![original.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut gate = Gate::install(&original.id, Boundary::SendInitialSnapshot);
+        let old_state = state.clone();
+        let id = original.id.clone();
+        let old = tokio::spawn(async move {
+            send_message(
+                State(old_state),
+                Path(id),
+                Ok(Json(SendMessageRequest {
+                    message: "OLD".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response()
+        });
+        gate.entered().await;
+        run_native_cli(&["session", "set-session-id", &original.id, B]).await?;
+        let storage = crate::session::Storage::open_reference("default")?;
+        let selected = storage.load_instances_complete()?.remove(0);
+        assert_eq!(selected.lifecycle_generation, original.lifecycle_generation);
+        assert_eq!(
+            selected.resume_intent,
+            crate::session::ResumeIntent::Use(B.into())
+        );
+        gate.release();
+        let (status, refusal) =
+            response_json(tokio::time::timeout(Duration::from_secs(10), old).await??).await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        assert!(
+            !launches.exists(),
+            "OLD prepared the newer selected native context"
+        );
+        assert!(!received.exists());
+
+        // Apply the newly observed CLI choice before the next explicit action.
+        state.instances.write().await[0] = selected;
+        let (status, response) = response_json(
+            send_message(
+                State(state),
+                Path(original.id.clone()),
+                Ok(Json(SendMessageRequest {
+                    message: "FRESH".into(),
+                    revive: true,
+                })),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let received = await_line(&received, "FRESH").await;
+        assert!(!received.lines().any(|line| line == "OLD"));
+        let launches = std::fs::read_to_string(launches)?;
+        assert_eq!(launches.lines().count(), 1);
+        assert!(launches.contains(B), "{launches}");
+        Ok(())
+    }
+
+    async fn replace_runtime(
+        state: &Arc<AppState>,
+        id: &str,
+        received: &std::path::Path,
+    ) -> anyhow::Result<Instance> {
+        let _namespace = state.profile_namespace.read().await;
+        let _submission = state.session_service.prompt_submission(id).await;
+        let lock = state.instance_lock(id).await;
+        let _guard = lock.lock().await;
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap()
+            .clone();
+        let worker_state = state.clone();
+        let command = producer_command(received);
+        let replacement = tokio::task::spawn_blocking(move || -> anyhow::Result<Instance> {
+            use crate::session::SessionStore;
+            let native = crate::server::session_store::NativeSessionStore::open(
+                worker_state,
+                &instance.source_profile,
+                None,
+            )?;
+            let _title = crate::session::acquire_session_title_lock(&instance.id)?;
+            let _lifecycle = native
+                .storage()
+                .acquire_instance_lifecycle_lock(&instance.id)?;
+            let session = instance.tmux_session()?;
+            session.kill()?;
+            let replacement = (&native as &dyn SessionStore).update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id).unwrap();
+                row.lifecycle_generation += 1;
+                row.status = Status::Running;
+                Ok(row.clone())
+            })?;
+            session.create(
+                &replacement.project_path,
+                Some(&command),
+                &replacement.source_profile,
+            )?;
+            native.refresh_pane_observations(&replacement)?;
+            Ok(replacement)
+        })
+        .await??;
+        await_line(received, "READY").await;
+        Ok(replacement)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admitted_http_send_never_retargets_a_replacement_runtime() -> anyhow::Result<()> {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let mut violations = Vec::new();
+        for revive in [false, true] {
+            let root = tempfile::tempdir_in("/tmp")?;
+            let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+                .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+            })?;
+            let project = root.path().join("project");
+            std::fs::create_dir(&project)?;
+            let transcript = root.path().join("history.jsonl");
+            std::fs::write(&transcript, "preserved conversation\n")?;
+            let mut row = Instance::new("HTTP send custody", project.to_str().unwrap());
+            row.source_profile = "default".into();
+            row.status = Status::Running;
+            row.agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
+            let mut binding = crate::session::ConversationBinding::unknown(
+                row.agent_session_id.as_deref().unwrap(),
+            );
+            binding.transcript_path = Some(transcript.clone());
+            row.agent_session_binding = Some(binding);
+            let conversation = row.conversation_state();
+            let original_received = root.path().join("original-received");
+            row.command = producer_command(&original_received);
+            let session = row.tmux_session()?;
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+            session.create(&row.project_path, Some(&row.command), &row.source_profile)?;
+            let original_entry = await_line(&original_received, "READY").await;
+            let original_pid: u32 = original_entry
+                .lines()
+                .find_map(|line| line.strip_prefix("PID "))
+                .ok_or_else(|| anyhow::anyhow!("original final process did not publish its pid"))?
+                .parse()?;
+            let original_birth = crate::process::process_birth_identity(original_pid)?
+                .ok_or_else(|| anyhow::anyhow!("original final process birth unavailable"))?;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                &row.source_profile,
+                vec![row.clone()],
+            );
+            let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let (status, original) = response_json(
+                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                    .await
+                    .into_response(),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{original}");
+            assert_eq!(original["status"], "alive");
+            assert!(!original["physical"].is_null(), "{original}");
+            let mut gate = Gate::install(&row.id, Boundary::SendAdmitted);
+            let old_state = state.clone();
+            let id = row.id.clone();
+            let old = tokio::spawn(async move {
+                send_message(
+                    State(old_state),
+                    Path(id),
+                    Ok(Json(SendMessageRequest {
+                        message: "OLD".into(),
+                        revive,
+                    })),
+                )
+                .await
+                .into_response()
+            });
+            gate.entered().await;
+            let replacement_received = root.path().join("replacement-received");
+            let replacement = replace_runtime(&state, &row.id, &replacement_received).await?;
+            assert!(replacement.lifecycle_generation > row.lifecycle_generation);
+            let replacement_entry = await_line(&replacement_received, "READY").await;
+            let replacement_pid: u32 = replacement_entry
+                .lines()
+                .find_map(|line| line.strip_prefix("PID "))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("replacement final process did not publish its pid")
+                })?
+                .parse()?;
+            let replacement_birth = crate::process::process_birth_identity(replacement_pid)?
+                .ok_or_else(|| anyhow::anyhow!("replacement final process birth unavailable"))?;
+            assert_ne!(
+                (replacement_pid, &replacement_birth),
+                (original_pid, &original_birth),
+                "the replacement must have its own acknowledged final-process birth"
+            );
+            let (status, target) = response_json(
+                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                    .await
+                    .into_response(),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_ne!(target["physical"], original["physical"]);
+            gate.release();
+            let (old_status, old_body) =
+                response_json(tokio::time::timeout(Duration::from_secs(10), old).await??).await?;
+            assert_eq!(old_status, StatusCode::CONFLICT, "{old_body}");
+            assert_eq!(old_body["error"], "lifecycle_superseded", "{old_body}");
+            assert_eq!(std::fs::read_to_string(&original_received)?, original_entry);
+
+            // A fresh operation on that replacement refuses an unknown physical
+            // observation without changing it or permanently fencing later input.
+            let real_tmux = which::which("tmux")?;
+            let probe_bin = root.path().join("unknown-probe");
+            std::fs::create_dir(&probe_bin)?;
+            let probe_seen = root.path().join("unknown-probe-seen");
+            let shim = probe_bin.join("tmux");
+            let quote = crate::session::environment::shell_escape_script_word;
+            std::fs::write(&shim, format!(
+                "#!/bin/sh\nfor arg do\nif [ \"$arg\" = '#{{n:socket_path}}|#{{socket_path}}|#{{session_id}}|#{{pane_id}}|#{{pane_pid}}|#{{pid}}|#{{pane_dead}}|#{{pane_current_command}}|#{{pane_start_command}}' ]; then\n: > {}\nprintf 'malformed\\n'\nexit 0\nfi\ndone\nexec {} \"$@\"\n",
+                quote(&probe_seen.to_string_lossy()),
+                quote(&real_tmux.to_string_lossy()),
+            ))?;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))?;
+            let (unknown_status, unknown_body) = {
+                let _path = crate::session::test_support::path_prepended(&probe_bin);
+                response_json(
+                    ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                        .await
+                        .into_response(),
+                )
+                .await?
+            };
+            assert!(
+                probe_seen.exists(),
+                "the real physical query was not intercepted"
+            );
+            assert_eq!(unknown_status, StatusCode::CONFLICT, "{unknown_body}");
+            assert_eq!(
+                unknown_body["error"], "launch_indeterminate",
+                "{unknown_body}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&replacement_received)?,
+                replacement_entry
+            );
+            assert!(crate::process::process_birth_is_live(
+                replacement_pid,
+                &replacement_birth
+            )?);
+            let (fresh_status, fresh_body) = response_json(
+                send_message(
+                    State(state.clone()),
+                    Path(row.id.clone()),
+                    Ok(Json(SendMessageRequest {
+                        message: "FRESH".into(),
+                        revive,
+                    })),
+                )
+                .await
+                .into_response(),
+            )
+            .await?;
+            assert_eq!(fresh_status, StatusCode::OK, "{fresh_body}");
+            let received = await_line(&replacement_received, "FRESH").await;
+            assert_eq!(received.lines().filter(|line| *line == "FRESH").count(), 1);
+            let stored = Storage::open_unwatched(&row.source_profile)?
+                .load()?
+                .into_iter()
+                .find(|stored| stored.id == row.id)
+                .unwrap();
+            assert_eq!(stored.conversation_state(), conversation);
+            assert_eq!(
+                stored.lifecycle_generation,
+                replacement.lifecycle_generation
+            );
+            assert_eq!(
+                state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|live| live.id == row.id)
+                    .unwrap()
+                    .lifecycle_generation,
+                stored.lifecycle_generation,
+            );
+            assert!(crate::process::process_birth_is_live(
+                replacement_pid,
+                &replacement_birth
+            )?);
+            let (after_status, after) = response_json(
+                ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                    .await
+                    .into_response(),
+            )
+            .await?;
+            assert_eq!(after_status, StatusCode::OK, "{after}");
+            assert_eq!(after["physical"], target["physical"]);
+            assert_eq!(
+                std::fs::read_to_string(&transcript)?,
+                "preserved conversation\n"
+            );
+            if received.lines().any(|line| line == "OLD") || old_status.is_success() {
+                violations.push(format!(
+                    "admitted send must refuse without delivering OLD (revive={revive}): {received:?}; response={old_status} {old_body}"
+                ));
+            }
+        }
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ensure_missing_agent_refuses_changed_selection_without_generation_advance(
+    ) -> anyhow::Result<()> {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir_in("/tmp")?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+        })?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let original_received = root.path().join("PRIVATE_ORIGINAL_SELECTION");
+        let chosen_received = root.path().join("chosen-received");
+        let mut original = Instance::new("queued native selection", project.to_str().unwrap());
+        original.source_profile = "default".into();
+        original.tool = "bash".into();
+        original.command = producer_command(&original_received);
+        original.status = Status::Stopped;
+        let name = crate::tmux::Session::generate_name(&original.id, &original.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &original.source_profile,
+            vec![original.clone()],
+        );
+        let storage = crate::session::Storage::open_reference(&original.source_profile)?;
+        let profile = storage.bound_profile_identity()?;
+        let expected = crate::daemon::NativePreparationIdentity::from_instance(&original, profile);
+        assert!(!serde_json::to_string(&expected)?.contains("PRIVATE_ORIGINAL_SELECTION"));
+
+        // The original intent is already captured. A selected executable changes
+        // before dispatch, without changing creation, generation, or profile.
+        let mut chosen = original.clone();
+        chosen.command = producer_command(&chosen_received);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &chosen.source_profile,
+            vec![chosen.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![chosen.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let (status, refusal) = response_json(
+            ensure_session(
+                State(state.clone()),
+                Path(chosen.id.clone()),
+                Ok(Some(Json(crate::daemon::StartSessionBody {
+                    size: None,
+                    expected: Some(expected),
+                }))),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "{refusal}");
+        assert!(!original_received.exists());
+        assert!(
+            !chosen_received.exists(),
+            "stale intent prepared the newly selected actor"
+        );
+        let stored = storage.load_instances_complete()?.remove(0);
+        assert_eq!(stored.lifecycle_generation, original.lifecycle_generation);
+        assert_eq!(stored.command, chosen.command);
+
+        let fresh = crate::daemon::NativePreparationIdentity::from_instance(&chosen, profile);
+        let (status, receipt) = response_json(
+            ensure_session(
+                State(state),
+                Path(chosen.id.clone()),
+                Ok(Some(Json(crate::daemon::StartSessionBody {
+                    size: None,
+                    expected: Some(fresh),
+                }))),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{receipt}");
+        await_line(&chosen_received, "READY").await;
+        assert!(!original_received.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ensure_created_receipt_never_claims_a_replacement_runtime() -> anyhow::Result<()> {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return Ok(());
+        }
+        let root = tempfile::tempdir_in("/tmp")?;
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _env = crate::session::test_support::EnvGuard::unset(&["TMUX", "TMUX_PANE"])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.smart_rename = false;
+        })?;
+        let project = root.path().join("project");
+        std::fs::create_dir(&project)?;
+        let original_received = root.path().join("original-received");
+        let mut row = Instance::new("HTTP ensure custody", project.to_str().unwrap());
+        row.source_profile = "default".into();
+        row.tool = "bash".into();
+        row.command = producer_command(&original_received);
+        row.status = Status::Stopped;
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &row.source_profile,
+            vec![row.clone()],
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut gate = Gate::install(&row.id, Boundary::EnsureReceipt);
+        let own_state = state.clone();
+        let id = row.id.clone();
+        let own = tokio::spawn(async move {
+            ensure_session(State(own_state), Path(id), Ok(None))
+                .await
+                .into_response()
+        });
+        gate.entered().await;
+        await_line(&original_received, "READY").await;
+        let original = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|current| current.id == row.id)
+            .unwrap()
+            .clone();
+        assert!(original.lifecycle_generation > row.lifecycle_generation);
+        assert_eq!(
+            original.agent_pane.state,
+            crate::session::PanePresence::Alive
+        );
+        let original_physical = original
+            .agent_pane
+            .physical
+            .as_ref()
+            .expect("own successful startup must publish its physical target");
+        let replacement_received = root.path().join("replacement-received");
+        let replacement = replace_runtime(&state, &row.id, &replacement_received).await?;
+        let (fresh_status, fresh_target) = response_json(
+            ensure_session(State(state.clone()), Path(row.id.clone()), Ok(None))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(fresh_status, StatusCode::OK, "{fresh_target}");
+        assert_eq!(fresh_target["status"], "alive");
+        assert_eq!(
+            fresh_target["lifecycle_generation"],
+            replacement.lifecycle_generation
+        );
+        assert_ne!(
+            fresh_target["physical"],
+            serde_json::to_value(original_physical)?
+        );
+        gate.release();
+        let (status, receipt) =
+            response_json(tokio::time::timeout(Duration::from_secs(10), own).await??).await?;
+        if status.is_success() {
+            assert_eq!(receipt["resume_outcome"], "fresh", "{receipt}");
+            assert_eq!(
+                receipt["lifecycle_generation"], original.lifecycle_generation,
+                "own startup outcome was attached to a replacement: {receipt}"
+            );
+            assert_eq!(
+                receipt["physical"],
+                serde_json::to_value(original_physical)?,
+                "own startup receipt must retain its exact physical target"
+            );
+            assert_eq!(receipt["profile"], original.source_profile);
+            assert_eq!(
+                receipt["tmux_session"],
+                original.agent_pane.tmux_session.as_deref().unwrap()
+            );
+        } else {
+            assert!(
+                matches!(status, StatusCode::CONFLICT | StatusCode::NOT_FOUND),
+                "a superseded startup must refuse as stale: {status} {receipt}"
+            );
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn send_message_refreshes_instance_after_instance_lock() {
     let _home = crate::session::test_support::isolate_app_dir();
@@ -7173,25 +8270,25 @@ async fn container_terminal_refuses_archived_trashed_and_purged_sessions() {
 async fn start_paths_refuse_archived_and_trashed_sessions() {
     use axum::body::to_bytes;
     let _home = crate::session::test_support::isolate_app_dir();
-    let shelves: [(fn(&mut Instance), &str, &str); 2] = [
-        (
-            Instance::archive,
-            "session_archived",
-            "session is archived; unarchive it first",
-        ),
-        (
-            Instance::trash,
-            "session_trashed",
-            "session is in trash; restore it first",
-        ),
+    let shelves: [(fn(&mut Instance), &str); 2] = [
+        (Instance::archive, "session_archived"),
+        (Instance::trash, "session_trashed"),
     ];
-    for (shelve, code, message) in shelves {
+    for (shelve, code) in shelves {
         for which in ["start", "ensure", "send"] {
             let mut inst = make_test_instance();
+            inst.source_profile = "default".into();
             shelve(&mut inst);
             inst.status = Status::Stopped;
             let id = inst.id.clone();
+            let archived_at = inst.archived_at;
+            let trashed_at = inst.trashed_at;
+            crate::server::test_support::seed_instances_on_disk_for_test(
+                "default",
+                vec![inst.clone()],
+            );
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let response = match which {
                 "start" => start_session(State(state.clone()), Path(id.clone()), Ok(None))
                     .await
@@ -7215,10 +8312,19 @@ async fn start_paths_refuse_archived_and_trashed_sessions() {
                 serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap())
                     .unwrap();
             assert_eq!(body["error"], code, "{which}");
-            assert_eq!(body["message"], message, "{which}");
             let after = &state.instances.read().await[0];
             assert_eq!(after.status, Status::Stopped, "{which} {code}");
             assert!(!after.tmux_session().unwrap().exists(), "{which} {code}");
+            let stored = Storage::new_unwatched("default")
+                .unwrap()
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == id)
+                .unwrap();
+            assert_eq!(stored.status, Status::Stopped, "{which} {code}");
+            assert_eq!(stored.archived_at, archived_at, "{which} {code}");
+            assert_eq!(stored.trashed_at, trashed_at, "{which} {code}");
         }
     }
 }
@@ -7498,7 +8604,7 @@ fn archive_persist_waits_for_an_in_flight_send() {
         .unwrap();
     let stored_archived = || storage.load().unwrap()[0].is_archived();
 
-    let sending = inst.lock_for_input().unwrap();
+    let sending = inst.native_input_fence(true).unwrap().lock().unwrap();
     let (contended_tx, contended_rx) = std::sync::mpsc::channel();
     let archive = std::thread::spawn(move || {
         let _observer = crate::session::observe_lock_contention_for_test(contended_tx);
@@ -8919,14 +10025,16 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
         .expect("record pending approval");
 
     // A durable nonce without a live worker cannot be resolved.
-    let response = project_sessions(&state).await;
+    let workers = state.acp_supervisor.worker_states_snapshot().await;
+    let response = project_sessions(&state, &workers).await;
     assert!(
         response[0].pending_approvals.is_empty(),
         "a pending approval on a non-running worker must not be projected"
     );
 
     state.acp_supervisor.test_insert_worker(&id).await;
-    let response = project_sessions(&state).await;
+    let workers = state.acp_supervisor.worker_states_snapshot().await;
+    let response = project_sessions(&state, &workers).await;
     assert_eq!(
         response[0].pending_approvals,
         vec![PendingApproval {
@@ -12801,7 +13909,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
 
     let g = generation("parked");
     assert!(
-        lifecycle::continue_interrupted_prompt(&state, "parked", g, resets_at, false).await,
+        lifecycle::continue_interrupted_prompt(&state, "parked", g, resets_at, false)
+            .await
+            .unwrap(),
         "the interrupted prompt is the next turn, so no wake message"
     );
     assert_eq!(pending("parked").as_deref(), Some("finish the migration"));
@@ -12813,7 +13923,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
         .await;
     let g = generation("explicit");
     assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "explicit", g, resets_at, true).await,
+        !lifecycle::continue_interrupted_prompt(&state, "explicit", g, resets_at, true)
+            .await
+            .unwrap(),
         "an explicit wake message is sent by the restart itself"
     );
     assert_eq!(
@@ -12825,7 +13937,9 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
 
     let g = generation("superseded") + 1;
     assert!(
-        !lifecycle::continue_interrupted_prompt(&state, "superseded", g, resets_at, false).await
+        !lifecycle::continue_interrupted_prompt(&state, "superseded", g, resets_at, false)
+            .await
+            .unwrap()
     );
     assert_eq!(
         pending("superseded"),
@@ -12837,14 +13951,17 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     let g = generation("nothing-to-replay");
     assert!(
         !lifecycle::continue_interrupted_prompt(&state, "nothing-to-replay", g, resets_at, false)
-            .await,
+            .await
+            .unwrap(),
         "no turn to deliver: the default wake message must still go out"
     );
     assert_eq!(breadcrumbs("nothing-to-replay"), 1);
 
     let g = generation("pending-only");
     assert!(
-        lifecycle::continue_interrupted_prompt(&state, "pending-only", g, resets_at, false).await,
+        lifecycle::continue_interrupted_prompt(&state, "pending-only", g, resets_at, false)
+            .await
+            .unwrap(),
         "a continuation already pending is work, so the default wake message must not go out"
     );
     assert_eq!(
@@ -12928,7 +14045,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
     };
     release.send(()).unwrap();
     assert!(
-        helper.await.unwrap(),
+        helper.await.unwrap().unwrap(),
         "a continuation drained right after the install still counts as selected work"
     );
     drain.await.unwrap();

@@ -72,11 +72,15 @@ impl EventStore {
         );
         let turn_ended = first_work_seq.and_then(|work_seq| {
             exists_after(
-                "SELECT 1 FROM acp_events
+                concat!(
+                    "SELECT 1 FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND discriminant = 'Stopped'
-                 LIMIT 1",
+                   AND (discriminant = 'Stopped' OR ",
+                    native_channel_loss_sql!("event_json"),
+                    ")
+                 LIMIT 1"
+                ),
                 work_seq,
             )
         });

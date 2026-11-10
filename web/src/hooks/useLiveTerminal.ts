@@ -92,14 +92,23 @@ export function useLiveTerminal(
   const readingRef = useRef(false);
   const telemetrySeenRef = useRef(false);
   // Binary keystrokes and JSON paste messages, in send order.
-  const pendingInputRef = useRef<(Uint8Array<ArrayBuffer> | string)[]>([]);
+  const pendingInputRef = useRef<{
+    ws: WebSocket;
+    messages: (Uint8Array<ArrayBuffer> | string)[];
+  } | null>(null);
   // Hold input until the server confirms this connection owns the pane.
   const ownerKnownRef = useRef(false);
   const readOnlyRef = useRef(readOnly);
+  const inputScopeRef = useRef({ sessionId, wsPath });
+  useLayoutEffect(() => {
+    inputScopeRef.current = { sessionId, wsPath };
+    pendingInputRef.current = null;
+    ownerKnownRef.current = false;
+  }, [sessionId, wsPath]);
   useLayoutEffect(() => {
     readOnlyRef.current = readOnly;
+    if (pendingInputRef.current) pendingInputRef.current.messages = [];
     if (readOnly) {
-      pendingInputRef.current = [];
       desiredRef.current.resize = null;
     }
   }, [readOnly]);
@@ -129,13 +138,13 @@ export function useLiveTerminal(
 
   useEffect(() => {
     if (!sessionId) {
-      pendingInputRef.current = [];
+      pendingInputRef.current = null;
       ownerKnownRef.current = false;
       return;
     }
 
     wsRef.current?.close();
-    pendingInputRef.current = [];
+    pendingInputRef.current = null;
     ownerKnownRef.current = false;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
@@ -152,7 +161,8 @@ export function useLiveTerminal(
     };
 
     function connect() {
-      if (disposed) return;
+      if (disposed || inputScopeRef.current.sessionId !== sessionId || inputScopeRef.current.wsPath !== wsPath) return;
+      pendingInputRef.current = null;
       disposeInflater();
       ownerKnownRef.current = false;
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -172,17 +182,25 @@ export function useLiveTerminal(
       const ws = new WebSocket(url, protocols);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
+      pendingInputRef.current = { ws, messages: [] };
 
       const flushPendingInput = () => {
-        if (readOnlyRef.current || wsRef.current !== ws || !ownerKnownRef.current || ws.readyState !== WebSocket.OPEN)
-          return;
         const pending = pendingInputRef.current;
-        pendingInputRef.current = [];
-        for (const data of pending) ws.send(data);
+        if (
+          readOnlyRef.current ||
+          wsRef.current !== ws ||
+          pending?.ws !== ws ||
+          !ownerKnownRef.current ||
+          ws.readyState !== WebSocket.OPEN
+        )
+          return;
+        const messages = pending.messages;
+        pending.messages = [];
+        for (const data of messages) ws.send(data);
       };
 
       ws.onopen = () => {
-        if (wsRef.current !== ws) return;
+        if (wsRef.current !== ws || pendingInputRef.current?.ws !== ws) return;
         if (!readOnlyRef.current && !telemetrySeenRef.current) {
           telemetrySeenRef.current = true;
           reportTelemetrySeen("web_terminal");
@@ -211,7 +229,7 @@ export function useLiveTerminal(
       let lastSeq: number | null = null;
       let resyncPending = false;
       const handleMessageText = (text: string) => {
-        if (wsRef.current !== ws) return;
+        if (wsRef.current !== ws || pendingInputRef.current?.ws !== ws) return;
         let msg: LiveServerMessage;
         try {
           msg = JSON.parse(text) as LiveServerMessage;
@@ -221,6 +239,7 @@ export function useLiveTerminal(
         if (msg.type === "size_owner") {
           const owner = msg.is_owner;
           ownerKnownRef.current = true;
+          if (!owner) pendingInputRef.current.messages = [];
           setState((prev) =>
             prev.isOwner === owner && prev.ownerKnown ? prev : { ...prev, isOwner: owner, ownerKnown: true },
           );
@@ -298,7 +317,7 @@ export function useLiveTerminal(
       };
 
       ws.onmessage = (event: MessageEvent) => {
-        if (wsRef.current !== ws) return;
+        if (wsRef.current !== ws || pendingInputRef.current?.ws !== ws) return;
         if (typeof event.data === "string") {
           stats.wireBytes += event.data.length;
           handleMessageText(event.data);
@@ -309,9 +328,17 @@ export function useLiveTerminal(
         }
       };
 
+      ws.onerror = () => {
+        if (disposed || wsRef.current !== ws) return;
+        pendingInputRef.current = null;
+        ownerKnownRef.current = false;
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
+      };
+
       ws.onclose = (event: CloseEvent) => {
         if (disposed || wsRef.current !== ws) return;
         disposeInflater();
+        pendingInputRef.current = null;
         ownerKnownRef.current = false;
         const paneDead = event.code === CLOSE_CODE_PTY_DEAD;
         const redial = redialRef.current === ws;
@@ -377,6 +404,8 @@ export function useLiveTerminal(
     return () => {
       disposed = true;
       disposeInflater();
+      pendingInputRef.current = null;
+      ownerKnownRef.current = false;
       stopVisibility();
       stopNetwork();
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -386,6 +415,7 @@ export function useLiveTerminal(
         ws.onopen = null;
         ws.onmessage = null;
         ws.onclose = null;
+        ws.onerror = null;
         ws.close();
       }
       wsRef.current = null;
@@ -398,8 +428,11 @@ export function useLiveTerminal(
     (message: Uint8Array<ArrayBuffer> | string): boolean => {
       if (readOnlyRef.current) return false;
       const ws = wsRef.current;
+      const pending = pendingInputRef.current;
+      if (!ws || pending?.ws !== ws || (ws.readyState !== WebSocket.CONNECTING && ws.readyState !== WebSocket.OPEN))
+        return false;
       const isOwner = read().isOwner;
-      if (ownerKnownRef.current && isOwner && ws?.readyState === WebSocket.OPEN) {
+      if (ownerKnownRef.current && isOwner && ws.readyState === WebSocket.OPEN) {
         ws.send(message);
         return true;
       }
@@ -407,10 +440,9 @@ export function useLiveTerminal(
       if (ownerKnownRef.current && !isOwner) return false;
       const size = (item: Uint8Array | string) =>
         typeof item === "string" ? new TextEncoder().encode(item).byteLength : item.byteLength;
-      const pending = pendingInputRef.current;
-      const used = pending.reduce((total, item) => total + size(item), 0);
+      const used = pending.messages.reduce((total, item) => total + size(item), 0);
       if (size(message) > MAX_PENDING_INPUT_BYTES - used) return false;
-      pending.push(message);
+      pending.messages.push(message);
       return true;
     },
     [read],
@@ -482,6 +514,8 @@ export function useLiveTerminal(
   );
 
   const manualReconnect = useCallback(() => {
+    pendingInputRef.current = null;
+    ownerKnownRef.current = false;
     const ws = wsRef.current;
     if (ws && redialRef.current === ws) return;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
@@ -503,6 +537,8 @@ export function useLiveTerminal(
     setState((prev) => ({
       ...prev,
       connected: false,
+      isOwner: false,
+      ownerKnown: false,
       reconnecting: true,
       retryCount: 0,
       retryCountdown: 0,
