@@ -1788,6 +1788,11 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             })
             .await
             .expect("actual assignment reaches the status mirror before the refusal window");
+            let original_lease = state
+                .acp_supervisor
+                .current_lease(&id)
+                .expect("the original Native owns the running lease before EOF");
+            let mut completion = original_lease.test_child_wait_completed();
             let _pause = live.client.pause_drain().await;
             let row = {
                 let mut rows = state.instances.write().await;
@@ -1821,11 +1826,36 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             })
             .await
             .expect("actual Native EOF is qualified before any gesture");
+            let settled = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let result = *completion.borrow_and_update();
+                    if result.is_some() {
+                        break result;
+                    }
+                    completion
+                        .changed()
+                        .await
+                        .expect("the original Child wait publishes its outcome");
+                }
+            })
+            .await
+            .expect("the original Child wait completes before the refusal window");
+            assert_eq!(settled, Some(true), "the original Child was actually waited");
+            let registry = crate::process::worker_registry::record_path(&id).unwrap();
+            assert_eq!(
+                std::fs::read(&registry).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound,
+                "the original runner retires its record before any gesture"
+            );
+            assert!(state
+                .session_service
+                .prompt_native_unavailability(&id)
+                .await
+                .unwrap()
+                .is_some());
             let before = serde_json::to_value(&row).unwrap();
             let storage = crate::session::Storage::open_unwatched(&row.source_profile).unwrap();
             let disk_before = std::fs::read(storage.sessions_path()).unwrap();
-            let registry = crate::process::worker_registry::record_path(&id).unwrap();
-            let record_before = std::fs::read(&registry).ok();
             let methods_before = live.native.requests();
             let frontier = state.acp_event_store.highest_seq(&id);
             for diff_comments in [false, true] {
@@ -1861,7 +1891,10 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
                     before,
                 );
                 assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
-                assert_eq!(std::fs::read(&registry).ok(), record_before);
+                assert_eq!(
+                    std::fs::read(&registry).unwrap_err().kind(),
+                    std::io::ErrorKind::NotFound
+                );
                 assert_eq!(live.native.requests(), methods_before);
             }
             state
@@ -1883,7 +1916,10 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
                 before,
             );
             assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), disk_before);
-            assert_eq!(std::fs::read(&registry).ok(), record_before);
+            assert_eq!(
+                std::fs::read(&registry).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
             assert_eq!(live.native.requests(), methods_before);
             assert!(!state
                 .acp_event_store
