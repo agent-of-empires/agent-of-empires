@@ -1825,6 +1825,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         acknowledge_hooks();
 
         for restart in [false, true] {

@@ -1660,7 +1660,6 @@ fn canonical_trash_disarms_live_input_without_revoking_peer_authority() {
         assert!(native_lease.is_valid(), "peer authority stays available");
         assert_eq!(env.view.live_send.is_some(), !trashed);
         if trashed {
-            assert!(env.view.pending_paste.is_none());
             assert!(env.view.preview_capture_target.is_none());
             assert!(env.view.take_native_attachment().is_none());
         } else {

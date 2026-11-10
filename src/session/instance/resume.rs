@@ -1229,16 +1229,13 @@ mod tests {
         }
     }
 
-    /// Pins the order inside `stop_carry_and_prepare`: the launch command is
-    /// built from whether the incoming account's transcript exists, so the
-    /// carry has to have published it by then. Preparing first yields
-    /// `--session-id <sid>` on an id the agent rejects as already in use once
-    /// the carry creates the transcript (#3399, #4030).
+    /// Carry must publish the incoming transcript before launch chooses its resume flag.
     #[test]
     #[serial]
     fn carry_runs_before_the_launch_command_picks_its_resume_flag() {
         const SID: &str = "11111111-2222-3333-4444-555555555555";
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let stub = tempdir().unwrap();
         let _claude = install_fake_claude(stub.path(), "#!/bin/sh\nexit 1\n");
         let home = dirs::home_dir().expect("home");

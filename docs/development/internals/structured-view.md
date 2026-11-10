@@ -114,6 +114,8 @@ does not reinterpret unrelated Pi ACP IDs as native conversation IDs.
 Native admission takes the app-global namespace read lock before preparation
 and checks the resolved namespace before native preassignment, fork or adoption.
 The prepared launch retains that guard through spawn; Prime refresh reuses it.
+Admission resolves the same effective profile as the borrowed capture store,
+including rows without an explicit source profile.
 An unresolved namespace for a native-capable publisher fails closed before
 side-effectful preparation; ordinary shell commands are not native publishers.
 

@@ -925,10 +925,16 @@ impl Instance {
         stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
     ) -> Result<PreparedLaunch> {
-        let namespace_lock = stores.with_store(&self.source_profile, |storage| {
+        let profile = self.effective_profile();
+        let namespace_lock = stores.with_store(&profile, |storage| {
             crate::session::purge_owners::ConversationReadLock::namespace(storage.storage())
         })?;
-        self.prepare_admitted_launch_command_in(stores, expected_conversation, namespace_lock)
+        self.prepare_admitted_launch_command_in(
+            stores,
+            expected_conversation,
+            namespace_lock,
+            &profile,
+        )
     }
 
     fn prepare_admitted_launch_command_in(
@@ -936,8 +942,9 @@ impl Instance {
         stores: CaptureStorage<'_>,
         expected_conversation: ConversationState,
         namespace_lock: crate::session::purge_owners::ConversationReadLock,
+        profile: &str,
     ) -> Result<PreparedLaunch> {
-        stores.with_store(&self.source_profile, |storage| {
+        stores.with_store(profile, |storage| {
             anyhow::ensure!(
                 !crate::session::purge_owners::CleanupOwners::load_for(storage.storage())?
                     .retains_session(&self.id),
@@ -980,7 +987,7 @@ impl Instance {
             let mut handoff_prior = None;
             let (execution, unpinned) = self.resolve_launch_routing()?;
             if execution.is_some() || self.may_publish_native_conversation() {
-                stores.with_store(&self.source_profile, |storage| {
+                stores.with_store(profile, |storage| {
                     anyhow::ensure!(
                         !crate::session::purge_owners::CleanupOwners::load_for(storage.storage())?
                             .blocks_publisher(
@@ -1145,10 +1152,12 @@ impl Instance {
             );
         }
         self.absorb_published_prime_session(publication);
+        let profile = self.effective_profile();
         let mut refreshed = self.prepare_admitted_launch_command_in(
             stores,
             prepared.expected_conversation,
             prepared.namespace_lock,
+            &profile,
         )?;
         refreshed.require_conversation_publication |= prepared.require_conversation_publication;
         refreshed.expected_prior_omp_generation = prepared.expected_prior_omp_generation;
