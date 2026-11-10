@@ -3507,7 +3507,8 @@ mod tests {
         // Its controlling terminal is this private PTY, never the user's terminal.
         unsafe {
             command.pre_exec(|| {
-                if libc::setsid() == -1 || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1
+                if libc::setsid() == -1
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
                 {
                     return Err(std::io::Error::last_os_error());
                 }

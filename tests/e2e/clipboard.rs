@@ -199,7 +199,7 @@ fn app_processes_input_and_exits_while_terminal_output_stays_stalled() {
             if nix::libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) < 0 {
+            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
