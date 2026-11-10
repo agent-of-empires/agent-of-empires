@@ -2215,7 +2215,10 @@ mod tests {
         tick.run(&state).await;
         let startup = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let frame = publications.recv().await.expect("actual startup publication");
+                let frame = publications
+                    .recv()
+                    .await
+                    .expect("actual startup publication");
                 if frame.session_id == id
                     && matches!(frame.event.as_ref(), Event::AgentStartupError { .. })
                 {
@@ -2229,7 +2232,10 @@ mod tests {
             unreachable!("selected the actual startup failure");
         };
         let expected_error = crate::acp::supervisor::SupervisorError::UnknownAgent(
-            stopped.agent_name.clone().expect("the fixture selects an unknown agent"),
+            stopped
+                .agent_name
+                .clone()
+                .expect("the fixture selects an unknown agent"),
         )
         .to_string();
         assert!(
