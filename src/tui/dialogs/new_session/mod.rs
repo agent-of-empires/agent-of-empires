@@ -723,7 +723,9 @@ impl NewSessionDialog {
     }
 
     fn reset_yolo(&mut self) {
-        self.yolo_mode = self.selected_tool_always_yolo() || self.yolo_mode_default;
+        self.yolo_mode = self.yolo_mode_default
+            || (self.selected_tool_always_yolo()
+                && (self.structured_enabled || self.selected_declared_agent().is_none()));
     }
 
     /// The Yolo choice resets only when the view moves the session onto or off an
@@ -2407,7 +2409,9 @@ impl NewSessionDialog {
             },
             sandbox: self.sandbox_enabled,
             sandbox_image: self.sandbox_image.value().trim().to_string(),
-            yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),
+            yolo_mode: self.yolo_mode
+                || (self.selected_tool_always_yolo()
+                    && (self.structured_enabled || self.selected_declared_agent().is_none())),
             extra_env: if self.sandbox_enabled && self.extra_env_overridden {
                 self.extra_env.clone()
             } else {
