@@ -1840,7 +1840,11 @@ async fn native_loss_and_legacy_refusal_precede_prompt_touch_queue_or_launch() {
             })
             .await
             .expect("the original Child wait completes before the refusal window");
-            assert_eq!(settled, Some(true), "the original Child was actually waited");
+            assert_eq!(
+                settled,
+                Some(true),
+                "the original Child was actually waited"
+            );
             let registry = crate::process::worker_registry::record_path(&id).unwrap();
             assert_eq!(
                 std::fs::read(&registry).unwrap_err().kind(),
