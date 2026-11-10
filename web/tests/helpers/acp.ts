@@ -231,6 +231,7 @@ export async function openStructuredView(
   const box = composer(page);
   if (prompt !== undefined) {
     await box.fill(prompt);
+    await expect(page.getByTestId("composer-actions").getByRole("button").last()).toBeEnabled();
     await box.press("Enter");
   }
   return box;
