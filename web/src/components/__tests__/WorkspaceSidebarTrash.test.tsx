@@ -9,7 +9,7 @@
 // Vitest (accurate per-file V8) rather than Playwright, whose bundle->source
 // remap is lossy for this large file.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import { WorkspaceSidebar } from "../WorkspaceSidebar";
@@ -102,6 +102,10 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
   render(<WorkspaceSidebar {...props} />);
   return props;
 }
+
+beforeEach(() => {
+  window.localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarActiveOnly: false }));
+});
 
 afterEach(cleanup);
 
@@ -339,5 +343,42 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     const sunk = screen.getByTestId("sidebar-sunk-section");
     const projects = screen.getByTestId("sidebar-projects-section");
     expect(sunk.compareDocumentPosition(projects) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+});
+
+describe("WorkspaceSidebar activity view", () => {
+  it("does not show so many sessions when they are not active, without clearing their work", () => {
+    window.localStorage.setItem("aoe-web-settings", "{}");
+    const workspaces = [
+      workspace("working", [session({ id: "working", title: "working", status: "Running" })]),
+      workspace("waiting", [session({ id: "waiting", title: "waiting", status: "Waiting" })]),
+      workspace("failed", [session({ id: "failed", title: "failed", status: "Error" })]),
+      workspace("finished-idle", [session({ id: "finished", title: "finished-idle", status: "Idle" })]),
+      workspace("stopped-old", [session({ id: "stopped", title: "stopped-old", status: "Stopped" })]),
+      workspace("favorite-pa", [session({ id: "pa", title: "favorite-pa", status: "Idle", favorited: true })]),
+      workspace("current-draft", [session({ id: "draft", title: "current-draft", status: "Idle" })]),
+    ];
+    const groups = buildSessionGroups(workspaces, {
+      idleDecayWindowMs: 0,
+      sortMode: "lastActivity",
+      isCollapsed: () => false,
+    });
+    const stop = vi.fn();
+    const props = renderSidebar({ groups, activeId: "current-draft", onStopSession: stop });
+    for (const name of ["working", "waiting", "failed", "favorite-pa", "current-draft"])
+      expect(screen.getByText(name)).toBeTruthy();
+    expect(screen.queryByText("finished-idle")).toBeNull();
+    expect(screen.queryByText("stopped-old")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "All sessions" }));
+    expect(screen.getByText("finished-idle")).toBeTruthy();
+    expect(screen.getByText("stopped-old")).toBeTruthy();
+    expect(stop).not.toHaveBeenCalled();
+    expect(props.onDeleteSession).not.toHaveBeenCalled();
+    expect(props.onRestoreSession).not.toHaveBeenCalled();
+    cleanup();
+    renderSidebar({ groups, activeId: "current-draft" });
+    expect(screen.getByText("finished-idle")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Active sessions" }));
+    expect(screen.queryByText("finished-idle")).toBeNull();
   });
 });

@@ -69,6 +69,8 @@ See the [full features inventory](https://www.agent-of-empires.com/docs/features
 
 ## Web Dashboard
 
+The web dashboard starts with active sessions; select **All** in the sidebar to recover idle and stopped rows without changing their lifecycle. See [sidebar activity view](docs/guides/web/dashboard.md#sidebar-activity-view).
+
 Access your agents from any browser. The real agent terminal renders in the page; switch sessions, type into the terminal, and review diffs without leaving the tab. Press `R` in the TUI to start the server, or see the [web dashboard guide](https://www.agent-of-empires.com/guides/web-dashboard/) for details.
 
 ## How It Works

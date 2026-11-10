@@ -33,6 +33,8 @@ export interface WebSettings {
    *  title only, trailing badges hidden. Client-local; reclaims horizontal
    *  space on mobile/foldable without hiding the sidebar. See #2288. */
   sidebarCompact: boolean;
+  /** Show active sessions and deliberate anchors; All restores idle rows. */
+  sidebarActiveOnly: boolean;
   /** Auto-open the diff pane in newly opened sessions (#3035). Off keeps it
    *  closed by default; the activity-bar toggle still opens it on demand. */
   autoOpenDiffPane: boolean;
@@ -62,6 +64,7 @@ function getDefaults(): WebSettings {
     collapsedDiffDirs: [],
     sidebarSide: "left",
     sidebarCompact: false,
+    sidebarActiveOnly: true,
     autoOpenDiffPane: true,
     autoOpenTerminalPane: true,
     autoOpenPluginPanes: false,
@@ -86,6 +89,7 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     // localStorage is user-editable: a corrupted stringy "false" must not read
     // truthy and silently auto-open panes the user disabled.
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
+    sidebarActiveOnly: normalizeBool(settings.sidebarActiveOnly, defaults.sidebarActiveOnly),
     autoOpenDiffPane: normalizeBool(settings.autoOpenDiffPane, defaults.autoOpenDiffPane),
     autoOpenTerminalPane: normalizeBool(settings.autoOpenTerminalPane, defaults.autoOpenTerminalPane),
     autoOpenPluginPanes: normalizeBool(settings.autoOpenPluginPanes, defaults.autoOpenPluginPanes),

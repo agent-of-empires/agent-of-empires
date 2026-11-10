@@ -1,3 +1,5 @@
+import { useWebSettings } from "../hooks/useWebSettings";
+import { sessionMatchesActivity } from "../lib/sidebarActivity";
 import { useMemo } from "react";
 import type { SessionResponse } from "../lib/types";
 import { getStatusTextClass, isSessionActive } from "../lib/session";
@@ -30,6 +32,7 @@ export function Dashboard({
   canManageProjects = true,
 }: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const { settings: webSettings } = useWebSettings();
   const isWideViewport = useIsWideViewport();
   const stats = useMemo(() => {
     const projects = new Set<string>();
@@ -54,10 +57,15 @@ export function Dashboard({
   const recentSessions = useMemo(
     () =>
       sessions
-        .filter((session) => !session.trashed_at)
+        .filter(
+          (session) =>
+            !session.trashed_at &&
+            (!webSettings.sidebarActiveOnly ||
+              (!session.archived_at && !session.snoozed_until && sessionMatchesActivity(session, idleDecayWindowMs))),
+        )
         .sort((a, b) => recentSessionTimestamp(b) - recentSessionTimestamp(a) || b.id.localeCompare(a.id))
         .slice(0, 5),
-    [sessions],
+    [sessions, webSettings.sidebarActiveOnly, idleDecayWindowMs],
   );
 
   return (

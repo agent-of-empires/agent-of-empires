@@ -18,6 +18,15 @@ import { startCoverage, stopAndWriteCoverage } from "./coverageCapture";
 
 export const test = base.extend({
   page: async ({ page }, use, testInfo) => {
+    // Existing scenarios exercise their own flow with the full list. Tests of
+    // the activity selector explicitly switch to Active; defaults are covered
+    // by the sidebar component regression.
+    await page.addInitScript(() => {
+      const key = "aoe-web-settings";
+      const saved = JSON.parse(localStorage.getItem(key) || "{}");
+      if (!("sidebarActiveOnly" in saved))
+        localStorage.setItem(key, JSON.stringify({ ...saved, sidebarActiveOnly: false }));
+    });
     const started = await startCoverage(page);
     await use(page);
     await stopAndWriteCoverage(page, testInfo.titlePath.join(" > "), started);

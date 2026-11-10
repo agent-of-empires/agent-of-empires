@@ -40,6 +40,12 @@ After the theme card, an interactive walkthrough highlights the major regions (c
 
 Completing or skipping the tour records `app_state.has_seen_web_tour` on the server, so it does not relaunch on reload or on another device pointed at the same server. That flag persists in the server's `state.toml` (a sibling of `config.toml`, see [Configuration Reference](../configuration.md#statetoml)); the `GET /api/settings` JSON key is unchanged, still `app_state.has_seen_web_tour`. To replay it, open the overflow menu and choose **Show tutorial**; re-triggering adapts to where you are (dashboard regions, or composer / mode picker / send controls inside a session). It does not auto-launch on touch devices, where it is menu-only.
 
+## Sidebar activity view
+
+The sidebar starts in **Active** view. It shows working, starting, creating, waiting and error sessions, the current workspace and deliberately pinned or favorited workspaces. Fresh idle sessions follow the configured idle-decay window. Other idle, stopped and unknown rows are hidden from this view. The home screen's recent-session list follows the same choice; its total counter continues to describe retained sessions. Archived, snoozed and trashed rows keep their existing separate recovery controls.
+
+**All** shows the full live list again. The Active/All choice persists per browser, remains available in compact mode, and combines with text and plugin filters across every grouping axis. Switching the view never stops, archives, snoozes, trashes, deletes or resumes a session, changes its favorite or ownership, or navigates away from the current terminal. Reordering requires All view so hidden rows cannot be reordered accidentally.
+
 ## Sidebar sort
 
 By default the sidebar shows your manually-ordered list. Drag a row (press-and-hold) to move it; the order persists across browsers and devices via `workspace-ordering.json`. To reorder whole projects, press-and-drag the project/group header itself (there is no separate handle); this group order is per-browser (localStorage), not synced. Group drag is disabled while a filter is active or a computed sort mode is selected.

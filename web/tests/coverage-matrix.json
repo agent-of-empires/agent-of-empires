@@ -3646,6 +3646,20 @@
         "src/components/acp/Composer.pluginComposerActions.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "sidebar.active-session-visibility",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.active-session-browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/active-sessions.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/Dashboard.tsx"]
     }
   ]
 }

@@ -1,10 +1,14 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Dashboard } from "../Dashboard";
 import type { SessionResponse } from "../../lib/types";
+
+beforeEach(() => {
+  window.localStorage.setItem("aoe-web-settings", JSON.stringify({ sidebarActiveOnly: false }));
+});
 
 afterEach(cleanup);
 
@@ -70,3 +74,20 @@ describe("Dashboard mobile recent sessions", () => {
 function withinText(section: HTMLElement): string[] {
   return Array.from(section.querySelectorAll("button span.font-mono.text-sm.font-medium")).map((el) => el.textContent);
 }
+
+it("does not show finished sessions as active recent work", () => {
+  window.localStorage.setItem("aoe-web-settings", "{}");
+  const props = {
+    sessions: [
+      { ...session("working", "2026-01-07T00:00:00Z"), status: "Running" as const },
+      session("finished", "2026-01-08T00:00:00Z"),
+    ],
+    onSelectSession: vi.fn(),
+    onNewSession: vi.fn(),
+    onCloneFromUrl: vi.fn(),
+    onToggleSidebar: vi.fn(),
+  };
+  render(<Dashboard {...props} />);
+  expect(screen.getByText("Session working")).toBeTruthy();
+  expect(screen.queryByText("Session finished")).toBeNull();
+});

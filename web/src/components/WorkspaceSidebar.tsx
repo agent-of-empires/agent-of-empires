@@ -37,6 +37,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { workspaceMatchesActivity } from "../lib/sidebarActivity";
 import { usePluginUiEntries } from "../lib/pluginUiContext";
 import {
   type ActiveFacet,
@@ -3162,6 +3163,8 @@ export function WorkspaceSidebar({
   // and always sits to the left of the content.
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
+  const activeOnly = webSettings.sidebarActiveOnly;
+  const idleDecayWindowMs = useIdleDecayWindowMs();
   // Compact (slim) rail (#2288). Overrides the drag width with a fixed narrow
   // rail and drops trailing badges via SidebarCompactContext; the saved drag
   // width is left untouched so toggling off restores it.
@@ -3203,15 +3206,17 @@ export function WorkspaceSidebar({
   }, [facetSpecs, facetSelection]);
   const workspaceMatchesFacets = useCallback(
     (ws: Workspace) =>
-      activeFacets.length === 0 || ws.sessions.some((s) => sessionMatchesFacets(pluginUiEntries, s.id, activeFacets)),
-    [activeFacets, pluginUiEntries],
+      (!activeOnly || workspaceMatchesActivity(ws, activeId, idleDecayWindowMs)) &&
+      (activeFacets.length === 0 || ws.sessions.some((s) => sessionMatchesFacets(pluginUiEntries, s.id, activeFacets))),
+    [activeOnly, activeId, idleDecayWindowMs, activeFacets, pluginUiEntries],
   );
 
   // A facet filter narrows the visible rows, but handleDragEnd rebuilds order
   // from the full group list, so a drag inside a filtered subset could move
   // hidden rows and persist an order the user never saw. Gate reorder off while
   // facets are active, like the computed sort modes. See #2401.
-  const dragDisabled = !!readOnly || sortMode === "lastActivity" || pluginSortActive || activeFacets.length > 0;
+  const dragDisabled =
+    !!readOnly || activeOnly || sortMode === "lastActivity" || pluginSortActive || activeFacets.length > 0;
   // Reorder (group drag + row drag) is also off whenever any visible group
   // forbids it, which is the whole user-group axis: groups have no manual
   // order in v1. Gating here keeps the shared DndContext from firing a
@@ -3357,7 +3362,7 @@ export function WorkspaceSidebar({
   // workspace/group name; a plugin facet filter (#2401) is ANDed on top, so an
   // active facet narrows rows even with an empty text query. `hasFilter` gates
   // whether the list is filtered at all.
-  const hasFilter = !!q || activeFacets.length > 0;
+  const hasFilter = activeOnly || !!q || activeFacets.length > 0;
   const textMatches = (v: SidebarWorkspaceView, ...groupNames: string[]) =>
     !q || workspaceMatchesFilter(v.workspace, q) || groupNames.some((n) => n.toLowerCase().includes(q));
 
@@ -3848,6 +3853,25 @@ export function WorkspaceSidebar({
           </button>
         </div>
 
+        <div className={`flex gap-1 pb-2 ${compact ? "px-1 flex-col" : "px-3"}`} aria-label="Session activity view">
+          {([true, false] as const).map((onlyActive) => (
+            <button
+              key={String(onlyActive)}
+              type="button"
+              aria-label={onlyActive ? "Active sessions" : "All sessions"}
+              aria-pressed={activeOnly === onlyActive}
+              onClick={() => updateWebSettings({ sidebarActiveOnly: onlyActive })}
+              className={`flex-1 rounded-md px-2 py-1.5 text-xs cursor-pointer transition-colors ${
+                activeOnly === onlyActive
+                  ? "bg-brand-500/15 text-brand-500"
+                  : "text-text-dim hover:text-text-secondary hover:bg-surface-700/40"
+              }`}
+            >
+              {onlyActive ? "Active" : "All"}
+            </button>
+          ))}
+        </div>
+
         {filterPanelOpen && (
           <div className="px-3 pb-2">
             <input
@@ -4273,7 +4297,9 @@ export function WorkspaceSidebar({
 
           {!hasResults && hasFilter && (
             <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{activeFilterQuery}&rdquo;</p>
+              <p className="text-sm text-text-muted">
+                {q ? <>No matches for &ldquo;{activeFilterQuery}&rdquo;</> : "No active sessions"}
+              </p>
             </div>
           )}
 
