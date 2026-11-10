@@ -73,6 +73,7 @@ Launch, detection, and reply-fallback declarations for the planned API 21 are
 not accepted by this host. API 20 agent integrations remain supported. The
 staged schema rejects control and Unicode format characters in launch flags,
 instruction templates, environment values, install hints, and literal reply keys.
+Resume declarations require OMP capture in at least one pane-scoped context.
 
 For reply-enabled integrations, the provider report's `reply_keys` must contain at most eight distinct function-key names from `F1` through `F12`; the host rejects a report with more than eight keys or any duplicate. AoE sends those keys only after the user submits a response. A status-only report may omit `reply_keys` or send an empty array. Prompts are ignored unless the integration enables replies and the report supplies wake keys. Missing or invalid reports for reply-enabled integrations never fall back to terminal approval keystrokes.
 
