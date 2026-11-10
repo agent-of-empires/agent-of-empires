@@ -1505,6 +1505,9 @@ mod tests {
     }
 
     fn handoff_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
+        let root = crate::session::get_app_dir().expect("isolated app directory");
+        crate::session::purge_owners::initialize(&root).expect("handoff purge ownership");
+        crate::tmux::tool_retirement::initialize(&root).expect("handoff tool ownership");
         let event_store = handoff_test_event_store(&prior[0].id);
         crate::server::test_support::build_test_app_state_impl_with_event_store(
             prior,
@@ -1644,6 +1647,9 @@ mod tests {
     #[serial_test::serial]
     async fn disable_after_agent_switch_rebinds_the_terminal_tool() -> anyhow::Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
         })?;
@@ -1814,6 +1820,9 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
         let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })?;
@@ -2086,6 +2095,9 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
         let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })?;
@@ -2859,6 +2871,9 @@ mod tests {
             Ok(result)
         }
         let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
         crate::session::config::update_app_state(|s| s.has_acknowledged_agent_hooks = true)?;
         for owed in [
             HandoffStage::TerminalLaunchOwed,
@@ -3227,6 +3242,9 @@ mod tests {
         use crate::process::worker_registry;
         use std::time::Duration;
         let _home = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&root)?;
+        crate::tmux::tool_retirement::initialize(&root)?;
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
         })?;

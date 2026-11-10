@@ -1008,17 +1008,19 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::{tempdir, TempDir};
 
-    /// Points `HOME` (and, on Linux/macOS, `XDG_CONFIG_HOME`) at `temp`
-    /// for the current test body. See [`crate::session::test_support`]:
-    /// the snapshot/restore is `EnvGuard`'s, so a non-UTF-8 prior value
-    /// round-trips instead of being dropped (#2751).
+    /// Isolate native storage and initialize its startup ownership journals.
+    /// EnvGuard restores prior values, including non-UTF-8 values.
     fn storage_home_guard(temp: &TempDir) -> EnvGuard {
         let pairs: Vec<(&'static str, PathBuf)> = vec![
             ("HOME", temp.path().to_path_buf()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             ("XDG_CONFIG_HOME", temp.path().join(".config")),
         ];
-        EnvGuard::set(&pairs)
+        let guard = EnvGuard::set(&pairs);
+        let root = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
+        guard
     }
 
     fn seed_instance_on_disk(profile: &str, inst: &Instance) {

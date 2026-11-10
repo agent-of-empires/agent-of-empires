@@ -1497,6 +1497,11 @@ async fn retained_trash_parked_conversation_refuses_import() -> anyhow::Result<(
         let home = tempfile::tempdir()?;
         let _home = crate::session::test_support::isolate_app_dir_at(home.path());
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let _native = crate::session::test_support::install_login_shell_path_command(
+            home.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
         let claude = home.path().join("claude");
         let _env = crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &claude)]);
         crate::session::config::update_app_state(|state| {

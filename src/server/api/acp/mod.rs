@@ -270,6 +270,9 @@ mod tests {
         prior: Vec<crate::session::Instance>,
         app_dir: &std::path::Path,
     ) -> Arc<AppState> {
+        let root = crate::session::get_app_dir().expect("isolated app directory");
+        crate::session::purge_owners::initialize(&root).expect("handoff purge ownership");
+        crate::tmux::tool_retirement::initialize(&root).expect("handoff tool ownership");
         let db_path = app_dir.join(format!("acp-events-{}.db", prior[0].id));
         let event_store = Arc::new(
             crate::acp::event_store::EventStore::open(&db_path, 100).expect("event store"),
@@ -569,6 +572,9 @@ mod tests {
     #[serial_test::serial]
     async fn worker_stopping_acp_endpoints_wait_for_an_in_flight_submission() {
         let _app_dir = crate::session::test_support::isolate_app_dir();
+        let root = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&root).unwrap();
+        crate::tmux::tool_retirement::initialize(&root).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })

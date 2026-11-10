@@ -71,12 +71,14 @@ impl IsolatedHome {
         let home = setup_temp_home();
         disable_systemd_scopes(&agent_of_empires::session::get_app_dir().unwrap());
         let runtime_dir = tempfile::tempdir().unwrap();
-        Self {
+        let isolated = Self {
             _runtime: EnvRestore::set("XDG_RUNTIME_DIR", runtime_dir.path()),
             _bus: EnvRestore::set("DBUS_SESSION_BUS_ADDRESS", ""),
             _runtime_dir: runtime_dir,
             home,
-        }
+        };
+        agent_of_empires::migrations::run_migrations().expect("bootstrap isolated native storage");
+        isolated
     }
 
     fn path(&self) -> &std::path::Path {
