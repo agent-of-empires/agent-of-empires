@@ -300,6 +300,21 @@ pub fn current_schema_version() -> u32 {
     CURRENT_VERSION
 }
 
+/// Seed current ownership journals in a fresh, isolated integration fixture.
+/// Historical migrations may touch host paths outside HOME and must not run here.
+#[cfg(feature = "e2e-tests")]
+#[doc(hidden)]
+pub fn initialize_empty_test_storage() -> Result<()> {
+    let root = crate::session::get_app_dir()?;
+    anyhow::ensure!(
+        !root.join(VERSION_FILE).try_exists()?,
+        "test storage must be fresh"
+    );
+    crate::session::purge_owners::initialize(&root)?;
+    crate::tmux::tool_retirement::initialize(&root)?;
+    set_version(CURRENT_VERSION)
+}
+
 /// Check whether there are any pending migrations to run.
 pub fn has_pending_migrations() -> bool {
     get_current_version() < CURRENT_VERSION

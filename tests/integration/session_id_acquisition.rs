@@ -77,26 +77,8 @@ impl IsolatedHome {
             _runtime_dir: runtime_dir,
             home,
         };
-        let bootstrap = Command::new(env!("CARGO_BIN_EXE_aoe"))
-            .arg("migrate")
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", isolated.path())
-            .env("XDG_CONFIG_HOME", isolated.path().join(".config"))
-            .env("XDG_DATA_HOME", isolated.path().join(".local/share"))
-            .env("XDG_CACHE_HOME", isolated.path().join(".cache"))
-            .env("XDG_RUNTIME_DIR", isolated._runtime_dir.path())
-            .env("DBUS_SESSION_BUS_ADDRESS", "")
-            .env("AOE_TMUX_SOCKET", tmux_socket())
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .current_dir(isolated.path())
-            .output()
-            .expect("bootstrap isolated native storage");
-        assert!(
-            bootstrap.status.success(),
-            "isolated bootstrap failed: {}",
-            String::from_utf8_lossy(&bootstrap.stderr)
-        );
+        agent_of_empires::migrations::initialize_empty_test_storage()
+            .expect("initialize isolated native ownership");
         isolated
     }
 
