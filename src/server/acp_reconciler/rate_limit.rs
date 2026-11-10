@@ -1157,9 +1157,53 @@ mod tests {
                     let original = crate::process::worker_registry::load_strict(&id)
                         .unwrap()
                         .unwrap();
+                    let original_identity =
+                        crate::acp::runner_lifecycle::RunnerIdentity::from_record(&original);
+                    let original_birth = crate::process::process_birth_identity(original.pid)
+                        .unwrap()
+                        .expect("the original runner has a real kernel birth");
+                    assert_eq!(
+                        original_identity.birth_fingerprint,
+                        Some(original_birth.fingerprint())
+                    );
+                    let original_lease = live.state.acp_supervisor.current_lease(&id).unwrap();
+                    let original_actual = live.client.actual();
+                    let available = live
+                        .state
+                        .acp_supervisor
+                        .current_native_availability(&id)
+                        .await
+                        .expect("this supervisor owns the original installed Native client");
+                    assert_eq!(available.lease, original_lease);
+                    assert_eq!(available.owner, Some(original_identity));
+                    assert!(std::sync::Arc::ptr_eq(&available.client, &original_actual));
+                    assert!(original_actual.ensure_available().is_ok());
                     live.client = scope
                         .adopt_with(live.client, false, || async {
-                            assert!(!live.state.acp_supervisor.is_running(&id).await);
+                            assert_eq!(live.state.acp_supervisor.count().await, 0);
+                            assert!(live
+                                .state
+                                .acp_supervisor
+                                .current_native_availability(&id)
+                                .await
+                                .is_none());
+                            assert_eq!(
+                                live.state.acp_supervisor.current_lease(&id).as_ref(),
+                                Some(&original_lease)
+                            );
+                            assert!(original_actual.ensure_available().is_err());
+                            let retained = crate::process::worker_registry::load_strict(&id)
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(
+                                crate::acp::runner_lifecycle::RunnerIdentity::from_record(&retained),
+                                original_identity
+                            );
+                            assert!(crate::process::process_birth_is_live(
+                                original.pid,
+                                &original_birth
+                            )
+                            .unwrap());
                             assert!(
                                 crate::process::worker_registry::retained_process_may_be_alive(
                                     &original
@@ -1197,8 +1241,22 @@ mod tests {
                                     matches!(result, Err(SupervisorError::NativeStoreUnavailable)),
                                     "{result:?}"
                                 );
-                                assert!(!live.state.acp_supervisor.is_running(&id).await,
-                        "failed durable publication must precede any worker installation");
+                                assert_eq!(
+                                    live.state.acp_supervisor.count().await,
+                                    0,
+                                    "failed durable publication must precede any worker installation"
+                                );
+                                assert!(live
+                                    .state
+                                    .acp_supervisor
+                                    .current_native_availability(&id)
+                                    .await
+                                    .is_none());
+                                assert_eq!(
+                                    live.state.acp_supervisor.current_lease(&id).as_ref(),
+                                    Some(&original_lease)
+                                );
+                                assert!(original_actual.ensure_available().is_err());
                                 assert_eq!(
                                     live.state
                                         .instances
@@ -1252,7 +1310,17 @@ mod tests {
                                 let retained = crate::process::worker_registry::load_strict(&id)
                                     .unwrap()
                                     .unwrap();
-                                assert_eq!(retained.pid, original.pid);
+                                assert_eq!(
+                                    crate::acp::runner_lifecycle::RunnerIdentity::from_record(
+                                        &retained
+                                    ),
+                                    original_identity
+                                );
+                                assert!(crate::process::process_birth_is_live(
+                                    original.pid,
+                                    &original_birth
+                                )
+                                .unwrap());
                                 assert!(
                                     crate::process::worker_registry::retained_process_may_be_alive(
                                         &retained
