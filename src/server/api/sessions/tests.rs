@@ -1619,13 +1619,7 @@ async fn retained_trash_parked_conversation_refuses_import() -> anyhow::Result<(
         )
         .await?;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-        assert!(
-            response["message"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("already owned"),
-            "{response}"
-        );
+        assert_eq!(response["error"], "create_failed", "{response}");
         assert!(
             storage.load()?.is_empty(),
             "import must not publish a claimant"
