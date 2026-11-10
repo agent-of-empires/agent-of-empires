@@ -201,20 +201,21 @@ pub async fn ensure_session(
 
 pub(super) fn physical_agent_target(
     instance: &Instance,
-) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>)>> {
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>, bool)>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
         crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
     else {
         return Ok(None);
     };
-    if !instance.pane_is_ready(pane)? {
+    if pane.pane_dead {
         return Ok(None);
     }
+    let ready = instance.pane_is_ready(pane)?;
     let physical = pane
         .physical_observation()
         .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
-    Ok(Some((name.to_owned(), physical)))
+    Ok(Some((name.to_owned(), physical, ready)))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -319,7 +320,9 @@ pub(super) async fn agent_target_response(
         );
         anyhow::ensure!(!instance.is_structured(), AgentTargetUnavailable);
         native.configuration(Some(&instance.source_profile))?;
-        let (name, physical) = physical_agent_target(&instance)?.ok_or(AgentTargetUnavailable)?;
+        let (name, physical, _) = physical_agent_target(&instance)?
+            .filter(|(_, _, ready)| *ready)
+            .ok_or(AgentTargetUnavailable)?;
         native.adopt_agent_observation(
             &instance,
             crate::session::PaneObservation {

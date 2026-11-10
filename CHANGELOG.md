@@ -14,6 +14,7 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **session:** Publish daemon capture commits through the canonical store before releasing Capture ownership; retain the existing global fail-closed metadata-health policy when a profile cannot open.
 - **session:** Accept unchanged preexisting dead panes in a complete handoff inventory, including tmux's empty dead-pane PID, while retaining strict structural IDs, socket, server, PID, and live-birth fencing.
 - **acp:** Decline idle retirement while a worker's lifecycle or activity publication is busy, without waiting on store I/O or clearing its captured lease and restart intent.
+- **session:** Capture fresh terminal input from the canonical native row before queuing, preserving the original physical owner when a completed CLI start leads the daemon cache; keep registered readiness checks before delivery.
 
 ### Security
 
