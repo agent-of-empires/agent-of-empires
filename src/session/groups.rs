@@ -598,23 +598,15 @@ fn last_activity_group_key(
     (ts.is_none(), Reverse(ts))
 }
 
-/// Priority tier for the Attention sort.
+/// Priority tier for the Attention sort. The per-status ranks live on
+/// [`crate::session::Status::attention_tier`].
 fn attention_tier(inst: &Instance) -> u8 {
-    use crate::session::Status::*;
     if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() || inst.pane_dead_observed {
         // Tier 99 sinks: archived and snoozed (snoozed = temporary archive, wakes automatically
         // when timer expires).
         return 99;
     }
-    match inst.status {
-        Waiting => 0,                        // agent paused, needs human input, TOP priority
-        Error => 1,                          // broken, needs attention
-        Idle => 2,                           // turn complete, ready for next prompt
-        Unknown => 3,                        // status undetermined, glance warranted
-        Running => 4,                        // actively working, leave alone
-        Stopped => 5, // dormant, sinks below running so the TUI shows live sessions first
-        Starting | Creating | Deleting => 6, // transient, sink to bottom
-    }
+    inst.status.attention_tier()
 }
 
 /// Attention bucket rank with the unread promoter folded in.

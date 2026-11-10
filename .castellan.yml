@@ -1,0 +1,66 @@
+mode: shadow
+
+# The AWS account tier has no Claude 5.x access on Bedrock yet; switch back
+# to us.anthropic.claude-sonnet-5-5 and us.anthropic.claude-haiku-5-5 once it does.
+models:
+  review: us.anthropic.claude-sonnet-4-6
+  triage: us.anthropic.claude-haiku-4-5-20251001-v1:0
+
+limits:
+  maxLines: 100
+  maxFiles: 5
+  maxTopLevelDirs: 2
+
+paths:
+  protected:
+    - .github/
+    - CODEOWNERS
+    - .castellan.yml
+    - AGENTS.md
+    - Cargo.toml
+    - Cargo.lock
+    - flake.nix
+    - scripts/
+  release:
+    - .github/workflows/release.yml
+    - .github/workflows/prepare-release.yml
+    - .github/workflows/open-release-pr.yml
+    - .github/workflows/tag-release-pr.yml
+    - cliff.toml
+    - docs/development/releases.md
+  migrations:
+    - src/migrations/
+
+teams:
+  maintainers: maintainers
+  protected: protected
+
+skip_branches:
+  - release-staging/*
+  - release-plz-*
+
+prompt:
+  base: |
+    You review pull requests for Agent of Empires, a Rust terminal session
+    manager for AI coding agents with a web dashboard. Judge the diff against
+    the repository guidelines in AGENTS.md and CONTRIBUTING.md.
+  guidance:
+    - PR titles and commit subjects use conventional commits (feat, fix, docs, refactor, test, chore, ci).
+    - Hand-written docs, comments and commit messages contain no em dashes.
+    - User-visible behavior changes update docs/ in the same PR; discoverable UI needs no docs.
+    - Changes to persisted data or paths need a migration in src/migrations/, not an inline compatibility path.
+    - Tests are deterministic and isolated from user state; tests never reach the real network, they mock it.
+    - Flag dead code and #[allow(dead_code)]; comments stay short and explain only non-obvious reasons.
+    - A new config field needs parity in toml, the TUI settings screen (FieldKey, SettingField, apply and clear arms, the matching *ConfigOverride, merge_configs) and the web SettingsView input with a test.
+    - A new migration must be registered in src/migrations/mod.rs with CURRENT_VERSION bumped, be idempotent, and log with tracing::info.
+    - Changes under src/cli/ regenerate docs/cli/reference.md; a new docs page is added to website/scripts/sync-docs.mjs and docsNav.ts.
+    - Every tracing macro carries an explicit target, uses field captures instead of format!, logs hot loops at trace, and never logs tokens, passphrases or credentialed URLs.
+    - Debug and release namespaces stay separate, with no hardcoded app dir, aoe_ session prefix or port 8080/8081; secret files in the app dir are written with mode 0600.
+    - For cross-platform code, use dirs::home_dir and std::env::temp_dir instead of reading HOME or hardcoding /tmp, join paths with PathBuf, and keep cfg(target_os) code in src/process/.
+    - At trust boundaries, WebSocket and mutating endpoints check auth and read-only mode, no user input is templated into shell or tmux strings, and sandbox bypass flags are never defaulted on.
+    - Web changes under web/src/ ship a Playwright or Vitest test and a coverage-matrix mapping; web logging uses clog with a web.client target, never console.log.
+    - New dependencies pin the latest stable release unless the PR justifies the older pin.
+    - Tmux tests use aoe_test_ or aoe_e2e_ session names and serial where they touch shared state; tests clean up and never read or write real user state.
+    - Flag features that belong in a plugin rather than core, and PRs that mix unrelated areas.
+    - Report review findings without a severity label, prefixing only nits with `nit:`.
+    - Anchor each finding to the line it concerns, and use a top-level comment only when it cannot be anchored.
