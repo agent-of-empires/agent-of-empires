@@ -403,3 +403,55 @@ async fn effort_id_is_re_read_from_the_model_switch_response() {
         "model must be applied before the effort (recorded: {recorded:?})"
     );
 }
+
+/// Fast mode and Ultracode picks are re-sent after the model and effort, and an
+/// option the model does not advertise (`ultracode` off `opus`) is skipped.
+#[tokio::test]
+#[serial_test::parallel]
+async fn model_config_picks_reapplied_after_model_and_effort() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    // (model, expected record lines in order)
+    let cases = [
+        (
+            "opus",
+            vec![
+                "model=opus",
+                "thought_level=high",
+                "fast=on",
+                "ultracode=on",
+            ],
+        ),
+        (
+            "sonnet",
+            vec!["model=sonnet", "thought_level=high", "fast=on"],
+        ),
+    ];
+    for (model, expected) in cases {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_path = temp.path().join("config-option-calls.log");
+        let mut env = shim_env(&record_path, true, true);
+        env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+        let mut config = spawn_config(
+            shim_path(),
+            env,
+            Some("stored-model-config-session".into()),
+            Some(model.into()),
+            Some("high".into()),
+        );
+        config.default_model_config = [("fast", "on"), ("ultracode", "on")]
+            .into_iter()
+            .map(|(id, value)| (id.to_string(), value.to_string()))
+            .collect();
+        run(config, "model-config").await;
+
+        let recorded = std::fs::read_to_string(&record_path).expect("record file");
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            expected,
+            "{model}: recorded {recorded:?}"
+        );
+    }
+}
