@@ -3185,9 +3185,9 @@ mod tests {
             );
             assert!(
                 events
-                    .replay_from(&source.id, 0)
+                    .replay_from(&source.id, 0)?
                     .iter()
-                    .any(|(seq, _)| *seq == sentinel),
+                    .any(|stored| stored.seq == sentinel),
                 "recovery without a physical receipt must retain the projection"
             );
             assert_eq!(
@@ -3354,9 +3354,9 @@ mod tests {
             assert!(matches!(renewed.context, HandoffContext::Discard));
             assert!(renewed.launch.as_ref().unwrap().receipt.is_none());
             assert!(events
-                .replay_from(&source.id, 0)
+                .replay_from(&source.id, 0)?
                 .iter()
-                .any(|(seq, _)| *seq == sentinel));
+                .any(|stored| stored.seq == sentinel));
             let response = terminal_handoff_request(state.clone(), source.id.clone()).await;
             assert_eq!(response.status(), StatusCode::OK);
             let completed = storage
@@ -3390,7 +3390,7 @@ mod tests {
                 "a repeated request must retain the actual new physical owner"
             );
             assert!(crate::process::process_birth_is_live(new_pid, &new_birth)?);
-            assert!(events.replay_from(&source.id, 0).is_empty());
+            assert!(events.replay_from(&source.id, 0)?.is_empty());
             assert_eq!(
                 crate::tmux::test_helpers::only_pane_id(peer.name()),
                 peer_pane
