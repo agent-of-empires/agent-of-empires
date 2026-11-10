@@ -32,7 +32,8 @@ import {
   makeRowFilter,
   renderedOrder,
   sunkViews,
-  uniqueWorkspaces,
+  visibleOrgRepos,
+  visibleSubgroups,
 } from "./sidebar/filterGroups";
 import { FlatGroupList, NestedGroupList, OrgGroupList, type ListContext } from "./sidebar/GroupLists";
 import { SessionRow } from "./sidebar/SessionRow";
@@ -106,7 +107,17 @@ interface Props {
 }
 
 export function WorkspaceSidebar(props: Props) {
-  const { groups, nestedGroups, orgGroups, trashedWorkspaces = [], activeId, open, readOnly, axis } = props;
+  const {
+    groups,
+    nestedGroups,
+    orgGroups,
+    trashedWorkspaces = [],
+    activeId,
+    activeSessionId,
+    open,
+    readOnly,
+    axis,
+  } = props;
   const { settings: webSettings, update: updateWebSettings } = useWebSettings();
   const rightSide = webSettings.sidebarSide === "right";
   const compact = webSettings.sidebarCompact;
@@ -150,27 +161,55 @@ export function WorkspaceSidebar(props: Props) {
   const isNested = axis === "repo+group";
   const isOrgAxis = axis === "org";
 
-  const allWorkspaces = useMemo(() => uniqueWorkspaces(groups), [groups]);
   // An expanded sibling keeps its own optimistic override, which has to reconcile against its one session,
-  // also after its siblings are gone. `allWorkspaces` keeps one slice per id, so the records come from every
-  // slice of every axis.
+  // also after its siblings are gone. The status axis repeats a workspace per bucket, so the records come
+  // from every slice of every axis plus their session children.
   const triageWorkspaces = useMemo(() => {
     const slices = [groups, ...nestedGroups.map((n) => n.subgroups), ...orgGroups.map((o) => o.repos)]
       .flat()
       .flatMap((g) => g.workspaces.map((v) => v.workspace));
-    return [...allWorkspaces, ...sessionWorkspaces(slices)];
-  }, [allWorkspaces, groups, nestedGroups, orgGroups]);
+    return [...slices, ...sessionWorkspaces(slices)];
+  }, [groups, nestedGroups, orgGroups]);
   const triage = useSidebarTriage(triageWorkspaces);
-  const orderedIds = useMemo(
-    () => renderedOrder(filteredGroups, hasFilter, sunkExpanded),
-    [filteredGroups, hasFilter, sunkExpanded],
-  );
+  // Rows, not workspaces: the status axis renders a workspace once per bucket, and each row's
+  // actions belong to its own session. Filtering keeps the selection, so ranges use `filtered`.
+  const [orderedIds, rows] = useMemo(() => {
+    const filteredAll = isNested
+      ? filteredNested.flatMap((ng) => ng.subgroups)
+      : isOrgAxis
+        ? filteredOrgGroups.flatMap((og) => og.repos)
+        : filteredGroups;
+    // A collapsed repo or org hides its children, so a range must skip the rows it hides.
+    const rendered = isNested
+      ? visibleSubgroups(filteredNested, hasFilter)
+      : isOrgAxis
+        ? visibleOrgRepos(filteredOrgGroups, hasFilter)
+        : filteredGroups;
+    const every = isNested
+      ? nestedGroups.flatMap((ng) => ng.subgroups)
+      : isOrgAxis
+        ? orgGroups.flatMap((og) => og.repos)
+        : groups;
+    return [renderedOrder(rendered, hasFilter, sunkExpanded, filteredAll), every.flatMap((g) => g.workspaces)] as const;
+  }, [
+    isNested,
+    isOrgAxis,
+    groups,
+    nestedGroups,
+    orgGroups,
+    filteredGroups,
+    filteredNested,
+    filteredOrgGroups,
+    hasFilter,
+    sunkExpanded,
+  ]);
   const selection = useSidebarSelection({
-    allWorkspaces,
+    rows,
     orderedIds,
     triage,
     readOnly,
     activeId,
+    activeSessionId,
     onSelect: props.onSelect,
   });
   const { onBulkArchive } = selection;
@@ -192,6 +231,7 @@ export function WorkspaceSidebar(props: Props) {
     readOnly,
     offline,
     displayedActiveId: selection.displayedActiveId,
+    displayedActiveSessionId: selection.displayedActiveSessionId,
     onNew: props.onNew,
     onCreateSession: props.onCreateSession,
     onUpdateAppearance: props.onUpdateRepoAppearance,
@@ -200,12 +240,16 @@ export function WorkspaceSidebar(props: Props) {
     onEditProjectSettings: props.onEditProjectSettings,
     onArchiveGroup,
     rowProps: (v: SidebarWorkspaceView) => ({
+      rowKey: v.key,
       workspace: v.workspace,
       observedById: props.observedById,
       runtimeEpoch: props.runtimeEpoch,
       onSessionMutation: props.onSessionMutation,
-      isActive: v.workspace.id === selection.displayedActiveId,
-      isSelected: selection.isSelected(v.workspace.id),
+      isActive:
+        v.workspace.id === selection.displayedActiveId &&
+        (selection.displayedActiveSessionId == null ||
+          v.workspace.sessions.some((s) => s.id === selection.displayedActiveSessionId)),
+      isSelected: selection.isSelected(v.key),
       onActivate: selection.handleRowActivate,
       ...(v.workspace.sessions.length > 1 && {
         activeSessionId: props.activeSessionId,
@@ -217,7 +261,7 @@ export function WorkspaceSidebar(props: Props) {
       onRestartForUpdate: props.onRestartForUpdate,
       onSwitchView: props.onSwitchView,
       readOnly,
-      optimistic: triage.optimisticFor(v.workspace.id),
+      optimistic: triage.optimisticFor(v.workspace),
       onPinToggle: triage.pinToggle,
       onArchiveToggle: triage.archiveToggle,
       onSnooze: triage.snooze,

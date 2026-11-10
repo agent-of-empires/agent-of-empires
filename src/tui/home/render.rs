@@ -47,6 +47,7 @@ fn compose_list_title(
     match group_by {
         GroupByMode::Project => suffix.push_str(" · project"),
         GroupByMode::Org => suffix.push_str(" · org"),
+        GroupByMode::Status => suffix.push_str(" · status"),
         GroupByMode::Manual => {}
     }
     if sort_order != SortOrder::default() {

@@ -3021,3 +3021,115 @@ fn tui_send_refuses_a_shelved_live_pane() {
 // side, which owns the archive write: `sessions::tests::archive_persists_under_the_lifecycle_lock`
 // and `sessions::tests::group_archive_gates_each_member_on_its_own_lifecycle_lock`
 // (`src/server/api/sessions/tests.rs`).
+
+/// Status grouping (#4867): headers keep the fixed attention order under any sort,
+/// bulk archive scopes to the selected status, and collapse persists per status.
+#[test]
+#[serial]
+fn status_grouping_orders_headers_and_persists_collapse() {
+    use crate::session::config::{AppStateConfig, GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut idle = Instance::new("idle", "/tmp/idle");
+    idle.status = Status::Idle;
+    let mut waiting = Instance::new("waiting", "/tmp/waiting");
+    waiting.status = Status::Waiting;
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let instances = vec![idle, waiting, running];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Status;
+    // The status order is fixed, so a timestamp sort must not reorder the headers.
+    view.sort_order = SortOrder::Newest;
+    view.flat_items = view.build_flat_items();
+
+    let layout: Vec<String> = view
+        .flat_items
+        .iter()
+        .map(|item| match item {
+            Item::Group { name, .. } => format!("group:{name}"),
+            Item::Session { id, .. } => format!(
+                "session:{}",
+                view.get_instance(id)
+                    .map_or("?", |inst| inst.title.as_str())
+            ),
+        })
+        .collect();
+    assert_eq!(
+        layout,
+        [
+            "group:Waiting",
+            "session:waiting",
+            "group:Idle",
+            "session:idle",
+            "group:Running",
+            "session:running",
+        ]
+    );
+
+    let waiting_id = view
+        .instances()
+        .find(|i| i.title == "waiting")
+        .map(|i| i.id.clone())
+        .expect("waiting instance");
+    view.selected_group = Some("Waiting".to_string());
+    assert_eq!(view.active_sessions_in_selected_group(), vec![waiting_id]);
+
+    view.status_group_collapsed
+        .insert("Waiting".to_string(), true);
+    view.flat_items = view.build_flat_items();
+    assert!(
+        view.flat_items.iter().any(|item| matches!(
+            item,
+            Item::Group {
+                name,
+                collapsed: true,
+                ..
+            } if name == "Waiting"
+        )),
+        "the Waiting header must render collapsed"
+    );
+    let session_rows = view
+        .flat_items
+        .iter()
+        .filter(|item| matches!(item, Item::Session { .. }))
+        .count();
+    assert_eq!(
+        session_rows, 2,
+        "only the Waiting row is hidden, got {:?}",
+        view.flat_items
+    );
+
+    view.save_status_group_collapsed();
+    let state = AppStateConfig::load().unwrap();
+    assert_eq!(state.status_group_collapsed, vec!["Waiting".to_string()]);
+
+    let fresh = HomeView::new_for_test(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.status_group_collapsed.get("Waiting"),
+        Some(&true),
+        "a relaunched HomeView should restore the collapsed Waiting group"
+    );
+}
