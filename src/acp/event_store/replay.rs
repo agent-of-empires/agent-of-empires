@@ -56,7 +56,15 @@ impl EventStore {
         let reader = self.reader();
         let Ok(snapshot) = reader.unchecked_transaction() else {
             warn!(target: "acp.event_store", "replay snapshot unavailable for {session_id}");
-            let events = self.page_on_connection(&reader, session_id, SeqBound::After(since), Order::Asc, None).events;
+            let events = self
+                .page_on_connection(
+                    &reader,
+                    session_id,
+                    SeqBound::After(since),
+                    Order::Asc,
+                    None,
+                )
+                .events;
             let mut last = since;
             for (seq, event) in events {
                 last = seq;
@@ -222,12 +230,16 @@ impl EventStore {
         limit: Option<usize>,
     ) -> ReplayPage {
         let conn = self.reader();
-        let snapshot = conn.unchecked_transaction().ok();
+        let snapshot = conn
+            .unchecked_transaction()
+            .map_err(|e| warn!(target: "acp.event_store", "replay snapshot for {session_id}: {e}"))
+            .ok();
         let page = self.page_on_connection(&conn, session_id, bound, order, limit);
         drop(snapshot);
         page
     }
 
+    /// Decode one page from the caller's read snapshot.
     fn page_on_connection(
         &self,
         conn: &rusqlite::Connection,
