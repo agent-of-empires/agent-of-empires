@@ -2490,6 +2490,12 @@ const TERMINAL_INITIAL_TURN_READY_BUDGET: std::time::Duration = std::time::Durat
 /// bare shell) and its prompt is showing. Stable output alone is never enough:
 /// a shell prompt or a failed launch is stable too.
 fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> anyhow::Result<()> {
+    // A shell or custom command has no agent readiness signal; typing the
+    // prompt there would run it as a command.
+    anyhow::ensure!(
+        !instance.expects_shell() && !instance.has_command_override(),
+        "initial prompts are only typed into a known agent"
+    );
     let deadline = std::time::Instant::now() + budget;
     while crate::server::api::sessions::ready_agent_session(instance)?.is_none() {
         anyhow::ensure!(
@@ -2889,6 +2895,16 @@ mod tests {
             payload_hash: payload_hash.to_string(),
         });
         inst
+    }
+
+    #[test]
+    fn initial_prompt_is_never_typed_into_a_shell_or_custom_command() {
+        for command in ["bash", "my-wrapper --flag"] {
+            let mut inst = Instance::new("t", "/tmp/aoe-shell-prompt");
+            inst.command = command.to_string();
+            let err = wait_for_terminal_agent(&inst, std::time::Duration::ZERO).unwrap_err();
+            assert!(err.to_string().contains("known agent"), "{command}: {err}");
+        }
     }
 
     fn test_spec() -> StructuredSessionSpec {
