@@ -104,6 +104,7 @@ impl HomeView {
         self.host_tab_title = config.session.host_tab_title;
         self.row_tag_mode = config.session.row_tag;
         self.show_activity_age = config.session.show_activity_age;
+        self.show_structured_badge = config.session.show_structured_badge;
         self.set_sidebar_position(config.session.sidebar_position);
         self.split_terminal_height_percent = config.session.split_terminal_height_percent;
         self.split_terminal_min_width = config.session.split_terminal_min_width;

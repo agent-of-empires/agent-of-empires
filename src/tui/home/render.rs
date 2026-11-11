@@ -2147,15 +2147,14 @@ impl HomeView {
                 )
             });
 
+        let show_structured = inst.is_structured() && self.show_structured_badge;
         let badge_text: Option<&'static str> =
-            if inst.is_structured() && self.view_mode != ViewMode::Terminal {
-                Some(" [structured]")
-            } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
+            if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
                 Some(match self.get_terminal_mode(id) {
                     TerminalMode::Container => " [container]",
                     TerminalMode::Host => " [host]",
                 })
-            } else if inst.is_structured() {
+            } else if show_structured {
                 Some(" [structured]")
             } else {
                 None

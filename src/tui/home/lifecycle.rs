@@ -104,6 +104,7 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             show_activity_age: resolved.session.show_activity_age,
+            show_structured_badge: resolved.session.show_structured_badge,
             sidebar_position: resolved.session.sidebar_position,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
