@@ -1329,6 +1329,18 @@ mod tests {
         }
     }
 
+    /// A replayed `Monitor` or background-command launch re-arms nothing: it
+    /// would read as a live watch after every respawn.
+    #[test]
+    fn load_replay_drops_a_monitor_arm() {
+        let armed = Event::MonitorArmed { description: None };
+        assert!(
+            is_transcript_event(&armed),
+            "{}",
+            transcript_event_kind(&armed)
+        );
+    }
+
     #[test]
     fn tool_call_update_mapping() {
         let events = claude(tool_update("tc-1", completed("abc1234 first commit")));

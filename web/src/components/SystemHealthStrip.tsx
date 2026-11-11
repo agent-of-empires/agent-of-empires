@@ -22,7 +22,7 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** The sidebar footer strip, gated on the same "Show system health strip"
+/** The sidebar footer strip, gated on the same "System health strip"
  *  setting as the TUI's. Renders and polls nothing while the setting is off. */
 export function SidebarSystemHealth() {
   const enabled = useSystemHealthEnabled();

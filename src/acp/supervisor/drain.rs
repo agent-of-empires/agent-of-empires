@@ -17,9 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, publish_with_next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap,
-    SharedSet, Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
-    RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, publish_next_persisted, publish_with_next_seq, BroadcastSink, Launcher,
+    PendingContextReset, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -112,9 +112,12 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
-            self.sink.publish(&self.session_id, seq, &event)
-        });
+        publish_next_persisted(
+            self.sink.as_ref(),
+            &self.next_seqs,
+            &self.session_id,
+            &event,
+        );
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
@@ -170,6 +173,11 @@ impl<S: BroadcastSink> Drain<S> {
         let mut end = StreamEnd::default();
         let mut established = false;
         while let Some(event) = inbound.recv().await {
+            // A runner stopped on purpose closes its connection with an error that is no
+            // failure: not published, and not a startup failure before the session is assigned.
+            if matches!(event, Event::AgentStartupError { .. }) && self.restart_intended() {
+                continue;
+            }
             match &event {
                 Event::Stopped { reason } => match reason.as_str() {
                     "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
@@ -286,6 +294,19 @@ impl<S: BroadcastSink> Drain<S> {
             });
         }
         end
+    }
+
+    /// Whether a restart is pending for the runner on record. A marker naming another
+    /// generation belongs to a different runner, so a replacement's genuine error passes.
+    fn restart_intended(&self) -> bool {
+        let Some(marker) = worker_registry::peek_restart_marker(&self.session_id) else {
+            return false;
+        };
+        let generation = worker_registry::load(&self.session_id)
+            .ok()
+            .flatten()
+            .map_or(0, |record| record.generation);
+        marker == generation
     }
 
     fn clear_pending_context_reset(&self) -> bool {
@@ -1310,6 +1331,68 @@ mod tests {
         }
     }
 
+    /// A runner stopped on purpose closes its connection with an error that is
+    /// not a startup failure, before or after the session is assigned. A marker
+    /// naming another generation belongs to a different runner, so its error passes.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_deliberate_restart_publishes_no_startup_error() {
+        // (name, session assigned first, marker generation, error is a deliberate close)
+        let cases = [
+            ("after assignment", true, 4, true),
+            ("before assignment", false, 4, true),
+            ("marker for another runner", false, 3, false),
+        ];
+        for (name, assigned, marker, deliberate) in cases {
+            let (_home, tmp) = isolate_home();
+            let id = "s-deliberate";
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            worker_registry::save(
+                &worker_record(id, std::process::id(), tmp.path().join("attach.sock"))
+                    .with_generation(4),
+            )
+            .unwrap();
+            worker_registry::mark_restart_pending(id, marker);
+            let (client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
+                crate::acp::state::AcpSessionId(id.into()),
+            );
+            let lease = sup
+                .test_install_handle(id, client, WorkerKind::Attached, None)
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
+            let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+            if assigned {
+                inbound_tx
+                    .send(Event::AcpSessionAssigned {
+                        acp_session_id: "acp-1".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            inbound_tx
+                .send(Event::AgentStartupError {
+                    message: "ACP connection failed: agent transport closed".into(),
+                })
+                .await
+                .unwrap();
+            drop(inbound_tx);
+            tokio::time::timeout(Duration::from_secs(2), drain)
+                .await
+                .expect("drain task should exit within 2s of inbound close")
+                .unwrap();
+
+            let published = sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. }))
+                .count();
+            assert_eq!(published, usize::from(!deliberate), "{name}: published");
+        }
+    }
+
     /// A worker that goes away with no respawn behind it takes its
     /// background-agent tailers with it, so the drain's terminal arms must
     /// detach whatever the log still shows running: otherwise the panel keeps
@@ -1441,6 +1524,48 @@ mod tests {
                 .count();
             assert_eq!(crash_messages, usize::from(expect_crash_message), "{id}");
         }
+    }
+
+    /// A runner drops its control channel when a frame write takes over 2 s,
+    /// so a stalled save must not stop the drain reading the next frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_event_save_does_not_stop_the_drain_reading_frames() {
+        let (sink, store, _rx, tmp) = channel_sink();
+        let sup = Supervisor::new(Arc::clone(&sink));
+        let id = "s-stalled-save";
+        let lease = sup.test_install_stdio(id).await;
+        let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(64);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let frames = 256;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..frames {
+                inbound_tx.send(Event::ThinkingStarted).await.unwrap();
+            }
+        })
+        .await;
+        blocker.execute_batch("COMMIT").unwrap();
+        sent.expect("the drain must keep reading frames while a save is stalled");
+
+        // Closing the stream lets the drain take every frame before the flush.
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must end once its stream closes")
+            .unwrap();
+        sink.flush();
+        let stored: Vec<u64> = store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, event)| matches!(event, Event::ThinkingStarted))
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(
+            stored,
+            (1..=frames).collect::<Vec<u64>>(),
+            "every frame is stored once, in order"
+        );
     }
 
     #[tokio::test]

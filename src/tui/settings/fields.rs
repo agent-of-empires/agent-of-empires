@@ -904,7 +904,7 @@ fn build_host_environment_row(ctx: &BuildCtx) -> SettingField {
              (passthrough from host), KEY=$$literal (escape a leading $), or bare KEY \
              (passthrough). All forms resolve to a literal `KEY=value` arg in the spawned \
              process, visible in `ps`; for secrets you want hidden from argv, configure \
-             Sandbox > Sandbox Environment instead. Profile value replaces the global list."
+             Sandbox > Environment variables instead. Profile value replaces the global list."
             .to_string(),
         value,
         category: SettingsCategory::Session,

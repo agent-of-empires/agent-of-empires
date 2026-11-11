@@ -30,7 +30,7 @@ use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
     WorkerStart,
 };
-use super::state::AcpSessionId;
+use super::state::{AcpSessionId, Event};
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{RetirementResources, RetirementTarget};
@@ -39,7 +39,7 @@ pub(crate) use agents::{
     apply_agent_command_override, command_override_for_spawn, Classified, SessionAgent,
 };
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
-pub use sink::{BroadcastSink, ChannelSink};
+pub use sink::{BroadcastSink, ChannelSink, Persisted};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
 const MAX_RESPAWNS_IN_WINDOW: u32 = 3;
@@ -115,6 +115,9 @@ pub enum SupervisorError {
     SessionGone(String),
     #[error("native session authority unavailable")]
     NativeStoreUnavailable,
+    /// The event log could not say whether a turn is open; the caller retries.
+    #[error("session {0:?} event log is unavailable")]
+    EventStoreUnavailable(String),
 }
 
 /// What the caller does with prompt text after it was published.
@@ -888,6 +891,21 @@ fn publish_with_next_seq<R>(
         *last = last.saturating_add(1);
         publish(*last)
     })
+}
+
+/// Queue `event` under the session's counter lock and wait for the store after
+/// releasing it, so a slow save does not hold up the worker drain on that lock.
+/// Returns the seq and whether the event was stored.
+fn publish_next_persisted<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    event: &Event,
+) -> (u64, bool) {
+    let (seq, persisted) = publish_with_next_seq(next_seqs, session_id, |seq| {
+        (seq, sink.queue_persisted(session_id, seq, event))
+    });
+    (seq, persisted.wait())
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
