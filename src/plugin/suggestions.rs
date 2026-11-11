@@ -60,7 +60,48 @@ pub(crate) fn providers() -> Vec<Provider> {
         .collect()
 }
 
+const SCHEMA_VERSION: i64 = 1;
+
+/// Every suggestion table, including the legacy `suggestion_policy`, dropped
+/// when the recorded schema version differs.
+const TABLES: [&str; 12] = [
+    "suggestion_providers",
+    "suggestion_items",
+    "suggestion_sources",
+    "suggestion_dismissals",
+    "suggestion_templates",
+    "suggestion_mappings",
+    "suggestion_fixes",
+    "suggestion_stale",
+    "suggestion_checks",
+    "suggestion_preferences",
+    "suggestion_provider_prefs",
+    "suggestion_policy",
+];
+
 pub(super) fn init(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS suggestion_schema (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             version INTEGER NOT NULL
+         );",
+    )?;
+    let version: Option<i64> = conn
+        .query_row(
+            "SELECT version FROM suggestion_schema WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if version != Some(SCHEMA_VERSION) {
+        for table in TABLES {
+            conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))?;
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO suggestion_schema (id, version) VALUES (1, ?1)",
+            params![SCHEMA_VERSION],
+        )?;
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS suggestion_providers (
              profile     TEXT NOT NULL,
@@ -1505,6 +1546,37 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init(&conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn a_store_from_another_schema_version_is_rebuilt() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE suggestion_items (
+                 profile TEXT NOT NULL, provider_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                 item_json TEXT NOT NULL, revision INTEGER NOT NULL,
+                 PRIMARY KEY (profile, provider_id, item_id)
+             );
+             CREATE TABLE suggestion_policy (profile TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        assert_eq!(publish(&conn, "p", &[item("a", "assigned")])["accepted"], 1);
+        let version: i64 = conn
+            .query_row("SELECT version FROM suggestion_schema", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let policy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'suggestion_policy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(policy, 0);
+        // A matching version keeps the data.
+        init(&conn).unwrap();
+        assert_eq!(ids(&snap(&conn, "p")), ["a"]);
     }
 
     fn provider() -> Provider {
