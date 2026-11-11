@@ -151,6 +151,7 @@ fn retained_source_preserves_byte_offsets_identity_and_private_metadata() {
                 task_id: "workflow".into(),
                 tool_call_id: Some("w".into()),
                 description: "work".into(),
+                started_at: None,
                 workflow: Some(WorkflowLaunch {
                     run_id: "run".into(),
                     name: "name".into(),
