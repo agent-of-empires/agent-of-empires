@@ -1929,6 +1929,8 @@ mod tests {
                 inbound_tx
                     .send(Event::AcpSessionAssigned {
                         acp_session_id: "acp-1".into(),
+                        connection_ready: false,
+                        native_subject: None,
                     })
                     .await
                     .unwrap();
@@ -1936,6 +1938,7 @@ mod tests {
             inbound_tx
                 .send(Event::AgentStartupError {
                     message: "ACP connection failed: agent transport closed".into(),
+                    native_subject: None,
                 })
                 .await
                 .unwrap();

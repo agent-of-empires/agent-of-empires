@@ -489,7 +489,6 @@ async fn spawn_fake_connection_with(
                     )]
                 }
                 Some("session/prompt") => on_prompt(id),
-                Some("session/set_config_option") => on_prompt(id),
                 _ => continue,
             };
             for reply in replies {
@@ -546,6 +545,7 @@ async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
         .send(ClientCmd::SetConfigOption {
             config_id: "model".into(),
             value: "selected".into(),
+            remember: false,
         })
         .await
         .unwrap();
