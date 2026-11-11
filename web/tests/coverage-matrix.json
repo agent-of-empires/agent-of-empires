@@ -973,6 +973,14 @@
       "notes": "The dismiss test asserts the contrast-safe token classes: text-subtle dismiss, text-primary body, no hover opacity on Re-enable."
     },
     {
+      "id": "notifications.toast-lifetime",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/Toasts.test.tsx"],
+      "components": ["web/src/components/Toasts.tsx"],
+      "notes": "A timed toast (plain, session or link) lasts 6 s but pauses while hovered or focused, including focus moving between its own controls. It resumes once both are released and stays at least 2 s more. Action toasts never time out."
+    },
+    {
       "id": "notifications.status-sounds",
       "kind": "vitest",
       "risk": "medium",
