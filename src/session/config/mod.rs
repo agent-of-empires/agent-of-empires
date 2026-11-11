@@ -795,6 +795,7 @@ pub enum GroupByMode {
     Manual,
     Project,
     Org,
+    Status,
 }
 
 impl GroupByMode {
@@ -802,7 +803,8 @@ impl GroupByMode {
         match self {
             GroupByMode::Manual => GroupByMode::Project,
             GroupByMode::Project => GroupByMode::Org,
-            GroupByMode::Org => GroupByMode::Manual,
+            GroupByMode::Org => GroupByMode::Status,
+            GroupByMode::Status => GroupByMode::Manual,
         }
     }
 
@@ -811,6 +813,7 @@ impl GroupByMode {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
             GroupByMode::Org => "Org",
+            GroupByMode::Status => "Status",
         }
     }
 
@@ -820,6 +823,7 @@ impl GroupByMode {
             GroupByMode::Manual => 'm',
             GroupByMode::Project => 'p',
             GroupByMode::Org => 'g',
+            GroupByMode::Status => 's',
         }
     }
 }
@@ -943,6 +947,10 @@ pub struct AppStateConfig {
     /// group record, so their collapse state has nowhere else to live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_group_collapsed: Vec<String>,
+
+    /// Collapsed paths of the status-mode sidebar folders, alongside `org_group_collapsed`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_group_collapsed: Vec<String>,
 
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
