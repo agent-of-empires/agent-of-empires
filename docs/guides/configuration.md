@@ -358,7 +358,7 @@ To forward everything else too:
 inherit_host_environment = true
 ```
 
-Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs are exported from a mode 0600 launch script, so values stay out of `ps`. Panes you open yourself inside a session do not receive them.
+Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs are exported from a mode 0600 launch script, so values stay out of `ps`. The terminal view skips names that tmux and the shell set for each pane, such as `TMUX`, `PWD`, `UID`, `USERNAME` and `TERM_PROGRAM`, so each pane keeps its own values. Panes you open yourself inside a session do not receive them.
 
 Managed OpenCode selects this policy before probing or launching the native agent. It also retains process essentials and OpenCode database, configuration and workspace selector inputs for validation when wholesale inheritance is off. Unsupported selectors remain unsupported. Explicit profile `environment` entries and before-session overrides take precedence; login-only exports are not imported. See [managed OpenCode contexts](session-resume.md#supported-managed-contexts).
 
