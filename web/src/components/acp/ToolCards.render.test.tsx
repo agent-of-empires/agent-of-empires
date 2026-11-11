@@ -874,6 +874,65 @@ describe("SubagentCard", () => {
   });
 });
 
+describe("delegation card from the session identity", () => {
+  // The adapter hides the Agent call: the card is the delegation message id and
+  // no background-agent record exists.
+  const card = makeToolCall({
+    id: "msg-1",
+    name: "Explore repo",
+    kind: "think",
+    args_preview: args({ description: "Explore repo", prompt: "find the bug" }),
+  });
+  const child: SubagentRecord = {
+    session_id: "child-1",
+    parent_session_id: "root",
+    parent_tool_call_id: "msg-1",
+    title: "Explore repo",
+    state: "running",
+    cancel_capable: true,
+  };
+  const view = (
+    record: SubagentRecord,
+    result?: ActivityRow,
+    cancelSubagent = vi.fn().mockResolvedValue(undefined),
+  ) => (
+    <BackgroundAgentsContext.Provider value={{ agents: [], subagents: [record], cancelSubagent }}>
+      {wrap(<ToolCard tool={card} result={result} />)}
+    </BackgroundAgentsContext.Provider>
+  );
+
+  it("shows the badge and a Stop that cancels the child by session id", () => {
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const { container, getByRole } = render(view(child, undefined, cancelSubagent));
+    expect(container.textContent).toContain("subagent");
+    expect(container.textContent).toContain("Explore repo");
+    expect(container.textContent).toContain("running");
+    fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+  });
+
+  it("offers no Stop when the child cannot be cancelled", () => {
+    const { queryByRole } = render(view({ ...child, cancel_capable: false }));
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+  });
+
+  it.each(["end_turn", "error"])("stops looking active once the child is idle with no reply (%s)", (stop_reason) => {
+    const { container, queryByRole } = render(view({ ...child, state: "idle", stop_reason }));
+    expect(container.textContent).toContain(`idle · ${stop_reason}`);
+    expect(container.textContent).not.toMatch(/running/);
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+  });
+
+  it("keeps the reply as the card's report", () => {
+    const { container, getByRole } = render(
+      view({ ...child, state: "idle" }, makeCompletion({ toolCallId: "msg-1", text: "the answer" })),
+    );
+    fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+    expect(container.textContent).toContain("find the bug");
+    expect(container.textContent).toContain("the answer");
+  });
+});
+
 describe("AsyncSubagentCard", () => {
   const tool = makeToolCall({
     id: "task-async",

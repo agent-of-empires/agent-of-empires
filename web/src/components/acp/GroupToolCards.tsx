@@ -8,6 +8,7 @@ import { pickStr } from "../../lib/acpArgs";
 import type { BackgroundAgentStatus, SubagentRecord, ToolCall } from "../../lib/acpTypes";
 import {
   isActiveAgent,
+  isStoppable,
   useBackgroundAgentFor,
   useCancelSubagent,
   useOpenBackgroundAgentsPane,
@@ -134,15 +135,41 @@ function subagentBadge(record: SubagentRecord): string {
   }
 }
 
+/** Stops one child. The header is a button, so a nested one would be invalid markup. */
+function StopSubagentButton({ sessionId }: { sessionId: string }) {
+  const cancel = useCancelSubagent();
+  if (!cancel) return null;
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      title="Stop this sub-agent"
+      aria-label="Stop sub-agent"
+      onClick={(e) => {
+        e.stopPropagation();
+        void cancel(sessionId);
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        e.stopPropagation();
+        void cancel(sessionId);
+      }}
+      className="ml-2 inline-flex items-center text-text-dim hover:text-rose-300"
+    >
+      <Square className="h-3 w-3 fill-current" strokeWidth={0} />
+    </span>
+  );
+}
+
 /** Async sub-agent launch, linked to its live Background agents record by
  *  tool-call id. Neutral until the first tailer event arrives. */
 export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
   const { description } = useTaskDescription(tool);
   const agent = useBackgroundAgentFor(tool.id);
   const record = useSubagentFor(tool.id);
-  const cancel = useCancelSubagent();
   const openPane = useOpenBackgroundAgentsPane();
-  const stoppable = !!agent && isActiveAgent(agent) && !!record?.cancel_capable && !!cancel;
+  const stoppable = !!agent && isActiveAgent(agent) && isStoppable(record);
 
   const [status, fallbackMeta] = agent ? ASYNC_STATUS[agent.status] : (["ok", "runs in background"] as const);
   let metaText = fallbackMeta;
@@ -165,28 +192,7 @@ export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
       meta={
         <>
           <span className="text-[11px] text-text-dim">{metaText}</span>
-          {stoppable && (
-            // The header is a button, so a nested one would be invalid markup.
-            <span
-              role="button"
-              tabIndex={0}
-              title="Stop this sub-agent"
-              aria-label="Stop sub-agent"
-              onClick={(e) => {
-                e.stopPropagation();
-                void cancel(record.session_id);
-              }}
-              onKeyDown={(e) => {
-                if (e.key !== "Enter" && e.key !== " ") return;
-                e.preventDefault();
-                e.stopPropagation();
-                void cancel(record.session_id);
-              }}
-              className="ml-2 inline-flex items-center text-text-dim hover:text-rose-300"
-            >
-              <Square className="h-3 w-3 fill-current" strokeWidth={0} />
-            </span>
-          )}
+          {stoppable && <StopSubagentButton sessionId={record.session_id} />}
         </>
       }
       expanded={false}
@@ -202,8 +208,8 @@ export function extractTaskResult(text: string): string {
   return match ? match[1]!.trim() : text;
 }
 
-/** A sub-agent Task. With children it is Claude's linked Task; childless it is an
- *  off-protocol launch (opencode) that only reports a final result. */
+/** A sub-agent Task or delegation. With children it nests their calls; childless it
+ *  only reports a final result (opencode, or a delegation with no calls yet). */
 export function SubagentCard({ tool, result, children }: ToolCardProps & { children: ToolCardProps[] }) {
   const { args, description: toolDescription } = useTaskDescription(tool);
   const record = useSubagentFor(tool.id);
@@ -211,9 +217,12 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
   const hasChildren = children.length > 0;
   const prompt = pickStr(args, "prompt");
   const report = result ? extractTaskResult(result.text ?? "") : "";
-  // Only the parent's own error fails the header.
-  const status: Status =
-    result === undefined || children.some((c) => !c.result) ? "running" : result.kind === "tool_error" ? "err" : "ok";
+  // Only the parent's own error fails the header. An idle child ends the card
+  // even when no reply ever completed it.
+  const idle = record?.state === "idle";
+  const pending = result === undefined || children.some((c) => !c.result);
+  const failed = result ? result.kind === "tool_error" : record?.stop_reason === "error";
+  const status: Status = pending && !idle ? "running" : failed ? "err" : "ok";
   const [open, setOpen] = useToolCardExpansion(status);
 
   return (
@@ -223,7 +232,14 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
         {...spanTimes([{ tool, result }, ...children])}
         icon={<Sparkles className={ICON} />}
         label="subagent"
-        meta={record && <span className="text-[11px] text-text-dim">{subagentBadge(record)}</span>}
+        meta={
+          record && (
+            <>
+              <span className="text-[11px] text-text-dim">{subagentBadge(record)}</span>
+              {isStoppable(record) && <StopSubagentButton sessionId={record.session_id} />}
+            </>
+          )
+        }
         primary={
           <>
             <span className="truncate">{description}</span>

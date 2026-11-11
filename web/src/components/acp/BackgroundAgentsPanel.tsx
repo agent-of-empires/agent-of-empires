@@ -7,7 +7,7 @@ import { Bot, ChevronDown, Maximize2, Square, Workflow, X } from "lucide-react";
 import { useBackgroundAgents, useBackgroundTasks, useSubagents, useWorkflowRuns } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool, SubagentRecord } from "../../lib/acpTypes";
 import { cancelSubagent } from "../../lib/api";
-import { findSubagent, isActiveAgent, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
+import { findSubagent, isActiveAgent, paneAgents, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 type Entry =
@@ -32,15 +32,15 @@ function entries(sorted: BackgroundAgent[], all: BackgroundAgent[]): Entry[] {
 }
 
 export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
-  const agents = useBackgroundAgents(sessionId);
   const subagents = useSubagents(sessionId);
+  const agents = paneAgents(useBackgroundAgents(sessionId), subagents);
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
 
   if (agents.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-text-dim">
-        No background sub-agents launched yet. When the agent dispatches an async{" "}
+        No sub-agents launched yet. When the agent delegates to a sub-agent, dispatches an async{" "}
         <span className="font-mono">Task</span> or runs a <span className="font-mono">Workflow</span>, its agents show
         up here with live progress.
       </div>
@@ -66,9 +66,8 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
         {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
       </div>
       <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-        Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
-        <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
-        transcript.
+        Delegated sub-agents, async (background) <span className="font-mono">Task</span> sub-agents and{" "}
+        <span className="font-mono">Workflow</span> agents show here. Inline sub-agents also appear in the transcript.
       </p>
       <div className="flex flex-col">
         {entries(sorted, agents).map((entry) =>

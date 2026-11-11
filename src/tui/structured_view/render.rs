@@ -1719,6 +1719,19 @@ impl ToolBlocks<'_> {
             retained_tool_lines(row, completion, self.theme, self.path_roots)
         } else {
             let mut card = tool_card_from_rows(row, self.completions);
+            // An idle child may never send a reply that completes its card.
+            if let (None, Some(record)) = (&card.completed, record) {
+                if record.state == SubagentState::Idle {
+                    card.completed = Some(ToolCompletion {
+                        outcome: if record.stop_reason.as_deref() == Some("error") {
+                            ToolOutcome::Error
+                        } else {
+                            ToolOutcome::Ok
+                        },
+                        content: String::new(),
+                    });
+                }
+            }
             if let Some(title) = record
                 .and_then(|r| r.title.as_ref())
                 .filter(|t| !t.is_empty())
@@ -3084,38 +3097,54 @@ mod tests {
         );
     }
 
+    /// The adapter's wire shape: the card is synthesized from the delegation
+    /// message id, so no background-agent record backs it. The child's tool
+    /// calls nest under it and the roster alone badges it.
     #[test]
-    fn subagent_title_and_state_badge_the_parent_card() {
+    fn delegation_card_nests_children_and_badges_from_the_roster_alone() {
         use crate::acp::state::SubagentState::*;
         let cases = [
+            (Running, None, vec!["tool ▶ · Explore repo · running"]),
             (
-                Some("Explore repo"),
-                Running,
-                "tool ▶ · Explore repo · running",
-            ),
-            (
-                Some("Explore repo"),
                 RequiresAction,
-                "tool ▶ · Explore repo · waiting on you",
+                None,
+                vec!["tool ▶ · Explore repo · waiting on you"],
             ),
-            (None, Idle, "tool ▶ · Agent · idle"),
-            (Some(""), Unknown, "tool ▶ · Agent · unknown"),
+            (Idle, None, vec!["✓ Explore repo · idle"]),
+            (
+                Idle,
+                Some("error"),
+                vec![
+                    "tool ✗ · Explore repo · idle",
+                    "  (tool failed; press `o` for details)",
+                ],
+            ),
+            (Unknown, None, vec!["tool ▶ · Explore repo · unknown"]),
         ];
-        for (title, state, want) in cases {
+        for (state, stop_reason, head) in cases {
             let mut t = AcpTranscript::new("s-1");
-            t.server_rows = server_rows(&[tool_event("p1", "Agent", None)]);
+            t.server_rows = server_rows(&[
+                tool_event("msg-1", "Explore repo", None),
+                tool_event("c1", "Read", Some("msg-1")),
+            ]);
             t.subagents = vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
-                parent_tool_call_id: Some("p1".into()),
-                title: title.map(Into::into),
+                parent_tool_call_id: Some("msg-1".into()),
+                title: Some("Explore repo".into()),
                 description: None,
                 state,
-                stop_reason: None,
+                stop_reason: stop_reason.map(Into::into),
                 cancel_capable: true,
                 model: None,
             }];
-            assert_eq!(tool_lines(&t), [want]);
+            let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
+            want.push("  tool ▶ · Read".into());
+            assert_eq!(tool_lines(&t), want);
+            assert_eq!(
+                t.stoppable_subagent().map(|r| r.session_id.as_str()),
+                matches!(state, Running | RequiresAction).then_some("child")
+            );
         }
     }
 

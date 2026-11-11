@@ -1449,11 +1449,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
 
 /** Folds a child's RFD snapshot into its agent; `at` stamps a newly ended one. */
 function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): BackgroundAgent {
-  if (child.state === "idle") {
-    const status = child.stop_reason === "error" ? "error" : "completed";
-    return { ...a, status, endedAt: a.endedAt ?? at };
-  }
-  return { ...a, status: child.state, endedAt: null };
+  const status = subagentStatus(child);
+  return child.state === "idle" ? { ...a, status, endedAt: a.endedAt ?? at } : { ...a, status, endedAt: null };
+}
+
+/** The agent status a child's session state stands for. */
+export function subagentStatus(child: SubagentRecord): BackgroundAgentStatus {
+  if (child.state !== "idle") return child.state;
+  return child.stop_reason === "error" ? "error" : "completed";
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */

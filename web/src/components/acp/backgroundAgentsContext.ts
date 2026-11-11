@@ -2,7 +2,7 @@
 
 import { createContext, useContext, useMemo } from "react";
 
-import type { BackgroundAgent, SubagentRecord, WorkflowRun } from "../../lib/acpTypes";
+import { subagentStatus, type BackgroundAgent, type SubagentRecord, type WorkflowRun } from "../../lib/acpTypes";
 
 export interface BackgroundAgentsContextValue {
   agents: BackgroundAgent[];
@@ -22,13 +22,45 @@ export function useBackgroundAgentFor(toolCallId: string | undefined): Backgroun
   return agents.find((a) => a.toolCallId === toolCallId);
 }
 
-/** The roster record for the subagent a `Task` call spawned. */
+/** What a card or pane row links a child by: its launch card, else its own session. */
+export const subagentKey = (s: SubagentRecord): string => s.parent_tool_call_id ?? s.session_id;
+
+/** The roster record for the subagent a card or pane row stands for. */
 export function findSubagent(
   subagents: SubagentRecord[] | undefined,
   toolCallId: string | undefined,
 ): SubagentRecord | undefined {
   if (!toolCallId) return undefined;
-  return subagents?.find((s) => s.parent_tool_call_id === toolCallId);
+  return subagents?.find((s) => subagentKey(s) === toolCallId);
+}
+
+/** A running child is stoppable when the adapter accepts a cancel for it. */
+export const isStoppable = (s: SubagentRecord | undefined): s is SubagentRecord =>
+  !!s?.cancel_capable && s.state !== "idle";
+
+/** The pane's rows: legacy launch records, plus a row for every child no record covers. */
+export function paneAgents(agents: BackgroundAgent[], subagents: SubagentRecord[]): BackgroundAgent[] {
+  const linked = new Set(agents.map((a) => a.toolCallId));
+  const rosterOnly = subagents
+    .filter((s) => !linked.has(subagentKey(s)))
+    .map((s): BackgroundAgent => ({
+      agentId: s.session_id,
+      toolCallId: subagentKey(s),
+      description: s.title || s.description || "",
+      prompt: "",
+      model: s.model ?? "",
+      status: subagentStatus(s),
+      // The roster carries no clock, so these rows show no elapsed time.
+      startedAt: "",
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    }));
+  return [...agents, ...rosterOnly];
 }
 
 export function useSubagentFor(toolCallId: string | undefined): SubagentRecord | undefined {

@@ -97,9 +97,7 @@ describe("BackgroundAgentsPanel", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.textContent).toContain("Background agents · 1");
-    // Persistent hint: async-only scope + where the sync ones live.
-    expect(container.textContent).toContain("Only async");
-    expect(container.textContent).toContain("Synchronous sub-agents run inline in the transcript");
+    expect(container.textContent).toContain("Inline sub-agents also appear in the transcript");
     expect(container.textContent).toContain("Map backend lifecycle");
     expect(container.textContent).toContain("running");
     expect(container.textContent).toContain("3 tools");
@@ -193,6 +191,41 @@ describe("BackgroundAgentsPanel", () => {
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       expect(await findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
       vi.unstubAllGlobals();
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("lists and stops a child that has no legacy background-agent record", async () => {
+      const fetchMock = vi.fn(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve("") }));
+      vi.stubGlobal("fetch", fetchMock);
+      agentsMock.mockReturnValue([]);
+      subagentsMock.mockReturnValue([
+        record({ parent_tool_call_id: "msg-1", title: "Explore repo" }),
+        record({
+          session_id: "child-2",
+          parent_tool_call_id: null,
+          title: "Unlinked",
+          state: "idle",
+          stop_reason: "end_turn",
+        }),
+      ]);
+      const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(container.textContent).toContain("Background agents · 2");
+      expect(container.textContent).toContain("Explore repo");
+      expect(container.textContent).toContain("Unlinked");
+      expect(container.textContent).toContain("done");
+      const stops = getAllByRole("button", { name: "Stop sub-agent" });
+      expect(stops).toHaveLength(1);
+      fireEvent.click(stops[0]!);
+      expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
+      vi.unstubAllGlobals();
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("lists a linked child once when a legacy record also covers it", () => {
+      agentsMock.mockReturnValue([agent()]);
+      subagentsMock.mockReturnValue([record()]);
+      const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(container.textContent).toContain("Background agents · 1");
       subagentsMock.mockReturnValue([]);
     });
 
