@@ -1885,7 +1885,6 @@ impl SessionService {
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
-                || inst.status != crate::session::Status::Idle
             {
                 return;
             }
@@ -1904,16 +1903,17 @@ impl SessionService {
             (caller, agent_key, queue)
         };
 
-        // `Status::Idle` above is a mirror the broadcast listener applies one serial task
-        // behind every session's events, so it still reads Idle for as long as that task is
-        // behind.
-        if self.fold_control_state(id).await.turn_active {
+        let control = self.fold_control_state(id).await;
+        if !control.accepts_queue_drain() {
             return;
         }
 
         // Leading batch up to a clear or compact boundary.
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
+        if profile.is_clear_command(&combined) && control.has_active_background_agent() {
+            return;
+        }
         let caller = match &sub[0].origin_plugin {
             Some(plugin_id) => SessionCaller::PluginMessage {
                 plugin_id: plugin_id.clone(),
