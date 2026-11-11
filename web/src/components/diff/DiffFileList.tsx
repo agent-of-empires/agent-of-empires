@@ -51,6 +51,8 @@ export function DiffFileList({
   onBaseBranchChanged,
 }: Props) {
   const isMultiRepo = perRepoBases.length > 1;
+  // A one-repo workspace's session path is the workspace dir, not its repo.
+  const workspaceRepo = !isMultiRepo && perRepoBases[0]?.repo_name ? perRepoBases[0] : undefined;
   const singleBaseBranch = perRepoBases[0]?.base_branch ?? "main";
   const outsideRepository = !isMultiRepo && Boolean(perRepoBases[0]?.outside_repository);
   const [collapsedRepos, setCollapsedRepos] = useState<Set<string>>(() => new Set());
@@ -197,9 +199,10 @@ export function DiffFileList({
           ) : sessionId && repoPath ? (
             <BasePicker
               sessionId={sessionId}
-              repoPath={repoPath}
+              repoPath={workspaceRepo?.repo_path ?? repoPath}
+              repoName={workspaceRepo?.repo_name}
               currentBase={singleBaseBranch}
-              hasOverride={Boolean(baseBranchOverride)}
+              hasOverride={Boolean(workspaceRepo ? workspaceRepo.base_override : baseBranchOverride)}
               onChanged={onBaseBranchChanged}
             />
           ) : (

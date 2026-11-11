@@ -1200,14 +1200,14 @@ pub async fn force_smart_rename(
         return resp;
     }
 
-    let Some((profile, tool, command, project_path, sandboxed, title, structured)) = ({
+    let Some((profile, tool, command, config_path, sandboxed, title, structured)) = ({
         let instances = state.instances.read().await;
         instances.iter().find(|i| i.id == id).map(|i| {
             (
                 i.source_profile.clone(),
                 i.tool.clone(),
                 i.command.clone(),
-                i.project_path.clone(),
+                i.repo_config_path().to_path_buf(),
                 i.is_sandboxed(),
                 i.title.clone(),
                 i.is_structured(),
@@ -1220,7 +1220,7 @@ pub async fn force_smart_rename(
     // Manual requests bypass the setting and current-title gates; the worker revalidates all others.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &profile,
-        std::path::Path::new(&project_path),
+        &config_path,
     );
     let config = &resolved.session;
     if let Err(reason) = crate::session::smart_rename::check_eligible_resolved(
@@ -2464,8 +2464,7 @@ fn reserve_structured_restart(
             target,
             Some(instance.id.clone()),
         )?;
-        (&target_native as &dyn SessionStore)
-            .launch_configuration(std::path::Path::new(&instance.project_path))?;
+        (&target_native as &dyn SessionStore).launch_configuration(instance.repo_config_path())?;
         let rows = target_native.load()?;
         if rows.iter().any(|row| row.id == instance.id)
             || is_duplicate_session(rows.iter(), &probe.title, &probe.project_path, None)
@@ -2473,8 +2472,7 @@ fn reserve_structured_restart(
             return Err(duplicate_session_error(&probe.title));
         }
     } else {
-        (&native as &dyn SessionStore)
-            .launch_configuration(std::path::Path::new(&instance.project_path))?;
+        (&native as &dyn SessionStore).launch_configuration(instance.repo_config_path())?;
     }
     let reserved = (&native as &dyn SessionStore).update(|rows, _| {
         let row = rows
@@ -2709,7 +2707,7 @@ async fn finish_structured_restart(
                 &started.tool,
                 started.agent_name.as_deref(),
                 &started.source_profile,
-                std::path::Path::new(&started.project_path),
+                started.repo_config_path(),
             )
             .await;
         let mut request = crate::server::api::acp::spawn_request_for(

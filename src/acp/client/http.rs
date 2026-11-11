@@ -1450,7 +1450,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HttpClient::new(endpoint(&base, None)).unwrap();
+        let client = HttpClient::new(endpoint(&base, Some("replay-fixture-token"))).unwrap();
         let (rows, lost) = client.replay_rows_paged(&id, 0, 2).await.unwrap();
         assert!(lost);
         assert_eq!(
@@ -1551,7 +1551,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = HttpClient::new(endpoint(
             &format!("http://{}", listener.local_addr().unwrap()),
-            None,
+            Some("replay-fixture-token"),
         ))
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1676,7 +1676,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = HttpClient::new(endpoint(
             &format!("http://{}", listener.local_addr().unwrap()),
-            None,
+            Some("replay-fixture-token"),
         ))
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1754,7 +1754,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = HttpClient::new(endpoint(
             &format!("http://{}", listener.local_addr().unwrap()),
-            None,
+            Some("replay-fixture-token"),
         ))
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1830,7 +1830,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = HttpClient::new(endpoint(
             &format!("http://{}", listener.local_addr().unwrap()),
-            None,
+            Some("replay-fixture-token"),
         ))
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
