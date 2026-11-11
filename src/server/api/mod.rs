@@ -28,7 +28,8 @@ pub use acp::{
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_retained_source,
     acp_set_config_option, acp_set_mode, acp_task_output, acp_worker_log, agent_install_info,
     get_option_catalog, install_agent, list_acp_agents, list_importable_sessions, resolve_approval,
-    resolve_elicitation, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent, switch_acp_provider,
+    resolve_elicitation, restart_acp, shutdown_acp, spawn_acp, switch_acp_agent,
+    switch_acp_provider,
 };
 pub(crate) use acp::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
