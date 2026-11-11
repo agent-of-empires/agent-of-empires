@@ -3195,16 +3195,13 @@ impl Instance {
             .into_iter()
             .filter(|(key, _)| !routing_keys.contains(&key.as_str()))
             .collect();
-        if assignments.is_empty() {
-            Ok(shell_words::join(words))
-        } else {
-            let assignments = assignments
-                .into_iter()
-                .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            Ok(format!("{assignments} {}", shell_words::join(words)))
-        }
+        Ok(super::launch_command::render_launch_command(
+            super::launch_command::ParsedLaunchCommand {
+                words,
+                assignments,
+                executable_end: parsed.executable_end,
+            },
+        ))
     }
 }
 
@@ -3992,10 +3989,6 @@ mod tests {
         std::fs::create_dir_all(&conflicting).unwrap();
         let mut instance = Instance::new("prefix-conflict", root.path().to_str().unwrap());
         instance.tool = "claude".into();
-        instance.command = format!(
-            "CLAUDE_CONFIG_DIR={} claude",
-            shell_words::quote(conflicting.to_str().unwrap()),
-        );
         // Store A is what resolution attests; store B reaches the frozen launch
         // only as a literal prefix (a recorded conversation, or an explicit
         // `agent_config_dir`, can disagree with the stored command's prefix).
