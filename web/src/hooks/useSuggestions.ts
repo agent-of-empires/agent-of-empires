@@ -156,6 +156,7 @@ export function useSuggestions(
           yolo_mode: draft.yolo,
           sandbox: draft.sandbox,
           worktree_enabled: draft.worktree,
+          create_new_branch: draft.worktree,
           initial_prompt: draft.initial_prompt,
           suggestion: link,
           idempotency_key: newIdempotencyKey(),

@@ -222,6 +222,7 @@ describe("SuggestionsView", () => {
       yolo_mode: true,
       sandbox: false,
       worktree_enabled: true,
+      create_new_branch: true,
       initial_prompt: "Template prompt.",
       suggestion: { provider_id: "github", id: "issue-1" },
       idempotency_key: "key-1",
