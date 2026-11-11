@@ -1562,6 +1562,19 @@
       ]
     },
     {
+      "id": "wizard.search-autofocus",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/wizard-project.spec.ts"],
+      "components": [
+        "web/src/components/DirectoryBrowser.tsx",
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
+        "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx"
+      ],
+      "notes": "Opening the Project panel (Recent and Browse tabs) or the Extra repos panel focuses its search box on a fine-pointer device."
+    },
+    {
       "id": "wizard.scratch-toggle-visible",
       "kind": "mocked-playwright",
       "risk": "medium",

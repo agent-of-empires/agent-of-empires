@@ -9,9 +9,10 @@ const BROWSE_PAGE_SIZE = 100;
 interface Props {
   initialPath?: string;
   onSelect: (path: string) => void;
+  autoFocus?: boolean;
 }
 
-export function DirectoryBrowser({ initialPath, onSelect }: Props) {
+export function DirectoryBrowser({ initialPath, onSelect, autoFocus = false }: Props) {
   const [currentPath, setCurrentPath] = useState(initialPath || "");
   const [entries, setEntries] = useState<DirEntry[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -206,6 +207,7 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
       <div className="mb-3">
         <input
           type="text"
+          autoFocus={autoFocus}
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           placeholder="Type to filter..."

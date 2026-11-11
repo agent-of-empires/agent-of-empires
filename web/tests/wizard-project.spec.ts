@@ -65,6 +65,15 @@ test.describe("project tabs", () => {
     await expectSelected(page, "/home/user/z-project");
   });
 
+  test("Recent and Browse tabs focus their search box on open", async ({ page }) => {
+    await mockBrowse(page, [{ name: "alpha" }]);
+    await startWizard(page);
+    await openPanel(page, "Project");
+    await expect(page.getByLabel("Search projects")).toBeFocused();
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+    await expect(page.getByPlaceholder("Type to filter...")).toBeFocused();
+  });
+
   test("Clone tab gates the button on a non-blank URL and Advanced reveals destination + shallow", async ({ page }) => {
     await startWizard(page, { project: false });
     await openWizard(page);
@@ -115,6 +124,11 @@ test.describe("extra repos", () => {
     return { picker, chip, input: page.getByPlaceholder("/path/to/another/repo") };
   }
 
+  test("search box is focused on open", async ({ page }) => {
+    const { picker } = await openPicker(page);
+    await expect(picker.getByLabel("Search projects")).toBeFocused();
+  });
+
   test("saved projects render without the primary and toggle as chips", async ({ page }) => {
     const { picker, chip } = await openPicker(page);
     await expect(picker.getByText("Projects", { exact: true })).toBeVisible();
@@ -124,6 +138,17 @@ test.describe("extra repos", () => {
     await expect(page.getByText("1 selected")).toBeVisible();
     await page.getByRole("button", { name: "Remove shared-lib" }).click();
     await expect(page.getByText("none")).toBeVisible();
+  });
+});
+
+test.describe("search autofocus on touch", () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  test("project search stays unfocused so the keyboard does not cover the list", async ({ page }) => {
+    await startWizard(page);
+    await openPanel(page, "Project");
+    await expect(page.getByLabel("Search projects")).toBeVisible();
+    await expect(page.getByLabel("Search projects")).not.toBeFocused();
   });
 });
 

@@ -22,6 +22,7 @@ interface Props {
   onSelect: (path: string) => void;
   /** Shown when a query matches nothing in either list. */
   emptyMessage?: string;
+  autoFocus?: boolean;
 }
 
 /** Search box plus saved and recent rows, shared by ProjectStep and ExtraReposPicker. */
@@ -33,11 +34,13 @@ export function ProjectSearchList({
   isSelected,
   onSelect,
   emptyMessage = "No projects match that search.",
+  autoFocus = false,
 }: Props) {
   return (
     <div className="flex flex-col gap-4">
       <input
         type="text"
+        autoFocus={autoFocus}
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
         placeholder="Search projects by name or path"

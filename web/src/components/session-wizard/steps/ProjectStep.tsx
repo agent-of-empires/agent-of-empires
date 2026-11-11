@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { AgentInfo, ImportableSession, ProjectOverrides } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
+import { hasFinePointer } from "../../../lib/platform";
 import { ImportSessionPicker } from "./ImportSessionPicker";
 import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
@@ -129,10 +130,11 @@ export function ProjectStep({
           isSelected={(path) => !data.scratch && data.path === path}
           onSelect={(path) => selectPath(path)}
           emptyMessage="No projects match that search. Try the Browse tab."
+          autoFocus={hasFinePointer()}
         />
       )}
 
-      {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} />}
+      {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} autoFocus={hasFinePointer()} />}
 
       {!loading &&
         activeTab === "import" &&

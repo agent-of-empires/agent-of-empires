@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fetchBranches, type BranchInfo } from "../../../lib/api";
+import { hasFinePointer } from "../../../lib/platform";
 import { ProjectSearchList } from "./ProjectSearchList";
 import { useProjectPicker } from "./projectPicker";
 
@@ -202,6 +203,7 @@ export function ExtraReposPicker({
             filteredRecent={filteredRecent}
             isSelected={isSelected}
             onSelect={toggle}
+            autoFocus={hasFinePointer()}
           />
         </div>
       )}
