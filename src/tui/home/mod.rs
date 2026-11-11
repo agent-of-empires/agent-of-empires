@@ -405,6 +405,8 @@ pub struct HomeView {
     pub(super) sidebar_source: super::session_feed::SidebarSource,
     /// Why the Daemon couldn't be reached, shown on the offline takeover.
     runtime_failure_reason: Option<String>,
+    /// What the offline takeover says and offers while disconnected.
+    pub(super) offline_attention: super::dialogs::DaemonAttention,
     pub(super) session_feed: super::session_feed::SessionFeed,
     pending_namespace_intent: Option<NamespaceIntent>,
     namespace_unknown_message: Option<String>,

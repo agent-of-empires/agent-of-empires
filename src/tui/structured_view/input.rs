@@ -82,6 +82,9 @@ pub enum Intent {
     /// Open the permission-mode picker (transcript `m`, when the agent
     /// advertised modes).
     OpenModePicker,
+    /// Open the Fast mode / Ultracode toggle picker (transcript `t`, when the
+    /// agent advertised any).
+    OpenToggles,
     /// Open the answer picker for the oldest pending elicitation (transcript
     /// `a`). The view decides whether the form is natively answerable.
     AnswerElicitation,
@@ -128,6 +131,8 @@ pub struct InputContext {
     pub choice_numbered: bool,
     /// The agent advertised permission modes; gates the transcript `m` key.
     pub has_modes: bool,
+    /// The agent advertised `model_config` on/off toggles; gates the transcript `t` key.
+    pub has_toggles: bool,
     /// Whether any undismissed session notice is on screen, gating `x`.
     pub has_notices: bool,
     /// The agent is generating. Gates `Esc` in the composer: it interrupts the
@@ -369,6 +374,7 @@ fn transcript_keys(key: &KeyEvent, ctx: InputContext) -> Intent {
         (m, KeyCode::Char('x')) if m.is_empty() && ctx.has_notices => Intent::DismissNotice(None),
         // Permission-mode picker, when the agent advertised modes.
         (m, KeyCode::Char('m')) if m.is_empty() && ctx.has_modes => Intent::OpenModePicker,
+        (m, KeyCode::Char('t')) if m.is_empty() && ctx.has_toggles => Intent::OpenToggles,
         // Esc backs out one level to the composer (the home base) rather than
         // leaving the view.
         (m, KeyCode::Esc) if m.is_empty() => Intent::SetFocus(Focus::Composer),
@@ -664,6 +670,23 @@ mod tests {
                 Is(Intent::Ignore),
             ),
             (Focus::Composer, Char('m'), NONE, ctx_modes(), Composes),
+            (
+                Focus::Transcript,
+                Char('t'),
+                NONE,
+                InputContext {
+                    has_toggles: true,
+                    ..InputContext::default()
+                },
+                Is(Intent::OpenToggles),
+            ),
+            (
+                Focus::Transcript,
+                Char('t'),
+                NONE,
+                ctx(),
+                Is(Intent::Ignore),
+            ),
             (
                 Focus::Transcript,
                 Char('a'),

@@ -402,7 +402,8 @@ fn render_confirm(
         mouse
             .keys
             .push((card_key(selected == transport, select), card_area));
-        let ready = status == TransportStatus::Ready;
+        // A timed-out provider is still selectable: its status line carries the warning.
+        let ready = matches!(status, TransportStatus::Ready | TransportStatus::TimedOut);
         let (card_inner, body) =
             render_card(frame, card_area, theme, title, selected == transport, ready);
         let mut lines = vec![Line::from("")];
@@ -417,6 +418,11 @@ fn render_confirm(
             TransportStatus::NotInstalled => {
                 ("\u{26A0}", not_installed, Style::default().fg(theme.dimmed))
             }
+            TransportStatus::TimedOut => (
+                "\u{26A0}",
+                "Timed out, press R to retry",
+                Style::default().fg(theme.waiting).bold(),
+            ),
             TransportStatus::FunnelNotEnabled => (
                 "\u{26A0}",
                 "Funnel not enabled for this node",
@@ -1090,6 +1096,30 @@ mod tests {
         crate::tui::dialogs::test_render::draw(width, 40, |f, _| {
             render(view, f, f.area(), &Theme::default())
         })
+    }
+
+    #[test]
+    fn a_timed_out_provider_card_shows_selection_and_the_retry_hint() {
+        use crate::tui::dialogs::test_render::{find, text};
+        let theme = Theme::default();
+        assert_ne!(theme.accent, theme.title);
+        for (selected, title_color) in [
+            (TunnelTransport::Tailscale, theme.accent),
+            (TunnelTransport::Cloudflare, theme.title),
+        ] {
+            let buf = draw_at(
+                &view(ServeViewState::Confirm {
+                    selected,
+                    tailscale: TransportStatus::TimedOut,
+                    cloudflare: TransportStatus::Ready,
+                    flash: None,
+                }),
+                100,
+            );
+            assert!(text(&buf).contains("Timed out, press R to retry"));
+            let (x, y) = find(&buf, "Tailscale Funnel");
+            assert_eq!(buf[(x, y)].fg, title_color, "{selected:?}");
+        }
     }
 
     #[test]

@@ -188,13 +188,15 @@ fn serve_mode_file_token_parses_server_output() {
 
 #[test]
 fn a_tunnel_retry_preselects_the_provider_that_did_not_fail() {
-    use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready};
+    use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready, TimedOut};
     use TunnelTransport::{Cloudflare, Tailscale};
     for (failed, tailscale, cloudflare, expected) in [
         (Some(Tailscale), Ready, Ready, Cloudflare),
         (Some(Tailscale), Ready, NotInstalled, Tailscale),
         (Some(Cloudflare), Ready, Ready, Tailscale),
         (Some(Cloudflare), FunnelNotEnabled, Ready, Cloudflare),
+        (Some(Cloudflare), TimedOut, Ready, Tailscale),
+        (None, TimedOut, Ready, Tailscale),
         (None, Ready, Ready, Tailscale),
         (None, NotInstalled, Ready, Cloudflare),
     ] {
@@ -202,6 +204,80 @@ fn a_tunnel_retry_preselects_the_provider_that_did_not_fail() {
             ServeViewState::provider_retry(failed, tailscale, cloudflare),
             ServeViewState::Confirm { selected, .. } if selected == expected
         ));
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn a_timed_out_tailscale_launches_nothing_until_cloudflare_is_chosen() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    use TransportStatus::{NotInstalled, Ready, TimedOut};
+    use TunnelTransport::{Cloudflare, Tailscale};
+    for (selected, cloudflare) in [
+        (Tailscale, Ready),
+        (Cloudflare, NotInstalled),
+        (Tailscale, NotInstalled),
+    ] {
+        let mut jobs = ServeJobs::default();
+        let held = if cloudflare == Ready {
+            Held::LaunchContext
+        } else {
+            Held::Providers
+        };
+        let (submitter, gate) = gated(&mut jobs, held);
+        let mut view = ServeView::with_state(
+            ServeViewState::Confirm {
+                selected,
+                tailscale: TimedOut,
+                cloudflare,
+                flash: None,
+            },
+            submitter,
+        );
+        assert!(matches!(
+            view.handle_key(KeyEvent::from(KeyCode::Enter)),
+            ServeAction::Continue
+        ));
+        assert!(matches!(
+            view.state,
+            ServeViewState::Confirm { selected: current, flash: Some(_), .. }
+                if current == selected
+        ));
+        assert!(view.pending.is_none());
+        assert!(view.take_launch().is_none());
+        if cloudflare == Ready {
+            view.handle_key(key('c'));
+            gate.entered(Held::LaunchContext);
+            assert!(view.take_launch().is_none());
+            gate.release(JobResult::LaunchContext {
+                persists: true,
+                log_offset: 0,
+                passphrase: Some("fixture phrase".to_owned()),
+            });
+            wait_for(&mut view, |view| view.pending_launch.is_some());
+            assert!(matches!(
+                view.take_launch(),
+                Some(ServeLaunchRequest {
+                    mode: ServeMode::Tunnel,
+                    transport: Some(Cloudflare),
+                    ..
+                })
+            ));
+        } else {
+            view.handle_key(key('R'));
+            gate.entered(Held::Providers);
+            gate.release(JobResult::Providers(Ready, NotInstalled));
+            wait_for(&mut view, |view| view.pending.is_none());
+            assert!(matches!(
+                view.state,
+                ServeViewState::Confirm {
+                    selected: current,
+                    tailscale: Ready,
+                    ..
+                } if current == selected
+            ));
+            assert!(view.take_launch().is_none());
+        }
     }
 }
 

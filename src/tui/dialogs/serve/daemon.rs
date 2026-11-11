@@ -72,13 +72,9 @@ pub(super) fn generate_passphrase() -> String {
 pub(super) fn assess_transports(
     cancel: &tokio_util::sync::CancellationToken,
 ) -> (TransportStatus, TransportStatus) {
-    let tailscale = if !crate::server::tunnel::tailscale_available_sync(cancel) {
-        TransportStatus::NotInstalled
-    } else if !crate::server::tunnel::tailscale_funnel_cap_ready_sync(cancel) {
-        TransportStatus::FunnelNotEnabled
-    } else {
-        TransportStatus::Ready
-    };
+    let tailscale = classify_tailscale(crate::server::tunnel::tailscale_probe_sync(cancel), || {
+        crate::server::tunnel::tailscale_funnel_cap_sync(cancel)
+    });
     let cloudflare = if crate::server::tunnel::check_cloudflared(cancel).is_ok() {
         TransportStatus::Ready
     } else {
@@ -87,13 +83,31 @@ pub(super) fn assess_transports(
     (tailscale, cloudflare)
 }
 
-/// A ready Tailscale wins (stable URL); with neither ready, Tailscale shows the fix instructions.
+/// The capability probe runs only for a usable Tailscale. A timeout stays distinct from an
+/// answer, so the picker offers a retry instead of install or ACL advice.
+fn classify_tailscale(
+    probe: crate::server::tunnel::TailscaleProbe,
+    funnel_cap: impl FnOnce() -> crate::server::tunnel::FunnelCapability,
+) -> TransportStatus {
+    use crate::server::tunnel::{FunnelCapability, TailscaleProbe};
+    match probe {
+        TailscaleProbe::Unavailable => TransportStatus::NotInstalled,
+        TailscaleProbe::TimedOut => TransportStatus::TimedOut,
+        TailscaleProbe::Available => match funnel_cap() {
+            FunnelCapability::Enabled => TransportStatus::Ready,
+            FunnelCapability::NotEnabled => TransportStatus::FunnelNotEnabled,
+            FunnelCapability::TimedOut => TransportStatus::TimedOut,
+        },
+    }
+}
+
+/// A timed-out Tailscale stays selected so Cloudflare is an explicit choice.
 pub(super) fn default_transport(
     tailscale: TransportStatus,
     cloudflare: TransportStatus,
 ) -> TunnelTransport {
     match (tailscale, cloudflare) {
-        (TransportStatus::Ready, _) => TunnelTransport::Tailscale,
+        (TransportStatus::Ready, _) | (TransportStatus::TimedOut, _) => TunnelTransport::Tailscale,
         (_, TransportStatus::Ready) => TunnelTransport::Cloudflare,
         _ => TunnelTransport::Tailscale,
     }
@@ -251,6 +265,66 @@ pub(super) fn run_tailscale_funnel_reset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::tunnel::{FunnelCapability, TailscaleProbe};
+
+    #[test]
+    fn a_probe_timeout_is_never_reported_as_missing_or_disabled() {
+        use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready, TimedOut};
+        // (probe, capability, status, whether the capability probe ran)
+        let cases = [
+            (
+                TailscaleProbe::Available,
+                FunnelCapability::Enabled,
+                Ready,
+                true,
+            ),
+            (
+                TailscaleProbe::Available,
+                FunnelCapability::NotEnabled,
+                FunnelNotEnabled,
+                true,
+            ),
+            (
+                TailscaleProbe::Available,
+                FunnelCapability::TimedOut,
+                TimedOut,
+                true,
+            ),
+            (
+                TailscaleProbe::Unavailable,
+                FunnelCapability::Enabled,
+                NotInstalled,
+                false,
+            ),
+            (
+                TailscaleProbe::TimedOut,
+                FunnelCapability::Enabled,
+                TimedOut,
+                false,
+            ),
+        ];
+        for (probe, cap, want, cap_runs) in cases {
+            let mut ran = false;
+            let got = classify_tailscale(probe, || {
+                ran = true;
+                cap
+            });
+            assert_eq!((got, ran), (want, cap_runs), "{probe:?} {cap:?}");
+        }
+    }
+
+    #[test]
+    fn a_timed_out_tailscale_stays_preselected_over_a_ready_cloudflare() {
+        use TransportStatus::{NotInstalled, Ready, TimedOut};
+        assert_eq!(
+            default_transport(TimedOut, Ready),
+            TunnelTransport::Tailscale
+        );
+        assert_eq!(
+            default_transport(NotInstalled, Ready),
+            TunnelTransport::Cloudflare
+        );
+    }
 
     #[test]
     fn passphrase_is_four_words_from_a_lowercase_list() {

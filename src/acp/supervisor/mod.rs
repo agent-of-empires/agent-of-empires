@@ -113,6 +113,9 @@ pub enum SupervisorError {
     SessionGone(String),
     #[error("native session authority unavailable")]
     NativeStoreUnavailable,
+    /// The event log could not say whether a turn is open; the caller retries.
+    #[error("session {0:?} event log is unavailable")]
+    EventStoreUnavailable(String),
 }
 
 /// What the caller does with prompt text after it was published.
@@ -426,6 +429,8 @@ pub struct SpawnRequest {
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.
     pub effort_explicit: bool,
+    /// Persisted `model_config` picks, re-applied after the model and effort.
+    pub model_config: std::collections::BTreeMap<String, String>,
     /// Prior ACP session id; loaded instead of a new session when the agent supports it.
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.

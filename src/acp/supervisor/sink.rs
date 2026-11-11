@@ -229,6 +229,12 @@ impl super::Supervisor<ChannelSink> {
         self.sink.flushed_store().has_in_flight_turn(session_id)
     }
 
+    /// Wait until every queued worker event is in the store, before a probe that
+    /// decides whether to stop or replace a worker.
+    pub(crate) fn flush_events(&self) {
+        self.sink.flush();
+    }
+
     /// Queue a gate or fault for deterministic writer tests.
     #[cfg(test)]
     pub(crate) fn test_run_on_writer(&self, run: impl FnOnce() + Send + 'static) {
@@ -535,7 +541,7 @@ mod tests {
                     "stalled",
                     "look".into(),
                     &[blob],
-                    None,
+                    Vec::new(),
                     false,
                     None,
                 ));

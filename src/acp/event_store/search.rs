@@ -43,7 +43,7 @@ impl EventStore {
         let limit = limit.clamp(1, MAX_SEARCH_RESULTS);
         let pattern = format!("%{}%", escape_like(&needle));
 
-        let conn = self.search_conn.lock().unwrap_or_else(|p| p.into_inner());
+        let conn = self.read_conn();
         let mut stmt = match conn.prepare(
             "SELECT session_id, seq, event_json FROM acp_events
              WHERE event_json LIKE ?1 ESCAPE '\\'

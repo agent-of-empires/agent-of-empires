@@ -885,6 +885,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: false,
+                        input_hint: None,
                     }],
                 },
             ),
@@ -1195,6 +1196,7 @@ mod tests {
         record(
             2,
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: "go".into(),
                 attachments: Vec::new(),
                 prompt_id: None,

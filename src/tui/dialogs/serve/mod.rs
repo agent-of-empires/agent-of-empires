@@ -328,6 +328,8 @@ enum TransportStatus {
     NotInstalled,
     /// Tailscale is logged in but the ACL doesn't grant Funnel.
     FunnelNotEnabled,
+    /// A probe didn't answer in time, so the real state is unknown.
+    TimedOut,
 }
 
 /// Transient message shown after a rejected keypress.
@@ -385,7 +387,8 @@ enum ServeViewState {
 
 impl ServeViewState {
     fn mode_picker(cancel: &tokio_util::sync::CancellationToken) -> (Self, String) {
-        let tunnel_available = crate::server::tunnel::tailscale_available_sync(cancel)
+        let tunnel_available = crate::server::tunnel::tailscale_probe_sync(cancel)
+            != crate::server::tunnel::TailscaleProbe::Unavailable
             || crate::server::tunnel::check_cloudflared(cancel).is_ok();
         let ips = crate::server::discover_tagged_ips();
         let local_available = !ips.is_empty();
@@ -683,7 +686,8 @@ fn restart_on_funnel(
 ) -> bool {
     let no_tailscale = transport == Some(TunnelTransport::Cloudflare);
     !crate::server::tunnel::skips_tailscale(no_tailscale, None, None)
-        && crate::server::tunnel::tailscale_available_sync(cancel)
+        && crate::server::tunnel::tailscale_probe_sync(cancel)
+            == crate::server::tunnel::TailscaleProbe::Available
 }
 
 fn link_authority(url: &str) -> Option<&str> {
@@ -1247,7 +1251,16 @@ impl ServeView {
             (TunnelTransport::Tailscale, TransportStatus::FunnelNotEnabled, _) => {
                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
             }
+            (TunnelTransport::Tailscale, TransportStatus::TimedOut, TransportStatus::Ready) => {
+                "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
+            }
+            (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
+                "Tailscale didn't answer in time; press R to retry."
+            }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
+            (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
+                "cloudflared isn't installed; press R to retry Tailscale."
+            }
             (TunnelTransport::Cloudflare, ..) => "cloudflared isn't installed; pick Tailscale.",
         };
         *flash = Some((rejection.to_string(), Instant::now()));

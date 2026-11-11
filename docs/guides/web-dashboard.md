@@ -27,6 +27,12 @@ aoe serve --remote --read-only  # Monitor without sending keystrokes
 
 From the TUI, press `R` (`Ctrl+R` with strict hotkeys), shown as `R Web` in the shortcut bar, to open Connections, then Enter on **Web dashboard** to start a background server on your network or over a tunnel. While it runs, the entry reads `R ● Web` in green. When the Daemon needs attention, the entry shows that instead, in red for a problem (`R ● Runtime outcome unknown`) or dim for a limit (`R ● Unavailable`), and Connections lists the Daemon with what it means. If the Daemon goes offline, Connections replaces the home screen, with `r` to reconnect.
 
+Connections also replaces the home screen when the local Daemon answers but can't be used, and the Daemon row gives the state:
+
+- **Outdated**: the Daemon predates your aoe upgrade. `r` restarts it in place, as `aoe serve --restart` would, then reconnects. Under `--no-autostart` the dialog shows that command instead, and for a Daemon aoe didn't start it says to restart it from its terminal or service manager; in both cases `r` checks again.
+- **Restarting**: the restart is running, with its progress. `q` waits for it; `Ctrl+C` still quits.
+- **Restart failed**: the dialog shows the error, and `r` reconnects to check where the Daemon stands.
+
 The Daemon prints a URL carrying an auth token. Open it in a browser; the token becomes a cookie on first visit.
 
 When a poll expires, the dashboard aborts its request and shows the server as

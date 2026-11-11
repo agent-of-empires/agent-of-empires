@@ -194,6 +194,9 @@ pub struct ReplayQuery {
     /// Optional projection selector.
     #[serde(default)]
     pub view: Option<String>,
+    /// Required retained snapshot identity after the first page.
+    #[serde(default)]
+    pub history_identity: Option<String>,
 }
 
 /// `GET /api/sessions/{id}/acp/replay` response.
@@ -223,6 +226,9 @@ pub struct ReplayResponse {
     /// `frames`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<crate::acp::transcript::TranscriptRow>>,
+    /// Content identity for `view=retained`, including empty histories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_identity: Option<String>,
 }
 
 /// `GET /api/sessions/{id}/acp/files` response.
