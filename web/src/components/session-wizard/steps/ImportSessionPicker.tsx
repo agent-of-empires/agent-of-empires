@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { hasFinePointer } from "../../../lib/platform";
 import { listImportableSessions, type ImportableSessionsResult } from "../../../lib/api";
 import { safeGetItem, safeSetItem } from "../../../lib/safeStorage";
 import type { ImportableSession } from "../../../lib/types";
@@ -86,6 +87,7 @@ export function ImportSessionPicker({
   return (
     <div className="flex flex-col gap-2">
       <select
+        autoFocus={hasFinePointer()}
         value={agent}
         onChange={(e) => pickAgent(e.target.value)}
         aria-label="Agent to import from"

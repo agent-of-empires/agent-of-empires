@@ -250,6 +250,7 @@ test.describe("import session", () => {
     const w = wizard(page);
     await w.getByRole("button", { name: "Import session", exact: true }).click();
     const agent = w.getByLabel("Agent to import from");
+    await expect(agent).toBeFocused();
     await expect(agent).toHaveValue("claude");
     await agent.selectOption("pi");
     await w.getByRole("button").filter({ hasText: "Refactor the parser" }).click();
