@@ -256,8 +256,11 @@ pub(super) async fn run_connection_task<W, R>(
                             .ingress
                             .notification(notification, wire_bytes)
                             .await?;
-                        if let Some((notification, _guard)) = admitted {
-                            shared.handle_notification(notification, true).await;
+                        match admitted {
+                            Some((notification, _guard)) => {
+                                shared.handle_notification(notification, true).await;
+                            }
+                            None => shared.settle_discarded().await,
                         }
                         Ok(())
                     }

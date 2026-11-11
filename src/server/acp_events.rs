@@ -1130,7 +1130,8 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
         | Event::ToolCallStarted { .. }
         | Event::Stopped { .. }
         | Event::AgentStartupError { .. }
-        | Event::IncompatibleAgent { .. } => Some(StatusPolicy::Authoritative),
+        | Event::IncompatibleAgent { .. }
+        | Event::IntegrationLost { .. } => Some(StatusPolicy::Authoritative),
         Event::BackgroundAgentLaunched { .. }
         | Event::BackgroundTaskStarted { .. }
         | Event::BackgroundAgentProgress {
