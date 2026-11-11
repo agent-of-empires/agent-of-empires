@@ -9,14 +9,19 @@ const VALID: &str = r####"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"later"},"_meta":{"aoe":{"v":1,"key":"tail-1","after_adapter_sequence":2,"ephemeral":true}}}}}
 "####;
 
+const NO_HELLO: &str = r####"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":1,"key":"call-t1"}}}}}
+"####;
+
 const INVALID: &str = r####"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"_meta":{"aoe":{"proxy":{"plugin_id":"example.plugin","protocol_version":9,"primitive_schema_version":1}}}}}
 {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Task","_meta":{"aoe":{"v":1}}}}}
 "####;
 
-fn lint(stream: &str) -> (Option<i32>, String) {
+fn lint(stream: &str, flags: &[&str]) -> (Option<i32>, String) {
     let home = tempfile::tempdir().expect("temp home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_aoe"))
-        .args(["acp", "lint-stream", "--require-hello", "-"])
+        .args(["acp", "lint-stream"])
+        .args(flags)
+        .arg("-")
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .stdin(Stdio::piped())
@@ -38,10 +43,16 @@ fn lint(stream: &str) -> (Option<i32>, String) {
 
 #[test]
 fn exit_code_follows_the_findings() {
-    let (code, stdout) = lint(VALID);
+    let (code, stdout) = lint(VALID, &["--require-hello"]);
     assert_eq!((code, stdout.as_str()), (Some(0), ""));
 
-    let (code, stdout) = lint(INVALID);
+    let (code, stdout) = lint(NO_HELLO, &[]);
+    assert_eq!((code, stdout.as_str()), (Some(0), ""));
+    let (code, stdout) = lint(NO_HELLO, &["--require-hello"]);
+    assert_eq!(code, Some(1));
+    assert!(stdout.contains("hello_missing"), "{stdout}");
+
+    let (code, stdout) = lint(INVALID, &["--require-hello"]);
     assert_eq!(code, Some(1));
     assert!(stdout.contains("invalid_hello"), "{stdout}");
     assert!(stdout.contains("bad_envelope"), "{stdout}");
