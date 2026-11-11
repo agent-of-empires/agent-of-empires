@@ -31,11 +31,11 @@ async fn retained_source_snapshot_does_not_block_publication_and_rejects_stale_i
         .recv_timeout(deadline)
         .expect("source reader must establish its snapshot");
     let (tx, mut broadcasts) = tokio::sync::broadcast::channel(4);
-    let sink = ChannelSink {
+    let sink = ChannelSink::new(
         tx,
-        event_store: Arc::clone(&store),
-        control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    };
+        Arc::clone(&store),
+        Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+    );
     let (done, completed) = mpsc::channel();
     let writer_id = id.clone();
     let writer = std::thread::spawn(move || {
