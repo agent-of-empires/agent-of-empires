@@ -29,8 +29,8 @@
 
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
-    AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, DiffPreview, ModeInfo,
-    PlanStepStatus, SessionNotice, SessionUsage,
+    AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, ConfigOptionSwitchFailure,
+    DiffPreview, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -70,6 +70,9 @@ pub struct AcpTranscript {
     /// Agent-advertised config options; the `model_config` on/off ones (Fast
     /// mode, Ultracode) drive the `t` toggle picker and the status line.
     pub config_options: Vec<ConfigOptionDescriptor>,
+    /// The adapter's latest rejection of a config-option pick, until a
+    /// snapshot confirms the value.
+    pub config_option_switch_failed: Option<ConfigOptionSwitchFailure>,
     /// Auth identity the agent reported for itself. `None` when it never
     /// reported, which renders as nothing rather than as logged out.
     pub auth_status: Option<AuthStatus>,
@@ -225,6 +228,7 @@ impl AcpTranscript {
             current_mode: None,
             available_modes: Vec::new(),
             config_options: Vec::new(),
+            config_option_switch_failed: None,
             auth_status: None,
             available_commands: Vec::new(),
             locally_resolved: Vec::new(),
@@ -344,6 +348,7 @@ impl AcpTranscript {
         if !holds("config_options") {
             self.config_options = state.config_options;
         }
+        self.config_option_switch_failed = state.config_option_switch_failed;
         self.session_notices = state.session_notices;
         self.current_mode = state.current_mode_id;
         self.auth_status = state.auth_status;
