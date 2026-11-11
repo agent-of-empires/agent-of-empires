@@ -234,26 +234,27 @@ impl Shared {
     }
 
     async fn handle_ingested(&self, ingested: Ingested) {
-        match ingested {
-            Ingested::Deliver(frames) => {
-                for frame in frames {
-                    self.handle_adapter_notification(
-                        frame.notification,
-                        frame.local_prompt_signals,
-                        frame.epoch,
-                    )
-                    .await;
-                }
-            }
-            Ingested::Lost(reason) => {
-                tracing::warn!(
-                    target: "acp.protocol",
-                    session = %self.session_label,
-                    ?reason,
-                    "agent integration lost; ignoring further frames"
-                );
-                self.emit(Event::IntegrationLost { reason }).await;
-            }
+        let (frames, lost) = match ingested {
+            Ingested::Deliver(frames) => (frames, None),
+            Ingested::Lost(reason) => (Vec::new(), Some(reason)),
+            Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
+        };
+        for frame in frames {
+            self.handle_adapter_notification(
+                frame.notification,
+                frame.local_prompt_signals,
+                frame.epoch,
+            )
+            .await;
+        }
+        if let Some(reason) = lost {
+            tracing::warn!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                ?reason,
+                "agent integration lost; ignoring further frames"
+            );
+            self.emit(Event::IntegrationLost { reason }).await;
         }
     }
 

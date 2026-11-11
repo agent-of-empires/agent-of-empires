@@ -32,6 +32,9 @@ pub(super) enum Ingested {
     Deliver(Vec<Delivered>),
     /// A proxied agent broke the contract: stop interpreting its frames.
     Lost(IntegrationLostReason),
+    /// The break came partway through a released batch: the frames before it
+    /// arrived first, so they are processed before the loss.
+    DeliverThenLost(Vec<Delivered>, IntegrationLostReason),
 }
 
 /// Strictness depends on the hello: an agent that proved it is proxied is held
@@ -156,7 +159,12 @@ impl AoeIngress {
                 .filter(|_| frame.admit_leases)
             {
                 if self.leases.apply(lease, now_ms).is_err() && proxied {
-                    return self.lose(IntegrationLostReason::LeaseOverflow);
+                    return match self.lose(IntegrationLostReason::LeaseOverflow) {
+                        Ingested::Lost(reason) if !deliver.is_empty() => {
+                            Ingested::DeliverThenLost(deliver, reason)
+                        }
+                        lost => lost,
+                    };
                 }
             }
             if frame.envelope.as_ref().and_then(|e| e.ephemeral) == Some(true) {
@@ -423,6 +431,40 @@ mod tests {
         assert!(!i.leases.any_live(1), "no historical lease is taken");
         ids(i.ingest(frame("live", lease("new", None)), true, 0, 1));
         assert!(i.leases.working(2), "a live lease after the load applies");
+    }
+
+    #[test]
+    fn frames_released_before_a_lease_overflow_are_still_delivered() {
+        use crate::acp::aoe_meta::lease::MAX_LEASES;
+        let i = ingress(true);
+        let lease = |key: String, anchor: Option<u64>| {
+            let mut aoe = json!({"v":1,"key":key,"lease":{"id":key,"kind":"task","ttl_ms":60000}});
+            if let Some(n) = anchor {
+                aoe["after_adapter_sequence"] = json!(n);
+            }
+            aoe
+        };
+        for n in 0..MAX_LEASES {
+            ids(i.ingest(frame("l", lease(format!("l{n}"), None)), true, 0, 0));
+        }
+        let next = MAX_LEASES as u64 + 1;
+        let plain_tailer = json!({"v":1,"key":"plain","after_adapter_sequence":next});
+        assert!(ids(i.ingest(frame("tail", plain_tailer), true, 0, 0)).is_empty());
+        let over = lease("over".into(), Some(next));
+        assert!(ids(i.ingest(frame("over", over), true, 0, 0)).is_empty());
+        let Ingested::DeliverThenLost(frames, IntegrationLostReason::LeaseOverflow) =
+            i.ingest(frame("f", json!(null)), true, 0, 0)
+        else {
+            panic!("expected the batch before the overflow, then the loss");
+        };
+        let delivered: Vec<_> = frames
+            .iter()
+            .map(|d| match &d.notification.update {
+                SessionUpdate::ToolCall(tc) => tc.tool_call_id.0.to_string(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(delivered, ["f", "tail"]);
     }
 
     #[test]
