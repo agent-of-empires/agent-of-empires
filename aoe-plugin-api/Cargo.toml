@@ -1,6 +1,6 @@
 [package]
 name = "aoe-plugin-api"
-version = "1.22.3"
+version = "1.23.0"
 edition = "2021"
 rust-version = "1.89"
 publish = false

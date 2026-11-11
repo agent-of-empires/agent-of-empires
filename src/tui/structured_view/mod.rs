@@ -74,7 +74,10 @@ pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
     let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
 
     run(
-        guard.terminal.as_mut().expect("standalone terminal initialized"),
+        guard
+            .terminal
+            .as_mut()
+            .expect("standalone terminal initialized"),
         &mut event_stream,
         &theme,
         session_id,
@@ -669,6 +672,7 @@ async fn handle_terminal_event(
             | Intent::ChoicePick(_)
             | Intent::ChoiceAccept
             | Intent::SubmitPrompt
+            | Intent::StopSubagent
             | Intent::OpenModePicker
     ) && !state.interaction_presented()
     {
@@ -943,6 +947,42 @@ async fn handle_terminal_event(
                     state,
                     toast_deadline,
                     format!("cancel failed: {e}"),
+                    ToastKind::Error,
+                ),
+            }
+            Ok(false)
+        }
+        Intent::StopSubagent => {
+            let Some(target) = state.transcript.stoppable_subagent() else {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    "no stoppable subagent".into(),
+                    ToastKind::Info,
+                );
+                return Ok(false);
+            };
+            let child_id = target.session_id.clone();
+            let label = target
+                .title
+                .clone()
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| child_id.chars().take(8).collect());
+            match state
+                .http
+                .cancel_subagent(&state.session_id, &child_id)
+                .await
+            {
+                Ok(()) => set_toast(
+                    state,
+                    toast_deadline,
+                    format!("stop sent to subagent: {label}"),
+                    ToastKind::Info,
+                ),
+                Err(e) => set_toast(
+                    state,
+                    toast_deadline,
+                    format!("stop subagent failed: {e}"),
                     ToastKind::Error,
                 ),
             }

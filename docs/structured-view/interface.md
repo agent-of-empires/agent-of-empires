@@ -46,6 +46,7 @@ The view opens with the composer ready. The transcript stays scrollable from the
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard |
 | Any         | `Ctrl+X`        | Clear every queued prompt |
+| Any         | `Ctrl+T`        | Stop the newest running subagent; the turn continues |
 
 Approval keys resolve only while the approval card has focus, so typing "always allow" into the composer can never approve a tool.
 

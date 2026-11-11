@@ -13,7 +13,7 @@ use super::agents::log_wrapper_substitution;
 use super::launch::{
     admit_stored_row, apply_claude_store_pin, apply_declared_config_dir,
     await_resume_to_completion, before_session_env, discovery_key, overlay_env, publish_rejection,
-    refresh_spawn_model_effort, resolve_mcp_servers,
+    refresh_spawn_model_effort, resolve_mcp_servers, McpPaths,
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
@@ -750,9 +750,12 @@ impl<S: BroadcastSink> Drain<S> {
     async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {
         let agent = config.agent_key.clone();
         let profile = config.source_profile.clone().unwrap_or_default();
-        let cwd = config.cwd.clone();
+        let config_path = config.config_path.clone();
         let resolved = tokio::task::spawn_blocking(move || {
-            crate::session::config::repo_config::resolve_config_with_repo_or_warn(&profile, &cwd)
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+                &profile,
+                &config_path,
+            )
         })
         .await;
         match &resolved {
@@ -819,7 +822,10 @@ impl<S: BroadcastSink> Drain<S> {
             discovery_key(config.sandbox_info.is_some(), &config.agent_key, native),
             session_id,
             config.source_profile.clone(),
-            config.cwd.clone(),
+            McpPaths {
+                cwd: config.cwd.clone(),
+                config_path: config.config_path.clone(),
+            },
             config.host_environment.clone(),
             claude_config_dir,
             "MCP re-resolution on respawn failed",
@@ -2423,6 +2429,43 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["home"]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn respawn_forwards_a_workspace_launch_repo_project_mcp_servers() {
+        let (_home, temp) = isolate_home();
+        let _env = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let repo = temp.path().join("repo");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            repo.join(".mcp.json"),
+            r#"{ "mcpServers": { "project-only": { "command": "pl" } } }"#,
+        )
+        .unwrap();
+        let servers = crate::session::mcp::project_mcp::load_project_mcp_servers(&repo).unwrap();
+        let hash = crate::session::mcp::project_mcp::fingerprint(&servers);
+        crate::session::config::repo_config::trust_repo(&repo, None, Some(&hash)).unwrap();
+
+        let mut config = runner_config(worker_registry::socket_path_for("s-ws-mcp").unwrap());
+        config.cwd = workspace;
+        config.config_path = repo;
+        config.base_host_environment = vec![("HOME".into(), temp.path().display().to_string())];
+        config.host_environment = config.base_host_environment.clone();
+
+        Drain::<VecSink>::refresh_launch_env("s-ws-mcp", &mut config).await;
+
+        let forwarded = serde_json::to_value(&config.mcp_servers).unwrap();
+        assert!(
+            forwarded
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|server| server["name"] == "project-only"),
+            "{forwarded}"
+        );
     }
 
     #[tokio::test]

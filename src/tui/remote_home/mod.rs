@@ -133,7 +133,10 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
 
     run(
-        guard.terminal.as_mut().expect("standalone terminal initialized"),
+        guard
+            .terminal
+            .as_mut()
+            .expect("standalone terminal initialized"),
         &mut event_stream,
         &theme,
         endpoint,

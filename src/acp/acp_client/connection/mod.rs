@@ -10,6 +10,7 @@ mod command_loop;
 mod establish;
 mod notifications;
 mod prompt;
+mod subagents;
 #[cfg(test)]
 mod tests;
 
@@ -18,8 +19,9 @@ use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::state::Event;
 use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
-    CreateTerminalResponse, ElicitationScope, KillTerminalRequest, KillTerminalResponse, McpServer,
-    ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
+    CreateTerminalResponse, ElicitationAction, ElicitationScope, KillTerminalRequest,
+    KillTerminalResponse, McpServer, ReadTextFileRequest, ReadTextFileResponse,
+    ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SessionId, TerminalOutputRequest,
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
@@ -41,7 +43,7 @@ use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::{captured_rate_limit_resets_at, classify_rate_limit_from_message};
-use super::session_identity::{SessionIngress, SessionIngressNotification};
+use super::session_identity::{RequestPolicy, SessionIngress, SessionIngressNotification};
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
@@ -112,11 +114,11 @@ macro_rules! resource_requests {
                 let res = $resources.clone();
                 let ingress = $ingress.clone();
                 builder.on_receive_request(
-                    move |request: $req, responder: Responder<$resp>, _conn| {
+                    move |request: $req, responder: Responder<$resp>, _conn: ConnectionTo<Agent>| {
                         let (res, ingress) = (res.clone(), ingress.clone());
                         async move {
                             // A foreign session's callback performs no effect.
-                            let _guard = match ingress.request(&request.session_id).await {
+                            let _guard = match ingress.request(&request.session_id, RequestPolicy::ParentOnly).await {
                                 Ok(guard) => guard,
                                 Err(error) => return reply(responder, Err(error)),
                             };
@@ -254,8 +256,11 @@ pub(super) async fn run_connection_task<W, R>(
                             .ingress
                             .notification(notification, wire_bytes)
                             .await?;
-                        if let Some((notification, _guard)) = admitted {
-                            shared.handle_notification(notification, true).await;
+                        match admitted {
+                            Some((notification, _guard)) => {
+                                shared.handle_notification(notification, true).await;
+                            }
+                            None => shared.settle_discarded().await,
                         }
                         Ok(())
                     }
@@ -269,22 +274,47 @@ pub(super) async fn run_connection_task<W, R>(
                 let pending = pending_responders.clone();
                 move |request: RequestPermissionRequest,
                       responder: Responder<RequestPermissionResponse>,
-                      _conn| {
+                      conn: ConnectionTo<Agent>| {
                     let (shared, pending) = (shared.clone(), pending.clone());
                     async move {
-                        let _guard = match shared.ingress.request(&request.session_id).await {
-                            Ok(guard) => guard,
-                            Err(error) => return reply(responder, Err(error)),
-                        };
-                        let outcome = handle_permission_request(
-                            request,
-                            shared.event_tx.clone(),
-                            pending,
-                            profile,
-                            shared.tool_context_cache.clone(),
-                        )
-                        .await;
-                        reply(responder, outcome)
+                        // The wait on the human must not block the dispatch loop.
+                        conn.spawn(async move {
+                            let guard = match shared
+                                .ingress
+                                .request(&request.session_id, RequestPolicy::ParentOrChild)
+                                .await
+                            {
+                                Ok(guard) => guard,
+                                Err(error) => return reply(responder, Err(error)),
+                            };
+                            let _parked = shared.ingress.park();
+                            let session_id = request.session_id.clone();
+                            let outcome = handle_permission_request(
+                                request,
+                                shared.event_tx.clone(),
+                                pending,
+                                profile,
+                                shared.tool_context_cache.clone(),
+                                Some(guard),
+                            )
+                            .await;
+                            // The fence was released across the wait, so a reset
+                            // in between must not turn into an approval.
+                            let outcome = if shared
+                                .ingress
+                                .still_admitted(&session_id, RequestPolicy::ParentOrChild)
+                            {
+                                outcome
+                            } else {
+                                outcome.map(|_| {
+                                    RequestPermissionResponse::new(
+                                        RequestPermissionOutcome::Cancelled,
+                                    )
+                                })
+                            };
+                            reply(responder, outcome)
+                        })?;
+                        Ok(())
                     }
                 }
             },
@@ -296,22 +326,43 @@ pub(super) async fn run_connection_task<W, R>(
                 let ingress = ingress.clone();
                 move |request: CreateElicitationRequest,
                       responder: Responder<CreateElicitationResponse>,
-                      _conn| {
+                      conn: ConnectionTo<Agent>| {
                     let (event_tx, pending) = (event_tx.clone(), pending_responders.clone());
                     let ingress = ingress.clone();
                     async move {
-                        // Only a session-scoped elicitation carries an identity
-                        // to fence on.
-                        let _guard = if let ElicitationScope::Session(scope) = request.scope() {
-                            match ingress.request(&scope.session_id).await {
-                                Ok(guard) => Some(guard),
-                                Err(error) => return reply(responder, Err(error)),
-                            }
-                        } else {
-                            None
-                        };
-                        let outcome = handle_elicitation_request(request, event_tx, pending).await;
-                        reply(responder, outcome)
+                        // The wait on the human must not block the dispatch loop.
+                        conn.spawn(async move {
+                            // Only a session-scoped elicitation carries an identity
+                            // to fence on.
+                            let (session_id, guard) =
+                                if let ElicitationScope::Session(scope) = request.scope() {
+                                    match ingress
+                                        .request(&scope.session_id, RequestPolicy::ParentOrChild)
+                                        .await
+                                    {
+                                        Ok(guard) => (Some(scope.session_id.clone()), Some(guard)),
+                                        Err(error) => return reply(responder, Err(error)),
+                                    }
+                                } else {
+                                    (None, None)
+                                };
+                            let _parked = guard.as_ref().map(|_| ingress.park());
+                            let outcome =
+                                handle_elicitation_request(request, event_tx, pending, guard).await;
+                            let outcome = match session_id {
+                                Some(id)
+                                    if !ingress
+                                        .still_admitted(&id, RequestPolicy::ParentOrChild) =>
+                                {
+                                    outcome.map(|_| {
+                                        CreateElicitationResponse::new(ElicitationAction::Cancel)
+                                    })
+                                }
+                                _ => outcome,
+                            };
+                            reply(responder, outcome)
+                        })?;
+                        Ok(())
                     }
                 }
             },

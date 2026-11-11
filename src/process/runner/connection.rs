@@ -301,6 +301,10 @@ pub(super) async fn handle_control_connection(
                 }
                 continue;
             }
+            ControlBody::CancelSession { session_id } => {
+                shared.agent_cancel(&agent_stdin, &session_id).await;
+                continue;
+            }
             ControlBody::ServerResult { call_id, result } => {
                 shared
                     .resolve_server_call(

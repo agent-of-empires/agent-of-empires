@@ -1,6 +1,6 @@
 //! ACP structured-view CLI subcommands.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 
 use crate::acp::agent_registry::AgentRegistry;
@@ -38,6 +38,19 @@ pub enum AcpCommands {
     },
     /// List configured agents (claude-code, aoe-agent, etc.).
     Agents,
+    /// Check a recorded agent-to-client NDJSON stream (one JSON-RPC frame per
+    /// line) against the `_meta.aoe` primitive contract. Exits 1 on any
+    /// finding, so a plugin can run it in CI.
+    LintStream {
+        /// NDJSON file, or `-` for stdin.
+        path: String,
+        /// Emit findings as JSON instead of a human report.
+        #[arg(long)]
+        json: bool,
+        /// Fail a stream with no `_meta.aoe.proxy` hello.
+        #[arg(long)]
+        require_hello: bool,
+    },
     /// Internal: trap for `aoe acp ps`, removed in favour of the unified
     /// `aoe ps --acp`. Redirects rather than 404ing on an unknown subcommand.
     /// Hidden from help.
@@ -236,6 +249,11 @@ pub async fn run(command: AcpCommands) -> Result<()> {
             all_adapters,
         } => doctor(json, fix, adapter, all_adapters).await,
         AcpCommands::Agents => agents(),
+        AcpCommands::LintStream {
+            path,
+            json,
+            require_hello,
+        } => lint_stream(&path, json, require_hello),
         AcpCommands::Ps { .. } => ps_trap(),
         AcpCommands::Stop {
             session,
@@ -791,6 +809,28 @@ fn agents() -> Result<()> {
     Ok(())
 }
 
+fn lint_stream(path: &str, json: bool, require_hello: bool) -> Result<()> {
+    use crate::acp::aoe_meta::lint::{lint, LintOptions};
+    let opts = LintOptions { require_hello };
+    let findings = if path == "-" {
+        lint(std::io::stdin().lock(), opts)
+    } else {
+        let file = std::fs::File::open(path).with_context(|| format!("open {path}"))?;
+        lint(std::io::BufReader::new(file), opts)
+    };
+    if json {
+        crate::cli::output::print_json(&findings)?;
+    } else {
+        for f in &findings {
+            println!("line {}: {}: {}", f.line, f.code, f.message);
+        }
+    }
+    if !findings.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 pub(crate) fn ps_trap() -> Result<()> {
     anyhow::bail!(
         "`aoe acp ps` has been removed. Use the unified runtime view:\n  \
@@ -1315,6 +1355,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
         Event::BackgroundAgentProgress { .. } => "background_agent_progress",
         Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
+        Event::SubagentUpdated { .. } => "subagent_updated",
         Event::BackgroundTaskStarted { .. } => "background_task_started",
         Event::BackgroundTaskFinished { .. } => "background_task_finished",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
@@ -1322,6 +1363,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",
+        Event::IntegrationLost { .. } => "integration_lost",
         Event::IncompatibleAgent { .. } => "incompatible_agent",
         Event::UserPromptSent { .. } => "user_prompt_sent",
         Event::UserDiffCommentsPrompt { .. } => "user_diff_comments_prompt",

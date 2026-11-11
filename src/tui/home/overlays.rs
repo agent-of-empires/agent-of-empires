@@ -25,10 +25,7 @@ impl HomeView {
         presented
     }
 
-    pub(in crate::tui) fn acknowledge_confirmation(
-        &mut self,
-        painted: Option<ConfirmationToken>,
-    ) {
+    pub(in crate::tui) fn acknowledge_confirmation(&mut self, painted: Option<ConfirmationToken>) {
         self.presented_confirmation = painted.filter(|token| {
             token.input == self.confirmation_input_revision
                 && (self

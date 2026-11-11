@@ -1,6 +1,6 @@
 [package]
 name = "aoe-settings-derive"
-version = "1.22.3"
+version = "1.23.0"
 edition = "2021"
 publish = false
 description = "Derive macro emitting settings FieldDescriptors from Config sub-structs (#1692)"

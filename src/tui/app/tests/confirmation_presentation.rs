@@ -1,7 +1,9 @@
 use super::*;
 use crate::tui::terminal_output::{
     install_test_output,
-    tests::{block_terminal, drain_terminal, private_terminal, read_terminal_until, resume_terminal},
+    tests::{
+        block_terminal, drain_terminal, private_terminal, read_terminal_until, resume_terminal,
+    },
 };
 use std::fs::File;
 
@@ -34,7 +36,10 @@ fn dialog_open(app: &App, kind: Kind) -> bool {
 
 fn open(app: &mut App, kind: Kind) {
     app.home.handle_key(key(KeyCode::Char('d')), None);
-    assert!(dialog_open(app, kind), "the real delete gesture must open {kind:?}");
+    assert!(
+        dialog_open(app, kind),
+        "the real delete gesture must open {kind:?}"
+    );
 }
 
 fn present(
@@ -50,7 +55,10 @@ fn present(
         if app.home.presentation_ready {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "private App frame did not finish");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "private App frame did not finish"
+        );
     }
     drain_terminal(master, bytes);
 }
@@ -75,7 +83,8 @@ async fn exercise(kind: Kind, stale: Stale) {
     std::fs::create_dir(&project).unwrap();
     let marker = project.join("keep.txt");
     std::fs::write(&marker, b"private resources must survive unseen consent").unwrap();
-    let mut row = crate::session::Instance::new("Private consent target", project.to_str().unwrap());
+    let mut row =
+        crate::session::Instance::new("Private consent target", project.to_str().unwrap());
     row.source_profile = "test".into();
     row.group_path = "Review".into();
     row.status = crate::session::Status::Stopped;
@@ -100,9 +109,11 @@ async fn exercise(kind: Kind, stale: Stale) {
         crate::file_watch::FileWatchService::noop(),
     )
     .unwrap();
-    app.home.session_feed.publish_for_test(
-        crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)),
-    );
+    app.home
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(snapshot),
+        ));
     app.home.apply_session_feed();
     app.home.selected_session = (kind != Kind::Group).then(|| row.id.clone());
     app.home.selected_group = (kind == Kind::Group).then(|| "Review".into());
@@ -158,7 +169,10 @@ async fn exercise(kind: Kind, stale: Stale) {
         Stale::Unseen => {}
         Stale::Replaced => {
             app.home.handle_key(key(KeyCode::Esc), None);
-            assert!(!dialog_open(&app, kind), "Cancel must work while output is blocked");
+            assert!(
+                !dialog_open(&app, kind),
+                "Cancel must work while output is blocked"
+            );
             open(&mut app, kind);
         }
         Stale::ChangedOptions => {
@@ -189,13 +203,29 @@ async fn exercise(kind: Kind, stale: Stale) {
             assert!(app.home.info_dialog.is_none());
         }
     }
-    let submit = if kind == Kind::Group { KeyCode::Enter } else { KeyCode::Char('y') };
+    let submit = if kind == Kind::Group {
+        KeyCode::Enter
+    } else {
+        KeyCode::Char('y')
+    };
     app.home.handle_key(key(submit), None);
-    assert!(!dispatched(), "{kind:?}/{stale:?}: unseen consent dispatched a mutation");
-    assert_eq!(serde_json::to_value(storage.load().unwrap()).unwrap(), before);
+    assert!(
+        !dispatched(),
+        "{kind:?}/{stale:?}: unseen consent dispatched a mutation"
+    );
+    assert_eq!(
+        serde_json::to_value(storage.load().unwrap()).unwrap(),
+        before
+    );
     assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
-    assert_eq!(std::fs::read(&marker).unwrap(), b"private resources must survive unseen consent");
-    assert!(dialog_open(&app, kind), "refused consent must remain safely cancellable");
+    assert_eq!(
+        std::fs::read(&marker).unwrap(),
+        b"private resources must survive unseen consent"
+    );
+    assert!(
+        dialog_open(&app, kind),
+        "refused consent must remain safely cancellable"
+    );
     app.home.handle_key(key(KeyCode::Esc), None);
     assert!(!dialog_open(&app, kind));
     assert!(!dispatched());
@@ -207,13 +237,21 @@ async fn exercise(kind: Kind, stale: Stale) {
     crate::tui::terminal_output::request_redraw();
     present(&mut app, &mut terminal, &mut master, &mut emitted);
     app.home.handle_key(key(submit), None);
-    assert!(dispatched(), "{kind:?}/{stale:?}: visible confirmation became a dead end");
+    assert!(
+        dispatched(),
+        "{kind:?}/{stale:?}: visible confirmation became a dead end"
+    );
 }
 
 #[tokio::test]
 #[serial_test::serial]
 async fn home_destructive_consent_trash_requires_presented_semantics() {
-    for stale in [Stale::Unseen, Stale::Replaced, Stale::ChangedOptions, Stale::Covered] {
+    for stale in [
+        Stale::Unseen,
+        Stale::Replaced,
+        Stale::ChangedOptions,
+        Stale::Covered,
+    ] {
         exercise(Kind::Trash, stale).await;
     }
 }
@@ -221,7 +259,12 @@ async fn home_destructive_consent_trash_requires_presented_semantics() {
 #[tokio::test]
 #[serial_test::serial]
 async fn home_destructive_consent_permanent_delete_requires_presented_semantics() {
-    for stale in [Stale::Unseen, Stale::Replaced, Stale::ChangedOptions, Stale::Covered] {
+    for stale in [
+        Stale::Unseen,
+        Stale::Replaced,
+        Stale::ChangedOptions,
+        Stale::Covered,
+    ] {
         exercise(Kind::Permanent, stale).await;
     }
 }
@@ -229,7 +272,12 @@ async fn home_destructive_consent_permanent_delete_requires_presented_semantics(
 #[tokio::test]
 #[serial_test::serial]
 async fn home_destructive_consent_group_delete_requires_presented_semantics() {
-    for stale in [Stale::Unseen, Stale::Replaced, Stale::ChangedOptions, Stale::Covered] {
+    for stale in [
+        Stale::Unseen,
+        Stale::Replaced,
+        Stale::ChangedOptions,
+        Stale::Covered,
+    ] {
         exercise(Kind::Group, stale).await;
     }
 }

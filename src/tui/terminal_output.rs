@@ -41,7 +41,9 @@ pub(super) fn next_interaction_revision() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut current = NEXT.load(Ordering::Relaxed);
     loop {
-        let revision = current.checked_add(1).expect("interaction identity overflow");
+        let revision = current
+            .checked_add(1)
+            .expect("interaction identity overflow");
         match NEXT.compare_exchange_weak(current, revision, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => return revision,
             Err(observed) => current = observed,

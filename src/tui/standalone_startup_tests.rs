@@ -48,16 +48,34 @@ fn startup_case(test: &str, remote: bool, unwind: bool) {
                     entered = true;
                     panic!("controlled unwind while the standalone entrypoint owns raw input");
                 } else {
-                    assert!(startup.await.is_err(), "read-only output must refuse startup");
+                    assert!(
+                        startup.await.is_err(),
+                        "read-only output must refuse startup"
+                    );
                 }
             });
         }));
         assert_eq!(result.is_err(), unwind);
-        assert!(!unwind || entered, "the real entrypoint must reach raw-mode ownership");
+        assert!(
+            !unwind || entered,
+            "the real entrypoint must reach raw-mode ownership"
+        );
         let after = modes(0);
         assert_eq!(
-            (after.c_iflag, after.c_oflag, after.c_cflag, after.c_lflag, after.c_cc),
-            (before.c_iflag, before.c_oflag, before.c_cflag, before.c_lflag, before.c_cc),
+            (
+                after.c_iflag,
+                after.c_oflag,
+                after.c_cflag,
+                after.c_lflag,
+                after.c_cc
+            ),
+            (
+                before.c_iflag,
+                before.c_oflag,
+                before.c_cflag,
+                before.c_lflag,
+                before.c_cc
+            ),
             "standalone startup must restore input on errors and unwind"
         );
         return;
@@ -71,14 +89,20 @@ fn startup_case(test: &str, remote: bool, unwind: bool) {
     settings.c_iflag |= libc::ICRNL | libc::IXON;
     settings.c_oflag |= libc::OPOST;
     // SAFETY: only this case owns the private PTY.
-    assert_eq!(unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &settings) }, 0);
+    assert_eq!(
+        unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &settings) },
+        0
+    );
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env(CHILD, test)
         .env("HOME", home.path())
         .env("XDG_CONFIG_HOME", home.path())
-        .env("AOE_DAEMON_URL", format!("http://{}", listener.local_addr().unwrap()))
+        .env(
+            "AOE_DAEMON_URL",
+            format!("http://{}", listener.local_addr().unwrap()),
+        )
         .env("AOE_DAEMON_TOKEN", "startup-fixture-token")
         .env_remove("AOE_DAEMON_PASSPHRASE")
         .env_remove("TMUX")

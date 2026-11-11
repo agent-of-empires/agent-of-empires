@@ -1,4 +1,4 @@
-import { useId, useRef, type ReactNode } from "react";
+import { useId, useRef, type ReactNode, type Ref } from "react";
 import { Toggle } from "./steps/Toggle";
 
 const ROW = "flex items-center gap-3 min-h-[44px] md:min-h-[36px] px-3 border-b border-surface-700/30 last:border-b-0";
@@ -131,6 +131,7 @@ export function SegmentedRow<T extends string>({
   onChange,
   summary,
   testId,
+  groupRef,
 }: {
   label: string;
   options: SegmentOption<T>[];
@@ -138,6 +139,7 @@ export function SegmentedRow<T extends string>({
   onChange: (value: T) => void;
   summary: ReactNode;
   testId?: string;
+  groupRef?: Ref<HTMLDivElement>;
 }) {
   const refs = useRef<(HTMLButtonElement | null)[]>([]);
   const summaryId = useId();
@@ -163,6 +165,7 @@ export function SegmentedRow<T extends string>({
         {summary}
       </span>
       <div
+        ref={groupRef}
         role="radiogroup"
         aria-label={label}
         aria-describedby={summaryId}

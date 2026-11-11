@@ -1815,6 +1815,19 @@ export async function acpDisable(
   }
 }
 
+/** Stop one subagent without ending the root turn. Resolves to an error message, or null on success. */
+export async function cancelSubagent(sessionId: string, childId: string): Promise<string | null> {
+  const url = `/api/sessions/${encodeURIComponent(sessionId)}/acp/subagents/${encodeURIComponent(childId)}/cancel`;
+  try {
+    const res = await fetch(url, { method: "POST" });
+    if (res.ok) return null;
+    const detail = (await res.text().catch(() => "")).slice(0, 200);
+    return `Could not stop subagent (${res.status}). ${detail}`.trim();
+  } catch (e) {
+    return `Network error stopping subagent: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 // The daemon owns the structured-view prompt queue; /queue reads it on demand.
 // Queued follow-ups survive client reloads and drain server-side.
 
@@ -2019,11 +2032,19 @@ export async function fetchAgents(profile?: string): Promise<AgentInfo[] | null>
   return Array.isArray(agents) ? agents : null;
 }
 
-/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes. */
-export async function fetchProfileAgents(profile?: string): Promise<AgentInfo[] | "profile_not_found" | null> {
-  const query = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+/** Like `fetchAgents`, but says when the Daemon has no such profile, which no retry fixes.
+ *  With a `project`, `acp_create_ready` also counts that project's repository config and hooks. */
+export async function fetchProfileAgents(
+  profile?: string,
+  project?: { path: string; scratch: boolean },
+): Promise<AgentInfo[] | "profile_not_found" | null> {
+  const params = new URLSearchParams();
+  if (profile) params.set("profile", profile);
+  if (project?.scratch) params.set("scratch", "true");
+  else if (project?.path) params.set("path", project.path);
+  const query = params.toString();
   try {
-    const res = await fetch(`/api/agents${query}`);
+    const res = await fetch(`/api/agents${query ? `?${query}` : ""}`);
     if (res.ok) return (await res.json()) as AgentInfo[];
     if (res.status !== 404) return null;
     const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
