@@ -289,6 +289,17 @@ pub(super) async fn establish(
     Ok(Some(session))
 }
 
+/// A live busy or task lease holds the turn open however long the agent is
+/// silent; the grace counts again once it expires.
+fn resume_idle_expired(
+    idle_ms: i64,
+    grace_ms: i64,
+    leases: &aoe_meta::lease::LeaseTable,
+    now: i64,
+) -> bool {
+    idle_ms >= grace_ms && !leases.working(now)
+}
+
 /// Fallback when an adopted turn neither completes nor shows activity, so the
 /// UI cannot stay "thinking" forever. Once the turn is observable, completion
 /// belongs to the between-prompt watchdog.
@@ -311,8 +322,9 @@ fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
                 );
                 return;
             }
-            let idle_ms = now_ms() - shared.last_event_at.load(Ordering::Relaxed);
-            if idle_ms >= grace_ms {
+            let now = now_ms();
+            let idle_ms = now - shared.last_event_at.load(Ordering::Relaxed);
+            if resume_idle_expired(idle_ms, grace_ms, &shared.aoe.leases, now) {
                 if shared.terminal_claim.claim() {
                     info!(
                         target: "acp.protocol",
@@ -759,6 +771,37 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_silent_lease_holds_the_resume_idle_stop_until_it_expires() {
+        use aoe_meta::{LeaseKind, LeaseOp, LeaseVerb};
+        let leases = aoe_meta::lease::LeaseTable::default();
+        let acquire = LeaseOp {
+            id: "bg".into(),
+            kind: LeaseKind::Busy,
+            op: LeaseVerb::Acquire,
+            ttl_ms: Some(60_000),
+        };
+        leases.apply(&acquire, 0).unwrap();
+        // (now, idle since the lease frame, stop expected); grace is 30s.
+        for (now, idle, stop) in [
+            (31_000, 31_000, false),
+            (59_999, 59_999, false),
+            (60_000, 60_000, true),
+        ] {
+            assert_eq!(
+                resume_idle_expired(idle, 30_000, &leases, now),
+                stop,
+                "{now}"
+            );
+        }
+        assert!(resume_idle_expired(
+            30_000,
+            30_000,
+            &Default::default(),
+            30_000
+        ));
+    }
 
     #[test]
     fn reset_reasons_follow_prior_conversation() {
