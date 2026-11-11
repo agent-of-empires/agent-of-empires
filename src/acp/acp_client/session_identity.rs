@@ -165,6 +165,14 @@ struct IdentityState {
     pending: Option<Establishment>,
     generation: u64,
     failed: bool,
+    /// Adapter frames dropped for another session id. They still hold a
+    /// position in the proxy's connection-wide numbering.
+    discarded_adapter_frames: u64,
+}
+
+fn is_adapter_frame(notification: &SessionNotification) -> bool {
+    !serde_json::to_value(&notification.update)
+        .is_ok_and(|update| crate::acp::aoe_meta::is_anchored(&update))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -329,14 +337,18 @@ impl SessionIngress {
         };
         // Wire order: an announcement admits the child frames after it.
         let mut updates = Vec::with_capacity(pending.len());
+        let mut discarded = 0;
         for notification in pending {
             if Some(&notification.session_id) == id.as_ref()
                 || children.contains_key(&notification.session_id)
             {
                 register_child(&mut children, id.as_ref(), &notification);
                 updates.push(notification);
+            } else if is_adapter_frame(&notification) {
+                discarded += 1;
             }
         }
+        state.discarded_adapter_frames += discarded;
         state.current = id;
         state.children = children;
         drop(state);
@@ -400,6 +412,9 @@ impl SessionIngress {
         if state.current.as_ref() != Some(&notification.session_id)
             && !state.children.contains_key(&notification.session_id)
         {
+            if is_adapter_frame(&notification) {
+                state.discarded_adapter_frames += 1;
+            }
             return Ok(None);
         }
         // Registered under the state lock so the next child frame cannot
@@ -409,6 +424,11 @@ impl SessionIngress {
         } = &mut *state;
         register_child(children, current.as_ref(), &notification);
         Ok(Some(notification))
+    }
+
+    /// The adapter frames dropped since the last call.
+    pub(super) fn take_discarded_adapter_frames(&self) -> u64 {
+        std::mem::take(&mut self.state.lock().unwrap().discarded_adapter_frames)
     }
 
     /// Route of a subagent session, valid while the caller holds the fence.
@@ -623,6 +643,38 @@ mod tests {
             let update: SubagentUpdate = serde_json::from_value(update).unwrap();
             assert_eq!(cancel_capable(&update, current), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn dropped_old_session_frames_keep_their_adapter_position() {
+        let ingress = SessionIngress::default();
+        ingress
+            .finish(Some(SessionId::from("old".to_string())))
+            .unwrap();
+        ingress.begin();
+        // Buffered during the reset, then dropped at the commit.
+        assert!(ingress.route(notif("old"), None).unwrap().is_none());
+        let mut tailer = notif("old");
+        let anchored =
+            serde_json::json!({"aoe": {"v": 1, "key": "t", "after_adapter_sequence": 2}});
+        if let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) =
+            &mut tailer.update
+        {
+            chunk.meta = anchored.as_object().cloned();
+        }
+        assert!(ingress.route(tailer, None).unwrap().is_none());
+        ingress
+            .finish(Some(SessionId::from("new".to_string())))
+            .unwrap();
+        assert_eq!(
+            ingress.take_discarded_adapter_frames(),
+            1,
+            "tailer frames take no number"
+        );
+        // A late old-session frame is dropped as well.
+        assert!(ingress.route(notif("old"), None).unwrap().is_none());
+        assert_eq!(ingress.take_discarded_adapter_frames(), 1);
+        assert_eq!(ingress.take_discarded_adapter_frames(), 0, "drained");
     }
 
     #[test]

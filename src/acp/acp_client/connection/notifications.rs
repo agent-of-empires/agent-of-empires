@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
@@ -85,6 +86,7 @@ pub(super) struct Shared {
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
+    pub(super) aoe: AoeIngress,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -134,6 +136,7 @@ impl Shared {
             subagents: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
+            aoe: AoeIngress::default(),
             claude_home,
         }
     }
@@ -205,8 +208,61 @@ impl Shared {
     /// per-prompt watchdog.
     pub(super) async fn handle_notification(
         &self,
+        notification: SessionNotification,
+        local_prompt_signals: bool,
+    ) {
+        // A frame the contract consumes without delivering (a lease renewal)
+        // still proves the agent is alive.
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        self.settle_discarded().await;
+        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        let ingested = self
+            .aoe
+            .ingest(notification, local_prompt_signals, epoch, now_ms());
+        self.handle_ingested(ingested).await;
+    }
+
+    /// Frames the session identity dropped still count in the proxy's
+    /// numbering, so a tailer frame anchored after them is not held for
+    /// adapter output that already happened.
+    pub(super) async fn settle_discarded(&self) {
+        let skipped = self.ingress.take_discarded_adapter_frames();
+        if skipped > 0 {
+            let ingested = self.aoe.skip_frames(skipped, now_ms());
+            self.handle_ingested(ingested).await;
+        }
+    }
+
+    async fn handle_ingested(&self, ingested: Ingested) {
+        let (frames, lost) = match ingested {
+            Ingested::Deliver(frames) => (frames, None),
+            Ingested::Lost(reason) => (Vec::new(), Some(reason)),
+            Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
+        };
+        for frame in frames {
+            self.handle_adapter_notification(
+                frame.notification,
+                frame.local_prompt_signals,
+                frame.epoch,
+            )
+            .await;
+        }
+        if let Some(reason) = lost {
+            tracing::warn!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                ?reason,
+                "agent integration lost; ignoring further frames"
+            );
+            self.emit(Event::IntegrationLost { reason }).await;
+        }
+    }
+
+    async fn handle_adapter_notification(
+        &self,
         mut notification: SessionNotification,
         local_prompt_signals: bool,
+        epoch: u64,
     ) {
         // Subagent traffic never feeds the root session's dedup, compaction
         // or watchdog state: a busy child would hold its parent's turn open.
@@ -269,9 +325,8 @@ impl Shared {
         let restored_wake_event = restored_title
             .as_deref()
             .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, title));
-        // One epoch per notification, so its signals belong to the prompt
-        // that was current when it arrived.
-        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        // `epoch` is the prompt current when the frame arrived, so its signals
+        // belong to that prompt even if the frame was held.
         let (lifecycle, wakeup) = classify_watchdog_notification_signals(
             &notification.update,
             restored_title.as_deref(),
