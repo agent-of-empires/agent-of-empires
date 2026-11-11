@@ -171,16 +171,17 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
     {
         let id = lease.session_id();
         for task_id in sink.unresolved_background_task_ids(id) {
-            if !super::publish_with_next_seq(seqs, id, |seq| {
-                sink.publish_persisted(
-                    id,
-                    seq,
-                    &Event::BackgroundTaskFinished {
-                        task_id,
-                        ended_at: Some(chrono::Utc::now()),
-                    },
-                )
-            }) {
+            if !super::publish_next_persisted(
+                sink,
+                seqs,
+                id,
+                &Event::BackgroundTaskFinished {
+                    task_id,
+                    ended_at: Some(chrono::Utc::now()),
+                },
+            )
+            .1
+            {
                 return false;
             }
         }
@@ -193,16 +194,12 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &super::SeqMap, leas
                 warning: None,
                 ended_at: chrono::Utc::now(),
             };
-            if !super::publish_with_next_seq(seqs, id, |seq| {
-                sink.publish_persisted(id, seq, &event)
-            }) {
+            if !super::publish_next_persisted(sink, seqs, id, &event).1 {
                 return false;
             }
         }
         if let Some(reason) = debt.reason {
-            if !super::publish_with_next_seq(seqs, id, |seq| {
-                sink.publish_persisted(id, seq, &Event::Stopped { reason })
-            }) {
+            if !super::publish_next_persisted(sink, seqs, id, &Event::Stopped { reason }).1 {
                 return false;
             }
         }
@@ -337,47 +334,49 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
         for task_id in self.sink.unresolved_background_task_ids(session_id) {
-            if !super::publish_with_next_seq(&self.next_seqs, session_id, |seq| {
-                self.sink.publish_persisted(
-                    session_id,
-                    seq,
-                    &Event::BackgroundTaskFinished {
-                        task_id,
-                        ended_at: Some(chrono::Utc::now()),
-                    },
-                )
-            }) {
+            if !super::publish_next_persisted(
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
+                &Event::BackgroundTaskFinished {
+                    task_id,
+                    ended_at: Some(chrono::Utc::now()),
+                },
+            )
+            .1
+            {
                 return Err(SupervisorError::TeardownPending(session_id.to_owned()));
             }
         }
         for agent_id in self.sink.unresolved_background_agent_ids(session_id) {
-            if !super::publish_with_next_seq(&self.next_seqs, session_id, |seq| {
-                self.sink.publish_persisted(
-                    session_id,
-                    seq,
-                    &Event::BackgroundAgentCompleted {
-                        agent_id,
-                        status: BackgroundAgentStatus::Detached,
-                        tools: Vec::new(),
-                        result: None,
-                        warning: None,
-                        ended_at: chrono::Utc::now(),
-                    },
-                )
-            }) {
+            if !super::publish_next_persisted(
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
+                &Event::BackgroundAgentCompleted {
+                    agent_id,
+                    status: BackgroundAgentStatus::Detached,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+            )
+            .1
+            {
                 return Err(SupervisorError::TeardownPending(session_id.to_owned()));
             }
         }
         if !stopped_already_persisted
-            && !super::publish_with_next_seq(&self.next_seqs, session_id, |seq| {
-                self.sink.publish_persisted(
-                    session_id,
-                    seq,
-                    &Event::Stopped {
-                        reason: "user_stopped".to_owned(),
-                    },
-                )
-            })
+            && !super::publish_next_persisted(
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
+                &Event::Stopped {
+                    reason: "user_stopped".to_owned(),
+                },
+            )
+            .1
         {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
@@ -1566,6 +1565,7 @@ mod tests {
                     tool_call_id: None,
                     description: "work".into(),
                     workflow: None,
+                    started_at: None,
                 },
             );
             sup.publish_next(
@@ -1737,6 +1737,7 @@ mod tests {
                 tool_call_id: None,
                 description: "work".into(),
                 workflow: None,
+                started_at: None,
             })
             .await
             .unwrap();
@@ -1854,6 +1855,7 @@ mod tests {
                     tool_call_id: None,
                     description: "new work".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
         });
@@ -2338,6 +2340,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();
@@ -2433,6 +2436,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();
@@ -2600,6 +2604,7 @@ mod tests {
                 tool_call_id: None,
                 description: "sleep".into(),
                 workflow: None,
+                started_at: None,
             })
             .await
             .unwrap();
@@ -2687,6 +2692,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();

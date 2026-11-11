@@ -9,7 +9,7 @@ Add the field to the relevant `#[derive(SettingsSection)]` struct (in `src/sessi
 ```rust
 /// Doc comment becomes the field's description on every surface.
 #[serde(default)]
-#[setting(label = "My Setting", widget = "toggle")]
+#[setting(label = "My setting", widget = "toggle", summary = "One line for users on what it does.")]
 pub my_setting: bool,
 ```
 
@@ -35,6 +35,8 @@ A new section struct is not the one-edit case: add it to `build_schema` in `sett
 ## Attributes
 
 Beyond `label`, `desc` (defaults to the doc comment), `widget`, `options`, `min` / `max` / `step`, and `multiline` / `mono`:
+
+- `summary`: one short line for users, served as `summary` from `GET /api/settings/schema` (omitted when unset). For now it is served metadata only: both apps still show the `description` under the label until #5302 renders summaries, so don't put guidance only in the summary. The doc comment stays the `description`, written for developers and the docs site. Write the label in sentence case with glossary terms ("Agent", "Session", "Structured view"), and the summary as what the setting does for the user, not how it is implemented.
 
 - `validate`: the server-authoritative check (`range:MIN[:MAX]`, `nonempty`, `memory_limit`, `volume_list`, `env_list`, `port_mapping_list`, `capability_list`, `security_opt_list`, `network`, `systemd_slice`). If none fits, add a `ValidationKind` variant and a `validate=` keyword; that one rule drives both the client UX validator and the server gate.
 - `web`: `elevation:<reason>` (passphrase step-up to save from the web) or `local_only:<reason>` (a host-execution surface the server rejects and the dashboard never renders, such as a binary path or command argv). Omit for a plain allow.

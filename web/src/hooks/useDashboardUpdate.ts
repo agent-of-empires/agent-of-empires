@@ -7,9 +7,9 @@ import { currentWebBuildId, isWebUpdateAvailable } from "../lib/webBuildId";
 // fires several when a PWA resumes); one /api/about per window is plenty.
 const CHECK_THROTTLE_MS = 30_000;
 
-/** Whether the Daemon now serves a newer dashboard bundle than this page loaded. */
-export function useDashboardUpdate(): boolean {
-  const [updateAvailable, setUpdateAvailable] = useState(false);
+/** The Daemon's version once it serves a newer dashboard bundle than this page loaded, else null. */
+export function useDashboardUpdate(): string | null {
+  const [updatedTo, setUpdatedTo] = useState<string | null>(null);
   const lastCheckRef = useRef(0);
 
   useEffect(() => {
@@ -25,7 +25,7 @@ export function useDashboardUpdate(): boolean {
       const about = await fetchAbout();
       if (cancelled || !about) return;
       if (isWebUpdateAvailable(ownId, about.web_build_id)) {
-        setUpdateAvailable(true);
+        setUpdatedTo(about.version);
       }
     };
 
@@ -54,5 +54,5 @@ export function useDashboardUpdate(): boolean {
     };
   }, []);
 
-  return updateAvailable;
+  return updatedTo;
 }

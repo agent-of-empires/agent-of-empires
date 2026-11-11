@@ -7,6 +7,7 @@ import {
   normaliseTurnState,
   type AcpState,
   type BackgroundAgent,
+  type BackgroundShell,
   type WorkflowRun,
 } from "../../lib/acpTypes";
 import {
@@ -202,6 +203,7 @@ function subscribeAcpState(sessionId: string, cb: () => void): () => void {
 
 const EMPTY_BACKGROUND_AGENTS: BackgroundAgent[] = [];
 const EMPTY_BACKGROUND_TASKS: string[] = [];
+const EMPTY_BACKGROUND_SHELLS: BackgroundShell[] = [];
 const EMPTY_WORKFLOW_RUNS: Record<string, WorkflowRun> = {};
 
 /** One field of a session's cached state, so sibling panels need no second WebSocket. */
@@ -219,6 +221,7 @@ function useCachedField<T>(sessionId: string | null, pick: (state: AcpState) => 
 
 const pickBackgroundAgents = (s: AcpState) => s.backgroundAgents;
 const pickBackgroundTasks = (s: AcpState) => s.backgroundTasks;
+const pickBackgroundShells = (s: AcpState) => s.backgroundShells;
 const pickWorkflowRuns = (s: AcpState) => s.workflowRuns;
 
 export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[] {
@@ -227,6 +230,10 @@ export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[]
 
 export function useBackgroundTasks(sessionId: string | null): string[] {
   return useCachedField(sessionId, pickBackgroundTasks, EMPTY_BACKGROUND_TASKS);
+}
+
+export function useBackgroundShells(sessionId: string | null): BackgroundShell[] {
+  return useCachedField(sessionId, pickBackgroundShells, EMPTY_BACKGROUND_SHELLS);
 }
 
 export function useWorkflowRuns(sessionId: string | null): Record<string, WorkflowRun> {

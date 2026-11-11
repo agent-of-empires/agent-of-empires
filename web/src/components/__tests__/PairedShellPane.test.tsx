@@ -84,7 +84,7 @@ describe("PairedShellPane", () => {
           onModeChange={onModeChange}
         />,
       );
-      expect(ensureTerminal).toHaveBeenLastCalledWith("sess-rp-1", 0, container);
+      expect(ensureTerminal).toHaveBeenLastCalledWith("sess-rp-1", 0, container, expect.any(AbortSignal));
       expect(screen.getByRole("button", { name: /^Host$/ }).getAttribute("aria-pressed")).toBe(String(!container));
       fireEvent.click(screen.getByRole("button", { name: /^Host$/ }));
       expect(onModeChange).toHaveBeenCalledWith("host");

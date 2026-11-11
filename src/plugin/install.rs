@@ -2428,6 +2428,7 @@ mod tests {
                 provider_versions: Vec::new(),
                 command: Some("agent --flag".into()),
                 replies: false,
+                ..Default::default()
             }],
         ));
     }
@@ -2439,6 +2440,7 @@ mod tests {
             provider_versions: Vec::new(),
             command: Some("x\u{202e}tail".into()),
             replies: false,
+            ..Default::default()
         };
         let disclosed = disclosure_integrations(std::slice::from_ref(&raw));
         // The consent that the CLI/TUI/web serialize carries the escaped form.

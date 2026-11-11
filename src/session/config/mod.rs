@@ -269,10 +269,11 @@ pub struct LoggingConfig {
     /// Baseline applied to every known target root. Per-target overrides win.
     #[serde(default = "default_log_level")]
     #[setting(
-        label = "Default level",
+        label = "How much to log",
         widget = "select",
         options = "trace:trace,debug:debug,info:info,warn:warn,error:error",
-        global_only
+        global_only,
+        summary = "Debug and Trace increase file size quickly. AOE_LOG_LEVEL overrides this when it's set at startup."
     )]
     pub default_level: String,
 
@@ -280,9 +281,10 @@ pub struct LoggingConfig {
     /// to a level; (default) inherits the baseline.
     #[serde(default)]
     #[setting(
-        label = "Per-target overrides",
+        label = "Per-area levels",
         widget = "custom:logging-targets",
-        global_only
+        global_only,
+        summary = "Log one part of AoE in more detail, like acp."
     )]
     pub targets: std::collections::BTreeMap<String, String>,
 
@@ -291,11 +293,12 @@ pub struct LoggingConfig {
     /// effect.
     #[serde(default)]
     #[setting(
-        label = "Output (restart req.)",
+        label = "Write to (restart req.)",
         widget = "select",
         options = "file:file,stdout:stdout",
         global_only,
-        advanced
+        advanced,
+        summary = "The console only works when you run aoe serve in a terminal. The terminal app and the background Daemon always use the file."
     )]
     pub output: SinkKind,
 
@@ -303,10 +306,11 @@ pub struct LoggingConfig {
     /// absolute paths are used verbatim. Restart aoe for changes.
     #[serde(default = "default_file_path")]
     #[setting(
-        label = "File path (restart req.)",
+        label = "File (restart req.)",
         widget = "text",
         global_only,
-        advanced
+        advanced,
+        summary = "A name goes in AoE's app data folder; a full path is used as is."
     )]
     pub file_path: String,
 
@@ -336,11 +340,12 @@ pub struct LoggingConfig {
     /// How many rotated files to retain (.1 through .keep_count).
     #[serde(default = "default_keep_count")]
     #[setting(
-        label = "Keep count (restart req.)",
+        label = "Keep (restart req.)",
         widget = "number",
         min = 0,
         global_only,
-        advanced
+        advanced,
+        summary = "Older files are deleted. At least 1."
     )]
     pub keep_count: u8,
 
@@ -351,10 +356,11 @@ pub struct LoggingConfig {
     /// polling endpoints. Off by default keeps the log readable.
     #[serde(default = "default_show_spans")]
     #[setting(
-        label = "Show span context (restart req.)",
+        label = "Show where each line came from (restart req.)",
         widget = "toggle",
         global_only,
-        advanced
+        advanced,
+        summary = "Adds context to each line. Makes the log longer."
     )]
     pub show_spans: bool,
 }
@@ -430,16 +436,22 @@ pub struct AcpConfig {
     /// app (#3517).
     #[serde(default)]
     #[setting(
-        label = "Structured view",
+        label = "New Sessions open in",
         widget = "select",
-        options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view"
+        options = "auto:Auto,off:Off,terminal:Terminal view,structured:Structured view",
+        summary = "Auto preselects Structured view for new Sessions in the Web dashboard and Terminal view in the terminal app. Off removes Structured view from the new Session dialog and the view switch; you can still switch a Structured view Session to Terminal view."
     )]
     pub structured_view: StructuredView,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
     /// codex). Must name an agent that can start: `aoe-agent` is not
     /// packaged yet (#3553).
     #[serde(default = "default_agent")]
-    #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
+    #[setting(
+        label = "Default Agent in Structured view",
+        widget = "text",
+        validate = "nonempty",
+        summary = "The Agent a new Structured view Session falls back to when none is chosen and its own Agent can't run in Structured view. Type the Agent's name."
+    )]
     pub default_agent: String,
     /// Restrict structured view sessions to the agents named in
     /// `allowed_agents`. Off by default, which leaves every registered agent
@@ -450,11 +462,12 @@ pub struct AcpConfig {
     /// override cannot widen it, and the web surface requires elevation.
     #[serde(default)]
     #[setting(
-        label = "Restrict agents to the allowlist",
+        label = "Only allow some Agents",
         widget = "toggle",
         global_only,
         advanced,
-        web = "elevation:restricts which coding agents a session may run"
+        web = "elevation:restricts which coding agents a session may run",
+        summary = "Limit Structured view to the Agents you pick."
     )]
     pub restrict_agents: bool,
     /// Agent registry keys a structured view session may run while
@@ -463,36 +476,40 @@ pub struct AcpConfig {
     /// denies every agent, so a lockdown names the agents it permits.
     #[serde(default)]
     #[setting(
-        label = "Allowed agents",
+        label = "Allowed Agents",
         widget = "list",
         global_only,
         advanced,
-        web = "elevation:restricts which coding agents a session may run"
+        web = "elevation:restricts which coding agents a session may run",
+        summary = "Check the Agents Structured view may start."
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue.
+    /// additional sessions queue. Takes effect when the Daemon starts.
     #[serde(default = "default_max_workers")]
     #[setting(
-        label = "Max concurrent workers",
+        label = "Most Agents running at once",
         widget = "number",
         min = 1,
         validate = "range:1",
-        advanced
+        global_only,
+        advanced,
+        summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
     )]
     pub max_concurrent_workers: u32,
     /// Per-session retention cap on acp events. 0 = unlimited (default);
     /// set a non-zero value to bound disk usage on long-running sessions.
     #[serde(default = "default_replay_events")]
-    #[setting(label = "History cap (events)", widget = "number", min = 0)]
+    #[setting(label = "Keep the last", widget = "number", min = 0)]
     pub replay_events: u32,
     /// Override Node.js binary location. Empty resolves via
     /// AOE_ACP_NODE then PATH then the bundled fallback.
     #[serde(default)]
     #[setting(
-        label = "Node path",
+        label = "Node.js path",
         widget = "text",
-        web = "local_only:host Node binary path, a local execution surface"
+        web = "local_only:host Node binary path, a local execution surface",
+        summary = "For Agents that need Node.js. Leave empty to find it automatically."
     )]
     pub node_path: String,
     /// Render a per-tool elapsed-time label on every acp tool card.
@@ -501,12 +518,20 @@ pub struct AcpConfig {
     /// durations include stream-arrival skew; turn off if the inflated
     /// numbers are more confusing than useful.
     #[serde(default = "default_true")]
-    #[setting(label = "Show tool-call durations", widget = "toggle")]
+    #[setting(
+        label = "Show tool-call times",
+        widget = "toggle",
+        summary = "How long each tool call took, on its card. Times can run a little long with Claude Code."
+    )]
     pub show_tool_durations: bool,
     /// Wrap long lines in tool-call input and output blocks by default. Each
     /// block still has its own wrap toggle; this only sets where it starts.
     #[serde(default)]
-    #[setting(label = "Wrap tool output", widget = "toggle")]
+    #[setting(
+        label = "Wrap tool output",
+        widget = "toggle",
+        summary = "Start long lines wrapped. Each block still has its own switch."
+    )]
     pub wrap_tool_output: bool,
     /// Show a dismissable reminder in the structured view once the agent's
     /// context window passes `compaction_reminder_percent`, suggesting
@@ -515,18 +540,23 @@ pub struct AcpConfig {
     /// only some users want. Agents that do not advertise a `compact`
     /// command never show it. See #3253.
     #[serde(default)]
-    #[setting(label = "Compaction reminder", widget = "toggle")]
+    #[setting(
+        label = "Remind me to compact",
+        widget = "toggle",
+        summary = "Suggest /compact when the conversation fills most of the Agent's context."
+    )]
     pub compaction_reminder: bool,
     /// Context-window percentage at which the compaction reminder appears.
     /// Independent of the usage meter's own warn colour, which stays at a
     /// fixed 90%: that is passive severity, this is when to interrupt.
     #[serde(default = "default_compaction_reminder_percent")]
     #[setting(
-        label = "Compaction reminder threshold (%)",
+        label = "Remind at",
         widget = "number",
         min = 1,
         max = 99,
-        validate = "range:1:99"
+        validate = "range:1:99",
+        summary = "How full the context gets first."
     )]
     pub compaction_reminder_percent: u8,
     /// How the structured view shows agent notices (rate-limit warnings, model
@@ -535,9 +565,10 @@ pub struct AcpConfig {
     /// them. Error notices always stay until dismissed.
     #[serde(default)]
     #[setting(
-        label = "Agent notices",
+        label = "Conversation banners",
         widget = "select",
-        options = "persistent:Until dismissed,timeout:Auto-dismiss,hidden:Hidden"
+        options = "persistent:Until dismissed,timeout:Auto-dismiss,hidden:Hidden",
+        summary = "Banners in the conversation, like usage warnings or a model switch. Errors always stay until dismissed."
     )]
     pub notice_display: NoticeDisplay,
     /// Seconds before an info or warning notice auto-dismisses when agent
@@ -546,7 +577,7 @@ pub struct AcpConfig {
     /// cannot overflow and fire immediately.
     #[serde(default = "default_notice_timeout_secs")]
     #[setting(
-        label = "Notice auto-dismiss (s)",
+        label = "Hide banners after",
         widget = "number",
         min = 1,
         max = 2147483,
@@ -578,10 +609,11 @@ pub struct AcpConfig {
     /// watchdog accidentally. See #1240, #1360.
     #[serde(default = "default_silent_orphan_grace_secs")]
     #[setting(
-        label = "Silent-orphan grace (s)",
+        label = "Cancel a stuck reply after",
         widget = "number",
         min = 0,
-        advanced
+        advanced,
+        summary = "If the Agent goes quiet mid-reply with nothing running, AoE cancels the turn so you can carry on."
     )]
     pub silent_orphan_grace_secs: u32,
     /// Auto-stop idle acp workers: seconds of inactivity (no acp
@@ -593,10 +625,11 @@ pub struct AcpConfig {
     /// inactivity.
     #[serde(default = "default_acp_auto_stop_idle_secs")]
     #[setting(
-        label = "Auto-stop idle worker (s)",
+        label = "Stop Idle Structured view Sessions after",
         widget = "number",
         min = 0,
-        advanced
+        advanced,
+        summary = "Stops the Agent to free memory. It starts again when you send a message."
     )]
     pub auto_stop_idle_secs: u32,
     /// Opt-in auto-resume after a provider usage/rate-limit reset. When a
@@ -613,7 +646,11 @@ pub struct AcpConfig {
     /// that reports `kind == "rate_limit"` is eligible. Default false,
     /// preserving the manual-first behavior. See #1722.
     #[serde(default)]
-    #[setting(label = "Auto-resume after rate limit", widget = "toggle")]
+    #[setting(
+        label = "Resume after a usage limit",
+        widget = "toggle",
+        summary = "When an Agent hits its usage limit, pick up again on its own once the limit resets. It stops trying after a few attempts in a row."
+    )]
     pub rate_limit_auto_resume: bool,
     /// Allow the web dashboard's "Update & restart" control to run the
     /// agent's `npm install -g <pkg>` on the host and respawn the worker.
@@ -625,11 +662,12 @@ pub struct AcpConfig {
     /// install hint. See #2109.
     #[serde(default)]
     #[setting(
-        label = "Allow agent install from web",
+        label = "Let the Web dashboard install Agents",
         widget = "toggle",
         web = "local_only:runs npm install on the host as the daemon user",
         global_only,
-        advanced
+        advanced,
+        summary = "Install or update an Agent with npm on this computer, as the Daemon's user."
     )]
     pub allow_agent_install: bool,
 
@@ -642,7 +680,11 @@ pub struct AcpConfig {
     /// Edited per agent through the `acp-defaults` custom widget (composer-style
     /// dropdowns on the web, an inline JSON field in the TUI).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[setting(label = "Structured View Defaults", widget = "custom:acp-defaults")]
+    #[setting(
+        label = "Agent defaults",
+        widget = "custom:acp-defaults",
+        summary = "The model, mode and thinking level each Agent starts with in Structured view. In Terminal view, the Agent's own settings decide."
+    )]
     pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 }
 
@@ -1040,16 +1082,21 @@ pub struct SessionConfig {
     /// shadow them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "Default Tool",
+        label = "Default Agent",
         widget = "custom:default-tool",
         category = "Agents",
-        repo = "deny"
+        repo = "deny",
+        summary = "New Sessions start with this Agent, in either view. Unset, it uses the first Agent available."
     )]
     pub default_tool: Option<String>,
 
     /// Enable YOLO mode by default for new sessions (skip permission prompts).
     #[serde(default)]
-    #[setting(label = "YOLO Mode Default", widget = "toggle")]
+    #[setting(
+        label = "Start in Yolo mode",
+        widget = "toggle",
+        summary = "New Sessions approve the Agent's permission prompts on their own. Turn off to review each one."
+    )]
     pub yolo_mode_default: bool,
 
     /// Pre-trust each session's worktree in the agent's own config so it does
@@ -1062,10 +1109,11 @@ pub struct SessionConfig {
     /// would have trusted by hand.
     #[serde(default)]
     #[setting(
-        label = "Pre-trust worktrees on the host",
+        label = "Skip the Agent's \"trust this folder?\" prompt",
         widget = "toggle",
         category = "Agents",
-        web = "elevation:lets a repo's own hooks run unprompted on the host"
+        web = "elevation:lets a repo's own hooks run unprompted on the host",
+        summary = "Pre-trusts each host Session's folder when it starts, worktree or not. This also turns on the repository's own Agent settings file."
     )]
     pub pre_trust_agent_folders: bool,
 
@@ -1073,13 +1121,17 @@ pub struct SessionConfig {
     /// CPU, memory pressure, and running agent and process counts. Off by
     /// default; also toggleable from the command palette.
     #[serde(default)]
-    #[setting(label = "Show system health strip", widget = "toggle")]
+    #[setting(
+        label = "System health strip",
+        widget = "toggle",
+        summary = "CPU, memory and running Agents at the bottom of the sidebar."
+    )]
     pub show_diagnostics_pane: bool,
 
     /// Side of the TUI session list. Narrow terminals keep the list above the preview.
     #[serde(default)]
     #[setting(
-        label = "Sidebar Position",
+        label = "Sidebar position",
         widget = "select",
         options = "left:Left,right:Right",
         global_only,
@@ -1090,39 +1142,42 @@ pub struct SessionConfig {
     /// Percentage of split preview rows allocated to the paired terminal.
     #[serde(default = "default_split_terminal_height_percent")]
     #[setting(
-        label = "Split Terminal Height (%)",
+        label = "Paired terminal share of the split (%)",
         widget = "number",
         min = 1,
         max = 99,
         validate = "range:1:99",
         tui_only,
-        global_only
+        global_only,
+        summary = "In the terminal app's split preview, how much of the height the paired terminal gets."
     )]
     pub split_terminal_height_percent: u16,
 
     /// Minimum whole-window width for the paired terminal split.
     #[serde(default = "default_split_terminal_min_width")]
     #[setting(
-        label = "Split Terminal Minimum Width",
+        label = "Split only when at least this wide",
         widget = "number",
         min = 0,
         max = 1000,
         validate = "range:0:1000",
         tui_only,
-        global_only
+        global_only,
+        summary = "Window width in columns. A narrower terminal app window shows the preview without the paired terminal. 0 never hides it for width."
     )]
     pub split_terminal_min_width: u16,
 
     /// Minimum whole-window height for the paired terminal split.
     #[serde(default = "default_split_terminal_min_height")]
     #[setting(
-        label = "Split Terminal Minimum Height",
+        label = "Split only when at least this tall",
         widget = "number",
         min = 0,
         max = 1000,
         validate = "range:0:1000",
         tui_only,
-        global_only
+        global_only,
+        summary = "Window height in rows. A shorter terminal app window shows the preview without the paired terminal. 0 never hides it for height."
     )]
     pub split_terminal_min_height: u16,
 
@@ -1132,10 +1187,11 @@ pub struct SessionConfig {
     /// internals (AOE_* and AGENT_OF_EMPIRES_*) are never forwarded.
     #[serde(default)]
     #[setting(
-        label = "Inherit Host Environment",
+        label = "Share your whole environment with Agents",
         widget = "toggle",
         web = "elevation:widens what every agent process can read from the host environment",
-        advanced
+        advanced,
+        summary = "Pass AoE's whole environment (like API keys and tool paths) to Agents on your computer, not just the ones you list. A Daemon started outside your shell only has what it was given. Sandboxed Sessions use their own list."
     )]
     pub inherit_host_environment: bool,
 
@@ -1143,10 +1199,11 @@ pub struct SessionConfig {
     /// opencode=--port 8080).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Extra Args",
+        label = "Extra arguments",
         widget = "list",
         web = "local_only:per-agent argv injection, a host execution surface",
-        category = "Agents"
+        category = "Agents",
+        summary = "Flags added each time an Agent starts. Pick the Agent, then type its flags."
     )]
     pub agent_extra_args: HashMap<String, String>,
 
@@ -1154,10 +1211,11 @@ pub struct SessionConfig {
     /// resolved agent binary first; wrappers and shell syntax disable it.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Command Override",
+        label = "Replace start command",
         widget = "list",
         web = "local_only:replaces the agent binary, a host execution surface",
-        category = "Agents"
+        category = "Agents",
+        summary = "Pick an Agent and the command to run instead of its usual one."
     )]
     pub agent_command_override: HashMap<String, String>,
 
@@ -1166,7 +1224,12 @@ pub struct SessionConfig {
     /// agent's settings file; status detection falls back to tmux pane
     /// content parsing, which is less reliable.
     #[serde(default = "default_true")]
-    #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
+    #[setting(
+        label = "Status hooks",
+        widget = "toggle",
+        category = "Agents",
+        summary = "Let AoE add hooks to the Agent's settings file, so its status is exact. When off, AoE reads status from the terminal."
+    )]
     pub agent_status_hooks: bool,
 
     /// For agents whose hooks are scoped to a user-selected named agent (e.g.
@@ -1178,9 +1241,10 @@ pub struct SessionConfig {
     /// leaves the user's agent file untouched.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Merge Hooks Into Selected Agent",
+        label = "Status hooks for --agent NAME",
         widget = "toggle",
-        category = "Agents"
+        category = "Agents",
+        summary = "For Agents like Kiro started with a named agent (--agent NAME), add AoE's status hooks to its file so status keeps working."
     )]
     pub merge_hooks_into_selected_agent: bool,
 
@@ -1196,24 +1260,35 @@ pub struct SessionConfig {
     /// agent holds it). Agents without a one-shot mode, sandboxed sessions, and
     /// command-overridden agents keep the generated name.
     #[serde(default = "default_true")]
-    #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
+    #[setting(
+        label = "Smart rename",
+        widget = "toggle",
+        category = "Agents",
+        summary = "After the first reply, give the Session a short title based on what you asked."
+    )]
     pub smart_rename: bool,
 
     /// Give a title typed in the TUI's New Session dialog to the agent as its own session name on
     /// the first launch (Claude's `--name`), so it shows in the agent's own apps. Later
     /// launches leave the agent's name alone, so a rename inside the agent survives restarts.
     #[serde(default)]
-    #[setting(label = "Name Agent Session", widget = "toggle", category = "Agents")]
+    #[setting(
+        label = "Share the title with the Agent",
+        widget = "toggle",
+        category = "Agents",
+        summary = "Send a title you type in the New Session dialog to the Agent, so it shows in the Agent's own app too. Works with Claude Code."
+    )]
     pub name_agent_session: bool,
 
     /// Override Smart Session Rename for scratch sessions specifically, since they have no repo
     /// path to key a per-project override on the way a registered project does.
     #[serde(default)]
     #[setting(
-        label = "Smart Session Rename (Scratch)",
+        label = "Smart rename for Scratch Sessions",
         widget = "select",
         options = "inherit:Use Smart Session Rename,on:On,off:Off",
-        category = "Agents"
+        category = "Agents",
+        summary = "Matches Smart rename unless you change it here."
     )]
     pub scratch_smart_rename: ScratchSmartRenameMode,
 
@@ -1226,9 +1301,10 @@ pub struct SessionConfig {
     /// installed one-shot-capable agents.
     #[serde(default)]
     #[setting(
-        label = "Utility Agent",
+        label = "Titles written by",
         widget = "custom:smart-rename-agent",
-        category = "Agents"
+        category = "Agents",
+        summary = "Which Agent writes the titles."
     )]
     pub smart_rename_agent: String,
 
@@ -1244,10 +1320,11 @@ pub struct SessionConfig {
     /// default. Only agents with a one-shot mode are tunable.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Smart Rename Model",
+        label = "Title model",
         widget = "custom:smart-rename-model",
         web = "elevation:pins the model argv token for the rename one-shot CLI call",
-        category = "Agents"
+        category = "Agents",
+        summary = "Each Agent uses its own model for titles. A small, cheap one is recommended."
     )]
     pub smart_rename_model: HashMap<String, String>,
 
@@ -1259,7 +1336,12 @@ pub struct SessionConfig {
     /// agent invocation. The on-demand "Summarize" action works regardless
     /// of this setting. See #2808.
     #[serde(default)]
-    #[setting(label = "Conversation summary", widget = "toggle", category = "Agents")]
+    #[setting(
+        label = "Conversation summary",
+        widget = "toggle",
+        category = "Agents",
+        summary = "Every so often, add a summary of the conversation so far to Structured view Sessions. Uses extra tokens. You can still summarize on demand."
+    )]
     pub conversation_summary: bool,
 
     /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
@@ -1270,9 +1352,10 @@ pub struct SessionConfig {
     /// respawning a dead pane. See #2609.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Auto-resume on restart/reattach",
+        label = "Continue the conversation on restart",
         widget = "toggle",
-        category = "Agents"
+        category = "Agents",
+        summary = "When you restart or reopen a Terminal view Session, pick up its last conversation. Turn off to start fresh."
     )]
     pub auto_resume_on_restart: bool,
     /// Pre-assign OpenCode's session id before launch so AoE knows the exact
@@ -1282,10 +1365,11 @@ pub struct SessionConfig {
     /// Off by default. Sandboxed OpenCode automatic capture is unsupported.
     #[serde(default)]
     #[setting(
-        label = "Pre-assign opencode session id",
+        label = "Reliable OpenCode resume",
         widget = "toggle",
         category = "Agents",
-        advanced
+        advanced,
+        summary = "Makes resuming OpenCode reliable, but adds about two seconds to each new launch."
     )]
     pub opencode_preassign_session_id: bool,
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
@@ -1296,10 +1380,11 @@ pub struct SessionConfig {
     /// force capture off when set.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Mouse Capture",
+        label = "Mouse capture",
         widget = "toggle",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "AoE handles scrolling and clicks. Turn off to use your terminal's own text selection."
     )]
     pub mouse_capture: bool,
 
@@ -1307,10 +1392,11 @@ pub struct SessionConfig {
     /// selection via OSC 0. Disable to keep the terminal's own naming.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Host Tab Title",
+        label = "Set the terminal tab title",
         widget = "toggle",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "Name the terminal tab after the selected Session."
     )]
     pub host_tab_title: bool,
 
@@ -1322,7 +1408,8 @@ pub struct SessionConfig {
         label = "Custom Agents",
         widget = "list",
         web = "local_only:maps names to arbitrary shell commands, a host execution surface",
-        category = "Agents"
+        category = "Agents",
+        summary = "An Agent AoE doesn't know about: a name and the command that starts it."
     )]
     pub custom_agents: HashMap<String, String>,
 
@@ -1331,11 +1418,12 @@ pub struct SessionConfig {
     /// heuristics.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Detect As",
+        label = "Treat as",
         widget = "list",
         web = "local_only:part of the agent-command surface, edited locally only",
         category = "Agents",
-        repo = "allow"
+        repo = "allow",
+        summary = "Read a custom Agent's status the way AoE reads a known one, e.g. a wrapper around Claude Code."
     )]
     pub agent_detect_as: HashMap<String, String>,
 
@@ -1344,17 +1432,18 @@ pub struct SessionConfig {
     /// it writes, paired with agent_config_dir.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Execution As",
+        label = "Run as",
         widget = "list",
         web = "local_only:asserts the native execution and conversation namespace of a wrapper",
-        category = "Agents"
+        category = "Agents",
+        summary = "Which known Agent a custom one really runs, so AoE can find and resume its conversations. Use with Settings folder."
     )]
     pub agent_execution_as: HashMap<String, String>,
 
-    /// ACP launch command for a custom agent, enabling it to run in the
-    /// structured acp UI (e.g., "oc-superpowers" = "ocp run sp acp").
-    /// A custom agent with an entry here is acp-capable; without one it
-    /// is tmux-only.
+    /// ACP launch command for a custom agent, so it can run in the structured
+    /// view (e.g. "oc-superpowers" = "ocp run sp acp"). Without one, a custom
+    /// agent whose `agent_detect_as` base is in the ACP registry runs that
+    /// base's adapter; otherwise it is terminal-only.
     ///
     /// Note: unlike `custom_agents` (a shell command run in a tmux pane),
     /// this value is split into argv with shell-word rules and executed
@@ -1362,10 +1451,11 @@ pub struct SessionConfig {
     /// `sh -lc 'source ~/.profile && ocp run sp acp'`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Acp Command",
+        label = "Use in Structured view",
         widget = "list",
         web = "local_only:argv launched directly to run a custom agent in acp, a host execution surface",
-        category = "Agents"
+        category = "Agents",
+        summary = "The command that runs a Custom Agent in Structured view, often labelled \"ACP\" in its docs. Without one, a Custom Agent uses its Treat as Agent's adapter when that Agent has one, and otherwise stays in Terminal view."
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
@@ -1382,10 +1472,11 @@ pub struct SessionConfig {
     /// records.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[setting(
-        label = "Agent Config Dir",
+        label = "Settings folder",
         widget = "list",
         web = "local_only:points an agent at a config dir whose settings file can run commands",
-        category = "Agents"
+        category = "Agents",
+        summary = "Pick an Agent and the settings folder it should use."
     )]
     pub agent_config_dir: HashMap<String, String>,
 
@@ -1398,7 +1489,12 @@ pub struct SessionConfig {
     /// if so, rebind tmux's send-prefix or use the `D` key from the help overlay.
     /// Off by default; existing users keep the legacy single-letter UX.
     #[serde(default)]
-    #[setting(label = "Strict Hotkeys", widget = "toggle", tui_only)]
+    #[setting(
+        label = "Strict hotkeys",
+        widget = "toggle",
+        tui_only,
+        summary = "Letter shortcuts need Shift (Shift+D to Trash), so stray typing can't trigger them."
+    )]
     pub strict_hotkeys: bool,
 
     /// Default snooze for `aoe session snooze` (1-43200 min, picker overrides).
@@ -1407,11 +1503,12 @@ pub struct SessionConfig {
     /// attention sort, then rejoins the active list when the timer expires.
     #[serde(default = "default_snooze_duration_minutes")]
     #[setting(
-        label = "Snooze Duration (minutes)",
+        label = "Snooze for",
         widget = "number",
         min = 1,
         max = 43200,
-        validate = "range:1:43200"
+        validate = "range:1:43200",
+        summary = "How long a Snooze lasts. Snoozed Sessions sink to the bottom and come back when it ends."
     )]
     pub snooze_duration_minutes: u32,
 
@@ -1424,11 +1521,12 @@ pub struct SessionConfig {
     /// start. 0 keeps the default (50).
     #[serde(default = "default_session_id_poller_max_threads")]
     #[setting(
-        label = "Session-id poller threads (restart req.)",
+        label = "Conversation lookup threads (restart req.)",
         widget = "number",
         min = 0,
         global_only,
-        advanced
+        advanced,
+        summary = "The most Sessions AoE keeps matched to their Agent conversation at once. Past this, the extra Sessions stop updating until another one stops."
     )]
     pub session_id_poller_max_threads: u32,
 
@@ -1441,7 +1539,11 @@ pub struct SessionConfig {
     /// An explicit purge (`aoe rm --purge`, the web "Delete permanently"
     /// action) always purges regardless of this setting.
     #[serde(default = "default_true")]
-    #[setting(label = "Delete to Trash", widget = "toggle")]
+    #[setting(
+        label = "Use Trash",
+        widget = "toggle",
+        summary = "Trashed Sessions can be restored until they're purged. Turn off to erase them immediately."
+    )]
     pub delete_to_trash: bool,
 
     /// Ask for confirmation before deleting a session with the TUI `d` key.
@@ -1454,7 +1556,11 @@ pub struct SessionConfig {
     /// permanent-delete/force-remove paths are gated by their own dialogs
     /// regardless. See #2583, #3364.
     #[serde(default = "default_true")]
-    #[setting(label = "Confirm Before Delete", widget = "toggle")]
+    #[setting(
+        label = "Confirm before moving to Trash",
+        widget = "toggle",
+        summary = "Ask before d moves a Session to Trash. In the Web dashboard the Session menu asks, but the command palette doesn't."
+    )]
     pub confirm_delete: bool,
 
     /// Minutes a session stays in the trash before it is automatically
@@ -1465,11 +1571,12 @@ pub struct SessionConfig {
     /// next daemon start or a manual purge (`aoe session empty-trash`).
     #[serde(default = "default_trash_retention_minutes")]
     #[setting(
-        label = "Trash Retention (minutes)",
+        label = "Purge after",
         widget = "number",
         min = 0,
         max = 5256000,
-        validate = "range:0:5256000"
+        validate = "range:0:5256000",
+        summary = "Trashed Sessions are purged after this long. The Daemon does it; if it isn't running, purging waits until it next starts."
     )]
     pub trash_retention_minutes: u32,
 
@@ -1485,11 +1592,12 @@ pub struct SessionConfig {
     /// separate `acp.auto_stop_idle_secs` knob; see #1689 and #1690.
     #[serde(default = "default_auto_stop_idle_secs")]
     #[setting(
-        label = "Auto-stop idle session (s)",
+        label = "Stop Idle Terminal view Sessions after",
         widget = "number",
         min = 0,
         category = "Interaction",
-        advanced
+        advanced,
+        summary = "Ends a Session that has been Idle this long. A Session with a terminal attached is never stopped. Needs the Daemon running."
     )]
     pub auto_stop_idle_secs: u32,
 
@@ -1503,7 +1611,12 @@ pub struct SessionConfig {
     /// single process-wide assertion, so a per-profile override would be
     /// silently ignored; keep the schema honest by scoping it global.
     #[serde(default)]
-    #[setting(label = "Keep OS Awake While Active", widget = "toggle", global_only)]
+    #[setting(
+        label = "Keep the computer awake",
+        widget = "toggle",
+        global_only,
+        summary = "While a Session is working or waiting on you, and for a grace time after it goes Idle, the computer won't go to sleep on its own. Needs the Daemon running; macOS and Linux only."
+    )]
     pub prevent_sleep_when_active: bool,
 
     /// Minutes a session must stay idle before the sleep-inhibit assertion
@@ -1511,13 +1624,14 @@ pub struct SessionConfig {
     /// `global_only` for the same reason as that toggle.
     #[serde(default = "default_prevent_sleep_idle_grace_minutes")]
     #[setting(
-        label = "Sleep-Inhibit Grace (min)",
+        label = "Let the computer sleep after",
         widget = "number",
         min = 0,
         max = 240,
         validate = "range:0:240",
         global_only,
-        advanced
+        advanced,
+        summary = "How long after the last Session goes Idle."
     )]
     pub prevent_sleep_idle_grace_minutes: u32,
 
@@ -1525,14 +1639,22 @@ pub struct SessionConfig {
     /// recovery when `startup_recovery_wake` is enabled, once the pane is ready.
     /// An empty string disables the message without disabling the restart.
     #[serde(default = "default_restart_wake_message")]
-    #[setting(label = "Restart Wake Message", widget = "text")]
+    #[setting(
+        label = "Wake message",
+        widget = "text",
+        summary = "What AoE sends to wake a Session."
+    )]
     pub restart_wake_message: String,
 
     /// Send `restart_wake_message` after automatic Daemon startup recovery.
     /// Disabled by default; recovery still restores missing panes and resumes
     /// conversations. Explicit restarts are unaffected. An empty message stays off.
     #[serde(default)]
-    #[setting(label = "Startup Recovery Wake", widget = "toggle")]
+    #[setting(
+        label = "Wake after recovery",
+        widget = "toggle",
+        summary = "Send the wake message below to Sessions AoE recovers at startup."
+    )]
     pub startup_recovery_wake: bool,
 
     /// What to show next to each session title: Branch (default), Auto
@@ -1540,9 +1662,10 @@ pub struct SessionConfig {
     /// (sb on sandboxed rows).
     #[serde(default)]
     #[setting(
-        label = "Row Tag",
+        label = "Label after the title",
         widget = "select",
-        options = "none:None,auto:Auto,profile:Profile,sandbox:Sandbox,branch:Branch"
+        options = "none:None,auto:Auto,profile:Profile,sandbox:Sandbox,branch:Branch",
+        summary = "A short tag next to each Session title in the sidebar. Branch shows the worktree's branch; Profile and Sandbox show a short code."
     )]
     pub row_tag: RowTagMode,
 
@@ -1550,7 +1673,12 @@ pub struct SessionConfig {
     /// the agent stopped on Idle rows, time since last access on Unknown rows,
     /// and remaining snooze time under the Attention sort.
     #[serde(default = "default_true")]
-    #[setting(label = "Show Session Age", widget = "toggle", tui_only)]
+    #[setting(
+        label = "Show Session age",
+        widget = "toggle",
+        tui_only,
+        summary = "How long each Session has been Idle, at the right of its row."
+    )]
     pub show_activity_age: bool,
 
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
@@ -1559,10 +1687,11 @@ pub struct SessionConfig {
     /// additional exits if you need to send C-q through to the agent.
     #[serde(default = "default_live_send_exit_chord")]
     #[setting(
-        label = "Live-Send Exit Chord",
+        label = "Exit live-send with",
         widget = "text",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "Keys that leave live-send mode."
     )]
     pub live_send_exit_chord: String,
 
@@ -1579,10 +1708,11 @@ pub struct SessionConfig {
     /// leader and stays a single-press fast exit.
     #[serde(default = "default_live_send_leader")]
     #[setting(
-        label = "Live-Send Leader Chord",
+        label = "Live-send leader key",
         widget = "text",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "Prefix for live-send commands. Press it twice to send it to the Agent."
     )]
     pub live_send_leader: String,
 
@@ -1593,18 +1723,19 @@ pub struct SessionConfig {
     /// ignore this setting.
     #[serde(default)]
     #[setting(
-        label = "Attach Mode",
+        label = "Open a Session with",
         widget = "select",
         options = "tmux:Tmux,live_send:Live mode",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "What Enter or a double-click does on a Terminal view Session."
     )]
     pub default_attach_mode: AttachMode,
 
     /// How the TUI opens a terminal-mode session after it is created.
     #[serde(default)]
     #[setting(
-        label = "New Session Mode",
+        label = "Open a new Session with",
         widget = "select",
         options = "match_default:Match default attach,tmux:Tmux,live_send:Live mode",
         category = "Interaction",
@@ -1616,10 +1747,11 @@ pub struct SessionConfig {
     /// view, instead of requiring a separate Enter/Tab/click.
     #[serde(default)]
     #[setting(
-        label = "Auto Live-Send On View Switch",
+        label = "Live-send when switching view",
         widget = "toggle",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "Start live-send as soon as you switch to Terminal view."
     )]
     pub live_send_on_view_switch: bool,
 
@@ -1630,22 +1762,25 @@ pub struct SessionConfig {
     /// Attach Mode regardless of this setting.
     #[serde(default)]
     #[setting(
-        label = "Mouse Click Action",
+        label = "Clicking a row",
         widget = "select",
         options = "live_send:Live mode,select_only:Select only",
         category = "Interaction",
-        tui_only
+        tui_only,
+        summary = "Live mode types into the Session. Select opens the preview without typing into it."
     )]
     pub click_action: ClickAction,
 
     /// Warn before quitting aoe when you press `q` on the home screen (the
-    /// dialog can also turn this off). Ctrl+C always force-quits.
+    /// dialog can also turn this off). Ctrl+C quits without asking, except
+    /// while a session is being created.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Confirm Before Quit",
+        label = "Confirm before quitting",
         widget = "toggle",
         global_only,
-        tui_only
+        tui_only,
+        summary = "Ask before q quits. Ctrl+C quits without asking, except while a Session is being created."
     )]
     pub confirm_before_quit: bool,
 
@@ -1663,10 +1798,11 @@ pub struct SessionConfig {
     /// schema honest by scoping it global.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Unread Session Indicator",
+        label = "Unread marker",
         widget = "toggle",
         category = "Interaction",
-        global_only
+        global_only,
+        summary = "Mark Sessions with replies you haven't seen."
     )]
     pub unread_indicator: bool,
 
@@ -1683,10 +1819,11 @@ pub struct SessionConfig {
     /// advertise semantics the web cannot honor.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Session Color Labels",
+        label = "Session colors",
         widget = "toggle",
         category = "Interaction",
-        global_only
+        global_only,
+        summary = "A colored dot on each row, and Color in the Session menu."
     )]
     pub show_session_colors: bool,
 
@@ -1706,10 +1843,11 @@ pub struct SessionConfig {
     /// `unread_indicator`.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Favorites First",
+        label = "Favorites first",
         widget = "toggle",
         category = "Interaction",
-        global_only
+        global_only,
+        summary = "Favorited Sessions sort to the top of their Group. The Web dashboard uses Pin instead."
     )]
     pub favorites_first: bool,
 
@@ -1720,10 +1858,11 @@ pub struct SessionConfig {
     /// [`crate::tips`].
     #[serde(default = "default_true")]
     #[setting(
-        label = "Show tips",
+        label = "Tips",
         widget = "toggle",
         category = "Interaction",
-        global_only
+        global_only,
+        summary = "Show an occasional tip in the footer."
     )]
     pub show_tips: bool,
 
@@ -1731,11 +1870,12 @@ pub struct SessionConfig {
     /// one row; shortcuts, help, and temporary notifications remain available.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Show shortcut bar",
+        label = "Shortcut bar",
         widget = "toggle",
         category = "Interaction",
         global_only,
-        tui_only
+        tui_only,
+        summary = "The key hints at the bottom. Hiding it frees one row."
     )]
     pub show_shortcut_bar: bool,
 
@@ -1753,7 +1893,8 @@ pub struct SessionConfig {
         web = "local_only:hands pane-supplied links to the host's URL handlers",
         global_only,
         tui_only,
-        advanced
+        advanced,
+        summary = "Other link types a click may open, like vscode://file/. Web links always open."
     )]
     pub preview_link_prefixes: Vec<String>,
 
@@ -1765,9 +1906,10 @@ pub struct SessionConfig {
     /// No-op for non-worktree sessions.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Tie Worktree Directory to Session Name",
+        label = "Name the worktree folder after the Session title",
         widget = "toggle",
-        category = "Worktree"
+        category = "Worktree",
+        summary = "Renaming a Session renames its worktree folder too. Stop the Session first."
     )]
     pub tie_workdir_to_name: bool,
 }
@@ -2333,17 +2475,30 @@ pub struct DiffConfig {
     /// Default branch to compare against (e.g., "main", "master")
     /// If not set, will try to auto-detect from the repository
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[setting(label = "Default Branch", widget = "optional_text")]
+    #[setting(
+        label = "Compare against",
+        widget = "optional_text",
+        summary = "Set it if diffs compare against the wrong branch, like develop instead of main. Used only when the Project and worktree don't set one. Leave empty to detect it."
+    )]
     pub default_branch: Option<String>,
 
     /// Number of context lines to show around changes
     #[serde(default = "default_context_lines")]
-    #[setting(label = "Context Lines", widget = "number", min = 0)]
+    #[setting(
+        label = "Lines around each change",
+        widget = "number",
+        min = 0,
+        summary = "The Web dashboard always shows 3."
+    )]
     pub context_lines: usize,
 
     /// Render diffs side-by-side (split) instead of unified.
     #[serde(default)]
-    #[setting(label = "Side-by-side diff", widget = "toggle")]
+    #[setting(
+        label = "Side by side in the terminal app",
+        widget = "toggle",
+        summary = "Also toggled with s in the terminal app's diff, which saves it here."
+    )]
     pub split_view: bool,
 }
 
@@ -2371,39 +2526,64 @@ pub struct WebConfig {
     /// subscriptions persist across flips, so toggling back to true resumes
     /// delivery without requiring users to re-opt-in.
     #[serde(default = "default_true")]
-    #[setting(label = "Push notifications", widget = "toggle", global_only)]
+    #[setting(
+        label = "Notifications for every browser",
+        widget = "toggle",
+        global_only,
+        summary = "Off stops notifications in every browser and hides the Turn on button. Applies to every Profile, after the Daemon restarts."
+    )]
     pub notifications_enabled: bool,
 
     /// Default: send a push when a session transitions Running to Waiting
     /// (agent is asking for input). Sessions can override individually.
     #[serde(default = "default_true")]
-    #[setting(label = "Notify on waiting", widget = "toggle", global_only)]
+    #[setting(
+        label = "A Session needs you",
+        widget = "toggle",
+        global_only,
+        summary = "The Agent is waiting for your answer or approval. Applies after the Daemon restarts."
+    )]
     pub notify_on_waiting: bool,
 
     /// Default: send a push when a session finishes (Running to Idle). Off by
     /// default because short sessions make this noisy; sessions can opt in
     /// individually.
     #[serde(default)]
-    #[setting(label = "Notify on idle", widget = "toggle", global_only)]
+    #[setting(
+        label = "A Session finishes",
+        widget = "toggle",
+        global_only,
+        summary = "The Agent is done and the Session is Idle. Applies after the Daemon restarts."
+    )]
     pub notify_on_idle: bool,
 
     /// Default: send a push when a session errors (Running to Error).
     #[serde(default = "default_true")]
-    #[setting(label = "Notify on error", widget = "toggle", global_only)]
+    #[setting(label = "A Session hits an error", widget = "toggle", global_only)]
     pub notify_on_error: bool,
 
     /// Default: send a push when an acp session's ScheduleWakeup timer
     /// fires (the next /loop turn starts). Suppressed if the TUI or web
     /// dashboard has been active in the last 30s. See #1091.
     #[serde(default = "default_true")]
-    #[setting(label = "Notify on scheduled wake", widget = "toggle", global_only)]
+    #[setting(
+        label = "A scheduled wake-up fires",
+        widget = "toggle",
+        global_only,
+        summary = "When an Agent set itself a timer to check back. Skipped if you were using AoE in the last 30 seconds. Applies after the Daemon restarts."
+    )]
     pub notify_on_wake_fire: bool,
 
     /// Serve a Model Context Protocol server at `/mcp` on the daemon so MCP
-    /// clients holding the daemon token can list and drive sessions. When
-    /// false the route does not exist. Read at daemon startup.
+    /// clients holding the daemon token can list sessions (read-only tools for
+    /// now). When false the route does not exist. Read at daemon startup.
     #[serde(default)]
-    #[setting(label = "MCP server", widget = "toggle", global_only)]
+    #[setting(
+        label = "Let other apps control AoE",
+        widget = "toggle",
+        global_only,
+        summary = "Apps like Claude Code can list your Sessions through MCP. Read-only for now. Works when aoe serve uses the access link without a passphrase, or --auth none. Applies after the Daemon restarts."
+    )]
     pub mcp_enabled: bool,
 }
 
@@ -2429,7 +2609,12 @@ pub struct AuthConfig {
     /// (0600) under the app dir and dropped if the passphrase changes. Turn
     /// off to make every restart force re-authentication. See #1235.
     #[serde(default = "default_true")]
-    #[setting(label = "Persist login sessions", widget = "toggle", global_only)]
+    #[setting(
+        label = "Keep Devices signed in after a restart",
+        widget = "toggle",
+        global_only,
+        summary = "Off makes every Device sign in again after the Daemon restarts."
+    )]
     pub persist_sessions: bool,
 }
 
@@ -2471,16 +2656,22 @@ pub struct ThemeConfig {
     /// surface regardless of the active session profile (see
     /// `config::resolve_theme_name`), so it is not profile-overridable.
     #[serde(default)]
-    #[setting(label = "Theme", widget = "custom:theme-name", global_only)]
+    #[setting(
+        label = "Theme",
+        widget = "custom:theme-name",
+        global_only,
+        summary = "Used by the Web dashboard and the terminal app. Applies to every Profile."
+    )]
     pub name: String,
     /// Truecolor (24-bit RGB) or palette (xterm-256). Use palette if your
     /// terminal mangles RGB escapes. Global, like the theme itself.
     #[serde(default)]
     #[setting(
-        label = "Color Mode",
+        label = "Terminal colors",
         widget = "select",
         options = "truecolor:truecolor,palette:palette",
-        global_only
+        global_only,
+        summary = "Full color works in most terminals. Use 256 colors if yours can't show full color, which can happen in older terminals or over some remote connections."
     )]
     pub color_mode: ColorMode,
     /// Off by default (0). Set a positive value to opt in: a freshly-stopped
@@ -2489,7 +2680,12 @@ pub struct ThemeConfig {
     /// treated as actionable by the `w` keybind. The time-since-stop column
     /// is `session.show_activity_age`.
     #[serde(default = "default_idle_decay_minutes")]
-    #[setting(label = "Idle Decay (minutes)", widget = "number", min = 0)]
+    #[setting(
+        label = "Highlight Sessions that just finished",
+        widget = "number",
+        min = 0,
+        summary = "In the terminal app, newly Idle Sessions keep a soft highlight and a breathing icon for the set time, and w jumps to them."
+    )]
     pub idle_decay_minutes: u64,
 }
 
@@ -2554,9 +2750,10 @@ pub struct UpdatesConfig {
     /// notify = show banner / CLI notice (default). off = skip every check.
     #[serde(default)]
     #[setting(
-        label = "Update Check Mode",
+        label = "When a new version is out",
         widget = "select",
-        options = "auto:auto,notify:notify,off:off"
+        options = "auto:auto,notify:notify,off:off",
+        summary = "Tell me shows a banner in the Web dashboard and the terminal app. Install in the background works only in the terminal app, for a binary from the install script. Don't check turns checks off."
     )]
     pub update_check_mode: UpdateCheckMode,
 
@@ -2568,7 +2765,12 @@ pub struct UpdatesConfig {
     // (`Config::load_or_warn`), so a profile/repo override would be silently
     // ignored; show it but do not offer non-global scopes.
     #[serde(default)]
-    #[setting(label = "Auto-update plugins", widget = "toggle", global_only)]
+    #[setting(
+        label = "Update plugins automatically",
+        widget = "toggle",
+        global_only,
+        summary = "When AoE starts. Installs plugin updates that don't ask for anything new. Updates that need new permissions still wait for you. Applies to every Profile."
+    )]
     pub auto_update_plugins: bool,
 }
 
@@ -2593,10 +2795,11 @@ pub struct SkillsConfig {
     /// to every agent. Defaults to `false`.
     #[serde(default)]
     #[setting(
-        label = "Share skills with agents",
+        label = "Give skills to each Agent",
         widget = "toggle",
         web = "elevation:writes into the agent config directories in your home dir",
-        global_only
+        global_only,
+        summary = "Copies AoE's skills into each Agent's skills folder (like ~/.claude/skills) when a Session starts. Copies you've edited are left alone. Applies to every Profile."
     )]
     pub auto_propagate: bool,
 }
@@ -2614,7 +2817,12 @@ pub struct SkillsConfig {
 pub struct TelemetryConfig {
     /// User opted in to anonymous usage telemetry. Defaults to `false`.
     #[serde(default)]
-    #[setting(label = "Anonymous usage telemetry", widget = "toggle", global_only)]
+    #[setting(
+        label = "Share anonymous usage data",
+        widget = "toggle",
+        global_only,
+        summary = "Anonymous counts: your Sessions and their Agents and models, which features and aoe commands you use, your AoE version and operating system. Never your prompts, file paths, names, branches or shell commands."
+    )]
     pub enabled: bool,
 }
 
@@ -2626,10 +2834,11 @@ pub struct WorktreeConfig {
     /// Enable worktree mode by default for new sessions.
     #[serde(default)]
     #[setting(
-        label = "Enabled by Default",
+        label = "Use a worktree for new Sessions",
         widget = "toggle",
         web = "elevation:worktree config affects host filesystem",
-        repo = "deny"
+        repo = "deny",
+        summary = "Each new Session gets its own branch and folder. You can still change it in the new Session dialog."
     )]
     pub enabled: bool,
 
@@ -2637,10 +2846,11 @@ pub struct WorktreeConfig {
     /// `$VAR` / `${VAR}` are expanded; see `docs/guides/worktrees.md`.
     #[serde(default = "default_worktree_template")]
     #[setting(
-        label = "Path Template",
+        label = "Where worktrees go",
         widget = "text",
         web = "elevation:worktree config affects host filesystem",
-        repo = "deny"
+        repo = "deny",
+        summary = "{repo-name} and {branch} are filled in. Relative paths start from the repository."
     )]
     pub path_template: String,
 
@@ -2648,20 +2858,24 @@ pub struct WorktreeConfig {
     /// worktrees as siblings within the repo directory.
     #[serde(default = "default_bare_repo_template")]
     #[setting(
-        label = "Bare Repo Template",
+        label = "Where worktrees go for a bare repository",
         widget = "text",
         web = "elevation:worktree config affects host filesystem",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "Used instead of the path above when the repository is bare."
     )]
     pub bare_repo_path_template: String,
 
-    /// Automatically clean up worktrees on session delete.
+    /// Remove an AoE-managed worktree when Trash purges its session, and
+    /// pre-check worktree removal in the delete dialogs. `aoe rm` removes it
+    /// only with `--delete-worktree`.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Auto Cleanup",
+        label = "Remove the worktree with the Session",
         widget = "toggle",
-        web = "elevation:worktree config affects host filesystem"
+        web = "elevation:worktree config affects host filesystem",
+        summary = "Removes the worktree AoE made when Trash purges a Session, and pre-checks it when you delete one. aoe rm needs --delete-worktree."
     )]
     pub auto_cleanup: bool,
 
@@ -2669,21 +2883,23 @@ pub struct WorktreeConfig {
     /// (unchecked in the delete dialog).
     #[serde(default)]
     #[setting(
-        label = "Delete Branch on Cleanup",
+        label = "Delete the branch too",
         widget = "toggle",
         web = "elevation:worktree config affects host filesystem",
-        advanced
+        advanced,
+        summary = "Also deletes the worktree's branch. Only with Remove the worktree on."
     )]
     pub delete_branch_on_cleanup: bool,
 
     /// Template for multi-repo workspace directories ({branch}, {session-id}).
     #[serde(default = "default_workspace_template")]
     #[setting(
-        label = "Workspace Path Template",
+        label = "Where multi-repo workspaces go",
         widget = "text",
         web = "elevation:worktree config affects host filesystem",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "For Sessions that span several repositories."
     )]
     pub workspace_path_template: String,
 
@@ -2694,10 +2910,11 @@ pub struct WorktreeConfig {
     /// `Creating` while submodules clone.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Init Submodules",
+        label = "Set up submodules",
         widget = "toggle",
         web = "elevation:worktree config affects host filesystem",
-        advanced
+        advanced,
+        summary = "Runs git submodule update in each new worktree."
     )]
     pub init_submodules: bool,
 
@@ -2707,10 +2924,11 @@ pub struct WorktreeConfig {
     /// takes precedence over this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "Default Base Branch",
+        label = "Base branch for new worktrees",
         widget = "optional_text",
         web = "elevation:worktree config affects host filesystem",
-        advanced
+        advanced,
+        summary = "Leave empty to start from the repository's default branch."
     )]
     pub default_base_branch: Option<String>,
 }
@@ -2758,32 +2976,35 @@ pub struct SandboxConfig {
     /// Enable sandbox mode by default for new sessions.
     #[serde(default)]
     #[setting(
-        label = "Enabled by Default",
+        label = "Run new Sessions in a sandbox",
         widget = "toggle",
         web = "elevation:sandbox config affects host isolation",
-        repo = "deny"
+        repo = "deny",
+        summary = "Each Session's Agent runs inside its own container. It can reach the Project's files and any folders from your computer you add under Extra folders."
     )]
     pub enabled_by_default: bool,
 
     /// Container image to use for sandboxes.
     #[serde(default = "default_sandbox_image")]
     #[setting(
-        label = "Default Image",
+        label = "Image",
         widget = "text",
         web = "elevation:sandbox config affects host isolation",
-        repo = "deny"
+        repo = "deny",
+        summary = "The container image Sessions start from."
     )]
     pub default_image: String,
 
     /// Additional volume mounts (host:container or host:container:ro).
     #[serde(default, deserialize_with = "super::serde_helpers::string_or_vec")]
     #[setting(
-        label = "Extra Volumes",
+        label = "Extra folders",
         widget = "list",
         validate = "volume_list",
         web = "elevation:sandbox config affects host isolation",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "Folders from your computer the container can also see."
     )]
     pub extra_volumes: Vec<String>,
 
@@ -2798,21 +3019,23 @@ pub struct SandboxConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     #[setting(
-        label = "Sandbox Environment",
+        label = "Environment variables",
         widget = "list",
         validate = "env_list",
         web = "elevation:sandbox config affects host isolation",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "Variables passed into the container, like API keys. Separate from the host list on Agents. Use KEY=$VAR to pass a value from your computer without showing it."
     )]
     pub environment: Vec<String>,
 
     /// Remove containers when sessions are deleted.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Auto Cleanup",
+        label = "Remove the container with the Session",
         widget = "toggle",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        summary = "When a Session is purged, its container is removed too."
     )]
     pub auto_cleanup: bool,
 
@@ -2820,32 +3043,35 @@ pub struct SandboxConfig {
     /// pull command to run instead. Read globally by the Daemon, so it can't be set per profile.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Allow image pull from web",
+        label = "Allow image pull from the Web dashboard",
         widget = "toggle",
         web = "local_only:pulls images on the host as the daemon user",
         global_only,
-        advanced
+        advanced,
+        summary = "Lets the Web dashboard download a newer image. Applies to every Profile. Off shows the command to run instead."
     )]
     pub allow_image_pull: bool,
 
     /// CPU limit for containers (e.g. "4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "CPU Limit",
+        label = "CPU limit",
         widget = "optional_text",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Like 4 for CPUs."
     )]
     pub cpu_limit: Option<String>,
 
     /// Memory limit for containers (e.g. "8g", "512m").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "Memory Limit",
+        label = "Memory limit",
         widget = "optional_text",
         validate = "memory_limit",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Like 8g for memory."
     )]
     pub memory_limit: Option<String>,
 
@@ -2856,11 +3082,12 @@ pub struct SandboxConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     #[setting(
-        label = "Port Mappings",
+        label = "Ports",
         widget = "list",
         validate = "port_mapping_list",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Open a port in the container on your computer, like 3000:3000 for a dev server."
     )]
     pub port_mappings: Vec<String>,
 
@@ -2876,27 +3103,30 @@ pub struct SandboxConfig {
         widget = "optional_text",
         validate = "network",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Leave empty for the usual network. none cuts the container off, including from the Agent's own model. host isn't allowed."
     )]
     pub network: Option<String>,
 
     /// Default terminal for sandboxed sessions (toggle with 'c' key).
     #[serde(default)]
     #[setting(
-        label = "Default Terminal Mode",
+        label = "Terminal opens in",
         widget = "select",
         options = "host:Host,container:Container",
-        web = "elevation:sandbox config affects host isolation"
+        web = "elevation:sandbox config affects host isolation",
+        summary = "Where the paired terminal starts: Your computer or Container."
     )]
     pub default_terminal_mode: DefaultTerminalMode,
 
     /// Directories to exclude from host mount (e.g. target, node_modules).
     #[serde(default, deserialize_with = "super::serde_helpers::string_or_vec")]
     #[setting(
-        label = "Volume Ignores",
+        label = "Folders to leave out",
         widget = "list",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Paths inside the Project the container shouldn't see, like node_modules."
     )]
     pub volume_ignores: Vec<String>,
 
@@ -2905,21 +3135,23 @@ pub struct SandboxConfig {
     /// shadow bind-mount subdirectories.
     #[serde(default)]
     #[setting(
-        label = "Volume Ignores Strategy",
+        label = "How to leave them out",
         widget = "select",
         options = "anonymous:anonymous,named:named",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Standard works on Linux. On a Mac, if left-out folders still show up in the container, switch to Named volumes."
     )]
     pub volume_ignores_strategy: VolumeIgnoresStrategy,
 
     /// Mount ~/.ssh into sandbox containers (for git SSH access).
     #[serde(default)]
     #[setting(
-        label = "Mount SSH",
+        label = "Share your SSH keys",
         widget = "toggle",
         web = "elevation:sandbox config affects host isolation",
-        repo = "deny"
+        repo = "deny",
+        summary = "Shares your ~/.ssh folder read-only with the container, so the Agent can push and pull over SSH with those key files."
     )]
     pub mount_ssh: bool,
 
@@ -2928,11 +3160,12 @@ pub struct SandboxConfig {
     /// Docker/Podman.
     #[serde(default)]
     #[setting(
-        label = "SELinux Relabel",
+        label = "SELinux relabel",
         widget = "toggle",
         web = "elevation:sandbox config affects host isolation",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "Only needed on Linux with SELinux, if the container can't read your files."
     )]
     pub selinux_relabel: bool,
 
@@ -2941,11 +3174,12 @@ pub struct SandboxConfig {
     /// dockerd) inside the sandbox.
     #[serde(default)]
     #[setting(
-        label = "Privileged",
+        label = "Privileged mode",
         widget = "toggle",
         web = "local_only:grants the container full host privileges",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "Gives the container full access to your computer. Avoid unless a tool needs it."
     )]
     pub privileged: bool,
 
@@ -2956,7 +3190,7 @@ pub struct SandboxConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     #[setting(
-        label = "Add Capabilities",
+        label = "Add capabilities",
         widget = "list",
         validate = "capability_list",
         web = "local_only:grants the container extra Linux capabilities",
@@ -2973,7 +3207,7 @@ pub struct SandboxConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     #[setting(
-        label = "Drop Capabilities",
+        label = "Drop capabilities",
         widget = "list",
         validate = "capability_list",
         web = "local_only:a write replaces the list, so it can undo hardening",
@@ -2990,7 +3224,7 @@ pub struct SandboxConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     #[setting(
-        label = "Security Options",
+        label = "Security options",
         widget = "list",
         validate = "security_opt_list",
         web = "local_only:relaxes the container security profile",
@@ -3008,33 +3242,37 @@ pub struct SandboxConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     #[setting(
-        label = "Extra Run Args",
+        label = "Extra run arguments",
         widget = "list",
         web = "local_only:arbitrary container runtime argv, a host execution surface",
         repo = "deny",
-        advanced
+        advanced,
+        summary = "Passed straight to the container runtime. Not checked, so it can undo the sandbox's protections."
     )]
     pub extra_run_args: Vec<String>,
 
     /// Custom instruction text appended to the agent's system prompt in
-    /// sandboxed sessions (Claude, Codex only).
+    /// sandboxed terminal-view sessions, for agents with an instruction flag
+    /// (Claude Code, Codex, Qwen, OMP, Prime Agent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "Custom Instruction",
+        label = "Custom instructions",
         widget = "optional_text",
         web = "elevation:sandbox config affects host isolation",
-        advanced
+        advanced,
+        summary = "Added to the Agent's instructions in sandboxed Terminal view Sessions, for Agents that accept it, like Claude Code and Codex."
     )]
     pub custom_instruction: Option<String>,
 
     /// Container runtime for sandboxing.
     #[serde(default)]
     #[setting(
-        label = "Container Runtime",
+        label = "Container runtime",
         widget = "select",
         options = "docker:Docker,podman:Podman,apple_container:Apple Container",
         web = "elevation:sandbox config affects host isolation",
-        global_only
+        global_only,
+        summary = "Docker, Podman or Apple Container. Applies to every Profile."
     )]
     pub container_runtime: ContainerRuntimeName,
 }
@@ -3138,9 +3376,10 @@ pub struct TmuxConfig {
     /// Control tmux status bar styling (Auto respects your tmux config).
     #[serde(default)]
     #[setting(
-        label = "Status Bar",
+        label = "AoE's status bar",
         widget = "select",
-        options = "auto:Auto,enabled:Enabled,disabled:Disabled"
+        options = "auto:Auto,enabled:Enabled,disabled:Disabled",
+        summary = "The themed bar at the bottom of each Session. Auto shows AoE's bar unless you have your own tmux config."
     )]
     pub status_bar: TmuxSettingMode,
 
@@ -3148,9 +3387,10 @@ pub struct TmuxConfig {
     /// when your own tmux config sets `mouse`, and enables it otherwise).
     #[serde(default)]
     #[setting(
-        label = "Mouse Support",
+        label = "Mouse",
         widget = "select",
-        options = "auto:Auto,enabled:Enabled,disabled:Disabled"
+        options = "auto:Auto,enabled:Enabled,disabled:Disabled",
+        summary = "Scroll and select with the mouse inside a Session. Auto turns it on unless your tmux config sets the mouse."
     )]
     pub mouse: TmuxSettingMode,
 
@@ -3161,9 +3401,10 @@ pub struct TmuxConfig {
     /// tmux config sets one of those two options.
     #[serde(default)]
     #[setting(
-        label = "Clipboard Pass-through",
+        label = "Let Agents copy to your clipboard",
         widget = "select",
-        options = "auto:Auto,enabled:Enabled,disabled:Disabled"
+        options = "auto:Auto,enabled:Enabled,disabled:Disabled",
+        summary = "What an Agent copies reaches your clipboard, even over SSH. Auto turns it on unless your tmux config handles copying. Off also stops copying from the Web dashboard's terminal."
     )]
     pub clipboard: TmuxSettingMode,
 
@@ -3173,10 +3414,11 @@ pub struct TmuxConfig {
     /// behavior). A bare name, not a path; takes effect on the next aoe start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "Socket Name",
+        label = "Separate tmux server",
         widget = "optional_text",
         global_only,
-        web = "local_only:changes which tmux server hosts your sessions on this machine"
+        web = "local_only:changes which tmux server hosts your sessions on this machine",
+        summary = "Keeps AoE's Sessions apart from your other tmux sessions. Enter a short name, like aoe. Change it when no Sessions are running."
     )]
     pub socket_name: Option<String>,
 
@@ -3188,7 +3430,13 @@ pub struct TmuxConfig {
     /// keep tmux's rendered capture, with OSC 52 forwarding through a raw
     /// observer; a split window is composited from captured panes.
     #[serde(default = "default_true")]
-    #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
+    #[setting(
+        label = "Live terminal stream",
+        widget = "toggle",
+        advanced,
+        global_only,
+        summary = "Faster terminal updates, and faster typing on tmux 3.8+. Turn off if a terminal glitches; applies to the next one you open."
+    )]
     pub vt_live: bool,
 }
 
@@ -3203,23 +3451,29 @@ pub struct SystemdSettings {
     /// the systemd user manager is unreachable. Existing scopes are still
     /// stopped with their sessions when off. Applies after an aoe restart.
     #[serde(default = "default_true")]
-    #[setting(label = "Use systemd scopes", widget = "toggle", global_only)]
+    #[setting(
+        label = "Run Sessions in systemd scopes",
+        widget = "toggle",
+        global_only,
+        summary = "Does nothing if systemd isn't available."
+    )]
     pub enabled: bool,
 
     /// Slice for the session scopes; must end in `.slice`. `{profile}` and `{session}` expand to the escaped profile name and session id. Applies after an aoe restart.
     #[serde(default = "default_systemd_slice")]
     #[setting(
-        label = "Systemd slice",
+        label = "Slice",
         widget = "text",
         validate = "systemd_slice",
-        global_only
+        global_only,
+        summary = "Must end in .slice. {profile} becomes the Profile name and {session} the Session's id."
     )]
     pub slice: String,
 
     /// Keep sessions running when the aoe daemon service stops. Applies after an aoe restart.
     #[serde(default = "default_true")]
     #[setting(
-        label = "Sessions survive daemon restart",
+        label = "Keep Sessions running when the Daemon restarts",
         widget = "toggle",
         global_only
     )]
@@ -3228,18 +3482,19 @@ pub struct SystemdSettings {
     /// Per-session memory cap (e.g. `4G`, `512M`). Empty means unlimited. Applies after an aoe restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[setting(
-        label = "Session memory limit",
+        label = "Memory limit per Session",
         widget = "optional_text",
         validate = "memory_limit",
         global_only,
-        advanced
+        advanced,
+        summary = "Leave empty for no limit, or enter a size like 4G or 512M."
     )]
     pub memory_max: Option<String>,
 
     /// Per-session task cap. 0 means unlimited. Applies after an aoe restart.
     #[serde(default)]
     #[setting(
-        label = "Session task limit",
+        label = "Limit processes per Session",
         widget = "number",
         min = 0,
         max = 4194304,

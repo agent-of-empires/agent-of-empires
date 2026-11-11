@@ -899,18 +899,26 @@ mod tests {
 
         let profile = profile_from(json!({"acp": {
             "default_agent": "claude-code",
-            "max_concurrent_workers": 9,
             "replay_events": 1024,
             "node_path": "/opt/node",
         }}));
 
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.acp.default_agent, "claude-code");
-        assert_eq!(merged.acp.max_concurrent_workers, 9);
         assert_eq!(merged.acp.replay_events, 1024);
         assert_eq!(merged.acp.node_path, "/opt/node");
         // Not overridden: inherits global default.
         assert!(merged.acp.show_tool_durations);
+    }
+
+    #[test]
+    fn profile_cannot_override_the_daemon_wide_worker_cap() {
+        let mut global = Config::default();
+        global.acp.max_concurrent_workers = 7;
+
+        let profile = profile_from(json!({"acp": {"max_concurrent_workers": 1}}));
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.acp.max_concurrent_workers, 7);
     }
 
     #[test]

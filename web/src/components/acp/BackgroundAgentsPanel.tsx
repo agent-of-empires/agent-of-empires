@@ -4,9 +4,15 @@
 import { useEffect, useState } from "react";
 import { Bot, ChevronDown, Maximize2, Square, Workflow, X } from "lucide-react";
 
-import { useBackgroundAgents, useBackgroundTasks, useWorkflowRuns } from "../../hooks/useAcpSession";
+import {
+  useBackgroundAgents,
+  useBackgroundShells,
+  useBackgroundTasks,
+  useWorkflowRuns,
+} from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
 import { isActiveAgent, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
+import { BackgroundShells } from "./BackgroundShells";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 type Entry =
@@ -34,17 +40,16 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   const agents = useBackgroundAgents(sessionId);
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
+  const shells = useBackgroundShells(sessionId);
 
-  if (agents.length === 0) {
+  if (agents.length === 0 && shells.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-text-dim">
-        No background sub-agents launched yet. When the agent dispatches an async{" "}
-        <span className="font-mono">Task</span> or runs a <span className="font-mono">Workflow</span>, its agents show
-        up here with live progress.
+        No background work yet. Async <span className="font-mono">Task</span> sub-agents,{" "}
+        <span className="font-mono">Workflow</span> runs and background shell commands show up here.
       </div>
     );
   }
-
   // Running first, then most-recently-started within each group.
   const sorted = [...agents].sort((a, b) => {
     const ra = isActiveAgent(a) ? 0 : 1;
@@ -55,33 +60,42 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   // A stalled agent is no longer writing, so cancel would be a no-op.
   const anyRunning = agents.some((a) => a.status === "running");
 
+  // One stable slot for the shells: moving it remounts the shell dialog and closes it.
+  const hasAgents = agents.length > 0;
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
-        <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
-          Background agents · {agents.length}
-        </span>
-        {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
-      </div>
-      <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-        Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
-        <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
-        transcript.
-      </p>
-      <div className="flex flex-col">
-        {entries(sorted, agents).map((entry) =>
-          entry.kind === "agent" ? (
-            <AgentRow key={entry.agent.agentId} agent={entry.agent} />
-          ) : (
-            <WorkflowGroup
-              key={entry.runId}
-              name={entry.name}
-              agents={entry.agents}
-              live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
-            />
-          ),
-        )}
-      </div>
+      {hasAgents && (
+        <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
+          <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
+            Background agents · {agents.length}
+          </span>
+          {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
+        </div>
+      )}
+      {sessionId && <BackgroundShells sessionId={sessionId} />}
+      {hasAgents && (
+        <>
+          <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
+            Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
+            <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
+            transcript.
+          </p>
+          <div className="flex flex-col">
+            {entries(sorted, agents).map((entry) =>
+              entry.kind === "agent" ? (
+                <AgentRow key={entry.agent.agentId} agent={entry.agent} />
+              ) : (
+                <WorkflowGroup
+                  key={entry.runId}
+                  name={entry.name}
+                  agents={entry.agents}
+                  live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
+                />
+              ),
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

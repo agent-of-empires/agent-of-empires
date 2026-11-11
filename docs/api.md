@@ -762,6 +762,26 @@ curl -sS \
   "http://localhost:7777/api/sessions/abc123/output?lines=80&format=text"
 ```
 
+## GET /api/sessions/{id}/acp/replay?view=retained
+
+Read durable ACP history without starting a worker or preparing a pane. Missing
+events remain missing; this endpoint does not import native agent histories.
+
+Retained responses include an opaque `history_identity` for that session's stored
+content. The identity changes on inserts, replacements, deletion, and backfill,
+even when sequence bounds stay unchanged. Unrelated sessions do not change it.
+
+For a consistent multi-page read, pass the first page's `history_identity` on
+subsequent requests, alongside the usual `since`, `before`, and `limit` parameters.
+Each page binds its events, coverage, and identity to one database snapshot.
+A mismatched identity returns `409`: discard the staged pages and restart the
+read. Keep the previous complete transcript visible if the replacement read fails.
+
+Raw retained pages preserve the scanned rows and cursor; backward pages need not
+start at a turn boundary. Keep reducer state across forward retained pages.
+Ordinary backward replay, including `view=rows`, still trims a leading partial
+turn when older rows remain.
+
 ## Native session freshness and disconnection
 
 The Daemon owns native session status. The experimental TUI consumes its

@@ -272,6 +272,12 @@ impl EventStore {
     }
 
     pub fn has_unresolved_background_tasks(&self, session_id: &str) -> bool {
+        self.try_has_unresolved_background_tasks(session_id)
+            .unwrap_or(false)
+    }
+
+    /// `None` when the query failed.
+    fn try_has_unresolved_background_tasks(&self, session_id: &str) -> Option<bool> {
         logged(
             self.conn()
                 .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)
@@ -279,7 +285,6 @@ impl EventStore {
             "has_unresolved_background_tasks",
             session_id,
         )
-        .unwrap_or(false)
     }
 
     pub fn unresolved_background_task_launches(
@@ -403,7 +408,73 @@ impl EventStore {
         .collect()
     }
 
-    fn latest_prompt_state(&self, session_id: &str) -> Option<bool> {
+    /// Turn output after the latest `Stopped`: a turn the agent started itself
+    /// (a Monitor or background finish woke it), which opens with no
+    /// `UserPromptSent`. The between-prompt watchdog ends such a turn with a
+    /// `Stopped` once it goes quiet.
+    pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Option<bool> {
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('AgentMessageChunk', 'AgentThoughtChunk', 'ToolCallStarted', 'ThinkingStarted')
+                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                           WHERE session_id = ?1
+                                             AND discriminant = 'Stopped'), 0))",
+                params![session_id],
+                |row| row.get::<_, bool>(0),
+            ),
+            "has_open_agent_turn query",
+            session_id,
+        )
+    }
+
+    /// True while a turn is open: an in-flight prompt, background work, or a turn
+    /// the agent started itself. `None` when a query failed, which callers that
+    /// would stop live work must read as busy.
+    pub fn has_open_turn(&self, session_id: &str) -> Option<bool> {
+        if self.try_in_flight_turn(session_id)? {
+            return Some(true);
+        }
+        self.has_open_agent_turn(session_id)
+    }
+
+    /// True while the agent process holds work a replacement would lose: an open
+    /// turn, or a recent background finish the agent has not yet answered with a
+    /// turn. `None` when a query failed.
+    pub fn holds_live_work(&self, session_id: &str) -> Option<bool> {
+        if self.has_open_turn(session_id)? {
+            return Some(true);
+        }
+        self.has_unhandled_finish(session_id)
+    }
+
+    /// A background task or agent finished after the latest `Stopped`, so the
+    /// agent's follow-up turn is still pending. Old finishes expire so a turn
+    /// that never came cannot hold the runner forever.
+    fn has_unhandled_finish(&self, session_id: &str) -> Option<bool> {
+        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('BackgroundTaskFinished', 'BackgroundAgentCompleted')
+                       AND created_at >= ?2
+                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                           WHERE session_id = ?1
+                                             AND discriminant = 'Stopped'), 0))",
+                params![session_id, stale_cutoff],
+                |row| row.get::<_, bool>(0),
+            ),
+            "has_unhandled_finish query",
+            session_id,
+        )
+    }
+
+    /// `Some(None)` when no prompt exists, `None` when a query failed.
+    fn latest_prompt_state(&self, session_id: &str) -> Option<Option<bool>> {
         let conn = self.conn();
         let prompt_seq = logged(
             conn.query_row(
@@ -415,8 +486,10 @@ impl EventStore {
             ),
             "main_turn_state prompt query",
             session_id,
-        )
-        .flatten()?;
+        )?;
+        let Some(prompt_seq) = prompt_seq else {
+            return Some(None);
+        };
         let terminator = logged(
             conn.query_row(
                 "SELECT MIN(seq) FROM acp_events
@@ -430,17 +503,22 @@ impl EventStore {
             "main_turn_state terminator query",
             session_id,
         )?;
-        Some(terminator.is_none())
+        Some(Some(terminator.is_none()))
     }
 
     /// True while a main turn, background task, or recently reporting background agent is open.
     pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
-        if self.has_unresolved_background_tasks(session_id) {
-            return true;
+        self.try_in_flight_turn(session_id).unwrap_or(false)
+    }
+
+    /// [`Self::has_in_flight_turn`], or `None` when any constituent query failed.
+    pub(crate) fn try_in_flight_turn(&self, session_id: &str) -> Option<bool> {
+        if self.try_has_unresolved_background_tasks(session_id)? {
+            return Some(true);
         }
-        match self.latest_prompt_state(session_id) {
-            None => return false,
-            Some(true) => return true,
+        match self.latest_prompt_state(session_id)? {
+            None => return Some(false),
+            Some(true) => return Some(true),
             Some(false) => {}
         }
         let conn = self.conn();
@@ -473,9 +551,8 @@ impl EventStore {
             ),
             "has_in_flight_turn bg-agent query",
             session_id,
-        )
-        .unwrap_or(0);
-        bg_in_flight > 0
+        )?;
+        Some(bg_in_flight > 0)
     }
 
     /// Read the inputs the terminal-repair pass decides on.
@@ -723,6 +800,153 @@ mod tests {
     }
 
     #[test]
+    fn a_background_finish_holds_live_work_until_the_agent_answers() {
+        let (_tmp, store) = open_store(1000);
+        let started = Event::BackgroundTaskStarted {
+            task_id: "t".into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+            workflow: None,
+            started_at: None,
+        };
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        // (events, holds live work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    started.clone(),
+                    stopped("prompt_complete"),
+                    finished.clone(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    started,
+                    stopped("prompt_complete"),
+                    finished,
+                    agent_chunk("done"),
+                    stopped("prompt_complete"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, holds)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(store.holds_live_work(&id), Some(holds), "case {i}");
+        }
+    }
+
+    /// An agent-initiated turn (a Monitor or background finish waking the
+    /// agent) opens with no `UserPromptSent`, so only its own events show it.
+    #[test]
+    fn an_agent_initiated_turn_without_a_stop_is_open_work() {
+        let (_tmp, store) = open_store(1000);
+        let tool_call = || Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                id: "t".into(),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        // (events, open work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("woken"),
+                    tool_call(),
+                ],
+                true,
+            ),
+            // Text thinking is the only output of a thought-only turn.
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    Event::AgentThoughtChunk {
+                        text: "hmm".into(),
+                        message_id: None,
+                    },
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("woken"),
+                    tool_call(),
+                    stopped("agent_idle"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, open)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(store.holds_live_work(&id), Some(open), "case {i}");
+        }
+    }
+
+    /// A failed query is unknown, never "no live work": every aggregate that
+    /// callers use to protect work reports `None`, and recovers afterwards.
+    #[test]
+    fn a_failed_query_is_unknown_not_idle() {
+        let (_tmp, store) = open_store(1000);
+        record_from(
+            &store,
+            "s",
+            1,
+            vec![user_prompt("go"), stopped("prompt_complete")],
+        );
+        assert_eq!(store.holds_live_work("s"), Some(false));
+
+        store.test_set_unavailable(true);
+        assert_eq!(store.try_in_flight_turn("s"), None);
+        assert_eq!(store.has_open_agent_turn("s"), None);
+        assert_eq!(store.has_open_turn("s"), None);
+        assert_eq!(store.holds_live_work("s"), None);
+        assert!(!store.has_in_flight_turn("s"), "the lossy bool stays false");
+
+        store.test_set_unavailable(false);
+        assert_eq!(store.holds_live_work("s"), Some(false));
+    }
+
+    /// An unhandled finish whose follow-up turn never came does not hold the
+    /// runner forever.
+    #[test]
+    fn an_old_unhandled_finish_no_longer_holds_live_work() {
+        let (_tmp, store) = open_store(1000);
+        let old =
+            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+        store.record_at("s", 1, &user_prompt("go"), old).unwrap();
+        store
+            .record_at("s", 2, &stopped("prompt_complete"), old)
+            .unwrap();
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        store.record_at("s", 3, &finished, old).unwrap();
+        assert_eq!(store.holds_live_work("s"), Some(false));
+    }
+
+    #[test]
     fn snapshot_queries_read_the_latest_event() {
         use crate::acp::state::{PlanStep, PlanStepStatus};
         let (_tmp, store) = open_store(1000);
@@ -947,6 +1171,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let chunk = || Event::AgentMessageChunk {
             text: "x".into(),
@@ -1005,8 +1230,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            lifecycle_rows, 3,
-            "completed pairs age out; only the open starts stay"
+            lifecycle_rows, 7,
+            "completed agents age out; recent task pairs stay for the shell panel"
         );
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         for (seq, event) in store.replay_from("s-1", 0) {
@@ -1016,6 +1241,123 @@ mod tests {
             state.background_tasks,
             ["open".to_string(), "reused".to_string()]
         );
+    }
+
+    /// A finished shell stays replayable until it falls out of the newest
+    /// `MAX_FINISHED_BACKGROUND_SHELLS`, even past the retention cap.
+    #[test]
+    fn finished_shells_beyond_the_keep_count_age_out_of_the_log() {
+        use crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let total = MAX_FINISHED_BACKGROUND_SHELLS + 5;
+        for i in 0..total {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("t{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+            record(Event::BackgroundTaskFinished {
+                task_id: format!("t{i}"),
+                ended_at: None,
+            });
+        }
+        // Open shells newer than every finished one must not use up kept slots.
+        for i in 0..3 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("open{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let kept: Vec<String> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
+            .map(|i| format!("t{i}"))
+            .chain((0..3).map(|i| format!("open{i}")))
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
+    }
+
+    /// Workflows share the task events but must not use up the shells' kept
+    /// slots, on replay or in the folded state.
+    #[test]
+    fn finished_workflows_do_not_displace_a_finished_shell() {
+        use crate::acp::state::{
+            AcpSessionId, AcpState, AgentName, WorkflowLaunch, MAX_FINISHED_BACKGROUND_SHELLS,
+        };
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let finish = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        record(Event::BackgroundTaskStarted {
+            task_id: "shell".into(),
+            tool_call_id: None,
+            description: "make build".into(),
+            workflow: None,
+            started_at: None,
+        });
+        record(finish("shell"));
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 5 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("wf{i}"),
+                tool_call_id: Some(format!("call-{i}")),
+                description: "drafts".into(),
+                workflow: Some(WorkflowLaunch {
+                    run_id: format!("wf_{i}"),
+                    name: "drafts".into(),
+                    summary: None,
+                    transcript_dir: String::new(),
+                }),
+                started_at: None,
+            });
+            record(finish(&format!("wf{i}")));
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for (seq, event) in store.replay_from("s-1", 0) {
+            state.apply_event(seq, event).unwrap();
+        }
+        assert_eq!(state.background_shells.len(), 1);
+        assert_eq!(state.background_shells[0].command, "make build");
+        assert!(state.background_shells[0].finished);
+        assert_eq!(state.workflow_runs.len(), MAX_FINISHED_BACKGROUND_SHELLS);
     }
 
     /// Nothing guarantees an adapter task id stays unique for a session, so a
@@ -1028,6 +1370,7 @@ mod tests {
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = || Event::BackgroundTaskFinished {
             task_id: "t".into(),
@@ -1065,6 +1408,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         store.record("s-1", 1, &started("t-1")).unwrap();
         store.record("s-1", 2, &started("t-2")).unwrap();
@@ -1120,6 +1464,7 @@ mod tests {
                     tool_call_id: Some("toolu_wf".into()),
                     description: "drafts".into(),
                     workflow: Some(launch.clone()),
+                    started_at: None,
                 },
                 workflow_agent("a1", "wf_1"),
                 workflow_agent("a2", "wf_1"),

@@ -5,7 +5,9 @@ use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
 use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
-use agent_client_protocol::v1::schema::{SessionId, SessionNotification, SessionUpdate};
+use agent_client_protocol::v1::schema::{
+    ContentBlock, SessionId, SessionNotification, SessionUpdate,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,7 +22,8 @@ use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
-    restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
+    restore_wake_tool_title, shell_command, update_tool_context_cache, ToolCallContextCache,
+    ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -47,6 +50,9 @@ pub(super) struct Shared {
     /// replayed user messages are the only record of them (#2276). Any other
     /// `user_message_chunk` is the agent echoing a prompt already recorded.
     pub(super) seed_user_replay: AtomicBool,
+    /// The last AoE prompt's text and when it ended (`0` while running), to
+    /// drop an echo that trails its `Stopped`.
+    pub(super) last_prompt: std::sync::Mutex<(String, i64)>,
     /// Epoch-ms of the last inbound notification, for the resume-idle
     /// watchdog.
     pub(super) last_event_at: AtomicI64,
@@ -108,6 +114,7 @@ impl Shared {
             profile,
             suppress_history_replay: AtomicBool::new(false),
             seed_user_replay: AtomicBool::new(false),
+            last_prompt: Default::default(),
             last_event_at: AtomicI64::new(now_ms()),
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
@@ -167,6 +174,20 @@ impl Shared {
                 TailerStart::Resumed,
             );
         }
+    }
+
+    /// A user chunk repeating the prompt AoE just finished, arriving within
+    /// the grace after its `Stopped`.
+    fn is_late_echo(&self, update: &SessionUpdate) -> bool {
+        const LATE_ECHO_GRACE_MS: i64 = 2_000;
+        let SessionUpdate::UserMessageChunk(chunk) = update else {
+            return false;
+        };
+        let ContentBlock::Text(text) = &chunk.content else {
+            return false;
+        };
+        let (prompt, ended_ms) = &*self.last_prompt.lock().expect("last prompt mutex poisoned");
+        *ended_ms != 0 && now_ms() - ended_ms < LATE_ECHO_GRACE_MS && text.text.trim() == prompt
     }
 
     pub(super) fn reset_message_dedup(&self) {
@@ -254,7 +275,12 @@ impl Shared {
         self.capture_rate_limit(&notification.update);
         let session_id = notification.session_id.0.to_string();
         let update_for_tool_context = notification.update.clone();
+        // A chunk while an AoE prompt is in flight echoes it (#5224). Idle, it
+        // is a Remote Control message from another client.
+        let user_echo =
+            prompt_active || !local_prompt_signals || self.is_late_echo(&notification.update);
         let mut events = if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
+            && user_echo
             && !self.seed_user_replay.load(Ordering::Relaxed)
         {
             Vec::new()
@@ -273,7 +299,7 @@ impl Shared {
             &self.session_label,
         )
         .await;
-        for event in events {
+        for mut event in events {
             if let Event::BackgroundAgentLaunched {
                 agent_id,
                 output_file,
@@ -301,6 +327,17 @@ impl Shared {
                     "dropping post-load history-replay event"
                 );
                 continue;
+            }
+            if let Event::BackgroundTaskStarted {
+                tool_call_id: Some(call),
+                description,
+                workflow: None,
+                ..
+            } = &mut event
+            {
+                if let Some(command) = shell_command(&self.tool_context_cache, call) {
+                    *description = command;
+                }
             }
             if let Event::BackgroundTaskStarted {
                 task_id,
@@ -393,10 +430,10 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, TextContent};
+    use agent_client_protocol::v1::schema::{ContentChunk, TextContent};
 
-    async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
-        let (event_tx, mut event_rx) = mpsc::channel(8);
+    fn echo_shared(prompt_in_flight: bool) -> (Shared, mpsc::Receiver<Event>) {
+        let (event_tx, event_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let shared = Shared::new(
             event_tx,
@@ -404,19 +441,24 @@ mod tests {
             &crate::acp::agent_profiles::CLAUDE,
             lifecycle_tx,
             Arc::new(TerminalClaim::new()),
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(prompt_in_flight)),
             None,
             Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
             None,
         );
-        shared
-            .seed_user_replay
-            .store(seed_user_replay, Ordering::Relaxed);
+        (shared, event_rx)
+    }
+
+    async fn user_chunk_events(
+        shared: Shared,
+        mut event_rx: mpsc::Receiver<Event>,
+        local_prompt_signals: bool,
+    ) -> Vec<Event> {
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));
         shared
             .handle_notification(
                 SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk)),
-                true,
+                local_prompt_signals,
             )
             .await;
         drop(shared);
@@ -427,13 +469,52 @@ mod tests {
         events
     }
 
+    async fn user_echo_events(
+        seed_user_replay: bool,
+        prompt_in_flight: bool,
+        local_prompt_signals: bool,
+    ) -> Vec<Event> {
+        let (shared, event_rx) = echo_shared(prompt_in_flight);
+        shared
+            .seed_user_replay
+            .store(seed_user_replay, Ordering::Relaxed);
+        user_chunk_events(shared, event_rx, local_prompt_signals).await
+    }
+
     #[tokio::test]
-    async fn user_message_chunk_records_only_while_seeding_import_replay() {
-        // Live echo is already recorded locally (#5224); import replay is not.
-        assert!(user_echo_events(false).await.is_empty());
-        assert!(matches!(
-            user_echo_events(true).await.as_slice(),
-            [Event::UserPromptSent { text, .. }] if text == "hello"
-        ));
+    async fn user_message_chunk_records_replay_and_remote_messages_only() {
+        // Echo of an AoE prompt is already recorded locally (#5224).
+        assert!(user_echo_events(false, true, true).await.is_empty());
+        // Replayed update committed with the session belongs to no live message.
+        assert!(user_echo_events(false, false, false).await.is_empty());
+        // Import replay and an idle Remote Control message are recorded.
+        for (seed, in_flight) in [(true, true), (true, false), (false, false)] {
+            assert!(
+                matches!(
+                    user_echo_events(seed, in_flight, true).await.as_slice(),
+                    [Event::UserPromptSent { text, .. }] if text == "hello"
+                ),
+                "seed={seed} in_flight={in_flight}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn echo_trailing_its_stopped_is_dropped_within_the_grace_only() {
+        // (prompt text, ms since it ended, recorded)
+        for (prompt, ago_ms, recorded) in [
+            ("hello", 100, false),
+            ("hello", 10_000, true),
+            ("other", 100, true),
+        ] {
+            let (shared, event_rx) = echo_shared(false);
+            *shared.last_prompt.lock().unwrap() = (prompt.to_string(), now_ms() - ago_ms);
+            let events = user_chunk_events(shared, event_rx, true).await;
+            assert_eq!(
+                !events.is_empty(),
+                recorded,
+                "{prompt} ended {ago_ms}ms ago"
+            );
+        }
     }
 }
