@@ -24,7 +24,7 @@ pub struct DeleteOptions {
 pub struct DeleteDialogConfig {
     pub worktree_branch: Option<String>,
     pub has_sandbox: bool,
-    pub project_path: Option<String>,
+    pub config_path: Option<String>,
     /// Surfaces the "Keep scratch directory" opt-in, off by default so the
     /// normal flow stays one keystroke.
     pub is_scratch: bool,
@@ -42,6 +42,7 @@ enum FocusElement {
 }
 
 pub struct UnifiedDeleteDialog {
+    presentation_id: u64,
     session_title: String,
     config: DeleteDialogConfig,
     options: DeleteOptions,
@@ -59,7 +60,7 @@ pub struct UnifiedDeleteDialog {
 
 impl UnifiedDeleteDialog {
     pub fn new(session_title: String, config: DeleteDialogConfig, profile: &str) -> Self {
-        let user_config = match config.project_path.as_ref() {
+        let user_config = match config.config_path.as_ref() {
             Some(p) => crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 profile,
                 std::path::Path::new(p),
@@ -89,6 +90,7 @@ impl UnifiedDeleteDialog {
         let focusable_elements = Self::build_focusable_elements(&config, &options);
 
         Self {
+            presentation_id: crate::tui::terminal_output::next_interaction_revision(),
             session_title,
             config,
             options,
@@ -99,6 +101,10 @@ impl UnifiedDeleteDialog {
             focusable_rects: Vec::new(),
             hover: HoverState::default(),
         }
+    }
+
+    pub(in crate::tui) fn presentation_id(&self) -> u64 {
+        self.presentation_id
     }
 
     /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`,
@@ -548,7 +554,7 @@ mod tests {
             DeleteDialogConfig {
                 worktree_branch: Some("feature-branch".to_string()),
                 has_sandbox: true,
-                project_path: None,
+                config_path: None,
                 is_scratch: false,
             },
             "default",
@@ -561,7 +567,7 @@ mod tests {
             DeleteDialogConfig {
                 worktree_branch: None,
                 has_sandbox: false,
-                project_path: None,
+                config_path: None,
                 is_scratch: true,
             },
             "default",

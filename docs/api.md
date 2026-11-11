@@ -884,6 +884,10 @@ Admitted stop work survives HTTP cancellation; its committed native fence surviv
 
 If a write commits but canonical publication fails, the stop remains durable and the response reports an unconfirmed outcome. Unproven retirement remains pending rather than reporting success. Daemon detach, idle shutdown and internal provider teardown do not independently create user-stop intent. Reversible stop preserves native transcript history.
 
+## POST /api/sessions/{id}/acp/subagents/{child_id}/cancel
+
+Stops one Claude subagent session without ending the root turn. `202` when `session/cancel` was sent to the child, `409` when the child is unknown or did not announce the `cancel` capability (`SubagentRecord.cancel_capable`). `POST /api/sessions/{id}/acp/cancel` still cancels the whole turn.
+
 ## DELETE /api/workspaces
 
 Permanently purge an explicit `session_ids` selection. Capture the IDs and trash consent when opening confirmation; do not rebuild the selection from a later list. Duplicate IDs are processed once. The server identifies the managed worktree owner and removes selected siblings before it.

@@ -253,25 +253,32 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
 
     // Text ramp. text-bright is the most readable; dim is the WCAG-AA
     // floor for descriptive copy (validated by the issue #1105 work).
+    // Body text sits on surface-900, -850, the modal surface-800, the code-block
+    // surface-950 and the startup error banner's tint.
+    let text_surfaces = [
+        bg,
+        elevated_1,
+        elevated_2,
+        deeper,
+        composite(theme.error, bg, 0.1),
+    ];
+    let hint = hex(lift_until(
+        theme.hint,
+        bg,
+        &text_surfaces,
+        TEXT_CONTRAST_RATIO,
+    ));
     css.insert("--color-text-primary".into(), hex(theme.text));
-    css.insert("--color-text-secondary".into(), hex(theme.hint));
-    css.insert("--color-text-muted".into(), hex(theme.hint));
+    css.insert("--color-text-secondary".into(), hint.clone());
+    css.insert("--color-text-muted".into(), hint);
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
-    // Dimmed lifted to body-text AA on surface-900, -850, the modal surface-800, the
-    // code-block surface-950 and the startup error banner's tint, for small text that
-    // cannot use the raw slot.
+    // Dimmed lifted for small text that cannot use the raw slot.
     css.insert(
         "--color-text-subtle".into(),
         hex(lift_until(
             theme.dimmed,
             bg,
-            &[
-                bg,
-                elevated_1,
-                elevated_2,
-                deeper,
-                composite(theme.error, bg, 0.1),
-            ],
+            &text_surfaces,
             TEXT_CONTRAST_RATIO,
         )),
     );
@@ -662,6 +669,22 @@ mod tests {
                     ratio >= TEXT_CONTRAST_RATIO,
                     "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
                 );
+            }
+            // Secondary and muted body text, on every body-text surface.
+            for fg in ["--color-text-secondary", "--color-text-muted"] {
+                for (surface, label) in [
+                    (var("--color-surface-900"), "surface-900"),
+                    (var("--color-surface-850"), "surface-850"),
+                    (var("--color-surface-800"), "surface-800"),
+                    (var("--color-surface-950"), "surface-950"),
+                    (tint, "bg-status-error/10"),
+                ] {
+                    let ratio = contrast_ratio(var(fg), surface);
+                    assert!(
+                        ratio >= TEXT_CONTRAST_RATIO,
+                        "{name}: {fg} on {label} is {ratio:.2}, below body-text AA"
+                    );
+                }
             }
             // Dialog hints, such as the onboarding footer and the tour's Skip button, sit on the
             // modal surface.

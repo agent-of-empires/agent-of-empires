@@ -82,6 +82,7 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "BackgroundAgentCompleted",
     "BackgroundTaskStarted",
     "BackgroundTaskFinished",
+    "SubagentUpdated",
 ];
 
 /// Idle read connections kept open; concurrent reads beyond this open more.

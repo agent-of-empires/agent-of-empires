@@ -13,7 +13,7 @@ Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket 
 Invariants worth knowing before touching this code:
 
 - **One owner per generation.** Every spawn, attach and respawn has a local lease epoch tied to its captured runner generation. Shutdown, the reaper, the drain task and the reconciler refuse stale authority. A spawn completing after a stop tears its own runner down instead of installing it. Stop remains pending until physical runner and scope retirement is proven, holding prompts and refusing resumes while the reconciler retries.
-- **`runner_version` is an attachment-compatibility generation**, separate from liveness and `build_version`. Generation 4 requires the runner to announce authoritative native identity before session callbacks; the control wire version stays 3. An incompatible live runner is reaped before replacement, and an in-flight turn gets an explicit `Stopped { reason: "runner_protocol_upgraded" }`, since the daemon cannot truthfully drain a protocol it cannot attach to. Same-generation build changes stay attachable: idle workers are replaced immediately and busy ones respawn at the next idle boundary (`aoe ps --acp` marks them `(stale)`).
+- **`runner_version` is an attachment-compatibility generation**, separate from liveness and `build_version`. Generation 4 requires the runner to announce authoritative native identity before session callbacks; the control wire version is 4. An incompatible live runner is reaped before replacement, and an in-flight turn gets an explicit `Stopped { reason: "runner_protocol_upgraded" }`, since the daemon cannot truthfully drain a protocol it cannot attach to. Same-generation build changes stay attachable: idle workers are replaced immediately and busy ones respawn at the next idle boundary (`aoe ps --acp` marks them `(stale)`).
 - **Process-group termination.** Runners are group leaders via `setsid`, and every termination path signals the group, so the node wrapper and SDK child die with the runner rather than reparenting to PID 1. Prefer the verbs over `kill -9`, which leaves the runner no chance to clean up.
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
 - **Detach buffer.** Only agent notifications and `PromptCompleted` survive a detach, in a queue bounded by frame count and encoded bytes that sheds the oldest first. Delivery is best effort, not durable or exactly once. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; within the admitted native session `terminal/release` is idempotent cleanup, so it needs no tombstone.
@@ -24,6 +24,7 @@ Invariants worth knowing before touching this code:
 - **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
+- **Subagent sessions.** A profile with `supports_subagents` declares the ACP subagents capability, so each subagent is a child session on the same connection. `SessionIngress` admits a child only after a `subagent_update` on an admitted session names it, and answers its permission and elicitation requests but refuses its fs and terminal requests, which assume the root session's workspace. Child traffic takes `handle_child_notification`, never the root's dedup, compaction or watchdog path. The adapter hides the Agent/Task call, so aoe synthesizes the card from the parent-to-child delegation `session_message` (its message id is the card id and the child's `parent_tool_call_id`); the child's reply or hand-back `session_message` completes it, while a background child has none and its card follows the roster state. Only child tool calls and its model reach the transcript, and the tool calls nest under that card via `parent_tool_call_id`. `SubagentUpdated` carries a full merged snapshot, so replay is last-write-wins, and its state replaces the transcript tailer's heuristics for that agent. Stop sends `session/cancel` with the child id over `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`, or `ControlBody::CancelSession` through a runner (control protocol 4), and only for a child that announced `capabilities.cancel`. A child's own delegations (grandchildren) are not rendered: their `session_message`s are dropped. A conversation reset is refused while a child runs, since it would drop the child routes. Restoring children after `session/load` is not implemented, so an async agent left open by a restart is still resolved by the resumed tailer below.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
 
 ## Terminal handoff
@@ -243,13 +244,17 @@ Exit cleanup recovers poisoned output custody and discards an unsubmitted captur
 ordinary rendering still refuses poisoned state.
 
 The initial guard covers failure in `App::new`. After successful construction,
-the guard is moved into a binding declared after `app`, intentionally reversing
-their drop order. On normal return, error, and unwind, the guard first cancels
-clipboard admission and work, restores input, drops its terminal wrapper (cursor
-cleanup), and attempts final display controls. Only then does `App` drop and join
-the clipboard executor. Keep this binding order when changing startup.
-Standalone owners use explicit normal-return teardown; they do not inherit this
-App unwind guarantee. Abort and fatal termination do not run Rust destructors.
+the guard moves into a binding declared after `app`, intentionally reversing drop
+order. On return, error, and unwind, the guard first cancels clipboard admission
+and work, restores input, drops its terminal wrapper (cursor cleanup), and attempts
+final display controls. Only afterward does `App` drop and join the executor.
+Keep this binding order when changing startup. Standalone ACP attach and remote
+home use the same guard, created immediately after raw mode is enabled and before
+fallible output or terminal construction. Each standalone executor is declared
+before its guard: error and unwind restore input before any clipboard worker join.
+Nested structured views borrow the remote owner's terminal and executor, so
+returning to the picker does not disable raw input. Abort and fatal termination
+do not run Rust destructors.
 
 If a terminated process leaves input unusable, run `stty sane` from the shell.
 Input repair does not reset display modes. For supported xterm-compatible terminals,
@@ -268,13 +273,18 @@ handing the terminal to a child. A matching emission receipt commits mouse mode;
 pointer geometry stays unavailable until that frame and retained window match.
 Unpresented geometry cancels drag/copy selection without blocking keyboard input.
 Interactive presentation also owns a view-unique semantic revision, not merely
-frame bytes: approval selection, elicitation ownership, focus, picker/input and
-side-channel changes invalidate old authority. Receipts for an older revision
-cannot enable Allow/answer actions on a replacement request. Draft editing and
-cancellation remain available. Revisions are scalar; unchanged authority compares
-borrowed identities and does not clone a model or allocate per frame.
+frame bytes: approval selection, elicitation and subagent-stop targets, focus,
+picker/input and side-channel changes invalidate old authority. Older receipts
+cannot authorize replacement requests or child-stop targets. Draft editing and
+whole-turn cancellation remain available. Revisions are scalar; unchanged authority
+compares borrowed identities and does not clone a model or allocate per frame.
 
-
+Home confirmations bind consent to a unique dialog owner and its input revision.
+Trash, permanent-delete and group-delete submission requires the matching emitted
+frame; opening or replacing a dialog and changing its options cannot reuse an old
+receipt. Only the foreground confirmation actually painted by that frame receives
+authority; a covering notice does not authorize a hidden prompt. Cancellation and
+option navigation remain available while output is pending.
 
 Actual nonblocking writes and readiness polls share a deadline. Interrupted OSC
 strings and fatal frame writes record pending framing recovery; recovery emits CAN
@@ -288,34 +298,6 @@ never an unbounded stdout fallback. Desktop helpers remain independent transport
 Standalone error screens keep polling the same bounded output coordinator while
 waiting for dismissal. Both a partial frame and an initial capture refused by
 active OSC resume without requiring a dismiss key.
-
-
-## Retained history consistency
-
-Retained page identity combines the event-store incarnation with the session
-revision. Every append or replacement invalidates the complete snapshot.
-Bounds and identity are read in one SQLite transaction; independent indexed
-first/last lookups avoid scanning payloads for metadata. A stale identity reaches
-the HTTP client as a conflict, while coherent successful pages carrying different
-identities are rejected as inconsistent metadata. Neither may publish mixed rows.
-Unchanged incomplete histories retain their identity for cheap refresh probes.
-Identity installation reserves SQLite's writer before checking its schema, so
-concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
-the existing incarnation and session revisions; lock waiting remains bounded by
-the connection's busy policy.
-
-File-backed retained reads reuse the independent query-only search reader, not
-the event writer. Identity, bounds and raw rows share one read transaction; commit
-and release the reader before JSON decoding. Private memory and temporary
-databases use their original connection and still release it before decoding.
-Raw retained pages preserve scanned rows and cursors without turn alignment.
-Forward retained replay keeps reducer state across pages.
-
-Migration 54 installs identity only when `acp_events` exists. An existing empty
-database defers to the normal EventStore opener, which creates schema before
-identity. Corruption and access failures are not empty-database cases. Backward
-cursors remain strict within SQLite's signed sequence range; a larger unsigned
-cursor includes the maximum stored signed sequence rather than dropping it.
 
 ## Persistence and the context primer
 
@@ -400,7 +382,7 @@ Each agent has two profile sources, kept aligned by registry key:
 - **Server**, `src/acp/agent_profiles.rs`: `parent_meta_namespaces`, `clear_aliases`, and the `supports_exit_plan_mode` / `supports_wakeup_tools` gates.
 - **Frontend**, `web/src/lib/agentProfiles.ts`: the card-classifier alias map, claude-specialized capabilities (`todos`, `skills`, `wakeup`), the MCP prefix list, and special-title patterns matched only when the capability is on.
 
-Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId`. An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
+Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
 
 ## Security model
 

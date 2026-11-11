@@ -113,50 +113,35 @@ impl RemoteHomeState {
 /// Set up alternate-screen terminal, run the remote home loop, tear it
 /// down. Invoked from `tui::run` when `AOE_DAEMON_URL` is set.
 pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
-    use crossterm::event::{
-        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
-    };
-    use crossterm::execute;
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
-    use std::io;
     use std::io::IsTerminal;
 
-    if !io::stdin().is_terminal() {
+    if !std::io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal; `aoe` needs an interactive TTY");
     }
 
-    enable_raw_mode()?;
-    let mut stdout = Output::default();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
-    // Push the kitty enhancement stack so the remote picker and the
-    // structured-view it hands off to see `Shift+Enter` as a distinct
-    // KeyEvent (#2362). Best-effort like `TerminalGuard::enter`; the
-    // `AOE_DAEMON_URL` flow never enters via `TerminalGuard`.
-    #[cfg(unix)]
-    let _ = execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-    );
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = crate::tui::terminal_output::Terminal::new(backend)?;
+    // Nested structured views borrow this owner; returning to the picker keeps raw input.
+    // On exit/unwind the guard restores input before the executor's worker joins.
+    let clipboard = super::clipboard::Executor::new()?;
+    let mut guard = super::TerminalGuard::<CrosstermBackend<Output>>::enter(true, false)?;
+    guard.clipboard = Some(clipboard.stop_handle());
+    guard.terminal = Some(crate::tui::terminal_output::Terminal::new(
+        CrosstermBackend::new(Output::default()),
+    )?);
     let mut event_stream = EventStream::new();
     let theme_name = resolve_theme_name();
     let palette_mode = resolve_theme_palette_mode();
     let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
 
-    let result = run(&mut terminal, &mut event_stream, &theme, endpoint).await;
-
-    disable_raw_mode()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-    drop(terminal);
-    crate::tui::terminal_output::restore_after_exit(true, None, deadline)?;
-    result
+    run(
+        guard
+            .terminal
+            .as_mut()
+            .expect("standalone terminal initialized"),
+        &mut event_stream,
+        &theme,
+        endpoint,
+    )
+    .await
 }
 
 async fn run(

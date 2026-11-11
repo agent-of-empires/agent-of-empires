@@ -22,26 +22,13 @@ use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::NoticePolicy;
 use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
+use crate::tui::terminal_output::next_interaction_revision;
 
 /// Most plugin notifications buffered awaiting a free toast slot. The daemon
 /// already bounds its ring; this second guard drops old un-shown toasts rather
 /// than the newest.
 const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
-fn next_interaction_revision() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut current = NEXT.load(Ordering::Relaxed);
-    loop {
-        let revision = current
-            .checked_add(1)
-            .expect("structured interaction identity overflow");
-        match NEXT.compare_exchange_weak(current, revision, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return revision,
-            Err(observed) => current = observed,
-        }
-    }
-}
 
 pub struct StructuredViewState {
     pub session_id: String,
@@ -130,6 +117,7 @@ pub struct StructuredViewState {
     presented_interaction: u64,
     interaction_approval: Option<String>,
     interaction_elicitation: Option<String>,
+    interaction_subagent: Option<String>,
     interaction_focus: Focus,
     /// The button under the pointer. Visual only; never moves keyboard focus.
     pub hover: HoverState,
@@ -320,12 +308,18 @@ impl StructuredViewState {
             .pending_elicitations
             .first()
             .map(|pending| pending.nonce.as_str());
+        let subagent = self
+            .transcript
+            .stoppable_subagent()
+            .map(|record| record.session_id.as_str());
         if self.interaction_approval.as_deref() != self.selected_approval.as_deref()
             || self.interaction_focus != self.focus
             || self.interaction_elicitation.as_deref() != elicitation
+            || self.interaction_subagent.as_deref() != subagent
         {
             self.interaction_approval = self.selected_approval.clone();
             self.interaction_elicitation = elicitation.map(str::to_owned);
+            self.interaction_subagent = subagent.map(str::to_owned);
             self.interaction_focus = self.focus;
             self.interaction_changed();
         }
@@ -407,6 +401,7 @@ impl StructuredViewState {
             presented_interaction: interaction_revision,
             interaction_approval: None,
             interaction_elicitation: None,
+            interaction_subagent: None,
             interaction_focus: Focus::Composer,
             hover: HoverState::default(),
             choice: None,
@@ -712,6 +707,42 @@ mod tests {
         let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, Source::Env);
         let http = HttpClient::new(endpoint.clone()).unwrap();
         StructuredViewState::new("s-1".into(), endpoint, http, ws)
+    }
+
+    #[test]
+    fn changing_subagent_stop_target_requires_a_new_presentation() {
+        let mut state = test_state(None);
+        state
+            .transcript
+            .subagents
+            .push(crate::acp::state::SubagentRecord {
+                session_id: "child-a".into(),
+                parent_session_id: "s-1".into(),
+                parent_tool_call_id: None,
+                title: None,
+                description: None,
+                state: crate::acp::state::SubagentState::Running,
+                stop_reason: None,
+                cancel_capable: true,
+                model: None,
+            });
+        state.reconcile_interaction_authority();
+        assert!(!state.interaction_presented());
+        let first = state.interaction_revision;
+        assert!(state.confirm_presentation(first));
+        state.reconcile_interaction_authority();
+        assert_eq!(state.interaction_revision, first);
+        assert!(state.interaction_presented());
+
+        state.transcript.subagents[0].session_id = "child-b".into();
+        state.reconcile_interaction_authority();
+        assert!(!state.interaction_presented());
+        assert!(!state.confirm_presentation(first));
+        assert!(state.confirm_presentation(state.interaction_revision));
+
+        state.transcript.subagents[0].cancel_capable = false;
+        state.reconcile_interaction_authority();
+        assert!(!state.interaction_presented());
     }
 
     #[test]

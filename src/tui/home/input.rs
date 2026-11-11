@@ -1451,6 +1451,7 @@ impl HomeView {
 
     pub(in crate::tui) fn invalidate_presentation(&mut self) {
         self.presentation_ready = false;
+        self.presented_confirmation = None;
         if let Some(view) = self.structured_preview.as_mut() {
             view.invalidate_presentation();
         }
@@ -1750,6 +1751,7 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        let presented_confirmation = self.begin_confirmation_input();
         if self.reconcile_delete_confirmation() {
             return true;
         }
@@ -1795,6 +1797,13 @@ impl HomeView {
             if let Some(result) = dialog.dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation.is_some_and(|token| {
+                            token.dialog == dialog.dialog.presentation_id()
+                        }) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
@@ -1930,6 +1939,12 @@ impl HomeView {
                 let action = dialog.action().to_string();
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_indeterminate_resolution = None;
@@ -2072,6 +2087,12 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.group_delete_options_dialog = None;
                     }
@@ -2306,6 +2327,7 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        let presented_confirmation = self.begin_confirmation_input();
         // A key is a context change: a pending native attachment was prepared
         // for the session, profile, view and terminal mode in force when it was
         // requested, so reconcile before the keystroke acts on any of them.
@@ -2389,6 +2411,12 @@ impl HomeView {
             if let Some(dialog) = &mut self.confirm_dialog {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => return None,
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return None;
+                    }
                     DialogResult::Cancel => {
                         // User chose not to discard, go back to settings
                         self.confirm_dialog = None;
@@ -2739,6 +2767,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_indeterminate_resolution = None;
@@ -2769,6 +2803,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.unified_delete_dialog {
             match dialog.dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
@@ -2788,6 +2828,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.group_delete_options_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.group_delete_options_dialog = None;
                 }
@@ -3846,7 +3892,7 @@ impl HomeView {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &inst.source_profile,
-            std::path::Path::new(&inst.project_path),
+            inst.repo_config_path(),
         );
         // The reverse direction stays available regardless, so a session can always get out.
         (config.acp.structured_view.is_offered()
@@ -4281,14 +4327,24 @@ impl HomeView {
             return;
         };
 
-        let repo_path = std::path::PathBuf::from(&inst.project_path);
         let session_id_owned = inst.id.clone();
         let profile = inst.source_profile.clone();
-        let base_override = inst.base_branch_override.clone();
-        let worktree_base = inst
-            .worktree_info
-            .as_ref()
-            .and_then(|w| w.base_branch.clone());
+        // A single-repo workspace's cwd is the workspace dir, not a checkout, so
+        // diff its one repo; the daemon routes an unnamed base write there too.
+        let (repo_path, base_override, worktree_base) = match inst.all_repos() {
+            [only] => (
+                std::path::PathBuf::from(&only.worktree_path),
+                only.base_branch_override.clone(),
+                only.base_branch.clone(),
+            ),
+            _ => (
+                std::path::PathBuf::from(&inst.project_path),
+                inst.base_branch_override.clone(),
+                inst.worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone()),
+            ),
+        };
 
         // A session on a non-git project runs in place, so there is no repo to diff
         // against; say so rather than surfacing the git layer's raw error.
@@ -4385,7 +4441,15 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.project_path.clone());
+            .map(|inst| {
+                if inst.workspace_info.is_some() {
+                    repo_config::repo_config_source_path(inst.repo_config_path())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    inst.project_path.clone()
+                }
+            });
         match SettingsView::new(&self.config_profile(), project_path) {
             Ok(view) => self.settings_view = Some(view),
             Err(e) => {
@@ -6304,7 +6368,7 @@ impl HomeView {
                         .map(|wt| wt.branch.clone())
                         .or_else(|| inst.workspace_info.as_ref().map(|w| w.branch.clone())),
                     has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
-                    project_path: Some(inst.project_path.clone()),
+                    config_path: Some(inst.repo_config_path().to_string_lossy().into_owned()),
                     is_scratch: inst.scratch,
                 };
 
@@ -8228,6 +8292,7 @@ mod tests {
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
+            workspace: false,
             sandbox: true,
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,

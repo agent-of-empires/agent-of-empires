@@ -35,6 +35,22 @@ pub(crate) struct FrameOutcome {
     pub presented: Option<FrameId>,
 }
 
+/// Unique semantic owners share receipt identity without allocating per frame.
+pub(super) fn next_interaction_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut current = NEXT.load(Ordering::Relaxed);
+    loop {
+        let revision = current
+            .checked_add(1)
+            .expect("interaction identity overflow");
+        match NEXT.compare_exchange_weak(current, revision, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return revision,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 /// Stage Ratatui's cursor cleanup before attempting bounded terminal output.
 pub(crate) struct Terminal<B: ratatui::backend::Backend> {
     inner: Option<ratatui::Terminal<B>>,

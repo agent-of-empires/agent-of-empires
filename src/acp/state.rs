@@ -384,6 +384,22 @@ pub enum StartupErrorDetail {
         expected: String,
         received: String,
     },
+    /// The adapter's proxy sent a `_meta.aoe.proxy` hello core cannot accept.
+    InvalidProxyHello {
+        reason: String,
+    },
+}
+
+/// Why a proxied session's integration was lost mid-session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntegrationLostReason {
+    /// A `_meta.aoe` frame broke the contract.
+    ContractViolation { detail: String },
+    /// Too many frames waited on an adapter sequence that never arrived.
+    HoldOverflow,
+    /// The proxy held more leases than any real agent does.
+    LeaseOverflow,
 }
 
 /// Lifecycle status of an async background sub-agent.
@@ -393,6 +409,10 @@ pub enum BackgroundAgentStatus {
     Running,
     /// No transcript growth for the idle window.
     Stalled,
+    /// A subagent session is blocked on the user (RFD `requires_action`).
+    RequiresAction,
+    /// The agent cannot say what the subagent is doing (RFD `unknown`).
+    Unknown,
     Completed,
     /// The parent session ended before the agent finished.
     Detached,
@@ -475,6 +495,46 @@ pub struct WorkflowRef {
     pub run_id: String,
     pub name: String,
     pub phase: String,
+}
+
+/// Work state of a subagent session, from the ACP subagents RFD snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentState {
+    Running,
+    RequiresAction,
+    /// Ready for another prompt; `SubagentRecord::stop_reason` says why.
+    Idle,
+    /// Also the state before the agent has reported one.
+    #[default]
+    Unknown,
+}
+
+/// One subagent session announced by its parent. The event carries the whole
+/// merged snapshot, so replay is last-write-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRecord {
+    pub session_id: String,
+    pub parent_session_id: String,
+    /// The card for the delegation message that launched it (its message id).
+    /// Unset renders the child in a flat roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub state: SubagentState,
+    /// Open string: the RFD reserves values for future stop reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Whether `session/cancel` may target this child.
+    #[serde(default)]
+    pub cancel_capable: bool,
+    /// Read-only: the child's own model selector, never set by aoe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One tool call a background sub-agent made, parsed from its transcript.
@@ -566,6 +626,8 @@ pub struct AcpState {
     pub last_agent_switch: Option<AgentSwitchInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_error: Option<StartupErrorDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_lost: Option<IntegrationLostReason>,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
@@ -577,6 +639,8 @@ pub struct AcpState {
     pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentRecord>,
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<String>,
@@ -815,6 +879,11 @@ pub enum Event {
         warning: Option<String>,
         ended_at: DateTime<Utc>,
     },
+    /// A subagent session was announced or its snapshot changed.
+    SubagentUpdated {
+        subagent: SubagentRecord,
+        at: DateTime<Utc>,
+    },
     /// A background task that is not a sub-agent (Bash `run_in_background`, or
     /// a `Workflow` run) started, from the tool result's `toolResponse`. Its
     /// end is read from the session transcript (`acp::task_transcript`).
@@ -866,6 +935,11 @@ pub enum Event {
     /// `initialize` completed but the adapter failed the compatibility policy.
     IncompatibleAgent {
         detail: StartupErrorDetail,
+    },
+    /// A proxied agent broke the `_meta.aoe` contract mid-session; core stops
+    /// interpreting its frames.
+    IntegrationLost {
+        reason: IntegrationLostReason,
     },
     UserPromptSent {
         text: String,
@@ -1178,10 +1252,17 @@ impl AcpState {
                 self.startup_error = Some(detail);
                 self.sidebar_phase = SidebarPhase::Error;
             }
+            Event::IntegrationLost { reason } => {
+                self.integration_lost = Some(reason);
+                self.turn_active = false;
+                self.cancelling = false;
+                self.sidebar_phase = SidebarPhase::Error;
+            }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
             Event::PromptCapabilities { steering, .. } => self.steering = steering,
             Event::AcpSessionAssigned { .. } => {
                 self.startup_error = None;
+                self.integration_lost = None;
                 self.rate_limit = None;
                 self.heal_sidebar_phase();
             }
@@ -1216,23 +1297,32 @@ impl AcpState {
                 output_file: _,
                 workflow,
                 started_at,
-            } => self.launch_background_agent(BackgroundAgentRecord {
-                agent_id,
-                tool_call_id,
-                description,
-                prompt,
-                model,
-                workflow,
-                status: BackgroundAgentStatus::Running,
-                started_at,
-                ended_at: None,
-                tool_count: 0,
-                tools: Vec::new(),
-                last_tool: None,
-                last_text: None,
-                result: None,
-                warning: None,
-            }),
+            } => {
+                let mut record = BackgroundAgentRecord {
+                    agent_id,
+                    tool_call_id,
+                    description,
+                    prompt,
+                    model,
+                    workflow,
+                    status: BackgroundAgentStatus::Running,
+                    started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                };
+                // A child's snapshot may predate the launch event.
+                if let Some(child) = self.subagents.iter().find(|s| {
+                    s.parent_tool_call_id.as_deref() == Some(record.tool_call_id.as_str())
+                }) {
+                    record.reconcile(child, started_at);
+                }
+                self.launch_background_agent(record);
+            }
             Event::BackgroundAgentProgress {
                 agent_id,
                 status,
@@ -1276,6 +1366,7 @@ impl AcpState {
                     }
                 }
             }
+            Event::SubagentUpdated { subagent, at } => self.apply_subagent(subagent, at),
             Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
@@ -1386,7 +1477,10 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = SidebarPhase::Idle;
+        // A lost integration is an error until a new connection restores it.
+        if self.integration_lost.is_none() {
+            self.sidebar_phase = SidebarPhase::Idle;
+        }
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -1415,6 +1509,7 @@ impl AcpState {
         self.mode = SessionMode::Default;
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
+        self.subagents = Vec::new();
         self.last_agent_switch = Some(AgentSwitchInfo {
             from,
             to,
@@ -1431,10 +1526,50 @@ impl AcpState {
         }
     }
 
+    /// The RFD snapshot is authoritative for the async agent that child
+    /// belongs to, so it replaces the transcript tailer's heuristics and,
+    /// unlike them, may reopen an idle agent that was messaged again.
+    fn apply_subagent(&mut self, subagent: SubagentRecord, at: DateTime<Utc>) {
+        if let Some(tool_call_id) = subagent.parent_tool_call_id.as_deref() {
+            if let Some(agent) = self
+                .background_agents
+                .iter_mut()
+                .find(|a| a.tool_call_id == tool_call_id)
+            {
+                agent.reconcile(&subagent, at);
+            }
+        }
+        match self
+            .subagents
+            .iter_mut()
+            .find(|s| s.session_id == subagent.session_id)
+        {
+            Some(existing) => *existing = subagent,
+            None => self.subagents.push(subagent),
+        }
+    }
+
     fn background_agent(&mut self, agent_id: &str) -> Option<&mut BackgroundAgentRecord> {
         self.background_agents
             .iter_mut()
             .find(|a| a.agent_id == agent_id)
+    }
+}
+
+impl BackgroundAgentRecord {
+    /// Folds a child's RFD snapshot in; `at` stamps a newly ended agent.
+    fn reconcile(&mut self, child: &SubagentRecord, at: DateTime<Utc>) {
+        let (status, ended) = match child.state {
+            SubagentState::Running => (BackgroundAgentStatus::Running, false),
+            SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
+            SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
+            SubagentState::Idle if child.stop_reason.as_deref() == Some("error") => {
+                (BackgroundAgentStatus::Error, true)
+            }
+            SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+        };
+        self.status = status;
+        self.ended_at = ended.then(|| self.ended_at.unwrap_or(at));
     }
 }
 
@@ -2276,6 +2411,106 @@ mod tests {
         }
     }
 
+    fn subagent(state: SubagentState, stop_reason: Option<&str>) -> Event {
+        Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "root".into(),
+                parent_tool_call_id: Some("tc1".into()),
+                title: Some("map backend".into()),
+                description: None,
+                state,
+                stop_reason: stop_reason.map(str::to_owned),
+                cancel_capable: true,
+                model: None,
+            },
+            at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn launch_reconciles_a_child_snapshot_that_arrived_first() {
+        let cases = [
+            (
+                SubagentState::Idle,
+                Some("end_turn"),
+                BackgroundAgentStatus::Completed,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("error"),
+                BackgroundAgentStatus::Error,
+                true,
+            ),
+            (
+                SubagentState::RequiresAction,
+                None,
+                BackgroundAgentStatus::RequiresAction,
+                false,
+            ),
+        ];
+        for (state, stop, expected, ended) in cases {
+            let s = applied([subagent(state, stop), launched()]);
+            let agent = &s.background_agents[0];
+            assert_eq!(agent.status, expected);
+            assert_eq!(agent.ended_at.is_some(), ended);
+        }
+    }
+
+    /// The RFD snapshot replaces the tailer's heuristics, and an idle child that
+    /// is messaged again runs again, which no tailer status could express.
+    #[test]
+    fn subagent_state_drives_the_async_agent_it_belongs_to() {
+        let mut s = applied([launched()]);
+        let steps = [
+            (
+                SubagentState::Running,
+                None,
+                BackgroundAgentStatus::Running,
+                true,
+            ),
+            (
+                SubagentState::RequiresAction,
+                None,
+                BackgroundAgentStatus::RequiresAction,
+                true,
+            ),
+            (
+                SubagentState::Unknown,
+                None,
+                BackgroundAgentStatus::Unknown,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("end_turn"),
+                BackgroundAgentStatus::Completed,
+                false,
+            ),
+            (
+                SubagentState::Running,
+                None,
+                BackgroundAgentStatus::Running,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("error"),
+                BackgroundAgentStatus::Error,
+                false,
+            ),
+        ];
+        for (state, reason, status, active) in steps {
+            s.apply_event(s.last_seq + 1, subagent(state, reason))
+                .unwrap();
+            assert_eq!(s.background_agents[0].status, status, "{state:?}");
+            assert_eq!(s.has_active_background_agent(), active, "{state:?}");
+        }
+        assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
+        assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+    }
+
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {
         Event::BackgroundAgentProgress {
             agent_id: "a1".into(),
@@ -2630,11 +2865,41 @@ mod tests {
             },
         )
         .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            subagent(SubagentState::Running, None),
+        )
+        .unwrap();
+        assert_eq!(s.subagents.len(), 1);
         s.apply_event(s.last_seq.saturating_add(1), switch_agent())
             .unwrap();
         assert!(s.config_options.is_empty() && s.config_option_switch_failed.is_none());
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+        assert!(s.subagents.is_empty());
+    }
+
+    /// The turn that ends after an integration loss must not heal the Error
+    /// phase; a new connection (`AcpSessionAssigned`) does.
+    #[test]
+    fn integration_loss_keeps_the_error_phase_until_a_new_session() {
+        let mut state = AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+        let lost = Event::IntegrationLost {
+            reason: IntegrationLostReason::HoldOverflow,
+        };
+        let stopped = Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        let assigned = Event::AcpSessionAssigned {
+            acp_session_id: "s2".into(),
+        };
+        for (seq, event) in [lost, stopped].into_iter().enumerate() {
+            state.apply_event(seq as u64 + 1, event).unwrap();
+        }
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        state.apply_event(3, assigned).unwrap();
+        assert!(state.integration_lost.is_none());
+        assert_ne!(state.sidebar_phase, SidebarPhase::Error);
     }
 }

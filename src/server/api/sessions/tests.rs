@@ -980,6 +980,82 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
 
 #[tokio::test]
 #[serial_test::serial]
+async fn a_workspace_keeps_its_launch_repo_agent_detect_as() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })?;
+    let adapters = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    crate::session::test_support::write_stub_adapter(adapters.path(), "pi-acp");
+    let workspaces = tempfile::tempdir()?;
+    crate::session::config::update_config(|config| {
+        config
+            .session
+            .custom_agents
+            .insert("my-pi".into(), "pi".into());
+        config.worktree.workspace_path_template =
+            format!("{}/{{session-id}}", workspaces.path().display());
+    })?;
+    let (project, _repo) = crate::git::test_support::init_repo();
+    std::fs::create_dir(project.path().join(".agent-of-empires"))?;
+    std::fs::write(
+        project.path().join(".agent-of-empires/config.toml"),
+        "[session.agent_detect_as]\nmy-pi = \"pi\"\n",
+    )?;
+    let (launched_tx, mut launched) = tokio::sync::mpsc::unbounded_channel();
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, _id| {
+        let _ = launched_tx.send(config);
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "test launcher".into(),
+            ))
+        })
+    });
+    let state =
+        crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    let _storage = Storage::new("detect", state.file_watch.clone())?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+
+    let (status, json) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "detect", "path": project.path(), "tool": "my-pi", "view": "structured",
+            "profile": "detect",
+            "worktree_branch": "feat/detect", "create_new_branch": true, "workspace": true,
+        }),
+    )
+    .await;
+    let instance = state.instances.read().await.first().cloned();
+    if let Some(instance) = &instance {
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
+            crate::tmux::Session::generate_name(&instance.id, &instance.title),
+        );
+    }
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    let instance = instance.expect("created row");
+    let checkout = &instance.workspace_info.as_ref().expect("workspace").repos[0].worktree_path;
+    assert_eq!(instance.view, crate::session::View::Structured, "{json}");
+    let launch = tokio::time::timeout(std::time::Duration::from_secs(30), launched.recv())
+        .await?
+        .expect("structured creation launches the agent");
+    assert_eq!(launch.agent_key, "pi");
+    assert_eq!(
+        launch.wrapper_substitution,
+        Some(("my-pi".to_string(), "pi".to_string()))
+    );
+    assert_eq!(launch.cwd, std::path::Path::new(&instance.project_path));
+    assert_eq!(launch.config_path, std::path::Path::new(checkout));
+    let restart = crate::server::api::acp::spawn_request_for(&instance, "pi".into(), None);
+    assert_eq!(restart.config_path, std::path::Path::new(checkout));
+    Ok(())
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn canonical_fork_refusals_do_not_create_sessions() -> anyhow::Result<()> {
     async fn request(state: Arc<AppState>, body: serde_json::Value) -> axum::response::Response {
         create_session(
@@ -4871,6 +4947,27 @@ fn create_body_flags_resolve_worktree_scratch_and_seed_conflicts() {
     }
 }
 
+#[tokio::test]
+#[serial_test::serial]
+async fn create_rejects_a_workspace_without_a_worktree() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let state = crate::server::test_support::build_test_app_state(Vec::new());
+    let (status, json) = post_create(
+        &state,
+        serde_json::json!({
+            "path": project.path().to_string_lossy(),
+            "tool": "claude",
+            "title": "ws",
+            "workspace": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["message"], "Workspace mode requires worktree mode");
+    assert!(state.instances.read().await.is_empty());
+}
+
 #[test]
 fn fork_from_rejects_ambiguous_parent_session_id() {
     let binding = |store: &str| crate::session::ConversationBinding {
@@ -5557,6 +5654,49 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
     // The unnamed target is the session's own checkout.
     apply_diff_base_override(&mut inst, None, Some("develop".to_string()));
     assert_eq!(inst.base_branch_override.as_deref(), Some("develop"));
+}
+
+#[test]
+fn diff_base_target_defaults_only_an_unambiguous_workspace_repo() {
+    let with_repos = |names: &[&str]| {
+        let mut inst = make_test_instance();
+        if !names.is_empty() {
+            inst.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "feature/x".to_string(),
+                workspace_dir: "/ws".to_string(),
+                repos: names
+                    .iter()
+                    .map(|n| crate::session::WorkspaceRepo {
+                        name: n.to_string(),
+                        source_path: format!("/src/{n}"),
+                        branch: "feature/x".to_string(),
+                        worktree_path: format!("/ws/{n}"),
+                        main_repo_path: format!("/src/{n}"),
+                        managed_by_aoe: true,
+                        branch_preexisting: false,
+                        base_branch: None,
+                        base_branch_override: None,
+                    })
+                    .collect(),
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
+            });
+        }
+        inst
+    };
+    let named = |n: &str| Some(n.to_string());
+    let cases: &[(&[&str], Option<String>, Result<Option<String>, ()>)] = &[
+        (&[], None, Ok(None)),
+        (&["api"], None, Ok(named("api"))),
+        (&["api"], named("api"), Ok(named("api"))),
+        (&["api"], named("web"), Err(())),
+        (&["api", "web"], None, Err(())),
+        (&["api", "web"], named("web"), Ok(named("web"))),
+    ];
+    for (repos, requested, want) in cases {
+        let got = diff_base_target(&with_repos(repos), requested.clone()).map_err(|_| ());
+        assert_eq!(&got, want, "{repos:?} {requested:?}");
+    }
 }
 
 /// An expired snooze stays on disk for the next mutation to rewrite, but the

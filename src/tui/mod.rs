@@ -29,6 +29,9 @@ mod worker;
 
 pub use app::*;
 
+#[cfg(all(test, unix))]
+mod standalone_startup_tests;
+
 /// Re-enter one libtest case in a private, killable process. Output stays off
 /// the terminal, including OSC52 sequences emitted by clipboard tests.
 #[cfg(test)]
@@ -134,32 +137,26 @@ fn env_mouse_capture_allows() -> bool {
 
 /// Restore cooked input before joining application workers, including on unwind.
 /// Display cleanup is bounded best effort; aborts and fatal signals skip Drop.
-struct TerminalGuard {
+struct TerminalGuard<B: ratatui::backend::Backend = app::TuiBackend> {
     // Mosh never captures the mouse; other terminals may toggle capture at runtime.
     disable_mouse: bool,
     clipboard: Option<clipboard::StopHandle>,
-    terminal: Option<terminal_output::Terminal<app::TuiBackend>>,
+    terminal: Option<terminal_output::Terminal<B>>,
 }
 
-impl TerminalGuard {
+impl<B: ratatui::backend::Backend> TerminalGuard<B> {
     fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
-        // Roll back partial state so a failed enter never wedges the shell.
         enable_raw_mode()?;
+        // Own input immediately: every later error and unwind runs the same cleanup.
+        let guard = Self {
+            disable_mouse: !mosh_active,
+            clipboard: None,
+            terminal: None,
+        };
         let mut stdout = terminal_output::Output::default();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
-            let _ = disable_raw_mode();
-            return Err(err.into());
-        }
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         if enable_mouse {
-            if let Err(err) = execute!(stdout, EnableMouseCapture) {
-                let _ = disable_raw_mode();
-                let _ = terminal_output::restore_after_exit(
-                    true,
-                    None,
-                    std::time::Instant::now() + std::time::Duration::from_millis(250),
-                );
-                return Err(err.into());
-            }
+            execute!(stdout, EnableMouseCapture)?;
         }
         // Kitty DISAMBIGUATE_ESCAPE_CODES makes Shift+Enter distinct from Enter;
         // other terminals ignore it. No support probe: it can stall startup for
@@ -174,15 +171,11 @@ impl TerminalGuard {
                 "kitty keyboard enhancement push failed (Shift+Enter will submit instead of inserting newline): {err}",
             );
         }
-        Ok(Self {
-            disable_mouse: !mosh_active,
-            clipboard: None,
-            terminal: None,
-        })
+        Ok(guard)
     }
 }
 
-impl Drop for TerminalGuard {
+impl<B: ratatui::backend::Backend> Drop for TerminalGuard<B> {
     fn drop(&mut self) {
         if let Some(clipboard) = &self.clipboard {
             clipboard.stop();

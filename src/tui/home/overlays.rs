@@ -6,6 +6,43 @@ use std::time::{Duration, Instant};
 const FLASH_WINDOW: Duration = Duration::from_secs(3);
 
 impl HomeView {
+    /// Preserve pre-input authority only for this event; changed options or focus
+    /// need a new actual frame before a subsequent event can submit.
+    pub(super) fn begin_confirmation_input(&mut self) -> Option<ConfirmationToken> {
+        let presented = self
+            .presented_confirmation
+            .filter(|token| token.input == self.confirmation_input_revision);
+        if self.confirm_dialog.is_some()
+            || self.unified_delete_dialog.is_some()
+            || self.group_delete_options_dialog.is_some()
+        {
+            self.confirmation_input_revision = self
+                .confirmation_input_revision
+                .checked_add(1)
+                .expect("confirmation input revision overflow");
+            self.presented_confirmation = None;
+        }
+        presented
+    }
+
+    pub(in crate::tui) fn acknowledge_confirmation(&mut self, painted: Option<ConfirmationToken>) {
+        self.presented_confirmation = painted.filter(|token| {
+            token.input == self.confirmation_input_revision
+                && (self
+                    .confirm_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.presentation_id() == token.dialog)
+                    || self
+                        .unified_delete_dialog
+                        .as_ref()
+                        .is_some_and(|pending| pending.dialog.presentation_id() == token.dialog)
+                    || self
+                        .group_delete_options_dialog
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.presentation_id() == token.dialog))
+        });
+    }
+
     /// Expire the settings view's transient "Settings saved" toast when its
     /// window passes, so it fades even while the keyboard is idle. Returns true
     /// when a redraw is needed. No-op when the settings overlay isn't open.

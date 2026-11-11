@@ -572,6 +572,7 @@ impl RetainedView {
                 );
             }
         }
+
         (
             render::TranscriptGeometry {
                 text_area: Rect {

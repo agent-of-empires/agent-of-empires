@@ -102,6 +102,8 @@ pub enum HttpError {
     ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
+    #[error("subagent cannot be cancelled")]
+    SubagentNotCancellable,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
     RevivalRequired,
     #[error("Auto-name skipped: the session changed or no title could be applied")]
@@ -493,6 +495,23 @@ impl HttpClient {
             path_segment(session_id)?
         );
         let res = self.execute(self.http.post(&url)).await?;
+        check_status(res, session_id)?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`; the parent
+    /// turn keeps running. A 409 means the child cannot be cancelled.
+    pub async fn cancel_subagent(&self, session_id: &str, child_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/subagents/{}/cancel",
+            self.endpoint.base_url,
+            path_segment(session_id)?,
+            path_segment(child_id)?
+        );
+        let res = self.execute(self.http.post(&url)).await?;
+        if res.status() == StatusCode::CONFLICT {
+            return Err(HttpError::SubagentNotCancellable);
+        }
         check_status(res, session_id)?;
         Ok(())
     }
@@ -1357,7 +1376,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = HttpClient::new(endpoint(&base, None)).unwrap();
+        let client = HttpClient::new(endpoint(&base, Some("replay-fixture-token"))).unwrap();
         let (rows, lost) = client.replay_rows_paged(&id, 0, 2).await.unwrap();
         assert!(lost);
         assert_eq!(
@@ -1366,6 +1385,7 @@ mod tests {
                 .map(|seq| format!("retained-{seq}"))
                 .collect::<Vec<_>>()
         );
+
 
         server.abort();
         let _ = server.await;

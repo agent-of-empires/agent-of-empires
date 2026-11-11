@@ -52,6 +52,12 @@ pub(super) async fn settle_namespace(
     let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
     let before_groups = group_snapshot(view);
     let mut respond = view.session_feed.namespace_driver_for_test();
+    if view.confirm_dialog.is_some()
+        || view.unified_delete_dialog.is_some()
+        || view.group_delete_options_dialog.is_some()
+    {
+        render_geometry(view);
+    }
     action(view)?;
     let boundary_destination = match &view.pending_namespace_intent {
         Some(super::super::NamespaceIntent::ReorderSession {
@@ -175,6 +181,12 @@ pub(super) async fn settle_row_command(
     let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
     let mut capture = view.session_feed.capture_request_driver_for_test();
     let epoch = view.session_feed.applied_epoch().unwrap().to_owned();
+    if view.confirm_dialog.is_some()
+        || view.unified_delete_dialog.is_some()
+        || view.group_delete_options_dialog.is_some()
+    {
+        render_geometry(view);
+    }
     action(view)?;
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),
@@ -1246,6 +1258,7 @@ fn status_group_archive_preserves_prompt_membership_and_eligibility() {
         view.rebuild_flat_items();
 
         let mut respond = view.session_feed.command_driver_for_test();
+        render_geometry(&mut view);
         view.handle_key(key(crossterm::event::KeyCode::Char('y')), None);
         assert!(view.confirm_dialog.is_none());
         let cursor = || crate::daemon::RuntimeCursor {

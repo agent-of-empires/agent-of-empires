@@ -222,6 +222,12 @@ pub(in crate::tui) struct ReadyNativeAttachment {
     pub intent: crate::tui::home::panes::PaneIntent,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) struct ConfirmationToken {
+    dialog: u64,
+    input: u64,
+}
+
 pub struct HomeView {
     pub(super) storages: HashMap<String, Storage>,
     pub(super) active_profile: Option<String>,
@@ -380,6 +386,9 @@ pub struct HomeView {
     /// `preview_text_view` maps transcript rows rather than the tmux capture.
     pub(super) structured_transcript_painted: bool,
     pub(in crate::tui) presentation_ready: bool,
+    pub(in crate::tui) painted_confirmation: Option<ConfirmationToken>,
+    pub(super) presented_confirmation: Option<ConfirmationToken>,
+    pub(super) confirmation_input_revision: u64,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
     pub(super) pending_trash_session: Option<TrashDialogTarget>,

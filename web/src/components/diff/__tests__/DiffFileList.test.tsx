@@ -265,6 +265,21 @@ describe("multi-repo groups", () => {
     fireEvent.click(await screen.findByText(/Reset to auto-detected/));
     await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null, "web"));
   });
+
+  it("scopes a one-repo workspace's single picker to that repo's worktree and override", async () => {
+    mock.fetchBranches.mockResolvedValue([]);
+    renderList({
+      perRepoBases: [{ repo_name: "api", base_branch: "develop", base_override: "develop", repo_path: "/ws/api" }],
+      sessionId: "s1",
+      repoPath: "/ws",
+      baseBranchOverride: null,
+    });
+    expect(screen.queryByText(/repos$/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Change diff base/ }));
+    await vi.waitFor(() => expect(mock.fetchBranches).toHaveBeenCalledWith("/ws/api", true));
+    fireEvent.click(await screen.findByText(/Reset to auto-detected/));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null, "api"));
+  });
 });
 
 describe("base picker", () => {

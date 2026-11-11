@@ -102,15 +102,11 @@ jobs:
       # dashboard bundle. The e2e target is gated behind the `e2e-tests`
       # feature so the core-rest leg below can skip it; this leg opts in.
       #
-      # `--test-threads=3` on a 4-vCPU runner: the suite used to be entirely
-      # `#[serial]` and took ~4 min of pure wall. Only the handful of tests that
-      # mutate process-global env still need that (see tests/e2e/harness.rs);
-      # the rest are `#[parallel]` and isolate through per-Command env plus a
-      # per-test tmux socket. The work is latency-bound (polling tmux panes),
-      # not CPU-bound, so 3 concurrent tests on 4 cores is comfortable:
-      # measured 336s -> 114s pinned to 4 cores, with identical results.
-      # Raise this only with evidence; 4+ starts trading wall for flake risk on
-      # the tests that wait on an ACP handshake.
+      # Test threads: about 0.75 per vCPU (6 on the 8 vCPU RunsOn runner, 3 on
+      # 4 vCPU GitHub-hosted fallbacks). Only tests that mutate process-global
+      # env stay `#[serial]` (tests/e2e/harness.rs); the rest isolate through
+      # per-Command env and a per-test tmux socket. More threads per core
+      # trade wall time for flake risk on tests that wait on an ACP handshake.
       - name: Build tests (web, e2e)
         if: matrix.leg == 'web-e2e'
         run: cargo test --features web,e2e-tests --test e2e --test integration --lib --no-run
@@ -118,7 +114,8 @@ jobs:
         if: matrix.leg == 'web-e2e'
         env:
           AOE_REQUIRE_LOCAL_NETWORK_TESTS: '1'
-        run: cargo test --features web,e2e-tests --test e2e -- --test-threads=3
+          E2E_THREADS: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && '3' || '6' }}
+        run: cargo test --features web,e2e-tests --test e2e -- --test-threads="$E2E_THREADS"
       # Run Web-only regressions omitted by core-rest. Keep e2e-tests to reuse
       # this leg's artifacts, and filter library tests instead of rerunning
       # the full suite.
@@ -332,6 +329,10 @@ jobs:
       id-token: write
     # Allow cold compilation and both test stages within a bounded job.
     timeout-minutes: 90
+    env:
+      # The 7 GB runner compiles the crate twice (lib and lib tests); skipping
+      # debug info shrinks both. Backtraces lose file and line numbers.
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -352,6 +353,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      # Two steps so the two crate compiles (lib, then lib tests) never run at
+      # once: together they overflow the runner's 7 GB and swap.
+      - name: Build lib and bins (macOS)
+        run: cargo nextest run --features e2e-tests --bins --no-run
       - name: Build tests (macOS)
         run: |
           cargo nextest run --features e2e-tests --lib --bins --test integration --no-run
@@ -477,7 +482,7 @@ jobs:
 
   playwright:
     name: Playwright (mocked)
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 20
     steps:
       # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
@@ -571,7 +576,7 @@ jobs:
     # Unsharded: shards each repeat the ~2 min cargo build and hold a runner
     # from the shared concurrency pool, which costs more wall than it saves.
     name: Playwright (live)
-    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=4cpu-linux-x64/family=m8a+c8i+m8i+c7i+m7i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    runs-on: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && 'ubuntu-latest' || format('runs-on={0}-playwright-live-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -635,6 +640,8 @@ jobs:
         env:
           AOE_COVERAGE: '1'
           AOE_E2E_BINARY: ${{ github.workspace }}/target/debug/aoe
+          # 6 on the 8 vCPU RunsOn runner; GitHub-hosted fallbacks have 4.
+          PW_LIVE_WORKERS: ${{ (github.event.pull_request.head.repo.fork || vars.RUNS_ON_DISABLED == 'true') && '3' || '6' }}
         run: npx playwright test --config=playwright.live.config.ts
       - name: Build LCOV from collected Playwright coverage
         working-directory: web

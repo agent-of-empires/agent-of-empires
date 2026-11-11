@@ -135,7 +135,11 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
     >
       <div className="w-full max-w-xl rounded-lg border border-status-error/60 bg-surface-850 p-4 text-text-primary shadow-lg sm:p-6">
         <div className="text-[11px] font-semibold uppercase tracking-wide text-status-error-text">
-          {detail.kind === "unsupported_protocol_version" ? "Adapter not supported" : "Adapter out of date"}
+          {detail.kind === "unsupported_protocol_version"
+            ? "Adapter not supported"
+            : detail.kind === "invalid_proxy_hello"
+              ? "Agent proxy rejected"
+              : "Adapter out of date"}
         </div>
         <h2 className="mt-2 text-lg font-semibold text-text-primary">{headlineFor(detail, name)}</h2>
         <p data-testid="startup-error-version" className="mt-1 break-words font-mono text-[12px] text-text-subtle">
@@ -156,7 +160,14 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false }: P
         )}
 
         <ol className="mt-4 space-y-3 text-sm" data-testid="startup-error-steps">
-          {detail.kind === "unsupported_protocol_version" ? (
+          {detail.kind === "invalid_proxy_hello" ? (
+            <>
+              <Step n={1} title="Update the agent plugin or aoe">
+                The agent's proxy sent a hello this aoe build rejects: {detail.reason}.
+              </Step>
+              {!observer && <Step n={2} title="Click Check again" />}
+            </>
+          ) : detail.kind === "unsupported_protocol_version" ? (
             <>
               <Step n={1} title={`Install an adapter that speaks ACP protocol ${detail.expected}`}>
                 This aoe build negotiates protocol {detail.expected}; the adapter speaks {detail.received}. Install an
@@ -313,6 +324,8 @@ function headlineFor(detail: IncompatibleAgentDetail, name: string | null): stri
       return `${adapter} reported a version aoe can't read`;
     case "unsupported_protocol_version":
       return `${adapter} speaks an ACP protocol aoe doesn't support`;
+    case "invalid_proxy_hello":
+      return `${adapter}'s proxy isn't compatible with this aoe`;
   }
 }
 
@@ -328,6 +341,8 @@ function versionLineFor(detail: IncompatibleAgentDetail): string {
       return `${detail.package_name} "${detail.raw_version}" · needs ${detail.required} or newer`;
     case "unsupported_protocol_version":
       return `protocol ${detail.received} · needs ${detail.expected}`;
+    case "invalid_proxy_hello":
+      return detail.reason;
   }
 }
 
@@ -343,6 +358,8 @@ function rationaleFor(detail: IncompatibleAgentDetail): string {
       return `The adapter reported "${detail.raw_version}", which isn't a semver version. Reinstalling the official build fixes it.`;
     case "unsupported_protocol_version":
       return `The adapter is from an older or newer generation than this aoe build supports.`;
+    case "invalid_proxy_hello":
+      return `The plugin's proxy hello was rejected; the reason above says why.`;
   }
 }
 
@@ -371,6 +388,9 @@ function DetailRows({ detail, sandboxed }: { detail: IncompatibleAgentDetail; sa
       break;
     case "unsupported_protocol_version":
       rows.push(["Expected protocol", detail.expected], ["Received protocol", detail.received]);
+      break;
+    case "invalid_proxy_hello":
+      rows.push(["Reason", detail.reason]);
       break;
   }
   rows.push(["Where", sandboxed ? "This Session's container" : "Host, where the Daemon runs"]);

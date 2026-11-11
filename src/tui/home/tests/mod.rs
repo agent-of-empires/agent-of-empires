@@ -438,6 +438,8 @@ fn render_geometry(view: &mut HomeView) {
             view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
+    // This backend completes output synchronously; acknowledge only the painted overlay.
+    view.acknowledge_confirmation(view.painted_confirmation);
 }
 
 /// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
@@ -906,6 +908,7 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         create_new_branch: false,
         base_branch: None,
         extra_repo_paths: Vec::new(),
+        workspace: false,
         sandbox: false,
         sandbox_image: String::new(),
         yolo_mode: false,
@@ -934,6 +937,7 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
             view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
+    view.acknowledge_confirmation(view.painted_confirmation);
     let buf = terminal.backend().buffer().clone();
     let mut screen = String::new();
     for y in 0..buf.area.height {
