@@ -52,6 +52,7 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 | `AOE_LOG_LEVEL` | File log level for AoE's own targets: `trace`, `debug`, `info`, `warn`, `error`. Dependency crates stay at `warn`. One-shot CLI commands always log to the same file at the configured level once the app directory exists; `[logging].output = "stdout"` applies to a foreground `aoe serve` only |
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
+| `AOE_SERVE_PORT` | Port for a newly started `aoe serve` daemon, below `--port` and above `[serve] port`. See [Serve](#serve) |
 
 ## Theme
 
@@ -536,6 +537,15 @@ update_check_mode = "notify"   # auto | notify | off
 - `off`: no check, banner, or dashboard poll. Use it on offline networks.
 
 Checks hit GitHub at most once a day; the dashboard re-polls the cached status hourly while open.
+
+## Serve
+
+```toml
+[serve]
+port = 8080               # debug builds default to 8081
+```
+
+A newly started daemon, including TUI autostart, takes its port from `--port`, then `AOE_SERVE_PORT`, then this key. `aoe serve --restart` and the TUI restart keep the running daemon's recorded port unless a port is passed explicitly. Global only; applies after the daemon restarts.
 
 ## Tools
 
