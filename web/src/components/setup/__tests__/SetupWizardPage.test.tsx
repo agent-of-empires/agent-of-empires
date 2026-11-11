@@ -219,3 +219,22 @@ it("a failed settings read offers a retry instead of showing defaults as the sav
   await enabled("Next");
   expect(screen.queryByRole("alert")).toBeNull();
 });
+
+it("stays on setup when the reload after Go to dashboard fails", async () => {
+  const onLeave = vi.fn();
+  render(
+    <MemoryRouter initialEntries={["/setup"]}>
+      <SetupWizardPage
+        status={status(["agents"])}
+        about={null}
+        profile=""
+        refresh={async () => null}
+        onLeave={onLeave}
+      />
+    </MemoryRouter>,
+  );
+  fireEvent.click(screen.getAllByRole("button", { name: /Go to dashboard/ })[0]!);
+  expect((await screen.findByRole("alert")).textContent).toContain("couldn't reload setup");
+  expect(patches).toEqual([{ deferred: true }]);
+  expect(onLeave).not.toHaveBeenCalled();
+});

@@ -38,6 +38,7 @@ interface Props {
 type MachineValues = Partial<Record<string, Record<string, unknown>>>;
 
 const LEAVE_NOTE = "Leave whenever you like. Anything unfinished stays on your dashboard.";
+const RELOAD_FAILED = "Saved, but couldn't reload setup. Try again.";
 
 export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Props) {
   const steps = status.steps;
@@ -160,7 +161,11 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
       setError(result.message ?? "Couldn't finish setup.");
       return;
     }
-    await refresh();
+    // On the stale status the dashboard would send the user straight back here.
+    if (!(await refresh())) {
+      setError(RELOAD_FAILED);
+      return;
+    }
     onLeave();
   };
 
@@ -221,7 +226,10 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
         setError(result.message ?? "Couldn't leave setup.");
         return;
       }
-      await refresh();
+      if (!(await refresh())) {
+        setError(RELOAD_FAILED);
+        return;
+      }
       onLeave();
     });
 
