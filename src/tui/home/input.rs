@@ -4874,6 +4874,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.vt_yield = None;
                 self.retained_preview = None;
                 self.retained_focus = None;
                 self.retained_scroll_offset = 0;
@@ -7247,6 +7248,7 @@ impl HomeView {
             _ => "Another surface took over this session's live view.",
         };
         self.teardown_live_send();
+        self.vt_yield = Some(state.tmux_name);
         self.info_dialog = Some(InfoDialog::new("Live send ended", message));
         true
     }

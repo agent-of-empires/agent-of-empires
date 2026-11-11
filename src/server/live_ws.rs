@@ -2783,7 +2783,9 @@ mod tests {
 
     /// A tab that opened while the TUI was in live mode is on the capture fallback. Taking
     /// control must bring it onto the grid on the same socket: reconnecting would release the
-    /// lock it just took.
+    /// lock it just took. The TUI's VT lease here is a stand-in that is never refreshed;
+    /// `test_web_claim_moves_the_socket_onto_the_tuis_released_pipe` in tests/e2e covers the
+    /// real TUI's release.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -2791,8 +2793,6 @@ mod tests {
         use futures_util::FutureExt;
         use tokio_tungstenite::tungstenite::Message as Ws;
 
-        // Unit tests already get a per-process tmux socket; a per-test override would be
-        // cached by the first tmux call and outlive this test's home.
         let _home = crate::session::test_support::isolate_app_dir();
         if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("Skipping test: tmux unavailable");

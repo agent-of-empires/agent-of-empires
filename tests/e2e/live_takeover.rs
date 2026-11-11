@@ -141,3 +141,151 @@ fn test_web_takeover_exits_tui_live_mode_with_dialog() {
         "TUI must not re-steal the size-owner lock after takeover"
     );
 }
+
+fn show_option(socket: &std::path::Path, session: &str, opt: &str) -> String {
+    let out = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args(["show-options", "-qv", "-t", session, opt])
+        .output()
+        .expect("tmux show-options");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A Web tab that opens while the TUI is in live mode falls back to capture frames, since
+/// the TUI's preview holds the pane's VT pipe. Taking control must make the real TUI give
+/// the pipe up, so the same socket moves onto the grid.
+#[test]
+#[parallel]
+fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("live_takeover_pipe");
+    write_live_send_config(&h);
+    let bin = h.install_path_command("claude");
+    std::fs::write(bin.join("claude"), "#!/bin/sh\nsleep 300\n").expect("write sleeping claude");
+
+    let project = h.project_path();
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Takeover"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&h.run_cli_ok(&["list", "--json"])).expect("list json");
+    let id = rows
+        .iter()
+        .find(|row| row["title"] == "Takeover")
+        .and_then(|row| row["id"].as_str())
+        .expect("session id")
+        .to_string();
+
+    h.spawn_tui();
+    h.wait_for_runtime_ready();
+    h.wait_for("Takeover");
+    h.send_keys("Enter");
+    h.wait_for_timeout("LIVE", Duration::from_secs(10));
+
+    let socket = h.home_path().join("tmux.sock");
+    let agent_session = list_sessions_on(&socket)
+        .into_iter()
+        .find(|name| name.starts_with("aoe_dev_") && !name.starts_with("aoe_e2e_"))
+        .expect("agent tmux session exists");
+    let tui_pipe =
+        crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
+            let owner = show_option(&socket, &agent_session, "@aoe_vt_owner");
+            if owner.is_empty() {
+                Err("the TUI preview never armed its VT pipe".to_string())
+            } else {
+                Ok(owner)
+            }
+        });
+
+    let api = app_dir_in(h.home_path()).join("daemon/api.sock");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let stream = tokio::net::UnixStream::connect(&api)
+            .await
+            .expect("connect api.sock");
+        let (mut ws, _) = tokio_tungstenite::client_async(
+            format!("ws://localhost/sessions/{id}/live-ws"),
+            stream,
+        )
+        .await
+        .expect("live-ws upgrade");
+        async fn until<S>(
+            ws: &mut S,
+            timeout: Duration,
+            what: &str,
+            mut done: impl FnMut(&serde_json::Value) -> bool,
+        ) -> serde_json::Value
+        where
+            S: futures_util::Stream<Item = Result<Ws, tokio_tungstenite::tungstenite::Error>>
+                + Unpin,
+        {
+            tokio::time::timeout(timeout, async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Ws::Text(text))) => {
+                            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            if done(&value) {
+                                return value;
+                            }
+                        }
+                        Some(Ok(_)) => {}
+                        other => panic!("socket ended waiting for {what}: {other:?}"),
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+        }
+
+        ws.send(Ws::Text(r#"{"type":"resize","cols":80,"rows":24}"#.into()))
+            .await
+            .unwrap();
+        let owner = until(&mut ws, Duration::from_secs(10), "size_owner", |v| {
+            v["type"] == "size_owner"
+        })
+        .await;
+        assert_eq!(owner["is_owner"], false, "{owner}");
+        assert_eq!(owner["owner"], "tui", "{owner}");
+        let fallback = until(&mut ws, Duration::from_secs(10), "transport", |v| {
+            v["type"] == "transport"
+        })
+        .await;
+        assert_eq!(fallback["grid"], false, "{fallback}");
+        assert_eq!(fallback["reason"], "pipe_owned", "{fallback}");
+
+        ws.send(Ws::Text(r#"{"type":"claim"}"#.into()))
+            .await
+            .unwrap();
+        let claimed = until(&mut ws, Duration::from_secs(10), "claimed", |v| {
+            v["type"] == "size_owner"
+        })
+        .await;
+        assert_eq!(claimed["is_owner"], true, "{claimed}");
+
+        // The daemon retries arming for twice the VT lease TTL after the claim.
+        let grid = until(&mut ws, Duration::from_secs(10), "grid transport", |v| {
+            v["type"] == "transport"
+        })
+        .await;
+        assert_eq!(grid["grid"], true, "{grid}");
+        // Read while the socket is open: closing it releases the daemon's pipe.
+        let owner = show_option(&socket, &agent_session, "@aoe_vt_owner");
+        assert!(
+            !owner.is_empty() && owner != tui_pipe,
+            "the Web socket's grid must hold the pipe, not the TUI ({tui_pipe}); got {owner:?}"
+        );
+        let _ = ws.close(None).await;
+    });
+    h.assert_screen_contains("Live send ended");
+}
