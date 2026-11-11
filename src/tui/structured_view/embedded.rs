@@ -573,6 +573,7 @@ impl RetainedView {
         )
     }
 }
+
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,

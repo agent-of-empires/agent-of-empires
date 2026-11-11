@@ -238,6 +238,7 @@ impl<B: Backend> Core<B> {
                 text,
                 attachments,
                 prompt_id,
+                merged_prompt_ids,
                 synthesized,
                 origin_plugin,
             } => {
@@ -260,7 +261,26 @@ impl<B: Backend> Core<B> {
                 row.origin_plugin = origin_plugin
                     .map(|value| self.backend.retain(value))
                     .transpose()?;
-                self.append_one(row)
+                row.merged_prompt_ids = self.backend.retain_prompt_ids(merged_prompt_ids)?;
+                let existing = if self.row_ids.contains(self.backend.borrow(&row.id))? {
+                    self.find_row(|existing| {
+                        self.backend
+                            .equal(&existing.id, self.backend.borrow(&row.id))
+                    })?
+                } else {
+                    None
+                };
+                match existing {
+                    Some(index) => {
+                        let delta = self.rows.update(index, |existing| {
+                            row.group_id = existing.group_id.clone();
+                            *existing = row;
+                            Ok(patch::<B>(existing))
+                        })?;
+                        self.one(delta)
+                    }
+                    None => self.append_one(row),
+                }
             }
             View::UserDiffCommentsPrompt {
                 intro,
@@ -903,6 +923,7 @@ impl<B: Backend> Core<B> {
             output: B::Output::default(),
             attachments: B::Attachments::default(),
             origin_plugin: None,
+            merged_prompt_ids: B::PromptIds::default(),
             diff_comments: None,
             elicitation_answers: B::Answers::default(),
             async_subagent: false,

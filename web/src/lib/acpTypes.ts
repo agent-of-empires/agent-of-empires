@@ -93,6 +93,8 @@ export interface AvailableCommand {
   description: string;
   /** The command takes free-form arguments after the name. */
   accepts_input: boolean;
+  /** Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`. */
+  input_hint?: string;
 }
 
 /** Unknown categories arrive as bare strings (Rust `Other` is untagged). */
@@ -415,6 +417,8 @@ export type AcpEvent =
         attachments?: PromptAttachmentRefWire[];
         /** Client-minted id echoed back so the optimistic row reconciles by id. */
         prompt_id?: string | null;
+        /** Other queued rows folded into this turn (queue drain or send-now); each one's optimistic row is retired too. */
+        merged_prompt_ids?: string[];
       };
     }
   | {
@@ -445,6 +449,7 @@ export type AcpEvent =
         tool_call_id?: string;
         description: string;
         workflow?: { run_id: string; name: string; summary?: string | null } | null;
+        started_at?: string | null;
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
@@ -528,6 +533,14 @@ export interface ReducedState {
   session_notices?: SessionNotice[];
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
+  /** Background shells, running and recently finished; omitted when there are none. */
+  background_shells?: {
+    task_id: string;
+    command: string;
+    started_at?: string | null;
+    ended_at?: string | null;
+    finished?: boolean;
+  }[];
   /** The session's workflow runs; omitted when there are none. */
   workflow_runs?: {
     task_id: string;
@@ -647,6 +660,8 @@ export interface AcpState {
   backgroundAgents: BackgroundAgent[];
   /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
+  /** Backgrounded shell commands, running and recently finished, oldest first. */
+  backgroundShells: BackgroundShell[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
   workflowRuns: Record<string, WorkflowRun>;
   /** Agent-pushed advisories for the current turn, oldest first. */
@@ -678,6 +693,23 @@ export interface WorkflowRef {
   run_id: string;
   name: string;
   phase: string;
+}
+
+/** Mirrors the daemon's cap on finished shells kept per session. */
+export const MAX_FINISHED_BACKGROUND_SHELLS = 20;
+
+export interface BackgroundShell {
+  taskId: string;
+  command: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  finished: boolean;
+}
+
+/** Drops the oldest finished shells beyond the cap. */
+function capFinishedShells(shells: BackgroundShell[]): BackgroundShell[] {
+  let drop = shells.filter((s) => s.finished).length - MAX_FINISHED_BACKGROUND_SHELLS;
+  return drop > 0 ? shells.filter((s) => !(s.finished && drop-- > 0)) : shells;
 }
 
 export interface WorkflowRun {
@@ -759,6 +791,8 @@ export interface ActivityRow {
   attachments?: AcpAttachment[];
   /** Plugin that sent a `user_prompt` row; unset when the user typed it. */
   originPlugin?: string;
+  /** Other queued rows folded into this `user_prompt` row; their optimistic rows are retired with it. */
+  mergedPromptIds?: string[];
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
@@ -779,6 +813,7 @@ export interface TranscriptRow {
   output?: ToolOutputBlock[];
   attachments?: PromptAttachmentRefWire[];
   origin_plugin?: string;
+  merged_prompt_ids?: string[];
   diff_comments?: {
     intro: string;
     outro: string;
@@ -830,6 +865,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
     ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
     ...(attachments ? { attachments } : {}),
     ...(row.origin_plugin ? { originPlugin: row.origin_plugin } : {}),
+    ...(row.merged_prompt_ids && row.merged_prompt_ids.length > 0 ? { mergedPromptIds: row.merged_prompt_ids } : {}),
     ...(row.diff_comments
       ? {
           diffComments: {
@@ -950,6 +986,7 @@ export function emptyAcpState(): AcpState {
     agentOrphaned: false,
     backgroundAgents: [],
     backgroundTasks: [],
+    backgroundShells: [],
     workflowRuns: {},
     modeSwitchFailed: null,
     lastAgentSwitch: null,
@@ -1200,10 +1237,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    const merged = event.UserPromptSent.merged_prompt_ids ?? [];
     if (wasInflight) {
       next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
     } else {
       next.promptSeq += 1;
+    }
+    if (merged.length > 0) {
+      next.inflightPromptIds = next.inflightPromptIds.filter((id) => !merged.includes(id));
+      next.optimisticRows = next.optimisticRows.filter((r) => !merged.includes(r.id));
     }
     next.serverTurnActive = true;
     next.turnActive = true;
@@ -1368,8 +1410,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("BackgroundTaskStarted" in event) {
-    const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
+    const { task_id: id, tool_call_id: toolCallId, workflow, description, started_at } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    next.backgroundShells = next.backgroundShells.filter((s) => s.taskId !== id);
+    if (!workflow) {
+      next.backgroundShells = [
+        ...next.backgroundShells,
+        { taskId: id, command: description, startedAt: started_at ?? null, endedAt: null, finished: false },
+      ];
+    }
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);
     if (workflow && toolCallId) {
       next.workflowRuns = {
@@ -1382,6 +1431,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("BackgroundTaskFinished" in event) {
     const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    next.backgroundShells = capFinishedShells(
+      next.backgroundShells.map((s) => (s.taskId === id ? { ...s, finished: true, endedAt: endedAt ?? null } : s)),
+    );
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
@@ -1449,9 +1501,30 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     locallyResolved,
   };
+}
+
+/** A snapshot older than a finish already applied must not reopen the shell.
+ *  A reused task id has a different start time, so it still replaces the run. */
+function restoreBackgroundShells(
+  local: BackgroundShell[],
+  records: NonNullable<ReducedState["background_shells"]>,
+): BackgroundShell[] {
+  return records.map((r) => {
+    const startedAt = r.started_at ?? null;
+    const done = local.find((s) => s.taskId === r.task_id && s.finished && s.startedAt === startedAt);
+    if (done && !r.finished) return done;
+    return {
+      taskId: r.task_id,
+      command: r.command,
+      startedAt,
+      endedAt: r.ended_at ?? null,
+      finished: r.finished ?? false,
+    };
+  });
 }
 
 /** The replay window can miss a run's launch or finish. Adopts runs it

@@ -21,6 +21,8 @@ struct Snapshot {
     incomplete: bool,
     highest: u64,
     attachments: Vec<u64>,
+    row_ids: Vec<String>,
+    prompt_ids: Vec<Vec<String>>,
 }
 fn string(context: &Context, text: pulldown_cmark::disk::TextRef) -> String {
     let mut bytes = Vec::new();
@@ -33,11 +35,21 @@ async fn snapshot(client: HttpClient, session: String) -> anyhow::Result<Snapsho
         let loaded = read(&client, &session, &runtime, &Cancellation::default())?;
         let mut rows = Vec::new();
         let mut attachments = Vec::new();
+        let mut row_ids = Vec::new();
+        let mut prompt_ids = Vec::new();
         for position in 0..loaded.invocations.rows.len() {
             if !loaded.invocations.visible(position)? {
                 continue;
             }
             let row = loaded.invocations.rows.read(position)?;
+            row_ids.push(string(&loaded.context, row.id));
+            prompt_ids.push(
+                loaded
+                    .context
+                    .items(row.merged_prompt_ids)?
+                    .map(|value| Ok(string(&loaded.context, loaded.context.text(value?)?)))
+                    .collect::<io::Result<Vec<_>>>()?,
+            );
             attachments.push(loaded.context.list_length(row.attachments)?);
             rows.push((
                 row.kind,
@@ -64,6 +76,8 @@ async fn snapshot(client: HttpClient, session: String) -> anyhow::Result<Snapsho
             incomplete: loaded.incomplete,
             highest: loaded.highest_seq,
             attachments,
+            row_ids,
+            prompt_ids,
         })
     })
     .await?
@@ -77,6 +91,45 @@ async fn serve(router: Router) -> (HttpClient, tokio::task::JoinHandle<()>) {
     );
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     (HttpClient::new(endpoint).unwrap(), server)
+}
+
+#[tokio::test]
+async fn retained_queue_drain_retry_preserves_merged_ids_without_duplicate_rows() {
+    let instance = crate::session::Instance::new("merged retained prompts", "/tmp");
+    let id = instance.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![instance]);
+    let prompt = Event::UserPromptSent {
+        text: "first\n\nsecond".into(),
+        attachments: Vec::new(),
+        prompt_id: Some("queued-first".into()),
+        merged_prompt_ids: vec!["queued-second".into(), "queued-third".into()],
+        synthesized: false,
+        origin_plugin: None,
+    };
+    for sequence in 1..=2 {
+        state
+            .acp_event_store
+            .record(&id, sequence, &prompt)
+            .unwrap();
+    }
+    let (client, server) = serve(
+        Router::new()
+            .route(
+                "/api/sessions/{id}/acp/retained-source",
+                get(crate::server::api::acp_retained_source),
+            )
+            .with_state(state),
+    )
+    .await;
+    let result = snapshot(client, id).await.unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].0, TranscriptRowKind::UserPrompt);
+    assert_eq!(result.rows[0].1, "first\n\nsecond");
+    assert_eq!(result.row_ids, ["queued-first"]);
+    assert_eq!(result.prompt_ids, [vec!["queued-second", "queued-third"]]);
+    assert!(!result.incomplete);
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]

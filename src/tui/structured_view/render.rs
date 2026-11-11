@@ -569,6 +569,12 @@ fn render_slash_picker(
         &matches,
         |cmd| {
             let mut spans = vec![Span::raw(format!("/{}", cmd.name))];
+            if let Some(hint) = &cmd.input_hint {
+                spans.push(Span::styled(
+                    format!(" {hint}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
             if !cmd.description.is_empty() {
                 spans.push(Span::styled(
                     format!("  {}", cmd.description),
@@ -1137,6 +1143,13 @@ fn render_status(
         spans.push(Span::styled(
             format!("· {mode} "),
             Style::default().fg(theme.title),
+        ));
+    }
+    for toggle in state.transcript.toggles() {
+        let on = toggle.current_value == "on";
+        spans.push(Span::styled(
+            format!("· {} {} ", toggle.name, if on { "on" } else { "off" }),
+            Style::default().fg(if on { theme.title } else { theme.hint }),
         ));
     }
     // Label only: the payload can carry the account email, which has no place
@@ -2221,6 +2234,7 @@ mod tests {
             name: name.to_string(),
             description: desc.to_string(),
             accepts_input: false,
+            input_hint: None,
         }
     }
 
@@ -2628,6 +2642,15 @@ mod tests {
         assert!(state.slash_picker_open());
         let dump = render_dump(&state, 80, 24);
         assert!(dump.contains("Commands") && dump.contains("/compact") && dump.contains('▶'));
+
+        let mut state = test_state();
+        state.focus = Focus::Composer;
+        let mut mcp = cmd("mcp", "MCP servers");
+        mcp.input_hint = Some("[reconnect|enable|disable]".into());
+        state.transcript.available_commands = vec![mcp];
+        state.composer.insert_str("/mc");
+        let dump = render_dump(&state, 80, 24);
+        assert!(dump.contains("/mcp [reconnect|enable|disable]"), "{dump:?}");
 
         // A short terminal must keep the selected last row on screen.
         let mut state = test_state();
@@ -3060,6 +3083,33 @@ mod tests {
         assert!(render_dump(&state, 100, 24).contains("/compact"));
     }
 
+    #[test]
+    fn status_line_shows_toggle_state() {
+        use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
+        let toggle = |id: &str, name: &str, current: &str| ConfigOptionDescriptor {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            category: ConfigOptionCategory::Other("model_config".into()),
+            current_value: current.into(),
+            options: ["on", "off"]
+                .map(|v| ConfigOptionChoice {
+                    value: v.into(),
+                    name: v.into(),
+                    description: None,
+                })
+                .to_vec(),
+        };
+        let mut state = test_state();
+        state.transcript.config_options = vec![
+            toggle("fast", "Fast mode", "on"),
+            toggle("ultracode", "Ultracode", "off"),
+        ];
+        let dump = render_dump(&state, 120, 24);
+        assert!(dump.contains("Fast mode on"), "{dump}");
+        assert!(dump.contains("Ultracode off"), "{dump}");
+    }
+
     /// #4001: the banner lights up for a background sub-agent even while the
     /// main turn is idle.
     #[test]
@@ -3098,6 +3148,7 @@ mod tests {
         });
         state.transcript.server_rows = server_rows(&[
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: "Hello.".into(),
                 attachments: Vec::new(),
@@ -3136,6 +3187,7 @@ mod tests {
 
         // A plugin-sent message names its sender; a typed one does not.
         state.transcript.server_rows = server_rows(&[Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "PR merged".into(),
             attachments: Vec::new(),

@@ -4411,7 +4411,7 @@ impl HomeView {
                 use crate::update::install::InstallMethod;
                 if !matches!(
                     &method,
-                    InstallMethod::Homebrew | InstallMethod::Tarball { .. }
+                    InstallMethod::Homebrew { .. } | InstallMethod::Tarball { .. }
                 ) {
                     let msg = match &method {
                         InstallMethod::Nix => {
@@ -6987,7 +6987,7 @@ impl HomeView {
     }
 
     /// Auto-start live-send after an explicit view switch (`ToggleView`,
-    /// opening a tool session) when the `Auto Live-Send On View Switch`
+    /// opening a tool session) when the `Live-send when switching view`
     /// setting is on for the selected session's resolved config. `None`
     /// when there's no selected session or the setting is off; the
     /// caller then leaves the plain view switch alone. Deliberately not

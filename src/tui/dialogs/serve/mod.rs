@@ -192,6 +192,8 @@ enum TransportStatus {
     NotInstalled,
     /// Tailscale is logged in but the ACL doesn't grant Funnel.
     FunnelNotEnabled,
+    /// A probe didn't answer in time, so the real state is unknown.
+    TimedOut,
 }
 
 /// Transient message shown after a rejected keypress.
@@ -291,7 +293,8 @@ enum ServeViewState {
 
 impl ServeViewState {
     fn mode_picker() -> Self {
-        let tunnel_available = crate::server::tunnel::tailscale_available_sync()
+        let tunnel_available = crate::server::tunnel::tailscale_probe_sync()
+            != crate::server::tunnel::TailscaleProbe::Unavailable
             || crate::server::tunnel::check_cloudflared().is_ok();
         let local_available = !crate::server::discover_tagged_ips().is_empty();
         // Prefer the last launched mode, falling back to whichever one is available.
@@ -577,7 +580,8 @@ fn persist_sessions() -> bool {
 fn restart_on_funnel(transport: Option<TunnelTransport>) -> bool {
     let no_tailscale = transport == Some(TunnelTransport::Cloudflare);
     !crate::server::tunnel::skips_tailscale(no_tailscale, None, None)
-        && crate::server::tunnel::tailscale_available_sync()
+        && crate::server::tunnel::tailscale_probe_sync()
+            == crate::server::tunnel::TailscaleProbe::Available
 }
 
 fn link_authority(url: &str) -> Option<&str> {
@@ -957,7 +961,16 @@ impl ServeView {
             (TunnelTransport::Tailscale, TransportStatus::FunnelNotEnabled, _) => {
                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
             }
+            (TunnelTransport::Tailscale, TransportStatus::TimedOut, TransportStatus::Ready) => {
+                "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
+            }
+            (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
+                "Tailscale didn't answer in time; press R to retry."
+            }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
+            (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
+                "cloudflared isn't installed; press R to retry Tailscale."
+            }
             (TunnelTransport::Cloudflare, ..) => "cloudflared isn't installed; pick Tailscale.",
         };
         *flash = Some((rejection.to_string(), Instant::now()));
@@ -1373,7 +1386,7 @@ mod tests {
 
     #[test]
     fn a_tunnel_retry_preselects_the_provider_that_did_not_fail() {
-        use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready};
+        use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready, TimedOut};
         use TunnelTransport::{Cloudflare, Tailscale};
         // (failed provider, tailscale, cloudflare, preselected)
         let cases = [
@@ -1382,6 +1395,8 @@ mod tests {
             (Some(Tailscale), Ready, NotInstalled, Tailscale),
             (Some(Cloudflare), Ready, Ready, Tailscale),
             (Some(Cloudflare), FunnelNotEnabled, Ready, Cloudflare),
+            (Some(Cloudflare), TimedOut, Ready, Tailscale),
+            (None, TimedOut, Ready, Tailscale),
             // A reattached daemon's transport is unknown.
             (None, Ready, Ready, Tailscale),
             (None, NotInstalled, Ready, Cloudflare),
@@ -1402,6 +1417,58 @@ mod tests {
                 "{failed:?} {ts:?} {cf:?}"
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_timed_out_tailscale_launches_nothing_until_cloudflare_is_chosen() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut view = ServeView::new();
+        view.state = ServeViewState::Confirm {
+            selected: TunnelTransport::Tailscale,
+            tailscale: TransportStatus::TimedOut,
+            cloudflare: TransportStatus::Ready,
+            flash: None,
+        };
+        let action = view.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, ServeAction::Continue));
+        assert!(matches!(
+            &view.state,
+            ServeViewState::Confirm { flash: Some((m, _)), .. } if m.contains("retry")
+        ));
+        let action = view.handle_key(KeyEvent::from(KeyCode::Char('c')));
+        assert!(matches!(
+            action,
+            ServeAction::Launch(ServeLaunchRequest {
+                transport: Some(TunnelTransport::Cloudflare),
+                ..
+            })
+        ));
+
+        // With cloudflared missing too, the only way forward is a retry.
+        view.state = ServeViewState::Confirm {
+            selected: TunnelTransport::Cloudflare,
+            tailscale: TransportStatus::TimedOut,
+            cloudflare: TransportStatus::NotInstalled,
+            flash: None,
+        };
+        let action = view.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(action, ServeAction::Continue));
+        assert!(matches!(
+            &view.state,
+            ServeViewState::Confirm { flash: Some((m, _)), .. } if m.contains("retry Tailscale")
+        ));
+        view.state = ServeViewState::Confirm {
+            selected: TunnelTransport::Tailscale,
+            tailscale: TransportStatus::TimedOut,
+            cloudflare: TransportStatus::NotInstalled,
+            flash: None,
+        };
+        view.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(
+            &view.state,
+            ServeViewState::Confirm { flash: Some((m, _)), .. } if !m.contains("Cloudflare")
+        ));
     }
 
     #[test]

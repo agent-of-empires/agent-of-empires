@@ -17,7 +17,7 @@ macro_rules! event_view {
 event_view! { 'a, B;
     AgentMessageChunk { text: B::Input<'a>, message_id: Option<B::Input<'a>> },
     AgentThoughtChunk { text: B::Input<'a>, message_id: Option<B::Input<'a>> },
-    UserPromptSent { text: B::Input<'a>, attachments: B::AttachmentsInput<'a>, prompt_id: Option<B::Input<'a>>, synthesized: bool, origin_plugin: Option<B::Input<'a>> },
+    UserPromptSent { text: B::Input<'a>, attachments: B::AttachmentsInput<'a>, prompt_id: Option<B::Input<'a>>, merged_prompt_ids: B::PromptIdsInput<'a>, synthesized: bool, origin_plugin: Option<B::Input<'a>> },
     UserDiffCommentsPrompt { intro: B::Input<'a>, outro: B::Input<'a>, is_multi_repo: bool, comments: B::CommentsInput<'a>, assembled_markdown: B::Input<'a> },
     ToolCallStarted { tool_call: InputTool<'a, B> },
     ToolCallCompleted { tool_call_id: B::Input<'a>, is_error: bool, content: B::Input<'a>, output: B::OutputInput<'a>, completed_at: DateTime<Utc>, async_subagent: bool },
@@ -214,12 +214,14 @@ pub(crate) fn memory(event: &Event) -> View<'_, Memory> {
             text,
             attachments,
             prompt_id,
+            merged_prompt_ids,
             synthesized,
             origin_plugin,
         } => View::UserPromptSent {
             text,
             attachments,
             prompt_id: prompt_id.as_deref(),
+            merged_prompt_ids,
             synthesized: *synthesized,
             origin_plugin: origin_plugin.as_deref(),
         },

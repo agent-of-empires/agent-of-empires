@@ -20,7 +20,7 @@ pub(crate) const LOAD_FAILED_PREFIX: &str = "session/load failed";
 /// One renderable row of the transcript.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    deserialize = "Text: Deserialize<'de>, Tool: Deserialize<'de>, Output: Deserialize<'de> + Default, Attachments: Deserialize<'de> + Default, Comments: Deserialize<'de>, Answers: Deserialize<'de> + Default"
+    deserialize = "Text: Deserialize<'de>, Tool: Deserialize<'de>, Output: Deserialize<'de> + Default, Attachments: Deserialize<'de> + Default, Comments: Deserialize<'de>, Answers: Deserialize<'de> + Default, PromptIds: Deserialize<'de> + Default"
 ))]
 pub struct TranscriptRow<
     Text = String,
@@ -29,6 +29,7 @@ pub struct TranscriptRow<
     Attachments: PayloadCollection = Vec<PromptAttachmentRef>,
     Comments = DiffCommentsPayload,
     Answers: PayloadCollection = Vec<ElicitationAnswer>,
+    PromptIds: PayloadCollection = Vec<String>,
 > {
     pub id: Text,
     pub group_id: Text,
@@ -50,6 +51,10 @@ pub struct TranscriptRow<
     /// Plugin that sent a `user_prompt` row; absent when the user typed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin: Option<Text>,
+    /// Ids of other queued rows folded into a `user_prompt` row, so a client that
+    /// only sees this row (snapshot or replay) still settles their optimistic rows.
+    #[serde(default, skip_serializing_if = "payload_is_empty")]
+    pub merged_prompt_ids: PromptIds,
     /// Structured payload on a `user_diff_comments` row; `text` holds the markdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_comments: Option<Comments>,
@@ -102,7 +107,7 @@ pub struct DiffCommentsPayload {
 /// An incremental change to the row list, emitted per event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    deserialize = "Text: Deserialize<'de>, TranscriptRow<Text, Tool, Output, Attachments, Comments, Answers>: Deserialize<'de>"
+    deserialize = "Text: Deserialize<'de>, TranscriptRow<Text, Tool, Output, Attachments, Comments, Answers, PromptIds>: Deserialize<'de>"
 ))]
 pub enum TranscriptDelta<
     Text = String,
@@ -111,11 +116,12 @@ pub enum TranscriptDelta<
     Attachments: PayloadCollection = Vec<PromptAttachmentRef>,
     Comments = DiffCommentsPayload,
     Answers: PayloadCollection = Vec<ElicitationAnswer>,
+    PromptIds: PayloadCollection = Vec<String>,
 > {
-    Append(TranscriptRow<Text, Tool, Output, Attachments, Comments, Answers>),
+    Append(TranscriptRow<Text, Tool, Output, Attachments, Comments, Answers, PromptIds>),
     Patch {
         id: Text,
-        row: TranscriptRow<Text, Tool, Output, Attachments, Comments, Answers>,
+        row: TranscriptRow<Text, Tool, Output, Attachments, Comments, Answers, PromptIds>,
     },
     /// A row was removed (an AskUserQuestion card superseded by its form).
     Remove(Text),
@@ -487,6 +493,7 @@ mod tests {
         assert_eq!((m.rows().len(), m.last_seq()), (1, 1));
 
         let with_attachment = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "look".into(),
             attachments: vec![PromptAttachmentRef {
                 id: "att-1".into(),
@@ -515,6 +522,7 @@ mod tests {
             m.apply_event(
                 7,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "hi".into(),
                     attachments: Vec::new(),
                     prompt_id: prompt_id.map(Into::into),
@@ -524,6 +532,34 @@ mod tests {
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
         }
+
+        let mut m = TranscriptModel::new();
+        m.apply_event(
+            8,
+            &Event::UserPromptSent {
+                merged_prompt_ids: vec!["q2".into()],
+                text: "a\n\nb".into(),
+                attachments: Vec::new(),
+                prompt_id: Some("q1".into()),
+                synthesized: false,
+                origin_plugin: None,
+            },
+        );
+        assert_eq!(m.rows()[0].id, "q1");
+        assert_eq!(m.rows()[0].merged_prompt_ids, ["q2"]);
+
+        // A drain retry republishes the same ids: one row, patched in place.
+        let retry = Event::UserPromptSent {
+            merged_prompt_ids: vec!["q2".into()],
+            text: "a\n\nb".into(),
+            attachments: Vec::new(),
+            prompt_id: Some("q1".into()),
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let deltas = m.apply_event(9, &retry);
+        assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
+        assert_eq!(m.rows().len(), 1);
 
         let m = fold([Event::UserDiffCommentsPrompt {
             intro: "look".into(),
@@ -559,6 +595,7 @@ mod tests {
 
         // Resume prompts must not duplicate a visible prompt.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "run the nightly task".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -572,6 +609,7 @@ mod tests {
 
         // A plugin-sent message keeps its sender on the row.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "PR #7 was merged".into(),
             attachments: Vec::new(),
             prompt_id: None,

@@ -21,6 +21,29 @@ pub(crate) enum SessionFeedResult {
     Snapshot(Arc<RuntimeSnapshot>),
     /// No daemon answered. The reason is for the transition log only.
     Unavailable(String),
+    /// A local Daemon answered in another protocol, which reconnecting can't fix.
+    Mismatched {
+        attention: crate::tui::dialogs::DaemonAttention,
+        summary: String,
+    },
+}
+
+fn classify_connect_failure(error: &anyhow::Error) -> SessionFeedResult {
+    use crate::daemon::OutdatedDaemonRemedy as Remedy;
+    use crate::tui::dialogs::DaemonAttention;
+    let Some(skew) = error.downcast_ref::<crate::daemon::PinnedProtocolSkew>() else {
+        return SessionFeedResult::Unavailable(error.to_string());
+    };
+    let attention = match skew.remedy {
+        None => DaemonAttention::DaemonNewer,
+        Some(Remedy::Restart(daemon)) => DaemonAttention::Outdated(daemon),
+        Some(Remedy::Command) => DaemonAttention::OutdatedCommand,
+        Some(Remedy::External) => DaemonAttention::OutdatedManual,
+    };
+    SessionFeedResult::Mismatched {
+        attention,
+        summary: skew.summary.clone(),
+    }
 }
 
 /// Where the sidebar's daemon-owned state currently comes from.
@@ -863,7 +886,7 @@ impl SessionFeed {
             quit_control.send_replace(None);
             sandbox_progress.send_replace(Vec::new());
             if let Err(error) = result {
-                sender.send_replace(Some(SessionFeedResult::Unavailable(error.to_string())));
+                sender.send_replace(Some(classify_connect_failure(&error)));
             }
         }));
     }
@@ -4111,6 +4134,45 @@ mod tests {
             writer.await.unwrap();
             server.abort();
             let _ = server.await;
+        }
+    }
+
+    #[test]
+    fn connect_failures_classify_by_what_can_fix_them() {
+        use crate::daemon::{
+            DaemonIncarnation, LocalRuntimeError as E, OutdatedDaemonRemedy as R,
+            PinnedProtocolSkew, RuntimeConnectionError,
+        };
+        use crate::tui::dialogs::DaemonAttention as A;
+        let daemon = DaemonIncarnation::sample("old");
+        let skew = |remedy| -> anyhow::Error {
+            PinnedProtocolSkew {
+                message: "full message".into(),
+                summary: "Daemon protocol 3, this aoe 4".into(),
+                remedy,
+            }
+            .into()
+        };
+        let cases: Vec<(anyhow::Error, Option<A>)> = vec![
+            (skew(Some(R::Restart(daemon))), Some(A::Outdated(daemon))),
+            (skew(Some(R::Command)), Some(A::OutdatedCommand)),
+            (skew(Some(R::External)), Some(A::OutdatedManual)),
+            // Restarting a newer Daemon with this binary would be a downgrade.
+            (skew(None), Some(A::DaemonNewer)),
+            (E::Identity.into(), None),
+            (RuntimeConnectionError::Protocol.into(), None),
+            (anyhow::anyhow!("connection refused"), None),
+        ];
+        for (error, expected) in cases {
+            let label = error.to_string();
+            match (classify_connect_failure(&error), expected) {
+                (SessionFeedResult::Mismatched { attention, summary }, Some(want)) => {
+                    assert_eq!(attention, want, "{label}");
+                    assert_eq!(summary, "Daemon protocol 3, this aoe 4", "{label}");
+                }
+                (SessionFeedResult::Unavailable(reason), None) => assert_eq!(reason, label),
+                (other, expected) => panic!("{label}: {other:?}, expected {expected:?}"),
+            }
         }
     }
 

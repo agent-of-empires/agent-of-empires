@@ -747,6 +747,34 @@ async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
     assert_eq!(*cmds.lock().expect("cmd log mutex poisoned"), ["prompt"]);
 }
 
+/// #5401: a queue drain publishes the first row's id as `prompt_id` and the
+/// rest as `merged_prompt_ids`, so the web client settles every optimistic row.
+#[tokio::test]
+async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-5401-drain";
+    let state = structured_state(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    for (row, text) in [("q1", "first"), ("q2", "second")] {
+        state
+            .session_service
+            .enqueue_prompt(id, row.into(), text.into(), vec![], None, None)
+            .await
+            .expect("session exists");
+    }
+
+    state.session_service.drain_queued_prompts_once(id).await;
+
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
+            if p == "q1" && merged_prompt_ids == &["q2".to_string()]
+    )));
+}
+
 /// #3649: a review that loses the guard to a turn-starting submission is
 /// refused, with nothing sent or published.
 #[tokio::test]
@@ -780,7 +808,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
             &id,
             "the winning turn".into(),
             &[],
-            None,
+            Vec::new(),
             false,
             None,
         )
@@ -809,6 +837,7 @@ fn seed_elapsed_rate_limit_park(state: &AppState, id: &str, busy: bool) {
     let at = long_ago.timestamp_millis();
     let mut events = vec![
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "interrupted prompt A".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -1059,6 +1088,38 @@ async fn sending_a_queued_plugin_row_now_keeps_its_stored_sender() {
     .await
     .into_response();
     assert_eq!(again.status(), StatusCode::CONFLICT);
+}
+
+/// Another tab's optimistic row carries the queued row id, so it must settle too.
+#[tokio::test]
+async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-ids";
+    let state = state_with_queued_plugin_row(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        Ok(Json(PromptRequest {
+            text: "PR #7 was merged".to_string(),
+            attachments: Vec::new(),
+            prompt_id: Some("req-1".to_string()),
+            no_revive: false,
+            queued_prompt_id: Some("q1".to_string()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
+            if p == "req-1" && merged_prompt_ids == &["q1".to_string()]
+    )));
 }
 
 async fn state_with_queued_plugin_row(id: &str, idle: bool) -> Arc<AppState> {
@@ -1362,7 +1423,14 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
         .await;
     state
         .acp_supervisor
-        .publish_user_prompt_with_attachments(id, "the user's turn".into(), &[], None, false, None)
+        .publish_user_prompt_with_attachments(
+            id,
+            "the user's turn".into(),
+            &[],
+            Vec::new(),
+            false,
+            None,
+        )
         .await;
 
     let response = acp_prompt(
@@ -1391,6 +1459,7 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
         steering,
     };
     let earlier_turn = || Event::UserPromptSent {
+        merged_prompt_ids: Vec::new(),
         text: "an earlier turn".into(),
         attachments: Vec::new(),
         prompt_id: None,

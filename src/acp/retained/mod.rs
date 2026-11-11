@@ -218,6 +218,8 @@ impl Backend for Disk {
     type CommentsInput<'a> = List;
     type Answers = List;
     type AnswersInput<'a> = List;
+    type PromptIds = List;
+    type PromptIdsInput<'a> = List;
     type Writer<'a> = Writer<'a>;
     type Rows = DiskRows;
     type Set = DiskSet;
@@ -315,6 +317,9 @@ impl Backend for Disk {
         self.0.check_list(value)
     }
     fn retain_answers<'a>(&self, value: List) -> io::Result<List> {
+        self.0.check_list(value)
+    }
+    fn retain_prompt_ids<'a>(&self, value: List) -> io::Result<List> {
         self.0.check_list(value)
     }
     fn comments<'a>(

@@ -230,10 +230,13 @@ impl Context {
                 }
                 Ok(())
             })?;
+            let merged_prompt_ids = object.list("merged_prompt_ids")?;
+            self.each(merged_prompt_ids, |value| self.text(value).map(|_| ()))?;
             return Ok(View::UserPromptSent {
                 text: object.text("text")?,
                 attachments,
                 prompt_id: object.optional_text("prompt_id")?,
+                merged_prompt_ids,
                 synthesized: object.boolean("synthesized", Some(false))?,
                 origin_plugin: object.optional_text("origin_plugin")?,
             });

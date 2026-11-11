@@ -55,6 +55,34 @@ pub(super) fn close_frozen_payload() -> std::io::Result<()> {
     nix::unistd::close(4).map_err(std::io::Error::from)
 }
 
+pub(super) fn inherit_file_at_fd(
+    command: &mut Command,
+    file: std::fs::File,
+    target: std::os::fd::RawFd,
+) {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    // SAFETY: lseek, dup2 and fcntl are async-signal-safe, the only pre_exec requirement.
+    unsafe {
+        command.pre_exec(move || {
+            let source = file.as_raw_fd();
+            // macOS `/dev/fd/N` shares this offset instead of reopening the file.
+            let result = if libc::lseek(source, 0, libc::SEEK_SET) < 0 {
+                -1
+            } else if source == target {
+                libc::fcntl(target, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(source, target)
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 pub(super) fn exec_command(command: &mut Command) -> std::io::Error {
     use std::os::unix::process::CommandExt;
     command.exec()

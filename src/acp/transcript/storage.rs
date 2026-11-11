@@ -24,6 +24,7 @@ pub(crate) type RowOf<B> = TranscriptRow<
     <B as Backend>::Attachments,
     <B as Backend>::Comments,
     <B as Backend>::Answers,
+    <B as Backend>::PromptIds,
 >;
 pub(crate) type DeltaOf<B> = TranscriptDelta<
     <B as Backend>::Text,
@@ -32,6 +33,7 @@ pub(crate) type DeltaOf<B> = TranscriptDelta<
     <B as Backend>::Attachments,
     <B as Backend>::Comments,
     <B as Backend>::Answers,
+    <B as Backend>::PromptIds,
 >;
 
 pub(crate) enum Part<'a, T> {
@@ -125,6 +127,8 @@ pub(crate) trait Backend: Sized + 'static {
     type CommentsInput<'a>: Copy + PayloadCollection;
     type Answers: Clone + Default + PayloadCollection;
     type AnswersInput<'a>: Copy + PayloadCollection;
+    type PromptIds: Clone + Default + PayloadCollection;
+    type PromptIdsInput<'a>: Copy + PayloadCollection;
     type Writer<'a>: TextWriter<Self>
     where
         Self: 'a;
@@ -169,6 +173,10 @@ pub(crate) trait Backend: Sized + 'static {
         &self,
         value: Self::AnswersInput<'a>,
     ) -> Result<Self::Answers, Self::Error>;
+    fn retain_prompt_ids<'a>(
+        &self,
+        value: Self::PromptIdsInput<'a>,
+    ) -> Result<Self::PromptIds, Self::Error>;
     fn comments<'a>(
         &self,
         intro: Self::Input<'a>,
@@ -337,6 +345,8 @@ impl Backend for Memory {
     type CommentsInput<'a> = &'a [DiffComment];
     type Answers = Vec<ElicitationAnswer>;
     type AnswersInput<'a> = &'a [ElicitationAnswer];
+    type PromptIds = Vec<String>;
+    type PromptIdsInput<'a> = &'a [String];
     type Writer<'a> = MemoryWriter;
     type Rows = Vec<TranscriptRow>;
     type Set = HashSet<String>;
@@ -411,6 +421,9 @@ impl Backend for Memory {
         Ok(value.to_vec())
     }
     fn retain_output(&self, value: &[ToolOutputBlock]) -> Result<Vec<ToolOutputBlock>, Infallible> {
+        Ok(value.to_vec())
+    }
+    fn retain_prompt_ids(&self, value: &[String]) -> Result<Vec<String>, Infallible> {
         Ok(value.to_vec())
     }
     fn retain_attachments(

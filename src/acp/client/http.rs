@@ -45,7 +45,6 @@ enum ReplayKind {
     Live,
     Rows,
 }
-
 #[derive(serde::Deserialize)]
 struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
@@ -1367,6 +1366,7 @@ mod tests {
                 .map(|seq| format!("retained-{seq}"))
                 .collect::<Vec<_>>()
         );
+
         server.abort();
         let _ = server.await;
     }

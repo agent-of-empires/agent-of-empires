@@ -162,7 +162,7 @@ impl HomeView {
         }
         match self.sidebar_source {
             SidebarSource::Connecting => None,
-            SidebarSource::Disconnected => Some(DaemonAttention::Offline),
+            SidebarSource::Disconnected => Some(self.offline_attention),
             SidebarSource::Daemon
                 if self.session_feed.cityhall_mode()
                     || self.session_feed.any_pending()
@@ -208,7 +208,14 @@ impl HomeView {
         let reason = (source == SidebarSource::Disconnected)
             .then(|| reason.filter(|reason| !reason.is_empty()))
             .flatten();
-        if self.sidebar_source == source && reason == self.runtime_failure_reason.as_deref() {
+        let attention_cleared = std::mem::replace(
+            &mut self.offline_attention,
+            crate::tui::dialogs::DaemonAttention::Offline,
+        ) != crate::tui::dialogs::DaemonAttention::Offline;
+        if self.sidebar_source == source
+            && reason == self.runtime_failure_reason.as_deref()
+            && !attention_cleared
+        {
             return false;
         }
         self.runtime_failure_reason = reason.map(str::to_owned);
@@ -239,6 +246,21 @@ impl HomeView {
             ),
         }
         true
+    }
+
+    /// Show the offline takeover in `attention`, with `reason` under it.
+    pub(in crate::tui) fn set_offline_attention(
+        &mut self,
+        attention: crate::tui::dialogs::DaemonAttention,
+        reason: Option<&str>,
+    ) -> bool {
+        let changed = self.set_sidebar_source(
+            crate::tui::session_feed::SidebarSource::Disconnected,
+            reason,
+        );
+        let attention_changed = self.offline_attention != attention;
+        self.offline_attention = attention;
+        changed || attention_changed
     }
 
     /// Whether applying this runtime revision would outrun the local storage
@@ -835,6 +857,13 @@ impl HomeView {
                     self.canonical_metadata_lag = None;
                     self.pending_created_attach = None;
                     self.set_sidebar_source(SidebarSource::Disconnected, Some(&reason))
+                }
+                SessionFeedResult::Mismatched { attention, summary } => {
+                    self.session_feed_reload_retry_at = None;
+                    self.session_feed_failed_cursor = None;
+                    self.canonical_metadata_lag = None;
+                    self.pending_created_attach = None;
+                    self.set_offline_attention(attention, Some(&summary))
                 }
             },
             Err(TryRecvError::Empty) => false,

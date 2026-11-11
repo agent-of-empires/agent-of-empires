@@ -280,6 +280,33 @@ waiting for dismissal. Both a partial frame and an initial capture refused by
 active OSC resume without requiring a dismiss key.
 
 
+## Retained history consistency
+
+Retained page identity combines the event-store incarnation with the session
+revision. Every append or replacement invalidates the complete snapshot.
+Bounds and identity are read in one SQLite transaction; independent indexed
+first/last lookups avoid scanning payloads for metadata. A stale identity reaches
+the HTTP client as a conflict, while coherent successful pages carrying different
+identities are rejected as inconsistent metadata. Neither may publish mixed rows.
+Unchanged incomplete histories retain their identity for cheap refresh probes.
+Identity installation reserves SQLite's writer before checking its schema, so
+concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
+the existing incarnation and session revisions; lock waiting remains bounded by
+the connection's busy policy.
+
+File-backed retained reads reuse the independent query-only search reader, not
+the event writer. Identity, bounds and raw rows share one read transaction; commit
+and release the reader before JSON decoding. Private memory and temporary
+databases use their original connection and still release it before decoding.
+Raw retained pages preserve scanned rows and cursors without turn alignment.
+Forward retained replay keeps reducer state across pages.
+
+Migration 54 installs identity only when `acp_events` exists. An existing empty
+database defers to the normal EventStore opener, which creates schema before
+identity. Corruption and access failures are not empty-database cases. Backward
+cursors remain strict within SQLite's signed sequence range; a larger unsigned
+cursor includes the maximum stored signed sequence rather than dropping it.
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.

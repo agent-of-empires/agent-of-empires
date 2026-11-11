@@ -136,8 +136,9 @@ struct Detail {
     attachments: List,
     origin: Option<TextRef>,
     answers: List,
+    prompt_ids: List,
 }
-record!(Detail { output: List, attachments: List, origin: Option<TextRef>, answers: List });
+record!(Detail { output: List, attachments: List, origin: Option<TextRef>, answers: List, prompt_ids: List });
 struct ToolHead {
     id: TextRef,
     name: TextRef,
@@ -241,6 +242,7 @@ impl RowArena {
             output: detail.output,
             attachments: detail.attachments,
             origin_plugin: detail.origin,
+            merged_prompt_ids: detail.prompt_ids,
             diff_comments,
             elicitation_answers: detail.answers,
             async_subagent: head.flags.0 & 4 != 0,
@@ -274,6 +276,7 @@ impl RowArena {
                 attachments: row.attachments,
                 origin: row.origin_plugin,
                 answers: row.elicitation_answers,
+                prompt_ids: row.merged_prompt_ids,
             },
         )?;
         if let Some(tool) = &row.tool {

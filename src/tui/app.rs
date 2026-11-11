@@ -142,6 +142,7 @@ pub struct App {
     pending_view_switch: Option<String>,
 
     pending_smart_rename: Option<String>,
+    daemon_restart: Option<DaemonRestart>,
     dashboard_stop_requested: bool,
     dashboard_stop: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     dashboard_launch: Option<
@@ -365,6 +366,7 @@ impl App {
             pending_view_switch: None,
             pending_smart_rename: None,
             dashboard_launch: None,
+            daemon_restart: None,
             dashboard_stop_requested: false,
             dashboard_stop: None,
             pending_install_version: None,
@@ -1421,6 +1423,7 @@ impl App {
             needs_full_refresh |= self.home.apply_session_feed();
             needs_full_refresh |= self.poll_dashboard_launch();
             needs_full_refresh |= self.poll_dashboard_stop();
+            needs_full_refresh |= self.poll_daemon_restart();
             let had_native_error = self.home.info_dialog.is_some();
             if let Some(ready) = self.home.take_native_attachment() {
                 use crate::tui::home::panes::PaneIntent;
@@ -1498,13 +1501,8 @@ impl App {
             }
 
             let heartbeat_due = last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL;
-            let dirty = self
-                .home
-                .disk_watch
-                .dirty
-                .swap(false, std::sync::atomic::Ordering::Acquire);
             let refresh_plan =
-                plan_disk_refresh(live_idle, heartbeat_due, dirty, full_heartbeat_deferred);
+                self.plan_tick_disk_refresh(live_idle, heartbeat_due, full_heartbeat_deferred);
             full_heartbeat_deferred = refresh_plan.full_heartbeat_deferred;
 
             match refresh_plan.decision {
@@ -1987,7 +1985,7 @@ impl App {
                 if !crate::update::install::parent_is_writable(binary_path)
         );
 
-        if matches!(method, InstallMethod::Homebrew) || needs_sudo {
+        if matches!(method, InstallMethod::Homebrew { .. }) || needs_sudo {
             let Some(suspension) = self.admit_terminal_handoff()? else {
                 return Ok(());
             };
@@ -2211,6 +2209,25 @@ enum QuitIntent {
     ConfirmDuringCreation,
     Confirm,
     Quit,
+}
+
+struct DaemonRestart {
+    result: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    stage: tokio::sync::watch::Receiver<String>,
+}
+
+fn restart_stage_line(event: crate::migrations::progress::Event) -> Option<String> {
+    use crate::migrations::progress::Event;
+    match event {
+        Event::Started {
+            name,
+            position,
+            total,
+            ..
+        } => Some(format!("Migrating data ({position}/{total}): {name}")),
+        Event::Step(line) | Event::Progress(line) => Some(line),
+        Event::Notice(_) | Event::Finished { .. } => None,
+    }
 }
 
 fn quit_intent(
@@ -2775,14 +2792,21 @@ impl App {
     /// Keys while the runtime isn't the Daemon and no Web dashboard view is open: the offline
     /// takeover or the "Connecting" screen. Returns true to quit.
     fn handle_runtime_gate_key(&mut self, key: KeyEvent) -> bool {
+        use crate::tui::dialogs::DaemonAttention;
         use crate::tui::session_feed::SidebarSource;
         match (key.code, key.modifiers) {
+            // Quitting now could leave the old Daemon stopped and no successor started.
+            (KeyCode::Char('q'), KeyModifiers::NONE) if self.daemon_restart.is_some() => {}
             (KeyCode::Char('q'), KeyModifiers::NONE)
             | (KeyCode::Char('c'), KeyModifiers::CONTROL) => return true,
             (KeyCode::Char('r'), KeyModifiers::NONE)
                 if self.home.sidebar_source == SidebarSource::Disconnected =>
             {
-                self.home.connect_runtime();
+                match self.home.offline_attention {
+                    DaemonAttention::Outdated(daemon) => self.start_daemon_restart(daemon),
+                    DaemonAttention::Restarting => {}
+                    _ => self.home.connect_runtime(),
+                }
             }
             // A dashboard start hidden with Esc keeps the runtime off the Daemon, so this screen is
             // the only way back to it: still starting, or why it didn't.
@@ -2792,6 +2816,86 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    /// A restart's migrations hold the profile flocks these synchronous reloads
+    /// wait on, so the dirty latch and overdue heartbeat are kept for afterwards.
+    fn plan_tick_disk_refresh(
+        &self,
+        live_idle: bool,
+        heartbeat_due: bool,
+        full_heartbeat_deferred: bool,
+    ) -> DiskRefreshPlan {
+        if self.daemon_restart.is_some() {
+            return DiskRefreshPlan {
+                decision: DiskRefreshDecision::None,
+                full_heartbeat_deferred,
+            };
+        }
+        let dirty = self
+            .home
+            .disk_watch
+            .dirty
+            .swap(false, std::sync::atomic::Ordering::Acquire);
+        plan_disk_refresh(live_idle, heartbeat_due, dirty, full_heartbeat_deferred)
+    }
+
+    fn start_daemon_restart(&mut self, daemon: crate::daemon::DaemonIncarnation) {
+        let (stage_sender, stage) = tokio::sync::watch::channel("Starting restart".to_owned());
+        let (done, result) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let progress: crate::migrations::progress::Reporter =
+                std::sync::Arc::new(move |event| {
+                    if let Some(line) = restart_stage_line(event) {
+                        stage_sender.send_replace(line);
+                    }
+                });
+            let restarted = crate::cli::serve::restart_daemon_for_tui(daemon, progress)
+                .await
+                .map(|outcome| {
+                    tracing::info!(target: "tui.home", ?outcome, "daemon restart settled");
+                })
+                .map_err(|error| {
+                    tracing::warn!(target: "tui.home", %error, "daemon restart failed");
+                    format!("{error:#}")
+                });
+            let _ = done.send(restarted);
+        });
+        self.home.set_offline_attention(
+            crate::tui::dialogs::DaemonAttention::Restarting,
+            Some("Starting restart"),
+        );
+        self.daemon_restart = Some(DaemonRestart { result, stage });
+    }
+
+    fn poll_daemon_restart(&mut self) -> bool {
+        use crate::tui::dialogs::DaemonAttention;
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(restart) = &mut self.daemon_restart else {
+            return false;
+        };
+        let result = match restart.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => {
+                if !restart.stage.has_changed().unwrap_or(false) {
+                    return false;
+                }
+                let stage = restart.stage.borrow_and_update().clone();
+                return self
+                    .home
+                    .set_offline_attention(DaemonAttention::Restarting, Some(&stage));
+            }
+            Err(TryRecvError::Closed) => Err("The restart was interrupted.".to_owned()),
+        };
+        self.daemon_restart = None;
+        match result {
+            Ok(()) => self.home.connect_runtime(),
+            Err(message) => {
+                self.home
+                    .set_offline_attention(DaemonAttention::RestartFailed, Some(&message));
+            }
+        }
+        true
     }
 
     fn request_dashboard_stop(&mut self) {
@@ -5616,6 +5720,163 @@ mod tests {
         let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
         assert_eq!(paste, "hi\n");
         assert!(enter.is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn disk_reloads_wait_for_a_daemon_restart_without_losing_their_trigger() {
+        use std::sync::atomic::Ordering;
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let (_done, result) = tokio::sync::oneshot::channel();
+        let (_stage_sender, stage) = tokio::sync::watch::channel(String::new());
+        app.daemon_restart = Some(DaemonRestart { result, stage });
+        app.home.disk_watch.dirty.store(true, Ordering::Release);
+
+        for (heartbeat_due, deferred) in [(false, false), (true, false), (true, true)] {
+            let plan = app.plan_tick_disk_refresh(true, heartbeat_due, deferred);
+            assert_eq!(plan.decision, DiskRefreshDecision::None);
+            assert_eq!(plan.full_heartbeat_deferred, deferred);
+            assert!(app.home.disk_watch.dirty.load(Ordering::Acquire));
+        }
+
+        app.daemon_restart = None;
+        let plan = app.plan_tick_disk_refresh(true, false, false);
+        assert_eq!(plan.decision, DiskRefreshDecision::StorageOnly);
+        assert!(!app.home.disk_watch.dirty.load(Ordering::Acquire));
+        assert_eq!(
+            app.plan_tick_disk_refresh(true, true, false).decision,
+            DiskRefreshDecision::FullHeartbeat
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn r_restarts_only_a_restartable_daemon_and_reports_the_outcome() {
+        use crate::migrations::progress::Event;
+        use crate::tui::dialogs::{test_render, DaemonAttention as A};
+        use crate::tui::session_feed::{SessionFeed, SessionFeedResult, SidebarSource};
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        let r = KeyEvent::from(KeyCode::Char('r'));
+        let q = KeyEvent::from(KeyCode::Char('q'));
+        let takeover = |app: &mut App| {
+            test_render::text(&test_render::draw(110, 40, |frame, theme| {
+                app.home
+                    .render(frame, frame.area(), theme, None, None, None)
+            }))
+        };
+        let mismatched = |app: &mut App, attention| {
+            app.home
+                .session_feed
+                .publish_for_test(SessionFeedResult::Mismatched {
+                    attention,
+                    summary: "Daemon protocol 3, this aoe 4".into(),
+                });
+            app.home.apply_session_feed();
+        };
+        // Drops the reconnect before it can run, so no test autostarts a Daemon.
+        let reconnecting = |app: &mut App| {
+            assert_eq!(app.home.sidebar_source, SidebarSource::Connecting);
+            app.home.session_feed = SessionFeed::new();
+        };
+
+        let outdated = A::Outdated(crate::daemon::DaemonIncarnation::sample("old"));
+        // A feed mismatch reaches the takeover, and r runs the real restart path. This isolated
+        // home has no Daemon, so the one classified is gone and r reconnects instead of failing.
+        mismatched(&mut app, outdated);
+        let screen = takeover(&mut app);
+        assert!(screen.contains("[ r Restart Daemon ]"), "{screen}");
+        assert!(!screen.contains("Not responding"), "{screen}");
+        assert!(!app.handle_runtime_gate_key(r));
+        assert!(app.daemon_restart.is_some());
+        assert_eq!(app.home.offline_attention, A::Restarting);
+        assert!(takeover(&mut app).contains("Starting restart"));
+        // While it runs, neither r nor q interrupts it.
+        assert!(!app.handle_runtime_gate_key(r));
+        assert!(!app.handle_runtime_gate_key(q));
+        assert!(app.daemon_restart.is_some());
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while app.daemon_restart.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restart never settled"
+            );
+            app.poll_daemon_restart();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        reconnecting(&mut app);
+
+        // A failed restart shows why, and offers a re-check.
+        let (done, result) = tokio::sync::oneshot::channel();
+        let (_stage_sender, stage) = tokio::sync::watch::channel(String::new());
+        app.home.set_offline_attention(A::Restarting, None);
+        app.daemon_restart = Some(DaemonRestart { result, stage });
+        assert!(done.send(Err("bind failed".to_owned())).is_ok());
+        assert!(app.poll_daemon_restart());
+        assert_eq!(app.home.offline_attention, A::RestartFailed);
+        let screen = takeover(&mut app);
+        assert!(screen.contains("bind failed"), "{screen}");
+        assert!(screen.contains("[ r Reconnect ]"), "{screen}");
+        // A failed restart may have stopped the Daemon, so r re-checks rather than restarts.
+        assert!(!app.handle_runtime_gate_key(r));
+        assert!(app.daemon_restart.is_none());
+        reconnecting(&mut app);
+
+        // Progress is shown as it arrives; success reconnects without another key.
+        let (stage_sender, stage) = tokio::sync::watch::channel(String::new());
+        let (done, result) = tokio::sync::oneshot::channel();
+        app.home.set_offline_attention(A::Restarting, None);
+        app.daemon_restart = Some(DaemonRestart { result, stage });
+        stage_sender.send_replace(
+            restart_stage_line(Event::Started {
+                version: 33,
+                name: "isolate",
+                position: 1,
+                total: 2,
+            })
+            .unwrap(),
+        );
+        assert!(app.poll_daemon_restart());
+        assert!(takeover(&mut app).contains("Migrating data (1/2): isolate"));
+        assert!(!app.poll_daemon_restart(), "no new stage, no redraw");
+        assert!(done.send(Ok(())).is_ok());
+        assert!(app.poll_daemon_restart());
+        assert!(app.daemon_restart.is_none());
+        reconnecting(&mut app);
+
+        // Anything this aoe may not restart gets a re-check, never a restart.
+        for attention in [A::OutdatedCommand, A::OutdatedManual, A::DaemonNewer] {
+            mismatched(&mut app, attention);
+            assert!(!app.handle_runtime_gate_key(r));
+            assert!(app.daemon_restart.is_none(), "{attention:?}");
+            reconnecting(&mut app);
+        }
+
+        // A later connectivity failure replaces the mismatch instead of inheriting its action.
+        mismatched(&mut app, outdated);
+        app.home
+            .session_feed
+            .publish_for_test(SessionFeedResult::Unavailable("connection refused".into()));
+        app.home.apply_session_feed();
+        assert_eq!(app.home.offline_attention, A::Offline);
+        assert!(takeover(&mut app).contains("[ r Reconnect ]"));
     }
 
     #[tokio::test]

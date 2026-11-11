@@ -1032,6 +1032,7 @@ mod tests {
                 .unwrap();
             if active {
                 let event = Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "hold this turn".into(),
                     attachments: vec![],
                     prompt_id: None,

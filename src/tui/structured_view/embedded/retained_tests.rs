@@ -501,6 +501,7 @@ async fn stable_gaps_and_unrelated_writes_do_not_reload_retained_content() {
         view.effective_offset().is_some() && text.contains("FIRST") && text.contains("LAST")
     })
     .await;
+    assert!(view.message.contains("incomplete"));
     let initial_reads = full_reads.load(Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(12), async {
         observed_probes.recv().await.unwrap();
@@ -536,6 +537,7 @@ async fn stable_gaps_and_unrelated_writes_do_not_reload_retained_content() {
     })
     .await;
     assert_eq!(full_reads.load(Ordering::SeqCst), initial_reads + 1);
+    assert!(!view.message.contains("incomplete"));
     drop(view);
     server.abort();
     let _ = server.await;
