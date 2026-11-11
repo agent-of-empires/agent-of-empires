@@ -156,6 +156,10 @@ preserves the prior enabled, source, dev, grant, dismissal and settings values
 without overwriting unrelated config. A backup cleanup failure after commit is
 reported as recovery required; do not restore that backup over the committed tree.
 Local release-binary targets must be regular executable files before publication.
+Release assets are streamed into staging and may only add files: an asset entry
+that would replace a file already in the source tree, or that is a symlink,
+hardlink or special file, is rejected so the disclosed manifest and tree match
+what gets installed.
 
 A plugin lands in `<app_dir>/plugins/<id>/`. GitHub sources are pinned to an exact commit and release-binary workers are downloaded for your platform; local sources must supply their own executable. Set `AOE_GITHUB_CLONE_BASE` to install from a GitHub Enterprise host. Resolved versions (commit, manifest hash, release asset) live in `<app_dir>/plugins.lock`, so an install is reproducible.
 

@@ -194,7 +194,7 @@ struct GitFailed {
     stderr: String,
 }
 
-fn run_git(args: &[&str], cwd: Option<&Path>, budget: super::execution::Budget) -> Result<String> {
+fn git_command(args: &[&str], cwd: Option<&Path>) -> Command {
     let mut cmd = Command::new("git");
     cmd.args(args)
         .stdin(Stdio::null())
@@ -203,17 +203,42 @@ fn run_git(args: &[&str], cwd: Option<&Path>, budget: super::execution::Budget) 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
+    cmd
+}
+
+fn git_failure(args: &[&str], output: &std::process::Output) -> anyhow::Error {
+    GitFailed {
+        command: args.join(" "),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    }
+    .into()
+}
+
+fn run_git(args: &[&str], cwd: Option<&Path>, budget: super::execution::Budget) -> Result<String> {
+    let mut cmd = git_command(args, cwd);
     let output = budget
         .run(&mut cmd)
         .context("failed to run git (is it installed and on PATH?)")?;
     if !output.status.success() {
-        return Err(GitFailed {
-            command: args.join(" "),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        }
-        .into());
+        return Err(git_failure(args, &output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Clone and checkout stdout is progress noise that no caller reads.
+fn run_git_discarding_stdout(
+    args: &[&str],
+    cwd: Option<&Path>,
+    budget: super::execution::Budget,
+) -> Result<()> {
+    let mut cmd = git_command(args, cwd);
+    let output = budget
+        .run_discarding_stdout(&mut cmd)
+        .context("failed to run git (is it installed and on PATH?)")?;
+    if !output.status.success() {
+        return Err(git_failure(args, &output));
+    }
+    Ok(())
 }
 
 pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
@@ -279,7 +304,7 @@ fn git_clone_checkout(
     let dest_str = path_arg(dest)?;
 
     let shallow = match reference {
-        Some(reference) => run_git(
+        Some(reference) => run_git_discarding_stdout(
             &[
                 "-c",
                 "core.autocrlf=false",
@@ -295,7 +320,7 @@ fn git_clone_checkout(
             None,
             budget,
         ),
-        None => run_git(
+        None => run_git_discarding_stdout(
             &[
                 "-c",
                 "core.autocrlf=false",
@@ -316,13 +341,13 @@ fn git_clone_checkout(
             return Err(error);
         }
         let _ = std::fs::remove_dir_all(dest);
-        run_git(
+        run_git_discarding_stdout(
             &["-c", "core.autocrlf=false", "clone", "--", url, dest_str],
             None,
             budget,
         )?;
         if let Some(reference) = reference {
-            run_git(
+            run_git_discarding_stdout(
                 &[
                     "-c",
                     "advice.detachedHead=false",
@@ -462,11 +487,21 @@ async fn download_release_binary(
                 )
             })?;
 
-        let bytes = http_get_bytes(&asset.browser_download_url).await?;
-        Ok::<_, anyhow::Error>((bytes, asset.name.clone(), release.tag_name, bin.clone()))
+        let staging = fetched
+            .tree
+            .parent()
+            .ok_or_else(|| anyhow!("plugin staging tree has no parent directory"))?;
+        let asset_path = staging.join(".asset-download");
+        download_asset(&asset.browser_download_url, &asset_path).await?;
+        Ok::<_, anyhow::Error>((
+            asset_path.to_path_buf(),
+            asset.name.clone(),
+            release.tag_name,
+            bin.clone(),
+        ))
     }
     .await;
-    let (bytes, name, tag, bin) = match download {
+    let (asset_path, name, tag, bin) = match download {
         Ok(download) => download,
         Err(error) => {
             fetched.cleanup().await?;
@@ -479,8 +514,8 @@ async fn download_release_binary(
         let result = super::execution::catch_panic(|| {
             #[cfg(test)]
             test_gate::reach(&fetched.tree, "asset");
-            let sha = sha256_hex(&bytes);
-            install_asset_into(&fetched.tree, &name, bin.as_deref(), &bytes)?;
+            let sha = sha256_file(&asset_path)?;
+            install_asset_into(&fetched.tree, &name, bin.as_deref(), &asset_path)?;
             fetched.release_tag = Some(tag);
             fetched.asset_name = Some(name);
             fetched.asset_sha256 = Some(sha);
@@ -540,25 +575,47 @@ pub(super) fn render_asset_template<'a>(
     }
 }
 
-async fn http_get_bytes(url: &str) -> Result<Vec<u8>> {
+async fn download_asset(url: &str, dest: &Path) -> Result<()> {
+    use std::io::Write;
     let client = reqwest::Client::builder()
         .user_agent(DEFAULT_USER_AGENT)
         .timeout(Duration::from_secs(300))
         .build()?;
-    let response = client.get(url).send().await?;
+    let mut response = client.get(url).send().await?;
     let status = response.status();
     if !status.is_success() {
         bail!("downloading {url} failed: HTTP {status}");
     }
-    Ok(response.bytes().await?.to_vec())
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk)
+            .with_context(|| format!("writing {url} to {}", dest.display()))?;
+    }
+    file.flush()
+        .with_context(|| format!("writing {url} to {}", dest.display()))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write;
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("hashing {}", path.display()))?;
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .with_context(|| format!("hashing {}", path.display()))?;
+        if read == 0 {
+            return Ok(sha256_label(&hasher.finalize()));
+        }
+        hasher.update(&buf[..read]);
+    }
+}
+
+fn sha256_label(digest: &[u8]) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(7 + digest.len() * 2);
     out.push_str("sha256:");
     for byte in digest {
@@ -567,63 +624,137 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha256_label(&sha2::Sha256::digest(bytes))
+}
+
 fn install_asset_into(
     tree: &Path,
     asset_name: &str,
     bin: Option<&str>,
-    bytes: &[u8],
+    asset: &Path,
 ) -> Result<()> {
     if asset_name.ends_with(".tar.gz") || asset_name.ends_with(".tgz") {
-        let decoder = flate2::read::GzDecoder::new(bytes);
-        let mut archive = tar::Archive::new(decoder);
-        archive
-            .unpack(tree)
-            .with_context(|| format!("unpacking {asset_name}"))?;
         let bin_rel =
             bin.ok_or_else(|| anyhow!("a release-binary archive asset must set `bin`"))?;
-        ensure_executable(&safe_tree_path(tree, bin_rel)?)
+        let source =
+            std::fs::File::open(asset).with_context(|| format!("opening {}", asset.display()))?;
+        extract_asset_archive(tree, asset_name, source)?;
+        ensure_executable(tree, &checked_asset_path(Path::new(bin_rel))?)
     } else {
-        let name = bin.unwrap_or(asset_name);
-        let path = safe_tree_path(tree, name)?;
-        std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
-        ensure_executable(&path)
+        let name = checked_asset_path(Path::new(bin.unwrap_or(asset_name)))?;
+        let root = crate::session::AnchoredDir::open(tree)?;
+        if let Some(parent) = name.parent().filter(|p| !p.as_os_str().is_empty()) {
+            root.ensure_dir(parent)?;
+        }
+        let Some(mut output) = root.create_new_regular(&name)? else {
+            bail!(
+                "release asset {asset_name:?} would replace the plugin source file {}",
+                tree.join(&name).display()
+            );
+        };
+        let mut input =
+            std::fs::File::open(asset).with_context(|| format!("opening {}", asset.display()))?;
+        std::io::copy(&mut input, &mut output)
+            .with_context(|| format!("writing {}", tree.join(&name).display()))?;
+        set_asset_mode(&output, 0o755)
     }
 }
 
-fn safe_tree_path(tree: &Path, rel: &str) -> Result<PathBuf> {
+/// Assets may only add files: a replacement would change the manifest or tree
+/// after the consent fingerprint was computed over the source snapshot.
+fn extract_asset_archive(tree: &Path, asset_name: &str, source: std::fs::File) -> Result<()> {
+    let root = crate::session::AnchoredDir::open(tree)?;
+    let decoder = flate2::read::GzDecoder::new(source);
+    for entry in tar::Archive::new(decoder)
+        .entries()
+        .with_context(|| format!("unpacking {asset_name}"))?
+    {
+        let mut entry = entry.with_context(|| format!("unpacking {asset_name}"))?;
+        let kind = entry.header().entry_type();
+        let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
+        let entry_path = entry
+            .path()
+            .with_context(|| format!("reading an entry name from {asset_name}"))?
+            .into_owned();
+        let rel = checked_asset_path(&entry_path)?;
+        if kind.is_dir() {
+            root.ensure_dir(&rel)
+                .with_context(|| format!("unpacking {asset_name}"))?;
+        } else if kind.is_file() {
+            if let Some(parent) = rel.parent().filter(|p| !p.as_os_str().is_empty()) {
+                root.ensure_dir(parent)
+                    .with_context(|| format!("unpacking {asset_name}"))?;
+            }
+            let Some(mut output) = root.create_new_regular(&rel)? else {
+                bail!(
+                    "release asset {asset_name:?} would replace the plugin source entry {}",
+                    tree.join(&rel).display()
+                );
+            };
+            std::io::copy(&mut entry, &mut output)
+                .with_context(|| format!("unpacking {asset_name}"))?;
+            set_asset_mode(&output, mode)?;
+        } else {
+            bail!(
+                "release asset {asset_name:?} contains an unsupported entry ({})",
+                rel.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn checked_asset_path(rel: &Path) -> Result<PathBuf> {
     use std::path::Component;
-    let candidate = Path::new(rel);
-    let safe = candidate
+    let mut normalized = PathBuf::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            _ => bail!(
+                "plugin path {rel:?} must be a relative path inside the plugin (no absolute path or `..`)"
+            ),
+        }
+    }
+    let first = normalized
         .components()
-        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-    if !safe || candidate.as_os_str().is_empty() {
-        bail!("plugin path {rel:?} must be a relative path inside the plugin (no absolute path or `..`)");
+        .next()
+        .ok_or_else(|| anyhow!("plugin path {rel:?} is empty"))?
+        .as_os_str();
+    if first == ".git" || first == super::integrity::BUILD_OUTPUT_DIR {
+        bail!("plugin path {rel:?} uses the reserved {first:?} namespace");
     }
-    Ok(tree.join(candidate))
+    Ok(normalized)
 }
 
-#[cfg(unix)]
-fn ensure_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if !path.exists() {
-        bail!(
-            "expected binary {} missing after extraction",
-            path.display()
-        );
+fn set_asset_mode(file: &std::fs::File, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
     }
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("making {} executable", path.display()))
+    #[cfg(not(unix))]
+    let _ = (file, mode);
+    Ok(())
 }
 
-#[cfg(not(unix))]
-fn ensure_executable(path: &Path) -> Result<()> {
-    if !path.exists() {
+/// Open through the anchored root so a planted symlink is never chmodded.
+fn ensure_executable(tree: &Path, rel: &Path) -> Result<()> {
+    let root = crate::session::AnchoredDir::open(tree)?;
+    let Some(file) = root.open_regular(rel, usize::MAX)? else {
         bail!(
             "expected binary {} missing after extraction",
-            path.display()
+            tree.join(rel).display()
         );
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode();
+        set_asset_mode(&file, mode | 0o755)?;
     }
     Ok(())
 }
@@ -700,13 +831,25 @@ mod tests {
     }
 
     #[test]
-    fn safe_tree_path_rejects_escapes() {
-        let tree = Path::new("/plugins/acme");
-        assert!(safe_tree_path(tree, "bin/worker").is_ok());
-        assert!(safe_tree_path(tree, "worker").is_ok());
-        for bad in ["../../.bashrc", "/etc/passwd", "a/../../b", ""] {
+    fn checked_asset_path_rejects_escapes_and_reserved_namespaces() {
+        assert_eq!(
+            checked_asset_path(Path::new("bin/worker")).unwrap(),
+            Path::new("bin/worker")
+        );
+        assert_eq!(
+            checked_asset_path(Path::new("./worker")).unwrap(),
+            Path::new("worker")
+        );
+        for bad in [
+            "../../.bashrc",
+            "/etc/passwd",
+            "a/../../b",
+            "",
+            ".git/config",
+            ".aoe-build/worker",
+        ] {
             assert!(
-                safe_tree_path(tree, bad).is_err(),
+                checked_asset_path(Path::new(bad)).is_err(),
                 "{bad} should be rejected"
             );
         }
@@ -715,8 +858,12 @@ mod tests {
     #[test]
     fn raw_asset_is_written_executable() {
         let dir = tempfile::tempdir().unwrap();
-        install_asset_into(dir.path(), "thing", Some("thing"), b"#!/bin/sh\n").unwrap();
-        let path = dir.path().join("thing");
+        let downloaded = dir.path().join("download");
+        std::fs::write(&downloaded, b"#!/bin/sh\n").unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        install_asset_into(&tree, "thing", Some("thing"), &downloaded).unwrap();
+        let path = tree.join("thing");
         assert!(path.exists());
         #[cfg(unix)]
         {
@@ -1062,25 +1209,195 @@ mod tests {
         encoder.flush().unwrap();
         let bytes = encoder.finish().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        install_asset_into(dir.path(), "worker.tar.gz", Some("worker"), &bytes).unwrap();
-        assert_eq!(std::fs::read(dir.path().join("worker")).unwrap(), raw);
+        let downloaded = dir.path().join("worker.tar.gz");
+        std::fs::write(&downloaded, &bytes).unwrap();
+        let ok_tree = dir.path().join("ok");
+        std::fs::create_dir(&ok_tree).unwrap();
+        install_asset_into(&ok_tree, "worker.tar.gz", Some("worker"), &downloaded).unwrap();
+        assert_eq!(std::fs::read(ok_tree.join("worker")).unwrap(), raw);
         assert_ne!(sha256_hex(&bytes), sha256_hex(raw));
+        let broken = dir.path().join("broken.tgz");
+        std::fs::write(&broken, b"bad").unwrap();
+        let broken_tree = dir.path().join("broken");
+        std::fs::create_dir(&broken_tree).unwrap();
         assert!(
-            install_asset_into(dir.path(), "broken.tgz", Some("worker"), b"bad")
+            install_asset_into(&broken_tree, "broken.tgz", Some("worker"), &broken)
                 .unwrap_err()
                 .to_string()
                 .contains("unpacking")
         );
-        assert!(install_asset_into(dir.path(), "worker.tgz", None, &bytes)
-            .unwrap_err()
-            .to_string()
-            .contains("must set `bin`"));
+        let archive_path = dir.path().join("worker.tgz");
+        std::fs::write(&archive_path, &bytes).unwrap();
+        let unset_tree = dir.path().join("unset");
+        std::fs::create_dir(&unset_tree).unwrap();
         assert!(
-            install_asset_into(dir.path(), "worker.tgz", Some("missing"), &bytes)
+            install_asset_into(&unset_tree, "worker.tgz", None, &archive_path)
+                .unwrap_err()
+                .to_string()
+                .contains("must set `bin`")
+        );
+        let missing_tree = dir.path().join("missing");
+        std::fs::create_dir(&missing_tree).unwrap();
+        assert!(
+            install_asset_into(&missing_tree, "worker.tgz", Some("missing"), &archive_path)
                 .unwrap_err()
                 .to_string()
                 .contains("missing")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_asset_never_follows_links_or_replaces_the_source_snapshot() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn gzip(entries: &[(&str, Option<&[u8]>, u32)]) -> Vec<u8> {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            for (name, data, mode) in entries {
+                let mut header = tar::Header::new_gnu();
+                match data {
+                    Some(data) => {
+                        header.set_entry_type(tar::EntryType::Regular);
+                        header.set_size(data.len() as u64);
+                        header.set_mode(*mode);
+                        header.set_cksum();
+                        archive.append_data(&mut header, name, &data[..]).unwrap();
+                    }
+                    None => {
+                        header.set_entry_type(tar::EntryType::Directory);
+                        header.set_size(0);
+                        header.set_mode(*mode);
+                        header.set_cksum();
+                        archive
+                            .append_data(&mut header, name, std::io::empty())
+                            .unwrap();
+                    }
+                }
+            }
+            let mut encoder = archive.into_inner().unwrap();
+            encoder.flush().unwrap();
+            encoder.finish().unwrap()
+        }
+
+        let work = tempfile::tempdir().unwrap();
+        let victim = work.path().join("victim");
+        std::fs::write(&victim, b"private").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Archive symlink selected as `bin` must not be opened for chmod.
+        let tree = work.path().join("symlink-tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("aoe-plugin.toml"), b"id = \"acme.bin\"\n").unwrap();
+        // Absolute entry names cannot be produced through the safe builder, so
+        // write the header directly; real archives can still carry them.
+        let link_archive = work.path().join("link.tgz");
+        {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.as_mut_bytes()[..11].copy_from_slice(b"/etc/passwd");
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(7);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append(&header, &b"ignored"[..]).unwrap();
+            let mut encoder = archive.into_inner().unwrap();
+            encoder.flush().unwrap();
+            std::fs::write(&link_archive, encoder.finish().unwrap()).unwrap();
+        }
+        let error =
+            install_asset_into(&tree, "link.tgz", Some("worker"), &link_archive).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("must be a relative path inside the plugin"),
+            "{error:#}"
+        );
+
+        let symlinked_archive = work.path().join("symlinked.tgz");
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_cksum();
+        archive.append_link(&mut header, "worker", &victim).unwrap();
+        let mut encoder = archive.into_inner().unwrap();
+        encoder.flush().unwrap();
+        std::fs::write(&symlinked_archive, encoder.finish().unwrap()).unwrap();
+        let error = install_asset_into(&tree, "symlinked.tgz", Some("worker"), &symlinked_archive)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported entry"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&victim).unwrap(), b"private");
+        assert_eq!(
+            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // A regular entry over an existing source file would change the
+        // consented manifest, so the overlay is refused.
+        let manifest_archive = work.path().join("manifest.tgz");
+        std::fs::write(
+            &manifest_archive,
+            gzip(&[("aoe-plugin.toml", Some(b"id = \"evil\"\n"), 0o644)]),
+        )
+        .unwrap();
+        let error = install_asset_into(
+            &tree,
+            "manifest.tgz",
+            Some("aoe-plugin.toml"),
+            &manifest_archive,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("would replace"), "{error:#}");
+        assert_eq!(
+            std::fs::read(tree.join("aoe-plugin.toml")).unwrap(),
+            b"id = \"acme.bin\"\n"
+        );
+
+        // Raw assets may not replace a source file either.
+        std::fs::write(tree.join("worker"), b"source").unwrap();
+        let raw = work.path().join("worker");
+        std::fs::write(&raw, b"new").unwrap();
+        let error = install_asset_into(&tree, "worker", None, &raw).unwrap_err();
+        assert!(format!("{error:#}").contains("would replace"), "{error:#}");
+        assert_eq!(std::fs::read(tree.join("worker")).unwrap(), b"source");
+
+        // Legitimate additions still land, with their archive mode.
+        let additions = work.path().join("additions.tgz");
+        std::fs::write(
+            &additions,
+            gzip(&[
+                ("bin/", None, 0o755),
+                ("bin/worker", Some(b"#!/bin/sh\nexit 0\n"), 0o750),
+                ("empty/", None, 0o755),
+            ]),
+        )
+        .unwrap();
+        install_asset_into(&tree, "additions.tgz", Some("bin/worker"), &additions).unwrap();
+        assert_eq!(
+            std::fs::metadata(tree.join("bin/worker"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert!(tree.join("empty").is_dir());
+
+        // Archives that list only files still create their parent directories.
+        let nested = work.path().join("nested.tgz");
+        std::fs::write(
+            &nested,
+            gzip(&[("deep/inner/worker", Some(b"#!/bin/sh\n"), 0o644)]),
+        )
+        .unwrap();
+        install_asset_into(&tree, "nested.tgz", Some("deep/inner/worker"), &nested).unwrap();
+        assert!(tree.join("deep/inner/worker").is_file());
     }
 }
 

@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 
+/// Git progress and error text is diagnostic only; commit identities and ref
+/// listings are never truncated, they feed the resolved commit.
+pub(super) const DIAGNOSTIC_LIMIT: usize = 64 * 1024;
+
 #[derive(Clone, Copy)]
 pub(super) struct Budget {
     deadline: Instant,
@@ -60,6 +64,16 @@ impl Budget {
     }
 
     pub(super) fn run(self, command: &mut Command) -> Result<Output> {
+        self.run_captured(command, true)
+    }
+
+    /// Clone and checkout stdout is discarded by every caller, so it must not
+    /// be buffered. Diagnostics stay bounded either way.
+    pub(super) fn run_discarding_stdout(self, command: &mut Command) -> Result<Output> {
+        self.run_captured(command, false)
+    }
+
+    fn run_captured(self, command: &mut Command, keep_stdout: bool) -> Result<Output> {
         if self.is_expired() {
             return Err(Exhausted.into());
         }
@@ -85,17 +99,28 @@ impl Budget {
         // Drain captured Git output concurrently. Build stdio remains attached to its log.
         fn reader<R: Read + Send + 'static>(
             pipe: Option<R>,
-        ) -> Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>> {
+            keep: Option<usize>,
+        ) -> Option<std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>> {
             pipe.map(|mut pipe| {
                 std::thread::spawn(move || {
-                    let mut bytes = Vec::new();
-                    pipe.read_to_end(&mut bytes)?;
-                    Ok(bytes)
+                    let mut buf = [0u8; 8192];
+                    let mut retained = Vec::new();
+                    let mut truncated = false;
+                    loop {
+                        let read = pipe.read(&mut buf)?;
+                        if read == 0 {
+                            return Ok((retained, truncated));
+                        }
+                        let room = keep.map_or(0, |limit| limit.saturating_sub(retained.len()));
+                        let take = room.min(read);
+                        retained.extend_from_slice(&buf[..take]);
+                        truncated |= take < read;
+                    }
                 })
             })
         }
-        let stdout = reader(stdout);
-        let stderr = reader(stderr);
+        let stdout = reader(stdout, keep_stdout.then_some(usize::MAX));
+        let stderr = reader(stderr, Some(DIAGNOSTIC_LIMIT));
         let mut timed_out = false;
         let mut next_census = Instant::now() + Duration::from_secs(1);
         loop {
@@ -160,18 +185,23 @@ impl Budget {
             RecoveryRequired(format!("command {pid} final reap unproven: {error}"))
         })?;
         fn finish(
-            reader: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
-        ) -> Result<Vec<u8>> {
+            reader: Option<std::thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>>>,
+        ) -> Result<(Vec<u8>, bool)> {
             match reader {
                 Some(reader) => reader
                     .join()
                     .map_err(|_| anyhow!("plugin output reader panicked"))?
                     .map_err(Into::into),
-                None => Ok(Vec::new()),
+                None => Ok((Vec::new(), false)),
             }
         }
-        let stdout = finish(stdout)?;
-        let stderr = finish(stderr)?;
+        let stdout = finish(stdout)?.0;
+        let (mut stderr, truncated) = finish(stderr)?;
+        if truncated {
+            stderr.extend_from_slice(
+                format!("\n[plugin diagnostics truncated at {DIAGNOSTIC_LIMIT} bytes]").as_bytes(),
+            );
+        }
         if timed_out {
             return Err(Exhausted.into());
         }
@@ -352,5 +382,40 @@ mod tests {
             late.exited().unwrap(),
             "late uncaptured group writer must physically exit"
         );
+    }
+
+    #[test]
+    fn git_diagnostics_are_bounded_and_clone_stdout_is_discarded() {
+        let mut loud = Command::new("sh");
+        loud.args([
+            "-c",
+            "dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\0' 'e' >&2; printf stdout",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        let output = Budget::new().run(&mut loud).unwrap();
+        assert!(output.status.success());
+        // Retained identity output stays complete.
+        assert_eq!(output.stdout, b"stdout");
+        assert!(
+            output.stderr.len() <= DIAGNOSTIC_LIMIT + 128,
+            "{}",
+            output.stderr.len()
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("[plugin diagnostics truncated"));
+
+        let mut noisy = Command::new("sh");
+        noisy
+            .args([
+                "-c",
+                "dd if=/dev/zero bs=1024 count=512 2>/dev/null | tr '\\0' 'x'",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let output = Budget::new().run_discarding_stdout(&mut noisy).unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
     }
 }
