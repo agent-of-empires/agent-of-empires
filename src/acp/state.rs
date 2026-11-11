@@ -46,6 +46,9 @@ pub struct Todo {
     pub completed: bool,
 }
 
+/// Ends an `args_preview` that was cut at the ingest cap.
+pub(crate) const ARGS_CUT_MARKER: &str = "\u{2026}[truncated]";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -1085,10 +1088,12 @@ impl AcpState {
                         tool.name = title;
                     }
                     if let Some(args_preview) = args_preview {
-                        tool.args_preview = args_preview;
-                        if prompt.is_some() {
+                        // An uncut preview means the prompt is no longer oversized; a cut
+                        // one with no prompt is a deduplicated repeat of the stored prompt.
+                        if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
                             tool.prompt = prompt;
                         }
+                        tool.args_preview = args_preview;
                     }
                     if let Some(started_at) = started_at {
                         tool.started_at = started_at;
@@ -2250,9 +2255,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            restated.in_flight_tool.unwrap().prompt.as_deref(),
+            restated.in_flight_tool.as_ref().unwrap().prompt.as_deref(),
             Some("full prompt"),
-            "an update without its own prompt keeps the stored one"
+            "a cut preview without its own prompt keeps the stored one"
+        );
+        restated
+            .apply_event(
+                restated.last_seq.saturating_add(1),
+                Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"B\"}".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.unwrap().prompt,
+            None,
+            "an uncut preview means the prompt was replaced by a short one"
         );
 
         let mut richer = tool_call("tc-1");

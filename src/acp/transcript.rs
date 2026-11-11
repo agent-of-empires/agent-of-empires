@@ -7,7 +7,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
+use super::state::{
+    notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock, ARGS_CUT_MARKER,
+};
 use crate::daemon::PromptAttachmentRef;
 
 /// Reasons with this prefix are hidden before the first prompt, since a never-prompted
@@ -758,10 +760,10 @@ impl TranscriptModel {
                 tool.name = title.to_string();
             }
             if let Some(args_preview) = args_preview {
-                tool.args_preview = args_preview.to_string();
-                if let Some(prompt) = prompt {
-                    tool.prompt = Some(prompt.to_string());
+                if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
+                    tool.prompt = prompt.map(str::to_string);
                 }
+                tool.args_preview = args_preview.to_string();
             }
             if let Some(started_at) = started_at {
                 tool.started_at = started_at;
@@ -1102,17 +1104,28 @@ mod tests {
     }
 
     #[test]
-    fn an_update_without_a_prompt_keeps_the_stored_one() {
+    fn an_update_keeps_the_stored_prompt_only_while_the_preview_stays_cut() {
         let mut start = tool("t", "Task");
-        start.args_preview = r#"{"prompt":"cut"#.into();
+        start.args_preview = "{\"prompt\":\"cut\u{2026}[truncated]".into();
         start.prompt = Some("full prompt".into());
         let m = fold([
-            started(start),
-            updated("t", None, Some(r#"{"prompt":"cut"#), None),
+            started(start.clone()),
+            updated("t", None, Some(&start.args_preview), None),
         ]);
         assert_eq!(
             tool_of(&m, "start-t").prompt.as_deref(),
-            Some("full prompt")
+            Some("full prompt"),
+            "a deduplicated repeat of the cut call"
+        );
+
+        let m = fold([
+            started(start),
+            updated("t", None, Some(r#"{"prompt":"B"}"#), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt,
+            None,
+            "an explicit short replacement drops the old prompt"
         );
     }
 

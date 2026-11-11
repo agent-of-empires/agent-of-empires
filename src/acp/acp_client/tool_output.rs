@@ -1,7 +1,7 @@
 //! Reading a tool call's content: text, media and resource blocks, memory
 //! recalls, and diffs, each under a size cap.
 
-use crate::acp::state::{DiffPreview, Event, MemoryRecall, ToolOutputBlock};
+use crate::acp::state::{DiffPreview, Event, MemoryRecall, ToolOutputBlock, ARGS_CUT_MARKER};
 use agent_client_protocol::v1::schema::ContentBlock;
 
 pub(super) fn raw_event<T: serde::Serialize>(value: &T) -> Event {
@@ -34,7 +34,7 @@ pub(super) fn preview_args(raw: &serde_json::Value) -> String {
     let mut out = String::with_capacity(serialised.len().min(16 * 1024));
     for c in serialised.chars() {
         if out.len() >= 16 * 1024 {
-            out.push_str("\u{2026}[truncated]");
+            out.push_str(ARGS_CUT_MARKER);
             break;
         }
         if c.is_control() && c != '\n' && c != '\t' {
