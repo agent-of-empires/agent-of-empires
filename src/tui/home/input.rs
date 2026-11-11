@@ -4921,6 +4921,7 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.vt_yield = None;
+                self.live_takeover = None;
                 self.retained_preview = None;
                 self.retained_focus = None;
                 self.retained_scroll_offset = 0;
@@ -6899,6 +6900,7 @@ impl HomeView {
     /// that is already the live-send target, so clicking the same row twice does not
     /// re-run ensure_pane_ready or drop the live worker.
     pub(super) fn start_live_send(&mut self) -> Option<Action> {
+        self.live_takeover = None;
         let id = self.selected_session.clone()?;
         if self.live_send.as_ref().is_some_and(|s| s.session_id == id) {
             return None;
@@ -7128,7 +7130,7 @@ impl HomeView {
             self.selected_group,
             self.selected_group_profile,
         ) = selection;
-        self.flash_status("Live send ended: its session is hidden (y to show)");
+        self.flash_status("Live mode ended: its session is hidden (y to show)");
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:
@@ -7258,7 +7260,7 @@ impl HomeView {
             return false;
         };
         self.exit_live_send_and_restore_sizing(state);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        self.info_dialog = Some(InfoDialog::new("Live mode ended", reason));
         true
     }
 
@@ -7267,7 +7269,7 @@ impl HomeView {
             return false;
         };
         self.exit_live_send_and_restore_sizing(state);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        self.info_dialog = Some(InfoDialog::new("Live mode ended", reason));
         true
     }
 
@@ -7297,20 +7299,13 @@ impl HomeView {
         if self.end_live_send_on_drift(&state) {
             return true;
         }
-        // Name the thief where the owner id is unambiguous: the web dashboard's live
-        // viewers register as `live-*` (src/server/live_ws.rs), other TUIs as `tui-*`.
-        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
-            Some((id, _)) if id.starts_with("live-") => {
-                "The web dashboard took over this session's live view."
-            }
-            Some((id, _)) if id.starts_with("tui-") => {
-                "Another aoe TUI took over this session's live view."
-            }
-            _ => "Another surface took over this session's live view.",
-        };
+        let owner = crate::tmux::Session::from_name(&state.tmux_name).size_owner();
+        let taker =
+            live_send::LiveTakeover::from_owner_id(owner.as_ref().map(|(id, _)| id.as_str()));
         self.teardown_live_send();
         self.vt_yield = Some(state.tmux_name);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        // A footer line, not a dialog: the live key takes control back.
+        self.live_takeover = Some((state.session_id, taker));
         true
     }
 

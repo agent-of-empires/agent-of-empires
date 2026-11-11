@@ -520,6 +520,28 @@ fn footer_advertises_tab_as_attach_when_default_is_live_send() {
     );
 }
 
+/// After a takeover the footer names the key that enters live mode, which is Enter once
+/// live-send owns it; Tab keeps its attach hint.
+#[test]
+#[serial]
+fn takeover_footer_names_enter_when_enter_is_live() {
+    let mut env = create_test_env_empty();
+    write_global_default_attach_mode(AttachMode::LiveSend);
+    let id = add_session(&mut env.view, "session-one");
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.cursor = 0;
+    env.view.update_selected();
+    env.view.live_takeover = Some((id, crate::tui::home::live_send::LiveTakeover::Web));
+    let out = render_home(&mut env);
+    let footer = out.lines().last().unwrap_or_default();
+    assert!(
+        footer.contains("Web dashboard took control · ↵ take control"),
+        "{footer}"
+    );
+    assert!(footer.contains("⇥  Attach"), "{footer}");
+    assert!(!footer.contains("Live"), "{footer}");
+}
+
 /// Structured rows have no distinct Tab action to advertise.
 #[test]
 #[serial]

@@ -4521,12 +4521,40 @@ impl HomeView {
                 }
                 None => (None, None),
             };
+            // After another window took live control: its status, then the key that takes
+            // control back. Only live entry claims the size lock; a full-screen attach doesn't.
+            let takeover = self
+                .live_takeover
+                .as_ref()
+                .filter(|(id, _)| self.selected_session.as_deref() == Some(id.as_str()))
+                .map(|(_, taker)| *taker);
+            let live_key = takeover.map(|taker| {
+                let (click, key) = if tab_action_text == Some("Live") {
+                    (ktab, "Tab")
+                } else {
+                    (kenter, "↵")
+                };
+                groups.push((
+                    0,
+                    None,
+                    vec![Span::styled(
+                        taker.label(),
+                        Style::default().fg(theme.text).bold(),
+                    )],
+                ));
+                groups.push((0, click, mk(key, "take control")));
+                click
+            });
             if let Some(enter_action_text) = enter_action_text {
                 // U+21B5 keeps Enter to one display cell without shortening its action label.
-                groups.push((0, kenter, mk("↵", enter_action_text)));
+                if live_key != Some(kenter) {
+                    groups.push((0, kenter, mk("↵", enter_action_text)));
+                }
             }
             if let Some(tab_action_text) = tab_action_text {
-                groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                if live_key != Some(ktab) {
+                    groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                }
             }
 
             let (click, key) = bound(ActionId::ToggleView);
