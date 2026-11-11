@@ -675,7 +675,7 @@ mod tests {
                     let initial = connection.send_request(NewSessionRequest::new(cwd.path().to_path_buf()))
                         .block_task().await?;
                     let old = initial.session_id;
-                    assert_eq!(old.0, "s-fence-reset");
+                    assert_eq!(old.0.as_ref(), "s-fence-reset");
                     shared.commit_session(old.clone()).await?;
                     assert!(matches!(event_rx.recv().await,
                         Some(Event::AcpSessionAssigned { acp_session_id }) if acp_session_id == "s-fence-reset"));

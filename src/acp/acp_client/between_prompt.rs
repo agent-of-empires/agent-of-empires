@@ -566,7 +566,7 @@ mod tests {
                 &claim
             ));
             assert_eq!(
-                tracker.take_idle_fire(10_000_000),
+                tracker.take_idle_fire(10_000_000, false),
                 None,
                 "an already-failed operation cannot gain another synthetic terminal"
             );

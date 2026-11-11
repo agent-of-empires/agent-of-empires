@@ -1528,11 +1528,9 @@ mod tests {
             )
             .await
         });
-        let (event_tx, _) = mpsc::channel::<Event>(1);
         let error = connect(
             &control,
             "old",
-            event_tx,
             Arc::new(TerminalClaim::new()),
             false,
         )
