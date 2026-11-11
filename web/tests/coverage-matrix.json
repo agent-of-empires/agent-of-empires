@@ -4116,7 +4116,7 @@
       "risk": "medium",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "Terminal UI sizing controls expose bounds and global scope and save sparse numeric patches."
+      "notes": "Terminal UI sizing controls, labelled Paired terminal share of the split (%), Split only when at least this wide and Split only when at least this tall, expose bounds and global scope and save sparse numeric patches."
     },
     {
       "id": "story.settings-tmux-select",
