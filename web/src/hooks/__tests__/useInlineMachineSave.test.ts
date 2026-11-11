@@ -117,3 +117,44 @@ it("a request cancelled while elevating never retries its write", async () => {
   });
   expect(bodies).toEqual([{ worktree: { enabled: true } }, { sandbox: { enabled_by_default: true } }]);
 });
+
+it("an older write's late 403 doesn't replace the newer write's prompt", async () => {
+  const committed: unknown[] = [];
+  let releaseOlder: (() => void) | undefined;
+  let elevated = false;
+  server.use(
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = (await request.json()) as { sandbox: { container_runtime: string } };
+      if (elevated) {
+        committed.push(body);
+        return new HttpResponse(null, { status: 204 });
+      }
+      if (body.sandbox.container_runtime === "docker") await new Promise<void>((r) => (releaseOlder = r));
+      return HttpResponse.json({ error: "elevation_required" }, { status: 403 });
+    }),
+    http.post("*/api/login/elevate", () => {
+      elevated = true;
+      return HttpResponse.json({ elevated_until_secs: 900 });
+    }),
+  );
+  const { result } = renderHook(() => useInlineMachineSave());
+  let older: Promise<boolean> | undefined;
+  let newer: Promise<boolean> | undefined;
+  act(() => {
+    older = result.current.save({ sandbox: { container_runtime: "docker" } });
+  });
+  await waitFor(() => expect(releaseOlder).toBeDefined());
+  act(() => {
+    newer = result.current.save({ sandbox: { container_runtime: "podman" } });
+  });
+  await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  const prompt = result.current.elevation;
+
+  releaseOlder!();
+  expect(await older).toBe(false);
+  expect(result.current.elevation).toBe(prompt);
+
+  await act(async () => void (await prompt!.submit("right")));
+  expect(await newer).toBe(true);
+  expect(committed).toEqual([{ sandbox: { container_runtime: "podman" } }]);
+});

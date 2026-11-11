@@ -10,12 +10,16 @@ export interface ElevationRequest {
 export function useInlineMachineSave() {
   const [elevation, setElevation] = useState<ElevationRequest | null>(null);
   const pending = useRef<ElevationRequest | null>(null);
+  const latest = useRef(0);
   useEffect(() => () => pending.current?.cancel(), []);
 
   const save = useCallback(async (updates: Record<string, unknown>): Promise<boolean> => {
+    const id = ++latest.current;
     const outcome = await updateMachineSettingsInline(updates);
     // `uncertain` isn't success: the caller can't know the value it shows was saved.
     if (outcome !== "elevation_required") return outcome === "committed";
+    // A newer write started first owns the prompt; this late 403 must not replace it.
+    if (id !== latest.current) return false;
     // A newer write cancels the pending one, so every save promise settles.
     pending.current?.cancel();
     return new Promise<boolean>((resolve) => {
