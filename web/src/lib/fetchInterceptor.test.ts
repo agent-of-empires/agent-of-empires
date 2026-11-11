@@ -187,6 +187,29 @@ describe("installFetchErrorToasts", () => {
     expect(saveToken).toHaveBeenCalledWith("rotated");
   });
 
+  it.each<[string, string | null, string | null, Response, boolean]>([
+    ["the token the request carried", "t1", "t1", json(200, {}, { "x-aoe-token": "t2" }), true],
+    ["no token on a cookie-bound device", null, null, json(200, {}, { "x-aoe-token": "t2" }), true],
+    ["a token saved while the request was in flight", "t1", "t3", json(200, {}, { "x-aoe-token": "t2" }), false],
+    [
+      "a token Connect saved before a login 401 landed",
+      "old",
+      "new",
+      json(401, { error: "unauthorized" }, { "x-aoe-token": "old" }),
+      false,
+    ],
+  ])("a rotated X-Aoe-Token, with %s stored", async (_name, sentWith, current, response, adopted) => {
+    storedToken = sentWith;
+    await install();
+    let answer!: (res: Response) => void;
+    original.mockReturnValueOnce(new Promise<Response>((resolve) => (answer = resolve)));
+    const inFlight = window.fetch(response.status === 401 ? "/api/login" : "/api/sessions");
+    storedToken = current;
+    answer(response);
+    await inFlight;
+    expect(saveToken).toHaveBeenCalledTimes(adopted ? 1 : 0);
+  });
+
   describe("auth failures", () => {
     it("a generic 401 clears the token and fires one deduped event until re-armed", async () => {
       await install();

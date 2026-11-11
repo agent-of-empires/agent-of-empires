@@ -65,7 +65,7 @@ export function installFetchErrorToasts(): void {
     const isApi = path.startsWith("/api/");
     const sameOrigin = isSameOrigin(rawUrl);
 
-    // A 401 rejects the token the request carried, not one saved while it was in flight.
+    // A 401 or a rotation answers the token the request carried, not one saved while it was in flight.
     const sentToken = sameOrigin ? getToken() : null;
     // X-Request-Id correlates a devtools entry with the backend `http.request` span.
     let patchedInit = attachAuthHeader(sameOrigin, sentToken, init);
@@ -85,8 +85,10 @@ export function installFetchErrorToasts(): void {
     try {
       const res = await original(input, patchedInit);
       if (sameOrigin) {
+        // The header names the token current when the response was built, so a slow
+        // response must not overwrite one saved since.
         const rotated = res.headers.get("x-aoe-token");
-        if (rotated) saveToken(rotated);
+        if (rotated && getToken() === sentToken) saveToken(rotated);
       }
       if (res.status === 401 && isApi) {
         const authError = await classifyAuthError(res);
