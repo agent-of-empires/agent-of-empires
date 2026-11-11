@@ -555,10 +555,15 @@ pub(crate) struct CreateHookPlan {
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
     /// Repo hooks replace global and profile ones per type, so this is per type too.
     pub(crate) on_create_from_repo: bool,
+    /// The caller chose to create without setup: no `on_create` hook runs.
+    pub(crate) skip_on_create: bool,
 }
 
 impl CreateHookPlan {
     pub(crate) fn on_create(&self) -> &[String] {
+        if self.skip_on_create {
+            return &[];
+        }
         self.hooks
             .as_ref()
             .map_or(&[], |hooks| &hooks.hooks().on_create)
@@ -636,6 +641,7 @@ pub(crate) fn resolve_create_hook_plan(
         hooks,
         trust_write,
         on_create_from_repo,
+        skip_on_create: false,
     })
 }
 
@@ -954,9 +960,10 @@ pub(crate) async fn create_session_with(
         body.base_branch = None;
         body.sandbox = false;
         body.sandbox_image = None;
-        // Hook approval remains operator-owned.
+        // Hook approval and skipping setup remain operator-owned.
         body.trust_hooks = None;
         body.trust_review = None;
+        body.skip_on_create = false;
         // Registry order selects the primary project.
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
@@ -1423,6 +1430,7 @@ pub(crate) async fn create_session_with(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         trust_review: body.trust_review,
+        skip_on_create: body.skip_on_create,
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key.clone(),

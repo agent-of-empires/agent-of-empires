@@ -520,6 +520,7 @@ async fn admit_and_create(
         scratch,
         trust_hooks: None,
         trust_review: None,
+        skip_on_create: false,
         custom_instruction: None,
         // Plugin-created sessions have no request-level dispatcher callback
         // or idempotency key; that surface is REST-only (#3156). Plugin

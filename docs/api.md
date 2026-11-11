@@ -505,6 +505,13 @@ skips untrusted hooks and MCP. Skipping retains global/profile hooks and any
 already-trusted repository surfaces without granting or revoking approval.
 Plugin creation always refuses unapproved repository hooks.
 
+`skip_on_create: true` creates the session without running any `on_create`
+hook, and the response row carries `created_without_setup: true` when there was
+one to skip. The `trust_hooks` decision and the other hook types still apply.
+A failed creation is cached under its key, so resend with a new
+`idempotency_key` to retry or to skip. Plugin and CityHall creations ignore
+`skip_on_create`.
+
 `POST /api/sessions/creation-trust` reviews `{path, profile?, scratch?}` without
 granting trust or provisioning a session. It returns merged and repository-only
 hooks, MCP summaries with environment/header names but not their values,

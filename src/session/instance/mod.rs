@@ -649,6 +649,9 @@ pub struct Instance {
     /// See `src/session/scratch.rs`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scratch: bool,
+    /// Created with its `on_create` hooks skipped (`skip_on_create`), so their setup never ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_without_setup: bool,
 
     // Git worktree integration
     #[serde(default, skip_serializing_if = "Option::is_none")]

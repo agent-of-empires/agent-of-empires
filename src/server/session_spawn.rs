@@ -35,6 +35,8 @@ pub(crate) struct StructuredSessionSpec {
     pub scratch: bool,
     pub trust_hooks: Option<bool>,
     pub trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+    /// Create without setup: skip `on_create` and tag the row.
+    pub skip_on_create: bool,
     pub custom_instruction: Option<String>,
     /// External work-queue dispatcher completion callback, persisted onto
     /// the created instance. See #3156.
@@ -149,6 +151,7 @@ pub(crate) async fn spawn_structured_session(
             scratch,
             trust_hooks,
             trust_review,
+            skip_on_create,
             custom_instruction,
             callback_url,
             idempotency_key,
@@ -185,7 +188,7 @@ pub(crate) async fn spawn_structured_session(
 
         // Persist approval against the source repository before provisioning can run Git hooks.
         let original_path = path.clone();
-        let hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
+        let mut hook_plan = crate::server::api::sessions::resolve_create_hook_plan(
             &profile,
             &config.hooks,
             std::path::Path::new(&original_path),
@@ -193,6 +196,8 @@ pub(crate) async fn spawn_structured_session(
             trust_hooks,
             trust_review.as_ref(),
         )?;
+        let created_without_setup = skip_on_create && !hook_plan.on_create().is_empty();
+        hook_plan.skip_on_create = skip_on_create;
         if let Some((hooks_hash, mcp_hash)) = &hook_plan.trust_write {
             crate::session::config::repo_config::trust_repo(
                 std::path::Path::new(&original_path), hooks_hash.as_deref(), mcp_hash.as_deref(),
@@ -304,6 +309,7 @@ pub(crate) async fn spawn_structured_session(
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
+        instance.created_without_setup = created_without_setup;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -1176,6 +1182,7 @@ mod tests {
             scratch: true,
             trust_hooks: None,
             trust_review: None,
+            skip_on_create: false,
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
@@ -1225,11 +1232,13 @@ mod tests {
     async fn sandboxed_cli_create_runs_on_create_and_rolls_back_only_itself() {
         use crate::session::{LifecycleOperation, LifecycleReservationError, Storage};
         use std::os::unix::fs::PermissionsExt;
-        for (label, hook) in [
-            ("no hook", None),
-            ("hook", Some("echo created")),
-            ("slow hook", Some("echo slow")),
-            ("failing hook", Some("exit 7")),
+        for (label, hook, skip) in [
+            ("no hook", None, false),
+            ("hook", Some("echo created"), false),
+            ("slow hook", Some("echo slow"), false),
+            ("failing hook", Some("exit 7"), false),
+            ("failing hook created without setup", Some("exit 7"), true),
+            ("no hook created without setup", None, true),
         ] {
             let root = tempfile::tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
@@ -1332,6 +1341,7 @@ mod tests {
                 scratch: false,
                 trust_hooks: None,
                 trust_review: None,
+                skip_on_create: skip,
                 custom_instruction: None,
                 callback_url: None,
                 idempotency_key: Some("create-key".into()),
@@ -1421,10 +1431,16 @@ mod tests {
                 assert_eq!(created.status, crate::session::Status::Stopped, "{label}");
                 assert!(created.lifecycle_reservation.is_none(), "{label}");
                 assert!(branch.is_ok(), "{label}");
+                let ran = hook.is_some_and(|hook| {
+                    log.lines()
+                        .any(|line| line.contains(&format!("bash -c {hook}")))
+                });
+                assert_eq!(ran, hook.is_some() && !skip, "{label}: {log}");
+                // A skip with nothing to skip leaves no setup missing.
                 assert_eq!(
-                    log.lines().any(|line| line.contains("bash -c echo")),
-                    hook.is_some(),
-                    "{label}: {log}"
+                    created.created_without_setup,
+                    skip && hook.is_some(),
+                    "{label}"
                 );
             }
         }
