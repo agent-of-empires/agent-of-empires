@@ -1639,11 +1639,11 @@ mod tests {
         use crate::acp::supervisor::BroadcastSink;
         let _home = crate::session::test_support::isolate_app_dir();
         let (deps, state, _dir, _cmds) = foreign_live_session("sess-msg-busy").await;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         assert!(sink.publish_persisted(
             "sess-msg-busy",
             1,
@@ -1988,11 +1988,11 @@ mod tests {
             .acp_supervisor
             .test_insert_worker("sess-3685")
             .await;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         let ctx = ctx_with(&["session.prompt"]);
 
         let mut seq = 0;
