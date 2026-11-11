@@ -956,7 +956,7 @@ impl PluginJobRegistry {
                     PluginJobStatus::Succeeded
                 }
                 Err(e) => {
-                    let error = format!("{e:#}");
+                    let error = crate::logging::redact(&format!("{e:#}"));
                     tracing::warn!(target: "plugin.install", job_id = %id, kind = ?job.kind, target = %job.target, duration_ms, %error, "plugin job finished");
                     PluginJobStatus::Failed { error }
                 }
@@ -1161,7 +1161,7 @@ pub async fn plugin_job_status(
             log: PluginJobLog {
                 path,
                 exists,
-                tail: lines.join("\n"),
+                tail: crate::logging::redact(&lines.join("\n")),
                 lines_returned: lines.len(),
                 truncated,
             },
@@ -1572,16 +1572,24 @@ while not (p/'finish').exists():
                     panic!("job requires a real log file")
                 };
                 writeln!(file, "early diagnostic sentinel")?;
+                writeln!(file, "cloning https://user:hunter2@example.com/acme failed")?;
                 for line in 0..250 {
                     writeln!(file, "later build output {line}")?;
                 }
-                std::fs::metadata(crate::session::get_app_dir()?.join("absent-build-input"))?;
-                Ok(())
+                writeln!(file, "build failed: token=hunter2")?;
+                anyhow::bail!(
+                    "git clone failed: authentication token=hunter2 rejected by https://user:hunter2@example.com/acme"
+                );
             },
         )
         .await;
         let job = finish(&state, response).await;
-        assert!(matches!(job.status, PluginJobStatus::Failed { .. }));
+        let PluginJobStatus::Failed { error } = &job.status else {
+            panic!("job must fail: {:?}", job.status);
+        };
+        assert!(!error.contains("hunter2"), "{error}");
+        assert!(error.contains("[REDACTED]"), "{error}");
+        assert!(error.contains("git clone failed"), "{error}");
         let response: PluginJobResponse = decode(
             plugin_job_status(
                 State(state.clone()),
@@ -1593,9 +1601,15 @@ while not (p/'finish').exists():
         .await;
         assert!(!response.log.tail.contains("early diagnostic sentinel"));
         assert!(response.log.tail.contains("later build output 249"));
-        assert!(std::fs::read_to_string(&response.log.path)
-            .unwrap()
-            .contains("early diagnostic sentinel"));
+        assert!(
+            !response.log.tail.contains("hunter2"),
+            "{}",
+            response.log.tail
+        );
+        assert!(response.log.tail.contains("[REDACTED]"));
+        let raw = std::fs::read_to_string(&response.log.path).unwrap();
+        assert!(raw.contains("early diagnostic sentinel"));
+        assert!(raw.contains("hunter2"));
     }
 
     #[cfg(unix)]
