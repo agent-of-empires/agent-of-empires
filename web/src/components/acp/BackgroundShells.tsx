@@ -59,7 +59,9 @@ function ShellGroup({
             className={`h-2 w-2 shrink-0 rounded-full ${s.finished ? "bg-text-dim/60" : "bg-status-waiting animate-pulse"}`}
           />
           <Terminal className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{s.command || "(command unavailable)"}</span>
+          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">
+            {s.command || "(command unavailable)"}
+          </span>
           <span className="shrink-0 text-[11px] text-text-dim">{s.finished ? "done" : "running"}</span>
           <Maximize2 className="h-3.5 w-3.5 shrink-0 text-text-dim" />
         </button>
