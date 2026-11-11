@@ -1569,7 +1569,9 @@ mod tests {
                  item_json TEXT NOT NULL, revision INTEGER NOT NULL,
                  PRIMARY KEY (profile, provider_id, item_id)
              );
-             CREATE TABLE suggestion_policy (profile TEXT PRIMARY KEY);",
+             CREATE TABLE suggestion_policy (profile TEXT PRIMARY KEY);
+             CREATE TABLE suggestion_schema (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+             INSERT INTO suggestion_schema VALUES (1, 0);",
         )
         .unwrap();
         init(&conn).unwrap();
