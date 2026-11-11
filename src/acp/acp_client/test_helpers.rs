@@ -148,6 +148,7 @@ impl super::AcpClient {
             install_binary: "test-agent-acp".into(),
             source_profile: Some(row.source_profile.clone()),
             default_effort: None,
+            default_model_config: Default::default(),
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),

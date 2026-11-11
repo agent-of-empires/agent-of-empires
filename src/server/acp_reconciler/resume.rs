@@ -1211,7 +1211,7 @@ mod tests {
         let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
 
         state.acp_event_store.test_set_unavailable(true);
-        let deferred = trigger_resume_background(&state.session_service, id, authority).await;
+        let deferred = trigger_resume_background(&state.session_service, id, authority, None).await;
         assert!(matches!(
             deferred,
             Err(SupervisorError::EventStoreUnavailable(_))
@@ -1222,7 +1222,7 @@ mod tests {
         );
 
         state.acp_event_store.test_set_unavailable(false);
-        let trigger = trigger_resume_background(&state.session_service, id, authority)
+        let trigger = trigger_resume_background(&state.session_service, id, authority, None)
             .await
             .expect("the retry is admitted");
         assert!(matches!(trigger, ResumeTrigger::Started));
