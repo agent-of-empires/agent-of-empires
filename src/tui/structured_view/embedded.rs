@@ -1701,6 +1701,7 @@ mod retained_tests {
             )
             .unwrap();
         assert!(refresh(&mut view).await);
+        assert!(view.message.contains("incomplete"));
         let previous_reads = full_reads.load(Ordering::SeqCst);
         for unrelated_write in [false, true] {
             if unrelated_write {

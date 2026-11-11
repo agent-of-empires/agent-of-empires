@@ -865,6 +865,7 @@ async fn persist_agent_switch(
             instance.acp_session_id = None;
             instance.import_pending = None;
             instance.acp_effort = None;
+            instance.acp_model_config.clear();
             instance.agent_model = model.clone();
             instance.terminal_rebind_pending = true;
             Ok(())
@@ -971,6 +972,7 @@ pub async fn switch_acp_agent(
         model: model.clone(),
         effort: None,
         effort_explicit: false,
+        model_config: Default::default(),
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
@@ -3308,6 +3310,7 @@ mod tests {
             if code == "turn_active" {
                 state.acp_supervisor.test_insert_worker(&id).await;
                 let prompt = crate::acp::state::Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     prompt_id: None,
                     text: "still working".to_string(),
                     attachments: Vec::new(),
@@ -3558,6 +3561,7 @@ mod tests {
 
         let resets_at = Utc::now() - chrono::Duration::minutes(30);
         let prompt = || crate::acp::Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "continue the interrupted work".into(),
             attachments: Vec::new(),
             prompt_id: None,

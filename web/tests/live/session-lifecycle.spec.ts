@@ -118,7 +118,7 @@ test.describe("ensure_session restart flow", () => {
 
 test("SIGTERM surfaces the alert; restart() clears it and flashes reconnected", async ({ serve, page }) => {
   // Filter by text: an unrelated dnd-kit live region is also role=status.
-  const alertBanner = page.getByRole("alert").filter({ hasText: /server unreachable/i });
+  const alertBanner = page.getByRole("alert").filter({ hasText: /daemon unreachable/i });
   const reconnectedBanner = page.getByRole("status").filter({ hasText: /reconnected/i });
   await page.goto(serve.baseUrl, { waitUntil: "domcontentloaded" });
   // The first successful sessions poll must land before the kill, or "Reconnected" fires early.

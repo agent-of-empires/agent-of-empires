@@ -333,9 +333,10 @@ pub(super) fn map_update_to_events(
             }
             other => vec![raw_event(&other)],
         },
-        // Import replay only (#2276); `Shared` drops live echoes, which duplicate UserPromptSent.
+        // Import replay (#2276) and Remote Control messages typed outside AoE; `Shared` drops echoes of AoE prompts.
         SessionUpdate::UserMessageChunk(chunk) => match chunk.content {
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: text.text,
                 attachments: Vec::new(),
                 prompt_id: None,
@@ -621,10 +622,17 @@ pub(super) fn map_update_to_events(
             let commands: Vec<AvailableCommand> = u
                 .available_commands
                 .into_iter()
-                .map(|c| AvailableCommand {
-                    name: c.name,
-                    description: c.description,
-                    accepts_input: matches!(c.input, Some(AvailableCommandInput::Unstructured(_))),
+                .map(|c| {
+                    let hint = match c.input {
+                        Some(AvailableCommandInput::Unstructured(u)) => Some(u.hint),
+                        _ => None,
+                    };
+                    AvailableCommand {
+                        name: c.name,
+                        description: c.description,
+                        accepts_input: hint.is_some(),
+                        input_hint: hint.map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()),
+                    }
                 })
                 .collect();
             debug!(
@@ -1327,6 +1335,54 @@ mod tests {
                 "{status:?} {events:?}"
             );
         }
+    }
+
+    /// A replayed `Monitor` or background-command launch re-arms nothing: it
+    /// would read as a live watch after every respawn.
+    #[test]
+    fn load_replay_drops_a_monitor_arm() {
+        let armed = Event::MonitorArmed { description: None };
+        assert!(
+            is_transcript_event(&armed),
+            "{}",
+            transcript_event_kind(&armed)
+        );
+    }
+
+    #[test]
+    fn available_commands_keep_input_hint() {
+        use agent_client_protocol::v1::schema::{
+            AvailableCommand as Wire, AvailableCommandInput, AvailableCommandsUpdate,
+            UnstructuredCommandInput,
+        };
+        let input = |hint: &str| {
+            Some(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new(hint),
+            ))
+        };
+        let mut mcp = Wire::new("mcp", "MCP servers");
+        mcp.input = input(" [reconnect|enable|disable] ");
+        let mut blank = Wire::new("blank", "");
+        blank.input = input("  ");
+        let plain = Wire::new("help", "");
+        let events = claude(SessionUpdate::AvailableCommandsUpdate(
+            AvailableCommandsUpdate::new(vec![mcp, blank, plain]),
+        ));
+        let [Event::AvailableCommandsUpdated { commands }] = events.as_slice() else {
+            panic!("expected AvailableCommandsUpdated, got {events:?}");
+        };
+        let got: Vec<_> = commands
+            .iter()
+            .map(|c| (c.accepts_input, c.input_hint.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (true, Some("[reconnect|enable|disable]")),
+                (true, None),
+                (false, None)
+            ]
+        );
     }
 
     #[test]

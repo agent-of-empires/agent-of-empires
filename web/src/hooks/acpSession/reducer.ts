@@ -108,12 +108,39 @@ function pruneOptimisticRows(state: AcpState): AcpState {
   return { ...state, optimisticRows: kept };
 }
 
+// A server prompt row proves the daemon has the prompt, so its own and merged ids stop being pending
+// even when the live event that would have settled them was missed.
+function settleServerPrompts(state: AcpState, rows: readonly ActivityRow[]): AcpState {
+  if (state.optimisticRows.length === 0 && state.inflightPromptIds.length === 0) return state;
+  const serverIds = new Set(
+    rows.flatMap((r) => (r.kind === "user_prompt" ? [r.id, ...(r.mergedPromptIds ?? [])] : [])),
+  );
+  return retireQueuedOptimistics(state, serverIds);
+}
+
 function withServerRows(state: AcpState, activity: ActivityRow[]): AcpState {
-  return pruneOptimisticRows({ ...state, activity });
+  return settleServerPrompts(pruneOptimisticRows({ ...state, activity }), activity);
 }
 
 function mapQueued(state: AcpState, id: string, update: (q: QueuedPrompt) => QueuedPrompt): AcpState {
   return { ...state, queuedPrompts: state.queuedPrompts.map((q) => (q.id === id ? update(q) : q)) };
+}
+
+// The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
+function rollbackOptimisticPrompt(state: AcpState, id: string): AcpState {
+  const idx = state.optimisticRows.findIndex((r) => r.id === id);
+  if (idx === -1) return settleInflightPrompt(state, id);
+  const optimisticRows = state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1));
+  return settleInflightPrompt({ ...state, optimisticRows }, id);
+}
+
+// A queue row proves the daemon accepted the prompt even when the POST response never reached this tab.
+// Absence proves nothing (it may have been dispatched), so rows are only ever retired on a match.
+function retireQueuedOptimistics(state: AcpState, serverIds: ReadonlySet<string>): AcpState {
+  const queued = state.inflightPromptIds
+    .concat(state.optimisticRows.map((r) => r.id))
+    .filter((id) => serverIds.has(id));
+  return queued.reduce(rollbackOptimisticPrompt, state);
 }
 
 // Keeps local attachment bytes for rows queued here, builds metadata-only views for the rest,
@@ -137,7 +164,7 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
     };
   });
   const stillPending = state.queuedPrompts.filter((q) => q.pending && !serverIds.has(q.id));
-  return { ...state, queuedPrompts: merged.concat(stillPending) };
+  return retireQueuedOptimistics({ ...state, queuedPrompts: merged.concat(stillPending) }, serverIds);
 }
 
 export function reducer(state: AcpState, action: Action): AcpState {
@@ -159,7 +186,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       const next = { ...state, oldestSeq: action.oldestSeq };
       if (action.rows.length === 0) return next;
       next.activity = mergePrependedActivity(action.rows, state.activity);
-      return next;
+      return settleServerPrompts(next, action.rows);
     }
     case "transcript_snapshot":
       if (action.rows.length === 0) return state;
@@ -252,14 +279,17 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return settleInflightPrompt({ ...state, inFlightTool: null }, action.id);
     case "settle_inflight_prompt":
       return settleInflightPrompt(state, action.id);
-    case "rollback_optimistic_prompt": {
-      // The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
-      const idx = state.optimisticRows.findIndex((r) => r.id === action.id);
-      if (idx === -1) return settleInflightPrompt(state, action.id);
-      const optimisticRows = state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1));
-      return settleInflightPrompt({ ...state, optimisticRows }, action.id);
-    }
+    case "rollback_optimistic_prompt":
+      return rollbackOptimisticPrompt(state, action.id);
     case "enqueue_prompt": {
+      // A late POST response can land after hydration already added the row: keep its server text and
+      // order, but restore the local bytes hydration could only see as metadata.
+      if (state.queuedPrompts.some((q) => q.id === action.id)) {
+        const attachments = action.attachments;
+        return attachments && attachments.length > 0
+          ? mapQueued(state, action.id, (q) => ({ ...q, attachments }))
+          : state;
+      }
       const entry: QueuedPrompt = {
         id: action.id,
         text: action.text,
