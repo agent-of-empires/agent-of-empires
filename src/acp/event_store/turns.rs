@@ -807,6 +807,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = Event::BackgroundTaskFinished {
             task_id: "t".into(),
