@@ -152,6 +152,9 @@ Non-ACP tools always run in the terminal view.
 
 See the [local Daemon workflow](quick-start.md#launch-the-tui) for startup, shutdown, and recovery. Structured sidebar statuses arrive through the runtime WebSocket. Reconnecting restores live state.
 
+In the native TUI, wrapping and copying keep Unicode grapheme clusters intact
+across ANSI style changes. A cluster uses its first code point's style.
+
 ### Inspecting Trash in the TUI
 
 Select a session in the expanded **Trash** section to read its retained ACP
@@ -223,7 +226,7 @@ mode = "plan"             # default mode, applied when the agent advertises one
 "anthropic/opus" = "low"
 ```
 
-`model` applies at worker start. `effort` and `mode` use advertised ACP config options and are skipped with a warning when unsupported. A matching `effort_by_model` entry overrides flat `effort`. Web **Structured View Defaults** exposes the same values from each agent's last advertised choices.
+`model` applies at worker start. `effort` and `mode` use advertised ACP config options and are skipped with a warning when unsupported. A matching `effort_by_model` entry overrides flat `effort`. Web **Agent defaults** exposes the same values from each agent's last advertised choices.
 
 The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
 

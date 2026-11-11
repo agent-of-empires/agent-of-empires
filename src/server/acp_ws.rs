@@ -1170,11 +1170,11 @@ mod tests {
 
         // Publish through the real choke point rather than writing straight to the store.
         use crate::acp::supervisor::BroadcastSink;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         let record = |seq: u64, event: Event| {
             assert!(
                 sink.publish_persisted("s-fold", seq, &event),

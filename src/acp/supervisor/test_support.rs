@@ -276,11 +276,11 @@ pub(super) fn channel_sink() -> (
     let tmp = tempfile::TempDir::new().unwrap();
     let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
     let (tx, rx) = broadcast::channel(16);
-    let sink = Arc::new(ChannelSink {
+    let sink = Arc::new(ChannelSink::new(
         tx,
-        event_store: event_store.clone(),
-        control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    });
+        event_store.clone(),
+        Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+    ));
     (sink, event_store, rx, tmp)
 }
 
@@ -609,6 +609,7 @@ pub(crate) struct HeldAttachRunner {
     entered: Option<tokio::sync::oneshot::Receiver<()>>,
     disconnected: Option<tokio::sync::oneshot::Receiver<()>>,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
+    trailer: Arc<std::sync::atomic::AtomicBool>,
     peer: tokio::task::JoinHandle<()>,
     child: std::process::Child,
     _socket_dir: tempfile::TempDir,
@@ -658,6 +659,8 @@ impl HeldAttachRunner {
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
         let (completion, completion_rx) = tokio::sync::oneshot::channel();
+        let trailer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let peer_trailer = trailer.clone();
         let id = session_id.to_owned();
         let peer = tokio::spawn(async move {
             let mut entered_tx = Some(entered_tx);
@@ -748,6 +751,26 @@ impl HeldAttachRunner {
                             )
                             .await
                             .unwrap();
+                            if peer_trailer.load(std::sync::atomic::Ordering::SeqCst) {
+                                control_protocol::write_frame(
+                                    &mut stream,
+                                    &ControlBody::Notify {
+                                        method: "session/update".into(),
+                                        params: serde_json::json!({
+                                            "sessionId": native_id,
+                                            "update": {
+                                                "sessionUpdate": "agent_message_chunk",
+                                                "content": {
+                                                    "type": "text",
+                                                    "text": "after the retained completion"
+                                                }
+                                            }
+                                        }),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                            }
                         }
                         frame => panic!("unexpected attach request: {frame:?}"),
                     }
@@ -760,10 +783,19 @@ impl HeldAttachRunner {
             entered: Some(entered),
             disconnected: Some(disconnected),
             completion: Some(completion),
+            trailer,
             peer,
             child,
             _socket_dir: socket_dir,
         }
+    }
+
+    /// Sends one more chunk after the completion, so a test can wait on the frames
+    /// being processed in order before asserting that the completion did nothing.
+    pub(crate) fn with_trailing_chunk(self) -> Self {
+        self.trailer
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self
     }
 
     pub(crate) async fn entered(&mut self) {

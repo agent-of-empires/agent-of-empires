@@ -317,7 +317,7 @@ describe("StartupErrorScreen", () => {
     expect(queryByTestId("startup-error-install-command")?.textContent ?? null).toBe(c.command);
     if (c.locked) {
       expect(getByTestId("startup-error-step-1").textContent).toContain(
-        'Turn on TUI › Settings › Global › Acp › Advanced › "Allow agent install from web". The install runs npm install as the Daemon\'s user.',
+        'Turn on TUI › Settings › Global › Acp › Advanced › "Let the Web dashboard install Agents". The install runs npm install as the Daemon\'s user.',
       );
     }
     if (c.text) expect(screen.textContent).toContain(c.text);

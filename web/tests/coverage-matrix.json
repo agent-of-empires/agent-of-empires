@@ -151,8 +151,17 @@
       "id": "app-shell.dashboard-update-banner",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
-      "components": ["web/src/components/DashboardUpdateBanner.tsx", "web/src/hooks/useDashboardUpdate.ts"]
+      "specs": [
+        "src/components/__tests__/DashboardUpdateBanner.test.tsx",
+        "src/lib/webBuildId.test.ts",
+        "src/components/__tests__/BannerStack.test.tsx"
+      ],
+      "components": [
+        "web/src/components/DashboardUpdateBanner.tsx",
+        "web/src/hooks/useDashboardUpdate.ts",
+        "web/src/components/BannerStack.tsx"
+      ],
+      "notes": "Names the version the Daemon now serves (\"Dashboard updated to v1.22.1.\"), from the same /api/about answer that showed the bundle changed (#5514)."
     },
     {
       "id": "app-shell.loading-skeleton",
@@ -1508,6 +1517,14 @@
       ]
     },
     {
+      "id": "acp.explicit-start-after-stop",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-worker-api.spec.ts"],
+      "components": ["src/server/api/sessions/lifecycle.rs", "src/server/acp_reconciler/mod.rs"],
+      "notes": "Explicit start after a daemon restart resumes a deliberately stopped structured worker without a queued prompt."
+    },
+    {
       "id": "acp.custom-agent-acp-capable",
       "kind": "live-playwright",
       "risk": "high",
@@ -2419,6 +2436,25 @@
       ]
     },
     {
+      "id": "sidebar.status-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/lib/sidebarGroups.ts"]
+    },
+    {
+      "id": "sidebar.status-axis-live",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-grouping.spec.ts"],
+      "components": [
+        "web/src/components/SidebarAxisPicker.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useStatusGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",
@@ -3010,7 +3046,7 @@
       "risk": "medium",
       "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
       "components": ["web/src/components/UpdateBanner.tsx"],
-      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control."
+      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control. #5514: each install method's lines are pinned in UpdateBanner.test.tsx (an unknown install reads \"Run aoe update on the machine running AoE.\"; a release install has no second line). The mocked spec checks the layout: at 1280px the dot and lines form one centered block, line two starts under line one, and the dot and × share line one's center, × pinned right; at 375px the lines stack left-aligned with × at the top right and nothing scrolls sideways."
     },
     {
       "id": "connectivity.banner-stack",
@@ -3184,8 +3220,9 @@
       "id": "acp.approval-resolve-clear",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/acpSession/reducer.test.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/hooks/acpSession/reducer.test.ts", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts"],
+      "notes": "A failed approval POST records the error and rejects so the card can retry; a 404 for an approval already resolved counts as resolved."
     },
     {
       "id": "acp.attention-chime",
@@ -3625,14 +3662,24 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
-      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
+      "notes": "Destructive holds run by mouse, touch, or Space/Enter held 800ms; release, button blur, window blur, and page hiding cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every decision. Card and modal order decisions Allow, Always, Deny."
+    },
+    {
+      "id": "acp.approval-hold-browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-approval-hold.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"],
+      "notes": "In Chromium, a completed Space/Enter hold submits once and its release adds nothing; release, Tab, window blur, or page hiding before 800ms submits nothing."
     },
     {
       "id": "acp.plan-modal",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-plan-modal.spec.ts"],
-      "components": ["web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/PlanModal.tsx", "web/src/components/Dialog.tsx"],
+      "notes": "On a short 390px screen an answer list wraps inside a bounded, scrollable footer; every action stays inside the panel and Dismiss is reachable by scrolling."
     },
     {
       "id": "acp.markdown",
@@ -3803,7 +3850,8 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"],
+      "notes": "The existing five mobile stories preserve reader escape, streaming follow, reload and collapse behavior. Composer growth waits for its real final textarea and grid heights, observes the pin beyond the chrome-follow window and captures the grown pinned surface. Hook consumers distinguish a coarse viewport resize from an actual reader gesture while retaining the unchanged coarse fold-movement contract."
     },
     {
       "id": "acp.tool-stopped-sweep",
@@ -4077,7 +4125,7 @@
       "risk": "medium",
       "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "Terminal UI sizing controls expose bounds and global scope and save sparse numeric patches."
+      "notes": "Terminal UI sizing controls, labelled Paired terminal share of the split (%), Split only when at least this wide and Split only when at least this tall, expose bounds and global scope and save sparse numeric patches."
     },
     {
       "id": "story.settings-tmux-select",
@@ -5167,9 +5215,14 @@
       "specs": [
         "src/lib/__tests__/sidebarSelection.test.ts",
         "src/lib/__tests__/sidebarOptimistic.test.ts",
-        "src/lib/__tests__/sidebarBulk.test.ts"
+        "src/lib/__tests__/sidebarBulk.test.ts",
+        "src/hooks/useSidebarTriage.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/sidebarBulk.ts"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/sidebarBulk.ts",
+        "web/src/hooks/useSidebarTriage.ts"
+      ]
     },
     {
       "id": "sidebar.multi-select-gestures",
