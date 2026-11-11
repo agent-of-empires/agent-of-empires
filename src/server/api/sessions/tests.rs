@@ -11309,15 +11309,14 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         ("with-prompt", axum::http::HeaderMap::new()),
         ("with-prompt-tui", tui),
     ] {
-        let (status, bytes) = post_create_bytes_with(
-            &state,
-            headers,
-            serde_json::json!({
-                "title": title, "path": "", "tool": "claude",
-                "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
-            }),
-        )
-        .await;
+        let mut body = serde_json::json!({
+            "title": title, "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
+        });
+        if title == "with-prompt" {
+            body["suggestion"] = serde_json::json!({ "provider_id": "acme.github", "id": "42" });
+        }
+        let (status, bytes) = post_create_bytes_with(&state, headers, body).await;
         assert_eq!(status, axum::http::StatusCode::CREATED, "{bytes:?}");
     }
     let instances = state.instances.read().await;
@@ -11336,6 +11335,42 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         origin_of("with-prompt-tui"),
         crate::daemon::PromptOrigin::Tui
     );
+    let linked = instances.iter().find(|i| i.title == "with-prompt").unwrap();
+    let origin = linked.suggestion.as_ref().expect("linked");
+    assert_eq!(
+        (origin.provider_id.as_str(), origin.id.as_str()),
+        ("acme.github", "42")
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_a_blank_or_oversized_suggestion_reference() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let state = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    for suggestion in [
+        serde_json::json!({ "provider_id": " ", "id": "42" }),
+        serde_json::json!({ "provider_id": "acme.github", "id": "x".repeat(257) }),
+    ] {
+        let (status, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "bad-ref", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured", "suggestion": suggestion,
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "validation_failed");
+    }
+    assert!(state.instances.read().await.is_empty());
 }
 
 #[tokio::test]

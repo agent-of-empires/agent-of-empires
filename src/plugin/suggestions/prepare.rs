@@ -11,7 +11,7 @@ pub(crate) enum PrepareRefusal {
     Stale,
 }
 
-/// An expanded prompt would exceed [`MAX_PROMPT_BYTES`].
+/// An expanded prompt would exceed [`MAX_INITIAL_PROMPT_BYTES`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PromptTooLong;
 
@@ -19,10 +19,10 @@ pub(crate) struct PromptTooLong;
 /// right: `{a{pr_number}}` becomes `{a42}`. Anything else, including unknown
 /// names and stray braces, stays as typed, and substituted values are never
 /// scanned again: they are untrusted text. Stops once the output would pass
-/// [`MAX_PROMPT_BYTES`].
+/// [`MAX_INITIAL_PROMPT_BYTES`].
 fn expand(template: &str, variables: &BTreeMap<String, String>) -> Result<String, PromptTooLong> {
     fn push(out: &mut String, text: &str) -> Result<(), PromptTooLong> {
-        if out.len() + text.len() > MAX_PROMPT_BYTES {
+        if out.len() + text.len() > MAX_INITIAL_PROMPT_BYTES {
             return Err(PromptTooLong);
         }
         out.push_str(text);
@@ -352,18 +352,18 @@ mod tests {
     #[test]
     fn expand_stops_at_the_prompt_bound() {
         let vars: BTreeMap<String, String> = [("x".to_string(), "ab".to_string())].into();
-        assert!(expand(&"a".repeat(MAX_PROMPT_BYTES), &vars).is_ok());
+        assert!(expand(&"a".repeat(MAX_INITIAL_PROMPT_BYTES), &vars).is_ok());
         assert_eq!(
-            expand(&"a".repeat(MAX_PROMPT_BYTES + 1), &vars),
+            expand(&"a".repeat(MAX_INITIAL_PROMPT_BYTES + 1), &vars),
             Err(PromptTooLong)
         );
         // Exactly at the bound, then one byte over, through substitution.
-        let at = format!("{}{{x}}", "a".repeat(MAX_PROMPT_BYTES - 2));
-        assert_eq!(expand(&at, &vars).unwrap().len(), MAX_PROMPT_BYTES);
-        let over = format!("{}{{x}}", "a".repeat(MAX_PROMPT_BYTES - 1));
+        let at = format!("{}{{x}}", "a".repeat(MAX_INITIAL_PROMPT_BYTES - 2));
+        assert_eq!(expand(&at, &vars).unwrap().len(), MAX_INITIAL_PROMPT_BYTES);
+        let over = format!("{}{{x}}", "a".repeat(MAX_INITIAL_PROMPT_BYTES - 1));
         assert_eq!(expand(&over, &vars), Err(PromptTooLong));
         // Many braces stay linear and verbatim.
-        let braces = "{".repeat(MAX_PROMPT_BYTES);
+        let braces = "{".repeat(MAX_INITIAL_PROMPT_BYTES);
         assert_eq!(expand(&braces, &vars).unwrap(), braces);
     }
 
@@ -385,8 +385,8 @@ mod tests {
         assert_eq!(templated(None), json!(false));
         assert_eq!(templated(Some("Fix {repo}")), json!(true));
         // 12-byte value, template within the stored bound: expansion is not.
-        let bomb = "{repo}".repeat(MAX_PROMPT_BYTES / "{repo}".len());
-        assert!(bomb.len() <= MAX_PROMPT_BYTES);
+        let bomb = "{repo}".repeat(MAX_INITIAL_PROMPT_BYTES / "{repo}".len());
+        assert!(bomb.len() <= MAX_INITIAL_PROMPT_BYTES);
         assert_eq!(prompt(Some(&bomb)), Err(PrepareRefusal::PromptTooLong));
     }
 
