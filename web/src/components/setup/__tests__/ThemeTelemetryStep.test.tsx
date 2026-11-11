@@ -38,5 +38,38 @@ it("a superseded theme pick neither rolls back the newer pick nor reports an err
   await act(async () => pending.dracula!());
 
   await waitFor(() => expect((screen.getByRole("radio", { name: "nord" }) as HTMLInputElement).checked).toBe(true));
-  expect(screen.queryByText(/Couldn't/)).toBeNull();
+  expect(screen.queryByText(/Could not save theme/)).toBeNull();
+});
+
+it("a late failure from an earlier pick of the same theme doesn't undo the newer one", async () => {
+  const held: (() => void)[] = [];
+  server.use(
+    http.get("*/api/themes", () => HttpResponse.json(["empire", "dracula", "nord"])),
+    http.patch("*/api/theme", async () => {
+      await new Promise<void>((resolve) => held.push(resolve));
+      return HttpResponse.json({ ok: true });
+    }),
+  );
+  render(
+    <ThemeTelemetryStep
+      share={false}
+      onShareChange={() => {}}
+      doNotTrack={false}
+      telemetry="loaded"
+      onRetryTelemetry={() => {}}
+    />,
+  );
+  fireEvent.click(await screen.findByRole("radio", { name: "dracula" }));
+  await waitFor(() => expect(held).toHaveLength(1));
+  fireEvent.click(screen.getByRole("radio", { name: "nord" }));
+  await waitFor(() => expect(held).toHaveLength(2));
+  fireEvent.click(screen.getByRole("radio", { name: "dracula" }));
+  await waitFor(() => expect(held).toHaveLength(3));
+
+  await act(async () => held[2]!());
+  await act(async () => held[1]!());
+  await act(async () => held[0]!());
+
+  await waitFor(() => expect((screen.getByRole("radio", { name: "dracula" }) as HTMLInputElement).checked).toBe(true));
+  expect(screen.queryByText(/Could not save theme/)).toBeNull();
 });
