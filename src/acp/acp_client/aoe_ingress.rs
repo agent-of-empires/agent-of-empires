@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn contract_breaks_end_a_proxied_integration_only() {
         let broken = || frame("t", json!({"v": 1}));
-        // (name, proxied, expected)
+        // (name, proxied)
         for (name, proxied) in [("proxied", true), ("plain agent", false)] {
             let i = ingress(proxied);
             let out = i.ingest(broken(), true, 0, 0);
