@@ -73,3 +73,33 @@ it("a late failure from an earlier pick of the same theme doesn't undo the newer
   await waitFor(() => expect((screen.getByRole("radio", { name: "dracula" }) as HTMLInputElement).checked).toBe(true));
   expect(screen.queryByText(/Could not save theme/)).toBeNull();
 });
+
+it("a failed pick rolls back to the last saved theme, not to an unsaved earlier pick", async () => {
+  document.documentElement.dataset.theme = "empire";
+  let releaseFirst: (() => void) | undefined;
+  server.use(
+    http.get("*/api/themes", () => HttpResponse.json(["empire", "dracula", "nord"])),
+    http.patch("*/api/theme", async ({ request }) => {
+      const { name } = (await request.json()) as { name: string };
+      if (name === "dracula") await new Promise<void>((resolve) => (releaseFirst = resolve));
+      return HttpResponse.json({ error: "invalid" }, { status: 400 });
+    }),
+  );
+  render(
+    <ThemeTelemetryStep
+      share={false}
+      onShareChange={() => {}}
+      doNotTrack={false}
+      telemetry="loaded"
+      onRetryTelemetry={() => {}}
+    />,
+  );
+  fireEvent.click(await screen.findByRole("radio", { name: "dracula" }));
+  await waitFor(() => expect(releaseFirst).toBeDefined());
+  fireEvent.click(screen.getByRole("radio", { name: "nord" }));
+  await screen.findByText(/Could not save theme/);
+  await act(async () => releaseFirst!());
+
+  await waitFor(() => expect((screen.getByRole("radio", { name: "empire" }) as HTMLInputElement).checked).toBe(true));
+  delete document.documentElement.dataset.theme;
+});

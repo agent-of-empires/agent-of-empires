@@ -20,21 +20,21 @@ export function ThemeTelemetryStep({ share, onShareChange, doNotTrack, telemetry
   const [selected, setSelected] = useState(() => document.documentElement.dataset.theme ?? "");
   const [error, setError] = useState<string | null>(null);
   const { select } = useThemeMutation();
-  // A newer pick supersedes an older one, whose failure then means nothing.
-  const latest = useRef(0);
+  // A failed pick rolls back to the last saved theme, unless a newer pick superseded it.
+  const picks = useRef({ id: 0, saved: selected });
 
   useEffect(() => {
     void fetchThemes().then(setThemes);
   }, []);
 
   const pick = async (name: string) => {
-    const previous = selected;
-    const id = ++latest.current;
+    const id = ++picks.current.id;
     setSelected(name);
     setError(null);
     const result = await select(name);
-    if (!result.ok && latest.current === id) {
-      setSelected(previous);
+    if (result.ok) picks.current.saved = name;
+    else if (picks.current.id === id) {
+      setSelected(picks.current.saved);
       setError(result.error);
     }
   };
