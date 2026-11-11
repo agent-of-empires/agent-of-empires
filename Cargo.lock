@@ -305,7 +305,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aoe-plugin-api"
-version = "0.1.0"
+version = "1.22.3"
 dependencies = [
  "semver",
  "serde",
@@ -313,11 +313,12 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "toml",
+ "unicode-general-category",
 ]
 
 [[package]]
 name = "aoe-settings-derive"
-version = "0.1.0"
+version = "1.22.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6360,7 +6361,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "1.22.3"
 dependencies = [
  "agent-of-empires",
  "aoe-plugin-api",

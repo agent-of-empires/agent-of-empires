@@ -287,6 +287,12 @@ impl EventStore {
     }
 
     pub fn has_unresolved_background_tasks(&self, session_id: &str) -> bool {
+        self.try_has_unresolved_background_tasks(session_id)
+            .unwrap_or(false)
+    }
+
+    /// `None` when the query failed.
+    fn try_has_unresolved_background_tasks(&self, session_id: &str) -> Option<bool> {
         logged(
             self.conn()
                 .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)
@@ -294,7 +300,6 @@ impl EventStore {
             "has_unresolved_background_tasks",
             session_id,
         )
-        .unwrap_or(false)
     }
 
     pub fn unresolved_background_task_launches(
@@ -436,7 +441,73 @@ impl EventStore {
         .collect()
     }
 
-    fn latest_prompt_state(&self, session_id: &str) -> Option<bool> {
+    /// Turn output after the latest `Stopped`: a turn the agent started itself
+    /// (a Monitor or background finish woke it), which opens with no
+    /// `UserPromptSent`. The between-prompt watchdog ends such a turn with a
+    /// `Stopped` once it goes quiet.
+    pub(crate) fn has_open_agent_turn(&self, session_id: &str) -> Option<bool> {
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('AgentMessageChunk', 'AgentThoughtChunk', 'ToolCallStarted', 'ThinkingStarted')
+                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                           WHERE session_id = ?1
+                                             AND discriminant = 'Stopped'), 0))",
+                params![session_id],
+                |row| row.get::<_, bool>(0),
+            ),
+            "has_open_agent_turn query",
+            session_id,
+        )
+    }
+
+    /// True while a turn is open: an in-flight prompt, background work, or a turn
+    /// the agent started itself. `None` when a query failed, which callers that
+    /// would stop live work must read as busy.
+    pub fn has_open_turn(&self, session_id: &str) -> Option<bool> {
+        if self.try_in_flight_turn(session_id)? {
+            return Some(true);
+        }
+        self.has_open_agent_turn(session_id)
+    }
+
+    /// True while the agent process holds work a replacement would lose: an open
+    /// turn, or a recent background finish the agent has not yet answered with a
+    /// turn. `None` when a query failed.
+    pub fn holds_live_work(&self, session_id: &str) -> Option<bool> {
+        if self.has_open_turn(session_id)? {
+            return Some(true);
+        }
+        self.has_unhandled_finish(session_id)
+    }
+
+    /// A background task or agent finished after the latest `Stopped`, so the
+    /// agent's follow-up turn is still pending. Old finishes expire so a turn
+    /// that never came cannot hold the runner forever.
+    fn has_unhandled_finish(&self, session_id: &str) -> Option<bool> {
+        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        logged(
+            self.conn().query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND discriminant IN ('BackgroundTaskFinished', 'BackgroundAgentCompleted')
+                       AND created_at >= ?2
+                       AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                           WHERE session_id = ?1
+                                             AND discriminant = 'Stopped'), 0))",
+                params![session_id, stale_cutoff],
+                |row| row.get::<_, bool>(0),
+            ),
+            "has_unhandled_finish query",
+            session_id,
+        )
+    }
+
+    /// `Some(None)` when no prompt exists, `None` when a query failed.
+    fn latest_prompt_state(&self, session_id: &str) -> Option<Option<bool>> {
         let conn = self.conn();
         let prompt_seq = logged(
             conn.query_row(
@@ -449,8 +520,10 @@ impl EventStore {
             ),
             "main_turn_state prompt query",
             session_id,
-        )
-        .flatten()?;
+        )?;
+        let Some(prompt_seq) = prompt_seq else {
+            return Some(None);
+        };
         let terminator = logged(
             conn.query_row(
                 concat!(
@@ -469,7 +542,7 @@ impl EventStore {
             "main_turn_state terminator query",
             session_id,
         )?;
-        Some(terminator.is_none())
+        Some(Some(terminator.is_none()))
     }
 
     /// A native prompt completion may be adopted only for an open main turn.
@@ -501,12 +574,17 @@ impl EventStore {
 
     /// True while a main turn, background task, or recently reporting background agent is open.
     pub fn has_in_flight_turn(&self, session_id: &str) -> bool {
-        if self.has_unresolved_background_tasks(session_id) {
-            return true;
+        self.try_in_flight_turn(session_id).unwrap_or(false)
+    }
+
+    /// [`Self::has_in_flight_turn`], or `None` when any constituent query failed.
+    pub(crate) fn try_in_flight_turn(&self, session_id: &str) -> Option<bool> {
+        if self.try_has_unresolved_background_tasks(session_id)? {
+            return Some(true);
         }
-        match self.latest_prompt_state(session_id) {
-            None => return false,
-            Some(true) => return true,
+        match self.latest_prompt_state(session_id)? {
+            None => return Some(false),
+            Some(true) => return Some(true),
             Some(false) => {}
         }
         let conn = self.conn();
@@ -539,9 +617,8 @@ impl EventStore {
             ),
             "has_in_flight_turn bg-agent query",
             session_id,
-        )
-        .unwrap_or(0);
-        bg_in_flight > 0
+        )?;
+        Some(bg_in_flight > 0)
     }
 
     /// Read the inputs the terminal-repair pass decides on.
@@ -903,6 +980,152 @@ mod tests {
             !store.has_unsuccessful_main_outcome("diagnostic-only"),
             "a diagnostic is not a completed main outcome"
         );
+    }
+
+    #[test]
+    fn a_background_finish_holds_live_work_until_the_agent_answers() {
+        let (_tmp, store) = open_store(1000);
+        let started = Event::BackgroundTaskStarted {
+            task_id: "t".into(),
+            tool_call_id: None,
+            description: "sleep".into(),
+            workflow: None,
+        };
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        // (events, holds live work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    started.clone(),
+                    stopped("prompt_complete"),
+                    finished.clone(),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    started,
+                    stopped("prompt_complete"),
+                    finished,
+                    agent_chunk("done"),
+                    stopped("prompt_complete"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, holds)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(store.holds_live_work(&id), Some(holds), "case {i}");
+        }
+    }
+
+    /// An agent-initiated turn (a Monitor or background finish waking the
+    /// agent) opens with no `UserPromptSent`, so only its own events show it.
+    #[test]
+    fn an_agent_initiated_turn_without_a_stop_is_open_work() {
+        let (_tmp, store) = open_store(1000);
+        let tool_call = || Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                id: "t".into(),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        // (events, open work)
+        let cases = [
+            (vec![user_prompt("go"), stopped("prompt_complete")], false),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("woken"),
+                    tool_call(),
+                ],
+                true,
+            ),
+            // Text thinking is the only output of a thought-only turn.
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    Event::AgentThoughtChunk {
+                        text: "hmm".into(),
+                        message_id: None,
+                    },
+                ],
+                true,
+            ),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("woken"),
+                    tool_call(),
+                    stopped("agent_idle"),
+                ],
+                false,
+            ),
+        ];
+        for (i, (events, open)) in cases.into_iter().enumerate() {
+            let id = format!("s-{i}");
+            record_from(&store, &id, 1, events);
+            assert_eq!(store.holds_live_work(&id), Some(open), "case {i}");
+        }
+    }
+
+    /// A failed query is unknown, never "no live work": every aggregate that
+    /// callers use to protect work reports `None`, and recovers afterwards.
+    #[test]
+    fn a_failed_query_is_unknown_not_idle() {
+        let (_tmp, store) = open_store(1000);
+        record_from(
+            &store,
+            "s",
+            1,
+            vec![user_prompt("go"), stopped("prompt_complete")],
+        );
+        assert_eq!(store.holds_live_work("s"), Some(false));
+
+        store.test_set_unavailable(true);
+        assert_eq!(store.try_in_flight_turn("s"), None);
+        assert_eq!(store.has_open_agent_turn("s"), None);
+        assert_eq!(store.has_open_turn("s"), None);
+        assert_eq!(store.holds_live_work("s"), None);
+        assert!(!store.has_in_flight_turn("s"), "the lossy bool stays false");
+
+        store.test_set_unavailable(false);
+        assert_eq!(store.holds_live_work("s"), Some(false));
+    }
+
+    /// An unhandled finish whose follow-up turn never came does not hold the
+    /// runner forever.
+    #[test]
+    fn an_old_unhandled_finish_no_longer_holds_live_work() {
+        let (_tmp, store) = open_store(1000);
+        let old =
+            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+        store.record_at("s", 1, &user_prompt("go"), old).unwrap();
+        store
+            .record_at("s", 2, &stopped("prompt_complete"), old)
+            .unwrap();
+        let finished = Event::BackgroundTaskFinished {
+            task_id: "t".into(),
+            ended_at: None,
+        };
+        store.record_at("s", 3, &finished, old).unwrap();
+        assert_eq!(store.holds_live_work("s"), Some(false));
     }
 
     #[test]

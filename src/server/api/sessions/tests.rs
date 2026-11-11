@@ -13823,6 +13823,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     let prompt = || Event::UserPromptSent {
         text: "finish the migration".into(),
         attachments: Vec::new(),
+        merged_prompt_ids: Vec::new(),
         prompt_id: None,
         synthesized: false,
         origin_plugin: None,
@@ -13991,6 +13992,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
         Event::UserPromptSent {
             text: "finish the migration".into(),
             attachments: Vec::new(),
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,

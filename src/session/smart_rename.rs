@@ -2152,6 +2152,7 @@ mod serve {
             }
 
             let non_stop = Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: "hi".into(),
                 attachments: vec![],

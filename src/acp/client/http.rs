@@ -55,8 +55,8 @@ pub(crate) struct RetainedReplay {
     /// Inclusive ranges of successfully folded sequence numbers.
     pub coverage: Vec<(u64, u64)>,
     pub incomplete: bool,
+    pub history_identity: String,
 }
-
 #[derive(serde::Deserialize)]
 struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
@@ -187,6 +187,26 @@ impl HttpClient {
         decode_replay(res).await
     }
 
+    pub(crate) async fn replay_retained_page(
+        &self,
+        session_id: &str,
+        since: u64,
+        limit: u64,
+        identity: Option<&str>,
+    ) -> Result<ReplayResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/replay?since={since}&limit={limit}&view=retained",
+            self.endpoint.base_url,
+            path_segment(session_id)?,
+        );
+        let mut request = self.http.get(&url);
+        if let Some(identity) = identity {
+            request = request.query(&[("history_identity", identity)]);
+        }
+        let res = check_status(self.execute(request).await?, session_id)?;
+        decode_replay(res).await
+    }
+
     /// Live replay stops for reset after loss; retained replay keeps reading.
     async fn replay_pages(
         &self,
@@ -199,12 +219,39 @@ impl HttpClient {
         let mut cursor = since;
         let mut target = None;
         let mut any_lost = false;
+        let mut expected_identity: Option<String> = None;
         loop {
             let page = if matches!(kind, ReplayKind::Rows) {
                 self.replay_rows_page(session_id, cursor, page_size).await?
+            } else if matches!(kind, ReplayKind::Retained) {
+                self.replay_retained_page(
+                    session_id,
+                    cursor,
+                    page_size,
+                    expected_identity.as_deref(),
+                )
+                .await?
             } else {
                 self.replay_page(session_id, cursor, page_size).await?
             };
+            if matches!(kind, ReplayKind::Retained) {
+                let identity = page
+                    .history_identity
+                    .as_deref()
+                    .ok_or(HttpError::Transport)?;
+                if expected_identity
+                    .as_deref()
+                    .is_some_and(|expected| expected != identity)
+                {
+                    return Err(HttpError::Server {
+                        status: StatusCode::CONFLICT,
+                        body: "retained history changed during read".into(),
+                    });
+                }
+                if expected_identity.is_none() {
+                    expected_identity = Some(identity.to_owned());
+                }
+            }
             let cap = *target.get_or_insert(page.highest_seq);
             let (highest_seq, lowest_seq, lost) = (page.highest_seq, page.lowest_seq, page.lost);
             any_lost |= lost;
@@ -246,6 +293,7 @@ impl HttpClient {
             next_cursor: None,
             has_more: false,
             rows: None,
+            history_identity: None,
         })
     }
 
@@ -301,13 +349,17 @@ impl HttpClient {
         let mut snapshot_highest = 0;
         let mut incomplete = false;
         let mut coverage: Vec<(u64, u64)> = Vec::new();
+        let mut history_identity = None;
         let (_, _, reported_lost) = self
             .replay_pages(
                 session_id,
                 0,
                 page_size,
                 ReplayKind::Retained,
-                |page, cap| {
+                |mut page, cap| {
+                    if history_identity.is_none() {
+                        history_identity = page.history_identity.take();
+                    }
                     snapshot_highest = cap;
                     for frame in page.frames {
                         if frame.seq <= last_seen || frame.seq > cap {
@@ -332,6 +384,7 @@ impl HttpClient {
             highest_seq: snapshot_highest,
             coverage,
             incomplete,
+            history_identity: history_identity.ok_or(HttpError::Transport)?,
         })
     }
 
@@ -1526,7 +1579,103 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retained_replay_caches_only_the_folded_snapshot_cap() {
+    async fn retained_endpoint_returns_raw_conflict_for_stale_identity() {
+        use crate::acp::state::Event;
+        use axum::{routing::get, Router};
+        let instance = crate::session::Instance::new("stale retained identity", "/tmp");
+        let id = instance.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![instance]);
+        state
+            .acp_event_store
+            .record(&id, 1, &Event::ThinkingStarted)
+            .unwrap();
+        let app = Router::new()
+            .route(
+                "/api/sessions/{id}/acp/replay",
+                get(crate::server::api::acp_replay),
+            )
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/api/sessions/{id}/acp/replay",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let initial: serde_json::Value = http
+            .get(&url)
+            .query(&[("view", "retained")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        state
+            .acp_event_store
+            .record(&id, 2, &Event::ThinkingEnded)
+            .unwrap();
+        let response = http
+            .get(&url)
+            .query(&[
+                ("view", "retained"),
+                (
+                    "history_identity",
+                    initial["history_identity"].as_str().unwrap(),
+                ),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_client_rejects_two_successful_pages_with_distinct_identities() {
+        use axum::{routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route("/api/sessions/{id}/acp/replay", get({
+            let calls = Arc::clone(&calls);
+            move || {
+                let page = calls.fetch_add(1, Ordering::SeqCst);
+                async move { axum::Json(serde_json::json!({
+                    "frames": [{"session_id": "fixture", "seq": page + 1, "event": {"AgentMessageChunk": {"text": "readable", "message_id": null}}}],
+                    "lost": false, "highest_seq": 2, "lowest_seq": 1,
+                    "next_cursor": page + 1, "has_more": page == 0,
+                    "history_identity": if page == 0 { "first-snapshot" } else { "different-snapshot" }
+                })) }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = HttpClient::new(endpoint(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            None,
+        ))
+        .unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = client
+            .replay_retained_paged("fixture", 1)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            matches!(error, HttpError::Server { status, .. } if status == StatusCode::CONFLICT)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn retained_replay_rejects_content_changes_during_pagination() {
         use crate::acp::{protocol::ReplayQuery, state::Event};
         use axum::{
             extract::{Path, Query, State},
@@ -1590,21 +1739,11 @@ mod tests {
         ))
         .unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let first = client.replay_retained_paged(&id, 2).await.unwrap();
+        let error = client.replay_retained_paged(&id, 2).await.unwrap_err();
         assert!(appended.load(Ordering::SeqCst));
-        assert_eq!(first.highest_seq, 3);
-        assert!(!first.incomplete);
-        assert!(first
-            .transcript
-            .rows
-            .iter()
-            .any(|row| row.text.contains("retained-3")));
-        assert!(!first
-            .transcript
-            .rows
-            .iter()
-            .any(|row| row.text.contains("retained-4")));
-        assert_eq!(client.replay(&id, u64::MAX).await.unwrap().highest_seq, 4);
+        assert!(
+            matches!(error, HttpError::Server { status, .. } if status == StatusCode::CONFLICT)
+        );
         let next = client.replay_retained_paged(&id, 2).await.unwrap();
         assert_eq!(next.highest_seq, 4);
         assert!(next

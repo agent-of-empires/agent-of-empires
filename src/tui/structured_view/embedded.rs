@@ -39,7 +39,6 @@ pub enum EmbeddedEvent {
 }
 
 const RETAINED_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-const RETAINED_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct RetainedTextCache {
     width: u16,
@@ -63,10 +62,10 @@ pub struct RetainedView {
         Result<Option<crate::acp::client::http::RetainedReplay>, String>,
     >,
     known_highest: Option<u64>,
+    known_identity: Option<String>,
     known_coverage: Vec<(u64, u64)>,
     known_incomplete: bool,
     next_read: Instant,
-    next_recheck: Instant,
     message: String,
 }
 
@@ -110,10 +109,10 @@ impl RetainedView {
             load: None,
             result,
             known_highest: None,
+            known_identity: None,
             known_coverage: Vec::new(),
             known_incomplete: false,
             next_read: now,
-            next_recheck: now,
             message: "Daemon unavailable; retained transcript could not be read.".into(),
         };
         let Some(endpoint) = endpoint else {
@@ -139,6 +138,7 @@ impl RetainedView {
             self.state = Some(state);
         }
         self.known_highest = None;
+        self.known_identity = None;
         self.rediscover = false;
         Ok(())
     }
@@ -161,17 +161,19 @@ impl RetainedView {
         };
         let http = state.http.clone();
         let id = self.session_id.clone();
-        let known_highest = if self.known_incomplete && Instant::now() >= self.next_recheck {
-            None
-        } else {
-            self.known_highest
-        };
+        let known_identity = self.known_identity.clone();
         let (tx, result) = tokio::sync::oneshot::channel();
         self.result = result;
         self.load = Some(tokio::spawn(async move {
             let read = async {
-                if let Some(highest) = known_highest {
-                    if http.replay(&id, u64::MAX).await?.highest_seq == highest {
+                if let Some(identity) = known_identity {
+                    if http
+                        .replay_retained_page(&id, u64::MAX, 1, None)
+                        .await?
+                        .history_identity
+                        .as_deref()
+                        == Some(identity.as_str())
+                    {
                         return Ok(None);
                     }
                 }
@@ -208,18 +210,15 @@ impl RetainedView {
         self.next_read = now + RETAINED_REFRESH_INTERVAL;
         match result {
             Ok(Some(replay)) => {
-                let changed = self.known_highest != Some(replay.highest_seq)
+                let changed = self.known_identity.as_deref()
+                    != Some(replay.history_identity.as_str())
+                    || self.known_highest != Some(replay.highest_seq)
                     || self.known_coverage != replay.coverage
                     || self.known_incomplete != replay.incomplete;
                 self.known_highest = Some(replay.highest_seq);
+                self.known_identity = Some(replay.history_identity);
                 self.known_coverage = replay.coverage;
                 self.known_incomplete = replay.incomplete;
-                self.next_recheck = now
-                    + if changed {
-                        RETAINED_REFRESH_INTERVAL
-                    } else {
-                        RETAINED_RECHECK_INTERVAL
-                    };
                 if !changed {
                     return false;
                 }
@@ -246,6 +245,7 @@ impl RetainedView {
             Ok(None) => return false,
             Err(error) => {
                 self.known_highest = None;
+                self.known_identity = None;
                 self.rediscover = true;
                 let message = format!("Transcript read failed: {error}");
                 let changed = self.message != message;
@@ -379,7 +379,6 @@ impl Drop for RetainedView {
         }
     }
 }
-
 pub struct EmbeddedView {
     state: StructuredViewState,
     toast_deadline: Option<Instant>,
@@ -1248,6 +1247,7 @@ mod retained_tests {
                         vec![(1, highest_seq)]
                     },
                     incomplete,
+                    history_identity: "fixture".into(),
                 })))
                 .unwrap();
                 assert!(view.tick());
@@ -1536,7 +1536,7 @@ mod retained_tests {
                     &id,
                     seq,
                     &Event::AgentMessageChunk {
-                        text: "KEEP-ON-ERROR\n\n".into(),
+                        text: "ORIGINAL-RETAINED\n\n".into(),
                         message_id: None,
                     },
                 )
@@ -1590,12 +1590,33 @@ mod retained_tests {
         assert!(finish(&mut view).await);
         assert!(prepared_text(&mut view, 80)
             .to_string()
-            .contains("KEEP-ON-ERROR"));
+            .contains("ORIGINAL-RETAINED"));
         assert!(!view.tick(), "not due");
         assert!(
             !refresh(&mut view).await,
             "unchanged metadata must not invalidate selection"
         );
+        state.acp_event_store.delete_session(&id);
+        for seq in 1..=2 {
+            state
+                .acp_event_store
+                .record(
+                    &id,
+                    seq,
+                    &Event::AgentMessageChunk {
+                        text: "KEEP-ON-ERROR\n\n".into(),
+                        message_id: None,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            refresh(&mut view).await,
+            "same sequence bounds must not hide replacement"
+        );
+        let changed = prepared_text(&mut view, 80).to_string();
+        assert!(changed.contains("KEEP-ON-ERROR"));
+        assert!(!changed.contains("ORIGINAL-RETAINED"));
         failing.store(true, Ordering::SeqCst);
         assert!(refresh(&mut view).await);
         assert!(view.message.contains("503"));
@@ -1675,15 +1696,9 @@ mod retained_tests {
             .unwrap();
         assert!(refresh(&mut view).await);
         assert!(view.message.contains("incomplete"));
-        let rechecked_at = Instant::now();
-        view.next_recheck = rechecked_at;
         assert!(
             !refresh(&mut view).await,
-            "unchanged authoritative replay must preserve selection"
-        );
-        assert!(
-            view.next_recheck >= rechecked_at + RETAINED_RECHECK_INTERVAL,
-            "stable gaps must not cause full replays at every metadata poll"
+            "unchanged identity probe must preserve selection"
         );
         state
             .acp_event_store
@@ -1696,7 +1711,6 @@ mod retained_tests {
                 },
             )
             .unwrap();
-        view.next_recheck = Instant::now();
         assert!(refresh(&mut view).await);
         assert!(prepared_text(&mut view, 80)
             .to_string()
@@ -1727,6 +1741,7 @@ mod retained_tests {
                             return axum::Json(serde_json::json!({
                                 "frames": [], "lost": false, "highest_seq": 0,
                                 "lowest_seq": null, "next_cursor": null, "has_more": false,
+                                "history_identity": "refresh-fixture",
                             }))
                             .into_response();
                         }

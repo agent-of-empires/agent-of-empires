@@ -658,6 +658,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 base_host_environment,
                 default_effort: effort,
                 default_effort_explicit: req.effort_explicit,
+                default_model_config: req.model_config.clone(),
                 default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
                 default_model: model,
                 socket_path: Some(socket_path),
@@ -3449,6 +3450,7 @@ time.sleep(60)
                 id,
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "continue the original turn".into(),
                     attachments: vec![],
                     prompt_id: None,
@@ -3502,8 +3504,15 @@ time.sleep(60)
             assert_eq!(sup.running_identity(id), Some(runner.identity));
             assert!(control.signals().is_empty());
             runner.complete_turn();
+            // The turn's Stopped is stored before the reattached runner's
+            // last chunk, so wait for that chunk as well.
+            let completed = || {
+                store.replay_from(id, 0).iter().any(|(_, event)| {
+                    matches!(event, Event::AgentMessageChunk { text, .. } if text == "original producer completed")
+                })
+            };
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while store.has_in_flight_turn(id) {
+                while store.has_in_flight_turn(id) || !completed() {
                     rx.recv().await.unwrap();
                 }
             })

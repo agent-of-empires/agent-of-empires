@@ -381,7 +381,15 @@ pub(crate) async fn submit_prompt(
                 text: req.text,
                 attachments: &attachments,
                 woke_idle_dormant,
-                prompt_id: req.prompt_id.clone(),
+                prompt_ids: {
+                    let mut ids: Vec<String> = req.prompt_id.clone().into_iter().collect();
+                    if let Some(row) = &queued_row {
+                        if !ids.contains(&row.id) {
+                            ids.push(row.id.clone());
+                        }
+                    }
+                    ids
+                },
                 synthesized: false,
                 no_revive: req.no_revive,
             },

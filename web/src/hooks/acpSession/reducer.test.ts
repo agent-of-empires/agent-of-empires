@@ -242,6 +242,22 @@ describe("in-flight prompt settlement", () => {
     });
     expect(reducer(echoed, { kind: "settle_inflight_prompt", id: "p1" }).turnActive).toBe(true);
   });
+
+  it("a drained batch echo settles every merged id and their overlay rows (#5401)", () => {
+    const three = run(
+      sent("p1"),
+      { kind: "user_prompt", id: "p2", text: "second" },
+      { kind: "user_prompt", id: "p3", text: "third" },
+      { kind: "user_prompt", id: "other", text: "still sending" },
+    );
+    const drained = applyEvent(three, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "hi\n\nsecond\n\nthird", prompt_id: "p1", merged_prompt_ids: ["p2", "p3"] } },
+    });
+    expect(drained.inflightPromptIds).toEqual(["other"]);
+    expect(drained.optimisticRows.map((r) => r.id)).toEqual(["p1", "other"]);
+  });
 });
 
 describe("prompt queue", () => {
@@ -276,6 +292,34 @@ describe("prompt queue", () => {
     expect(reducer(s, { kind: "clear_queue" }).queuedPrompts).toEqual([]);
   });
 
+  it("server prompt rows settle their own and merged ids when the live frame was missed (#5401)", () => {
+    const row = (id: string, mergedPromptIds?: string[]) => ({
+      id,
+      kind: "user_prompt" as const,
+      at: "2026-01-01T00:00:00Z",
+      text: id,
+      ...(mergedPromptIds ? { mergedPromptIds } : {}),
+    });
+    const pending = (...ids: string[]) =>
+      run(empty(), ...ids.map((id): Action => ({ kind: "user_prompt", id, text: id })));
+
+    const idle = reducer(pending("p1", "p2", "p3"), {
+      kind: "transcript_snapshot",
+      rows: [row("p1", ["p2", "p3"])],
+    });
+    expect(idle.inflightPromptIds).toEqual([]);
+    expect(idle.optimisticRows).toEqual([]);
+    expect(idle.turnActive).toBe(false);
+
+    const busy = reducer(pending("p1", "p2", "direct"), { kind: "transcript_snapshot", rows: [row("p1", ["p2"])] });
+    expect(busy.inflightPromptIds).toEqual(["direct"]);
+    expect(busy.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+
+    const older = reducer(pending("p2"), { kind: "prepend", rows: [row("p1", ["p2"])], oldestSeq: 0 });
+    expect(older.inflightPromptIds).toEqual([]);
+    expect(older.optimisticRows).toEqual([]);
+  });
+
   it("hydrate replaces confirmed rows with the server snapshot but keeps in-flight ones", () => {
     const local = run(
       empty(),
@@ -289,6 +333,58 @@ describe("prompt queue", () => {
       rows: [serverRow("a", 0, "one"), serverRow("b", 1, "two")],
     });
     expect(next.queuedPrompts.map((q) => q.text)).toEqual(["one", "two", "just typed"]);
+  });
+
+  it("hydrate retires the optimistic row and spinner of a prompt the queue holds, and only those (#5401)", () => {
+    const local = run(
+      empty(),
+      { kind: "user_prompt", id: "lost-response", text: "queued during compact" },
+      { kind: "user_prompt", id: "direct", text: "dispatched, echo not here yet" },
+    );
+    const next = reducer(local, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("lost-response", 0, "queued")],
+      queueAtRead: local.queuedPrompts,
+    });
+    expect(next.inflightPromptIds).toEqual(["direct"]);
+    expect(next.optimisticRows.map((r) => r.id)).toEqual(["direct"]);
+    expect(next.turnActive).toBe(true);
+
+    const pending = run(empty(), { kind: "user_prompt", id: "lost-response", text: "x" });
+    const idle = reducer(pending, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("lost-response", 0, "x")],
+      queueAtRead: pending.queuedPrompts,
+    });
+    expect(idle.optimisticRows).toEqual([]);
+    expect(idle.turnActive).toBe(false);
+  });
+
+  it("a late queued response does not duplicate a row hydration already added", () => {
+    const initial = empty();
+    const hydrated = reducer(initial, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "one")], queueAtRead: initial.queuedPrompts });
+    const late = run(
+      hydrated,
+      { kind: "enqueue_prompt", id: "q1", text: "one", preserveExisting: true },
+      { kind: "confirm_queued_prompt", id: "q1" },
+    );
+    expect(late.queuedPrompts.map((q) => q.id)).toEqual(["q1"]);
+  });
+
+  it("a late queued response restores local attachment bytes on a hydrated row", () => {
+    const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
+    const initial = empty();
+    const hydrated = reducer(initial, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])], queueAtRead: initial.queuedPrompts });
+    expect(hydrated.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("");
+
+    const late = reducer(hydrated, { kind: "enqueue_prompt", id: "q1", text: "local", attachments: [image], preserveExisting: true });
+    expect(late.queuedPrompts).toHaveLength(1);
+    expect(late.queuedPrompts[0]).toMatchObject({ id: "q1", text: "srv" });
+    expect(late.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
+
+    const again = reducer(late, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])], queueAtRead: late.queuedPrompts });
+    expect(again.queuedPrompts).toHaveLength(1);
+    expect(again.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
   });
 
   it("hydrate keeps local attachment bytes, else builds a metadata-only view", () => {

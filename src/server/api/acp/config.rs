@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use crate::acp::state::ConfigOptionCategory;
+use crate::acp::state::MODEL_CONFIG_CATEGORY;
 
 use super::*;
 
@@ -100,6 +101,14 @@ async fn persist_selector(
     selector: PersistedSelector,
     value: &str,
 ) -> anyhow::Result<()> {
+    persist_with(state, id, |inst| selector.apply(inst, value.to_string())).await
+}
+
+async fn persist_with(
+    state: &Arc<AppState>,
+    id: &str,
+    apply: impl Fn(&mut crate::session::Instance),
+) -> anyhow::Result<()> {
     let _reload = state.session_service.disk_mutation_guard().await;
     let profile = {
         let instances = state.instances.read().await;
@@ -111,14 +120,14 @@ async fn persist_selector(
     crate::session::Storage::new(&profile, state.file_watch.clone())?.update(
         |instances, _groups| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                selector.apply(inst, value.to_string());
+                apply(inst);
             }
             Ok(())
         },
     )?;
     let mut instances = state.instances.write().await;
     if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        selector.apply(inst, value.to_string());
+        apply(inst);
         state
             .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -138,13 +147,25 @@ async fn catalog_agent(state: &Arc<AppState>, id: &str) -> Option<String> {
     })
 }
 
-/// The category the session's agent advertised for `config_id`, from the
-/// option catalog (the daemon keeps no live per-session option state).
+/// The category `config_id` has for this session. Its own advertised options
+/// win because the agent-wide catalog is replaced by whichever session
+/// reported last; the catalog covers a session with no options yet.
 async fn config_option_category(
     state: &Arc<AppState>,
     id: &str,
     config_id: &str,
 ) -> Option<ConfigOptionCategory> {
+    let own = state
+        .session_service
+        .fold_control_state(id)
+        .await
+        .config_options;
+    if !own.is_empty() {
+        return own
+            .into_iter()
+            .find(|opt| opt.id == config_id)
+            .map(|opt| opt.category);
+    }
     let agent = catalog_agent(state, id).await?;
     crate::acp::option_catalog::load()
         .agents
@@ -180,6 +201,7 @@ pub async fn acp_set_config_option(
         return session_not_found();
     };
     // Respawns reuse persisted selector picks.
+    let mut is_model_config = false;
     let selector = if req.config_id == "model" {
         Some(PersistedSelector::Model)
     } else {
@@ -187,7 +209,11 @@ pub async fn acp_set_config_option(
             Some(ConfigOptionCategory::Model) => Some(PersistedSelector::Model),
             Some(ConfigOptionCategory::Mode) => Some(PersistedSelector::Mode),
             Some(ConfigOptionCategory::ThoughtLevel) => Some(PersistedSelector::ThoughtLevel),
-            Some(ConfigOptionCategory::Other(_)) | None => None,
+            Some(ConfigOptionCategory::Other(c)) => {
+                is_model_config = c == MODEL_CONFIG_CATEGORY;
+                None
+            }
+            None => None,
         }
     };
     // The adapter rejects a bad effort only after the pick is stored, so an
@@ -209,7 +235,7 @@ pub async fn acp_set_config_option(
     }
     if let Err(e) = state
         .acp_supervisor
-        .set_config_option(&id, &req.config_id, &req.value)
+        .set_config_option(&id, &req.config_id, &req.value, is_model_config)
         .await
     {
         return supervisor_error_response("set_config_option failed", &e);
@@ -230,6 +256,27 @@ pub async fn acp_set_config_option(
                 .refresh_cached_model(&id, &req.value)
                 .await;
         }
+    }
+    if is_model_config {
+        let (config_id, value) = (req.config_id.clone(), req.value.clone());
+        if let Err(e) = persist_with(&state, &id, |inst| {
+            inst.acp_model_config
+                .insert(config_id.clone(), value.clone());
+        })
+        .await
+        {
+            return persist_failure_response(
+                &state,
+                &id,
+                &format!("config-option pick for acp_model_config.{}", req.config_id),
+                &e,
+            )
+            .await;
+        }
+        state
+            .acp_supervisor
+            .refresh_cached_model_config(&id, &req.config_id, &req.value)
+            .await;
     }
     tracing::info!(
         target: "acp.protocol",
@@ -586,6 +633,123 @@ mod tests {
             assert_eq!(resp.status(), expected, "{agent} {value}");
             assert_eq!(state.instances.read().await[0].acp_effort, None);
         }
+    }
+
+    /// Only an option the catalog files under `model_config` is stored for
+    /// respawn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn model_config_pick_is_stored_for_respawn() {
+        let _tmp = isolate_app_dir();
+        let option = |id: &str, category| ConfigOptionDescriptor {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            category,
+            current_value: String::new(),
+            options: vec![],
+        };
+        crate::acp::option_catalog::record(
+            "claude",
+            &[
+                option(
+                    "fast",
+                    ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into()),
+                ),
+                option("other", ConfigOptionCategory::Other("misc".into())),
+            ],
+            "2026-07-24T00:00:00Z".to_string(),
+        )
+        .unwrap();
+
+        let mut inst = crate::session::Instance::new("claude", "/tmp");
+        inst.agent_name = Some("claude".to_string());
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        for config_id in ["other", "fast"] {
+            let resp = acp_set_config_option(
+                State(state.clone()),
+                Path(id.clone()),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: config_id.to_string(),
+                    value: "on".to_string(),
+                })),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED, "{config_id}");
+        }
+        let stored = state.instances.read().await[0].acp_model_config.clone();
+        assert_eq!(
+            stored.into_iter().collect::<Vec<_>>(),
+            vec![("fast".to_string(), "on".to_string())]
+        );
+    }
+
+    /// The catalog holds whichever session reported last, so a pick is
+    /// classified from the addressed session's own options.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn model_config_pick_is_classified_from_the_sessions_own_options() {
+        let _tmp = isolate_app_dir();
+        let option = |id: &str, category| ConfigOptionDescriptor {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: None,
+            category,
+            current_value: String::new(),
+            options: vec![],
+        };
+        let toggle = ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into());
+        crate::acp::option_catalog::record(
+            "claude",
+            &[option("model", ConfigOptionCategory::Model)],
+            "2026-07-24T00:00:00Z".to_string(),
+        )
+        .unwrap();
+
+        let mut with_toggle = crate::session::Instance::new("claude", "/tmp");
+        with_toggle.agent_name = Some("claude".to_string());
+        let mut without = with_toggle.clone();
+        without.id = "sess-without-toggle".to_string();
+        let (with_id, without_id) = (with_toggle.id.clone(), without.id.clone());
+        let state = crate::server::test_support::build_test_app_state(vec![with_toggle, without]);
+        for (id, options) in [
+            (
+                &with_id,
+                vec![
+                    option("model", ConfigOptionCategory::Model),
+                    option("ultracode", toggle.clone()),
+                ],
+            ),
+            (
+                &without_id,
+                vec![option("model", ConfigOptionCategory::Model)],
+            ),
+        ] {
+            state
+                .acp_event_store
+                .record_at(
+                    id,
+                    1,
+                    &crate::acp::state::Event::ConfigOptionsUpdated { options },
+                    0,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            config_option_category(&state, &with_id, "ultracode").await,
+            Some(toggle)
+        );
+        assert_eq!(
+            config_option_category(&state, &without_id, "ultracode").await,
+            None
+        );
     }
 
     #[tokio::test]

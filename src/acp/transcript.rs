@@ -37,6 +37,10 @@ pub struct TranscriptRow {
     /// Plugin that sent a `user_prompt` row; absent when the user typed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_plugin: Option<String>,
+    /// Ids of other queued rows folded into a `user_prompt` row, so a client that
+    /// only sees this row (snapshot or replay) still settles their optimistic rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_prompt_ids: Vec<String>,
     /// Structured payload on a `user_diff_comments` row; `text` holds the markdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_comments: Option<DiffCommentsPayload>,
@@ -364,6 +368,7 @@ impl TranscriptModel {
                 text,
                 attachments,
                 prompt_id,
+                merged_prompt_ids,
                 synthesized,
                 origin_plugin,
             } => {
@@ -382,7 +387,16 @@ impl TranscriptModel {
                     let mut row = self.grouped_row(id, TranscriptRowKind::UserPrompt, text.clone());
                     row.attachments = attachments.clone();
                     row.origin_plugin = origin_plugin.clone();
-                    vec![self.append(row)]
+                    row.merged_prompt_ids = merged_prompt_ids.clone();
+                    // A queue drain that failed after publishing retries with the same ids.
+                    match self.rows.iter_mut().find(|r| r.id == row.id) {
+                        Some(existing) => {
+                            row.group_id = existing.group_id.clone();
+                            *existing = row;
+                            vec![patch(existing)]
+                        }
+                        None => vec![self.append(row)],
+                    }
                 }
             }
             Event::UserDiffCommentsPrompt {
@@ -939,6 +953,7 @@ impl TranscriptRow {
             output: Vec::new(),
             attachments: Vec::new(),
             origin_plugin: None,
+            merged_prompt_ids: Vec::new(),
             diff_comments: None,
             elicitation_answers: Vec::new(),
             async_subagent: false,
@@ -1504,6 +1519,7 @@ mod tests {
         assert_eq!((m.rows().len(), m.last_seq()), (1, 1));
 
         let with_attachment = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "look".into(),
             attachments: vec![PromptAttachmentRef {
                 id: "att-1".into(),
@@ -1532,6 +1548,7 @@ mod tests {
             m.apply_event(
                 7,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "hi".into(),
                     attachments: Vec::new(),
                     prompt_id: prompt_id.map(Into::into),
@@ -1541,6 +1558,34 @@ mod tests {
             );
             assert_eq!(m.rows()[0].id, want, "prompt_id={prompt_id:?}");
         }
+
+        let mut m = TranscriptModel::new();
+        m.apply_event(
+            8,
+            &Event::UserPromptSent {
+                merged_prompt_ids: vec!["q2".into()],
+                text: "a\n\nb".into(),
+                attachments: Vec::new(),
+                prompt_id: Some("q1".into()),
+                synthesized: false,
+                origin_plugin: None,
+            },
+        );
+        assert_eq!(m.rows()[0].id, "q1");
+        assert_eq!(m.rows()[0].merged_prompt_ids, ["q2"]);
+
+        // A drain retry republishes the same ids: one row, patched in place.
+        let retry = Event::UserPromptSent {
+            merged_prompt_ids: vec!["q2".into()],
+            text: "a\n\nb".into(),
+            attachments: Vec::new(),
+            prompt_id: Some("q1".into()),
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let deltas = m.apply_event(9, &retry);
+        assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
+        assert_eq!(m.rows().len(), 1);
 
         let m = fold([Event::UserDiffCommentsPrompt {
             intro: "look".into(),
@@ -1577,6 +1622,7 @@ mod tests {
         // A synthesized resume prompt (#3028, #4040) renders no row but still
         // opens the turn.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "run the nightly task".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -1592,6 +1638,7 @@ mod tests {
 
         // A plugin-sent message keeps its sender on the row.
         let ev = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "PR #7 was merged".into(),
             attachments: Vec::new(),
             prompt_id: None,

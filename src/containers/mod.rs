@@ -189,7 +189,7 @@ impl DockerContainer {
         // A created ID came from a command run with the config's inherited overrides (see
         // `RuntimeBase::run_create`); a reused one was inspected on the ambient transport.
         let inherited = create_config
-            .map(|config| container_interface::docker_env_args(&config.environment).1)
+            .map(|config| container_interface::docker_env_args(&config.environment).inherit)
             .unwrap_or_default();
         let fresh = RuntimeExecutionSnapshot::capture_with(&self.runtime, &inherited);
         if let Err(error) = &fresh {

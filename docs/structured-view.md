@@ -181,10 +181,16 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
-The reader refreshes available content automatically and preserves focus and
-scroll position. Read failures keep the last loaded content visible with an
-error. Content, size, or theme changes clear the previous text selection.
-Reopen the reader after in-place edits to already retained events.
+The reader refreshes available content automatically, including replacements or
+backfills that leave sequence bounds unchanged, and preserves focus and scroll
+position. Read failures keep the last loaded content visible with an error.
+Content, size, or theme changes clear the previous text selection.
+
+Retained reads use one complete history snapshot. If stored history changes,
+including an append, the reader rejects mixed content and retries while keeping
+the last readable view. An incomplete but unchanged history does not repeatedly
+reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
+for the storage and migration contract.
 
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if the original session, profile, or lifecycle generation
@@ -228,7 +234,7 @@ mode = "plan"             # default mode, applied when the agent advertises one
 "anthropic/opus" = "low"
 ```
 
-`model` applies at worker start. `effort` and `mode` use advertised ACP config options and are skipped with a warning when unsupported. A matching `effort_by_model` entry overrides flat `effort`. Web **Structured View Defaults** exposes the same values from each agent's last advertised choices.
+`model` applies at worker start. `effort` and `mode` use advertised ACP config options and are skipped with a warning when unsupported. A matching `effort_by_model` entry overrides flat `effort`. Web **Agent defaults** exposes the same values from each agent's last advertised choices.
 
 The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
 

@@ -25,6 +25,8 @@ pub(super) enum ClientCmd {
     SetConfigOption {
         config_id: String,
         value: String,
+        /// A `model_config` pick that a conversation reset must re-send.
+        remember: bool,
     },
     /// Send the experimental `session/delete` RPC for the given ACP
     /// session id and report the outcome via `respond_to`. Issued by

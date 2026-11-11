@@ -14,6 +14,7 @@ import {
   Clock,
   Plug,
   Search,
+  Send,
   Sparkles,
   Square,
   Workflow,
@@ -469,12 +470,17 @@ const SPECIAL_TOOLS = {
     label: "task stop",
     primary: mono(pickStr(args, "task_id", "shell_id"), "stop task"),
   }),
+  SendMessage: (_tool: ToolCall, args: Args): SpecialHeader => ({
+    icon: <Send className={ICON} />,
+    label: "send message",
+    primary: withReason(mono(pickStr(args, "to"), "agent"), pickStr(args, "summary")),
+  }),
 };
 
 export type SpecialToolName = keyof typeof SPECIAL_TOOLS;
 
 export const SCHEDULE_TOOLS: readonly SpecialToolName[] = ["ScheduleWakeup", "CronCreate", "CronList", "CronDelete"];
-export const HARNESS_TOOLS: readonly SpecialToolName[] = ["ToolSearch", "Monitor", "TaskStop"];
+export const HARNESS_TOOLS: readonly SpecialToolName[] = ["ToolSearch", "Monitor", "TaskStop", "SendMessage"];
 
 /** The `family` tool this call is, when its title is also in the profile's `allowed` list. */
 export function classifySpecialTool(

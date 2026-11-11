@@ -788,7 +788,7 @@ async fn sessions_turn_send(
                 SendTurnRequest { resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false, },
             )
@@ -1005,7 +1005,7 @@ async fn deliver_structured(
                 text: &req.message,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false,
             },
@@ -1685,15 +1685,16 @@ mod tests {
         use crate::acp::supervisor::BroadcastSink;
         let _home = crate::session::test_support::isolate_app_dir();
         let (deps, state, _dir, _cmds) = foreign_live_session("sess-msg-busy").await;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         assert!(sink.publish_persisted(
             "sess-msg-busy",
             1,
             &Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: "the user's turn".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
@@ -1991,7 +1992,7 @@ mod tests {
                 "sess-3649",
                 "the winning turn".into(),
                 &[],
-                None,
+                Vec::new(),
                 false,
                 None,
             )
@@ -2034,11 +2035,11 @@ mod tests {
             .acp_supervisor
             .test_insert_worker("sess-3685")
             .await;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         let ctx = ctx_with(&["session.prompt"]);
 
         let mut seq = 0;
@@ -2050,6 +2051,7 @@ mod tests {
             );
         };
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "the owner's turn".into(),
             attachments: Vec::new(),
             prompt_id: None,

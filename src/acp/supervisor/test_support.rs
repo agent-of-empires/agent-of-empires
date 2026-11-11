@@ -284,14 +284,25 @@ pub(super) fn channel_sink() -> (
     broadcast::Receiver<crate::server::AcpBroadcastFrame>,
     tempfile::TempDir,
 ) {
+    channel_sink_with_cache(Arc::new(crate::acp::control_cache::ControlStateCache::new()))
+}
+
+pub(super) fn channel_sink_with_cache(
+    cache: Arc<crate::acp::control_cache::ControlStateCache>,
+) -> (
+    Arc<ChannelSink>,
+    Arc<EventStore>,
+    broadcast::Receiver<crate::server::AcpBroadcastFrame>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::TempDir::new().unwrap();
     let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
     let (tx, rx) = broadcast::channel(16);
-    let sink = Arc::new(ChannelSink {
+    let sink = Arc::new(ChannelSink::new(
         tx,
-        event_store: event_store.clone(),
-        control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    });
+        event_store.clone(),
+        cache,
+    ));
     (sink, event_store, rx, tmp)
 }
 
@@ -364,6 +375,7 @@ pub(crate) fn spawn_request(session_id: &str) -> SpawnRequest {
         model: None,
         effort: None,
         effort_explicit: false,
+        model_config: Default::default(),
         stored_acp_session_id: None,
         fork_from: None,
         sandbox_continuation: super::SandboxContinuation::Persisted,
@@ -397,6 +409,7 @@ pub(super) fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         host_environment: vec![],
         default_effort: None,
         default_effort_explicit: false,
+        default_model_config: Default::default(),
         default_mode: None,
         default_model: None,
         socket_path: Some(socket_path),
@@ -648,6 +661,7 @@ pub(crate) struct HeldAttachRunner {
     completion: Option<std::process::ChildStdin>,
     resumed: mpsc::Receiver<String>,
     prompts: mpsc::Receiver<serde_json::Value>,
+    trailer: bool,
     peer: tokio::task::JoinHandle<()>,
     child: HeldChild,
     _socket_dir: tempfile::TempDir,
@@ -843,12 +857,17 @@ for attempt in range(2):
                         "sessionId": native, "update": {"sessionUpdate": "usage_update",
                         "used": 10, "size": 100, "cost": {"amount": 0.1, "currency": "USD"}}}})
                 if hold:
-                    assert sys.stdin.readline() == "complete\n"
+                    completion = sys.stdin.readline()
+                    assert completion in ("complete\n", "complete-trailer\n")
                     send(s, {"kind": "notify", "method": "session/update", "params": {
                         "sessionId": native, "update": {"sessionUpdate": "agent_message_chunk",
                         "content": {"type": "text", "text": "original producer completed"}}}})
                     send(s, {"kind": "prompt_completed", "prompt_req_id": 77,
                              "outcome": {"status": "completed", "stop_reason": "end_turn"}})
+                    if completion == "complete-trailer\n":
+                        send(s, {"kind": "notify", "method": "session/update", "params": {
+                            "sessionId": native, "update": {"sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "after the retained completion"}}}})
             elif mode == "record" and kind == "prompt":
                 print("prompt:" + json.dumps(frame["request"]), flush=True)
                 send(s, {"kind": "prompt_started", "prompt_req_id": 78})
@@ -975,6 +994,7 @@ for attempt in range(2):
             completion,
             resumed,
             prompts,
+            trailer: false,
             peer,
             child,
             _socket_dir: socket_dir,
@@ -1001,6 +1021,13 @@ for attempt in range(2):
         runner
     }
 
+    /// Sends one more chunk after the completion, so a test can wait on the frames
+    /// being processed in order before asserting that the completion did nothing.
+    pub(crate) fn with_trailing_chunk(mut self) -> Self {
+        self.trailer = true;
+        self
+    }
+
     pub(crate) async fn entered(&mut self) {
         self.entered.take().unwrap().await.unwrap();
     }
@@ -1023,7 +1050,7 @@ for attempt in range(2):
         self.completion
             .take()
             .unwrap()
-            .write_all(b"complete\n")
+            .write_all(if self.trailer { b"complete-trailer\n" } else { b"complete\n" })
             .unwrap();
     }
 

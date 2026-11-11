@@ -312,7 +312,7 @@ export function useAcpSession(
   );
 
   const showServerQueued = useCallback((id: string, text: string, attachments?: PromptAttachmentInput[]) => {
-    dispatch({ kind: "enqueue_prompt", id, text, attachments });
+    dispatch({ kind: "enqueue_prompt", id, text, attachments, preserveExisting: true });
     dispatch({ kind: "confirm_queued_prompt", id });
   }, []);
 
