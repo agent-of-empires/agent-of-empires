@@ -214,11 +214,27 @@ impl Shared {
         // A frame the contract consumes without delivering (a lease renewal)
         // still proves the agent is alive.
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        self.settle_discarded().await;
         let epoch = self.prompt_epoch.load(Ordering::Relaxed);
-        match self
+        let ingested = self
             .aoe
-            .ingest(notification, local_prompt_signals, epoch, now_ms())
-        {
+            .ingest(notification, local_prompt_signals, epoch, now_ms());
+        self.handle_ingested(ingested).await;
+    }
+
+    /// Frames the session identity dropped still count in the proxy's
+    /// numbering, so a tailer frame anchored after them is not held for
+    /// adapter output that already happened.
+    pub(super) async fn settle_discarded(&self) {
+        let skipped = self.ingress.take_discarded_adapter_frames();
+        if skipped > 0 {
+            let ingested = self.aoe.skip_frames(skipped, now_ms());
+            self.handle_ingested(ingested).await;
+        }
+    }
+
+    async fn handle_ingested(&self, ingested: Ingested) {
+        match ingested {
             Ingested::Deliver(frames) => {
                 for frame in frames {
                     self.handle_adapter_notification(

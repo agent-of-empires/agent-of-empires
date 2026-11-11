@@ -142,6 +142,11 @@ impl AoeIngress {
         let Ok(released) = released else {
             return self.lose(IntegrationLostReason::HoldOverflow);
         };
+        self.deliver(released, now_ms)
+    }
+
+    fn deliver(&self, released: Vec<Frame>, now_ms: i64) -> Ingested {
+        let proxied = self.proxied.load(Ordering::Relaxed);
         let mut deliver = Vec::with_capacity(released.len());
         for frame in released {
             if let Some(lease) = frame
@@ -164,6 +169,18 @@ impl AoeIngress {
             });
         }
         Ingested::Deliver(deliver)
+    }
+
+    /// Numbers `n` frames the session identity discarded before they got
+    /// here, and delivers the held frames that releases.
+    pub(super) fn skip_frames(&self, n: u64, now_ms: i64) -> Ingested {
+        let mut order = self.order.lock().expect("aoe ordering mutex poisoned");
+        let released = order.skip_frames(n);
+        drop(order);
+        if self.lost.load(Ordering::Relaxed) {
+            return Ingested::Deliver(Vec::new());
+        }
+        self.deliver(released, now_ms)
     }
 
     fn count_adapter_frame(&self) {

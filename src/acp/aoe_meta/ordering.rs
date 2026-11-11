@@ -97,20 +97,33 @@ impl<T> ArrivalOrder<T> {
             None => {
                 self.adapter_frames += 1;
                 let mut out = if duplicate { Vec::new() } else { vec![item] };
-                let due: Vec<u64> = self
-                    .held
-                    .range(..=self.adapter_frames)
-                    .map(|(anchor, _)| *anchor)
-                    .collect();
-                for anchor in due {
-                    if let Some(items) = self.held.remove(&anchor) {
-                        self.held_len -= items.len();
-                        out.extend(items);
-                    }
-                }
+                out.extend(self.release_due());
                 Ok(out)
             }
         }
+    }
+
+    /// Numbers `n` adapter frames that core never saw, for example old-session
+    /// frames dropped at a reset, and returns the held frames they release.
+    pub fn skip_frames(&mut self, n: u64) -> Vec<T> {
+        self.adapter_frames += n;
+        self.release_due()
+    }
+
+    fn release_due(&mut self) -> Vec<T> {
+        let due: Vec<u64> = self
+            .held
+            .range(..=self.adapter_frames)
+            .map(|(anchor, _)| *anchor)
+            .collect();
+        let mut out = Vec::new();
+        for anchor in due {
+            if let Some(items) = self.held.remove(&anchor) {
+                self.held_len -= items.len();
+                out.extend(items);
+            }
+        }
+        out
     }
 
     /// `false` for a key already seen.
@@ -236,6 +249,15 @@ mod tests {
         o.count_frame();
         assert!(o.drain_held().is_empty(), "released frames are discarded");
         assert_eq!(o.arrive(after("n", 2), "n").unwrap(), ["n"], "count kept");
+    }
+
+    #[test]
+    fn skipped_frames_take_their_numbers_and_release_held_ones() {
+        let mut o = ArrivalOrder::default();
+        assert!(o.arrive(plain(), "f1").unwrap().len() == 1);
+        assert!(o.arrive(after("t", 3), "t").unwrap().is_empty());
+        assert_eq!(o.skip_frames(2), ["t"]);
+        assert_eq!(o.arrive(after("n", 3), "n").unwrap(), ["n"], "count kept");
     }
 
     #[test]

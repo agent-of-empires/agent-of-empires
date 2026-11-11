@@ -407,6 +407,7 @@ impl Session {
                 // id back up from the ingress on its next iteration.
                 self.session_from_storage = false;
                 self.shared.aoe.session_reset();
+                self.shared.settle_discarded().await;
                 self.channels = SessionChannels::new(
                     new_session.modes.as_ref(),
                     new_session.config_options.as_deref(),
