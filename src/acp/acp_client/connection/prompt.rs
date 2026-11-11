@@ -163,6 +163,22 @@ impl Session {
             .prompt_sent_since_attach
             .store(true, Ordering::Relaxed);
         shared.adopted_turn_active.store(false, Ordering::Relaxed);
+        *shared
+            .last_prompt
+            .lock()
+            .expect("last prompt mutex poisoned") = (
+            blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_owned(),
+            0,
+        );
         shared.prompt_in_flight.store(true, Ordering::Relaxed);
         shared.terminal_claim.begin_turn();
         shared.between_prompt.reset_for_prompt();
@@ -651,6 +667,11 @@ impl Session {
             })
             .await;
         shared.reset_message_dedup();
+        shared
+            .last_prompt
+            .lock()
+            .expect("last prompt mutex poisoned")
+            .1 = now_ms();
         shared.prompt_in_flight.store(false, Ordering::Relaxed);
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
         info!(
