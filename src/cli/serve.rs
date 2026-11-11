@@ -42,8 +42,10 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with_all = ["remote", "behind_proxy", "port", "host", "auth", "no_auth", "open", "passphrase", "allowed_host", "allowed_origin"])]
     pub core_only: bool,
 
-    /// Port to listen on (default: 8080; debug builds default to 8081 so a
-    /// `cargo run` instance does not collide with an installed release `aoe`).
+    /// Port to listen on. Falls back to the `AOE_SERVE_PORT` environment
+    /// variable, then `[serve] port` in config.toml, then 8080 (debug builds
+    /// default to 8081 so a `cargo run` instance does not collide with an
+    /// installed release `aoe`).
     #[arg(long)]
     pub port: Option<u16>,
 
@@ -235,19 +237,38 @@ impl ServeArgs {
             self.passphrase = resolve_launch_passphrase(self.passphrase.take(), None, || {
                 std::env::var("AOE_SERVE_PASSPHRASE").ok()
             });
+            if self.port.is_none() {
+                self.port = Some(resolve_serve_port(
+                    std::env::var_os("AOE_SERVE_PORT"),
+                    || crate::session::config::Config::load_or_warn().serve.port,
+                )?);
+            }
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
         Ok(())
     }
 
-    /// Resolve the port: explicit `--port` wins; otherwise 8081 in debug
-    /// builds, 8080 in release. The `-dev` suffix on the app dir keeps
-    /// state isolated, but two daemons cannot share a port, so the default
-    /// shifts as well.
+    /// Resolve the port: explicit `--port` wins; otherwise the build default
+    /// (8081 in debug builds, 8080 in release). Fresh launches fill `port` from
+    /// `AOE_SERVE_PORT` and `[serve] port` first, in `resolve_launch`.
     pub fn resolved_port(&self) -> u16 {
         self.port
-            .unwrap_or(if cfg!(debug_assertions) { 8081 } else { 8080 })
+            .unwrap_or(crate::session::config::DEFAULT_SERVE_PORT)
     }
+}
+
+/// `AOE_SERVE_PORT` wins over the configured port; an empty value counts as unset.
+fn resolve_serve_port(
+    env: Option<std::ffi::OsString>,
+    configured: impl FnOnce() -> u16,
+) -> Result<u16> {
+    let Some(raw) = env.filter(|raw| !raw.is_empty()) else {
+        return Ok(configured());
+    };
+    raw.to_str()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .with_context(|| format!("Invalid AOE_SERVE_PORT {raw:?}: expected 1-65535"))
 }
 
 /// Pure check used by both the CLI validator and its unit tests.
@@ -2937,6 +2958,27 @@ mod tests {
     #[test]
     fn cloudflared_required_when_no_tailscale_flag_set() {
         assert!(cloudflared_required(true, false, true));
+    }
+
+    #[test]
+    fn serve_port_prefers_environment_over_config() {
+        let os = |value: &str| Some(std::ffi::OsString::from(value));
+        let cases: [(Option<std::ffi::OsString>, Option<u16>); 7] = [
+            (None, Some(9000)),
+            (os(""), Some(9000)),
+            (os("8090"), Some(8090)),
+            (os(" 65535 "), Some(65535)),
+            (os("0"), None),
+            (os("65536"), None),
+            (os("abc"), None),
+        ];
+        for (env, expected) in cases {
+            assert_eq!(
+                resolve_serve_port(env.clone(), || 9000).ok(),
+                expected,
+                "{env:?}"
+            );
+        }
     }
 
     #[test]
