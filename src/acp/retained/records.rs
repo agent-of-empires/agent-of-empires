@@ -168,6 +168,11 @@ impl<T> Deref for Owned<T> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static ROW_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) struct RowArena {
     pub context: Rc<Context>,
     collections: [i64; 5],
@@ -190,6 +195,8 @@ impl RowArena {
         })
     }
     pub fn read(&self, index: u64) -> io::Result<RowOf<Disk>> {
+        #[cfg(test)]
+        ROW_READS.with(|reads| reads.set(reads.get() + 1));
         if index >= self.length {
             return Err(invalid("unknown retained row"));
         }

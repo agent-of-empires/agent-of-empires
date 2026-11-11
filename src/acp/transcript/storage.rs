@@ -1,4 +1,8 @@
-use std::{collections::HashSet, convert::Infallible, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    ops::Deref,
+};
 
 use indexmap::IndexMap;
 
@@ -74,6 +78,13 @@ pub(crate) trait Set<B: Backend> {
     fn clear(&mut self) -> Result<(), B::Error>;
 }
 
+pub(crate) trait Positions<B: Backend> {
+    fn get<'a>(&self, value: B::Input<'a>) -> Result<Option<u64>, B::Error>;
+    fn insert(&mut self, value: B::Text, index: u64) -> Result<(), B::Error>;
+    fn remove<'a>(&mut self, value: B::Input<'a>) -> Result<(), B::Error>;
+    fn clear(&mut self) -> Result<(), B::Error>;
+}
+
 pub(crate) trait Tools<B: Backend>: Sized {
     type Read<'a>: Deref<Target = ToolLifecycle<B::Text>>
     where
@@ -134,12 +145,14 @@ pub(crate) trait Backend: Sized + 'static {
         Self: 'a;
     type Rows: Rows<Self>;
     type Set: Set<Self>;
+    type Positions: Positions<Self>;
     type Tools: Tools<Self>;
     type Outputs: Outputs<Self>;
     type Changes: Changes<Self>;
 
     fn rows(&self) -> Result<Self::Rows, Self::Error>;
     fn set(&self) -> Result<Self::Set, Self::Error>;
+    fn positions(&self) -> Result<Self::Positions, Self::Error>;
     fn tools(&self) -> Result<Self::Tools, Self::Error>;
     fn outputs(&self) -> Result<Self::Outputs, Self::Error>;
     fn changes(&self) -> Self::Changes;
@@ -350,6 +363,7 @@ impl Backend for Memory {
     type Writer<'a> = MemoryWriter;
     type Rows = Vec<TranscriptRow>;
     type Set = HashSet<String>;
+    type Positions = HashMap<String, u64>;
     type Tools = IndexMap<String, ToolLifecycle<String>>;
     type Outputs = Vec<UnfinishedToolOutput>;
     type Changes = Vec<TranscriptDelta>;
@@ -358,6 +372,9 @@ impl Backend for Memory {
     }
     fn set(&self) -> Result<Self::Set, Infallible> {
         Ok(HashSet::new())
+    }
+    fn positions(&self) -> Result<Self::Positions, Infallible> {
+        Ok(HashMap::new())
     }
     fn tools(&self) -> Result<Self::Tools, Infallible> {
         Ok(IndexMap::new())
@@ -514,6 +531,23 @@ impl Set<Memory> for HashSet<String> {
     }
     fn clear(&mut self) -> Result<(), Infallible> {
         HashSet::clear(self);
+        Ok(())
+    }
+}
+impl Positions<Memory> for HashMap<String, u64> {
+    fn get(&self, value: &str) -> Result<Option<u64>, Infallible> {
+        Ok(HashMap::get(self, value).copied())
+    }
+    fn insert(&mut self, value: String, index: u64) -> Result<(), Infallible> {
+        HashMap::insert(self, value, index);
+        Ok(())
+    }
+    fn remove(&mut self, value: &str) -> Result<(), Infallible> {
+        HashMap::remove(self, value);
+        Ok(())
+    }
+    fn clear(&mut self) -> Result<(), Infallible> {
+        HashMap::clear(self);
         Ok(())
     }
 }

@@ -170,6 +170,12 @@ An explicit start after a terminal tool state begins fresh invocation metadata:
 empty arguments and changes do not inherit the prior call. Updates within that
 same invocation continue to merge normally.
 
+Tool-start lookup uses a backend-owned position index rather than scanning earlier
+rows. Retained indexes reuse the scratch store's keyed disk map and fixed cache;
+they do not grow a resident hash table with transcript length. Appends record the
+position, row compaction rebuilds it, and replacing a start with another row kind
+revokes its entry. The memory and disk reducers share the same index contract.
+
 
 The worker owns read cancellation and disk preparation. Loading copy is refused,
 not deferred. Lifecycle/profile ownership must match before copy-all; mouse release
@@ -186,6 +192,10 @@ a reader cancels preparation but cannot detach an active helper. The helper
 finishes or reaches its deadline before newer output starts. Feedback reports
 admission separately from completed desktop output or complete OSC byte emission.
 Superseded replies cannot update current feedback.
+Clearing a selection or invalidating its painted geometry cancels unadmitted
+preparation, not an admitted output receipt. The reader retains the matching
+ticket and result until completion, failure, or supersession, so successful
+desktop output cannot leave a permanent admission-only caption.
 Published source updates are reconciled before prepared copy results. Replacement
 cancels stale preparation while retaining the last readable window. Clipboard
 admission holds the publication read guard through ticket submission, so a source

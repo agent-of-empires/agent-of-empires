@@ -223,6 +223,7 @@ impl Backend for Disk {
     type Writer<'a> = Writer<'a>;
     type Rows = DiskRows;
     type Set = DiskSet;
+    type Positions = Positions;
     type Tools = DiskTools;
     type Outputs = DiskOutputs;
     type Changes = DiskChanges;
@@ -232,6 +233,9 @@ impl Backend for Disk {
     }
     fn set(&self) -> io::Result<DiskSet> {
         DiskSet::new(Rc::clone(&self.0))
+    }
+    fn positions(&self) -> io::Result<Positions> {
+        Positions::new(Rc::clone(&self.0))
     }
     fn tools(&self) -> io::Result<DiskTools> {
         DiskTools::new(Rc::clone(&self.0))

@@ -435,7 +435,19 @@ impl RetainedView {
             })
             .map(|window| window.offset)
     }
-    pub(crate) fn cancel_copy(&mut self) {
+    /// Clearing geometry can cancel preparation, but an admitted output owns its receipt.
+    pub(crate) fn cancel_selection_copy(&mut self) {
+        if self.clipboard_result.is_some() {
+            return;
+        }
+        let preparing = self.copy_result.is_some() || self.pending_copy.is_some();
+        self.cancel_copy();
+        if preparing {
+            self.copy_message = Some("Copy cancelled before output admission.".into());
+        }
+    }
+
+    fn cancel_copy(&mut self) {
         self.copy_ticket = None;
         self.copy_result = None;
         self.clipboard_result = None;

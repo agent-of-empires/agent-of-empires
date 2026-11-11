@@ -1467,7 +1467,7 @@ impl HomeView {
     pub fn clear_preview_selection(&mut self) -> bool {
         if self.preview_selection.take().is_some() {
             if let Some(view) = self.retained_preview.as_mut() {
-                view.cancel_copy();
+                view.cancel_selection_copy();
             }
             // A stale mouse release must not restart a cleared selection.
             if matches!(self.drag_state, Some(DragKind::PreviewSelect)) {

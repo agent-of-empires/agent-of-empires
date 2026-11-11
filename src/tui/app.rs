@@ -3509,6 +3509,9 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    mod retained_copy_completion;
+
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial]
     async fn child_handoff_restores_real_raw_input_before_blocked_screen_controls() {

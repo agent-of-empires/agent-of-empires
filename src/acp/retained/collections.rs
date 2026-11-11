@@ -205,6 +205,23 @@ impl Positions {
         self.0.insert(&Position { id, index })
     }
 }
+impl crate::acp::transcript::storage::Positions<Disk> for Positions {
+    fn get<'a>(&self, id: TextRef) -> io::Result<Option<u64>> {
+        Positions::get(self, id)
+    }
+    fn insert(&mut self, id: TextRef, index: u64) -> io::Result<()> {
+        Positions::insert(self, id, index)
+    }
+    fn remove<'a>(&mut self, id: TextRef) -> io::Result<()> {
+        match self.0.get(id)? {
+            Some((cursor, _)) => self.0.context.store.remove(cursor).map(|_| ()),
+            None => Ok(()),
+        }
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.0.context.store.clear_entries(self.0.collection)
+    }
+}
 
 pub(crate) struct DiskSet(KeyMap<TextRef>);
 impl DiskSet {

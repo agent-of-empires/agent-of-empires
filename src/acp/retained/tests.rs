@@ -261,3 +261,4 @@ fn timestamps_preserve_chrono_grammar_without_payload_sized_strings() {
 }
 
 mod lifecycle;
+mod indexed_tools;

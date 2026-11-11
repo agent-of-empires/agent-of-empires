@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 
 use super::event::View;
 use super::storage::{
-    Backend, Changes, DeltaOf, InputTool, Memory, Outputs, Part, RowOf, Rows, Set, ToolOf, Tools,
+    Backend, Changes, DeltaOf, InputTool, Memory, Outputs, Part, Positions, RowOf, Rows, Set,
+    ToolOf, Tools,
 };
 use super::{TranscriptRow, TranscriptRowKind, UnfinishedToolOutput, LOAD_FAILED_PREFIX};
 use crate::acp::state::{PayloadCollection, ToolCall};
@@ -44,6 +45,7 @@ pub(crate) struct Core<B: Backend> {
     pub(super) backend: B,
     pub(super) rows: B::Rows,
     row_ids: B::Set,
+    tool_starts: B::Positions,
     tools: B::Tools,
     retained_orphans: B::Outputs,
     elicitation_tool_ids: B::Set,
@@ -64,6 +66,7 @@ impl<B: Backend> Core<B> {
         Ok(Self {
             rows: backend.rows()?,
             row_ids: backend.set()?,
+            tool_starts: backend.positions()?,
             tools: backend.tools()?,
             retained_orphans: backend.outputs()?,
             elicitation_tool_ids: backend.set()?,
@@ -272,7 +275,14 @@ impl<B: Backend> Core<B> {
                 };
                 match existing {
                     Some(index) => {
+                        let backend = &self.backend;
+                        let tool_starts = &mut self.tool_starts;
                         let delta = self.rows.update(index, |existing| {
+                            if existing.kind == TranscriptRowKind::ToolStart {
+                                if let Some(id) = existing.tool_call_id.as_ref() {
+                                    tool_starts.remove(backend.borrow(id))?;
+                                }
+                            }
                             row.group_id = existing.group_id.clone();
                             *existing = row;
                             Ok(patch::<B>(existing))
@@ -898,8 +908,15 @@ impl<B: Backend> Core<B> {
         })?;
         if !changes.is_empty() {
             self.row_ids.clear()?;
+            self.tool_starts.clear()?;
             for index in 0..self.rows.len() {
-                self.row_ids.insert(self.rows.read(index)?.id.clone())?;
+                let row = self.rows.read(index)?;
+                self.row_ids.insert(row.id.clone())?;
+                if row.kind == TranscriptRowKind::ToolStart {
+                    if let Some(id) = row.tool_call_id.as_ref() {
+                        self.tool_starts.insert(id.clone(), index)?;
+                    }
+                }
             }
         }
         Ok(changes)
@@ -947,7 +964,13 @@ impl<B: Backend> Core<B> {
     }
     fn append(&mut self, row: RowOf<B>) -> Result<DeltaOf<B>, B::Error> {
         self.row_ids.insert(row.id.clone())?;
+        let index = self.rows.len();
         self.rows.push(&row)?;
+        if row.kind == TranscriptRowKind::ToolStart {
+            if let Some(id) = row.tool_call_id.as_ref() {
+                self.tool_starts.insert(id.clone(), index)?;
+            }
+        }
         Ok(super::TranscriptDelta::Append(row))
     }
     fn one(&self, delta: DeltaOf<B>) -> Result<B::Changes, B::Error> {
@@ -1027,13 +1050,7 @@ impl<B: Backend> Core<B> {
         Ok(None)
     }
     fn find_tool_start<'a>(&self, id: B::Input<'a>) -> Result<Option<u64>, B::Error> {
-        self.find_row(|row| {
-            Ok(row.kind == TranscriptRowKind::ToolStart
-                && match row.tool_call_id.as_ref() {
-                    Some(value) => self.backend.equal(value, id)?,
-                    None => false,
-                })
-        })
+        self.tool_starts.get(id)
     }
 }
 
@@ -1058,6 +1075,7 @@ impl Clone for Core<Memory> {
             backend: Memory,
             rows: self.rows.clone(),
             row_ids: self.row_ids.clone(),
+            tool_starts: self.tool_starts.clone(),
             tools: self.tools.clone(),
             retained_orphans: self.retained_orphans.clone(),
             elicitation_tool_ids: self.elicitation_tool_ids.clone(),
