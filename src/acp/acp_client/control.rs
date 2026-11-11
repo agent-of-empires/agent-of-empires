@@ -2445,6 +2445,7 @@ mod tests {
                     expected_agent: ExpectedAgent::Gemini,
                     source_profile: None,
                     default_effort: None,
+                    default_model_config: Default::default(),
                     default_mode: None,
                     default_model: None,
                     mcp_servers: Vec::new(),

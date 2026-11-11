@@ -408,7 +408,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// Forces the resume trigger even when the worker looks alive, mirroring
     /// the handler's idle-dormant wake (#1689).
     pub woke_idle_dormant: bool,
-    pub prompt_id: Option<String>,
+    /// Transcript row id first, then the ids of queued rows folded into the same turn.
+    pub prompt_ids: Vec<String>,
     /// True when the daemon queued this turn itself (a rate-limit resume
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
@@ -999,7 +1000,7 @@ impl SessionService {
             text,
             attachments,
             woke_idle_dormant,
-            prompt_id,
+            prompt_ids,
             synthesized,
             no_revive,
         } = turn;
@@ -1076,7 +1077,7 @@ impl SessionService {
                 id,
                 text.to_string(),
                 attachments,
-                prompt_id,
+                prompt_ids,
                 synthesized,
                 caller.message_origin().map(str::to_string),
             )
@@ -1196,7 +1197,7 @@ impl SessionService {
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized,
                     no_revive: false,
                 },
@@ -1964,7 +1965,7 @@ impl SessionService {
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: sent_ids.clone(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -3012,7 +3013,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3031,7 +3032,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3050,7 +3051,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3073,7 +3074,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3092,7 +3093,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3210,16 +3211,17 @@ mod tests {
         let service = state.session_service.clone();
 
         // Publish through the real choke point.
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         assert!(
             sink.publish_persisted(
                 "sess-mid-turn",
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,

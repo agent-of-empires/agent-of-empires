@@ -18,14 +18,14 @@ import { UpdateBanner } from "./UpdateBanner";
  */
 export function BannerStack({ onRetryServerSettings }: { onRetryServerSettings?: () => void } = {}) {
   const connection = useConnectionBanner();
-  const dashboardUpdated = useDashboardUpdate();
+  const dashboardVersion = useDashboardUpdate();
   const update = useUpdateBanner();
   const sandboxImage = useSandboxImageBanner();
 
   let top: ReactNode = null;
   if (connection === "down") top = <DisconnectBanner state="down" />;
   else if (onRetryServerSettings) top = <ServerSettingsBanner onRetry={onRetryServerSettings} />;
-  else if (dashboardUpdated) top = <DashboardUpdateBanner />;
+  else if (dashboardVersion !== null) top = <DashboardUpdateBanner version={dashboardVersion} />;
   else if (connection === "reconnected") top = <DisconnectBanner state="reconnected" />;
   else if (update) top = <UpdateBanner status={update.status} onDismiss={update.dismiss} />;
   else if (sandboxImage) top = <SandboxImageBanner view={sandboxImage} />;

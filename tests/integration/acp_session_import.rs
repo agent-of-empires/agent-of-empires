@@ -32,6 +32,7 @@ fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
         provider_routing: vec![],
         host_environment: vec![],
         default_effort_explicit: false,
+        default_model_config: Default::default(),
         default_effort: None,
         default_mode: None,
         default_model: None,

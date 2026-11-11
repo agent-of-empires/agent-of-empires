@@ -74,55 +74,69 @@ function restartLine(): ReactNode {
 export function UpdateBanner({ status, onDismiss }: { status: UpdateStatus; onDismiss: () => void }) {
   const method = status.install_method ?? "unknown";
   const command = status.update_command ?? "aoe update";
-  const after =
-    method === "nix"
-      ? "or rebuild your flake input"
-      : method === "unknown"
-        ? "to see how to update this install."
-        : null;
-  const second =
-    method === "release" ? (
-      <span>It offers to restart the Daemon for you when it's done.</span>
-    ) : method === "unknown" ? null : (
-      restartLine()
+  // An unknown install has no command of its own: `aoe update` prints the steps for it.
+  const instruction =
+    method === "unknown" ? (
+      <>
+        <span>Run</span>
+        <CopyCommand command={command} />
+        <span>on the machine running AoE.</span>
+      </>
+    ) : (
+      <>
+        <span>On the machine running AoE, run</span>
+        <CopyCommand command={command} />
+        {method === "nix" && <span>or rebuild your flake input</span>}
+      </>
     );
+  // A release install's `aoe update` asks about the restart itself, and an unknown one prints its own steps.
+  const second = method === "release" || method === "unknown" ? null : restartLine();
 
   return (
     <div
       role="status"
       aria-label={`Update available: v${status.latest_version}`}
-      className="bg-brand-600/10 border-b border-brand-600/30 px-4 py-2 flex items-start gap-3 text-xs text-brand-300 animate-fade-in"
+      className="relative bg-brand-600/10 border-b border-brand-600/30 py-2 pl-4 pr-12 sm:px-12 flex justify-center text-xs text-brand-300 animate-fade-in"
     >
-      <span className="mt-3.5 w-1.5 h-1.5 rounded-full bg-brand-400 shrink-0" />
-      <div className="min-w-0 flex-1 flex flex-col gap-1.5">
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
-          <span>
-            Update available:{" "}
-            <span className="font-mono text-brand-200">
-              v{status.current_version} → v{status.latest_version}
+      {/* Centered as one block (the padding is even from sm up, × sits in it), so a second line starts under the
+          first line's text; full width and left-aligned on phones. */}
+      <div className="flex min-w-0 gap-3 max-sm:w-full">
+        {/* As tall as a line, so the dot sits on the first line's center. */}
+        <span className="flex h-8 shrink-0 items-center" aria-hidden="true">
+          <span className="w-1.5 h-1.5 rounded-full bg-brand-400" />
+        </span>
+        <div className="min-w-0 flex flex-col gap-1.5">
+          <div data-banner-line className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+            <span>
+              Update available:{" "}
+              <span className="font-mono text-brand-200">
+                v{status.current_version} → v{status.latest_version}
+              </span>
             </span>
-          </span>
-          <span>On the machine running AoE, run</span>
-          <CopyCommand command={command} />
-          {after && <span>{after}</span>}
-          {status.release_url && (
-            <a
-              href={status.release_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex min-h-8 items-center underline hover:text-brand-200"
-            >
-              Release notes
-            </a>
+            {instruction}
+            {status.release_url && (
+              <a
+                href={status.release_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex min-h-8 items-center underline hover:text-brand-200"
+              >
+                Release notes
+              </a>
+            )}
+          </div>
+          {second && (
+            <div data-banner-line className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
+              {second}
+            </div>
           )}
         </div>
-        {second && <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">{second}</div>}
       </div>
       <button
         type="button"
         onClick={onDismiss}
         aria-label="Dismiss update notice"
-        className="flex h-8 w-8 shrink-0 items-center justify-center text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none"
+        className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center text-text-subtle hover:text-text-primary cursor-pointer text-base leading-none"
       >
         &times;
       </button>

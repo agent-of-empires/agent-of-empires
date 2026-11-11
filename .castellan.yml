@@ -23,10 +23,10 @@ paths:
     - scripts/
   release:
     - .github/workflows/release.yml
-    - .github/workflows/prepare-release.yml
-    - .github/workflows/open-release-pr.yml
-    - .github/workflows/tag-release-pr.yml
-    - cliff.toml
+    - .github/workflows/release-plz.yml
+    - .github/workflows/nightly.yml
+    - .github/workflows/build-binaries.yml
+    - release-plz.toml
     - docs/development/releases.md
   migrations:
     - src/migrations/
