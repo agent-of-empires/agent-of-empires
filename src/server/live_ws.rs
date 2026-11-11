@@ -2935,10 +2935,9 @@ mod tests {
                     .await
                     .unwrap();
                 let claimed = until(&mut client, progress_timeout, "claimed size_owner", |v| {
-                    v["type"] == "size_owner"
+                    v["type"] == "size_owner" && v["is_owner"] == true
                 })
                 .await;
-                assert_eq!(claimed["is_owner"], true, "{claimed}");
                 assert!(claimed.get("owner").is_none(), "{claimed}");
 
                 // Two frames captured after the claim: the loop pass that captured the second

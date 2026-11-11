@@ -214,6 +214,18 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
             Ok(owner)
         }
     });
+    // The live worker takes the size lock on its own thread, so wait for it too: a Web
+    // resize on a vacant lock would claim it.
+    crate::harness::wait_until(STARTUP, Duration::from_millis(50), || {
+        let owner = show_option(&socket, &agent_session, "@aoe_size_owner");
+        if owner.starts_with("tui-") {
+            Ok(())
+        } else {
+            Err(format!(
+                "the TUI never took the size lock; holder is {owner:?}"
+            ))
+        }
+    });
 
     let api = app_dir_in(h.home_path()).join("daemon/api.sock");
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -287,11 +299,10 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
         ws.send(Ws::Text(r#"{"type":"claim"}"#.into()))
             .await
             .unwrap();
-        let claimed = until(&mut ws, Duration::from_secs(10), "claimed", |v| {
-            v["type"] == "size_owner"
+        until(&mut ws, Duration::from_secs(10), "claimed", |v| {
+            v["type"] == "size_owner" && v["is_owner"] == true
         })
         .await;
-        assert_eq!(claimed["is_owner"], true, "{claimed}");
 
         // The daemon retries arming for twice the VT lease TTL after the claim.
         let grid = until(&mut ws, Duration::from_secs(10), "grid transport", |v| {
