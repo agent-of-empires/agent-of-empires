@@ -1582,9 +1582,13 @@
     },
     {
       "id": "modals.first-field-autofocus",
-      "kind": "vitest",
+      "kind": "mocked-playwright",
       "risk": "low",
-      "specs": ["src/components/__tests__/modalAutofocus.test.tsx"],
+      "specs": [
+        "tests/modal-autofocus.spec.ts",
+        "tests/diff-comments.spec.ts",
+        "tests/sidebar-project-settings.spec.ts"
+      ],
       "components": [
         "web/src/components/McpServerForm.tsx",
         "web/src/components/ProjectFormModal.tsx",
