@@ -529,9 +529,6 @@ impl<S: BroadcastSink> Drain<S> {
             .filter(|(current, _)| current == lease)
             .and_then(|(_, identity)| identity)
             .filter(|identity| identity.birth_fingerprint.is_some())?;
-        if attempts == 0 && !self.admit_reattach(lease).await {
-            return None;
-        }
         for attempt in attempts + 1..=CONTROL_REATTACH_ATTEMPTS {
             if attempt > 1 {
                 tokio::time::sleep(RESPAWN_BACKOFF).await;
@@ -557,6 +554,10 @@ impl<S: BroadcastSink> Drain<S> {
                 }
             };
             let stored_acp_session_id = record.stored_acp_session_id?;
+            // Charge only a verified live runner, so a dead one pays just its respawn.
+            if attempt == 1 && !self.admit_reattach(lease).await {
+                return None;
+            }
             let resume_by = tokio::time::Instant::now() + CONTROL_REATTACH_DEADLINE;
             let attempt_result = tokio::time::timeout_at(
                 resume_by,
@@ -3454,15 +3455,24 @@ mod tests {
         let sink = VecSink::new();
         let control = Arc::new(ObservedProcessControl::default());
         let launches = Arc::new(AtomicUsize::new(0));
-        let sup = Supervisor::new(sink.clone())
-            .with_process_control(control.clone())
-            .with_launcher(Arc::new({
-                let launches = Arc::clone(&launches);
-                move |_, _| {
-                    launches.fetch_add(1, Ordering::SeqCst);
-                    Box::pin(async { Err(AcpError::Spawn("replacement refused".into())) })
-                }
-            }));
+        // Restart budget charged by the time the replacement launches.
+        let charged = Arc::new(AtomicUsize::new(0));
+        let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+        let workers = Arc::clone(&sup.workers);
+        let sup = sup.with_launcher(Arc::new({
+            let launches = Arc::clone(&launches);
+            let charged = Arc::clone(&charged);
+            move |_, _| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                let workers = Arc::clone(&workers);
+                let charged = Arc::clone(&charged);
+                Box::pin(async move {
+                    let history = workers.lock().await[id].restart_history.len();
+                    charged.store(history, Ordering::SeqCst);
+                    Err(AcpError::Spawn("replacement refused".into()))
+                })
+            }
+        }));
         let mut client = AcpClient::attach(
             socket.clone(),
             tmp.path().into(),
@@ -3631,6 +3641,13 @@ mod tests {
                 case == ControlLossCase::DeadRunner,
                 "{case:?}: {stops:?}"
             );
+            if case == ControlLossCase::DeadRunner {
+                assert_eq!(
+                    charged.load(Ordering::SeqCst),
+                    1,
+                    "a dead runner is charged only its respawn"
+                );
+            }
         }
         peer.abort();
     }
