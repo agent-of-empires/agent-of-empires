@@ -310,7 +310,7 @@ pub fn launch_prefix(command: &str) -> Option<(Vec<&str>, usize)> {
 /// of a pipe, redirection or separate command. [`launch_prefix`] itself stops at
 /// the executable and never inspects the tail.
 pub fn direct_launch_words(command: &str) -> Option<(Vec<&str>, usize)> {
-    let (prefix, assignments) = launch_prefix(command)?;
+    let (_, assignments) = launch_prefix(command)?;
     let words: Vec<&str> = command
         .split([' ', '\t'])
         .filter(|word| !word.is_empty())
