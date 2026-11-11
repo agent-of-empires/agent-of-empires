@@ -2282,7 +2282,7 @@ mod tests {
                     .with_generation(4),
             )
             .unwrap();
-            worker_registry::mark_restart_pending(id, marker);
+            worker_registry::mark_restart_pending(id, marker).unwrap();
             let (client, _client_tx) = crate::acp::acp_client::AcpClient::fake_for_test(
                 crate::acp::state::AcpSessionId(id.into()),
             );
