@@ -1,5 +1,6 @@
 //! Fetching an external plugin into a staging tree, ready to be moved into
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -171,17 +172,24 @@ fn stage(
     }
 }
 
+/// A manifest is small; the cap keeps a hostile symlink or huge file from
+/// being read before the tree hash rejects it.
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+
 fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
-    let path = tree.join("aoe-plugin.toml");
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
-            "no aoe-plugin.toml at {}; this repository is not an installable plugin. \
+    let root = crate::session::AnchoredDir::open(tree)?;
+    let Some(mut file) = root.open_regular(Path::new("aoe-plugin.toml"), MAX_MANIFEST_BYTES)?
+    else {
+        bail!(
+            "no regular aoe-plugin.toml of at most {MAX_MANIFEST_BYTES} bytes at {}; \
+             this repository is not an installable plugin. \
              The GitHub `aoe-plugin` topic is also used by unrelated Age of Empires projects.",
-            path.display()
-        ),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            tree.join("aoe-plugin.toml").display()
+        );
     };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", tree.join("aoe-plugin.toml").display()))?;
     let text = std::str::from_utf8(&bytes).context("aoe-plugin.toml is not valid UTF-8")?;
     let manifest = PluginManifest::from_toml_str(text).map_err(|e| anyhow!("{e}"))?;
     Ok((manifest, bytes))
@@ -598,7 +606,6 @@ async fn download_asset(url: &str, dest: &Path) -> Result<()> {
 
 fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
-    use std::io::Read as _;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("hashing {}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -641,8 +648,9 @@ fn install_asset_into(
             bin.ok_or_else(|| anyhow!("a release-binary archive asset must set `bin`"))?;
         let source =
             std::fs::File::open(asset).with_context(|| format!("opening {}", asset.display()))?;
-        extract_asset_archive(tree, asset_name, source)?;
-        ensure_executable(tree, &checked_asset_path(Path::new(bin_rel))?)
+        let bin_rel = checked_asset_path(Path::new(bin_rel))?;
+        extract_asset_archive(tree, asset_name, source, Some(&bin_rel))?;
+        ensure_executable(tree, &bin_rel)
     } else {
         let name = checked_asset_path(Path::new(bin.unwrap_or(asset_name)))?;
         let root = crate::session::AnchoredDir::open(tree)?;
@@ -665,7 +673,12 @@ fn install_asset_into(
 
 /// Assets may only add files: a replacement would change the manifest or tree
 /// after the consent fingerprint was computed over the source snapshot.
-fn extract_asset_archive(tree: &Path, asset_name: &str, source: std::fs::File) -> Result<()> {
+fn extract_asset_archive(
+    tree: &Path,
+    asset_name: &str,
+    source: std::fs::File,
+    executable: Option<&Path>,
+) -> Result<()> {
     let root = crate::session::AnchoredDir::open(tree)?;
     let decoder = flate2::read::GzDecoder::new(source);
     for entry in tar::Archive::new(decoder)
@@ -674,12 +687,24 @@ fn extract_asset_archive(tree: &Path, asset_name: &str, source: std::fs::File) -
     {
         let mut entry = entry.with_context(|| format!("unpacking {asset_name}"))?;
         let kind = entry.header().entry_type();
+        // A global PAX header describes later entries and names no path.
+        if kind == tar::EntryType::XGlobalHeader {
+            continue;
+        }
         let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
         let entry_path = entry
             .path()
             .with_context(|| format!("reading an entry name from {asset_name}"))?
             .into_owned();
-        let rel = checked_asset_path(&entry_path)?;
+        let normalized = normalized_asset_path(&entry_path)?;
+        if normalized.as_os_str().is_empty() {
+            // `tar -C dist .` stores a "./" entry for the archive root.
+            if kind.is_dir() {
+                continue;
+            }
+            bail!("plugin path {entry_path:?} is empty");
+        }
+        let rel = checked_asset_path(&normalized)?;
         if kind.is_dir() {
             root.ensure_dir(&rel)
                 .with_context(|| format!("unpacking {asset_name}"))?;
@@ -696,6 +721,12 @@ fn extract_asset_archive(tree: &Path, asset_name: &str, source: std::fs::File) -
             };
             std::io::copy(&mut entry, &mut output)
                 .with_context(|| format!("unpacking {asset_name}"))?;
+            // The binary must stay readable for the verifying reopen below,
+            // which is why its executable mode is set through this descriptor.
+            let mode = match executable {
+                Some(bin) if bin == rel => mode | 0o755,
+                _ => mode,
+            };
             set_asset_mode(&output, mode)?;
         } else {
             bail!(
@@ -707,7 +738,7 @@ fn extract_asset_archive(tree: &Path, asset_name: &str, source: std::fs::File) -
     Ok(())
 }
 
-fn checked_asset_path(rel: &Path) -> Result<PathBuf> {
+fn normalized_asset_path(rel: &Path) -> Result<PathBuf> {
     use std::path::Component;
     let mut normalized = PathBuf::new();
     for component in rel.components() {
@@ -719,11 +750,15 @@ fn checked_asset_path(rel: &Path) -> Result<PathBuf> {
             ),
         }
     }
-    let first = normalized
-        .components()
-        .next()
-        .ok_or_else(|| anyhow!("plugin path {rel:?} is empty"))?
-        .as_os_str();
+    Ok(normalized)
+}
+
+fn checked_asset_path(rel: &Path) -> Result<PathBuf> {
+    let normalized = normalized_asset_path(rel)?;
+    let Some(first) = normalized.components().next() else {
+        bail!("plugin path {rel:?} is empty");
+    };
+    let first = first.as_os_str();
     if first == ".git" || first == super::integrity::BUILD_OUTPUT_DIR {
         bail!("plugin path {rel:?} uses the reserved {first:?} namespace");
     }
@@ -1247,39 +1282,41 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn gzip(entries: &[(&str, Option<&[u8]>, u32)]) -> Vec<u8> {
+        use std::io::Write;
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, data, mode) in entries {
+            let mut header = tar::Header::new_gnu();
+            match data {
+                Some(data) => {
+                    header.set_entry_type(tar::EntryType::Regular);
+                    header.set_size(data.len() as u64);
+                    header.set_mode(*mode);
+                    header.set_cksum();
+                    archive.append_data(&mut header, name, &data[..]).unwrap();
+                }
+                None => {
+                    header.set_entry_type(tar::EntryType::Directory);
+                    header.set_size(0);
+                    header.set_mode(*mode);
+                    header.set_cksum();
+                    archive
+                        .append_data(&mut header, name, std::io::empty())
+                        .unwrap();
+                }
+            }
+        }
+        let mut encoder = archive.into_inner().unwrap();
+        encoder.flush().unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[cfg(unix)]
     #[test]
     fn release_asset_never_follows_links_or_replaces_the_source_snapshot() {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
-
-        fn gzip(entries: &[(&str, Option<&[u8]>, u32)]) -> Vec<u8> {
-            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-            let mut archive = tar::Builder::new(encoder);
-            for (name, data, mode) in entries {
-                let mut header = tar::Header::new_gnu();
-                match data {
-                    Some(data) => {
-                        header.set_entry_type(tar::EntryType::Regular);
-                        header.set_size(data.len() as u64);
-                        header.set_mode(*mode);
-                        header.set_cksum();
-                        archive.append_data(&mut header, name, &data[..]).unwrap();
-                    }
-                    None => {
-                        header.set_entry_type(tar::EntryType::Directory);
-                        header.set_size(0);
-                        header.set_mode(*mode);
-                        header.set_cksum();
-                        archive
-                            .append_data(&mut header, name, std::io::empty())
-                            .unwrap();
-                    }
-                }
-            }
-            let mut encoder = archive.into_inner().unwrap();
-            encoder.flush().unwrap();
-            encoder.finish().unwrap()
-        }
 
         let work = tempfile::tempdir().unwrap();
         let victim = work.path().join("victim");
@@ -1398,6 +1435,86 @@ mod tests {
         .unwrap();
         install_asset_into(&tree, "nested.tgz", Some("deep/inner/worker"), &nested).unwrap();
         assert!(tree.join("deep/inner/worker").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_read_refuses_links_missing_and_oversized_files() {
+        use std::os::unix::fs::symlink;
+        let work = tempfile::tempdir().unwrap();
+        let tree = work.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        assert!(read_manifest(&tree).is_err());
+
+        let victim = work.path().join("victim");
+        std::fs::write(&victim, b"id = \"acme.evil\"\n").unwrap();
+        symlink(&victim, tree.join("aoe-plugin.toml")).unwrap();
+        assert!(read_manifest(&tree).is_err());
+
+        std::fs::remove_file(tree.join("aoe-plugin.toml")).unwrap();
+        std::fs::write(
+            tree.join("aoe-plugin.toml"),
+            vec![b'#'; MAX_MANIFEST_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_manifest(&tree).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_asset_accepts_root_metadata_and_execute_only_bin() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempfile::tempdir().unwrap();
+        let tree = work.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        let asset = work.path().join("asset.tgz");
+        {
+            let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut archive = tar::Builder::new(encoder);
+            let mut root = tar::Header::new_gnu();
+            root.set_entry_type(tar::EntryType::Directory);
+            root.set_size(0);
+            root.set_mode(0o755);
+            root.set_cksum();
+            archive
+                .append_data(&mut root, "./", std::io::empty())
+                .unwrap();
+            let mut global = tar::Header::new_gnu();
+            let pax_name = b"././@PaxHeader";
+            global.as_mut_bytes()[..pax_name.len()].copy_from_slice(pax_name);
+            global.set_entry_type(tar::EntryType::XGlobalHeader);
+            global.set_size(10);
+            global.set_mode(0o644);
+            global.set_cksum();
+            archive.append(&global, &b"comment=x\n"[..]).unwrap();
+            let raw = b"#!/bin/sh\nexit 0\n";
+            let mut worker = tar::Header::new_gnu();
+            worker.set_entry_type(tar::EntryType::Regular);
+            worker.set_size(raw.len() as u64);
+            worker.set_mode(0o111);
+            worker.set_cksum();
+            archive
+                .append_data(&mut worker, "worker", &raw[..])
+                .unwrap();
+            let mut encoder = archive.into_inner().unwrap();
+            encoder.flush().unwrap();
+            std::fs::write(&asset, encoder.finish().unwrap()).unwrap();
+        }
+        install_asset_into(&tree, "asset.tgz", Some("worker"), &asset).unwrap();
+        assert_eq!(
+            std::fs::read(tree.join("worker")).unwrap(),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            std::fs::metadata(tree.join("worker"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
     }
 }
 
