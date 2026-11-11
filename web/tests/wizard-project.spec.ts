@@ -137,7 +137,7 @@ test.describe("extra repos", () => {
     await expect(page.getByPlaceholder("/path/to/another/repo")).toBeFocused();
   });
 
-  test("projects loading late do not steal focus from a typed path", async ({ page }) => {
+  test("focus waits for projects to load and never overrides the user's choice", async ({ page }) => {
     await startWizard(page, {
       projects: [
         { name: "primary", path: "/tmp/example", scope: "global" },
@@ -152,6 +152,8 @@ test.describe("extra repos", () => {
     });
     await openPanel(page, "Extra repos");
     const input = page.getByPlaceholder("/path/to/another/repo");
+    await expect(input).toBeVisible();
+    await expect(input).not.toBeFocused();
     await input.click();
     await input.pressSequentially("/tmp/other");
     release();
