@@ -645,7 +645,8 @@ mod tests {
                     new_sessions += 1;
                     let response = serde_json::json!({
                         "jsonrpc":"2.0","id":message["id"],"result":{"sessionId":session_id}
-                    }).to_string();
+                    })
+                    .to_string();
                     agent_write.write_all(response.as_bytes()).await.unwrap();
                     agent_write.write_all(b"\n").await.unwrap();
                     agent_write.flush().await.unwrap();

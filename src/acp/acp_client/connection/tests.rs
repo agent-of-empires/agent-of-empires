@@ -3,9 +3,9 @@
 use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
-use crate::acp::approvals::Nonce;
 use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::approvals::ApprovalDecision;
+use crate::acp::approvals::Nonce;
 use crate::acp::fs_handler::FsPolicy;
 use crate::acp::state::{IntegrationLostReason, StartupErrorDetail, SubagentState};
 use crate::acp::terminal_handler::TerminalManager;
@@ -357,8 +357,15 @@ async fn spawn_fake_connection_with(
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
     let (ready, fake) = spawn_fake_connection_raw(
-        session_id, mode, close_after_prompt, "", default_mode, config_options, on_prompt,
-    ).await;
+        session_id,
+        mode,
+        close_after_prompt,
+        "",
+        default_mode,
+        config_options,
+        on_prompt,
+    )
+    .await;
     ready.expect("handshake ok");
     fake
 }
@@ -1429,8 +1436,12 @@ async fn collect_connection_events_until(
 
 async fn registered_interaction(fake: &mut FakeConnection, observed: &mut Vec<Event>) -> Nonce {
     collect_connection_events_until(fake, observed, |event| {
-        matches!(event, Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. })
-    }).await;
+        matches!(
+            event,
+            Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. }
+        )
+    })
+    .await;
     let nonce = match observed.last().unwrap() {
         Event::ApprovalRequested { approval } => approval.nonce.clone(),
         Event::ElicitationRequested { elicitation } => elicitation.nonce.clone(),
@@ -1472,16 +1483,21 @@ async fn resolve_registered_interaction(fake: &FakeConnection, nonce: &Nonce) {
 #[tokio::test]
 async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
     use crate::acp::elicitations::ElicitationOutcome;
-    let update = |session_id: &str, text: &str| serde_json::json!({
-        "jsonrpc":"2.0","method":"session/update","params":{
-            "sessionId":session_id,"update":{
-                "sessionUpdate":"agent_message_chunk",
-                "content":{"type":"text","text":text}
+    let update = |session_id: &str, text: &str| {
+        serde_json::json!({
+            "jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":session_id,"update":{
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":text}
+                }
             }
-        }
-    }).to_string();
+        })
+        .to_string()
+    };
     let boundary = |event: &Event| match event {
-        Event::SessionCleared | Event::SessionContextReset { .. } | Event::AcpSessionAssigned { .. } => true,
+        Event::SessionCleared
+        | Event::SessionContextReset { .. }
+        | Event::AcpSessionAssigned { .. } => true,
         Event::Stopped { reason } => reason == "session_reset",
         _ => false,
     };
@@ -1489,43 +1505,73 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
         let mut fake = spawn_fake_connection("s-pending-reset", None, false, |id| {
             vec![serde_json::json!({
                 "jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}
-            }).to_string()]
-        }).await;
+            })
+            .to_string()]
+        })
+        .await;
         let mut observed = Vec::new();
         collect_connection_events_until(&mut fake, &mut observed, |event| {
             matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "s-pending-reset")
         }).await;
         let initial_end = observed.len();
-        assert_eq!(fake.received.lock().await.iter().filter(|frame| frame["method"] == "session/new").count(), 1);
-        write_line(&fake.agent_write, &pending_interaction_line(kind, "s-pending-reset")).await;
+        assert_eq!(
+            fake.received
+                .lock()
+                .await
+                .iter()
+                .filter(|frame| frame["method"] == "session/new")
+                .count(),
+            1
+        );
+        write_line(
+            &fake.agent_write,
+            &pending_interaction_line(kind, "s-pending-reset"),
+        )
+        .await;
         let nonce = registered_interaction(&mut fake, &mut observed).await;
-        write_line(&fake.agent_write, &update("s-pending-reset", "unanswered before refusal")).await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset", "unanswered before refusal"),
+        )
+        .await;
         collect_connection_events_until(&mut fake, &mut observed, |event| {
             matches!(event, Event::AgentMessageChunk { text, .. } if text == "unanswered before refusal")
         }).await;
         let (respond_to, response) = oneshot::channel();
-        fake.cmd_tx.send(ClientCmd::ResetSession {
-            text: "/clear".into(),
-            deadline: tokio::time::Instant::now() + Duration::from_secs(10),
-            respond_to,
-        }).await.unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/clear".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                respond_to,
+            })
+            .await
+            .unwrap();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap(),
             ResetSessionOutcome::Failed { message } if message.contains("resolve it before clearing the conversation")
         ));
         assert!(fake.pending_responders.lock().await.contains_key(&nonce));
-        write_line(&fake.agent_write, &update("s-pending-reset", "unanswered after refusal")).await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset", "unanswered after refusal"),
+        )
+        .await;
         collect_connection_events_until(&mut fake, &mut observed, |event| {
             matches!(event, Event::AgentMessageChunk { text, .. } if text == "unanswered after refusal")
         }).await;
-        assert!(!observed[initial_end..].iter().any(&boundary), "{kind}: {observed:?}");
+        assert!(
+            !observed[initial_end..].iter().any(&boundary),
+            "{kind}: {observed:?}"
+        );
         assert!(fake.pending_responders.lock().await.contains_key(&nonce));
         assert!(!fake.received.lock().await.iter().any(|frame| {
             frame.get("method").is_none() && frame["id"] == "pending-interaction"
         }));
         resolve_registered_interaction(&fake, &nonce).await;
         let reply = tokio::time::timeout(Duration::from_secs(10), fake.responses.recv())
-            .await.unwrap().unwrap();
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(reply["id"], "pending-interaction");
         assert!(reply.get("error").is_none(), "{reply:?}");
         if kind == "permission" {
@@ -1534,70 +1580,142 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
         } else {
             assert_eq!(reply["result"]["action"], "decline");
         }
-        collect_connection_events_until(&mut fake, &mut observed, |event| {
-            match event {
-                Event::ApprovalResolved { nonce: actual, decision: ApprovalDecision::Allow } => kind == "permission" && actual == &nonce,
-                Event::ElicitationResolved { nonce: actual, outcome: ElicitationOutcome::Declined, .. } => kind == "elicitation" && actual == &nonce,
-                _ => false,
-            }
-        }).await;
+        collect_connection_events_until(&mut fake, &mut observed, |event| match event {
+            Event::ApprovalResolved {
+                nonce: actual,
+                decision: ApprovalDecision::Allow,
+            } => kind == "permission" && actual == &nonce,
+            Event::ElicitationResolved {
+                nonce: actual,
+                outcome: ElicitationOutcome::Declined,
+                ..
+            } => kind == "elicitation" && actual == &nonce,
+            _ => false,
+        })
+        .await;
         let (done, flushed) = oneshot::channel();
-        fake.cmd_tx.send(ClientCmd::FlushForTest(done)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), flushed).await.unwrap().unwrap();
-        fake.cmd_tx.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
-        collect_connection_events_until(&mut fake, &mut observed, |event| {
-            matches!(event, Event::Stopped { reason } if reason == "prompt_complete")
-        }).await;
-        assert!(!observed[initial_end..].iter().any(&boundary), "{kind}: {observed:?}");
+        fake.cmd_tx
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), flushed)
+            .await
+            .unwrap()
+            .unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(Vec::new()))
+            .await
+            .unwrap();
+        collect_connection_events_until(
+            &mut fake,
+            &mut observed,
+            |event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete"),
+        )
+        .await;
+        assert!(
+            !observed[initial_end..].iter().any(&boundary),
+            "{kind}: {observed:?}"
+        );
         {
             let received = fake.received.lock().await;
-            assert_eq!(received.iter().filter(|frame| frame["method"] == "session/new").count(), 1);
-            assert!(received.iter().filter(|frame| frame["method"] == "session/prompt")
+            assert_eq!(
+                received
+                    .iter()
+                    .filter(|frame| frame["method"] == "session/new")
+                    .count(),
+                1
+            );
+            assert!(received
+                .iter()
+                .filter(|frame| frame["method"] == "session/prompt")
                 .map(|frame| frame["params"]["sessionId"].as_str().unwrap())
                 .eq(["s-pending-reset"]));
         }
         let (respond_to, response) = oneshot::channel();
-        fake.cmd_tx.send(ClientCmd::ResetSession {
-            text: "/clear".into(),
-            deadline: tokio::time::Instant::now() + Duration::from_secs(10),
-            respond_to,
-        }).await.unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/clear".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                respond_to,
+            })
+            .await
+            .unwrap();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap(),
             ResetSessionOutcome::Reset { new_acp_session_id } if new_acp_session_id == "s-pending-reset-reset-1"
         ));
-        collect_connection_events_until(&mut fake, &mut observed, |event| {
-            matches!(event, Event::Stopped { reason } if reason == "session_reset")
-        }).await;
-        write_line(&fake.agent_write, &update("s-pending-reset", "stale after explicit reset")).await;
-        write_line(&fake.agent_write, &update("s-pending-reset-reset-1", "fresh after explicit reset")).await;
+        collect_connection_events_until(
+            &mut fake,
+            &mut observed,
+            |event| matches!(event, Event::Stopped { reason } if reason == "session_reset"),
+        )
+        .await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset", "stale after explicit reset"),
+        )
+        .await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset-reset-1", "fresh after explicit reset"),
+        )
+        .await;
         collect_connection_events_until(&mut fake, &mut observed, |event| {
             matches!(event, Event::AgentMessageChunk { text, .. } if text == "fresh after explicit reset")
         }).await;
-        fake.cmd_tx.send(ClientCmd::Prompt(Vec::new())).await.unwrap();
-        collect_connection_events_until(&mut fake, &mut observed, |event| {
-            matches!(event, Event::Stopped { reason } if reason == "prompt_complete")
-        }).await;
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(Vec::new()))
+            .await
+            .unwrap();
+        collect_connection_events_until(
+            &mut fake,
+            &mut observed,
+            |event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete"),
+        )
+        .await;
         assert!(!observed.iter().any(|event| {
             matches!(event, Event::AgentMessageChunk { text, .. } if text == "stale after explicit reset")
         }));
-        assert!(observed[initial_end..].iter().filter_map(|event| match event {
-            Event::SessionCleared => Some(0),
-            Event::SessionContextReset { .. } => Some(1),
-            Event::AcpSessionAssigned { .. } => Some(2),
-            Event::Stopped { reason } if reason == "session_reset" => Some(3),
-            _ => None,
-        }).eq([0, 1, 2, 3]), "{kind}: {observed:?}");
+        assert!(
+            observed[initial_end..]
+                .iter()
+                .filter_map(|event| match event {
+                    Event::SessionCleared => Some(0),
+                    Event::SessionContextReset { .. } => Some(1),
+                    Event::AcpSessionAssigned { .. } => Some(2),
+                    Event::Stopped { reason } if reason == "session_reset" => Some(3),
+                    _ => None,
+                })
+                .eq([0, 1, 2, 3]),
+            "{kind}: {observed:?}"
+        );
         assert!(observed[initial_end..].iter().any(|event| {
             matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "s-pending-reset-reset-1")
         }));
-        assert_eq!(observed[initial_end..].iter().filter(|event| {
-            matches!(event, Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. })
-        }).count(), 1);
+        assert_eq!(
+            observed[initial_end..]
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. }
+                    )
+                })
+                .count(),
+            1
+        );
         {
             let received = fake.received.lock().await;
-            assert_eq!(received.iter().filter(|frame| frame["method"] == "session/new").count(), 2);
-            assert!(received.iter().filter(|frame| frame["method"] == "session/prompt")
+            assert_eq!(
+                received
+                    .iter()
+                    .filter(|frame| frame["method"] == "session/new")
+                    .count(),
+                2
+            );
+            assert!(received
+                .iter()
+                .filter(|frame| frame["method"] == "session/prompt")
                 .map(|frame| frame["params"]["sessionId"].as_str().unwrap())
                 .eq(["s-pending-reset", "s-pending-reset-reset-1"]));
         }
@@ -2063,7 +2181,8 @@ fn tool_call_frame(id: &str, aoe: &str) -> String {
 /// broken frame ends the integration.
 #[tokio::test]
 async fn proxy_hello_and_primitives_shape_the_event_stream() {
-    let (ready, fake) = spawn_fake_connection_raw("s-h", None, false, BAD_HELLO, None, None, |_| vec![]).await;
+    let (ready, fake) =
+        spawn_fake_connection_raw("s-h", None, false, BAD_HELLO, None, None, |_| vec![]).await;
     assert!(
         matches!(&ready, Err(AcpError::IncompatibleAgent(e))
             if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),

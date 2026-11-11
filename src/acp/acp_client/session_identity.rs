@@ -793,7 +793,10 @@ mod tests {
         use futures_util::FutureExt as _;
         let ingress = SessionIngress::new(Some(SessionId::from("old")));
         let old = SessionId::from("old");
-        let request = ingress.request(&old, RequestPolicy::ParentOnly).await.unwrap();
+        let request = ingress
+            .request(&old, RequestPolicy::ParentOnly)
+            .await
+            .unwrap();
         let notification = ingress
             .notification(notif("old"), None)
             .now_or_never()
