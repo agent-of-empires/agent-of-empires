@@ -179,10 +179,16 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
-The reader refreshes available content automatically and preserves focus and
-scroll position. Read failures keep the last loaded content visible with an
-error. Content, size, or theme changes clear the previous text selection.
-Reopen the reader after in-place edits to already retained events.
+The reader refreshes available content automatically, including replacements or
+backfills that leave sequence bounds unchanged, and preserves focus and scroll
+position. Read failures keep the last loaded content visible with an error.
+Content, size, or theme changes clear the previous text selection.
+
+Retained reads use one complete history snapshot. If stored history changes,
+including an append, the reader rejects mixed content and retries while keeping
+the last readable view. An incomplete but unchanged history does not repeatedly
+reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
+for the storage and migration contract.
 
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if the original session, profile, or lifecycle generation
