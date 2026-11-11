@@ -299,16 +299,24 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
         ws.send(Ws::Text(r#"{"type":"claim"}"#.into()))
             .await
             .unwrap();
-        until(&mut ws, Duration::from_secs(10), "claimed", |v| {
-            v["type"] == "size_owner" && v["is_owner"] == true
-        })
+        // The claim queues the re-arm before it replies, so the grid transport can
+        // arrive first. The daemon retries arming for twice the VT lease TTL.
+        let (mut claimed, mut grid) = (false, None);
+        until(
+            &mut ws,
+            Duration::from_secs(10),
+            "claimed and grid transport",
+            |v| {
+                match v["type"].as_str() {
+                    Some("size_owner") if v["is_owner"] == true => claimed = true,
+                    Some("transport") if grid.is_none() => grid = Some(v.clone()),
+                    _ => {}
+                }
+                claimed && grid.is_some()
+            },
+        )
         .await;
-
-        // The daemon retries arming for twice the VT lease TTL after the claim.
-        let grid = until(&mut ws, Duration::from_secs(10), "grid transport", |v| {
-            v["type"] == "transport"
-        })
-        .await;
+        let grid = grid.unwrap();
         assert_eq!(grid["grid"], true, "{grid}");
         // Read while the socket is open: closing it releases the daemon's pipe.
         let owner = show_option(&socket, &agent_session, "@aoe_vt_owner");
