@@ -145,9 +145,12 @@ impl HomeView {
         self.flat_items.iter().position(|it| match it {
             Item::Group { path, .. } => {
                 crate::session::is_within_archived_section(path)
+                    || crate::session::is_suggested_section_path(path)
                     || crate::session::is_within_trash_section(path)
             }
-            Item::Session { .. } => false,
+            Item::Session { .. } | Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+                false
+            }
         })
     }
 
@@ -168,7 +171,9 @@ impl HomeView {
                         session_count,
                         ..
                     } => Some(((path, profile), session_count)),
-                    Item::Session { .. } => None,
+                    Item::Session { .. }
+                    | Item::Suggestion { .. }
+                    | Item::SuggestionsViewAll { .. } => None,
                 })
                 .collect()
         } else {
@@ -226,7 +231,9 @@ impl HomeView {
             .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))?;
         let (path, profile) = unfiltered[..at].iter().rev().find_map(|item| match item {
             Item::Group { path, profile, .. } => Some((path, profile)),
-            Item::Session { .. } => None,
+            Item::Session { .. } | Item::Suggestion { .. } | Item::SuggestionsViewAll { .. } => {
+                None
+            }
         })?;
         self.flat_items.iter().position(|item| {
             matches!(item, Item::Group { path: p, profile: pr, .. } if p == path && pr == profile)
@@ -284,6 +291,11 @@ impl HomeView {
             flatten_tree_all_profiles(&pool, &self.group_trees, self.sort_order)
         };
         append_archived_section(&mut items, &pool, self.archived_section_collapsed);
+        append_suggested_section(
+            &mut items,
+            &self.suggestions_feed.keys(),
+            self.suggested_section_collapsed,
+        );
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items
     }
@@ -333,6 +345,11 @@ impl HomeView {
             self.archived_section_collapsed,
             collapsed,
             self.sort_order,
+        );
+        append_suggested_section(
+            &mut items,
+            &self.suggestions_feed.keys(),
+            self.suggested_section_collapsed,
         );
         append_trash_section(&mut items, grouped, self.trashed_section_collapsed);
         items

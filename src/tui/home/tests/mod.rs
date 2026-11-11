@@ -233,6 +233,7 @@ mod split_terminal;
 mod stacked_divider_drag;
 mod stacked_single_seam;
 mod status_rows_menu;
+mod suggested_group;
 
 fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
@@ -917,6 +918,8 @@ fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> New
         scratch: false,
         fork_seed: None,
         structured: false,
+        initial_prompt: None,
+        suggestion: None,
     }
 }
 
