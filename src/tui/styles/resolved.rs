@@ -262,15 +262,15 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
         deeper,
         composite(theme.error, bg, 0.1),
     ];
-    let hint = hex(lift_until(
+    let lifted_hint = hex(lift_until(
         theme.hint,
         bg,
         &text_surfaces,
         TEXT_CONTRAST_RATIO,
     ));
     css.insert("--color-text-primary".into(), hex(theme.text));
-    css.insert("--color-text-secondary".into(), hint.clone());
-    css.insert("--color-text-muted".into(), hint);
+    css.insert("--color-text-secondary".into(), lifted_hint.clone());
+    css.insert("--color-text-muted".into(), lifted_hint);
     css.insert("--color-text-dim".into(), hex(theme.dimmed));
     // Dimmed lifted for small text that cannot use the raw slot.
     css.insert(
