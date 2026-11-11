@@ -9,6 +9,7 @@ import {
   isVisiblyBusy,
   mergeServerRows,
   patchServerRow,
+  MAX_FINISHED_BACKGROUND_SHELLS,
   summarizeAnswers,
   transcriptRowToActivity,
   type AcpEvent,
@@ -393,6 +394,54 @@ describe("applyEvent / subagent roster", () => {
     const state = run(launched, update("idle", "t1", { parent_tool_call_id: null }));
     expect(state.backgroundAgents[0]).toMatchObject({ status: "running", endedAt: null });
     expect(state.subagents).toHaveLength(1);
+  });
+});
+
+describe("applyEvent / background shells", () => {
+  it("keeps a shell's command after it ends and caps the finished ones", () => {
+    const start = (id: string, workflow?: { run_id: string; name: string }) =>
+      ({
+        BackgroundTaskStarted: { task_id: id, description: `cmd ${id}`, workflow, started_at: "2026-11-06T10:00:00Z" },
+      }) as AcpEvent;
+    const end = (id: string) =>
+      ({ BackgroundTaskFinished: { task_id: id, ended_at: "2026-11-06T10:01:00Z" } }) as AcpEvent;
+    let seq = 0;
+    let state = [start("a"), start("wf", { run_id: "wf_1", name: "drafts" })].reduce(
+      (s, e) => ev(s, ++seq, e),
+      emptyAcpState(),
+    );
+    expect(state.backgroundShells).toEqual([
+      { taskId: "a", command: "cmd a", startedAt: "2026-11-06T10:00:00Z", endedAt: null, finished: false },
+    ]);
+    state = ev(state, ++seq, end("a"));
+    expect(state.backgroundTasks).toEqual(["wf"]);
+    expect(state.backgroundShells[0]).toMatchObject({ finished: true, endedAt: "2026-11-06T10:01:00Z" });
+
+    for (let i = 0; i < MAX_FINISHED_BACKGROUND_SHELLS + 3; i++) {
+      state = ev(state, ++seq, start(`t${i}`));
+      state = ev(state, ++seq, end(`t${i}`));
+    }
+    expect(state.backgroundShells).toHaveLength(MAX_FINISHED_BACKGROUND_SHELLS);
+    expect(state.backgroundShells[0]!.taskId).toBe("t3");
+  });
+
+  it("keeps a finish a stale snapshot would reopen, but lets a reused task id restart", () => {
+    const run = (startedAt: string, finished: boolean) =>
+      reducedState({
+        background_shells: [{ task_id: "a", command: "cmd", started_at: startedAt, finished }],
+      });
+    let state = ev(emptyAcpState(), 1, {
+      BackgroundTaskStarted: { task_id: "a", description: "cmd", started_at: "2026-11-06T10:00:00Z" },
+    } as AcpEvent);
+    state = ev(state, 2, {
+      BackgroundTaskFinished: { task_id: "a", ended_at: "2026-11-06T10:01:00Z" },
+    } as AcpEvent);
+
+    const stale = applyReducedState(state, run("2026-11-06T10:00:00Z", false));
+    expect(stale.backgroundShells[0]).toMatchObject({ finished: true, endedAt: "2026-11-06T10:01:00Z" });
+
+    const reused = applyReducedState(state, run("2026-11-06T11:00:00Z", false));
+    expect(reused.backgroundShells[0]).toMatchObject({ finished: false, startedAt: "2026-11-06T11:00:00Z" });
   });
 });
 

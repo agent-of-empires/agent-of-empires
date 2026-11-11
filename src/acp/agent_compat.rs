@@ -6,8 +6,8 @@ use agent_client_protocol::v1::schema::InitializeResponse;
 use super::state::StartupErrorDetail;
 
 /// Single source of truth for the `claude-agent-acp` minimum-version floor.
-pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.99.1";
-pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.99.1";
+pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.103.0";
+pub const CLAUDE_AGENT_ACP_STEERING_MIN_VERSION: &str = "0.103.0";
 /// Single source of truth for the `opencode` minimum-version floor.
 pub const OPENCODE_MIN_VERSION: &str = "1.16.0";
 
@@ -157,7 +157,7 @@ impl StartupErrorDetail {
                 install_command,
                 ..
             } => format!(
-                "{package_name} {installed} installed; aoe requires >={required}. Run: {install_command}",
+                "{package_name} {installed} installed; aoe requires >={required}. Run: {install_command}, or `aoe acp doctor --fix`",
             ),
             Self::MissingAgentInfo {
                 expected_package,
@@ -454,12 +454,14 @@ mod tests {
             assert_eq!(got.as_ref().map(|e| e.kind()), want, "{agent:?} {info:?}");
         }
 
-        let Err(StartupError::IncompatibleAgentVersion {
+        let too_old = validate(ClaudeAgentAcp, &init(Some((CLAUDE, "0.0.0")))).unwrap_err();
+        assert!(too_old.user_message().contains("`aoe acp doctor --fix`"));
+        let StartupError::IncompatibleAgentVersion {
             installed,
             required,
             auto_install,
             ..
-        }) = validate(ClaudeAgentAcp, &init(Some((CLAUDE, "0.0.0"))))
+        } = too_old
         else {
             panic!("expected an incompatible version");
         };
@@ -489,8 +491,8 @@ mod tests {
             ),
             (ClaudeAgentAcp, Some(true), "999.0.0", true),
             // Advertised but pre-opt-in: the case the floor exists for.
-            (ClaudeAgentAcp, Some(true), "0.99.0", false),
-            (ClaudeAgentAcp, Some(true), "0.99.1-alpha.1", false),
+            (ClaudeAgentAcp, Some(true), "0.102.0", false),
+            (ClaudeAgentAcp, Some(true), "0.103.0-alpha.1", false),
             (ClaudeAgentAcp, Some(false), "999.0.0", false),
             (ClaudeAgentAcp, None, "999.0.0", false),
             (ClaudeAgentAcp, Some(true), "nightly", false),

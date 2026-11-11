@@ -111,6 +111,7 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
             tool_call_id,
             description: String::new(),
             workflow: None,
+            started_at: Some(chrono::Utc::now()),
         }),
         // The task tailer needs the tool call id to recognise the run's end.
         "Workflow" if str_field("status") == Some("async_launched") && tool_call_id.is_some() => {
@@ -125,6 +126,7 @@ pub(super) fn background_task_started_from_value(v: &serde_json::Value) -> Optio
                     summary: str_field("summary").map(str::to_string),
                     transcript_dir: str_field("transcriptDir").unwrap_or_default().to_string(),
                 }),
+                started_at: Some(chrono::Utc::now()),
             })
         }
         _ => None,
@@ -294,6 +296,7 @@ mod tests {
                 tool_call_id,
                 description,
                 workflow,
+                ..
             }) => {
                 assert_eq!(task_id, "wfgxmundi");
                 assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));

@@ -30,6 +30,7 @@ export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reduce
 export {
   clearAcpCache,
   useBackgroundAgents,
+  useBackgroundShells,
   useBackgroundTasks,
   useSubagents,
   useWorkflowRuns,

@@ -1292,14 +1292,34 @@ pub(super) fn apply_declared_config_dir(
     let native_of = |name: &str| crate::acp::agent_profiles::resolve(name).native_config_agent;
     // After an agent switch `tool` is unchanged but may name another backend: the tool's entry
     // applies only to a target it launches itself (same key, a built-in alias, or its base).
+    // An explicit execution mapping to another backend keeps the target's own route.
     let tool_runs_target = target == tool
         || native_of(target).is_some_and(|built_in| {
-            native_of(tool) == Some(built_in)
-                || [&session.agent_execution_as, &session.agent_detect_as]
-                    .iter()
-                    .any(|map| map.get(tool).map(String::as_str) == Some(native))
+            session
+                .agent_execution_as
+                .get(tool)
+                .is_none_or(|base| native_of(base) == Some(built_in))
+                && (native_of(tool) == Some(built_in)
+                    || [&session.agent_execution_as, &session.agent_detect_as]
+                        .iter()
+                        .any(|map| {
+                            map.get(tool).is_some_and(|base| {
+                                base == native || native_of(base) == Some(built_in)
+                            })
+                        }))
         });
-    let key = if tool_runs_target { tool } else { target };
+    let declared = |name: &str| {
+        session
+            .agent_config_dir
+            .get(name)
+            .is_some_and(|d| crate::session::config::is_resolvable_agent_config_dir(d))
+    };
+    // A compatible wrapper without a usable entry falls back to the target's.
+    let key = if tool_runs_target && (declared(tool) || !declared(target)) {
+        tool
+    } else {
+        target
+    };
     let native = session
         .agent_execution_as
         .get(key)
@@ -1678,6 +1698,79 @@ time.sleep(60)
                 "claude",
                 vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
                 Some(PathBuf::from("/acct")),
+            ),
+            // A session pinned to the `claude-code` agent still runs its wrapper's account.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "/acct")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
+                Some(PathBuf::from("/acct")),
+            ),
+            // A wrapper without an entry keeps the pinned target's directory.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/target")],
+                Some(PathBuf::from("/target")),
+            ),
+            // An unresolvable wrapper entry does not shadow the target's.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "relative/dir"), ("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/target")],
+                Some(PathBuf::from("/target")),
+            ),
+            // With both entries the wrapper's wins.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "/acct"), ("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/acct")],
+                Some(PathBuf::from("/acct")),
+            ),
+            // A wrapper that executes as another backend does not leak into the pinned target.
+            (
+                {
+                    let mut cfg = cfg(&[("claude-c", "/codex"), ("claude-code", "/target")]);
+                    cfg.session
+                        .agent_detect_as
+                        .insert("claude-c".into(), "claude".into());
+                    cfg.session
+                        .agent_execution_as
+                        .insert("claude-c".into(), "codex".into());
+                    cfg
+                },
+                "claude-c",
+                "claude-code",
+                vec![pair("CLAUDE_CONFIG_DIR", "/target")],
+                Some(PathBuf::from("/target")),
             ),
             (
                 cfg(&[("codex", "/acct")]),
@@ -2975,6 +3068,7 @@ time.sleep(60)
                     tool_call_id: Some("toolu_task".into()),
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             );
         }

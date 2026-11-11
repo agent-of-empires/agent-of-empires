@@ -1841,7 +1841,7 @@ mod tests {
             version_issue: issue,
         };
         let stale_issue = AgentVersionIssue {
-            reason: "installed 0.37.0; requires >=0.99.1".to_string(),
+            reason: "installed 0.37.0; requires >=0.103.0".to_string(),
             install_command: "npm install -g @x/y@latest".to_string(),
         };
         let marks = [

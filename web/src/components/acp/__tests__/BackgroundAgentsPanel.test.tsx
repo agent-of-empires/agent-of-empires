@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
-import { fireEvent, render } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { BackgroundAgent, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
+import type { BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -13,8 +13,15 @@ const agentsMock = vi.fn<() => BackgroundAgent[]>(() => []);
 const tasksMock = vi.fn<() => string[]>(() => []);
 const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
 const subagentsMock = vi.fn<() => SubagentRecord[]>(() => []);
+const shellsMock = vi.fn<() => BackgroundShell[]>(() => []);
+const taskOutputMock = vi.fn();
+vi.mock("../../../lib/api", async (importActual) => ({
+  ...(await importActual<typeof import("../../../lib/api")>()),
+  fetchTaskOutput: (...args: unknown[]) => taskOutputMock(...args),
+}));
 vi.mock("../../../hooks/useAcpSession", () => ({
   useBackgroundAgents: () => agentsMock(),
+  useBackgroundShells: () => shellsMock(),
   useBackgroundTasks: () => tasksMock(),
   useWorkflowRuns: () => runsMock(),
   useSubagents: () => subagentsMock(),
@@ -41,6 +48,231 @@ function agent(over: Partial<BackgroundAgent> = {}): BackgroundAgent {
     ...over,
   };
 }
+
+beforeEach(() => {
+  shellsMock.mockReturnValue([]);
+});
+
+function shell(over: Partial<BackgroundShell> = {}): BackgroundShell {
+  return { taskId: "bx1", command: "npm run dev", startedAt: null, endedAt: null, finished: false, ...over };
+}
+
+describe("BackgroundAgentsPanel shells", () => {
+  it("lists a running shell when there are no sub-agents, instead of the empty state", () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([
+      shell(),
+      shell({ taskId: "bx0", command: "make build", finished: true, endedAt: new Date().toISOString() }),
+    ]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = container.textContent ?? "";
+    expect(text).not.toContain("No background work yet");
+    expect(text).toContain("Running shells · 1");
+    expect(text).toContain("Recent shells · 1");
+    expect(text.indexOf("npm run dev")).toBeLessThan(text.indexOf("make build"));
+  });
+
+  it("shows the empty state with no agents and no shells", () => {
+    agentsMock.mockReturnValue([]);
+    const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(container.textContent).toContain("No background work yet");
+  });
+
+  it("opens the command and its output", async () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell({ finished: true })]);
+    taskOutputMock.mockResolvedValue({ exists: true, output: "listening on 3000", truncated: false });
+    const { getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByTitle("Open command and output"));
+    await waitFor(() => expect(document.body.textContent).toContain("listening on 3000"));
+    expect(document.body.textContent).toContain("npm run dev");
+    expect(taskOutputMock).toHaveBeenCalledWith("s-1", "bx1");
+  });
+
+  it("keeps an open shell dialog when the first background agent appears", async () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell({ finished: true })]);
+    taskOutputMock.mockResolvedValue({ exists: true, output: "listening on 3000", truncated: false });
+    const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(view.getByTitle("Open command and output"));
+    await waitFor(() => expect(view.getByRole("dialog")).toBeTruthy());
+
+    agentsMock.mockReturnValue([agent()]);
+    view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(view.getByText("Background agents · 1")).toBeTruthy();
+    expect(view.getByRole("dialog")).toBeTruthy();
+  });
+
+  it("says when the output is not available", async () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell({ finished: true })]);
+    taskOutputMock.mockResolvedValue({ exists: false, output: "", truncated: false });
+    const { getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByTitle("Open command and output"));
+    await waitFor(() => expect(document.body.textContent).toContain("Output not available."));
+  });
+});
+
+describe("BackgroundAgentsPanel shell dialog", () => {
+  const openShell = async (over: Partial<BackgroundShell> = {}, out = {}) => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell(over)]);
+    taskOutputMock.mockResolvedValue({ exists: true, output: "line one", truncated: false, ...out });
+    const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const launcher = view.getByTitle("Open command and output");
+    launcher.focus();
+    fireEvent.click(launcher);
+    await waitFor(() => expect(document.body.textContent).toContain("line one"));
+    return { ...view, launcher };
+  };
+
+  it("closes on Escape and on a backdrop click, returning focus to the launcher", async () => {
+    const { launcher } = await openShell({ finished: true });
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+    expect(document.activeElement).toBe(dialog.firstElementChild);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(launcher);
+
+    fireEvent.click(launcher);
+    fireEvent.click(document.querySelector('[role="dialog"]') as HTMLElement);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("keeps Tab inside the dialog", async () => {
+    await openShell({ finished: true });
+    const stops = [
+      ...(document.querySelector('[role="dialog"]') as HTMLElement).querySelectorAll<HTMLElement>(
+        "button, pre[tabindex]",
+      ),
+    ];
+    expect(stops.some((el) => el.getAttribute("aria-label") === "Shell output")).toBe(true);
+    const buttons = stops;
+    const last = buttons[buttons.length - 1]!;
+    last.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(document.activeElement).toBe(buttons[0]);
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(last);
+  });
+
+  it("toggles wrapping, flags a truncated tail and says when the command is unknown", async () => {
+    await openShell({ command: "", finished: true }, { truncated: true });
+    expect(document.body.textContent).toContain("(command unavailable)");
+    expect(document.body.textContent).toContain("Showing the end of a long output.");
+    const pre = document.querySelector("pre[class*='max-h']") as HTMLElement;
+    expect(pre.className).toContain("whitespace-pre-wrap");
+    fireEvent.click(document.querySelector("button[aria-pressed]") as HTMLElement);
+    expect(pre.className).not.toContain("whitespace-pre-wrap");
+  });
+
+  it("names the output region and leaves a reader who scrolled up where they are", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell()]);
+      taskOutputMock.mockReset();
+      const reply = (output: string) => ({ exists: true, output, truncated: false });
+      taskOutputMock
+        .mockResolvedValueOnce(reply("one"))
+        .mockResolvedValueOnce(reply("one\ntwo"))
+        .mockResolvedValue(reply("one\ntwo\nthree"));
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      const out = view.getByRole("region", { name: "Shell output" });
+      expect(out.textContent).toBe("one");
+      Object.defineProperty(out, "scrollHeight", { value: 1000, configurable: true });
+      Object.defineProperty(out, "clientHeight", { value: 100, configurable: true });
+
+      await act(() => vi.advanceTimersByTimeAsync(2001));
+      expect(out.textContent).toContain("two");
+      expect(out.scrollTop).toBe(1000);
+
+      out.scrollTop = 0;
+      fireEvent.scroll(out);
+      await act(() => vi.advanceTimersByTimeAsync(2001));
+      expect(out.textContent).toContain("three");
+      expect(out.scrollTop).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tells a failed read apart from a missing file and retries a finished shell until it lands", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell({ finished: true })]);
+      taskOutputMock.mockReset();
+      taskOutputMock
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue({ exists: true, output: "recovered", truncated: false });
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await act(() => vi.advanceTimersByTimeAsync(0));
+      expect(document.body.textContent).toContain("Could not load output.");
+      expect(document.body.textContent).not.toContain("Output not available.");
+
+      await act(() => vi.advanceTimersByTimeAsync(2001));
+      expect(view.getByRole("region", { name: "Shell output" }).textContent).toBe("recovered");
+      expect(document.body.textContent).not.toContain("Could not load output.");
+
+      const calls = taskOutputMock.mock.calls.length;
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(taskOutputMock).toHaveBeenCalledTimes(calls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops retrying a finished shell whose output never loads", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell({ finished: true })]);
+      taskOutputMock.mockReset();
+      taskOutputMock.mockResolvedValue(null);
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await act(() => vi.advanceTimersByTimeAsync(30_000));
+      expect(taskOutputMock).toHaveBeenCalledTimes(6);
+      expect(document.body.textContent).toContain("Could not load output.");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("polls a running shell one read at a time and stops once it finishes", async () => {
+    vi.useFakeTimers();
+    try {
+      agentsMock.mockReturnValue([]);
+      shellsMock.mockReturnValue([shell()]);
+      let release: (v: unknown) => void = () => {};
+      taskOutputMock.mockReset();
+      taskOutputMock
+        .mockImplementationOnce(() => new Promise((r) => (release = r)))
+        .mockResolvedValue({ exists: true, output: "later", truncated: false });
+      const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(view.getByTitle("Open command and output"));
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(taskOutputMock).toHaveBeenCalledTimes(1);
+
+      release({ exists: true, output: "first", truncated: false });
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(taskOutputMock).toHaveBeenCalledTimes(2);
+
+      shellsMock.mockReturnValue([shell({ finished: true })]);
+      view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+      await vi.advanceTimersByTimeAsync(0);
+      const afterFinish = taskOutputMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(taskOutputMock).toHaveBeenCalledTimes(afterFinish);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
 
 describe("BackgroundAgentsPanel", () => {
   it("groups a workflow's agents under the run and its phases", () => {
