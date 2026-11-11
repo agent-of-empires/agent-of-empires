@@ -71,6 +71,8 @@ export interface WizardState {
   agentsStatus: "loading" | "ready" | "failed" | "missing";
   /** Which profile `agents` and `agentsStatus` describe; any other profile is still loading. */
   agentsFor: string | null;
+  /** The project `agents` was fetched for; its `acp_create_ready` holds only for that project. */
+  agentsProject: string | null;
   groups: GroupInfo[];
   /** Which profile `groups` was fetched for; any other profile sees no Groups. */
   groupsFor: string | null;
@@ -89,7 +91,7 @@ export type Action =
   | { type: "SUBMIT_FAILED"; failure: CreateFailure }
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
-  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string }
+  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string; agentsProject: string }
   | { type: "AGENTS_FAILED"; agentsFor: string; missing: boolean }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
@@ -231,14 +233,17 @@ function seededStructuredView(data: WizardData, action: { useStructuredView?: bo
 
 const NO_AGENTS: AgentInfo[] = [];
 
-/** The agent list for `profile`: one loaded for another profile reads as still loading. */
+/** The agent list for `profile`: one loaded for another profile reads as still loading. One loaded
+ *  for another `project` keeps its agents but not their `acp_create_ready`, which may differ there. */
 export function agentsView(
-  state: Pick<WizardState, "agents" | "agentsStatus" | "agentsFor">,
+  state: Pick<WizardState, "agents" | "agentsStatus" | "agentsFor" | "agentsProject">,
   profile: string,
+  project: string,
 ): { agents: AgentInfo[]; agentsStatus: WizardState["agentsStatus"] } {
-  return state.agentsFor === profile
-    ? { agents: state.agents, agentsStatus: state.agentsStatus }
-    : { agents: NO_AGENTS, agentsStatus: "loading" };
+  if (state.agentsFor !== profile) return { agents: NO_AGENTS, agentsStatus: "loading" };
+  const agents =
+    state.agentsProject === project ? state.agents : state.agents.map(({ acp_create_ready: _, ...a }) => a);
+  return { agents, agentsStatus: state.agentsStatus };
 }
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -291,8 +296,16 @@ function reduce(state: WizardState, action: Action): WizardState {
     case "SUBMIT_CANCEL":
       return { ...state, isSubmitting: false, error: null, failure: null };
     case "SET_AGENTS":
-      return { ...state, agents: action.agents, agentsStatus: "ready", agentsFor: action.agentsFor };
+      return {
+        ...state,
+        agents: action.agents,
+        agentsStatus: "ready",
+        agentsFor: action.agentsFor,
+        agentsProject: action.agentsProject,
+      };
     case "AGENTS_FAILED":
+      // Another project's list for this Profile stays usable; only its readiness is dropped.
+      if (action.agentsFor === state.agentsFor && state.agentsStatus === "ready" && !action.missing) return state;
       return {
         ...state,
         // A retry for the same Profile keeps its list; another Profile's list must not be read for it.
