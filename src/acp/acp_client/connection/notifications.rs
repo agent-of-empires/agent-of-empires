@@ -22,7 +22,8 @@ use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
-    restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
+    restore_wake_tool_title, shell_command, update_tool_context_cache, ToolCallContextCache,
+    ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -298,7 +299,7 @@ impl Shared {
             &self.session_label,
         )
         .await;
-        for event in events {
+        for mut event in events {
             if let Event::BackgroundAgentLaunched {
                 agent_id,
                 output_file,
@@ -326,6 +327,17 @@ impl Shared {
                     "dropping post-load history-replay event"
                 );
                 continue;
+            }
+            if let Event::BackgroundTaskStarted {
+                tool_call_id: Some(call),
+                description,
+                workflow: None,
+                ..
+            } = &mut event
+            {
+                if let Some(command) = shell_command(&self.tool_context_cache, call) {
+                    *description = command;
+                }
             }
             if let Event::BackgroundTaskStarted {
                 task_id,

@@ -3312,3 +3312,19 @@ export async function syncSkills(options?: {
     };
   }
 }
+
+export interface TaskOutput {
+  exists: boolean;
+  output: string;
+  truncated: boolean;
+}
+
+const TASK_OUTPUT_TIMEOUT_MS = 10_000;
+
+/** Tail of a background shell's output; null when the request fails or times out. */
+export async function fetchTaskOutput(sessionId: string, taskId: string): Promise<TaskOutput | null> {
+  return fetchJson<TaskOutput>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/acp/tasks/${encodeURIComponent(taskId)}/output`,
+    { signal: AbortSignal.timeout(TASK_OUTPUT_TIMEOUT_MS) },
+  );
+}
