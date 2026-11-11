@@ -205,6 +205,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       >
         {toasts.map((t) => {
           const clickable = !!t.sessionId || !!t.href;
+          // A blank message would leave the opener without an accessible name.
+          const openerLabel = t.message.trim() ? t.message : t.href ? "Open link" : "Open session";
           const onToastClick = () => {
             if (t.href) {
               // Defensive re-check: the server already rejects disallowed notification hrefs, but never hand an
@@ -245,7 +247,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   }}
                   className="flex-1 break-words text-left cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
                 >
-                  {t.message}
+                  {openerLabel}
                 </button>
               ) : (
                 <span className="flex-1 break-words">{t.message}</span>

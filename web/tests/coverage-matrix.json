@@ -998,7 +998,7 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/Toasts.test.tsx"],
       "components": ["web/src/components/Toasts.tsx"],
-      "notes": "A toast that opens a session (in-app push) or a validated URL (plugin ui.open_url) renders its message as a native button before Dismiss in tab order: activating it opens the target once and dismisses the toast, a click elsewhere on the toast still opens it, and Dismiss closes it without navigating. Plain toasts keep a non-interactive message; status and alert roles are unchanged."
+      "notes": "A toast that opens a session (in-app push) or a validated URL (plugin ui.open_url) renders its message as a native button before Dismiss in tab order, labeled \"Open link\" or \"Open session\" when the message is blank: activating it opens the target once and dismisses the toast, a click elsewhere on the toast still opens it, and Dismiss closes it without navigating. Plain toasts keep a non-interactive message; status and alert roles are unchanged."
     },
     {
       "id": "notifications.linked-toasts-keyboard",

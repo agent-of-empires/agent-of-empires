@@ -229,6 +229,39 @@ describe("linked toasts from the keyboard", () => {
     window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
     open.mockRestore();
   });
+
+  it("names a blank message's opener after its target and opens it once", () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const onOpen = vi.fn();
+    window.addEventListener(OPEN_SESSION_EVENT, onOpen);
+    renderProvider();
+    // (how the blank toast arrives, the opener's name, what opening it must do)
+    const cases: [() => void, string, () => void][] = [
+      [
+        () => act(() => toastBus.handler?.openLink("   ", "https://example.com/pr/1")),
+        "Open link",
+        () => expect(open).toHaveBeenLastCalledWith("https://example.com/pr/1", "_blank", "noopener,noreferrer"),
+      ],
+      [
+        () => dispatchPush({ type: "aoe-push", payload: { title: "  ", session_id: "sess-1" } }),
+        "Open session",
+        () => expect((onOpen.mock.calls.at(-1)![0] as CustomEvent).detail).toEqual({ sessionId: "sess-1" }),
+      ],
+    ];
+    for (const [arrive, name, opened] of cases) {
+      const before = onOpen.mock.calls.length + open.mock.calls.length;
+      arrive();
+      const opener = screen.getByRole("button", { name });
+      const toast = opener.closest("[role]") as HTMLElement;
+      expect(within(toast).getAllByRole("button").indexOf(opener), name).toBe(0);
+      act(() => fireEvent.click(opener));
+      expect(onOpen.mock.calls.length + open.mock.calls.length - before, name).toBe(1);
+      opened();
+      expect(screen.queryByRole("button", { name }), name).toBeNull();
+    }
+    window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
+    open.mockRestore();
+  });
 });
 
 describe("timed toast lifetime", () => {
