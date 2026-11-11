@@ -458,6 +458,64 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
     let _ = fake.agent.await;
 }
 
+/// A message typed in another Remote Control client arrives as a live
+/// `user_message_chunk` with no AoE prompt in flight (#5086). It must show as
+/// a user message, and the reply that follows must close through the
+/// between-prompt watchdog.
+#[tokio::test]
+async fn idle_remote_control_message_records_and_returns_to_idle() {
+    let mut fake = spawn_fake_connection("s-remote", |_| Vec::new()).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(
+            fake.event_rx.recv().await.expect("connection remains open"),
+            Event::AcpSessionAssigned { .. }
+        ) {}
+    })
+    .await
+    .expect("session commits");
+
+    let update = |body: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-remote","update":{body}}}}}"#
+        )
+    };
+    for body in [
+        r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"from the app"}}"#,
+        r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"on it"}}"#,
+        r#"{"sessionUpdate":"usage_update","used":10,"size":100,"cost":{"amount":0.1,"currency":"USD"}}"#,
+    ] {
+        write_line(&fake.agent_write, &update(body)).await;
+    }
+
+    // The idle grace is wall-clock, so the deadline covers it with margin.
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(event) = fake.event_rx.recv().await {
+            let stopped = matches!(event, Event::Stopped { .. });
+            seen.push(event);
+            if stopped {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the agent-initiated turn must reach a terminal Stopped");
+
+    let user = seen.iter().position(|e| {
+        matches!(e, Event::UserPromptSent { text, prompt_id: None, .. } if text == "from the app")
+    });
+    let reply = seen
+        .iter()
+        .position(|e| matches!(e, Event::AgentMessageChunk { .. }));
+    let stopped = seen.iter().position(|e| matches!(e, Event::Stopped { .. }));
+    assert!(
+        user.is_some() && user < reply && reply < stopped,
+        "user message, reply, then Stopped expected: {seen:?}"
+    );
+    fake.agent.abort();
+    let _ = fake.agent.await;
+}
+
 /// A prompted turn the adapter ends normally after a rejected window parks like
 /// the error path; a cancelled turn, an already-past reset, or a window extra
 /// usage covers does not.
