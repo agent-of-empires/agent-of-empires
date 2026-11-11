@@ -202,4 +202,58 @@ describe("MobileLiveTerminal live-edge scroll", () => {
     expect(enterReading).not.toHaveBeenCalled();
     expect(returnToLive).toHaveBeenCalledTimes(2);
   });
+  it("clicking in a session while scrolled up stays where the reader was instead of scrolling down", async () => {
+    const returnToLive = vi.fn();
+    const termProps = { ...props(), returnToLive };
+    const { container, rerender } = render(<MobileLiveTerminal {...termProps} />);
+    const scroller = container.querySelector("[data-live-terminal] > div") as HTMLElement;
+    const input = termProps.inputRef.current as HTMLTextAreaElement;
+    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+    const readingPos = bottom() - 20 * LINE_H;
+    scroller.scrollTop = readingPos;
+    fireEvent.scroll(scroller);
+    // The hook answers enterReading by flipping `reading` on.
+    rerender(<MobileLiveTerminal {...termProps} reading />);
+    returnToLive.mockClear();
+
+    // A desktop click focuses the hidden input so the physical keyboard types;
+    // that focus alone is not an intent to leave the scrollback.
+    fireEvent.click(scroller);
+    expect(document.activeElement).toBe(input);
+    await nextFrame();
+    expect(scroller.scrollTop).toBeCloseTo(readingPos, 0);
+    expect(returnToLive).not.toHaveBeenCalled();
+
+    // Typing is: the reader is sent back to the live prompt they are typing into.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(scroller.scrollTop).toBe(bottom());
+    expect(returnToLive).toHaveBeenCalled();
+  });
+
+  it("opening the soft keyboard on touch still returns to the live prompt", async () => {
+    const savedMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(pointer: coarse)",
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      const returnToLive = vi.fn();
+      const termProps = { ...props(), returnToLive };
+      const { container } = render(<MobileLiveTerminal {...termProps} />);
+      const scroller = container.querySelector("[data-live-terminal] > div") as HTMLElement;
+      scroller.scrollTop = bottom() - 20 * LINE_H;
+      fireEvent.scroll(scroller);
+      returnToLive.mockClear();
+
+      fireEvent.click(scroller);
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      expect(scroller.scrollTop).toBe(bottom());
+      expect(returnToLive).toHaveBeenCalled();
+    } finally {
+      window.matchMedia = savedMatchMedia;
+    }
+  });
 });
