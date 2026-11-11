@@ -334,6 +334,7 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
 const TERMINAL_BUSY_BUDGET_MS = 30_000;
 
 // A launch holds the lifecycle reservation, so a terminal opened meanwhile gets 409 lifecycle_busy until it ends.
+// Only a launch is waited out: other busy operations (stop, purge, ...) are refused at once.
 export async function ensureTerminal(
   id: string,
   index = 0,
@@ -345,6 +346,7 @@ export async function ensureTerminal(
   for (let delay = 250; ; delay = Math.min(delay * 2, 1000)) {
     if (signal?.aborted) return { ok: false, error: "aborted" };
     let result: EnsureSessionResult;
+    let launching: boolean;
     try {
       const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
         method: "POST",
@@ -353,6 +355,7 @@ export async function ensureTerminal(
       if (res.ok) return { ok: true };
       const body = await res.json().catch(() => ({}));
       if (signal?.aborted) return { ok: false, error: "aborted" };
+      launching = body.error === "lifecycle_busy" && body.operation === "launch";
       result = {
         ok: false,
         error: typeof body.error === "string" ? body.error : undefined,
@@ -363,7 +366,7 @@ export async function ensureTerminal(
       return { ok: false, message: e instanceof Error ? e.message : "Network error" };
     }
     const remaining = deadline - Date.now();
-    if (result.error !== "lifecycle_busy" || remaining <= 0) return result;
+    if (!launching || remaining <= 0) return result;
     await new Promise((resolve) => setTimeout(resolve, Math.min(delay, remaining)));
     if (signal?.aborted) return { ok: false, error: "aborted" };
     if (Date.now() >= deadline) return result;

@@ -844,7 +844,7 @@ describe("ensureTerminal", () => {
   });
 
   describe("lifecycle_busy", () => {
-    const busy = () => json({ error: "lifecycle_busy", message: "busy" }, 409);
+    const busy = (operation = "launch") => json({ error: "lifecycle_busy", operation, message: "busy" }, 409);
     beforeEach(() => vi.useFakeTimers());
     afterEach(() => vi.useRealTimers());
 
@@ -854,6 +854,14 @@ describe("ensureTerminal", () => {
       await vi.advanceTimersByTimeAsync(10_000);
       expect(await result).toEqual({ ok: true });
       expect(fetchSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not wait out a busy operation other than a launch", async () => {
+      fetchSpy.mockResolvedValue(busy("stop"));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
     });
 
     it("gives the busy error back once the budget is spent", async () => {
