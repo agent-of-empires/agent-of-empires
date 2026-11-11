@@ -558,6 +558,7 @@ mod tests {
             size: 42,
         };
         let with_attachment = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: "look at this".into(),
             attachments: vec![attachment.clone()],

@@ -158,7 +158,8 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             let _ = entered.send(());
             let _ = release.await;
         }
-        if query_store(
+        if super::query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
             "idle-reap quota hold",
@@ -176,7 +177,9 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         let Some(scope) = lease.native_scope().ok().flatten() else {
             continue;
         };
-        let probe = query_store(
+        // Re-check after queued events reach the store; a failed probe is busy.
+        let probe = super::query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
             "idle-reap eligibility",
@@ -185,7 +188,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                     store
                         .last_event_at_for_sessions(&[id.to_owned()])
                         .remove(id),
-                    store.has_in_flight_turn(id),
+                    store.holds_live_work(id),
                     store.has_open_tool_call_in_epoch(id),
                     !store.unresolved_approval_nonces(id).is_empty()
                         || !store.unresolved_elicitation_nonces(id).is_empty(),
@@ -193,7 +196,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             },
         )
         .await;
-        let Some((latest, in_flight, open_tool, awaiting_user)) = probe else {
+        let Some((latest, holds_live_work, open_tool, awaiting_user)) = probe else {
             continue;
         };
         let last_ms = latest.map(|last| last.max(lease.idle_baseline_ms()));
@@ -203,7 +206,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                 chrono::Utc::now().timestamp_millis(),
                 last_ms,
                 idle_secs,
-                in_flight,
+                holds_live_work.unwrap_or(true),
             )
         {
             continue;
@@ -375,6 +378,8 @@ mod tests {
             },
             /// Quiet for an hour, but a prompt was admitted and not yet stored.
             PromptPending,
+            /// Quiet for an hour, but an agent-initiated turn never got its `Stopped`.
+            OpenAgentTurn,
         }
         // (worker, reaped)
         let cases = [
@@ -393,6 +398,7 @@ mod tests {
                 true,
             ),
             (Worker::PromptPending, false),
+            (Worker::OpenAgentTurn, false),
         ];
         for (worker, reaped) in cases {
             let id = "resuming-session";
@@ -431,6 +437,24 @@ mod tests {
                     lease.test_backdate_idle_baseline(
                         Utc::now().timestamp_millis() - admitted_secs_ago * 1000,
                     );
+                    (None, Running)
+                }
+                Worker::OpenAgentTurn => {
+                    state
+                        .acp_event_store
+                        .record_at(
+                            id,
+                            2,
+                            &Event::AgentMessageChunk {
+                                text: "woken".into(),
+                                message_id: None,
+                            },
+                            stale_ms,
+                        )
+                        .unwrap();
+                    sup.test_insert_worker(id).await;
+                    let lease = sup.running_lease(id).unwrap();
+                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
                     (None, Running)
                 }
                 Worker::PromptPending => {
@@ -754,6 +778,7 @@ mod tests {
         }
         fn prompt(text: &str) -> Event {
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 prompt_id: None,
                 text: text.to_string(),
                 attachments: Vec::new(),

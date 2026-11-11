@@ -93,6 +93,8 @@ export interface AvailableCommand {
   description: string;
   /** The command takes free-form arguments after the name. */
   accepts_input: boolean;
+  /** Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`. */
+  input_hint?: string;
 }
 
 /** Unknown categories arrive as bare strings (Rust `Other` is untagged). */
@@ -444,6 +446,8 @@ export type AcpEvent =
         attachments?: PromptAttachmentRefWire[];
         /** Client-minted id echoed back so the optimistic row reconciles by id. */
         prompt_id?: string | null;
+        /** Other queued rows folded into this turn (queue drain or send-now); each one's optimistic row is retired too. */
+        merged_prompt_ids?: string[];
       };
     }
   | {
@@ -814,6 +818,8 @@ export interface ActivityRow {
   attachments?: AcpAttachment[];
   /** Plugin that sent a `user_prompt` row; unset when the user typed it. */
   originPlugin?: string;
+  /** Other queued rows folded into this `user_prompt` row; their optimistic rows are retired with it. */
+  mergedPromptIds?: string[];
   output?: ToolOutputBlock[];
   elicitationAnswers?: ElicitationAnswer[];
   asyncSubagent?: boolean;
@@ -834,6 +840,7 @@ export interface TranscriptRow {
   output?: ToolOutputBlock[];
   attachments?: PromptAttachmentRefWire[];
   origin_plugin?: string;
+  merged_prompt_ids?: string[];
   diff_comments?: {
     intro: string;
     outro: string;
@@ -885,6 +892,7 @@ export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): 
     ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
     ...(attachments ? { attachments } : {}),
     ...(row.origin_plugin ? { originPlugin: row.origin_plugin } : {}),
+    ...(row.merged_prompt_ids && row.merged_prompt_ids.length > 0 ? { mergedPromptIds: row.merged_prompt_ids } : {}),
     ...(row.diff_comments
       ? {
           diffComments: {
@@ -1420,10 +1428,15 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    const merged = event.UserPromptSent.merged_prompt_ids ?? [];
     if (wasInflight) {
       next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
     } else {
       next.promptSeq += 1;
+    }
+    if (merged.length > 0) {
+      next.inflightPromptIds = next.inflightPromptIds.filter((id) => !merged.includes(id));
+      next.optimisticRows = next.optimisticRows.filter((r) => !merged.includes(r.id));
     }
     next.serverTurnActive = !next.connectionUnavailable;
     next.turnActive = deriveTurnActive(next);

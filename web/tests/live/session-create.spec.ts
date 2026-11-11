@@ -195,7 +195,7 @@ test.describe("scratch sessions", () => {
     await page.keyboard.press("ControlOrMeta+KeyK");
     await expect(page.getByPlaceholder(PALETTE_PLACEHOLDER)).toBeVisible();
     await expect(page.getByRole("option", { name: /New scratch session/i })).toHaveCount(0);
-    // #2108: the "New Session Mode" setting entry also matches but opens settings.
+    // #2108: a setting entry can also match "New session" but opens settings.
     await expect(
       page.getByRole("option", { name: /New session/i }).filter({ hasNotText: "Opens settings" }),
     ).toHaveCount(0);

@@ -31,7 +31,7 @@ use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
     WorkerStart,
 };
-use super::state::AcpSessionId;
+use super::state::{AcpSessionId, Event};
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{
@@ -40,7 +40,7 @@ pub(crate) use teardown::{
 
 pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
-pub use sink::{BroadcastSink, ChannelSink};
+pub use sink::{BroadcastSink, ChannelSink, Persisted};
 
 #[cfg(test)]
 thread_local! {
@@ -128,6 +128,9 @@ pub enum SupervisorError {
     NativeStoreUnavailable,
     #[error("worker registry admission busy")]
     RegistryBusy,
+    /// The event log could not say whether a turn is open; the caller retries.
+    #[error("session {0:?} event log is unavailable")]
+    EventStoreUnavailable(String),
 }
 
 impl SupervisorError {
@@ -588,6 +591,8 @@ pub struct SpawnRequest {
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.
     pub effort_explicit: bool,
+    /// Persisted `model_config` picks, re-applied after the model and effort.
+    pub model_config: std::collections::BTreeMap<String, String>,
     /// Prior ACP session id; loaded instead of a new session when the agent supports it.
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.
@@ -1098,6 +1103,21 @@ fn publish_with_next_seq<R>(
         *last = last.saturating_add(1);
         publish(*last)
     })
+}
+
+/// Queue `event` under the session's counter lock and wait for the store after
+/// releasing it, so a slow save does not hold up the worker drain on that lock.
+/// Returns the seq and whether the event was stored.
+fn publish_next_persisted<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    event: &Event,
+) -> (u64, bool) {
+    let (seq, persisted) = publish_with_next_seq(next_seqs, session_id, |seq| {
+        (seq, sink.queue_persisted(session_id, seq, event))
+    });
+    (seq, persisted.wait())
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

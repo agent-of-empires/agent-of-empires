@@ -12,7 +12,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, JsonRpcRequest};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,7 +26,8 @@ use super::ReadyTx;
 use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
 use crate::acp::acp_client::config_options::{
     apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
-    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
+    model_config_values, modes_available_event, thought_level_config_id,
+    ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::{establish_session_v5, DaemonControlClient};
 use crate::acp::acp_client::errors::{
@@ -101,6 +102,7 @@ pub(super) struct EstablishCtx {
     pub(super) expected_agent: ExpectedAgent,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
+    pub(super) default_model_config: BTreeMap<String, String>,
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
@@ -238,6 +240,7 @@ pub(super) async fn establish(
         close_capable: init.agent_capabilities.session_capabilities.close.is_some(),
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
+        default_model_config: ctx.default_model_config,
         default_mode: ctx.default_mode,
         default_model: ctx.default_model,
         agent_cwd: ctx.agent_cwd,
@@ -270,6 +273,7 @@ pub(super) async fn establish(
     };
     session.apply_default_model().await;
     session.apply_default_effort().await;
+    session.apply_default_model_config().await;
     if arm_resume_watchdog && shared.connection_state.loss().is_none() {
         spawn_resume_idle_watchdog(shared, &session.connection);
     }
@@ -720,6 +724,7 @@ impl Session {
             Ok(options) => {
                 self.channels.thought_level_config_option_id =
                     thought_level_config_id(&options).map(|id| id.0.to_string());
+                self.channels.model_config = model_config_values(&options);
             }
             Err(reason) if self.shared.connection_state.loss().is_none() => {
                 let event = config_option_failure_event(
@@ -736,13 +741,13 @@ impl Session {
 
     /// Effort is a pin carried across respawns, which resume via load or fork,
     /// so it applies after any establish path. Resume captures no option id.
-    async fn apply_default_effort(&self) {
+    async fn apply_default_effort(&mut self) {
         let Some(effort) = self.default_effort.as_deref() else {
             return;
         };
         match self.channels.thought_level_config_option_id.as_deref() {
             Some(config_id) => {
-                let _ = apply_config_default(
+                let result = apply_config_default(
                     &self.connection,
                     &self.shared.connection_state,
                     &self.shared.event_tx,
@@ -752,12 +757,54 @@ impl Session {
                     &self.shared.session_label,
                 )
                 .await;
+                if let Ok(options) = result {
+                    self.channels.model_config = model_config_values(&options);
+                }
             }
             None => debug!(
                 target: "acp.protocol",
                 session = %self.shared.session_label,
                 "structured view effort skipped; no thought_level option"
             ),
+        }
+    }
+}
+
+impl Session {
+    /// Runs last: a model switch rebuilds the option set, so each pick is
+    /// checked against what the model now advertises. An option the model
+    /// lacks is skipped; a rejection is only warned.
+    async fn apply_default_model_config(&mut self) {
+        let label = &self.shared.session_label;
+        for (id, value) in &self.default_model_config {
+            match self.channels.model_config.get(id) {
+                None => debug!(
+                    target: "acp.protocol",
+                    session = %label,
+                    config_id = %id,
+                    "structured view model_config skipped; option not advertised"
+                ),
+                Some(current) if current == value => debug!(
+                    target: "acp.protocol",
+                    session = %label,
+                    config_id = %id,
+                    "structured view model_config already current"
+                ),
+                Some(_) => {
+                    let result = apply_config_default(
+                        &self.connection,
+                        &self.shared.event_tx,
+                        self.acp_session_id.clone(),
+                        SessionConfigId::new(id.clone()),
+                        value,
+                        label,
+                    )
+                    .await;
+                    if let Ok(options) = result {
+                        self.channels.model_config = model_config_values(&options);
+                    }
+                }
+            }
         }
     }
 }

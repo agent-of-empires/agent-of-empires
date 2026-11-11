@@ -44,12 +44,12 @@ jobs:
 
             // Escape hatches for trusted internal automation, whose body
             // is not the contributor template: the nix-npm-hash bot
-            // (`.github/workflows/nix-npm-hash.yml`) and the weekly
-            // release-staging PR (`.github/workflows/open-release-pr.yml`).
+            // (`.github/workflows/nix-npm-hash.yml`) and the release PR
+            // (`.github/workflows/release-plz.yml`).
             //
             // Both open their PR with `secrets.RELEASE_TOKEN`, so the
             // author is the token owner, not github-actions[bot]. Key on
-            // the head branch, as `tag-release-pr.yml` does: creating a
+            // the head branch: creating a
             // branch in the base repo needs push access, so a fork cannot
             // opt out of enforcement by pasting a marker into its body.
             const head = context.payload.pull_request.head;
@@ -63,13 +63,11 @@ jobs:
               body.includes('<!-- nix-npm-hash:') &&
               body.includes('## Checklist');
 
-            const isReleaseStagingBotPr =
-              isInternalRepo &&
-              headRef.startsWith('release-staging/v') &&
-              body.includes('<!-- release-version:');
+            const isReleasePr =
+              isInternalRepo && headRef.startsWith('release-plz-');
 
             const hasChecklist =
-              hasAllTemplateSections || isNixNpmHashBotPr || isReleaseStagingBotPr;
+              hasAllTemplateSections || isNixNpmHashBotPr || isReleasePr;
 
             const prNumber = context.payload.pull_request.number;
             const labelName = 'missing-template';
@@ -191,9 +189,8 @@ jobs:
               // only a maintainer can set one.
               const prBody = pr.body || '';
               const prLabels = (pr.labels || []).map(l => l.name);
-              if (prLabels.includes('release-staging') &&
-                  prBody.includes('<!-- release-version:')) {
-                console.log(`Skipping release-staging PR #${pr.number}`);
+              if (prLabels.includes('release') && prBody.includes('release-plz')) {
+                console.log(`Skipping release PR #${pr.number}`);
                 continue;
               }
               if (prLabels.includes('automated') &&

@@ -205,6 +205,7 @@ struct Launch {
     install_binary: String,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    default_model_config: std::collections::BTreeMap<String, String>,
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
@@ -254,6 +255,7 @@ impl Launch {
             expected_agent: ExpectedAgent::from_command(&self.install_binary),
             source_profile: self.source_profile,
             default_effort: self.default_effort,
+            default_model_config: self.default_model_config,
             default_mode: self.default_mode,
             default_model: self.default_model,
             mcp_servers: self.mcp_servers,
@@ -749,6 +751,7 @@ impl AcpClient {
             install_binary: config.spec.command.clone(),
             source_profile: config.source_profile.clone(),
             default_effort: config.default_effort.clone(),
+            default_model_config: config.default_model_config.clone(),
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
@@ -928,6 +931,7 @@ impl AcpClient {
             // Resume sends no session/new or load, so defaults and MCP servers
             // were applied on first connect.
             default_effort: None,
+            default_model_config: Default::default(),
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
@@ -1038,10 +1042,16 @@ impl AcpClient {
         self.send_cmd(ClientCmd::SetMode(mode_id.to_string())).await
     }
 
-    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AcpError> {
+    pub async fn set_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+        remember: bool,
+    ) -> Result<(), AcpError> {
         self.send_cmd(ClientCmd::SetConfigOption {
             config_id: config_id.to_string(),
             value: value.to_string(),
+            remember,
         })
         .await
     }

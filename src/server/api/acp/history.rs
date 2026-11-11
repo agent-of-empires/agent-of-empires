@@ -293,12 +293,29 @@ pub async fn acp_replay(
         .unwrap_or(DEFAULT_REPLAY_PAGE)
         .clamp(1, MAX_REPLAY_PAGE);
     let backward = q.before.is_some();
-    // One store call so the page and its seq bounds are a consistent snapshot.
-    let page = match q.before {
-        Some(before) => state
-            .acp_event_store
-            .replay_page_before(&id, before, Some(limit)),
-        None => state.acp_event_store.replay_page(&id, q.since, Some(limit)),
+    let (page, history_identity) = if q.view.as_deref() == Some("retained") {
+        match state.acp_event_store.retained_page(
+            &id,
+            q.since,
+            q.before,
+            limit,
+            q.history_identity.as_deref(),
+        ) {
+            Ok(Some((page, identity))) => (page, Some(identity)),
+            Ok(None) => {
+                return (StatusCode::CONFLICT, "retained history changed during read")
+                    .into_response()
+            }
+            Err(error) => return blocking_failed("retained history read failed", error),
+        }
+    } else {
+        let page = match q.before {
+            Some(before) => state
+                .acp_event_store
+                .replay_page_before(&id, before, Some(limit)),
+            None => state.acp_event_store.replay_page(&id, q.since, Some(limit)),
+        };
+        (page, None)
     };
     let (highest_seq, lowest_seq, next_cursor, has_more) = (
         page.highest_seq,
@@ -345,6 +362,7 @@ pub async fn acp_replay(
         next_cursor,
         has_more,
         rows,
+        history_identity,
     })
     .into_response()
 }
@@ -690,6 +708,7 @@ done
             message_id: Some(message_id.into()),
         };
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "status".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -760,6 +779,7 @@ done
                 limit: None,
                 before: None,
                 view: Some("rows".into()),
+                history_identity: None,
             };
             let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
                 .await
@@ -791,6 +811,7 @@ done
             message_id: None,
         };
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "go".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -856,6 +877,7 @@ done
             message_id: Some("m-a".into()),
         };
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "go".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -889,6 +911,7 @@ done
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let events = [
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: "hello".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
@@ -922,6 +945,7 @@ done
                 limit: Some(2),
                 before: None,
                 view: view.map(str::to_string),
+                history_identity: None,
             };
             async move {
                 let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))

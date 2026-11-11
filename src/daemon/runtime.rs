@@ -151,6 +151,10 @@ pub struct RuntimeInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_instance_id: Option<String>,
     pub protocol_version: u16,
+    /// The Daemon's `CARGO_PKG_VERSION` semver, as `/api/about` reports; not `BUILD_VERSION`.
+    /// `None` means unknown: the Daemon predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
     /// Supports CLI selection intent and deferred terminal creation.
     #[serde(default)]
     pub cli_creation: bool,

@@ -1,5 +1,5 @@
-/** "Dashboard updated, reload" banner. */
-export function DashboardUpdateBanner() {
+/** "Dashboard updated, reload" banner. `version` is the Daemon's, which served the new bundle. */
+export function DashboardUpdateBanner({ version }: { version: string }) {
   return (
     <div
       role="status"
@@ -7,7 +7,7 @@ export function DashboardUpdateBanner() {
       className="bg-brand-600/10 border-b border-brand-600/30 px-4 py-2 flex items-center justify-center gap-3 text-xs font-mono text-brand-300 animate-fade-in"
     >
       <span className="w-1.5 h-1.5 rounded-full bg-brand-400 shrink-0" />
-      <span>Dashboard updated.</span>
+      <span>Dashboard updated to v{version}.</span>
       <button
         type="button"
         onClick={() => window.location.reload()}

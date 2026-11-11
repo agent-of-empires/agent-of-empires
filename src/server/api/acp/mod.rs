@@ -82,8 +82,8 @@ pub(super) fn supervisor_error_response(context: &str, err: &SupervisorError) ->
         SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
-        | SupervisorError::NativeStoreUnavailable
-        | SupervisorError::RegistryBusy
+        | SupervisorError::EventStoreUnavailable(_)
+        | SupervisorError::NativeStoreUnavailable| SupervisorError::RegistryBusy
         | SupervisorError::Acp(AcpError::RegistryBusy) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
@@ -196,6 +196,7 @@ pub(crate) fn spawn_request_for(
         model: instance.agent_model.clone(),
         effort: instance.acp_effort.clone(),
         effort_explicit: instance.acp_effort.is_some(),
+        model_config: instance.acp_model_config.clone(),
         stored_acp_session_id: instance.acp_session_id.clone(),
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
