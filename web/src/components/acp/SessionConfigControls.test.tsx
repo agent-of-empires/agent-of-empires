@@ -47,6 +47,13 @@ function mount(
   return { ...utils, onSetConfigOption };
 }
 
+const toggle = (id: string, name: string, current: "on" | "off"): ConfigOptionDescriptor => ({
+  ...option(id, name, "model_config", ["On", "Off"]),
+  current_value: current,
+});
+const FAST = toggle("fast", "Fast mode", "off");
+const ULTRACODE = toggle("ultracode", "Ultracode", "on");
+
 const byId = (id: string) => screen.queryByTestId(`config-option-${id}`);
 
 describe("SessionConfigControls", () => {
@@ -63,6 +70,42 @@ describe("SessionConfigControls", () => {
     const { container } = mount(options);
     if (shown.length === 0) expect(container.firstChild).toBeNull();
     for (const id of ["model", "effort", "future"]) expect(byId(id) !== null).toBe(shown.includes(id));
+  });
+
+  it("renders only on/off model_config options as switches that send the opposite value", () => {
+    const notOnOff = option("tier", "Tier", "model_config", ["Standard", "Priority"]);
+    const wrongCategory = { ...toggle("beta", "Beta", "off"), category: "future_category" };
+    const { onSetConfigOption } = mount([MODEL, FAST, ULTRACODE, notOnOff, wrongCategory]);
+
+    expect(screen.getAllByRole("switch").map((el) => el.getAttribute("aria-label"))).toEqual([
+      "Fast mode",
+      "Ultracode",
+    ]);
+    expect(screen.getByRole("switch", { name: "Fast mode" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("switch", { name: "Ultracode" }).getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(screen.getByRole("switch", { name: "Fast mode" }));
+    fireEvent.click(screen.getByRole("switch", { name: "Ultracode" }));
+    expect(onSetConfigOption.mock.calls).toEqual([
+      ["fast", "on"],
+      ["ultracode", "off"],
+    ]);
+  });
+
+  it("disables a switch while its flip is pending and keeps the confirmed state", () => {
+    mount([FAST], { configId: "fast", value: "on" });
+    const sw = screen.getByRole("switch", { name: "Fast mode" }) as HTMLButtonElement;
+    expect(sw.disabled).toBe(true);
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("drops the switch when the adapter stops advertising the option", () => {
+    const { rerender, onSetConfigOption } = mount([FAST]);
+    expect(screen.queryByRole("switch")).not.toBeNull();
+    rerender(
+      <SessionConfigControls configOptions={[]} pendingConfigOption={null} onSetConfigOption={onSetConfigOption} />,
+    );
+    expect(screen.queryByRole("switch")).toBeNull();
   });
 
   it("uses a segmented control for short effort lists, sending the value, and a dropdown past the threshold", () => {

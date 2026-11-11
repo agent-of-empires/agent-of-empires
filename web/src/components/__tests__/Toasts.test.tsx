@@ -184,6 +184,158 @@ describe("click-to-open (ui.open_url) toast", () => {
   });
 });
 
+describe("timed toast lifetime", () => {
+  const LIFETIME = 6000;
+  const GRACE = 2000;
+
+  const toastFor = (message: string) => screen.getByText(message).closest("[role]") as HTMLElement;
+  const dismissOf = (message: string) => within(toastFor(message)).getByRole("button", { name: "Dismiss" });
+  const advance = (ms: number) => act(() => void vi.advanceTimersByTime(ms));
+  const present = (message: string) => screen.queryByText(message) !== null;
+
+  it.each([
+    ["plain", () => act(() => toastBus.handler?.info("m"))],
+    ["session", () => dispatchPush({ type: "aoe-push", payload: { title: "m", session_id: "s1" } })],
+    ["link", () => act(() => toastBus.handler?.openLink("m", "https://example.com"))],
+  ])("expires a %s toast after its lifetime", (_name, push) => {
+    renderProvider();
+    push();
+    advance(LIFETIME - 1);
+    expect(present("m")).toBe(true);
+    advance(1);
+    expect(present("m")).toBe(false);
+  });
+
+  it("pauses while hovered and resumes with a grace period", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("hover"));
+    advance(5000);
+    fireEvent.pointerEnter(toastFor("hover"));
+    advance(60_000);
+    expect(present("hover")).toBe(true);
+    fireEvent.pointerLeave(toastFor("hover"));
+    advance(GRACE - 1);
+    expect(present("hover")).toBe(true);
+    advance(1);
+    expect(present("hover")).toBe(false);
+  });
+
+  it("resumes with the remaining time when it exceeds the grace", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("early"));
+    advance(1000);
+    fireEvent.pointerEnter(toastFor("early"));
+    advance(30_000);
+    fireEvent.pointerLeave(toastFor("early"));
+    advance(4999);
+    expect(present("early")).toBe(true);
+    advance(1);
+    expect(present("early")).toBe(false);
+  });
+
+  it("pauses while focused", () => {
+    renderProvider();
+    act(() => toastBus.handler?.openLink("focus", "https://example.com"));
+    advance(5000);
+    fireEvent.focusIn(dismissOf("focus"));
+    advance(60_000);
+    expect(present("focus")).toBe(true);
+    fireEvent.focusOut(dismissOf("focus"), { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("focus")).toBe(true);
+    advance(1);
+    expect(present("focus")).toBe(false);
+  });
+
+  it("keeps the pause when focus moves within the toast", () => {
+    renderProvider();
+    act(() => toastBus.handler?.openLink("focus", "https://example.com"));
+    advance(5000);
+    const dismiss = dismissOf("focus");
+    fireEvent.focusIn(dismiss);
+    fireEvent.focusOut(dismiss, { relatedTarget: toastFor("focus").querySelector("span") });
+    advance(60_000);
+    expect(present("focus")).toBe(true);
+    fireEvent.focusOut(dismiss, { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("focus")).toBe(true);
+    advance(1);
+    expect(present("focus")).toBe(false);
+  });
+
+  it("needs both hover and focus released", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("both"));
+    advance(5000);
+    fireEvent.pointerEnter(toastFor("both"));
+    fireEvent.focusIn(dismissOf("both"));
+    fireEvent.pointerLeave(toastFor("both"));
+    advance(60_000);
+    expect(present("both")).toBe(true);
+    fireEvent.focusOut(dismissOf("both"), { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("both")).toBe(true);
+    advance(1);
+    expect(present("both")).toBe(false);
+  });
+
+  it("does not subtract elapsed time twice on repeated pauses", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("twice"));
+    advance(5000);
+    fireEvent.pointerEnter(toastFor("twice"));
+    fireEvent.focusIn(dismissOf("twice"));
+    advance(3000);
+    fireEvent.pointerLeave(toastFor("twice"));
+    fireEvent.focusOut(dismissOf("twice"), { relatedTarget: document.body });
+    advance(GRACE - 1);
+    expect(present("twice")).toBe(true);
+    advance(1);
+    expect(present("twice")).toBe(false);
+  });
+
+  it("keeps a separate timer for each toast", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("A"));
+    advance(1000);
+    act(() => toastBus.handler?.info("B"));
+    fireEvent.pointerEnter(toastFor("A"));
+    advance(LIFETIME - 1);
+    expect(present("B")).toBe(true);
+    advance(1);
+    expect(present("B")).toBe(false);
+    expect(present("A")).toBe(true);
+    advance(60_000);
+    expect(present("A")).toBe(true);
+    fireEvent.pointerLeave(toastFor("A"));
+    advance(4999);
+    expect(present("A")).toBe(true);
+    advance(1);
+    expect(present("A")).toBe(false);
+  });
+
+  it("clears the timer when a toast is dismissed", () => {
+    renderProvider();
+    act(() => toastBus.handler?.info("x"));
+    fireEvent.pointerEnter(toastFor("x"));
+    fireEvent.click(dismissOf("x"));
+    expect(present("x")).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    act(() => toastBus.handler?.info("z"));
+    fireEvent.click(dismissOf("z"));
+    expect(present("z")).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears timers on unmount", () => {
+    const { unmount } = renderProvider();
+    act(() => toastBus.handler?.info("y"));
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("ToastBusBridge", () => {
   it("wires the bus only inside a provider and unwires on unmount", () => {
     const outside = render(<ToastBusBridge />);

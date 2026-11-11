@@ -67,6 +67,7 @@ fn spawn_config(
         provider_env: env,
         host_environment,
         default_effort_explicit: false,
+        default_model_config: Default::default(),
         default_effort: None,
         default_mode: None,
         default_model: None,

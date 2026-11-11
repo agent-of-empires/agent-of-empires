@@ -262,7 +262,13 @@ pub struct AvailableCommand {
     pub description: String,
     #[serde(default)]
     pub accepts_input: bool,
+    /// Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
 }
+
+/// The `Other` category claude-agent-acp uses for Fast mode and Ultracode.
+pub const MODEL_CONFIG_CATEGORY: &str = "model_config";
 
 /// Semantic category of an ACP `SessionConfigOption`; unknown values round-trip as `Other`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -293,6 +299,16 @@ pub struct ConfigOptionDescriptor {
     pub category: ConfigOptionCategory,
     pub current_value: String,
     pub options: Vec<ConfigOptionChoice>,
+}
+
+impl ConfigOptionDescriptor {
+    /// A `model_config` option whose only choices are `on` and `off`.
+    pub fn is_model_config_toggle(&self) -> bool {
+        let mut values: Vec<&str> = self.options.iter().map(|o| o.value.as_str()).collect();
+        values.sort_unstable();
+        self.category == ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into())
+            && values == ["off", "on"]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -815,6 +831,10 @@ pub enum Event {
         /// Client-minted id so a web client reconciles its optimistic row.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
+        /// Ids of the other queued rows folded into this turn (queue drain or
+        /// send-now), so a web client settles each of their optimistic rows.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merged_prompt_ids: Vec<String>,
         /// True when the daemon queued this turn itself (a rate-limit resume
         /// continuation) rather than the user typing it just now. The
         /// transcript model skips rendering a row for it: the user already
@@ -1411,6 +1431,7 @@ pub(crate) mod test_support {
 
     pub(crate) fn prompt(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: Vec::new(),
@@ -2609,6 +2630,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: true,
+                        input_hint: None,
                     }],
                 },
                 Event::ModesAvailable {
