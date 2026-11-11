@@ -7,6 +7,7 @@ import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
 import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
+import { recallReadingRow } from "../lib/liveScrollMemory";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
 import type { SessionResponse } from "../lib/types";
@@ -79,7 +80,16 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     },
     [],
   );
-  const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath, receiveAgentClipboard);
+  // Where the reader left this pane last time it was open (null: live tail).
+  // Recalled once per mount: the pane remounts on every session switch.
+  const scrollMemoryKey = `${surface}:${terminalIndex}:${session.id}`;
+  const [initialReadingRow] = useState(() => recallReadingRow(scrollMemoryKey));
+  const live = useLiveTerminal(
+    ensureState === "ready" ? session.id : null,
+    wsPath,
+    receiveAgentClipboard,
+    initialReadingRow != null,
+  );
   // The viewport hook supplies the iOS-regular-Safari bottom inset and
   // the occlusion-based keyboardOpen used to gate the pane's sizing
   // latch (occlusion is what shrinks the container, whichever element is
@@ -312,6 +322,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}
           keyboardOpen={keyboardOpen}
+          scrollMemoryKey={scrollMemoryKey}
+          initialReadingRow={initialReadingRow}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>

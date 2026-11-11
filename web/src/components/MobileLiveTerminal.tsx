@@ -18,6 +18,7 @@ import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
+import { forgetReadingRow, rememberReadingRow } from "../lib/liveScrollMemory";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -166,6 +167,13 @@ export interface MobileLiveTerminalProps {
    *  Gates the sizing latch so a pane that first measures with the keyboard
    *  up never ships keyboard-shrunk rows to tmux. Always false on desktop. */
   keyboardOpen: boolean;
+  /** Identifies this pane in the per-session reading-position memory (see
+   *  liveScrollMemory), where scrolling records the reader's place. Omitted:
+   *  no memory. */
+  scrollMemoryKey?: string;
+  /** The remembered row to reopen on (the parent recalled it at mount and
+   *  started the stream in reading mode for it); null opens at the live tail. */
+  initialReadingRow?: number | null;
 }
 
 // Backslash-escape whitespace and backslashes in a pasted image path, matching
@@ -492,6 +500,8 @@ export function MobileLiveTerminal({
   onInputFocusChange,
   bottomAlign,
   keyboardOpen,
+  scrollMemoryKey,
+  initialReadingRow = null,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
   // The live view now renders on desktop too, so it honors the right font-size
@@ -645,6 +655,9 @@ export function MobileLiveTerminal({
   // scrollTop alone. Latched, not recomputed per frame, so one paused
   // frame can't re-attach and snap the reader back down.
   const liveDetachedRef = useRef(false);
+  // `initialReadingRow` is applied once, on the first frame (its spacer spans
+  // the history); until then nothing may save or forget the position.
+  const restorePendingRef = useRef(initialReadingRow != null);
   // Opening a keyboard explicitly returns to the agent's prompt. The scroll
   // event caused by that programmatic move can arrive before React receives
   // the matching `returnToLive` state update; keep that one event from
@@ -915,8 +928,16 @@ export function MobileLiveTerminal({
     if (forwardModeRef.current) return;
     const el = scrollerRef.current;
     if (!el) return;
+    // Before a remembered position is restored the pane is empty and sits "at
+    // the bottom"; a scroll event then must not take the stream out of the
+    // reading mode it was opened in.
+    if (restorePendingRef.current) return;
     const movingUp = el.scrollTop < onScrollLastTopRef.current - 0.5;
     onScrollLastTopRef.current = el.scrollTop;
+    if (scrollMemoryKey && !restorePendingRef.current) {
+      if (atBottom()) forgetReadingRow(scrollMemoryKey);
+      else rememberReadingRow(scrollMemoryKey, el.scrollTop / lineH);
+    }
     if (forceLiveRef.current) {
       if (!reading) forceLiveRef.current = false;
       else {
@@ -940,7 +961,7 @@ export function MobileLiveTerminal({
     if (el.scrollHeight - el.clientHeight - el.scrollTop < 2 && !movingUp) {
       liveDetachedRef.current = false;
     }
-  }, [atBottom, enterReading, forwardModeRef, reading, returnToLive, scheduleViewSync]);
+  }, [atBottom, enterReading, forwardModeRef, lineH, reading, returnToLive, scheduleViewSync, scrollMemoryKey]);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
@@ -1502,6 +1523,23 @@ export function MobileLiveTerminal({
     // last known anchor instead of flapping the target to the literal
     // bottom and back.
     if (live.top != null) cursorAnchorRef.current = live.top;
+    // Reopening a session the reader left mid-history: put them back on those
+    // lines before the first pin can take them to the live tail. The spacer
+    // is sized from the frame's history count, so the offset is reachable on
+    // the first frame even though only the live window's text has arrived.
+    const restoreEl = scrollerRef.current;
+    if (restorePendingRef.current && restoreEl && lines.length > 0) {
+      restorePendingRef.current = false;
+      if (initialReadingRow != null && !forwardMode) {
+        const maxTop = Math.max(0, restoreEl.scrollHeight - restoreEl.clientHeight);
+        restoreEl.scrollTop = Math.min(initialReadingRow * lineH, maxTop);
+        onScrollLastTopRef.current = restoreEl.scrollTop;
+        if (!atBottom()) {
+          liveDetachedRef.current = true;
+          enterReading(rowsRef.current || screenRows);
+        } else returnToLive(rowsRef.current * LIVE_WINDOW_SCREENS);
+      }
+    }
     pinIfWasAtBottom();
     // Match the virtualization window to the (possibly just-pinned) position
     // before paint, so a content frame never renders the wrong row slice.
@@ -1515,7 +1553,21 @@ export function MobileLiveTerminal({
     // when not reading (trailing blanks trimmed); without it a settle that
     // grows/shrinks the document by a few rows would change scrollHeight while
     // following WITHOUT re-pinning, leaving scrollTop short of the new bottom.
-  }, [lines, spacerLines, lineH, live, renderRowCount, pinIfWasAtBottom, syncView]);
+  }, [
+    lines,
+    spacerLines,
+    lineH,
+    live,
+    renderRowCount,
+    pinIfWasAtBottom,
+    syncView,
+    initialReadingRow,
+    forwardMode,
+    atBottom,
+    enterReading,
+    returnToLive,
+    screenRows,
+  ]);
 
   // --- keyboard input -----------------------------------------------------------
   const composingRef = useRef(false);
@@ -1735,7 +1787,15 @@ export function MobileLiveTerminal({
   // reading scrollback the spacer model keeps above-viewport pixels invariant
   // so the position holds as the agent streams; trimming there would change
   // scrollHeight under the reader and snap the viewport.
-  const visibleRowCount = reading ? visual.rows.length : Math.min(renderRowCount, visual.rows.length);
+  // The debounced count only SHRINKS late; growth applies in this same render
+  // (`lastNonBlankRow + 1`), since the state catches up one commit later. A
+  // frame that turns spacer into content rows (a wider capture landing) would
+  // otherwise render one commit short of its height, and the browser clamps
+  // scrollTop to it: the reader is thrown to the top of the pane and the rows
+  // shown no longer match where they were.
+  const visibleRowCount = reading
+    ? visual.rows.length
+    : Math.min(Math.max(renderRowCount, lastNonBlankRow + 1), visual.rows.length);
 
   // Virtualization windows over [0, visibleRowCount): the rows whose document
   // positions fall within the viewport, plus one viewport of overscan each side

@@ -8,7 +8,7 @@ For tmux-backed sessions the dashboard renders a real terminal in the page: the 
 
 The main terminal attaches to the session's tmux pane through an xterm.js front end. The server spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over the WebSocket, so every key sequence, color, and scrollback line behaves like `tmux attach` over SSH.
 
-Scrolling up into history pauses the live tail and surfaces a **Back to live** button; scrolling back to the bottom (or clicking it) resumes the tail. Clicking inside the terminal while you read history keeps your place; typing (or, on touch, opening the soft keyboard) returns you to the live prompt.
+Scrolling up into history pauses the live tail and surfaces a **Back to live** button; scrolling back to the bottom (or clicking it) resumes the tail. Clicking inside the terminal while you read history keeps your place; typing (or, on touch, opening the soft keyboard) returns you to the live prompt. Each session remembers where you were reading: open another session and come back, and the terminal opens on the same lines, not at the live tail (until the page reloads). A session you left at the live tail reopens at the live tail.
 
 ## Copy and scroll
 

@@ -96,10 +96,17 @@ const INITIAL_STATE: LiveTerminalState = {
   ownerKnown: false,
 };
 
+// Most scrollback lines one capture window carries.
+const CAPTURE_LIMIT_LINES = 4000;
+
 export function useLiveTerminal(
   sessionId: string | null,
   wsPath: string = "live-ws",
   onClipboard?: (text: string) => void,
+  /** Open already reading scrollback (a remembered position is about to be
+   *  restored), so the first capture carries the history, not just the live
+   *  screen, and the restored lines never show as blank spacer. */
+  startReading = false,
 ) {
   const handleClipboard = useEffectEvent((text: string) => onClipboard?.(text));
   const wsRef = useRef<WebSocket | null>(null);
@@ -114,10 +121,10 @@ export function useLiveTerminal(
     resize: { cols: number; rows: number } | null;
     window: number | null;
     fast: boolean;
-  }>({ resize: null, window: null, fast: true });
+  }>({ resize: null, window: startReading ? CAPTURE_LIMIT_LINES : null, fast: true });
   // Whether the user is reading scrollback (off the live edge). Guards
   // enterReading/returnToLive against repeat fires from scroll events.
-  const readingRef = useRef(false);
+  const readingRef = useRef(startReading);
   // Fire the `web_terminal` usage signal once per hook lifetime, not on every
   // reconnect: onopen runs again after a WiFi blip, and the telemetry intent is
   // "this terminal was opened", not "the socket reconnected N times". Ported
@@ -135,7 +142,7 @@ export function useLiveTerminal(
     listeners: Set<() => void>;
   } | null>(null);
   if (storeRef.current == null) {
-    storeRef.current = { snapshot: INITIAL_STATE, listeners: new Set() };
+    storeRef.current = { snapshot: { ...INITIAL_STATE, reading: startReading }, listeners: new Set() };
   }
   const setState = useCallback((fn: (prev: LiveTerminalState) => LiveTerminalState) => {
     const store = storeRef.current!;
@@ -313,7 +320,7 @@ export function useLiveTerminal(
         // re-render as blank spacer under the reader. Deduped, so it is
         // one control message per growth step at idle cadence.
         if (readingRef.current) {
-          const full = Math.min(4000, incoming.rows + incoming.history);
+          const full = Math.min(CAPTURE_LIMIT_LINES, incoming.rows + incoming.history);
           if (full > (desiredRef.current.window ?? 0)) setWindowInternal(full);
         }
         // Always render the freshest frame. While reading scrollback the
@@ -509,7 +516,7 @@ export function useLiveTerminal(
       if (readingRef.current) return;
       readingRef.current = true;
       const latest = storeRef.current!.snapshot.frame;
-      const full = Math.min(4000, Math.max(rows, latest ? latest.rows + latest.history : rows));
+      const full = Math.min(CAPTURE_LIMIT_LINES, Math.max(rows, latest ? latest.rows + latest.history : rows));
       setWindowInternal(full);
       setState((prev) => ({ ...prev, reading: true }));
     },
