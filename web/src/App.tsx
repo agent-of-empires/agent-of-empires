@@ -72,15 +72,7 @@ import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
-import {
-  usePaneLayout,
-  dockTabs,
-  dockGroups,
-  dockOf,
-  isActiveTab,
-  isDockCollapsed,
-  renderedGroups,
-} from "./lib/paneLayout";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isDockCollapsed, renderedGroups } from "./lib/paneLayout";
 import { isPluginPaneId, resolvePaneIcon, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginPane";
 import { PluginPageView } from "./components/plugin/PluginPageView";
