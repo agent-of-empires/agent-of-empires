@@ -431,6 +431,8 @@ fn render_geometry(view: &mut HomeView) {
             view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
+    // This backend completes output synchronously; acknowledge only the painted overlay.
+    view.acknowledge_confirmation(view.painted_confirmation);
 }
 
 /// Screen row (0-indexed) of the shelf item at absolute `flat_items` index
@@ -927,6 +929,7 @@ fn render_home_to_string(view: &mut HomeView, width: u16, height: u16) -> String
             view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
+    view.acknowledge_confirmation(view.painted_confirmation);
     let buf = terminal.backend().buffer().clone();
     let mut screen = String::new();
     for y in 0..buf.area.height {

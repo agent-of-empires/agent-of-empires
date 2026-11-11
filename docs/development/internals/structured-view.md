@@ -136,6 +136,13 @@ replacement request. Draft editing and cancellation remain available.
 Interrupted output retains framing recovery (CAN, ST, tmux CAN, then style reset)
 before later terminal bytes. Terminal interpretation remains device-dependent.
 
+Home confirmations bind consent to a unique dialog owner and its input revision.
+Trash, permanent-delete and group-delete submission requires the matching emitted
+frame; opening or replacing a dialog and changing its options cannot reuse an old
+receipt. Only the foreground confirmation actually painted by that frame receives
+authority; a covering notice does not authorize a hidden prompt. Cancellation and
+option navigation remain available while output is pending.
+
 Handoff admission finishes leave-screen controls before disabling raw input,
 dropping the event stream, probing an editor, or preparing and starting a child.
 Backpressure safely refuses the operation with retry feedback. After an admitted
@@ -147,9 +154,13 @@ the guard moves into a binding declared after `app`, intentionally reversing dro
 order. On return, error, and unwind, the guard first cancels clipboard admission
 and work, restores input, drops its terminal wrapper (cursor cleanup), and attempts
 final display controls. Only afterward does `App` drop and join the executor.
-Keep this binding order when changing startup. Standalone owners use explicit
-normal-return teardown; they do not inherit App's unwind guarantee. Abort and
-fatal termination do not run Rust destructors.
+Keep this binding order when changing startup. Standalone ACP attach and remote
+home use the same guard, created immediately after raw mode is enabled and before
+fallible output or terminal construction. Each standalone executor is declared
+before its guard: error and unwind restore input before any clipboard worker join.
+Nested structured views borrow the remote owner's terminal and executor, so
+returning to the picker does not disable raw input. Abort and fatal termination
+do not run Rust destructors.
 
 Lock admission and final display cleanup share a 250 ms deadline. This is bounded
 best-effort emission, not confirmed restoration. Permanently stalled output can

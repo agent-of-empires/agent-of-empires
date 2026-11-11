@@ -380,7 +380,7 @@ impl RetainedView {
                 text_area.width,
             );
         }
-        self.paint_revision = Some(super::state::next_interaction_revision());
+        self.paint_revision = Some(crate::tui::terminal_output::next_interaction_revision());
         (
             render::TranscriptGeometry {
                 text_area,

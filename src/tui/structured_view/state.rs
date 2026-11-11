@@ -22,26 +22,13 @@ use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::NoticePolicy;
 use crate::tui::components::hover::HoverState;
 use crate::tui::plugin_ui;
+use crate::tui::terminal_output::next_interaction_revision;
 
 /// Most plugin notifications buffered awaiting a free toast slot. The daemon
 /// already bounds its ring; this second guard drops old un-shown toasts rather
 /// than the newest.
 const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
-pub(super) fn next_interaction_revision() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let mut current = NEXT.load(Ordering::Relaxed);
-    loop {
-        let revision = current
-            .checked_add(1)
-            .expect("structured interaction identity overflow");
-        match NEXT.compare_exchange_weak(current, revision, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return revision,
-            Err(observed) => current = observed,
-        }
-    }
-}
 
 pub struct StructuredViewState {
     pub session_id: String,

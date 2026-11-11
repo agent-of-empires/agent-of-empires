@@ -54,48 +54,32 @@ const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// given session, and tear it down on exit. Used by `aoe acp attach <id>`;
 /// pair with `AOE_DAEMON_URL` to attach to another machine's daemon.
 pub async fn run_standalone(session_id: &str) -> anyhow::Result<()> {
-    use crossterm::event::{
-        EnableBracketedPaste, EnableMouseCapture, EventStream, KeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
-    };
-    use crossterm::execute;
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
-    use std::io;
+    use crossterm::event::EventStream;
     use std::io::IsTerminal;
 
-    if !io::stdin().is_terminal() {
+    if !std::io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal; `aoe acp attach` requires an interactive TTY");
     }
 
-    enable_raw_mode()?;
-    let mut stdout = Output::default();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )?;
-    // Push the kitty enhancement stack so `Shift+Enter` arrives as
-    // `KeyEvent { Enter, SHIFT }` in the composer (#2362). Best-effort.
-    #[cfg(unix)]
-    let _ = execute!(
-        stdout,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-    );
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = crate::tui::terminal_output::Terminal::new(backend)?;
+    // The guard drops before this executor, restoring input before its worker joins.
+    let clipboard = super::clipboard::Executor::new()?;
+    let mut guard = super::TerminalGuard::<CrosstermBackend<Output>>::enter(true, false)?;
+    guard.clipboard = Some(clipboard.stop_handle());
+    guard.terminal = Some(crate::tui::terminal_output::Terminal::new(
+        CrosstermBackend::new(Output::default()),
+    )?);
     let mut event_stream = EventStream::new();
     let theme_name = resolve_theme_name();
     let palette_mode = resolve_theme_palette_mode();
     let theme = crate::tui::styles::load_theme_with_mode(&theme_name, palette_mode);
 
-    let result = run(&mut terminal, &mut event_stream, &theme, session_id).await;
-
-    disable_raw_mode()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-    drop(terminal);
-    crate::tui::terminal_output::restore_after_exit(true, None, deadline)?;
-    result
+    run(
+        guard.terminal.as_mut().expect("standalone terminal initialized"),
+        &mut event_stream,
+        &theme,
+        session_id,
+    )
+    .await
 }
 
 /// Open the full-screen structured view for `session_id` and run its event loop

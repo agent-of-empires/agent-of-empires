@@ -1397,6 +1397,7 @@ impl HomeView {
 
     pub(in crate::tui) fn invalidate_presentation(&mut self) {
         self.presentation_ready = false;
+        self.presented_confirmation = None;
         if let Some(view) = self.structured_preview.as_mut() {
             view.invalidate_presentation();
         }
@@ -1696,6 +1697,7 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        let presented_confirmation = self.begin_confirmation_input();
         if self.reconcile_delete_confirmation() {
             return true;
         }
@@ -1741,6 +1743,12 @@ impl HomeView {
             if let Some(result) = dialog.dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
@@ -1876,6 +1884,12 @@ impl HomeView {
                 let action = dialog.action().to_string();
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_indeterminate_resolution = None;
@@ -2018,6 +2032,12 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.group_delete_options_dialog = None;
                     }
@@ -2252,6 +2272,7 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        let presented_confirmation = self.begin_confirmation_input();
         // A key is a context change: a pending native attachment was prepared
         // for the session, profile, view and terminal mode in force when it was
         // requested, so reconcile before the keystroke acts on any of them.
@@ -2330,6 +2351,12 @@ impl HomeView {
             if let Some(dialog) = &mut self.confirm_dialog {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => return None,
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return None;
+                    }
                     DialogResult::Cancel => {
                         // User chose not to discard, go back to settings
                         self.confirm_dialog = None;
@@ -2680,6 +2707,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_indeterminate_resolution = None;
@@ -2710,6 +2743,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.unified_delete_dialog {
             match dialog.dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
@@ -2729,6 +2768,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.group_delete_options_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.group_delete_options_dialog = None;
                 }

@@ -1050,6 +1050,7 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
+        self.painted_confirmation = None;
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
@@ -1134,6 +1135,12 @@ impl HomeView {
             if self.settings_close_confirm {
                 if let Some(dialog) = &mut self.confirm_dialog {
                     dialog.render(frame, area, theme);
+                    if !area.is_empty() {
+                        self.painted_confirmation = Some(ConfirmationToken {
+                            dialog: dialog.presentation_id(),
+                            input: self.confirmation_input_revision,
+                        });
+                    }
                 }
             }
             return;
@@ -1325,6 +1332,7 @@ impl HomeView {
                 $(
                     if let Some(dialog) = &mut self.$field {
                         dialog.render(frame, area, theme);
+                        self.painted_confirmation = None;
                     }
                 )*
             };
@@ -1332,13 +1340,35 @@ impl HomeView {
 
         render_dialogs!(new_dialog);
         if self.snooze_duration_dialog.is_none() {
-            render_dialogs!(confirm_dialog);
+            if let Some(dialog) = &mut self.confirm_dialog {
+                dialog.render(frame, area, theme);
+                if !area.is_empty() {
+                    self.painted_confirmation = Some(ConfirmationToken {
+                        dialog: dialog.presentation_id(),
+                        input: self.confirmation_input_revision,
+                    });
+                }
+            }
         }
         if let Some(pending) = &mut self.unified_delete_dialog {
             pending.dialog.render(frame, area, theme);
+            if !area.is_empty() {
+                self.painted_confirmation = Some(ConfirmationToken {
+                    dialog: pending.dialog.presentation_id(),
+                    input: self.confirmation_input_revision,
+                });
+            }
+        }
+        if let Some(dialog) = &mut self.group_delete_options_dialog {
+            dialog.render(frame, area, theme);
+            if !area.is_empty() {
+                self.painted_confirmation = Some(ConfirmationToken {
+                    dialog: dialog.presentation_id(),
+                    input: self.confirmation_input_revision,
+                });
+            }
         }
         render_dialogs!(
-            group_delete_options_dialog,
             rename_dialog,
             worktree_name_dialog,
             restart_dialog,
@@ -1364,7 +1394,16 @@ impl HomeView {
         }
         render_dialogs!(snooze_duration_dialog);
         if self.snooze_duration_dialog.is_some() {
-            render_dialogs!(info_dialog, confirm_dialog);
+            render_dialogs!(info_dialog);
+            if let Some(dialog) = &mut self.confirm_dialog {
+                dialog.render(frame, area, theme);
+                if !area.is_empty() {
+                    self.painted_confirmation = Some(ConfirmationToken {
+                        dialog: dialog.presentation_id(),
+                        input: self.confirmation_input_revision,
+                    });
+                }
+            }
         }
         render_dialogs!(
             profile_picker_dialog,

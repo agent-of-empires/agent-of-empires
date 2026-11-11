@@ -95,6 +95,7 @@ struct PendingPresentation {
     mouse_capture: bool,
     retained: Option<u64>,
     structured: Option<u64>,
+    confirmation: Option<super::home::ConfirmationToken>,
 }
 
 pub struct App {
@@ -529,6 +530,7 @@ impl App {
                     .structured_preview
                     .as_ref()
                     .map(|view| view.interaction_revision()),
+                confirmation: self.home.painted_confirmation,
             });
         }
         let matching = self
@@ -551,6 +553,7 @@ impl App {
                     _ => false,
                 };
             self.home.presentation_ready &= structured_matches;
+            self.home.acknowledge_confirmation(pending.confirmation);
         } else {
             self.home.invalidate_presentation();
             self.host_title.invalidate();
@@ -3510,6 +3513,9 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod confirmation_presentation;
 
     #[cfg(unix)]
     #[tokio::test]

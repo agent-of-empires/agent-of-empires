@@ -15,6 +15,7 @@ fn render(env: &mut TestEnv) -> Buffer {
             env.view.render(f, area, &theme, None, None, None);
         })
         .unwrap();
+    env.view.acknowledge_confirmation(env.view.painted_confirmation);
     terminal.backend().buffer().clone()
 }
 
