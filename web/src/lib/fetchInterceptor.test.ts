@@ -201,6 +201,30 @@ describe("installFetchErrorToasts", () => {
       expect(onExpired).toHaveBeenCalledTimes(2);
     });
 
+    it.each<[string, string | null, boolean]>([
+      ["no token", null, false],
+      ["the previous token", "old", false],
+      ["the current token", "new", true],
+    ])("a 401 for a request sent under %s, landing after Connect", async (_name, sentWith, expires) => {
+      storedToken = sentWith;
+      await install();
+      let answer!: (res: Response) => void;
+      original.mockReturnValueOnce(new Promise<Response>((resolve) => (answer = resolve)));
+      const onExpired = listen(mod.TOKEN_EXPIRED_EVENT);
+      const inFlight = window.fetch("/api/settings");
+
+      // Connect: save the new token, re-arm the event, verify it.
+      storedToken = "new";
+      mod.resetTokenExpired();
+      original.mockResolvedValueOnce(json(200, { required: false }));
+      expect((await window.fetch("/api/login/status")).ok).toBe(true);
+
+      answer(json(401, { error: "unauthorized" }));
+      await inFlight;
+      expect(clearToken).toHaveBeenCalledTimes(expires ? 1 : 0);
+      expect(onExpired).toHaveBeenCalledTimes(expires ? 1 : 0);
+    });
+
     it("a 401 login_required asks for login without clearing the token", async () => {
       await install();
       original.mockResolvedValue(json(401, { error: "login_required" }));
