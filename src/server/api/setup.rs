@@ -162,14 +162,13 @@ fn open_required_step(inputs: &SetupInputs) -> Option<&'static str> {
         .map(|(key, _)| *key)
 }
 
-fn load_inputs(project_exists: bool) -> SetupInputs {
+fn load_inputs(profile: &str, project_exists: bool) -> SetupInputs {
     // Typed, so a value `Config` rejects counts as unset rather than configured.
     let config = crate::session::Config::load_or_warn();
-    let agents = crate::tmux::AvailableTools::detect_with_custom_agents(&config.session);
     SetupInputs {
         telemetry_answered: config.app_state.has_responded_to_telemetry
             || crate::telemetry::do_not_track(),
-        agent_installed: !agents.available_list().is_empty(),
+        agent_installed: !detect_agents(profile).available_list().is_empty(),
         project_exists,
         config: toml::Table::try_from(&config).unwrap_or_default(),
         defaults: toml::from_str::<crate::session::Config>("")
@@ -177,6 +176,13 @@ fn load_inputs(project_exists: bool) -> SetupInputs {
             .and_then(|c| toml::Table::try_from(c).ok())
             .unwrap_or_default(),
     }
+}
+
+/// The Agents step lists the served Profile's Agents, so detect the same set.
+fn detect_agents(profile: &str) -> crate::tmux::AvailableTools {
+    crate::tmux::AvailableTools::detect_with_custom_agents(
+        &crate::session::config::profile_config::resolve_config_or_warn(profile).session,
+    )
 }
 
 async fn project_exists(state: &AppState) -> bool {
@@ -208,9 +214,10 @@ fn internal_error(e: impl std::fmt::Display) -> axum::response::Response {
 pub async fn get_setup(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let projects = project_exists(&state).await;
     let serve_mode = state.serve_mode;
+    let profile = state.served_profile().clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<SetupStatus> {
         let app = AppStateConfig::load()?;
-        let inputs = load_inputs(projects);
+        let inputs = load_inputs(&profile, projects);
         Ok(SetupStatus {
             finished: app.setup_finished,
             deferred: app.setup_deferred,
@@ -269,9 +276,10 @@ pub async fn patch_setup(
         }
     };
     let projects = project_exists(&state).await;
+    let profile = state.served_profile().clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), String>> {
         if patch.finished == Some(true) {
-            if let Some(key) = open_required_step(&load_inputs(projects)) {
+            if let Some(key) = open_required_step(&load_inputs(&profile, projects)) {
                 return Ok(Err(format!("setup step '{key}' is required")));
             }
         }
@@ -502,6 +510,23 @@ mod tests {
         let app = AppStateConfig::load().unwrap();
         assert_eq!(app.setup_skipped_steps, ["sandbox"]);
         assert!(app.setup_confirmed_steps.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn agents_come_from_the_served_profile() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::profile_config::update_profile_config("work", |config| {
+            config.overrides.insert(
+                "session".into(),
+                serde_json::json!({ "custom_agents": { "mine": "sh" } }),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert!(detect_agents("work")
+            .available_list()
+            .contains(&"mine".to_string()));
     }
 
     #[test]
