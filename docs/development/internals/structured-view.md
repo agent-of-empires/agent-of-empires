@@ -192,6 +192,10 @@ first/last lookups avoid scanning payloads for metadata. A stale identity reache
 the HTTP client as a conflict, while coherent successful pages carrying different
 identities are rejected as inconsistent metadata. Neither may publish mixed rows.
 Unchanged incomplete histories retain their identity for cheap refresh probes.
+Identity installation reserves SQLite's writer before checking its schema, so
+concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
+the existing incarnation and session revisions; lock waiting remains bounded by
+the connection's busy policy.
 
 File-backed retained reads reuse the independent query-only search reader, not
 the event writer. Identity, bounds and raw rows share one read transaction; commit

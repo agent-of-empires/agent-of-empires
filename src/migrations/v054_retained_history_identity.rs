@@ -23,7 +23,7 @@ fn migrate_database(path: &Path) -> Result<()> {
         return Ok(());
     }
     crate::acp::event_store::identity::install(&mut conn)?;
-    info!(target: "migrations.v054", "Added retained history content identity");
+    info!(target: "migrations.v054", "Retained history content identity ready");
     Ok(())
 }
 
