@@ -560,10 +560,9 @@ describe("takeover intent retirement", () => {
   ])("retires %s takeover before same-hook %s", (pending, _label, sessionId, wsPath) => {
     vi.useFakeTimers();
     try {
-      const { result, rerender } = renderHook(
-        ({ sessionId, wsPath }) => useLiveTerminal(sessionId, false, wsPath),
-        { initialProps: { sessionId: "s1" as string | null, wsPath: "live-ws" } },
-      );
+      const { result, rerender } = renderHook(({ sessionId, wsPath }) => useLiveTerminal(sessionId, false, wsPath), {
+        initialProps: { sessionId: "s1" as string | null, wsPath: "live-ws" },
+      });
       const first = FakeWS.sockets[0]!;
       first.open();
       first.deliver({ type: "size_owner", is_owner: false });
