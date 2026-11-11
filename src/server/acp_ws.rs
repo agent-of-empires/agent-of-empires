@@ -510,6 +510,8 @@ fn project_control_state(
     let mut state = serde_json::to_value(reduced)?;
     if projection == SnapshotProjection::Web {
         if let Some(object) = state.as_object_mut() {
+            // The web client rebuilds this from the raw events. `subagents` stays: a
+            // cold open replays a bounded tail that can miss a live child's last update.
             object.remove("background_agents");
         }
     }
@@ -794,20 +796,34 @@ mod tests {
     }
 
     #[test]
-    fn web_projection_excludes_only_the_duplicate_background_field() {
+    fn web_projection_omits_background_agents_but_keeps_subagents() {
+        use crate::acp::state::{SubagentRecord, SubagentState};
         let mut reduced =
             AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         reduced.apply_event(1, background_launch()).unwrap();
+        let subagent = Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "s-1".into(),
+                parent_tool_call_id: Some("launch-1".into()),
+                title: None,
+                description: None,
+                state: SubagentState::Running,
+                stop_reason: None,
+                cancel_capable: true,
+                model: None,
+            },
+            at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        reduced.apply_event(2, subagent).unwrap();
         let full = serde_json::to_value(&reduced).unwrap();
         assert_eq!(
             project_control_state(&reduced, SnapshotProjection::Full).unwrap(),
             full
         );
         let mut expected = full.clone();
-        expected
-            .as_object_mut()
-            .unwrap()
-            .remove("background_agents");
+        let object = expected.as_object_mut().unwrap();
+        assert!(object.remove("background_agents").is_some());
         let mut web = project_control_state(&reduced, SnapshotProjection::Web).unwrap();
         assert_eq!(web, expected);
         let mut cold = ColdFieldCache::default();

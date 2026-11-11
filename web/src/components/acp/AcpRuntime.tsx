@@ -61,6 +61,7 @@ export interface AcpContext {
   pendingAttachments: PromptAttachmentInput[];
   setPendingAttachments: React.Dispatch<React.SetStateAction<PromptAttachmentInput[]>>;
   forceEndTurn: () => Promise<void>;
+  cancelSubagent: (childId: string) => Promise<void>;
   lastActivityRef: Session["lastActivityRef"];
   dismissError: () => void;
   dismissPrimer: () => void;
@@ -247,6 +248,7 @@ export function AcpRuntime({
         pendingAttachments,
         setPendingAttachments,
         forceEndTurn: acp.forceEndTurn,
+        cancelSubagent: acp.cancelSubagent,
         lastActivityRef: acp.lastActivityRef,
         dismissError: acp.dismissError,
         dismissPrimer: acp.dismissPrimer,

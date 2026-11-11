@@ -471,6 +471,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             get(api::acp_task_output),
         )
         .route(
+            "/api/sessions/{id}/acp/subagents/{child_id}/cancel",
+            post(api::acp_cancel_subagent),
+        )
+        .route(
             "/api/sessions/{id}/acp/force_end_turn",
             post(api::acp_force_end_turn),
         )

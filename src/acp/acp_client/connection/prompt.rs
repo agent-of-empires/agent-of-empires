@@ -401,6 +401,12 @@ impl Session {
 
     async fn on_command(&mut self, turn: &mut Turn, cmd: Option<ClientCmd>) -> AcpResult<Flow> {
         match cmd {
+            Some(ClientCmd::CancelChild {
+                session_id,
+                respond_to,
+            }) => {
+                let _ = respond_to.send(self.cancel_child(session_id).await);
+            }
             Some(ClientCmd::Cancel) => {
                 info!(target: "acp.protocol", "sending session/cancel during in-flight prompt");
                 self.send_cancel().await?;

@@ -1,7 +1,7 @@
 //! Structured view render: transcript, approval shelf, queue, composer, and
 //! status line, with pickers floating above the composer.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -21,7 +21,9 @@ use super::reducer::{
 use super::state::{FileIndex, PickerKind, PickerTarget, StructuredViewState, ViewLayout};
 use crate::acp::approvals::{tool_target, ToolTarget, CMD_KEYS, PATH_KEYS};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
-use crate::acp::state::{AuthStatusKind, SessionUsage, ToolOutputBlock};
+use crate::acp::state::{
+    AuthStatusKind, SessionUsage, SubagentRecord, SubagentState, ToolOutputBlock,
+};
 use crate::acp::transcript::{TranscriptRow, TranscriptRowKind};
 use crate::tui::components::hover::paint_hover_bg;
 use crate::tui::plugin_ui;
@@ -1536,6 +1538,31 @@ fn transcript_lines(
         }
     }
 
+    // Child tool calls nest under a parent card present in the window; others
+    // stay at top level.
+    let starts: HashSet<&str> = rows
+        .iter()
+        .filter(|row| row.kind == TranscriptRowKind::ToolStart)
+        .filter_map(|row| row.tool_call_id.as_deref())
+        .collect();
+    let mut children: HashMap<&str, Vec<&TranscriptRow>> = HashMap::new();
+    for row in rows
+        .iter()
+        .filter(|r| r.kind == TranscriptRowKind::ToolStart)
+    {
+        if let Some(parent) = in_window_parent(row, &starts) {
+            children.entry(parent).or_default().push(row);
+        }
+    }
+    let blocks = ToolBlocks {
+        completions: &completions,
+        children: &children,
+        subagents: &transcript.subagents,
+        theme,
+        path_roots,
+        tool_output,
+    };
+
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut i = 0;
     while i < rows.len() {
@@ -1588,18 +1615,10 @@ fn transcript_lines(
                 out.push(Line::default());
             }
             TranscriptRowKind::ToolStart => {
-                if matches!(tool_output, ToolOutputMode::Retained(_)) {
-                    let completion = row
-                        .tool_call_id
-                        .as_deref()
-                        .and_then(|id| completions.get(id))
-                        .copied();
-                    out.extend(retained_tool_lines(row, completion, theme, path_roots));
-                } else {
-                    let card = tool_card_from_rows(row, &completions);
-                    out.extend(render_tool_lines(&card, theme, path_roots));
+                if in_window_parent(row, &starts).is_none() {
+                    out.extend(blocks.lines(row));
+                    out.push(Line::default());
                 }
-                out.push(Line::default());
             }
             TranscriptRowKind::ToolComplete
             | TranscriptRowKind::ToolError
@@ -1668,6 +1687,96 @@ fn transcript_lines(
         )));
     }
     out
+}
+
+/// The spawning tool call of `row`, when its card is in the window.
+fn in_window_parent<'a>(row: &'a TranscriptRow, starts: &HashSet<&str>) -> Option<&'a str> {
+    let parent = row.tool.as_ref()?.parent_tool_call_id.as_deref()?;
+    (starts.contains(parent) && row.tool_call_id.as_deref() != Some(parent)).then_some(parent)
+}
+
+/// What nested tool rendering needs, shared across the recursion.
+struct ToolBlocks<'a> {
+    completions: &'a HashMap<&'a str, &'a TranscriptRow>,
+    children: &'a HashMap<&'a str, Vec<&'a TranscriptRow>>,
+    subagents: &'a [SubagentRecord],
+    theme: &'a Theme,
+    path_roots: Option<&'a SessionPathRoots>,
+    tool_output: ToolOutputMode<'a>,
+}
+
+impl ToolBlocks<'_> {
+    /// A tool card, then its child calls indented below it.
+    fn lines(&self, row: &TranscriptRow) -> Vec<Line<'static>> {
+        let id = row.tool_call_id.as_deref();
+        let record = id.and_then(|id| {
+            self.subagents
+                .iter()
+                .find(|record| record.parent_tool_call_id.as_deref() == Some(id))
+        });
+        let mut lines = if matches!(self.tool_output, ToolOutputMode::Retained(_)) {
+            let completion = id.and_then(|id| self.completions.get(id)).copied();
+            retained_tool_lines(row, completion, self.theme, self.path_roots)
+        } else {
+            let mut card = tool_card_from_rows(row, self.completions);
+            // The roster, not the launch call, says whether the child is still
+            // active: a stop at turn end must not close a running child's card,
+            // and an idle child may never send a reply.
+            if let Some(record) = record {
+                let stopped = matches!(
+                    &card.completed,
+                    Some(c) if c.outcome == ToolOutcome::Stopped
+                );
+                match record.state {
+                    SubagentState::Running | SubagentState::RequiresAction if stopped => {
+                        card.completed = None;
+                    }
+                    SubagentState::Idle if card.completed.is_none() || stopped => {
+                        card.completed = Some(ToolCompletion {
+                            outcome: if record.stop_reason.as_deref() == Some("error") {
+                                ToolOutcome::Error
+                            } else {
+                                ToolOutcome::Ok
+                            },
+                            content: String::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(title) = record
+                .and_then(|r| r.title.as_ref())
+                .filter(|t| !t.is_empty())
+            {
+                card.name = title.clone();
+            }
+            render_tool_lines(&card, self.theme, self.path_roots)
+        };
+        if let (Some(record), Some(header)) = (record, lines.first_mut()) {
+            header.spans.push(subagent_badge(record.state, self.theme));
+        }
+        for child in id
+            .and_then(|id| self.children.get(id))
+            .into_iter()
+            .flatten()
+        {
+            for mut line in self.lines(child) {
+                line.spans.insert(0, Span::raw("  "));
+                lines.push(line);
+            }
+        }
+        lines
+    }
+}
+
+fn subagent_badge(state: SubagentState, theme: &Theme) -> Span<'static> {
+    let (text, color) = match state {
+        SubagentState::Running => ("running", theme.running),
+        SubagentState::RequiresAction => ("waiting on you", theme.waiting),
+        SubagentState::Idle => ("idle", theme.hint),
+        SubagentState::Unknown => ("unknown", theme.hint),
+    };
+    Span::styled(format!(" · {text}"), Style::default().fg(color))
 }
 
 /// One dim preview per thought: the TUI has no expansion state to show it all.
@@ -2951,6 +3060,141 @@ mod tests {
 
     fn tool_text(row: &ToolCallRow, roots: Option<&SessionPathRoots>) -> String {
         joined(&render_tool_lines(row, &Theme::default(), roots))
+    }
+
+    fn tool_event(id: &str, name: &str, parent: Option<&str>) -> Event {
+        Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                id: id.into(),
+                name: name.into(),
+                kind: "other".into(),
+                args_preview: String::new(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: parent.map(Into::into),
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        }
+    }
+
+    fn tool_lines(t: &AcpTranscript) -> Vec<String> {
+        transcript_lines(t, &Theme::default(), None, ToolOutputMode::Compact)
+            .iter()
+            .map(line_text)
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Children indent under their parent card; orphans and unparented rows
+    /// stay at top level.
+    #[test]
+    fn child_tool_calls_nest_under_their_parent_with_orphan_fallback() {
+        let mut t = AcpTranscript::new("s-1");
+        t.server_rows = server_rows(&[
+            tool_event("p1", "Agent", None),
+            tool_event("c1", "Read", Some("p1")),
+            tool_event("c2", "Grep", Some("p1")),
+            tool_event("o1", "Orphan", Some("gone")),
+            tool_event("n1", "Plain", None),
+        ]);
+        assert_eq!(
+            tool_lines(&t),
+            [
+                "tool ▶ · Agent",
+                "  tool ▶ · Read",
+                "  tool ▶ · Grep",
+                "tool ▶ · Orphan",
+                "tool ▶ · Plain",
+            ]
+        );
+    }
+
+    /// The adapter's wire shape: the card is synthesized from the delegation
+    /// message id, so no background-agent record backs it. The child's tool
+    /// calls nest under it and the roster alone badges it.
+    #[test]
+    fn delegation_card_nests_children_and_badges_from_the_roster_alone() {
+        use crate::acp::state::SubagentState::*;
+        let cases = [
+            (Running, None, vec!["tool ▶ · Explore repo · running"]),
+            (
+                RequiresAction,
+                None,
+                vec!["tool ▶ · Explore repo · waiting on you"],
+            ),
+            (Idle, None, vec!["✓ Explore repo · idle"]),
+            (
+                Idle,
+                Some("error"),
+                vec![
+                    "tool ✗ · Explore repo · idle",
+                    "  (tool failed; press `o` for details)",
+                ],
+            ),
+            (Unknown, None, vec!["tool ▶ · Explore repo · unknown"]),
+        ];
+        for (state, stop_reason, head) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            t.server_rows = server_rows(&[
+                tool_event("msg-1", "Explore repo", None),
+                tool_event("c1", "Read", Some("msg-1")),
+            ]);
+            t.subagents = vec![SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "s-1".into(),
+                parent_tool_call_id: Some("msg-1".into()),
+                title: Some("Explore repo".into()),
+                description: None,
+                state,
+                stop_reason: stop_reason.map(Into::into),
+                cancel_capable: true,
+                model: None,
+            }];
+            let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
+            want.push("  tool ▶ · Read".into());
+            assert_eq!(tool_lines(&t), want);
+            assert_eq!(
+                t.stoppable_subagent().map(|r| r.session_id.as_str()),
+                matches!(state, Running | RequiresAction).then_some("child")
+            );
+        }
+    }
+
+    /// A background child outlives the turn whose end stopped its launch call.
+    #[test]
+    fn turn_end_stop_does_not_close_a_card_whose_child_is_active() {
+        use crate::acp::state::SubagentState::*;
+        let cases = [
+            (Running, "tool ▶ · Explore repo · running"),
+            (RequiresAction, "tool ▶ · Explore repo · waiting on you"),
+            (Idle, "✓ Explore repo · idle"),
+            (Unknown, "tool ◼ · Explore repo · unknown"),
+        ];
+        for (state, head) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            let mut events = vec![tool_event("msg-1", "Explore repo", None)];
+            events.push(Event::Stopped {
+                reason: "end_turn".into(),
+            });
+            t.server_rows = server_rows(&events);
+            t.subagents = vec![SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "s-1".into(),
+                parent_tool_call_id: Some("msg-1".into()),
+                title: Some("Explore repo".into()),
+                description: None,
+                state,
+                stop_reason: None,
+                cancel_capable: true,
+                model: None,
+            }];
+            let lines = tool_lines(&t);
+            assert_eq!(lines[0], head);
+            assert!(
+                lines.iter().all(|l| !l.contains("stopped when the turn")) || state == Unknown,
+                "{lines:?}"
+            );
+        }
     }
 
     #[test]

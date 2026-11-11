@@ -33,8 +33,8 @@ pub use history::{
 pub(crate) use history::{importable_sessions, list_error_response, read_log_tail};
 pub use install::{agent_install_info, install_agent};
 pub use prompt::{
-    acp_attachment, acp_cancel, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments,
-    resolve_approval, resolve_elicitation,
+    acp_attachment, acp_cancel, acp_cancel_subagent, acp_force_end_turn, acp_prompt,
+    acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
 pub use view::{acp_disable, acp_enable};
 pub(crate) use view::{

@@ -14,7 +14,7 @@ use agent_client_protocol::v1::schema::{
     SelectedPermissionOutcome,
 };
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, MutexGuard};
 use tracing::{trace, warn};
 
 use super::fs_handlers::enter_timestamp_ns;
@@ -147,6 +147,7 @@ pub(super) async fn handle_permission_request(
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
     tool_context_cache: ToolContextCache,
+    admission: Option<MutexGuard<'_, ()>>,
 ) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
@@ -241,6 +242,8 @@ pub(super) async fn handle_permission_request(
         ));
     }
 
+    // The wait is on the human, so it must not stall the dispatch loop.
+    drop(admission);
     // #1147: comparing this against the exit trace shows how long approval
     // blocked the agent's turn.
     let await_enter_ns = enter_timestamp_ns();
@@ -327,6 +330,7 @@ pub(super) async fn handle_elicitation_request(
     request: CreateElicitationRequest,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
+    admission: Option<MutexGuard<'_, ()>>,
 ) -> Result<CreateElicitationResponse, agent_client_protocol::Error> {
     let nonce = Nonce::new();
     let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {
@@ -361,6 +365,7 @@ pub(super) async fn handle_elicitation_request(
         return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
 
+    drop(admission);
     // `resolve_elicitation` validates before sending, so what arrives is
     // already a valid response. A dropped resolver cancels the tool call.
     let ElicitationResolutionMessage {
@@ -517,6 +522,7 @@ mod tests {
             pending.clone(),
             &crate::acp::agent_profiles::GEMINI,
             cache,
+            None,
         ));
         let nonce = loop {
             if let Event::ApprovalRequested { approval } = event_rx.recv().await.expect("events") {
@@ -597,6 +603,7 @@ mod tests {
                 pending,
                 &crate::acp::agent_profiles::CLAUDE,
                 cache,
+                None,
             ));
             let approval = loop {
                 if let Event::ApprovalRequested { approval } =
