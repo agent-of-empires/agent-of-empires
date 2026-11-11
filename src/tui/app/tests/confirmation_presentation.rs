@@ -236,7 +236,19 @@ async fn exercise(kind: Kind, stale: Stale) {
     open(&mut app, kind);
     crate::tui::terminal_output::request_redraw();
     present(&mut app, &mut terminal, &mut master, &mut emitted);
-    app.home.handle_key(key(submit), None);
+    if kind == Kind::Trash {
+        let yes = app
+            .home
+            .confirm_dialog
+            .as_ref()
+            .unwrap()
+            .yes_button_area_for_test();
+        assert!(app
+            .home
+            .handle_dialog_click(yes.x + yes.width / 2, yes.y + yes.height / 2));
+    } else {
+        app.home.handle_key(key(submit), None);
+    }
     assert!(
         dispatched(),
         "{kind:?}/{stale:?}: visible confirmation became a dead end"
@@ -280,4 +292,113 @@ async fn home_destructive_consent_group_delete_requires_presented_semantics() {
     ] {
         exercise(Kind::Group, stale).await;
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn home_visible_mouse_discard_restores_the_actual_theme_preview() {
+    use crate::tui::settings::SettingsFocus;
+
+    let root = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+    crate::session::get_profile_dir("test").unwrap();
+    crate::session::config::update_config(|_| {}).unwrap();
+    let mut app = App::new(
+        "test",
+        AvailableTools::with_tools(&["claude"]),
+        true,
+        false,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    let saved_theme = app.theme_name.clone();
+    let config_path = crate::session::config::config_path().unwrap();
+    let config_before = std::fs::read(&config_path).unwrap();
+    let (mut master, slave) = private_terminal();
+    let (_output_guard, _) = install_test_output(slave);
+    let mut terminal = output_test_terminal();
+    let mut emitted = Vec::new();
+    present(&mut app, &mut terminal, &mut master, &mut emitted);
+    app.home.open_settings();
+
+    let categories = app.home.settings_view.as_ref().unwrap().categories.len();
+    for _ in 0..categories {
+        if app
+            .home
+            .settings_view
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .any(|f| f.is_theme_name())
+        {
+            break;
+        }
+        app.handle_key(key(KeyCode::Down), &mut terminal)
+            .await
+            .unwrap();
+    }
+    assert!(app
+        .home
+        .settings_view
+        .as_ref()
+        .unwrap()
+        .fields
+        .iter()
+        .any(|f| f.is_theme_name()));
+    app.handle_key(key(KeyCode::Enter), &mut terminal)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.home.settings_view.as_ref().unwrap().focus,
+        SettingsFocus::Fields
+    );
+    let fields = app.home.settings_view.as_ref().unwrap().fields.len();
+    for _ in 0..fields {
+        let settings = app.home.settings_view.as_ref().unwrap();
+        if settings.fields[settings.selected_field].is_theme_name() {
+            break;
+        }
+        app.handle_key(key(KeyCode::Down), &mut terminal)
+            .await
+            .unwrap();
+    }
+    let settings = app.home.settings_view.as_ref().unwrap();
+    assert!(settings.fields[settings.selected_field].is_theme_name());
+    app.handle_key(key(KeyCode::Enter), &mut terminal)
+        .await
+        .unwrap();
+    assert_ne!(
+        app.theme_name, saved_theme,
+        "the real theme edit must apply its live preview"
+    );
+    assert!(app.home.settings_view.as_ref().unwrap().has_changes);
+    app.handle_key(key(KeyCode::Esc), &mut terminal)
+        .await
+        .unwrap();
+    assert!(app.home.settings_close_confirm);
+    present(&mut app, &mut terminal, &mut master, &mut emitted);
+    read_terminal_until(&mut master, &mut emitted, b"Unsaved Changes");
+
+    let yes = app
+        .home
+        .confirm_dialog
+        .as_ref()
+        .unwrap()
+        .yes_button_area_for_test();
+    assert!(yes.width > 0);
+    assert!(app
+        .home
+        .handle_dialog_click(yes.x + yes.width / 2, yes.y + yes.height / 2));
+    assert!(app.home.settings_view.is_none());
+    assert!(!app.home.settings_close_confirm);
+    let action = app
+        .home
+        .pending_dialog_click_action
+        .take()
+        .expect("visible mouse Discard action");
+    assert!(matches!(&action, Action::SetTheme(name) if name == &saved_theme));
+    app.execute_action(action, &mut terminal).unwrap();
+    assert_eq!(app.theme_name, saved_theme);
+    assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
 }
