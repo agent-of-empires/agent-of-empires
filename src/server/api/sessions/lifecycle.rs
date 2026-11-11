@@ -874,6 +874,7 @@ pub async fn trash_session(
             {
                 tracing::warn!(target: "session.trash", session = %worker_id, %reason, "could not move superseded trash relocation back");
             }
+            committed?;
             return Err(LifecycleTargetError::Busy.into());
         }
         committed?;
