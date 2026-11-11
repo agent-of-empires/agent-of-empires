@@ -1528,16 +1528,11 @@ mod tests {
             )
             .await
         });
-        let error = connect(
-            &control,
-            "old",
-            Arc::new(TerminalClaim::new()),
-            false,
-        )
-        .await
-        .err()
-        .expect("a version mismatch must fail the attach")
-        .to_string();
+        let error = connect(&control, "old", Arc::new(TerminalClaim::new()), false)
+            .await
+            .err()
+            .expect("a version mismatch must fail the attach")
+            .to_string();
         assert!(error.contains("runner Hello mismatch"), "{error}");
         assert!(
             error.contains(&format!(
