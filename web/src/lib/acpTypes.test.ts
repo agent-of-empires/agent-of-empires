@@ -15,6 +15,7 @@ import {
   type BackgroundAgent,
   type ConfigOptionDescriptor,
   type ReducedState,
+  type SubagentRecord,
 } from "./acpTypes";
 
 const ev = (state: AcpState, seq: number, event: AcpEvent) => applyEvent(state, { session_id: "s-1", seq, event });
@@ -318,6 +319,50 @@ describe("applyEvent control state", () => {
 
     // A daemon without the field must not blow up the picker-style adoption.
     expect(applyReducedState(adopted, reduced()).sessionNotices).toEqual([]);
+  });
+
+  it("adopts a live child whose last update is older than the replay tail", () => {
+    const child = {
+      session_id: "child-1",
+      parent_session_id: "s-1",
+      parent_tool_call_id: null,
+      title: null,
+      description: null,
+      state: "running",
+      stop_reason: null,
+      cancel_capable: true,
+      model: null,
+    } as SubagentRecord;
+    const base = {
+      agent: "claude",
+      model: null,
+      mode: "default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active: false,
+      cancelling: false,
+      compacting: false,
+      subagents: [child],
+    } as unknown as ReducedState;
+
+    const adopted = applyReducedState(emptyAcpState(), base);
+    expect(adopted.subagents).toEqual([child]);
+
+    const stopped = { ...child, state: "idle" } as SubagentRecord;
+    const replayed = applyEvent(adopted, {
+      session_id: "s-1",
+      seq: 9,
+      event: { SubagentUpdated: { subagent: stopped, at: "2026-01-01T00:00:00Z" } },
+    });
+    expect(replayed.subagents).toEqual([stopped]);
+    expect(applyReducedState(replayed, base).subagents).toEqual([stopped]);
   });
 
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {

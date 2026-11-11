@@ -534,6 +534,8 @@ export interface ReducedState {
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
   /** The session's workflow runs; omitted when there are none. */
+  /** The subagent roster; the Web projection keeps it for children older than the replay tail. */
+  subagents?: SubagentRecord[];
   workflow_runs?: {
     task_id: string;
     tool_call_id: string;
@@ -1515,6 +1517,11 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
+    // Replayed `SubagentUpdated` events carry the full record, so a local one is never older.
+    subagents: [
+      ...state.subagents,
+      ...(reduced.subagents ?? []).filter((r) => !state.subagents.some((s) => s.session_id === r.session_id)),
+    ],
     locallyResolved,
   };
 }

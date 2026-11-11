@@ -510,9 +510,9 @@ fn project_control_state(
     let mut state = serde_json::to_value(reduced)?;
     if projection == SnapshotProjection::Web {
         if let Some(object) = state.as_object_mut() {
-            // The web client rebuilds both from the raw events.
+            // The web client rebuilds this from the raw events. `subagents` stays: a
+            // cold open replays a bounded tail that can miss a live child's last update.
             object.remove("background_agents");
-            object.remove("subagents");
         }
     }
     Ok(state)
@@ -796,7 +796,7 @@ mod tests {
     }
 
     #[test]
-    fn web_projection_excludes_only_the_fields_rebuilt_from_raw_events() {
+    fn web_projection_omits_background_agents_but_keeps_subagents() {
         use crate::acp::state::{SubagentRecord, SubagentState};
         let mut reduced =
             AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
@@ -823,8 +823,7 @@ mod tests {
         );
         let mut expected = full.clone();
         let object = expected.as_object_mut().unwrap();
-        assert!(object.remove("subagents").is_some());
-        object.remove("background_agents");
+        assert!(object.remove("background_agents").is_some());
         let mut web = project_control_state(&reduced, SnapshotProjection::Web).unwrap();
         assert_eq!(web, expected);
         let mut cold = ColdFieldCache::default();
