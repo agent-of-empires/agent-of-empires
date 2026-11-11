@@ -140,7 +140,8 @@ const DEFAULT_RELEASE_BASE: &str =
 fn release_tarball_url(version: &str, platform: &str) -> String {
     let base =
         std::env::var("AOE_UPDATE_BASE_URL").unwrap_or_else(|_| DEFAULT_RELEASE_BASE.to_string());
-    format!("{base}/v{version}/aoe-{platform}.tar.gz")
+    let tag = super::release_tag(version);
+    format!("{base}/{tag}/aoe-{platform}.tar.gz")
 }
 
 async fn download_tarball(
