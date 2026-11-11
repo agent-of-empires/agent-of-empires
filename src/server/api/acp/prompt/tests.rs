@@ -175,6 +175,7 @@ async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker(
     let id = "sess-3172".to_string();
     let state = structured_state(&id, false).await;
     let seeded = crate::session::PendingInitialTurn {
+        error: None,
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
@@ -252,6 +253,7 @@ async fn a_rejected_enqueue_keeps_the_pending_turn_and_an_accepted_one_clears_it
         .expect("seed a running turn");
     state.acp_supervisor.hydrate_seqs([(id.clone(), 1)]);
     let seeded = crate::session::PendingInitialTurn {
+        error: None,
         text: "queued before the park".to_string(),
         attachments: Vec::new(),
         synthesized: true,
@@ -439,6 +441,7 @@ async fn no_revive_refuses_a_stopped_or_dormant_worker_without_side_effects() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
             });
         }
         seed_native_row(&state).await;
@@ -583,6 +586,7 @@ async fn no_revive_refuses_a_prompt_on_a_rate_limit_park() {
                 text: "queued before the park".to_string(),
                 attachments: Vec::new(),
                 synthesized: true,
+                error: None,
             });
         seed_native_row(&state).await;
 
@@ -642,6 +646,7 @@ async fn no_revive_refuses_a_workerless_rate_limit_park_with_a_stale_turn() {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
         });
     seed_native_row(&state).await;
 
