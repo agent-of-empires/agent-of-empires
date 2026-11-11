@@ -388,7 +388,15 @@ impl TranscriptModel {
                     row.attachments = attachments.clone();
                     row.origin_plugin = origin_plugin.clone();
                     row.merged_prompt_ids = merged_prompt_ids.clone();
-                    vec![self.append(row)]
+                    // A queue drain that failed after publishing retries with the same ids.
+                    match self.rows.iter_mut().find(|r| r.id == row.id) {
+                        Some(existing) => {
+                            row.group_id = existing.group_id.clone();
+                            *existing = row;
+                            vec![patch(existing)]
+                        }
+                        None => vec![self.append(row)],
+                    }
                 }
             }
             Event::UserDiffCommentsPrompt {
@@ -1557,6 +1565,19 @@ mod tests {
         );
         assert_eq!(m.rows()[0].id, "q1");
         assert_eq!(m.rows()[0].merged_prompt_ids, ["q2"]);
+
+        // A drain retry republishes the same ids: one row, patched in place.
+        let retry = Event::UserPromptSent {
+            merged_prompt_ids: vec!["q2".into()],
+            text: "a\n\nb".into(),
+            attachments: Vec::new(),
+            prompt_id: Some("q1".into()),
+            synthesized: false,
+            origin_plugin: None,
+        };
+        let deltas = m.apply_event(9, &retry);
+        assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
+        assert_eq!(m.rows().len(), 1);
 
         let m = fold([Event::UserDiffCommentsPrompt {
             intro: "look".into(),
