@@ -350,7 +350,14 @@ export type AcpEvent =
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
   | { RateLimitAutoResumed: { resets_at: string; manual?: boolean } }
-  | { SessionNotice: { severity: string; title: string; description?: string | null; key?: string | null } }
+  | {
+      SessionNotice: {
+        severity: string;
+        title: string;
+        description?: string | null;
+        key?: string | null;
+      };
+    }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -449,7 +456,11 @@ export type AcpEvent =
         task_id: string;
         tool_call_id?: string;
         description: string;
-        workflow?: { run_id: string; name: string; summary?: string | null } | null;
+        workflow?: {
+          run_id: string;
+          name: string;
+          summary?: string | null;
+        } | null;
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
@@ -508,7 +519,11 @@ export interface AuthStatus {
   /** Usable as a UI string on its own ("Claude Max", "Anthropic API key"). */
   label: string;
   detail?: string | null;
-  account?: { email?: string | null; organization?: string | null; plan?: string | null } | null;
+  account?: {
+    email?: string | null;
+    organization?: string | null;
+    plan?: string | null;
+  } | null;
 }
 
 /** Fields this client adopts from the daemon's folded `AcpState`. */
@@ -523,7 +538,11 @@ export interface ReducedState {
   thinking: { started_at: string } | null;
   rate_limit: RateLimitInfo | null;
   available_commands: AvailableCommand[];
-  available_modes: Array<{ id: string; name: string; description?: string | null }>;
+  available_modes: Array<{
+    id: string;
+    name: string;
+    description?: string | null;
+  }>;
   current_mode_id: string | null;
   auth_status?: AuthStatus | null;
   turn_active: boolean;
@@ -906,7 +925,12 @@ export function mergeServerRows(existing: ActivityRow[], incoming: ActivityRow[]
       const merged = mergeToolStart(prev.tool, row.tool);
       // Keep the earliest raw_name across a retitling merge for subagent classification.
       if (prev.tool.raw_name) merged.raw_name = prev.tool.raw_name;
-      out[idx] = { ...prev, tool: merged, text: merged.name, at: merged.started_at };
+      out[idx] = {
+        ...prev,
+        tool: merged,
+        text: merged.name,
+        at: merged.started_at,
+      };
     } else {
       out[idx] = row;
     }
@@ -1432,7 +1456,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     if (workflow && toolCallId) {
       next.workflowRuns = {
         ...next.workflowRuns,
-        [toolCallId]: { taskId: id, name: workflow.name, summary: workflow.summary ?? null },
+        [toolCallId]: {
+          taskId: id,
+          name: workflow.name,
+          summary: workflow.summary ?? null,
+        },
       };
     }
     return next;
@@ -1480,8 +1508,30 @@ export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
 }
 
+/**
+ * A snapshot at or past `lastSeq` refreshes held records, which may have missed frames after a lag; an older one
+ * (a replay already folded past it) only adds records we lack. Local-only records always stay.
+ */
+function mergeSubagents(
+  held: SubagentRecord[],
+  snapshot: SubagentRecord[],
+  snapshotIsNewer: boolean,
+): SubagentRecord[] {
+  const fromSnapshot = new Map(snapshot.map((r) => [r.session_id, r]));
+  const heldIds = new Set(held.map((r) => r.session_id));
+  return [
+    ...held.map((r) => (snapshotIsNewer ? (fromSnapshot.get(r.session_id) ?? r) : r)),
+    ...snapshot.filter((r) => !heldIds.has(r.session_id)),
+  ];
+}
+
 /** Adopt the daemon's folded control state. Leaves `lastSeq` to the raw frames that dedupe replays. */
-export function applyReducedState(state: AcpState, reduced: ReducedState, unchanged: string[] = []): AcpState {
+export function applyReducedState(
+  state: AcpState,
+  reduced: ReducedState,
+  unchanged: string[] = [],
+  seq?: number,
+): AcpState {
   // Omitted cold fields arrive as empty defaults; adopting them would blank the pickers.
   const holds = (field: string) => unchanged.includes(field);
   const stillPending = new Set<string>([
@@ -1520,11 +1570,7 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
-    // Replayed `SubagentUpdated` events carry the full record, so a local one is never older.
-    subagents: [
-      ...state.subagents,
-      ...(reduced.subagents ?? []).filter((r) => !state.subagents.some((s) => s.session_id === r.session_id)),
-    ],
+    subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
     locallyResolved,
   };
 }
@@ -1545,7 +1591,10 @@ function restoreWorkflowRuns(
       taskId: record.task_id,
       name: record.name,
       summary: local?.summary ?? record.summary ?? null,
-      ...(record.finished && { finished: true, endedAt: record.ended_at ?? null }),
+      ...(record.finished && {
+        finished: true,
+        endedAt: record.ended_at ?? null,
+      }),
     };
   }
   return next;
@@ -1595,7 +1644,12 @@ export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: Activ
       // The placeholder carried the completion time, which would zero the duration.
       if (row.tool.started_at) merged.started_at = row.tool.started_at;
       tail = tail.slice();
-      tail[idx] = { ...existing, tool: merged, text: merged.name, at: merged.started_at };
+      tail[idx] = {
+        ...existing,
+        tool: merged,
+        text: merged.name,
+        at: merged.started_at,
+      };
     }
   }
   return prepended.concat(tail);
