@@ -2465,12 +2465,14 @@ fn reconcile_pending_with_home(move_stores: bool, home: Option<PathBuf>) -> Resu
     )
 }
 
-pub(crate) fn migrate_instance(id: &str) -> Result<()> {
+pub(crate) fn migrate_instance(
+    id: &str,
+    runtime: &crate::containers::ContainerRuntime,
+) -> Result<()> {
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
-    let runtime = crate::containers::get_container_runtime();
-    let running = layout::batched_running_probe(&runtime, false);
-    let reap = |id: &str| layout::reap_migrated_container(id, &runtime);
+    let running = layout::batched_running_probe(runtime, false);
+    let reap = |id: &str| layout::reap_migrated_container(id, runtime);
     reconcile_in(
         &app,
         &home,
@@ -2531,9 +2533,7 @@ fn ensure_fresh_content_with(
                         && (identity(&root.path)?.is_some()
                             || certificate_path(app, instance, &root.path)?.exists())
                     {
-                        bail!(
-                            "sandbox {instance} has unproven native content; stop it and run aoe migrate before relaunch"
-                        );
+                        bail!(super::SandboxMigrationError::Deferred);
                     }
                 }
             }
@@ -2541,7 +2541,7 @@ fn ensure_fresh_content_with(
             let row = serde_json::json!({"id":instance,"tool":tool});
             let (path, mut receipt) = checked_receipt(app, &row, tool, &planned)?;
             if receipt.roots.iter().any(|part| part.original.is_some()) {
-                bail!("fresh-store admission cannot retire existing native content");
+                bail!(super::SandboxMigrationError::Deferred);
             }
             drop(transition);
             stage_receipt(app, &mut receipt, &path, home, config, workspace)?;
@@ -2608,10 +2608,7 @@ pub(crate) fn admit_fresh_instance(
     instance: &crate::session::Instance,
 ) -> Result<crate::session::StorageFlock> {
     if instance.sandbox_store_generation < container_config::CURRENT_SANDBOX_STORE_GENERATION {
-        bail!(
-            "sandbox {} still uses a legacy shared store; stop the other owners and run aoe migrate",
-            instance.id
-        );
+        bail!(super::SandboxMigrationError::Deferred);
     }
     let app = crate::session::get_app_dir()?;
     let home = dirs::home_dir().context("home directory unavailable for content isolation")?;
@@ -2626,6 +2623,13 @@ pub(crate) fn admit_fresh_instance(
         &config,
         Path::new(&instance.container_workdir()),
     )
+    .map_err(|error| {
+        if error.is::<super::SandboxMigrationError>() {
+            error
+        } else {
+            error.context(super::SandboxMigrationError::Failed)
+        }
+    })
 }
 
 pub(crate) fn guard_preparation(

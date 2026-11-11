@@ -68,6 +68,24 @@ fn wait_for(path: &Path, what: &str) {
     }
 }
 
+fn connect_ready(path: &Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => return stream,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("control socket {} not ready: {error}", path.display()),
+        }
+    }
+}
+
 fn wait_for_u32(path: &Path, what: &str) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1376,8 +1394,9 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
-    wait_for(&control, "control socket");
-    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    let first = connect_ready(&control);
+    first.set_nonblocking(true).unwrap();
+    let mut first = tokio::net::UnixStream::from_std(first).unwrap();
     assert!(matches!(
         control_protocol::read_frame(&mut first).await.unwrap(),
         Some(ControlBody::Hello { .. })
@@ -1551,10 +1570,11 @@ for line in sys.stdin:
             .spawn()
             .unwrap(),
     );
-    wait_for(&control, "control socket");
 
     // First daemon: establish the native session, then detach.
-    let mut first = tokio::net::UnixStream::connect(&control).await.unwrap();
+    let first = connect_ready(&control);
+    first.set_nonblocking(true).unwrap();
+    let mut first = tokio::net::UnixStream::from_std(first).unwrap();
     assert!(matches!(
         control_protocol::read_frame(&mut first).await.unwrap(),
         Some(ControlBody::Hello { .. })
@@ -1848,9 +1868,15 @@ for line in sys.stdin:
             .spawn()
             .expect("spawn native-identity runner"),
     );
-    wait_for(&control, "native-identity control socket");
+    let attach_count = std::cell::Cell::new(0);
     let attach = || {
-        let mut stream = UnixStream::connect(&control).unwrap();
+        attach_count.set(attach_count.get() + 1);
+        let mut stream = if attach_count.get() == 1 {
+            connect_ready(&control)
+        } else {
+            UnixStream::connect(&control)
+                .unwrap_or_else(|error| panic!("attach {} failed: {error}", attach_count.get()))
+        };
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
@@ -2175,6 +2201,8 @@ for line in sys.stdin:
     assert!(identity.birth_fingerprint.is_some());
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let detaching = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let proxy_detaching = detaching.clone();
     let mut proxy = tokio::task::JoinSet::new();
     proxy.spawn(async move {
         let mut held_tx = Some(held_tx);
@@ -2185,9 +2213,14 @@ for line in sys.stdin:
                 .await
                 .unwrap();
             if attempt == 1 {
-                tokio::io::copy_bidirectional(&mut daemon, &mut producer)
-                    .await
-                    .unwrap();
+                if let Err(error) = tokio::io::copy_bidirectional(&mut daemon, &mut producer).await
+                {
+                    assert!(
+                        error.kind() == std::io::ErrorKind::NotConnected
+                            && proxy_detaching.load(std::sync::atomic::Ordering::Acquire),
+                        "proxy failed before detach: {error}"
+                    );
+                }
                 continue;
             }
             let hello = control_protocol::read_frame(&mut producer)
@@ -2228,11 +2261,11 @@ for line in sys.stdin:
     });
     let store = Arc::new(EventStore::open(&scratch.0.join("consumer.db"), 1000).unwrap());
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-    let sink = Arc::new(ChannelSink {
+    let sink = Arc::new(ChannelSink::new(
         tx,
-        event_store: store.clone(),
-        control_cache: Arc::new(agent_of_empires::acp::control_cache::ControlStateCache::new()),
-    });
+        store.clone(),
+        Arc::new(agent_of_empires::acp::control_cache::ControlStateCache::new()),
+    ));
     sink.publish(
         id,
         1,
@@ -2284,8 +2317,15 @@ for line in sys.stdin:
         .unwrap();
     assert_eq!(supervisor.running_identity(id), Some(identity));
     gate.get_mut().write_all(b"c").await.unwrap();
+    // The turn's Stopped is stored before the reattached runner's last
+    // chunk, so wait for that chunk as well.
+    let completed = || {
+        store.replay_from(id, 0).iter().any(|(_, event)| {
+            matches!(event, Event::AgentMessageChunk { text, .. } if text == "real original turn completed")
+        })
+    };
     tokio::time::timeout(Duration::from_secs(10), async {
-        while store.has_in_flight_turn(id) {
+        while store.has_in_flight_turn(id) || !completed() {
             rx.recv().await.unwrap();
         }
     })
@@ -2331,6 +2371,11 @@ for line in sys.stdin:
         .any(|method| matches!(method, "session/load" | "session/cancel" | "session/delete")));
     assert!(runner.0.try_wait().unwrap().is_none());
     assert!(worker_registry::is_pid_alive(agent_pid));
+    detaching.store(true, std::sync::atomic::Ordering::Release);
     supervisor.detach_all().await;
+    assert!(runner.0.try_wait().unwrap().is_none());
+    assert!(worker_registry::is_pid_alive(agent_pid));
+    let retained = worker_registry::load(id).unwrap().unwrap();
+    assert_eq!(RunnerIdentity::from_record(&retained), identity);
     proxy.join_next().await.unwrap().unwrap();
 }

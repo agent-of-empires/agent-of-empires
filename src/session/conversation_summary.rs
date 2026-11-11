@@ -350,6 +350,7 @@ mod serve {
             };
             crate::session::smart_rename::run_oneshot(
                 &session_id,
+                &profile,
                 &argv,
                 &project_path,
                 SUMMARY_TIMEOUT,

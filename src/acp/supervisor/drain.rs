@@ -17,9 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, SeqMap, SharedSet,
-    Supervisor, SupervisorError, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
-    RESTART_WINDOW,
+    lock_recover, publish_next_persisted, publish_with_next_seq, BroadcastSink, Launcher,
+    PendingContextReset, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -112,8 +112,12 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        let seq = next_seq(&self.next_seqs, &self.session_id);
-        self.sink.publish(&self.session_id, seq, &event);
+        publish_next_persisted(
+            self.sink.as_ref(),
+            &self.next_seqs,
+            &self.session_id,
+            &event,
+        );
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
@@ -181,14 +185,16 @@ impl<S: BroadcastSink> Drain<S> {
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
                 Event::AcpSessionAssigned { acp_session_id } => {
                     if let Some(pending) = self.context_reset.take() {
-                        self.sink.publish_from_worker(
-                            &self.session_id,
-                            next_seq(&self.next_seqs, &self.session_id),
-                            &Event::SessionContextReset {
-                                reason: pending.reason,
-                            },
-                            generation,
-                        );
+                        publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                            self.sink.publish_from_worker(
+                                &self.session_id,
+                                seq,
+                                &Event::SessionContextReset {
+                                    reason: pending.reason,
+                                },
+                                generation,
+                            )
+                        });
                         let id = self.session_id.clone();
                         let assigned = acp_session_id.clone();
                         let acknowledged = tokio::task::spawn_blocking(move || {
@@ -208,16 +214,18 @@ impl<S: BroadcastSink> Drain<S> {
                         };
                         if let Some(error) = failure {
                             end.startup_failed = true;
-                            self.sink.publish_from_worker(
-                                &self.session_id,
-                                next_seq(&self.next_seqs, &self.session_id),
-                                &Event::AgentStartupError {
-                                    message: format!(
-                                        "Could not commit the isolated native context: {error}"
-                                    ),
-                                },
-                                generation,
-                            );
+                            publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                                self.sink.publish_from_worker(
+                                    &self.session_id,
+                                    seq,
+                                    &Event::AgentStartupError {
+                                        message: format!(
+                                            "Could not commit the isolated native context: {error}"
+                                        ),
+                                    },
+                                    generation,
+                                )
+                            });
                             let client = self
                                 .workers
                                 .lock()
@@ -274,10 +282,11 @@ impl<S: BroadcastSink> Drain<S> {
                 }
                 _ => {}
             }
-            let seq = next_seq(&self.next_seqs, &self.session_id);
             // Tagged so a frame queued by a replaced worker cannot mutate runtime state.
-            self.sink
-                .publish_from_worker(&self.session_id, seq, &event, generation);
+            publish_with_next_seq(&self.next_seqs, &self.session_id, |seq| {
+                self.sink
+                    .publish_from_worker(&self.session_id, seq, &event, generation)
+            });
         }
         end
     }
@@ -1435,6 +1444,48 @@ mod tests {
                 .count();
             assert_eq!(crash_messages, usize::from(expect_crash_message), "{id}");
         }
+    }
+
+    /// A runner drops its control channel when a frame write takes over 2 s,
+    /// so a stalled save must not stop the drain reading the next frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_event_save_does_not_stop_the_drain_reading_frames() {
+        let (sink, store, _rx, tmp) = channel_sink();
+        let sup = Supervisor::new(Arc::clone(&sink));
+        let id = "s-stalled-save";
+        let lease = sup.test_install_stdio(id).await;
+        let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(64);
+        let drain = sup.start_drain_task(id.into(), lease, inbound_rx, None);
+        let frames = 256;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..frames {
+                inbound_tx.send(Event::ThinkingStarted).await.unwrap();
+            }
+        })
+        .await;
+        blocker.execute_batch("COMMIT").unwrap();
+        sent.expect("the drain must keep reading frames while a save is stalled");
+
+        // Closing the stream lets the drain take every frame before the flush.
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("drain must end once its stream closes")
+            .unwrap();
+        sink.flush();
+        let stored: Vec<u64> = store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, event)| matches!(event, Event::ThinkingStarted))
+            .map(|(seq, _)| seq)
+            .collect();
+        assert_eq!(
+            stored,
+            (1..=frames).collect::<Vec<u64>>(),
+            "every frame is stored once, in order"
+        );
     }
 
     #[tokio::test]

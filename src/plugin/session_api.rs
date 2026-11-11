@@ -532,6 +532,7 @@ async fn admit_and_create(
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
         agent_name: None,
@@ -937,9 +938,8 @@ async fn deliver_structured(
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {
         if reason != QueueReason::WorkerDown {
-            service.clear_pending_initial_turn(id).await;
             service
-                .enqueue_prompt(
+                .enqueue_prompt_superseding_continuation(
                     id,
                     uuid::Uuid::new_v4().to_string(),
                     req.message.clone(),
@@ -948,6 +948,7 @@ async fn deliver_structured(
                     Some(plugin_id.to_string()),
                 )
                 .await
+                .map_err(|_| DispatchError::internal("the message could not be saved; retry"))?
                 .ok_or_else(session_not_found)?;
             return Ok(MessageSendResponse {
                 disposition: MessageDisposition::Queued,
@@ -970,7 +971,9 @@ async fn deliver_structured(
             },
         )
         .await;
-    service.clear_pending_initial_turn(id).await;
+    if sent.as_ref().err().is_none_or(SendTurnError::published) {
+        service.clear_pending_initial_turn(id).await;
+    }
     sent.map_err(map_send_error)?;
     Ok(MessageSendResponse {
         disposition: if dispatch == PromptDispatch::Steered {
@@ -1047,11 +1050,13 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "worker_not_ready",
             format!("worker resume failed: {e}"),
         ),
-        SendTurnError::WorkerNotReady => DispatchError::with_kind(
-            codes::SERVICE_UNAVAILABLE,
-            "worker_not_ready",
-            "worker not ready; retry",
-        ),
+        SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
+            DispatchError::with_kind(
+                codes::SERVICE_UNAVAILABLE,
+                "worker_not_ready",
+                "worker not ready; retry",
+            )
+        }
         // Unreachable: this plugin surface never sets `no_revive`.
         SendTurnError::RevivalRefused => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,
@@ -1634,11 +1639,11 @@ mod tests {
         use crate::acp::supervisor::BroadcastSink;
         let _home = crate::session::test_support::isolate_app_dir();
         let (deps, state, _dir, _cmds) = foreign_live_session("sess-msg-busy").await;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         assert!(sink.publish_persisted(
             "sess-msg-busy",
             1,
@@ -1739,6 +1744,36 @@ mod tests {
             );
             assert!(inst.last_accessed_at.is_some(), "{label}");
         }
+    }
+
+    #[tokio::test]
+    async fn message_send_refused_before_publish_keeps_the_pending_turn() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut parked = Instance::new("parked", "/tmp/aoe-msg-project");
+        parked.id = "sess-msg-pending".to_string();
+        parked.view = crate::session::View::Structured;
+        parked.agent_name = Some("aoe-no-such-agent-msg".to_string());
+        let seeded = crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        };
+        parked.pending_initial_turn = Some(seeded.clone());
+        let (deps, state, _dir) = test_deps(vec![parked]);
+        seed_native_rows(&state).await;
+        let result = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("sess-msg-pending", "wake up"),
+        )
+        .await;
+        assert!(result.is_err(), "the fake agent cannot start");
+        assert_eq!(
+            state.instances.read().await[0].pending_initial_turn,
+            Some(seeded),
+            "a message refused before publication must keep the pending turn"
+        );
     }
 
     #[tokio::test]
@@ -1953,11 +1988,11 @@ mod tests {
             .acp_supervisor
             .test_insert_worker("sess-3685")
             .await;
-        let sink = crate::acp::supervisor::ChannelSink {
-            tx: state.acp_events_tx.clone(),
-            event_store: Arc::clone(&state.acp_event_store),
-            control_cache: Arc::clone(&state.acp_control_cache),
-        };
+        let sink = crate::acp::supervisor::ChannelSink::new(
+            state.acp_events_tx.clone(),
+            Arc::clone(&state.acp_event_store),
+            Arc::clone(&state.acp_control_cache),
+        );
         let ctx = ctx_with(&["session.prompt"]);
 
         let mut seq = 0;

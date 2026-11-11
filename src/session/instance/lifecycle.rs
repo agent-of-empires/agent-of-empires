@@ -15,9 +15,8 @@ use super::*;
 /// without a whole-session reservation; its original cohort journal owns recovery.
 /// `status` is presentation state and never proves ownership.
 ///
-/// Ordinary crashed reservations expire after their TTL. Explicit terminal
-/// handoff debt requires matching-intent recovery, which advances generation
-/// before taking over so late results cannot mutate or clear its replacement.
+/// Ordinary crashed reservations expire after their TTL. Pending Trash teardown
+/// and terminal handoff require matching-intent recovery under a new generation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleOperation {
@@ -31,10 +30,16 @@ pub enum LifecycleOperation {
 
 impl LifecycleOperation {
     pub(crate) fn busy_reason(self) -> String {
+        if self == Self::Trash {
+            return "in an unfinished Trash transition; retry Trash before another lifecycle action".into();
+        }
         format!("busy with lifecycle operation {self:?}")
     }
 
     pub(crate) fn already_in_progress_reason(self) -> String {
+        if self == Self::Trash {
+            return "Trash is in progress or unfinished; if interrupted, retry Trash before another lifecycle action".into();
+        }
         format!("lifecycle operation {self:?} is already in progress")
     }
 }
@@ -66,10 +71,23 @@ pub struct LifecycleReservation {
 }
 
 impl Instance {
-    /// Longer than any bounded hook, teardown, or worktree move. A crashed
-    /// owner cannot retain the reservation forever; a late owner is still
-    /// harmless because every commit is generation-checked.
+    /// Ordinary crashed owners expire; generation checks fence late commits.
     pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
+
+    /// Sandbox Launch leases share this floor with native preparation requests.
+    pub(crate) const SANDBOX_PREPARATION_WINDOW: chrono::Duration = chrono::Duration::minutes(30);
+
+    fn lifecycle_reservation_ttl(
+        &self,
+        holder: LifecycleOperation,
+        ttl: chrono::Duration,
+    ) -> chrono::Duration {
+        if holder == LifecycleOperation::Launch && self.is_sandboxed() {
+            ttl.max(Self::SANDBOX_PREPARATION_WINDOW)
+        } else {
+            ttl
+        }
+    }
 
     fn next_available_lifecycle_generation(
         &self,
@@ -80,7 +98,8 @@ impl Instance {
             return Err(LifecycleReservationError::Busy(LifecycleOperation::Launch));
         }
         if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
-            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+            reservation.generation == self.lifecycle_generation
+                && (now - reservation.at) < self.lifecycle_reservation_ttl(reservation.op, ttl)
         }) {
             return Err(LifecycleReservationError::Busy(reservation.op));
         }
@@ -101,6 +120,9 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> Result<u64, LifecycleReservationError> {
+        if operation != LifecycleOperation::Trash && self.has_pending_trash() {
+            return Err(LifecycleReservationError::Busy(LifecycleOperation::Trash));
+        }
         let generation = self.next_available_lifecycle_generation(ttl, now)?;
         self.lifecycle_generation = generation;
         self.failed_purge = None;
@@ -139,12 +161,38 @@ impl Instance {
                 .is_none_or(|reservation| reservation.generation == generation)
     }
 
+    pub(crate) fn has_pending_trash(&self) -> bool {
+        self.is_trashed()
+            && self.lifecycle_reservation_is_owned(
+                LifecycleOperation::Trash,
+                self.lifecycle_generation,
+            )
+    }
+
+    /// A returned attempt no longer owns a live lease, but unconfirmed paths remain fenced.
+    pub(crate) fn retire_trash_reservation_if_owned(
+        &mut self,
+        generation: u64,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if !self.has_pending_trash()
+            || !self.lifecycle_reservation_is_owned(LifecycleOperation::Trash, generation)
+        {
+            return false;
+        }
+        if let Some(reservation) = &mut self.lifecycle_reservation {
+            reservation.at = reservation.at.min(now - Self::LIFECYCLE_RESERVATION_TTL);
+        }
+        true
+    }
+
     pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
+                    && (now - reservation.at)
+                        < self.lifecycle_reservation_ttl(reservation.op, Self::LIFECYCLE_RESERVATION_TTL)
         )
     }
 
@@ -212,14 +260,14 @@ impl Instance {
         ttl: chrono::Duration,
         now: DateTime<Utc>,
     ) -> bool {
-        if self.terminal_handoff.is_some() {
+        if self.terminal_handoff.is_some() || self.has_pending_trash() {
             return false;
         }
         if matches!(
             &self.lifecycle_reservation,
             Some(reservation)
                 if reservation.generation == self.lifecycle_generation
-                    && (now - reservation.at) >= ttl
+                    && (now - reservation.at) >= self.lifecycle_reservation_ttl(reservation.op, ttl)
         ) {
             self.lifecycle_reservation = None;
             true
@@ -695,6 +743,15 @@ impl Instance {
                 } else {
                     message.into()
                 }
+            } else if let Some(failure) =
+                error.downcast_ref::<crate::migrations::SandboxMigrationError>()
+            {
+                tracing::warn!(target: "session.store", session = %self.id, error = %format_args!("{error:#}"), "sandbox migration did not complete");
+                let message = failure.api_code().sandbox_migration_message().unwrap();
+                match scope_failure {
+                    Some(_) => format!("{message}\nScope retirement remains unproven."),
+                    None => message.into(),
+                }
             } else {
                 match scope_failure {
                     Some(scope) => {
@@ -720,6 +777,101 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_preparation_reservation_outlives_ordinary_recovery_without_blocking_it() {
+        let now = Utc::now();
+        let acquired = now - chrono::Duration::minutes(11);
+        for (sandboxed, operation) in [
+            (true, LifecycleOperation::Launch),
+            (false, LifecycleOperation::Launch),
+            (true, LifecycleOperation::Stop),
+            (true, LifecycleOperation::Purge),
+        ] {
+            let mut owner = Instance::new("preparing", "/tmp/preparing");
+            owner.sandbox_info = sandboxed.then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true, "image": "test-image", "container_name": "preparing"
+                }))
+                .unwrap()
+            });
+            let generation = owner
+                .try_acquire_lifecycle_reservation(
+                    operation,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    acquired,
+                )
+                .unwrap();
+            let protected = sandboxed && operation == LifecycleOperation::Launch;
+            assert_eq!(owner.has_fresh_lifecycle_reservation(now), protected);
+            let mut cleanup = owner.clone();
+            assert_eq!(
+                cleanup
+                    .clear_expired_lifecycle_reservation(Instance::LIFECYCLE_RESERVATION_TTL, now),
+                !protected
+            );
+            for contender in [
+                LifecycleOperation::Launch,
+                LifecycleOperation::Capture,
+                LifecycleOperation::Stop,
+                LifecycleOperation::Purge,
+                LifecycleOperation::Restore,
+                LifecycleOperation::Trash,
+            ] {
+                let mut next = owner.clone();
+                let outcome = next.try_acquire_lifecycle_reservation(
+                    contender,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now,
+                );
+                if protected {
+                    assert_eq!(
+                        outcome,
+                        Err(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+                    );
+                    assert_eq!(next.lifecycle_reservation, owner.lifecycle_reservation);
+                    assert_eq!(next.lifecycle_generation, generation);
+                } else {
+                    assert_eq!(outcome.unwrap(), generation + 1);
+                    assert!(!next.release_lifecycle_reservation_if_owned(operation, generation));
+                }
+            }
+            if protected {
+                owner.sandbox_store_generation = 2;
+                assert!(owner.has_fresh_lifecycle_reservation(now));
+                let expired = acquired + chrono::Duration::minutes(30);
+                assert!(!owner.has_fresh_lifecycle_reservation(expired));
+                let longer = chrono::Duration::minutes(31);
+                assert!(!owner.clear_expired_lifecycle_reservation(longer, expired));
+                assert_eq!(
+                    owner.try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Stop,
+                        longer,
+                        expired,
+                    ),
+                    Err(LifecycleReservationError::Busy(LifecycleOperation::Launch))
+                );
+                assert!(owner.clear_expired_lifecycle_reservation(
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    expired
+                ));
+                let next = owner
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Stop,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        expired,
+                    )
+                    .unwrap();
+                assert_eq!(next, generation + 1);
+                assert!(!owner.finish_lifecycle_status(
+                    LifecycleOperation::Launch,
+                    generation,
+                    Status::Idle
+                ));
+                assert!(owner.lifecycle_reservation_is_owned(LifecycleOperation::Stop, next));
+            }
+        }
+    }
 
     #[test]
     #[serial_test::serial]
@@ -1633,6 +1785,64 @@ mod tests {
         assert!(
             instance.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation)
         );
+    }
+
+    #[test]
+    fn unfinished_trash_survives_expiry_and_blocks_other_lifecycles() {
+        let now = Utc::now();
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
+        for (trashed, current) in [(true, true), (true, false), (false, true)] {
+            let mut row = Instance::new("unfinished trash", "/tmp/unfinished-trash");
+            row.try_acquire_lifecycle_reservation(
+                LifecycleOperation::Trash,
+                ttl,
+                now - ttl - chrono::Duration::seconds(1),
+            )
+            .unwrap();
+            if trashed {
+                row.trash();
+            }
+            if !current {
+                row.lifecycle_generation += 1;
+            }
+            let pending = trashed && current;
+            for operation in [
+                LifecycleOperation::Launch,
+                LifecycleOperation::Capture,
+                LifecycleOperation::Stop,
+                LifecycleOperation::Restore,
+                LifecycleOperation::Purge,
+            ] {
+                let mut contender = row.clone();
+                let before = serde_json::to_value(&contender).unwrap();
+                let result = contender.try_acquire_lifecycle_reservation(operation, ttl, now);
+                if pending {
+                    assert_eq!(
+                        result,
+                        Err(LifecycleReservationError::Busy(LifecycleOperation::Trash))
+                    );
+                    assert_eq!(serde_json::to_value(&contender).unwrap(), before);
+                } else {
+                    assert_eq!(result, Ok(row.lifecycle_generation + 1));
+                }
+            }
+            let mut cleared = row.clone();
+            assert_eq!(
+                cleared.clear_expired_lifecycle_reservation(ttl, now),
+                current && !trashed
+            );
+            if pending {
+                assert_eq!(
+                    serde_json::to_value(&cleared).unwrap(),
+                    serde_json::to_value(&row).unwrap()
+                );
+            }
+            let generation = row.lifecycle_generation;
+            assert_eq!(
+                row.try_acquire_lifecycle_reservation(LifecycleOperation::Trash, ttl, now),
+                Ok(generation + 1)
+            );
+        }
     }
 
     #[test]

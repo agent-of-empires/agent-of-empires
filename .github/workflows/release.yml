@@ -12,6 +12,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
   # Centralizes the "which ref do we operate on" rule so every job's checkout
   # stays in sync. Without this, workflow_dispatch silently fell back to main:
   # checkout's default ref ignored the `tag` input, so validation read main's
@@ -129,8 +132,12 @@ jobs:
         with:
           node-version: '22'
 
+      - name: Install web frontend dependencies
+        working-directory: web
+        run: npm install
       - name: Build web frontend
-        run: cd web && npm install && npm run build
+        working-directory: web
+        run: npm run build
 
       - name: Read release toolchain
         id: toolchain
@@ -229,7 +236,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: git-cliff
 

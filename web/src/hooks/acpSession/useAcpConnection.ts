@@ -336,7 +336,7 @@ export function useAcpConnection(
         if (!isCurrentDial()) return;
         if (replay.delivered()) setReplayedWhileDown(true);
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-        const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
+        const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}&projection=web`;
         const ws = new WebSocket(url, acpSocketProtocols());
         wsRef.current = ws;
         const handshakeTimer = setTimeout(() => {

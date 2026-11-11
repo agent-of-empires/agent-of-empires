@@ -171,12 +171,14 @@
         "tests/mobile-keyboard.spec.ts",
         "src/hooks/useMobileViewportLock.test.ts",
         "src/components/__tests__/LiveTerminalView.recover.test.tsx",
-        "src/components/__tests__/LiveTerminalView.restart.test.tsx"
+        "src/components/__tests__/LiveTerminalView.restart.test.tsx",
+        "src/components/__tests__/LiveTerminalView.keyboardResume.test.tsx"
       ],
       "components": [
         "web/src/App.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/LiveTerminalView.tsx",
+        "web/src/hooks/useMobileKeyboard.ts",
         "web/src/hooks/useMobileViewportLock.ts",
         "web/src/hooks/useLiveTerminal.ts"
       ]
@@ -224,7 +226,7 @@
       "risk": "medium",
       "specs": ["src/hooks/useLiveTerminal.test.ts", "src/components/__tests__/LiveTerminalView.recover.test.tsx"],
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"],
-      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it."
+      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it. Retry reconnects; a per-session dismissal persists until a grid transport or a user-initiated reconnect."
     },
     {
       "id": "terminal.live-alt-screen-scroll",
@@ -1021,6 +1023,22 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/RowBadges.tsx"]
     },
     {
+      "id": "sidebar.group-expand",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowGroupExpand.test.tsx",
+        "src/components/__tests__/WorkspaceSidebarGroupSlices.test.tsx",
+        "src/lib/__tests__/sessionWorkspace.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/RowBadges.tsx",
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ],
+      "notes": "A worktree row that collapsed more than one session into itself can expand into a full, indented row per session behind a guide line, instead of leaving every session but the row's picked one unreachable. Each expanded row has its own click-to-navigate (a modified click never selects the group), single-session context menu, optimistic triage and active-session marking; none of them read or write the group's selection or triage state. Expanded rows hide in the compact rail. On the group axis one workspace is split across groups under a single id, so every slice's children reconcile their optimistic overrides, and a later canonical update is not masked by a stale pin. A session keeps reconciling after its siblings leave, so a worktree going 2 -> 1 -> 2 sessions does not resurrect a stale override."
+    },
+    {
       "id": "app-shell.mobile-chrome-collapse",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -1249,7 +1267,7 @@
         "web/src/components/session-wizard/createFailureView.ts",
         "web/src/components/Toasts.tsx"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1268,7 +1286,7 @@
         "web/src/components/sidebar/sessionActionTargets.ts",
         "web/src/hooks/useSessions.ts"
       ],
-      "notes": "acp.structured_view = off hides the wizard toggle and the sidebar switch to structured view, including across profile changes, import exit and pin responses; terminal and structured preselect that view."
+      "notes": "acp.structured_view = auto or structured preselects structured in the wizard, while terminal preselects terminal; off hides the wizard toggle and sidebar switch to structured view, including across profile changes, import exit and pin responses."
     },
     {
       "id": "wizard.create-progress",
@@ -1504,6 +1522,14 @@
         "web/src/components/session-wizard/steps/AgentStep.tsx",
         "web/src/components/session-wizard/steps/AgentPanel.tsx"
       ]
+    },
+    {
+      "id": "acp.explicit-start-after-stop",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-worker-api.spec.ts"],
+      "components": ["src/server/api/sessions/lifecycle.rs", "src/server/acp_reconciler/mod.rs"],
+      "notes": "Explicit start after a daemon restart resumes a deliberately stopped structured worker without a queued prompt."
     },
     {
       "id": "acp.custom-agent-acp-capable",
@@ -1967,6 +1993,31 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/sidebar/TrashMenu.tsx"]
     },
     {
+      "id": "sidebar.trash-on-demand",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/hooks/useSessions.test.ts",
+        "src/hooks/__tests__/useOrphanSweep.test.tsx",
+        "src/hooks/useLastSessionRestore.test.tsx",
+        "src/components/__tests__/WorkspaceSidebarTrash.test.tsx",
+        "src/components/__tests__/TrashReadFailed.test.tsx",
+        "tests/session-trash-read-failure.spec.ts",
+        "tests/plugin-pages.spec.ts"
+      ],
+      "components": [
+        "web/src/hooks/useSessions.ts",
+        "web/src/hooks/useOrphanSweep.ts",
+        "web/src/hooks/useLastSessionRestore.ts",
+        "web/src/lib/api.ts",
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/TrashReadFailed.tsx",
+        "web/src/components/sidebar/TrashMenu.tsx"
+      ],
+      "notes": "The polled session list omits trashed rows and reports their count, so the Trash control shows it before any row exists. Opening Trash, or opening a session absent from the list, fetches the trashed rows, which then follow every poll and drop out when restored. The orphan draft and comment sweep takes its ids from one complete snapshot when a trash exists. A slow trash read lands despite newer list revisions, with each row fenced by its own newer receipt, and a pushed status for a trashed row survives older reads. A row last observed at a newer revision is not rolled back by a delayed list read, and a trash read's omission is fenced the same way in both directions: it does not drop a held row with a newer receipt, and it is remembered so an older list read cannot bring the row back. The newest observation of each row outlives its omission from the list, so an older trash read cannot reinstall a row that was shown and then left. A standalone cold launch whose saved session is trashed resolves it through the trash lookup instead of dropping it. A failed or timed-out trash read keeps the known rows and, for an opened session the list does not carry, shows an error with Retry instead of the skeleton or a gone screen; the next read that lands clears it. The daemon answers an unchanged list or UI state with a header-only 304 that the browser turns back into the stored body (Rust tests `unchanged_listing_answers_not_modified_without_a_body`, `unchanged_ui_state_answers_not_modified_without_a_body`)."
+    },
+    {
       "id": "sidebar.trash-row-context-menu",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -2246,6 +2297,17 @@
       ]
     },
     {
+      "id": "sidebar.popup-escape-keeps-selection",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SidebarSortPicker.test.tsx"],
+      "components": [
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/useOutsideDismiss.ts",
+        "web/src/components/sidebar/useSidebarSelection.ts"
+      ]
+    },
+    {
       "id": "sidebar.sort-live",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -2377,6 +2439,25 @@
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/hooks/useOrgGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
+      "id": "sidebar.status-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/lib/sidebarGroups.ts"]
+    },
+    {
+      "id": "sidebar.status-axis-live",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-grouping.spec.ts"],
+      "components": [
+        "web/src/components/SidebarAxisPicker.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useStatusGroups.ts",
         "web/src/lib/sidebarGroups.ts"
       ]
     },
@@ -2776,6 +2857,7 @@
     },
     {
       "id": "acp.history-window",
+      "notes": "Warm-cache tests hold catch-up after cached messages are readable, verify the same rendered window survives completion, and exercise reconnect without new events. Canonical overlap updates do not discard the loaded prefix or reset the oldest cursor.",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": [
@@ -2888,6 +2970,7 @@
       "risk": "medium",
       "specs": [
         "tests/diff.spec.ts",
+        "src/lib/snippetHighlighter.themes.test.ts",
         "src/components/diff/find/findMatches.test.ts",
         "src/components/diff/find/changedLines.test.ts",
         "src/components/diff/find/FindBar.test.tsx",
@@ -2897,6 +2980,7 @@
       ],
       "components": [
         "web/src/components/diff/find/FindBar.tsx",
+        "web/src/lib/snippetHighlighter.ts",
         "web/src/components/diff/pierre/DiffWorkerPoolProvider.tsx"
       ]
     },
@@ -2929,6 +3013,7 @@
       "id": "settings.persistent-structured-views",
       "kind": "vitest",
       "risk": "low",
+      "description": "Kept views stay attached across session switches, so each keeps its scroll position.",
       "specs": [
         "src/components/__tests__/StructuredSessionStack.test.tsx",
         "src/lib/__tests__/persistentStructuredViews.test.ts",
@@ -3142,8 +3227,9 @@
       "id": "acp.approval-resolve-clear",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/hooks/acpSession/reducer.test.ts"],
-      "components": ["web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/hooks/acpSession/reducer.test.ts", "src/hooks/useAcpSession.test.ts"],
+      "components": ["web/src/hooks/useAcpSession.ts"],
+      "notes": "A failed approval POST records the error and rejects so the card can retry; a 404 for an approval already resolved counts as resolved."
     },
     {
       "id": "acp.attention-chime",
@@ -3468,8 +3554,13 @@
       "id": "acp.reduced-state-channel",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/acpTypes.reducer.test.ts"],
-      "components": ["web/src/lib/acpTypes.ts", "web/src/hooks/useAcpSession.ts"]
+      "specs": ["src/lib/acpTypes.reducer.test.ts", "src/hooks/useAcpSession.test.ts"],
+      "components": [
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/useAcpConnection.ts"
+      ],
+      "notes": "Web negotiates projection=web on initial and reconnect sockets, omitting only the duplicate reduced_state.background_agents field without an unchanged marker. Default and explicit full snapshots preserve native busy state. Raw launch, progress and completion events retain complete prompt, tools and result for browser panels and Copy. The hook reconnects from the last lifecycle seq with an empty raw replay and an agent-free Web snapshot, preserving the existing agent details. Rust query, projection and WebSocket tests cover connect, live updates, reconnect and lag rebuilds."
     },
     {
       "id": "acp.drafts",
@@ -3578,14 +3669,24 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/ApprovalCard.test.tsx"],
-      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/ApprovalCard.tsx", "web/src/components/acp/PlanModal.tsx"],
+      "notes": "Destructive holds run by mouse, touch, or Space/Enter held 800ms; release, button blur, window blur, and page hiding cancel. Offline buttons are disabled and dimmed. A rejected submit re-enables every decision. Card and modal order decisions Allow, Always, Deny."
+    },
+    {
+      "id": "acp.approval-hold-browser",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-approval-hold.spec.ts"],
+      "components": ["web/src/components/acp/ApprovalCard.tsx"],
+      "notes": "In Chromium, a completed Space/Enter hold submits once and its release adds nothing; release, Tab, window blur, or page hiding before 800ms submits nothing."
     },
     {
       "id": "acp.plan-modal",
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-plan-modal.spec.ts"],
-      "components": ["web/src/components/acp/PlanModal.tsx"]
+      "components": ["web/src/components/acp/PlanModal.tsx", "web/src/components/Dialog.tsx"],
+      "notes": "On a short 390px screen an answer list wraps inside a bounded, scrollable footer; every action stays inside the panel and Dismiss is reachable by scrolling."
     },
     {
       "id": "acp.markdown",
@@ -3756,7 +3857,8 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"],
+      "notes": "The existing five mobile stories preserve reader escape, streaming follow, reload and collapse behavior. Composer growth waits for its real final textarea and grid heights, observes the pin beyond the chrome-follow window and captures the grown pinned surface. Hook consumers distinguish a coarse viewport resize from an actual reader gesture while retaining the unchanged coarse fold-movement contract."
     },
     {
       "id": "acp.tool-stopped-sweep",
@@ -4016,8 +4118,21 @@
       "id": "projects-section-unit",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/ProjectsSection.test.tsx"],
-      "components": ["web/src/components/ProjectsSection.tsx"]
+      "specs": ["src/components/__tests__/ProjectsSection.test.tsx", "src/lib/__tests__/registeredProjects.test.ts"],
+      "components": [
+        "web/src/components/ProjectsSection.tsx",
+        "web/src/lib/registeredProjects.ts",
+        "web/src/lib/sidebarAxis.ts"
+      ],
+      "notes": "Where the grouping draws repository headers (By repo, By organization, By repo and group) the section is \"Projects, no sessions\" and lists unpinned Projects without a live group; By group draws none, so it is \"Projects\" and lists every registered Project once, pinned or with live sessions included, a pinned row marked ◆ (#5065). Compact is \"Projects\" on every axis. The per-axis rule is axisDrawsRepoHeaders, a Record over SidebarAxis."
+    },
+    {
+      "id": "story.settings-paired-terminal-sizing",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"],
+      "notes": "Terminal UI sizing controls expose bounds and global scope and save sparse numeric patches."
     },
     {
       "id": "story.settings-tmux-select",
@@ -5107,9 +5222,14 @@
       "specs": [
         "src/lib/__tests__/sidebarSelection.test.ts",
         "src/lib/__tests__/sidebarOptimistic.test.ts",
-        "src/lib/__tests__/sidebarBulk.test.ts"
+        "src/lib/__tests__/sidebarBulk.test.ts",
+        "src/hooks/useSidebarTriage.test.ts"
       ],
-      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/sidebarBulk.ts"]
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/sidebarBulk.ts",
+        "web/src/hooks/useSidebarTriage.ts"
+      ]
     },
     {
       "id": "sidebar.multi-select-gestures",
@@ -5250,6 +5370,7 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
+      "description": "Plugin cards show validation, including a warning-styled dev badge.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"

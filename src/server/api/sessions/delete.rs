@@ -988,6 +988,10 @@ async fn empty_trash_owned(state: Arc<AppState>, profile: String) -> axum::respo
                 }
                 let (code, message) =
                     match error.downcast_ref::<crate::session::LifecycleReservationError>() {
+                        Some(crate::session::LifecycleReservationError::Busy(crate::session::LifecycleOperation::Trash)) => (
+                            GroupSessionFailureCode::LifecycleBusy,
+                            "Trash is in progress or unfinished; if interrupted, retry Trash before purging",
+                        ),
                         Some(crate::session::LifecycleReservationError::Busy(_)) => (
                             GroupSessionFailureCode::LifecycleBusy,
                             "Session lifecycle is busy",

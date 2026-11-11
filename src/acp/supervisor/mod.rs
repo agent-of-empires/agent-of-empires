@@ -30,14 +30,14 @@ use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
     WorkerStart,
 };
-use super::state::AcpSessionId;
+use super::state::{AcpSessionId, Event};
 use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{RetirementResources, RetirementTarget};
 
 pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
-pub use sink::{BroadcastSink, ChannelSink};
+pub use sink::{BroadcastSink, ChannelSink, Persisted};
 
 /// Post-startup respawns allowed within `RESTART_WINDOW` before the session is parked.
 const MAX_RESPAWNS_IN_WINDOW: u32 = 3;
@@ -60,7 +60,8 @@ pub(crate) type Launcher = Arc<
 
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 /// Per-session seq counter; outlives workers so every publisher shares one sequence.
-type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
+/// Each session's last allocated seq, under its own lock so sessions publish independently.
+type SeqMap = std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 type RestartRequests = Arc<std::sync::Mutex<HashMap<String, (u64, CancellationToken)>>>;
 type SpawnRequests = Arc<std::sync::Mutex<SpawnRequestState>>;
@@ -606,7 +607,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Seed seq counters from the event store's stored maxima.
     pub fn hydrate_seqs(&self, pairs: impl IntoIterator<Item = (String, u64)>) {
         if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.extend(pairs);
+            guard.extend(
+                pairs
+                    .into_iter()
+                    .map(|(id, seq)| (id, Arc::new(std::sync::Mutex::new(seq)))),
+            );
         }
     }
 
@@ -854,11 +859,44 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
-    let mut guard = next_seqs.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = guard.entry(session_id.to_string()).or_insert(0);
-    *entry = entry.saturating_add(1);
-    *entry
+fn session_seq(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<u64>> {
+    Arc::clone(
+        lock_recover(next_seqs)
+            .entry(session_id.to_string())
+            .or_default(),
+    )
+}
+
+/// Allocate the session's next seq and publish with it under that session's
+/// counter lock, so subscribers receive each session's events in seq order.
+/// `publish` must not allocate a seq for the same session.
+fn publish_with_next_seq<R>(
+    next_seqs: &SeqMap,
+    session_id: &str,
+    publish: impl FnOnce(u64) -> R,
+) -> R {
+    let counter = session_seq(next_seqs, session_id);
+    // A holder blocks on store I/O, so waiters and the holder both run off the async worker.
+    sink::blocking_io(|| {
+        let mut last = lock_recover(&counter);
+        *last = last.saturating_add(1);
+        publish(*last)
+    })
+}
+
+/// Queue `event` under the session's counter lock and wait for the store after
+/// releasing it, so a slow save does not hold up the worker drain on that lock.
+/// Returns the seq and whether the event was stored.
+fn publish_next_persisted<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    event: &Event,
+) -> (u64, bool) {
+    let (seq, persisted) = publish_with_next_seq(next_seqs, session_id, |seq| {
+        (seq, sink.queue_persisted(session_id, seq, event))
+    });
+    (seq, persisted.wait())
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

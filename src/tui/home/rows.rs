@@ -36,6 +36,11 @@ pub(super) fn project_group_key(inst: &Instance) -> String {
 /// sentinel identity the way project mode does for scratch (#3237).
 pub(super) const NO_ORG_GROUP_LABEL: &str = "No organization";
 
+/// Status-mode group key: the status's API spelling, so collapse keys stay stable.
+pub(super) fn status_group_key(inst: &Instance) -> String {
+    inst.status.wire_str().to_string()
+}
+
 impl HomeView {
     pub fn instances(&self) -> impl ExactSizeIterator<Item = &Instance> + '_ {
         self.instances.values()
@@ -206,7 +211,7 @@ impl HomeView {
             GroupByMode::Manual => {
                 !inst.group_path.is_empty() && self.sort_order != SortOrder::Attention
             }
-            GroupByMode::Project | GroupByMode::Org => true,
+            GroupByMode::Project | GroupByMode::Org | GroupByMode::Status => true,
         };
         grouped && !inst.is_archived() && !inst.is_trashed()
     }
@@ -240,6 +245,7 @@ impl HomeView {
         match self.group_by {
             GroupByMode::Project => return self.build_flat_items_by_project(hide_stopped),
             GroupByMode::Org => return self.build_flat_items_by_org(hide_stopped),
+            GroupByMode::Status => return self.build_flat_items_by_status(hide_stopped),
             GroupByMode::Manual => {}
         }
 
@@ -387,5 +393,56 @@ impl HomeView {
             .map(|i| Group::new(&self.resolve_org(i).0, &i.group_path))
             .collect();
         self.flatten_derived_groups(&grouped, &tree_seed, &org_groups, &self.org_group_collapsed)
+    }
+
+    /// One header per status, in the fixed attention order; sessions keep the current
+    /// sort order inside their status.
+    fn build_flat_items_by_status(&self, hide_stopped: bool) -> Vec<Item> {
+        let pool: Vec<Instance> = self
+            .cloned_instances_in_active_view()
+            .into_iter()
+            .map(|mut inst| {
+                inst.group_path = status_group_key(&inst);
+                inst
+            })
+            .collect();
+        let archived: Vec<Instance> = pool
+            .iter()
+            .filter(|i| i.is_archived() || i.is_trashed())
+            .cloned()
+            .collect();
+
+        let mut items = Vec::new();
+        for status in crate::session::Status::attention_order() {
+            let key = status.wire_str();
+            let mut members: Vec<Instance> = pool
+                .iter()
+                .filter(|i| i.group_path == key && !i.is_archived() && !i.is_trashed())
+                .cloned()
+                .collect();
+            // Seed from the unfiltered members, so a status whose sessions are all hidden
+            // keeps its header like the other derived groupings.
+            let present = !members.is_empty();
+            if hide_stopped && status == crate::session::Status::Stopped {
+                members.clear();
+            }
+            if !present {
+                continue;
+            }
+            let mut tree = GroupTree::new_with_groups(&members, &[Group::new(key, key)]);
+            if self
+                .status_group_collapsed
+                .get(key)
+                .copied()
+                .unwrap_or(false)
+            {
+                tree.set_collapsed(key, true);
+            }
+            items.extend(flatten_tree(&tree, &members, self.sort_order));
+        }
+
+        append_archived_section(&mut items, &archived, self.archived_section_collapsed);
+        append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
+        items
     }
 }

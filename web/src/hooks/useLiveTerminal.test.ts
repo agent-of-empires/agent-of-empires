@@ -343,6 +343,18 @@ describe("transport reason", () => {
     expect(result.current.state).toMatchObject({ transport: "grid", transportReason: null });
   });
 
+  it("reports only a grid transport to onGridTransport", () => {
+    const onGridTransport = vi.fn();
+    renderHook(() => useLiveTerminal("s1", false, "live-ws", undefined, onGridTransport));
+    const ws = FakeWS.sockets[0]!;
+    ws.open();
+    ws.deliver({ type: "transport", grid: false, reason: "pipe_owned" });
+    ws.deliver({ type: "transport", grid: false });
+    expect(onGridTransport).not.toHaveBeenCalled();
+    ws.deliver({ type: "transport", grid: true });
+    expect(onGridTransport).toHaveBeenCalledTimes(1);
+  });
+
   it("drops the previous connection's transport and reason when a replacement socket opens", () => {
     vi.useFakeTimers();
     try {
@@ -470,6 +482,90 @@ describe("size owner", () => {
       act(() => result.current.manualReconnect());
       FakeWS.sockets[1]!.open();
       expect(result.current.state.paneDead).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("redials a live socket once it closes, without counting a retry or showing the reconnect banner", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => result.current.manualReconnect());
+      act(() => result.current.manualReconnect());
+      expect(ws.readyState).toBe(FakeWS.CLOSED);
+      expect(FakeWS.sockets).toHaveLength(1);
+      expect(result.current.state).toMatchObject({ connected: true, reconnecting: false });
+
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ connected: false, reconnecting: false, retryCount: 0 });
+
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      next.readyState = FakeWS.CLOSED;
+      act(() => next.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(result.current.state).toMatchObject({ reconnecting: true, retryCount: 1 });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds automatic reconnects until a pending redial's socket closes", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      act(() => result.current.manualReconnect());
+      act(() => {
+        window.dispatchEvent(new Event("online"));
+      });
+      expect(FakeWS.sockets).toHaveLength(1);
+
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ reconnecting: false, retryCount: 0 });
+      const next = FakeWS.sockets[1]!;
+      next.open();
+
+      next.readyState = FakeWS.CLOSED;
+      act(() => next.onclose?.(new CloseEvent("close", { code: 1006 })));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ reconnecting: true, retryCount: 1 });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("redials without waiting for a close handshake that stalls", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, ws } = mount();
+      ws.deliver({ type: "size_owner", is_owner: true });
+      ws.close = () => {
+        ws.readyState = FakeWS.CLOSING;
+      };
+      act(() => result.current.manualReconnect());
+      act(() => vi.advanceTimersByTime(1999));
+      expect(FakeWS.sockets).toHaveLength(1);
+
+      act(() => vi.advanceTimersByTime(1));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({
+        connected: false,
+        isOwner: false,
+        ownerKnown: false,
+        reconnecting: false,
+        retryCount: 0,
+      });
+
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close")));
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(FakeWS.sockets).toHaveLength(2);
+      expect(result.current.state).toMatchObject({ reconnecting: false, retryCount: 0 });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

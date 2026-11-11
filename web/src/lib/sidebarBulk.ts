@@ -20,7 +20,7 @@ export interface BulkTriageBuckets {
 
 export function bucketSelectionForBulk(
   workspaces: readonly Workspace[],
-  optimisticFor: (workspaceId: string) => OptimisticTriage,
+  optimisticFor: (workspace: Workspace) => OptimisticTriage,
 ): BulkTriageBuckets {
   const buckets: BulkTriageBuckets = {
     pinnable: [],
@@ -31,7 +31,7 @@ export function bucketSelectionForBulk(
     unsnoozable: [],
   };
   for (const ws of workspaces) {
-    const o = optimisticFor(ws.id);
+    const o = optimisticFor(ws);
     const server = serverTriageOf(ws);
     const state = triageStateOf({
       isPinned: effectivePinnedOf(o, server.isPinned),
