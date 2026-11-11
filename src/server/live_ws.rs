@@ -2904,16 +2904,26 @@ mod tests {
                     .send(Ws::Text(r#"{"type":"resize","cols":40,"rows":6}"#.into()))
                     .await
                     .unwrap();
-                let refused = until(&mut client, progress_timeout, "size_owner", |v| {
-                    v["type"] == "size_owner"
-                })
+                // The capture loop announces the transport on its own task, so it may arrive before
+                // or after the resize's size_owner reply.
+                let (mut refused, mut fallback) = (None, None);
+                until(
+                    &mut client,
+                    progress_timeout,
+                    "size_owner and transport",
+                    |v| {
+                        match v["type"].as_str() {
+                            Some("size_owner") if refused.is_none() => refused = Some(v.clone()),
+                            Some("transport") if fallback.is_none() => fallback = Some(v.clone()),
+                            _ => {}
+                        }
+                        refused.is_some() && fallback.is_some()
+                    },
+                )
                 .await;
+                let (refused, fallback) = (refused.unwrap(), fallback.unwrap());
                 assert_eq!(refused["is_owner"], false, "{refused}");
                 assert_eq!(refused["owner"], "tui", "{refused}");
-                let fallback = until(&mut client, progress_timeout, "transport", |v| {
-                    v["type"] == "transport"
-                })
-                .await;
                 assert_eq!(fallback["grid"], false, "{fallback}");
                 assert_eq!(fallback["reason"], "pipe_owned", "{fallback}");
 

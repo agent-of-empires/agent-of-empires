@@ -261,16 +261,26 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
         ws.send(Ws::Text(r#"{"type":"resize","cols":80,"rows":24}"#.into()))
             .await
             .unwrap();
-        let owner = until(&mut ws, Duration::from_secs(10), "size_owner", |v| {
-            v["type"] == "size_owner"
-        })
+        // The capture loop announces the transport on its own task, so it may arrive before
+        // or after the resize's size_owner reply.
+        let (mut owner, mut fallback) = (None, None);
+        until(
+            &mut ws,
+            Duration::from_secs(10),
+            "size_owner and transport",
+            |v| {
+                match v["type"].as_str() {
+                    Some("size_owner") if owner.is_none() => owner = Some(v.clone()),
+                    Some("transport") if fallback.is_none() => fallback = Some(v.clone()),
+                    _ => {}
+                }
+                owner.is_some() && fallback.is_some()
+            },
+        )
         .await;
+        let (owner, fallback) = (owner.unwrap(), fallback.unwrap());
         assert_eq!(owner["is_owner"], false, "{owner}");
         assert_eq!(owner["owner"], "tui", "{owner}");
-        let fallback = until(&mut ws, Duration::from_secs(10), "transport", |v| {
-            v["type"] == "transport"
-        })
-        .await;
         assert_eq!(fallback["grid"], false, "{fallback}");
         assert_eq!(fallback["reason"], "pipe_owned", "{fallback}");
 
