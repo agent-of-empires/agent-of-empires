@@ -189,6 +189,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, &Event::SessionCleared);
         }
+        #[cfg(test)]
+        let gate = self.prompt_publish_gate.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
         PublishedPrompt {
             disposition,
             seq: Some(seq),
@@ -286,16 +293,28 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub(crate) async fn classified_receiver(
         &self,
         session_id: &str,
-    ) -> Option<(std::sync::Arc<crate::acp::acp_client::AcpClient>, String)> {
+    ) -> Option<(
+        std::sync::Arc<crate::acp::acp_client::AcpClient>,
+        String,
+        u64,
+    )> {
         let (client, epoch) = {
             let workers = self.workers.lock().await;
             let handle = workers.get(session_id)?;
             (std::sync::Arc::clone(&handle.client), handle.launch_epoch)
         };
         let agent = self.worker_agent_key(session_id).await?;
-        self.is_current_launch(session_id, epoch)
+        self.classified_receiver_is_ready(session_id, epoch)
             .await
-            .then_some((client, agent))
+            .then_some((client, agent, epoch))
+    }
+
+    pub(crate) async fn classified_receiver_is_ready(&self, session_id: &str, epoch: u64) -> bool {
+        let context_pending =
+            super::lock_recover(&self.pending_context_resets).contains(session_id);
+        !crate::process::worker_registry::stop_requested(session_id)
+            && !context_pending
+            && self.is_current_launch(session_id, epoch).await
     }
 
     /// [`Self::worker_agent_key`] for each of `session_ids` that has one, under one workers lock,

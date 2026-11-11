@@ -222,6 +222,8 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_waits: tokio::sync::broadcast::Sender<String>,
     #[cfg(test)]
     agent_key_gate: std::sync::Mutex<Option<test_support::AgentKeyGate>>,
+    #[cfg(test)]
+    prompt_publish_gate: std::sync::Mutex<Option<Arc<tokio::sync::Barrier>>>,
     /// Build-stale sessions draining a turn before the reconciler respawns them.
     respawn_pending: SharedSet,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
@@ -501,6 +503,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             worker_waits: tokio::sync::broadcast::channel(64).0,
             #[cfg(test)]
             agent_key_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            prompt_publish_gate: std::sync::Mutex::new(None),
             respawn_pending: Arc::default(),
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),

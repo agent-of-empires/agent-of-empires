@@ -23,6 +23,10 @@ pub(crate) struct AgentKeyGate {
 }
 
 impl<S: BroadcastSink> Supervisor<S> {
+    pub(crate) fn test_gate_prompt_publish(&self, gate: Arc<tokio::sync::Barrier>) {
+        *self.prompt_publish_gate.lock().unwrap() = Some(gate);
+    }
+
     pub(crate) fn test_gate_agent_key(&self, gate: AgentKeyGate) {
         *self.agent_key_gate.lock().unwrap() = Some(gate);
     }

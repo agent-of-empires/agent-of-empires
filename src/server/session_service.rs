@@ -1090,7 +1090,7 @@ impl SessionService {
         let profile = match classified_as {
             // A turn cut for one agent must not reach a worker a resume started as another.
             Some(cut) => {
-                let (client, receiving) = self
+                let (client, receiving, epoch) = self
                     .acp_supervisor
                     .classified_receiver(id)
                     .await
@@ -1105,7 +1105,7 @@ impl SessionService {
                     );
                     return Err(SendTurnError::AgentChanged);
                 }
-                receiver = Some((client, receiving));
+                receiver = Some((client, receiving, epoch));
                 Some(cut.profile)
             }
             None => self
@@ -1126,34 +1126,54 @@ impl SessionService {
                 profile,
             )
             .await;
-        let outcome = match published.disposition {
-            crate::acp::supervisor::PromptDisposition::Forward => match &receiver {
-                Some((client, _)) => client
-                    .send_prompt(text, attachments)
+        let receiver_ready = match &receiver {
+            Some((_, _, epoch)) => {
+                self.acp_supervisor
+                    .classified_receiver_is_ready(id, *epoch)
                     .await
-                    .map_err(Into::into),
-                None => self.acp_supervisor.send_prompt(id, text, attachments).await,
-            },
-            crate::acp::supervisor::PromptDisposition::ResetContext => match &receiver {
-                Some((client, agent)) => {
-                    self.acp_supervisor
-                        .reset_client_context(
-                            client,
-                            id,
-                            agent,
-                            text,
-                            acp_mode_id.as_deref(),
-                            yolo_mode,
-                        )
-                        .await
-                }
-                None => {
-                    self.acp_supervisor
-                        .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
-                        .await
-                }
-            },
+            }
+            None => true,
         };
+        let outcome = if !receiver_ready {
+            Err(crate::acp::supervisor::SupervisorError::SpawnCancelled(
+                id.into(),
+            ))
+        } else {
+            match published.disposition {
+                crate::acp::supervisor::PromptDisposition::Forward => match &receiver {
+                    Some((client, _, _)) => client
+                        .send_prompt(text, attachments)
+                        .await
+                        .map_err(Into::into),
+                    None => self.acp_supervisor.send_prompt(id, text, attachments).await,
+                },
+                crate::acp::supervisor::PromptDisposition::ResetContext => match &receiver {
+                    Some((client, agent, _)) => {
+                        self.acp_supervisor
+                            .reset_client_context(
+                                client,
+                                id,
+                                agent,
+                                text,
+                                acp_mode_id.as_deref(),
+                                yolo_mode,
+                            )
+                            .await
+                    }
+                    None => {
+                        self.acp_supervisor
+                            .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
+                            .await
+                    }
+                },
+            }
+        };
+        if receiver.is_some() && outcome.is_err() {
+            if let Some(seq) = published.seq {
+                self.acp_supervisor
+                    .publish_stopped_if_seq(id, "delivery_failed", seq);
+            }
+        }
         match outcome {
             Ok(()) => Ok(published.seq),
             // Intentional override of the canonical UnknownSession 404.
@@ -3472,7 +3492,8 @@ mod tests {
     async fn a_lost_ready_receiver_preserves_the_batch_for_a_replacement() {
         use crate::acp::supervisor::test_support::AgentKeyGate;
         use std::time::Duration;
-        for matching_identity in [false, true] {
+        for replacement_point in 0..3 {
+            let after_publication = replacement_point == 2;
             let _home = crate::session::test_support::isolate_app_dir();
             declare_custom_reset("/new");
             let id = "lost-ready-receiver";
@@ -3507,10 +3528,16 @@ mod tests {
                 .unwrap();
             let before_read = Arc::new(tokio::sync::Barrier::new(2));
             let after_read = Arc::new(tokio::sync::Barrier::new(2));
-            service.acp_supervisor.test_gate_agent_key(AgentKeyGate {
-                before_read: Arc::clone(&before_read),
-                after_read: Arc::clone(&after_read),
-            });
+            if after_publication {
+                service
+                    .acp_supervisor
+                    .test_gate_prompt_publish(Arc::clone(&before_read));
+            } else {
+                service.acp_supervisor.test_gate_agent_key(AgentKeyGate {
+                    before_read: Arc::clone(&before_read),
+                    after_read: Arc::clone(&after_read),
+                });
+            }
             let live = save_agent_record(id, "bridge", true);
             service
                 .acp_supervisor
@@ -3520,17 +3547,20 @@ mod tests {
                 .await
                 .unwrap();
             // Remove the ready receiver before identity validation.
-            if !matching_identity {
+            if replacement_point == 0 {
                 service.acp_supervisor.test_remove_worker(id).await;
                 drop(live);
                 crate::process::worker_registry::delete(id).unwrap();
             }
-            tokio::time::timeout(Duration::from_secs(10), before_read.wait())
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(10), after_read.wait())
-                .await
-                .unwrap();
+            if !after_publication {
+                tokio::time::timeout(Duration::from_secs(10), before_read.wait())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+                    .await
+                    .unwrap();
+            }
+
             // Replace after the identity read, without taking the submission lock.
             service.acp_supervisor.test_remove_worker(id).await;
             crate::process::worker_registry::delete(id).ok();
@@ -3541,7 +3571,12 @@ mod tests {
             let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
             std::fs::remove_file(crate::process::worker::control_socket_sibling(&socket)).ok();
             let _replacement = save_agent_record(id, "claude", true);
-            tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+            let release = if after_publication {
+                &before_read
+            } else {
+                &after_read
+            };
+            tokio::time::timeout(Duration::from_secs(10), release.wait())
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(10), drain)
