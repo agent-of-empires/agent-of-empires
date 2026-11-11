@@ -30,6 +30,7 @@ const live = vi.hoisted(() => ({
   typed: null as ((data: string) => boolean) | null,
   pasted: null as ((text: string, submit: boolean) => boolean) | null,
   tabEscape: null as (() => boolean) | null,
+  coarse: false,
 }));
 
 vi.mock("../../hooks/useLiveTerminal", () => ({
@@ -44,7 +45,7 @@ vi.mock("../../hooks/useLiveTerminal", () => ({
     claimAfterResize: live.claimAfterResize,
   }),
 }));
-vi.mock("../../hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => false }));
+vi.mock("../../hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => live.coarse }));
 vi.mock("../../hooks/useMobileKeyboard", () => ({
   useMobileKeyboard: () => ({ keyboardHeight: 0, keyboardOpen: false }),
 }));
@@ -82,6 +83,7 @@ beforeEach(() => {
   live.sendPaste.mockClear();
   live.claim.mockClear();
   live.claimAfterResize.mockClear();
+  live.coarse = false;
   window.localStorage.clear();
 });
 afterEach(() => {
@@ -204,6 +206,37 @@ describe("LiveTerminalView control strip", () => {
     rerender(<View />);
     expect(tab(), "holding control, right after a hold").toBe(false);
     expect(document.activeElement).toBe(input);
+  });
+
+  it("Take control gives focus back to where the Tab escape took it from, else to the input on a fine pointer only", async () => {
+    const proxy = document.createElement("textarea");
+    document.body.append(proxy);
+    const cases: [string, boolean, "input" | "proxy" | null, "input" | "proxy" | "not input"][] = [
+      ["escape from the input", false, "input", "input"],
+      ["escape from App's proxy, touch", true, "proxy", "proxy"],
+      ["desktop click, no escape", false, null, "input"],
+      ["touch, no escape", true, null, "not input"],
+    ];
+    for (const [name, coarse, from, back] of cases) {
+      live.coarse = coarse;
+      await mount();
+      const input = screen.getByLabelText<HTMLTextAreaElement>("Live terminal input");
+      const button = screen.getByRole("button", { name: "Take control" });
+      typeBlocked();
+      if (from) {
+        (from === "input" ? input : proxy).focus();
+        expect(live.tabEscape!(), name).toBe(true);
+      } else {
+        button.focus();
+      }
+      expect(document.activeElement, name).toBe(button);
+      fireEvent.click(button);
+      expect(strip(), name).toBeNull();
+      if (back === "not input") expect(document.activeElement, name).not.toBe(input);
+      else expect(document.activeElement, name).toBe(back === "input" ? input : proxy);
+      cleanup();
+    }
+    proxy.remove();
   });
 
   it("collapses to View only, remembered per Session, surface and pane", async () => {

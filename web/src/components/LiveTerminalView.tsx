@@ -157,12 +157,22 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     },
     [],
   );
+  const takeControlRef = useRef<HTMLButtonElement | null>(null);
+  // Where the Tab escape took focus from: the terminal's input or App's keyboard proxy.
+  const escapeOriginRef = useRef<HTMLElement | null>(null);
   const takeControl = useCallback(() => {
+    // The strip unmounts once claiming, so focus goes back to where it was; a touch tap restores nothing, so no
+    // soft keyboard opens.
+    if (document.activeElement === takeControlRef.current) {
+      const origin = escapeOriginRef.current?.isConnected ? escapeOriginRef.current : null;
+      (origin ?? (coarse ? null : inputRef.current))?.focus();
+    }
+    escapeOriginRef.current = null;
     setClaiming(true);
     claimAfterResize(CLAIM_FIT_DEADLINE_MS);
     if (claimingTimerRef.current) clearTimeout(claimingTimerRef.current);
     claimingTimerRef.current = setTimeout(() => setClaiming(false), CLAIMING_TIMEOUT_MS);
-  }, [claimAfterResize]);
+  }, [claimAfterResize, coarse]);
   const [blockedHold, setBlockedHold] = useState<string | null>(null);
   const holdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(
@@ -188,7 +198,6 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   // Holding control drops the hold at once: no notice may resize a terminal this tab sizes.
   const holdShown =
     blockedHold !== null && !claiming && (readOnly || notOwner || !live.state.connected) ? blockedHold : null;
-  const takeControlRef = useRef<HTMLButtonElement | null>(null);
   const { sendData, sendPaste, manualReconnect, reconnectAndClaim } = live;
   // Automatic redials keep the dismissal; only a reconnect the user asked for brings the notice back.
   const reconnect = useCallback(() => {
@@ -224,6 +233,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   // While view only the terminal sends no keys, so during a hold Tab can reach Take control.
   const escapeTabToTakeControl = useCallback(() => {
     if (!viewOnly || holdShown === null || !takeControlRef.current) return false;
+    escapeOriginRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     takeControlRef.current.focus();
     return true;
   }, [viewOnly, holdShown]);

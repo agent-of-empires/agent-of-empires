@@ -26,10 +26,21 @@ const sizing = (handle: MockHandle) =>
     }
   });
 
-// Only an owner's input reaches the pane, so a key from App's keyboard proxy arriving shows the claim was granted.
-const sendFromProxyUntilDelivered = (page: Page, handle: MockHandle, key: string, bytes: string) =>
+const resizes = (handle: MockHandle) =>
+  liveTexts(handle).flatMap((text) => {
+    try {
+      const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
+      return msg.type === "resize" ? [{ cols: msg.cols!, rows: msg.rows! }] : [];
+    } catch {
+      return [];
+    }
+  });
+
+// Only an owner's input reaches the pane, so a key arriving shows the claim was granted. `refocus` puts focus back
+// on App's keyboard proxy first, for paths that leave it elsewhere.
+const sendUntilDelivered = (page: Page, handle: MockHandle, key: string, bytes: string, refocus: boolean) =>
   expect(async () => {
-    await page.locator("[data-keyboard-proxy]").focus();
+    if (refocus) await page.locator("[data-keyboard-proxy]").focus();
     await page.keyboard.press(key);
     expect(handle.liveInput.map(String)).toContain(bytes);
   }).toPass();
@@ -83,17 +94,7 @@ test.describe("Live terminal control strip at 375px", () => {
       // The fit keeps its tallest height until the width changes by more than 1px, so a report sent before the
       // strip docked would keep the full grid. A narrower width, reported, then the original one resets it to the
       // docked height.
-      const lastResize = () =>
-        liveTexts(handle)
-          .flatMap((text) => {
-            try {
-              const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
-              return msg.type === "resize" ? [{ cols: msg.cols!, rows: msg.rows! }] : [];
-            } catch {
-              return [];
-            }
-          })
-          .at(-1);
+      const lastResize = () => resizes(handle).at(-1);
       const { width, height } = page.viewportSize()!;
       const wideCols = lastResize()!.cols;
       await page.setViewportSize({ width: width - 15, height });
@@ -124,7 +125,7 @@ test.describe("Live terminal control strip at 375px", () => {
       const full = sent.slice(0, claimAt).at(-1);
       // The claim resizes the pane to the last grid before it: the one without the strip.
       expect(typeof full === "number" && full > docked, JSON.stringify(sent)).toBe(true);
-      await sendFromProxyUntilDelivered(page, handle, "Enter", "\r");
+      await sendUntilDelivered(page, handle, "Enter", "\r", true);
       // Well past the 150ms fit debounce the grant's layout change triggers.
       await observeFor(page, 1000, async () => {
         expect(
@@ -135,6 +136,60 @@ test.describe("Live terminal control strip at 375px", () => {
       });
     });
   }
+
+  test("a fit still queued when Take control is clicked claims with the grid without the strip", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { viewOnly: { owner: "tui" } });
+    await openLiveSession(page, handle, { mobile: true });
+    await expect(page.locator("[data-live-control-strip]")).toBeVisible();
+    const scroller = page.locator("[data-live-terminal] > div").first();
+    const wideCols = resizes(handle).at(-1)!.cols;
+    // A narrower pane resets the fit's height latch, so it reports the docked grid at that width.
+    await scroller.evaluate((el) => {
+      el.style.width = `${el.clientWidth - 15}px`;
+    });
+    await expect.poll(() => resizes(handle).at(-1)!.cols).toBeLessThan(wideCols);
+    const docked = resizes(handle).at(-1)!.rows;
+
+    // Widen it back and click from an observer registered after the fit's: it runs once the fit has queued its
+    // debounced report, which resets the latch again and measures whatever the pane holds when it fires.
+    await scroller.evaluate(
+      (el) =>
+        new Promise<void>((resolve) => {
+          const ro = new ResizeObserver(() => {
+            ro.disconnect();
+            document.querySelector<HTMLButtonElement>("[data-live-take-control]")!.click();
+            resolve();
+          });
+          el.style.width = "";
+          ro.observe(el);
+        }),
+    );
+    await expect.poll(() => sizing(handle).filter((x) => x === "claim").length).toBe(1);
+    const sent = liveTexts(handle).flatMap((text) => {
+      try {
+        const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
+        if (msg.type === "claim") return ["claim" as const];
+        return msg.type === "resize" ? [{ cols: msg.cols!, rows: msg.rows! }] : [];
+      } catch {
+        return [];
+      }
+    });
+    const claimAt = sent.indexOf("claim");
+    const carrier = sent[claimAt - 1];
+    // The queued report carried the claim, at the restored width and without the strip.
+    expect(
+      typeof carrier === "object" && carrier.cols === wideCols && carrier.rows > docked,
+      JSON.stringify({ docked, sent }),
+    ).toBe(true);
+    await sendUntilDelivered(page, handle, "Enter", "\r", true);
+    await observeFor(page, 1000, async () => {
+      expect(
+        sizing(handle)
+          .slice(claimAt + 1)
+          .filter((rows) => typeof carrier !== "object" || rows !== carrier.rows),
+      ).toEqual([]);
+    });
+  });
 
   test("Tab on App's keyboard proxy reaches Take control only during a blocked key's hold", async ({ page }) => {
     const handle = await mockTerminalApis(page, { viewOnly: { owner: "tui" } });
@@ -151,8 +206,11 @@ test.describe("Live terminal control strip at 375px", () => {
     await expect(page.locator("[data-live-take-control]")).toBeFocused();
     await page.keyboard.press("Enter");
     await expect(strip).toHaveCount(0);
+    // The button is gone; focus is back on the proxy, so typing goes on without a tap.
+    await expect(proxy).toBeFocused();
     // Holding control, Tab goes to the pane again.
-    await sendFromProxyUntilDelivered(page, handle, "Tab", "\t");
+    await sendUntilDelivered(page, handle, "Tab", "\t", false);
+    await expect(proxy).toBeFocused();
   });
 
   test("after Take control, the top bar's slower-updates notice leaves the header's controls in view", async ({
