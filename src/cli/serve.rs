@@ -1244,7 +1244,14 @@ fn daemon_status_with(
             DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
         },
         DaemonProbeDisposition::Stale => DaemonStatus::Absent,
-        DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
+        // A pid we cannot signal (EPERM) is often a root process that reused it.
+        // Only a positively foreign command clears it; anything else fails closed.
+        DaemonProbeDisposition::Indeterminate => match inspect(pid) {
+            DaemonProcessIdentity::Foreign => DaemonStatus::Absent,
+            DaemonProcessIdentity::Verified | DaemonProcessIdentity::Indeterminate => {
+                DaemonStatus::Unverified
+            }
+        },
     }
 }
 
@@ -2559,6 +2566,13 @@ fn tui_observed_exit(
     Ok(Some(*pid))
 }
 
+fn bail_foreign_pid(pid: i32) -> Result<()> {
+    if clear_serve_state(pid) {
+        bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
+    }
+    bail!("PID {pid} belongs to a different process; serve state changed meanwhile and was preserved.");
+}
+
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
@@ -2584,17 +2598,22 @@ async fn stop_daemon_locked(
         .with_context(|| format!("PID file disappeared at {}", path.display()))?;
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
-    if matches!(
-        classify_daemon_probe(nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            None
-        )),
-        DaemonProbeDisposition::Stale
-    ) {
+    let probe = classify_daemon_probe(nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        None,
+    ));
+    if probe == DaemonProbeDisposition::Stale {
         if let Some(notice) = stale_cleanup_notice(pid, announce) {
             println!("{notice}");
         }
         return Ok(());
+    }
+    // A pid we cannot signal has no capturable handle below, so settle a foreign
+    // owner here without signalling.
+    if probe == DaemonProbeDisposition::Indeterminate
+        && inspect_daemon_process(pid) == DaemonProcessIdentity::Foreign
+    {
+        return bail_foreign_pid(pid);
     }
 
     // Capture before inspecting custody, so process exit or PID reuse during
@@ -2620,14 +2639,7 @@ async fn stop_daemon_locked(
                 );
             }
         }
-        DaemonProcessIdentity::Foreign => {
-            if clear_serve_state(pid) {
-                bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
-            }
-            bail!(
-                "PID {pid} belongs to a different process; serve state changed meanwhile and was preserved."
-            );
-        }
+        DaemonProcessIdentity::Foreign => return bail_foreign_pid(pid),
         DaemonProcessIdentity::Indeterminate => {
             bail!(
                 "Could not verify whether PID {} is an aoe serve daemon; \
@@ -3702,6 +3714,27 @@ mod tests {
 
             let _ = foreign.kill();
             let _ = foreign.wait();
+        }
+
+        #[test]
+        #[serial]
+        fn unsignalable_pid_is_absent_only_when_its_command_is_foreign() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+            publish(&dir, 4242);
+
+            for (identity, expected) in [
+                (DaemonProcessIdentity::Foreign, DaemonStatus::Absent),
+                (DaemonProcessIdentity::Verified, DaemonStatus::Unverified),
+                (
+                    DaemonProcessIdentity::Indeterminate,
+                    DaemonStatus::Unverified,
+                ),
+            ] {
+                let status =
+                    daemon_status_with(|_| DaemonProbeDisposition::Indeterminate, |_| identity);
+                assert_eq!(status, expected, "{identity:?}");
+            }
         }
 
         #[test]
