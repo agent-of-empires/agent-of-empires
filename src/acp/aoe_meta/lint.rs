@@ -109,7 +109,17 @@ pub fn lint(reader: impl BufRead, opts: LintOptions) -> Vec<Finding> {
             .and_then(|k| k.as_str())
             .unwrap_or_default()
             .to_string();
+        // The runtime drops an update for another session before it reads the
+        // envelope, but the frame still holds its adapter position.
+        let foreign = frame
+            .pointer("/params/sessionId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|id| session.as_deref().is_some_and(|current| current != id));
+        if foreign && super::is_anchored(update) {
+            continue;
+        }
         let envelope = match super::from_update_value(update) {
+            _ if foreign => None,
             Ok(envelope) => envelope,
             Err(e) => {
                 let code = match e {
@@ -233,6 +243,10 @@ mod tests {
         update_of("agent_message_chunk", meta)
     }
 
+    fn in_session(id: &str, frame: String) -> String {
+        frame.replace(r#""sessionId":"s""#, &format!(r#""sessionId":"{id}""#))
+    }
+
     fn run(lines: &[String], require_hello: bool) -> Vec<&'static str> {
         let text = lines.join("\n");
         lint(text.as_bytes(), LintOptions { require_hello })
@@ -330,7 +344,33 @@ mod tests {
                     tool_call("t1", r#"{"v":1,"key":"k"}"#),
                     r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
                     r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
-                    tool_call("t2", r#"{"v":1,"key":"k"}"#),
+                    in_session("s2", tool_call("t2", r#"{"v":1,"key":"k"}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "a late old-session frame is not checked in the new key space",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    in_session("s1", tool_call("t1", r#"{"v":1,"key":"k"}"#)),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session("s2", tool_call("t2", r#"{"v":1,"key":"k"}"#)),
+                    in_session("s1", tool_call("t3", r#"{"v":1,"key":"k"}"#)),
+                ],
+                false,
+                vec![],
+            ),
+            (
+                "a late old-session frame still takes its adapter number",
+                vec![
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
+                    r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s2"}}"#.into(),
+                    in_session(
+                        "s2",
+                        update(r#"{"v":1,"key":"t","after_adapter_sequence":1,"ephemeral":true}"#),
+                    ),
+                    in_session("s1", update(r#"{"v":1,"key":"late"}"#)),
                 ],
                 false,
                 vec![],
@@ -339,9 +379,9 @@ mod tests {
                 "key reused for a different update in the same session",
                 vec![
                     r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#.into(),
-                    tool_call("t1", r#"{"v":1,"key":"k"}"#),
+                    in_session("s1", tool_call("t1", r#"{"v":1,"key":"k"}"#)),
                     r#"{"jsonrpc":"2.0","id":3,"result":{"sessionId":"s1"}}"#.into(),
-                    tool_call("t2", r#"{"v":1,"key":"k"}"#),
+                    in_session("s1", tool_call("t2", r#"{"v":1,"key":"k"}"#)),
                 ],
                 false,
                 vec!["key_conflict"],
