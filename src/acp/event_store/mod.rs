@@ -1,6 +1,7 @@
 //! Disk-backed event log for structured view sessions.
 
 mod attachments;
+pub(crate) mod identity;
 mod rate_limit;
 mod replay;
 mod search;
@@ -73,13 +74,16 @@ const MAX_IDLE_READERS: usize = 4;
 /// SQLite-backed structured view event log.
 pub struct EventStore {
     conn: Mutex<Connection>,
-    /// Read-only connection used exclusively by `search_content`.
-    search_conn: Mutex<Connection>,
-    /// Read-only connections for replays, so a long read never holds `conn`.
+    /// Independent file-backed reader; private databases share `conn`.
+    read_conn: Option<Mutex<Connection>>,
     readers: Mutex<Vec<Connection>>,
     db_path: std::path::PathBuf,
     schema: events::Schema,
     max_events_per_session: usize,
+    #[cfg(test)]
+    retained_read_gate: Mutex<Option<test_support::RetainedReadGate>>,
+    #[cfg(any(test, debug_assertions))]
+    _temp_directory: Option<tempfile::TempDir>,
 }
 
 fn open_reader(db_path: &Path) -> Result<Connection> {
@@ -128,8 +132,18 @@ impl EventStore {
     pub fn open(db_path: &Path, max_events_per_session: usize) -> Result<Self> {
         // Prefix "acp" maps to the existing acp_events / acp_attachments tables.
         let schema = events::Schema::new("acp")?;
-        let conn = events::open(db_path, &schema)?;
-        let search_conn = open_reader(db_path)?;
+        let mut conn = events::open(db_path, &schema)?;
+        identity::install(&mut conn)?;
+        let private_database: bool = conn.query_row(
+            "SELECT file = '' FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let read_conn = if private_database {
+            None
+        } else {
+            Some(Mutex::new(open_reader(db_path)?))
+        };
         debug!(
             target: "acp.event_store",
             path = %db_path.display(),
@@ -138,20 +152,45 @@ impl EventStore {
         );
         Ok(Self {
             conn: Mutex::new(conn),
-            search_conn: Mutex::new(search_conn),
+            read_conn,
             readers: Mutex::new(Vec::new()),
             db_path: db_path.to_path_buf(),
             schema,
             max_events_per_session,
+            #[cfg(test)]
+            retained_read_gate: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            _temp_directory: None,
         })
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn temporary_for_test(max_events_per_session: usize) -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Self::open(
+            &directory.path().join("acp_events.db"),
+            max_events_per_session,
+        )?;
+        store._temp_directory = Some(directory);
+        Ok(store)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    fn read_conn(&self) -> MutexGuard<'_, Connection> {
+        self.read_conn
+            .as_ref()
+            .unwrap_or(&self.conn)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
     /// A connection for read-only queries that does not wait on writes.
     fn reader(&self) -> ReadConn<'_> {
+        if self.read_conn.is_none() {
+            return ReadConn::Writer(self.conn());
+        }
         let idle = self.readers.lock().unwrap_or_else(|p| p.into_inner()).pop();
         match idle.map_or_else(|| open_reader(&self.db_path), Ok) {
             Ok(conn) => ReadConn::Pooled(self, Some(conn)),
@@ -452,6 +491,61 @@ fn event_kind(json: &str) -> &str {
 pub(super) mod test_support {
     use super::*;
     use tempfile::TempDir;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::acp::event_store) enum RetainedReadStage {
+        Snapshot,
+        BeforeDecode,
+    }
+
+    pub(in crate::acp::event_store) struct RetainedReadGate {
+        session: String,
+        stage: RetainedReadStage,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    pub(in crate::acp::event_store) fn gate_retained_read(
+        store: &EventStore,
+        session: &str,
+        stage: RetainedReadStage,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, entered) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let mut slot = store.retained_read_gate.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some(RetainedReadGate {
+            session: session.into(),
+            stage,
+            reached,
+            release: resume,
+        });
+        (entered, release)
+    }
+
+    impl EventStore {
+        pub(in crate::acp::event_store) fn pause_retained_read(
+            &self,
+            session: &str,
+            stage: RetainedReadStage,
+        ) {
+            let gate = {
+                let mut slot = self.retained_read_gate.lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|gate| gate.session == session && gate.stage == stage)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.reached.send(()).unwrap();
+                let _ = gate.release.recv();
+            }
+        }
+    }
 
     pub(in crate::acp::event_store) fn open_store(max: usize) -> (TempDir, EventStore) {
         let tmp = TempDir::new().unwrap();

@@ -1,4 +1,4 @@
-//! Migration v054: `acp.max_concurrent_workers` is global-only. Move the served
+//! Migration v055: `acp.max_concurrent_workers` is global-only. Move the served
 //! profile's value (the default profile's if none is recorded) to the global
 //! config, since that value was the effective cap, and drop every other one.
 
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn upgrade_across_v030_keeps_the_served_profile_cap() {
+    fn upgrade_from_v030_to_v055_keeps_the_served_profile_cap() {
         // (recorded served profile, expected global cap)
         for (served, expected) in [(Some("other"), 1), (Some("bare"), 100), (None, 3)] {
             let temp = tempfile::tempdir().unwrap();

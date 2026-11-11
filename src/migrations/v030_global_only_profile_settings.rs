@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use std::{collections::HashSet, fs, io::ErrorKind, path::Path};
 use tracing::info;
 
-use super::v054_global_max_concurrent_workers::WORKER_CAP_FIELD;
+use super::v055_global_max_concurrent_workers::WORKER_CAP_FIELD;
 use crate::session::{
     acquire_storage_flock, atomic_write,
     config::{
@@ -34,7 +34,7 @@ fn read_config(path: &Path) -> Result<Option<toml::Table>> {
 }
 
 fn run_in(app_dir: &Path, write: impl FnMut(&Path, &[u8]) -> Result<()>) -> Result<()> {
-    // v054 owns this field: it must still be in the profiles when v054 picks the served one.
+    // v055 owns this field: it must still be in the profiles when v055 picks the served one.
     promote_fields(app_dir, write, None, |field| {
         !field.profile_overridable && field.path() != WORKER_CAP_FIELD
     })
