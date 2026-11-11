@@ -838,7 +838,7 @@ pub async fn trash_session(
                 pre_trash_project_path: instance.pre_trash_project_path.clone(),
             });
         let mut superseded = false;
-        store.update(|rows, _| {
+        let committed = store.update(|rows, _| {
             if let Some(relocation) = &relocation {
                 match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, relocation) {
                     crate::session::claim::RelocationCommit::Persisted => {}
@@ -867,7 +867,7 @@ pub async fn trash_session(
                 row.last_error = Some(error.to_string());
             }
             Ok(())
-        })?;
+        });
         if let Some(relocation) = relocation.filter(|_| superseded) {
             if let crate::session::trash::RestoreOutcome::Failed { reason } =
                 crate::session::trash::undo_raced_relocation(&instance, &relocation)
@@ -876,6 +876,7 @@ pub async fn trash_session(
             }
             return Err(LifecycleTargetError::Busy.into());
         }
+        committed?;
         retirement.generation = None;
         Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
