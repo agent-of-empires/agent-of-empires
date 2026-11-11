@@ -705,6 +705,7 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
         source_profile: None,
         default_effort: None,
         default_mode: None,
+        default_model_config: Default::default(),
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
