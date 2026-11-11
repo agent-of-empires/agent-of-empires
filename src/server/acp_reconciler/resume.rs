@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use super::{is_resumable, query_flushed, AppState, ResumeOutcome};
+use super::{is_resumable, query_flushed, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
     command_override_for_spawn, BroadcastSink, ResumeKind, ResumeReservation,
     ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError,
