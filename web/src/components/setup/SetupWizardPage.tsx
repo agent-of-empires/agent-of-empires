@@ -48,6 +48,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
     return requested >= 0 ? requested : firstOpenIndex(steps);
   });
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
+  const [schemaFailed, setSchemaFailed] = useState(false);
+  const [schemaChecks, setSchemaChecks] = useState(0);
   // `null` until loaded, so steps seed their selections from saved values.
   const [machine, setMachine] = useState<MachineValues | null>(null);
   const [machineFailed, setMachineFailed] = useState(false);
@@ -63,8 +65,20 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const { save, elevation } = useInlineMachineSave();
 
   useEffect(() => {
-    void getSettingsSchema().then((s) => setSchema(s ?? []));
-  }, []);
+    let live = true;
+    void getSettingsSchema().then((s) => {
+      if (!live) return;
+      setSchemaFailed(s === null);
+      if (s) setSchema(s);
+    });
+    return () => {
+      live = false;
+    };
+  }, [schemaChecks]);
+  const retrySchema = () => {
+    setSchemaFailed(false);
+    setSchemaChecks((n) => n + 1);
+  };
 
   useEffect(() => {
     let live = true;
@@ -236,10 +250,12 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const done = configuredCount(steps);
   const percent = Math.round((done / steps.length) * 100);
   const needsMachine = step.key !== "theme_telemetry" && step.key !== "project";
+  const needsSchema = step.key === "worktrees" || step.key === "sandbox" || step.key === "notifications";
   const blocked =
     (step.required && !step.configured) ||
     (step.key === "theme_telemetry" && telemetry !== "loaded") ||
-    (needsMachine && machine === null);
+    (needsMachine && machine === null) ||
+    (needsSchema && schemaFailed);
   const info = SETUP_STEP_INFO[step.key];
   const values = (section: string) => machine?.[section] ?? {};
 
@@ -323,6 +339,14 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
                   Couldn't load your settings.
                 </p>
                 <GhostButton onClick={retryMachine}>Check again</GhostButton>
+              </div>
+            )}
+            {needsSchema && schemaFailed && (
+              <div className="flex items-center gap-3">
+                <p role="alert" className="text-sm text-status-error-text">
+                  Couldn't load the settings for this step.
+                </p>
+                <GhostButton onClick={retrySchema}>Check again</GhostButton>
               </div>
             )}
             {machine !== null && step.key === "agents" && (

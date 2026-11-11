@@ -220,6 +220,20 @@ it("a failed settings read offers a retry instead of showing defaults as the sav
   expect(screen.queryByRole("alert")).toBeNull();
 });
 
+it("a failed schema read offers a retry instead of a step with no fields", async () => {
+  let fail = true;
+  server.use(
+    http.get("*/api/settings/schema", () => (fail ? new HttpResponse(null, { status: 500 }) : HttpResponse.json([]))),
+  );
+  renderPage(status(["agents"]), "/setup?step=worktrees");
+  expect((await screen.findByRole("alert")).textContent).toContain("Couldn't load the settings for this step");
+  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+  fail = false;
+  fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await enabled("Next");
+  expect(screen.queryByRole("alert")).toBeNull();
+});
+
 it("stays on setup when the reload after Go to dashboard fails", async () => {
   const onLeave = vi.fn();
   render(
