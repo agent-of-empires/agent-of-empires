@@ -88,77 +88,18 @@ Per-ID mutation exclusion stays shared with every held or queued operation. Reus
 
 Live owner references include missing descendants and symlink traversal dependencies. Permission errors, symlink loops and non-directory traversal refuse cleanup instead of being treated as absent owners.
 
-### Forgotten Trash ownership
+### Unfinished Trash recovery
 
-Forget requires exactly one matching runtime epoch and consent for the original
-profile, generation, Trash timestamp and lifecycle identity. Its durable retained
-owner precedes visible-row removal. A leftover same-ID row after interruption is
-a tombstone, not Restore, Retry or launch authority.
-Retrying Forget for that same profile, generation, Trash lifecycle identity and
-reservation reuses the durable owner without recapturing changed runtime resources
-or rewriting the journal. Conflicting or duplicate retained authority is refused.
-
-The version-5 purge journal records positive unpublished creation evidence keyed
-by immutable session ID and creation time. Only the canonical builder's single-use
-creation permit can register it, before row publication. Provisioning hooks,
-publisher admission, historical metadata, checkpoint replacement and profile moves
-consume this evidence before their first risky effect; failures never restore it.
-Missing evidence is not permission. Migration 56 preserves historical fences and
-creates no unpublished evidence; complete backup restoration discards such evidence.
-
-New Forget requires this proof plus a history-free row and resolved empty runtime
-ownership. Its `NoFuturePublisher` owner skips only cross-session namespace
-exclusion, retaining exact IDs, resource custody and profile protection.
-Legacy publisher fences use the original active execution and each parked
-conversation's qualified agent, filesystem domain and native stores. Current
-configuration and cwd cannot prove a separate namespace. Host store aliases
-compare device/inode identity for existing stores and canonical paths for missing
-leaves; unknown evidence overlaps conservatively. No TTL, daemon
-restart or PID absence releases these fences because unrecorded late SIDs can
-still name retained files.
-Parked ACP-only publishers retain namespace exclusion even when no native selector
-was captured. An attested Claude binding also covers Claude tool aliases; this
-does not reinterpret unrelated Pi ACP IDs as native conversation IDs.
-
-ACP admission qualifies the command, arguments and effective environment actually
-launched. Only attested built-in routes can prove distinct publisher stores;
-custom, unknown and legacy routes remain conservative. Exact current and parked
-ACP identities remain excluded independently of publisher namespace.
-Native admission takes the app-global namespace read lock before preparation
-and checks the resolved namespace before native preassignment, fork or adoption.
-The prepared launch retains that guard through spawn; Prime refresh reuses it.
-Admission resolves the same effective profile as the borrowed capture store,
-including rows without an explicit source profile.
-Final SID publication propagates ownership-lock errors before publishing the tmux
-environment or starting capture. A launch cannot acknowledge an unpublished SID
-after lock contention or an I/O failure.
-An unresolved namespace for a native-capable publisher fails closed before
-side-effectful preparation; ordinary shell commands are not native publishers.
-
-Forget takes the exclusive publication namespace lock before journal installation.
-Admission is nonblocking under lifecycle and registry exclusion. New owners cannot
-carry historical conversation claims; matching already-recorded owners complete
-idempotently without recapture. ACP import separately excludes every current and
-parked ACP ID, including ordinary pending purge owners whose rows are gone.
-Prime fork checks parent and destination under the existing read admission guard.
-
-Confirmed orphan removal holds identity, catalogue transition, app-root registry
-and profile registry exclusion through its final check. Registry slots compare
-resolved physical identity before locking an app-root alias twice. Every complete
-row contributes project, pre-Trash, holding, workspace and branch references;
-both primary and additional journal protection contribute too. An exact regular
-file at `.aoe-trash` is preserved as an obstruction with conservative lexical
-holding protection. Other traversal errors still refuse cleanup.
+Retry uses the existing Trash lifecycle, not a second cleanup authority.
+An expired reservation can be retried, but a fresh owner remains busy.
+Unknown or unverified checkout ownership remains protected and visible in Trash;
+neither Retry nor read-only inspection authorizes purge or deletes the record.
+Record-only removal is outside this change's scope.
 
 TUI confirmation and palette requests retain original targets and runtime epochs.
 Tests dequeue the actual captured command before dispatching it through the real
 router; expected fixtures are assertions, never substitute operations. Web Restore
 receipts use per-row revisions so an older Retry cannot overwrite restored state.
-Forget consumes capture-phase Escape before viewer listeners and defers onboarding.
-The runtime caches the reason-bearing Forget capability outside capture.
-Root journal changes refresh it even when row identity is unchanged; newer
-observations cannot be replaced by older samples. Both clients invalidate open
-confirmation when this capability disappears.
 
 ## Who owns the state
 

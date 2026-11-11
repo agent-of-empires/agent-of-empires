@@ -105,7 +105,7 @@ pub(super) async fn flush_passive_transition_writes(
         let transition = transition.clone();
         let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let storage = crate::session::Storage::open(&storage_profile, file_watch)?;
-            let result = transition.update_with_snapshot(&storage, |insts, _| {
+            transition.update_with_snapshot(&storage, |insts, _| {
                 for inst in insts.iter_mut() {
                     if inst.is_structured() {
                         continue;
@@ -128,11 +128,7 @@ pub(super) async fn flush_passive_transition_writes(
                     inst.mark_unread();
                 }
                 Ok(patches)
-            })?;
-            Ok((
-                result,
-                crate::session::purge_owners::ForgetAuthoritySnapshot::load(),
-            ))
+            })
         })
         .await
         .map_err(anyhow::Error::from)
@@ -145,15 +141,13 @@ pub(super) async fn flush_passive_transition_writes(
             ok = persisted.is_ok(),
             "persisted passive-status batch"
         );
-        let ((patches, rows, groups), authority) =
-            persisted.map_err(|error| super::reload::ReloadFailure {
-                health: crate::daemon::RuntimeHealth::Degraded {
-                    code: crate::daemon::ReloadFailureCode::ProfileData,
-                    profiles: vec![profile.clone()],
-                },
-                source: error,
-            })?;
-        metadata.forget_authority.adopt(authority);
+        let (patches, rows, groups) = persisted.map_err(|error| super::reload::ReloadFailure {
+            health: crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::ProfileData,
+                profiles: vec![profile.clone()],
+            },
+            source: error,
+        })?;
         super::reload::replace_committed_profiles(
             instances,
             metadata,

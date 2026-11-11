@@ -93,7 +93,6 @@ interface Props {
   onRestoreSession?: (sessionIds: string[]) => void;
   onEmptyTrash?: (workspaces: Workspace[]) => void;
   onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
-  onForgetTrash: (target: TrashRecoveryTarget) => void;
   onStopSession?: (sessionId: string) => void;
   onStartSession?: (sessionId: string) => void;
   onRestartForUpdate?: (sessionId: string) => void;
@@ -466,7 +465,6 @@ export function WorkspaceSidebar(props: Props) {
               readOnly={readOnly}
               runtimeEpoch={props.runtimeEpoch}
               onRetryTrash={props.onRetryTrash}
-              onForgetTrash={props.onForgetTrash}
               onOpen={selection.handleRowActivate}
               onRestore={(ids) => props.onRestoreSession?.(ids)}
               onDelete={(ids) => props.onDeleteSession?.(ids)}

@@ -64,8 +64,6 @@ mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
 mod v054_retained_history_identity;
 mod v055_global_max_concurrent_workers;
-mod v056_retained_trash_ownership;
-mod v057_unpublished_trash_authority;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -106,7 +104,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 57;
+const CURRENT_VERSION: u32 = 55;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -292,16 +290,6 @@ const MIGRATIONS: &[Migration] = &[
         "global_max_concurrent_workers",
         v055_global_max_concurrent_workers::run,
     ),
-    (
-        56,
-        "retained_trash_ownership",
-        v056_retained_trash_ownership::run,
-    ),
-    (
-        57,
-        "unpublished_trash_authority",
-        v057_unpublished_trash_authority::run,
-    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -310,21 +298,6 @@ const MIGRATIONS: &[Migration] = &[
 /// version-health signal; see `crate::telemetry`.
 pub fn current_schema_version() -> u32 {
     CURRENT_VERSION
-}
-
-/// Seed current ownership journals in a fresh, isolated integration fixture.
-/// Historical migrations may touch host paths outside HOME and must not run here.
-#[cfg(any(test, debug_assertions))]
-#[doc(hidden)]
-pub fn initialize_empty_test_storage(root: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(root)?;
-    anyhow::ensure!(
-        !root.join(VERSION_FILE).try_exists()?,
-        "test storage must be fresh"
-    );
-    crate::session::purge_owners::initialize(root)?;
-    crate::tmux::tool_retirement::initialize(root)?;
-    set_version_at(root, CURRENT_VERSION)
 }
 
 /// Check whether there are any pending migrations to run.
@@ -563,11 +536,8 @@ fn get_current_version() -> u32 {
 
 /// Write the version to the current app directory.
 fn set_version(version: u32) -> Result<()> {
-    set_version_at(&crate::session::get_app_dir()?, version)
-}
-
-fn set_version_at(root: &std::path::Path, version: u32) -> Result<()> {
-    let version_file = root.join(VERSION_FILE);
+    let dir = crate::session::get_app_dir()?;
+    let version_file = dir.join(VERSION_FILE);
     crate::session::atomic_write(&version_file, version.to_string().as_bytes())?;
     debug!("Updated schema version to {}", version);
     Ok(())
@@ -784,6 +754,7 @@ mod tests {
             &fs::read(app.join(crate::session::purge_owners::FILE_NAME)).unwrap(),
         )
         .unwrap();
+        assert_eq!(journal["version"], 3);
         assert_eq!(journal["owners"], serde_json::json!([]));
     }
 

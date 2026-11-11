@@ -392,16 +392,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
                     ));
                     return Ok(());
                 }
-                if super::purge_owners::CleanupOwners::load_for(store.storage())?
-                    .retains_session(&id)
-                {
-                    rejected = Some((
-                        DeletionDisposition::Failed,
-                        "Retained cleanup ownership prevents purge".into(),
-                        Some(stored.clone()),
-                    ));
-                    return Ok(());
-                }
             }
             if let Some(generation) = creation_generation {
                 if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
@@ -545,10 +535,6 @@ impl<S: SessionStore + 'static> PurgeTransaction<S> {
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
     pub fn run_hooks(self) -> Result<Self> {
-        super::purge_owners::consume_unpublished_before_risk(
-            &super::get_app_dir()?,
-            &self.request().session_id,
-        )?;
         let config = self
             .store()
             .configuration(Some(self.store().storage().profile()))?;
@@ -4175,7 +4161,6 @@ mod tests {
     fn creation_rollback_keeps_post_provision_cleanup_flags() {
         let temp = tempfile::tempdir().unwrap();
         let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let profile = "creation-provisioned-authority";
         let storage = Storage::new_unwatched(profile).unwrap();
         let repo = temp.path().join("repo");
@@ -7163,77 +7148,5 @@ mod tests {
         assert!(storage.load().unwrap().is_empty());
         row.untrash();
         assert_eq!(row.failed_purge_forced(), None);
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn forgotten_ownership_refuses_terminal_and_structured_purge_before_reservation() {
-        for view in [super::super::View::Terminal, super::super::View::Structured] {
-            let _home = super::super::test_support::isolate_app_dir();
-            let root = super::super::get_app_dir().unwrap();
-            super::super::purge_owners::initialize(&root).unwrap();
-            crate::tmux::tool_retirement::initialize(&root).unwrap();
-            let storage = Storage::new_unwatched("forgotten-admission").unwrap();
-            let checkout = root.join("retained-checkout");
-            std::fs::create_dir(&checkout).unwrap();
-            let sentinel = checkout.join("kept.txt");
-            std::fs::write(&sentinel, b"original").unwrap();
-            let mut row = Instance::new("forgotten", checkout.to_str().unwrap());
-            row.source_profile = "forgotten-admission".into();
-            row.view = view;
-            row.terminal_scopes = Some(Vec::new());
-            row.trash();
-            row.lifecycle_generation = 4;
-            row.lifecycle_reservation = Some(super::super::LifecycleReservation {
-                op: LifecycleOperation::Trash,
-                generation: 4,
-                at: Utc::now() - chrono::Duration::hours(1),
-            });
-            storage
-                .update(|rows, _| {
-                    rows.push(row.clone());
-                    Ok(())
-                })
-                .unwrap();
-            super::super::purge_owners::retain_forgotten_trash(&storage, &row).unwrap();
-            row.finish_lifecycle_status(
-                LifecycleOperation::Trash,
-                4,
-                super::super::Status::Stopped,
-            );
-            storage
-                .update(|rows, _| {
-                    rows[0] = row.clone();
-                    Ok(())
-                })
-                .unwrap();
-            let before = std::fs::read(storage.sessions_path()).unwrap();
-            let request = DeletionRequest {
-                session_id: row.id.clone(),
-                instance: row,
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: false,
-                keep_scratch: false,
-            };
-            let result = match PurgeTransaction::reserve(
-                Storage::open_unwatched("forgotten-admission").unwrap(),
-                request,
-                None,
-            )
-            .unwrap()
-            {
-                Ok(mut transaction) => {
-                    transaction.release_reservation(&[]).unwrap();
-                    panic!("retained ownership admitted a destructive purge");
-                }
-                Err(result) => result,
-            };
-            assert!(!result.teardown_started);
-            assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-            assert_eq!(std::fs::read(&sentinel).unwrap(), b"original");
-        }
     }
 }

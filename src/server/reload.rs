@@ -405,7 +405,6 @@ pub(crate) struct CanonicalMetadata {
     pub status_hooks: std::collections::HashMap<String, crate::status_hooks::StatusHookConfig>,
     pub auxiliary_tools: std::collections::HashMap<String, Vec<String>>,
     pub raw_tool_names: std::collections::HashMap<String, Vec<String>>,
-    pub forget_authority: crate::session::purge_owners::ForgetAuthoritySnapshot,
 }
 
 pub(crate) struct LoadedProfiles {
@@ -575,7 +574,6 @@ fn load_profiles(
             status_hooks,
             auxiliary_tools,
             raw_tool_names,
-            forget_authority: crate::session::purge_owners::ForgetAuthoritySnapshot::load(),
         },
     })
 }
@@ -739,18 +737,7 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
     _reload: &tokio::sync::OwnedRwLockWriteGuard<()>,
     _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<(), ReloadFailure> {
-    let authority =
-        tokio::task::spawn_blocking(crate::session::purge_owners::ForgetAuthoritySnapshot::load)
-            .await
-            .map_err(|error| ReloadFailure {
-                health: crate::daemon::RuntimeHealth::Degraded {
-                    code: crate::daemon::ReloadFailureCode::Metadata,
-                    profiles: Vec::new(),
-                },
-                source: error.into(),
-            })?;
     let mut metadata = state.canonical_metadata.write().await;
-    metadata.forget_authority.adopt(authority);
     let mut current = state.instances.write().await;
     let prior_statuses: Vec<_> = current
         .iter()
@@ -1426,12 +1413,7 @@ pub(super) async fn reload_state_instances_from_disk(
         *previous_cache = cache;
     }
     drop(current);
-    let mut canonical_metadata = state.canonical_metadata.write().await;
-    metadata
-        .forget_authority
-        .retain_newer(&canonical_metadata.forget_authority);
-    *canonical_metadata = metadata;
-    drop(canonical_metadata);
+    *state.canonical_metadata.write().await = metadata;
     set_canonical_health(state, native_health).await;
     *state
         .canonical_diagnostics
@@ -1792,7 +1774,6 @@ mod tests {
                 status_hooks: Default::default(),
                 auxiliary_tools: Default::default(),
                 raw_tool_names: Default::default(),
-                forget_authority: Default::default(),
             };
             let original_rows = serde_json::to_value(&current).unwrap();
             let original_metadata = metadata.clone();

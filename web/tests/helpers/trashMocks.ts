@@ -21,7 +21,6 @@ export interface TrashSession {
   cleanableWorktree?: boolean;
   sandboxed?: boolean;
   pendingTrash?: boolean;
-  forgetAllowed?: boolean;
 }
 
 interface TrashState extends TrashSession {
@@ -75,10 +74,6 @@ function sessionPayload(s: TrashState) {
     trashed_at: s.trashedAt,
     trash_lifecycle_id: s.trashLifecycleId,
     lifecycle_generation: s.lifecycleGeneration,
-    forget_trash: {
-      allowed: s.forgetAllowed === true,
-      reason: s.forgetAllowed ? null : "Shared history must stay protected. Retry remains available.",
-    },
     lifecycle_reservation: s.pendingTrash
       ? {
           op: "trash",

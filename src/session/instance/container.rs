@@ -197,10 +197,6 @@ impl Instance {
             .ok_or_else(|| anyhow::anyhow!("Cannot ensure container for non-sandboxed session"))?
             .image
             .clone();
-        crate::session::purge_owners::consume_unpublished_before_risk(
-            &crate::session::get_app_dir()?,
-            &self.id,
-        )?;
         let container = DockerContainer::new(
             &self.id,
             &image,

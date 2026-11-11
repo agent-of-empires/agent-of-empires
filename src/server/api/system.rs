@@ -4023,7 +4023,6 @@ mod tests {
     fn acp_command_fields_substitute_data_dir() {
         let dir = std::path::Path::new("/tmp/aoe-data");
         let spec = crate::acp::AgentSpec {
-            publisher_route: None,
             command: "${aoe_data_dir}/bin/custom-acp".into(),
             args: vec![],
             description: "custom".into(),

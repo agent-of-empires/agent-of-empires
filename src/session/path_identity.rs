@@ -207,39 +207,6 @@ impl CleanupProtection {
             if let Some(path) = owner.pre_trash_project_path.as_deref() {
                 self.add_path(path)?;
             }
-            if owner.has_pending_trash() {
-                let original = owner
-                    .pre_trash_project_path
-                    .as_deref()
-                    .unwrap_or(&owner.project_path);
-                if let Some(holding) =
-                    super::trash::trash_holding_path(Path::new(original), &owner.id)
-                {
-                    let parent = holding.parent().context("Trash holding parent missing")?;
-                    match std::fs::symlink_metadata(parent) {
-                        Ok(metadata) if metadata.file_type().is_file() => {
-                            let obstruction = PathIdentity::checked(parent, &mut self.paths)?;
-                            let resolved = obstruction
-                                .resolved
-                                .as_deref()
-                                .unwrap_or(&obstruction.lexical)
-                                .join(holding.file_name().context("Trash holding leaf missing")?);
-                            self.paths.push(obstruction);
-                            self.paths
-                                .push(PathIdentity::from_resolved(&holding, resolved));
-                        }
-                        Ok(_) => {
-                            let path = PathIdentity::checked(&holding, &mut self.paths)?;
-                            self.paths.push(path);
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            let path = PathIdentity::checked(&holding, &mut self.paths)?;
-                            self.paths.push(path);
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
             if let Some(worktree) = &owner.worktree_info {
                 self.add_branch(&worktree.main_repo_path, &worktree.branch)?;
             }

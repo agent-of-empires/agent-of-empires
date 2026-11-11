@@ -199,7 +199,7 @@ An unfinished Trash transition offers **Retry Trash** in the TUI context menu an
 web Trash controls. A fresh owner remains busy; an unverified retained checkout
 can still prevent completion. Retry is an explicit management action, never part
 of opening the transcript.
-The TUI command palette exposes Restore, Retry Trash, and Forget record using
+The TUI command palette exposes Restore and Retry Trash using
 the same lifecycle-gated actions as the context menu. Opening Trash confirmation
 captures its runtime epoch; a daemon replacement invalidates the confirmation.
 Trash remains read-only without discarding untargeted pending composer paste.
@@ -207,17 +207,9 @@ Web recovery lists unfinished members of mixed live/Trash workspaces separately.
 It never retries or restores a live sibling. Restore receipts keep their native
 revision so a late older Retry cannot replace the restored row.
 
-**Forget record…** is available only when AoE can prove that a new session has
-never launched a publisher or acquired history. Previously launched, imported,
-historical and unknown records must stay in Trash; Retry and read-only inspection
-remain available. A refusal reason explains unavailable Forget.
-The separate confirmation becomes invalid after a daemon restart, concurrent
-Trash transition or loss of this proof. Files remain on disk and cleanup
-protection persists without hooks or process termination. The forgotten session
-cannot be restored through Trash. New never-published owners do not block other
-sessions' history stores. Older retained owners keep their original protection
-across restart, with no automatic expiry or release on process exit.
-See the [forget-record contract](api.md#post-apisessionsidtrashforget).
+If Retry cannot verify the checkout, keep the record in Trash and inspect its
+retained history read-only. There is no record-only removal action. A fresh
+runtime, profile, or lifecycle generation requires fresh recovery consent.
 
 The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges

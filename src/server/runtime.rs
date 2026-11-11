@@ -520,39 +520,21 @@ pub(super) async fn epoch_gate(
         .headers()
         .get_all(crate::daemon::RUNTIME_EPOCH_HEADER)
         .iter();
-    let epoch = epochs.next();
-    if epochs.next().is_some()
-        || epoch.is_some_and(|epoch| epoch.as_bytes() != state.runtime.epoch.as_bytes())
-    {
-        return epoch_mismatch_response();
+    if let Some(epoch) = epochs.next() {
+        if epochs.next().is_some() || epoch.as_bytes() != state.runtime.epoch.as_bytes() {
+            let code = crate::daemon::ApiErrorCode::RuntimeEpochMismatch;
+            return (
+                code.status(),
+                code.header(),
+                Json(serde_json::json!({
+                    "error": code.as_str(),
+                    "message": "Reconnect before sending changes to this daemon.",
+                })),
+            )
+                .into_response();
+        }
     }
     next.run(request).await
-}
-
-pub(super) async fn require_epoch(
-    request: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    if !request
-        .headers()
-        .contains_key(crate::daemon::RUNTIME_EPOCH_HEADER)
-    {
-        return epoch_mismatch_response();
-    }
-    next.run(request).await
-}
-
-fn epoch_mismatch_response() -> Response {
-    let code = crate::daemon::ApiErrorCode::RuntimeEpochMismatch;
-    (
-        code.status(),
-        code.header(),
-        Json(serde_json::json!({
-            "error": code.as_str(),
-            "message": "Reconnect before sending changes to this daemon.",
-        })),
-    )
-        .into_response()
 }
 
 /// Flush only after releasing namespace, identity and publication guards.

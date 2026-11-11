@@ -101,13 +101,6 @@ fn daemon_status_ignores_an_unknown_session_id() {
 
 fn daemon_row(instance: &Instance, status: &str) -> crate::daemon::SessionResponse {
     let mut row = crate::server::api::sessions::session_response_from_instance(instance, false);
-    row.forget_trash = crate::daemon::ForgetTrashCapability::from_eligibility(
-        crate::session::purge_owners::ForgetAuthoritySnapshot::load().eligibility(
-            &instance.source_profile,
-            instance,
-            chrono::Utc::now(),
-        ),
-    );
     row.status = status.into();
     row.last_error = None;
     row.pane_dead_observed = false;
@@ -3618,63 +3611,6 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
 
 #[test]
 #[serial]
-fn forget_confirmation_rejects_epoch_replacement_or_identity_stable_capability_loss() {
-    use crate::session::{LifecycleOperation, LifecycleReservation};
-    use crate::tui::dialogs::ContextMenuAction;
-    for revoke_epoch in [true, false] {
-        let mut env = create_test_env_with_sessions(1);
-        let id = env.view.instance_at(0).id.clone();
-        env.view.mutate_instance(&id, |row| {
-            row.trash();
-            row.lifecycle_generation = 4;
-            row.lifecycle_reservation = Some(LifecycleReservation {
-                op: LifecycleOperation::Trash,
-                generation: 4,
-                at: chrono::Utc::now() - chrono::Duration::hours(1),
-            });
-        });
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
-        let row = env.view.get_instance(&id).unwrap();
-        let storage = Storage::new_unwatched(&row.source_profile).unwrap();
-        crate::session::purge_owners::seed_legacy_retained_for_test(&storage, row).unwrap();
-        env.view.trashed_section_collapsed = false;
-        env.view.rebuild_flat_items();
-        env.view.select_session_by_id(&id);
-        env.view
-            .session_feed
-            .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
-        env.view.apply_session_feed();
-        let mut commands = env.view.session_feed.request_driver_for_test();
-        env.view
-            .dispatch_context_menu_action(ContextMenuAction::ForgetTrash);
-        assert!(env.view.confirm_dialog.is_some());
-        let SessionFeedResult::Snapshot(mut next) = daemon_snapshot(&env.view, &id, "Stopped")
-        else {
-            unreachable!()
-        };
-        if revoke_epoch {
-            Arc::make_mut(&mut next).cursor.epoch = "replacement".into();
-        } else {
-            let row = &mut Arc::make_mut(&mut next).contents.sessions[0];
-            row.forget_trash = Default::default();
-        }
-        env.view
-            .session_feed
-            .publish_for_test(SessionFeedResult::Snapshot(next));
-        env.view.apply_session_feed();
-        assert!(
-            env.view.pending_forget_trash.is_none(),
-            "old consent must not authorize forgetting the same durable row in a new runtime"
-        );
-        assert!(env.view.confirm_dialog.is_none());
-        env.view.handle_key(key(KeyCode::Char('y')), None);
-        assert!(commands(Err("old consent was submitted".into())).is_none());
-        assert!(env.view.get_instance(&id).unwrap().has_pending_trash());
-    }
-}
-
-#[test]
-#[serial]
 fn retained_trash_context_menu_keeps_opening_epoch() {
     use crate::session::{LifecycleOperation, LifecycleReservation};
     use crate::tui::dialogs::{ContextMenuAction, ContextMenuDialog};
@@ -3739,9 +3675,7 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
     for (action, fresh) in [
         ("Restore selected Trash", false),
         ("Retry selected unfinished", false),
-        ("Forget selected unfinished", false),
         ("Retry selected unfinished", true),
-        ("Forget selected unfinished", true),
     ] {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
@@ -3750,13 +3684,7 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         let sentinel = path.join("recovery-sentinel");
         std::fs::write(&sentinel, b"keep recovery files").unwrap();
         let restore = action.starts_with("Restore");
-        let scopes = if action.starts_with("Forget") {
-            vec![crate::process::worker_registry::ScopeOwnership::Owned {
-                unit: format!("aoe-test-forget-{id}.scope"),
-            }]
-        } else {
-            Vec::new()
-        };
+        let scopes = Vec::new();
         env.view.mutate_instance(&id, |row| {
             row.terminal_scopes = Some(scopes.clone());
             row.project_path = path.to_string_lossy().into_owned();
@@ -3776,12 +3704,6 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         });
         seed_profile("test", &env.view.cloned_instances());
         let state = native_state(&["test"]).await;
-        if action.starts_with("Forget") && !fresh {
-            let row = env.view.get_instance(&id).unwrap();
-            let storage = Storage::open_unwatched("test").unwrap();
-            crate::session::purge_owners::seed_legacy_retained_for_test(&storage, row).unwrap();
-            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        }
         apply_published(&mut env.view, &state).await;
         env.view.trashed_section_collapsed = false;
         env.view.rebuild_flat_items();
@@ -3803,25 +3725,6 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
             env.view.handle_key(key(KeyCode::Char(ch)), None);
         }
         env.view.handle_key(key(KeyCode::Enter), None);
-        if action.starts_with("Forget") {
-            assert!(
-                capture().is_none(),
-                "palette must not supply Forget consent"
-            );
-            if fresh {
-                assert!(env.view.confirm_dialog.is_none());
-                assert!(env.view.info_dialog.is_some());
-                assert_eq!(
-                    std::fs::read(storage.sessions_path()).unwrap(),
-                    registry_before
-                );
-                assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
-                assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
-                continue;
-            }
-            assert!(env.view.confirm_dialog.is_some());
-            env.view.handle_key(key(KeyCode::Char('y')), None);
-        }
         let captured = capture().expect("palette recovery submitted");
         assert_eq!(captured.id, id);
         let (suffix, body, request_epoch) = match &captured.request {
@@ -3831,14 +3734,6 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
                 expected_epoch,
             } => (
                 "trash",
-                serde_json::to_value(body).unwrap(),
-                expected_epoch.as_str(),
-            ),
-            SessionRequest::ForgetTrash {
-                body,
-                expected_epoch,
-            } => (
-                "trash/forget",
                 serde_json::to_value(body).unwrap(),
                 expected_epoch.as_str(),
             ),
@@ -3887,36 +3782,14 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
                     outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
                 },
             ))),
-            SessionRequest::ForgetTrash { .. } => captured.finish_mutation(cursor),
             _ => unreachable!(),
         }
         env.view.apply_session_feed();
         apply_published(&mut env.view, &state).await;
         let rows = Storage::open_unwatched("test").unwrap().load().unwrap();
-        if action.starts_with("Forget") {
-            assert!(!rows.iter().any(|row| row.id == id));
-            assert!(crate::session::purge_owners::CleanupOwners::load(
-                &crate::session::get_app_dir().unwrap()
-            )
-            .unwrap()
-            .retains_session(&id));
-            let journal: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&journal_path).unwrap()).unwrap();
-            let owner = journal["owners"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|owner| owner["session_id"] == id)
-                .unwrap();
-            assert_eq!(
-                owner["purpose"]["terminal_scopes"],
-                serde_json::to_value(&scopes).unwrap()
-            );
-        } else {
-            let row = rows.iter().find(|row| row.id == id).unwrap();
-            assert_eq!(row.is_trashed(), !restore);
-            assert!(!row.has_pending_trash());
-        }
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.is_trashed(), !restore);
+        assert!(!row.has_pending_trash());
         assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
     }
 }

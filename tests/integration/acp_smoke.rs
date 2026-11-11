@@ -22,8 +22,6 @@ use crate::common::{shim_path, shim_ready};
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_round_trips_approval_allow() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -32,14 +30,12 @@ async fn shim_agent_round_trips_approval_allow() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -145,8 +141,6 @@ async fn shim_agent_round_trips_approval_allow() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_round_trips_a_question_option_list() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -154,7 +148,6 @@ async fn shim_agent_round_trips_a_question_option_list() {
     let shim = shim_path();
 
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         generation: 0,
@@ -162,7 +155,6 @@ async fn shim_agent_round_trips_a_question_option_list() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -263,8 +255,6 @@ async fn shim_agent_round_trips_a_question_option_list() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -272,7 +262,6 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
     let shim = shim_path();
 
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         generation: 0,
@@ -280,7 +269,6 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -358,8 +346,6 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_round_trips_fs() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -368,14 +354,12 @@ async fn shim_agent_round_trips_fs() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -454,8 +438,6 @@ async fn shim_agent_round_trips_fs() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_round_trips_terminal() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -464,14 +446,12 @@ async fn shim_agent_round_trips_terminal() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -562,8 +542,6 @@ async fn shim_agent_round_trips_terminal() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_set_mode_emits_current_mode_changed() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -572,14 +550,12 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -653,8 +629,6 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn shim_agent_emits_rate_limit_event() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     use agent_of_empires::acp::state::Event;
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
@@ -664,14 +638,12 @@ async fn shim_agent_emits_rate_limit_event() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()

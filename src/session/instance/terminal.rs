@@ -193,14 +193,6 @@ impl Instance {
             .get(tool_name)
             .filter(|tool| !tool.command.is_empty() && !tool.background)
             .ok_or_else(|| ToolLaunchUnavailable(tool_name.to_owned()))?;
-        let _publisher = crate::session::purge_owners::ConversationReadLock::publisher(
-            &crate::session::get_app_dir()?,
-            &self.id,
-            crate::session::purge_owners::PublisherAdmission {
-                namespace: crate::session::purge_owners::PublisherNamespace::Unknown,
-                acp_session_id: None,
-            },
-        )?;
         if let Some(adoption) = adoption {
             anyhow::ensure!(
                 adoption.profile == self.source_profile
@@ -309,14 +301,6 @@ impl Instance {
         store: &dyn crate::session::SessionStore,
     ) -> Result<(tmux::TerminalSession, bool)> {
         let (_title, _lifecycle) = self.acquire_auxiliary_locks_in(store)?;
-        let _publisher = crate::session::purge_owners::ConversationReadLock::publisher(
-            &crate::session::get_app_dir()?,
-            &self.id,
-            crate::session::purge_owners::PublisherAdmission {
-                namespace: crate::session::purge_owners::PublisherNamespace::Unknown,
-                acp_session_id: None,
-            },
-        )?;
         crate::tmux::refresh_session_cache();
         let session = self.terminal_tmux_session_indexed(index)?;
         let is_new = if session.exists_live() {

@@ -34,18 +34,6 @@ function mount(ready = true) {
 type ActionName = keyof ShortcutActions;
 
 describe("useKeyboardShortcuts", () => {
-  it("a consuming recovery Escape prevents later viewer listeners from closing the underlying surface", () => {
-    const { actions, unmount } = mount();
-    actions.onEscape.mockReturnValue(true);
-    const viewer = vi.fn();
-    window.addEventListener("keydown", viewer);
-    const event = dispatch(document.body, { key: "Escape" });
-    expect(event.defaultPrevented).toBe(true);
-    expect(viewer).not.toHaveBeenCalled();
-    window.removeEventListener("keydown", viewer);
-    unmount();
-  });
-
   it.each([
     ["an open field that owns Escape keeps it for its list", true, "true", 0],
     ["the same field closed lets Escape close the surface", true, "false", 1],

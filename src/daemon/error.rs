@@ -14,8 +14,6 @@ pub enum ApiErrorCode {
     CityhallMode,
     LifecycleLocked,
     TrashIncomplete,
-    NativeConversationRetained,
-    ForgetUnbounded,
     LifecycleSuperseded,
     PendingTargetGone,
     TlsRequired,
@@ -52,8 +50,6 @@ impl ApiErrorCode {
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
             Self::TrashIncomplete => "trash_incomplete",
-            Self::NativeConversationRetained => "native_conversation_retained",
-            Self::ForgetUnbounded => "forget_unbounded",
             Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
@@ -90,8 +86,6 @@ impl ApiErrorCode {
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
             | Self::TrashIncomplete
-            | Self::NativeConversationRetained
-            | Self::ForgetUnbounded
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
@@ -153,8 +147,6 @@ impl ApiErrorCode {
             b"cityhall_mode" => Self::CityhallMode,
             b"lifecycle_locked" => Self::LifecycleLocked,
             b"trash_incomplete" => Self::TrashIncomplete,
-            b"native_conversation_retained" => Self::NativeConversationRetained,
-            b"forget_unbounded" => Self::ForgetUnbounded,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,

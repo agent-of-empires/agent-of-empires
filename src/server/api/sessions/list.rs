@@ -24,13 +24,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
 }
 
 pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionResponse> {
-    let forget_authority = state
-        .canonical_metadata
-        .read()
-        .await
-        .forget_authority
-        .clone();
-    let now = chrono::Utc::now();
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
@@ -84,9 +77,6 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 active_monitor,
             );
             session.acp_worker_start = acp_worker_start;
-            session.forget_trash = crate::daemon::ForgetTrashCapability::from_eligibility(
-                forget_authority.eligibility(&inst.source_profile, inst, now),
-            );
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
@@ -707,7 +697,6 @@ mod workspace_ordering_tests {
 
     fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
         SessionResponse {
-            forget_trash: Default::default(),
             agent_pane: Default::default(),
             auxiliary: Vec::new(),
             acp_provider: None,

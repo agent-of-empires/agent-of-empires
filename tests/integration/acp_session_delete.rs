@@ -21,20 +21,14 @@ use agent_of_empires::acp::state::{AcpSessionId, Event};
 
 use crate::common::{shim_path, shim_ready};
 
-fn spawn_config_with_shim_env(
-    publisher_root: &std::path::Path,
-    shim: PathBuf,
-    env: Vec<(String, String)>,
-) -> SpawnConfig {
+fn spawn_config_with_shim_env(shim: PathBuf, env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -101,8 +95,6 @@ async fn drive_handshake_and_capture_session_id(
 #[tokio::test]
 #[serial_test::parallel]
 async fn session_delete_outcome_follows_the_adapter() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -132,7 +124,7 @@ async fn session_delete_outcome_follows_the_adapter() {
             "SHIM_DELETE_RECORD_FILE".into(),
             record_path.to_string_lossy().to_string(),
         ));
-        let config = spawn_config_with_shim_env(publisher_root, shim_path(), env);
+        let config = spawn_config_with_shim_env(shim_path(), env);
         let mut client = AcpClient::spawn(config, AcpSessionId(format!("delete-{case}")))
             .await
             .expect("spawn shim");

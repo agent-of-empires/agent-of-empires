@@ -164,12 +164,6 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/trash",
             post(api::trash_session).layer(read_only.clone()),
         )
-        .route(
-            "/api/sessions/{id}/trash/forget",
-            post(api::forget_trash_record)
-                .route_layer(axum::middleware::from_fn(super::runtime::require_epoch))
-                .layer(read_only.clone()),
-        )
         .route("/api/sessions/{id}/restore", post(api::restore_session))
         .route(
             "/api/sessions/{id}/purge/abandon",

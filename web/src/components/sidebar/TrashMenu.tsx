@@ -26,7 +26,6 @@ export function TrashMenu({
   readOnly,
   runtimeEpoch,
   onRetryTrash,
-  onForgetTrash,
   onOpen,
   onRestore,
   onDelete,
@@ -41,7 +40,6 @@ export function TrashMenu({
   readOnly?: boolean;
   runtimeEpoch: string | null;
   onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
-  onForgetTrash: (target: TrashRecoveryTarget) => void;
   onOpen: RowActivate;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (sessionIds: string[]) => void;
@@ -87,10 +85,6 @@ export function TrashMenu({
   const deleteWorkspace = (ws: Workspace) => {
     setOpen(false);
     onDelete(sessionIds(ws));
-  };
-  const forgetRecord = (target: TrashRecoveryTarget) => {
-    setOpen(false);
-    onForgetTrash(target);
   };
 
   useLayoutEffect(() => {
@@ -199,7 +193,6 @@ export function TrashMenu({
                       readOnly={readOnly}
                       runtimeEpoch={runtimeEpoch}
                       onRetryTrash={onRetryTrash}
-                      onForgetTrash={forgetRecord}
                       onOpen={() => openWorkspace(ws)}
                       onRestore={() => restoreWorkspace(ws)}
                       onDelete={() => deleteWorkspace(ws)}
@@ -238,18 +231,6 @@ export function TrashMenu({
                       icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
                     >
                       Retry Trash
-                    </MenuItem>
-                    <MenuItem
-                      onClick={() => {
-                        closeMenu();
-                        forgetRecord(target);
-                      }}
-                      detail={target.title}
-                      testId="sidebar-trash-context-menu-forget"
-                      icon={<X className="h-3.5 w-3.5 shrink-0" />}
-                      className="text-status-error hover:bg-status-error/10"
-                    >
-                      Forget record…
                     </MenuItem>
                   </Fragment>
                 ))}
@@ -306,7 +287,6 @@ function TrashRow({
   readOnly,
   runtimeEpoch,
   onRetryTrash,
-  onForgetTrash,
   onOpen,
   onRestore,
   onDelete,
@@ -316,7 +296,6 @@ function TrashRow({
   readOnly?: boolean;
   runtimeEpoch: string | null;
   onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
-  onForgetTrash: (target: TrashRecoveryTarget) => void;
   onOpen: () => void;
   onRestore: () => void;
   onDelete: () => void;
@@ -394,9 +373,7 @@ function TrashRow({
             <TrashRecoveryRow
               key={`${session.id}:${target.epoch}:${target.expected_generation}`}
               target={target}
-              forgetCapability={session.forget_trash}
               onRetry={onRetryTrash}
-              onForget={onForgetTrash}
             />
           ) : (
             <p key={session.id} className="mt-2 text-xs text-text-secondary">
@@ -410,14 +387,10 @@ function TrashRow({
 
 function TrashRecoveryRow({
   target,
-  forgetCapability,
   onRetry,
-  onForget,
 }: {
   target: TrashRecoveryTarget;
-  forgetCapability: { allowed: boolean; reason: string | null } | undefined;
   onRetry: (target: TrashRecoveryTarget) => Promise<void>;
-  onForget: (target: TrashRecoveryTarget) => void;
 }) {
   const [busy, setBusy] = useState(false);
   const pointerTarget = useRef<TrashRecoveryTarget | null>(null);
@@ -452,23 +425,7 @@ function TrashRecoveryRow({
         >
           Retry Trash
         </button>
-        <button
-          type="button"
-          onClick={() => {
-            if (forgetCapability?.allowed === true) onForget(target);
-          }}
-          disabled={busy || forgetCapability?.allowed !== true}
-          className={`${DANGER} disabled:opacity-50`}
-          data-testid="sidebar-trash-forget"
-        >
-          Forget record…
-        </button>
       </div>
-      {forgetCapability?.allowed !== true && (
-        <p className="mt-1 text-xs text-text-secondary">
-          {forgetCapability?.reason ?? "Forget is unavailable. Retry remains available."}
-        </p>
-      )}
     </div>
   );
 }

@@ -1,9 +1,6 @@
 //! CAS-guarded persistence of `agent_session_id` and `resume_intent`.
 
 use super::*;
-use crate::session::purge_owners::{
-    CleanupOwners, ConversationOwnershipBusy, ConversationReadLock,
-};
 
 #[cfg(test)]
 pub(super) mod test_support {
@@ -127,21 +124,9 @@ pub(crate) fn persist_session_to_storage(
 }
 
 impl Instance {
-    pub(super) fn check_retained_native_conversation(
-        &self,
-        storage: &crate::session::Storage,
-        session_id: &str,
-        source: Option<&crate::session::ExecutionBinding>,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            !CleanupOwners::load_for(storage)?.blocks_conversation(&self.id, session_id, source),
-            crate::session::purge_owners::ConversationOwnershipRetained
-        );
-        Ok(())
-    }
-
-    /// Consume an OMP pin only when the launched generation confirms its durable SID.
-    /// Check ownership and pin state under storage exclusion.
+    /// Consume an explicit OMP resume pin only after the matching launch
+    /// reports the already-durable sid. All three facts are checked under the
+    /// storage flock so a concurrent re-pin or relaunch cannot be consumed.
     pub(crate) fn persist_omp_pin_confirmation(
         storage: &dyn crate::session::SessionStore,
         instance_id: &str,
@@ -151,7 +136,6 @@ impl Instance {
         if !is_valid_session_id(session_id) {
             return Ok(CaptureCommit::unapplied(SidWrite::Failed));
         }
-        let _conversation_lock = ConversationReadLock::acquire(storage.storage(), session_id)?;
         storage.update(|instances, _groups| {
             let Some(instance) = instances
                 .iter_mut()
@@ -159,18 +143,6 @@ impl Instance {
             else {
                 return Err(LifecycleReservationError::Superseded.into());
             };
-            let source = instance
-                .active_execution
-                .as_ref()
-                .map(|execution| &execution.binding);
-            if CleanupOwners::load_for(storage.storage())?.blocks_conversation(
-                instance_id,
-                session_id,
-                source,
-            ) {
-                // Keep the poller's same-SID confirmation pending until ownership clears.
-                return Ok(CaptureCommit::unapplied(SidWrite::Skipped));
-            }
             let intent_matches = matches!(
                 &instance.resume_intent,
                 ResumeIntent::Use(pinned) if pinned == session_id
@@ -202,7 +174,7 @@ impl Instance {
         &mut self,
         storage: &dyn crate::session::SessionStore,
         expected: &ConversationState,
-    ) -> Result<SidPersistOutcome> {
+    ) -> SidPersistOutcome {
         let expected_prior_intent = expected.intent.clone();
         let new_sid = self.agent_session_id.clone();
         if self
@@ -210,12 +182,8 @@ impl Instance {
             .as_deref()
             .is_some_and(|sid| !is_valid_session_id(sid))
         {
-            return Ok(SidPersistOutcome::Skip);
+            return SidPersistOutcome::Skip;
         }
-        let _conversation_lock = new_sid
-            .as_deref()
-            .map(|sid| ConversationReadLock::acquire(storage.storage(), sid))
-            .transpose()?;
         // Cleared and Fork are one-shot launch directives. Use stays durable
         // only when no pane-scoped capture backend can observe a later `/new`;
         // capture-backed agents hand ownership back to their poller.
@@ -298,13 +266,6 @@ impl Instance {
                                 .filter(|binding| binding.session_id == sid)
                                 .is_some_and(ConversationBinding::is_known))
                 };
-                if CleanupOwners::load_for(storage.storage())?.blocks_conversation(
-                    &instance_id,
-                    sid,
-                    source,
-                ) {
-                    return Ok(SidWrite::Skipped);
-                }
                 if instances
                     .iter()
                     .filter(|peer| peer.id != instance_id)
@@ -365,7 +326,7 @@ impl Instance {
             Ok(SidWrite::Applied)
         });
 
-        Ok(match outcome {
+        match outcome {
             Ok(SidWrite::Applied) => {
                 // Outside the flock: a live cleared holder may still advertise
                 // the taken sid via AOE_CAPTURED_SESSION_ID, which
@@ -447,7 +408,7 @@ impl Instance {
                 );
                 SidPersistOutcome::Skip
             }
-        })
+        }
     }
 
     #[cfg(test)]
@@ -461,7 +422,6 @@ impl Instance {
             return SidPersistOutcome::Skip;
         };
         self.persist_session_id_with_storage(&storage, expected)
-            .expect("SID ownership lock must be available")
     }
 
     /// Publish the child without changing the Fork target still being validated.
@@ -538,17 +498,6 @@ pub(super) fn persist_session_with_storage(
     if observation.execution != expected.active {
         return CaptureCommit::unapplied(SidWrite::Skipped);
     }
-    let _conversation_lock = match ConversationReadLock::acquire(storage.storage(), session_id) {
-        Ok(guard) => guard,
-        Err(error) => {
-            let outcome = if error.is::<ConversationOwnershipBusy>() {
-                SidWrite::Skipped
-            } else {
-                SidWrite::Failed
-            };
-            return CaptureCommit::unapplied(outcome);
-        }
-    };
     let binding = observation.conversation_binding();
     let result = storage.update(|instances, _groups| {
         let Some(index) = instances
@@ -598,11 +547,7 @@ pub(super) fn persist_session_with_storage(
             sid == Some(session_id)
                 && crate::session::capture::owner_excludes(observation.source(), owner, session_id)
         };
-        let conflict = CleanupOwners::load_for(storage.storage())?.blocks_conversation(
-            instance_id,
-            session_id,
-            observation.source(),
-        ) || instances.iter().any(|peer| {
+        let conflict = instances.iter().any(|peer| {
             peer.id != instance_id
                 && (owns(
                     peer.agent_session_id.as_deref(),
@@ -614,8 +559,13 @@ pub(super) fn persist_session_with_storage(
                     )
                 }))
         });
+        // Read before the conflict verdict: a pin confirmation is not a fresh
+        // claim, so it keeps the retryable outcome instead of becoming one.
         let confirms_pin = observation.confirms_omp_pin(&instance.resume_intent);
         if conflict {
+            // A peer durably owns this sid, so the publication is a conflict to
+            // retry rather than a divergence to abandon. A pin confirmation is
+            // exempt: the row armed the pin and must be able to re-prove it.
             return Ok(CaptureCommit::unapplied(if confirms_pin {
                 SidWrite::Skipped
             } else {
@@ -688,7 +638,6 @@ mod tests {
     }
 
     fn seed(profile: &str, insts: &[&Instance]) {
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let owned: Vec<Instance> = insts.iter().map(|i| (*i).clone()).collect();
         Storage::new_unwatched(profile)
             .unwrap()
@@ -1009,66 +958,6 @@ mod tests {
             SidWrite::Skipped,
             "an unproven pin must remain retryable"
         );
-
-        let request = crate::session::deletion::DeletionRequest {
-            session_id: owner.id.clone(),
-            instance: owner.clone(),
-            delete_worktree: false,
-            delete_branch: false,
-            delete_sandbox: false,
-            force_delete: false,
-            detach_hooks: true,
-            keep_scratch: true,
-        };
-        let held = crate::session::purge_owners::PurgeOwner::record_plan(
-            &storage,
-            &owner,
-            owner.lifecycle_generation,
-            Some(&request),
-            None,
-            crate::session::purge_owners::PurgeCapture::new(&owner).unwrap(),
-        )
-        .unwrap();
-        storage
-            .update(|rows, _| {
-                rows.retain(|row| row.id != owner.id);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(
-            Instance::persist_omp_pin_confirmation(&storage, &claimant.id, VALID_SID, generation)
-                .unwrap()
-                .outcome,
-            SidWrite::Skipped
-        );
-        let blocked = storage.load().unwrap().remove(0);
-        assert_eq!(blocked.resume_intent, ResumeIntent::Use(VALID_SID.into()));
-
-        held.release().unwrap();
-        assert_eq!(
-            Instance::persist_omp_pin_confirmation(&storage, &claimant.id, VALID_SID, generation)
-                .unwrap()
-                .outcome,
-            SidWrite::Applied
-        );
-        let confirmed = storage.load().unwrap().remove(0);
-        assert_eq!(confirmed.resume_intent, ResumeIntent::Default);
-        let next_sid = "019342aa-2222-7eee-8fff-aaaabbbbcccc";
-        let mut later =
-            crate::session::poller::SessionIdObservation::omp(next_sid.into(), generation.into());
-        later.execution = claimant.active_execution.clone();
-        later.scope_to(claimant.active_execution.as_ref().unwrap().binding.clone());
-        assert_eq!(
-            persist_session_with_storage(
-                &storage,
-                &claimant.id,
-                &later,
-                &confirmed.conversation_state(),
-            )
-            .outcome,
-            SidWrite::Applied
-        );
-        assert_eq!(disk_sid(profile, &claimant.id).as_deref(), Some(next_sid));
     }
 
     #[test]
@@ -1360,8 +1249,7 @@ mod tests {
         live.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
         live.identity_publisher_launched = true;
         assert_eq!(
-            live.persist_session_id_with_storage(&storage, &expected)
-                .unwrap(),
+            live.persist_session_id_with_storage(&storage, &expected),
             SidPersistOutcome::Published
         );
         let disk = storage.load().unwrap();
@@ -1402,9 +1290,7 @@ mod tests {
         let mut refused = pinned.clone();
         refused.set_agent_conversation(Some(sid.into()), Some(binding.clone()), None);
         assert_eq!(
-            refused
-                .persist_session_id_with_storage(&storage, &expected)
-                .unwrap(),
+            refused.persist_session_id_with_storage(&storage, &expected),
             SidPersistOutcome::Published
         );
         assert_eq!(disk_sid(profile, &pinned.id), None);
@@ -1431,9 +1317,7 @@ mod tests {
             ..launcher.conversation_state()
         };
         assert_eq!(
-            stale
-                .persist_session_id_with_storage(&storage, &stale_expected)
-                .unwrap(),
+            stale.persist_session_id_with_storage(&storage, &stale_expected),
             SidPersistOutcome::Published
         );
         assert_eq!(disk_sid(profile, &launcher.id), None);
@@ -1510,7 +1394,7 @@ mod tests {
             &storage,
             &expected_state(&inst.tool, None, ResumeIntent::Default),
         );
-        assert_eq!(outcome.unwrap(), SidPersistOutcome::Published);
+        assert_eq!(outcome, SidPersistOutcome::Published);
         let loaded = storage.load().unwrap();
         assert_eq!(
             (loaded.len(), loaded[0].agent_session_id.clone()),
@@ -1541,8 +1425,7 @@ mod tests {
             .unwrap();
         inst.identity_publisher_launched = true;
         assert_eq!(
-            inst.persist_session_id_with_storage(&storage, &expected)
-                .unwrap(),
+            inst.persist_session_id_with_storage(&storage, &expected),
             SidPersistOutcome::Published
         );
         let disk = storage.load().unwrap();
@@ -2106,524 +1989,6 @@ mod tests {
                 assert_eq!(captured_env(tmux.name()).as_deref(), want_env, "{label}");
                 assert_eq!(inst.agent_session_id.as_deref(), want_sid, "{label}");
                 assert_eq!(inst.resume_intent, want_intent, "{label}");
-            }
-        }
-
-        #[test]
-        #[serial]
-        fn finalize_launch_rejects_unavailable_sid_lock_before_publication() {
-            if no_tmux() {
-                return;
-            }
-            for busy in [true, false] {
-                let profile = "finalize-sid-lock";
-                let mut inst = make_inst(profile, "preassigned-opencode");
-                inst.tool = "opencode".into();
-                let (_temp, _home, storage) = seeded(profile, &[&inst]);
-                let expected = inst.conversation_state();
-                let before = std::fs::read(storage.sessions_path()).unwrap();
-                let tmux = TmuxSession::create(&inst.id, &inst.title);
-                let (lock, lock_path) =
-                    crate::session::AnchoredDir::open(&crate::session::get_app_dir().unwrap())
-                        .unwrap()
-                        .bind_file(".retained-publisher-admission".as_ref())
-                        .unwrap()
-                        .open_sidecar()
-                        .unwrap();
-                let held = if busy {
-                    let file = lock;
-                    fs2::FileExt::try_lock_exclusive(&file).unwrap();
-                    Some(file)
-                } else {
-                    drop(lock);
-                    std::fs::remove_file(&lock_path).unwrap();
-                    std::fs::create_dir(&lock_path).unwrap();
-                    None
-                };
-                inst.agent_session_id = Some(VALID_SID.into());
-                let error = inst
-                    .finalize_launch_with_store(tmux.name(), &storage, &expected, None, false)
-                    .unwrap_err();
-                if busy {
-                    assert!(error.is::<ConversationOwnershipBusy>(), "{error:#}");
-                } else {
-                    assert_eq!(
-                        error.downcast_ref::<nix::errno::Errno>(),
-                        Some(&nix::errno::Errno::EISDIR),
-                        "{error:#}"
-                    );
-                }
-                assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-                assert_eq!(captured_env(tmux.name()), None);
-                drop(held);
-                if !busy {
-                    std::fs::remove_dir(&lock_path).unwrap();
-                }
-                inst.finalize_launch_with_store(tmux.name(), &storage, &expected, None, false)
-                    .unwrap();
-                assert_eq!(disk_sid(profile, &inst.id).as_deref(), Some(VALID_SID));
-                assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn forgotten_conversations_refuse_capture_and_resume_pin_transfer() {
-        use crate::session::instance::{ActiveExecution, PriorToolSession};
-        use crate::session::{
-            ConversationBinding, ConversationProvenance, ExecutionBinding, LifecycleOperation,
-            LifecycleReservation,
-        };
-        for parked in [false, true] {
-            for pin in [false, true] {
-                for namespace in ["same", "different", "unknown"] {
-                    let profile = "forgotten-conversation";
-                    let (temp, _home, storage) = seeded(profile, &[]);
-                    let root = crate::session::get_app_dir().unwrap();
-                    crate::session::purge_owners::initialize(&root).unwrap();
-                    crate::tmux::tool_retirement::initialize(&root).unwrap();
-                    let execution = |name: &str| ExecutionBinding {
-                        agent: "claude".into(),
-                        stores: vec![temp.path().join(name)],
-                        configuration: Vec::new(),
-                        cwd: temp.path().into(),
-                        cwd_filesystem: "host".into(),
-                        filesystem: "host".into(),
-                        exported_default_store: None,
-                    };
-                    let bound = |source: ExecutionBinding| ConversationBinding {
-                        session_id: VALID_SID.into(),
-                        execution: Some(source),
-                        provenance: ConversationProvenance::Asserted,
-                        transcript_path: None,
-                    };
-                    let owner_binding = execution("retained-store");
-                    let mut owner = make_inst(profile, "forgotten");
-                    owner.project_path = temp.path().join("owner").to_str().unwrap().into();
-                    std::fs::create_dir(&owner.project_path).unwrap();
-                    owner.terminal_scopes = Some(Vec::new());
-                    owner.active_execution = Some(ActiveExecution {
-                        launch_id: "original".into(),
-                        binding: owner_binding.clone(),
-                        capture: None,
-                        container: None,
-                    });
-                    if parked {
-                        owner.prior_tool_session_ids.insert(
-                            "claude".into(),
-                            PriorToolSession {
-                                agent_session_id: Some(VALID_SID.into()),
-                                agent_session_binding: Some(bound(owner_binding)),
-                                ..Default::default()
-                            },
-                        );
-                    } else {
-                        owner.set_agent_conversation(
-                            Some(VALID_SID.into()),
-                            Some(bound(owner_binding)),
-                            None,
-                        );
-                    }
-                    owner.trash();
-                    owner.lifecycle_generation = 4;
-                    owner.lifecycle_reservation = Some(LifecycleReservation {
-                        op: LifecycleOperation::Trash,
-                        generation: 4,
-                        at: chrono::Utc::now() - chrono::Duration::hours(1),
-                    });
-                    let source = match namespace {
-                        "same" => Some(execution("retained-store")),
-                        "different" => Some(execution("separate-store")),
-                        _ => None,
-                    };
-                    let mut claimant = make_inst(profile, "claimant");
-                    claimant.project_path = temp.path().join("claimant").to_str().unwrap().into();
-                    std::fs::create_dir(&claimant.project_path).unwrap();
-                    claimant.active_execution = source.clone().map(|binding| ActiveExecution {
-                        launch_id: "claimant".into(),
-                        binding,
-                        capture: None,
-                        container: None,
-                    });
-                    if pin {
-                        claimant.resume_intent = ResumeIntent::Use(VALID_SID.into());
-                        claimant.resume_binding = source.clone().map(bound);
-                    }
-                    seed(profile, &[&owner, &claimant]);
-                    let registry_before = std::fs::read(storage.sessions_path()).unwrap();
-                    let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
-                    let journal_before = std::fs::read(&journal_path).unwrap();
-                    let held = ConversationReadLock::acquire(&storage, VALID_SID).unwrap();
-                    assert!(
-                        crate::session::purge_owners::retain_forgotten_trash(&storage, &owner)
-                            .unwrap_err()
-                            .is::<ConversationOwnershipBusy>()
-                    );
-                    assert_eq!(
-                        std::fs::read(storage.sessions_path()).unwrap(),
-                        registry_before
-                    );
-                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
-                    drop(held);
-                    crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
-                    storage
-                        .update(|rows, _| {
-                            rows.retain(|row| row.id != owner.id);
-                            Ok(())
-                        })
-                        .unwrap();
-                    let before = std::fs::read(storage.sessions_path()).unwrap();
-                    let expected = claimant.conversation_state();
-                    if pin {
-                        claimant.set_agent_conversation(
-                            Some(VALID_SID.into()),
-                            source.clone().map(bound),
-                            None,
-                        );
-                        claimant.identity_publisher_launched = true;
-                        let _ = claimant.persist_session_id_with_storage(&storage, &expected);
-                    } else {
-                        let mut captured = observation(VALID_SID);
-                        captured.execution = claimant.active_execution.clone();
-                        if let Some(source) = source {
-                            captured.scope_to(source);
-                        }
-                        let outcome = persist_session_with_storage(
-                            &storage,
-                            &claimant.id,
-                            &captured,
-                            &expected,
-                        )
-                        .outcome;
-                        assert_eq!(
-                            outcome,
-                            if namespace == "different" {
-                                SidWrite::Applied
-                            } else {
-                                SidWrite::OwnershipConflict
-                            }
-                        );
-                    }
-                    assert_eq!(
-                        disk_sid(profile, &claimant.id).as_deref(),
-                        (namespace == "different").then_some(VALID_SID),
-                        "{namespace}, parked={parked}, pin={pin}"
-                    );
-                    if namespace != "different" {
-                        assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[serial]
-    fn hard_linked_hermes_stores_refuse_exact_and_late_conversation_adoption() {
-        use crate::session::deletion::DeletionRequest;
-        use crate::session::instance::ActiveExecution;
-        use crate::session::{ConversationBinding, ConversationProvenance};
-        let (temp, _home, storage) = seeded("hermes-owner", &[]);
-        let root = crate::session::get_app_dir().unwrap();
-        crate::tmux::tool_retirement::initialize(&root).unwrap();
-        let _env = crate::session::test_support::EnvGuard::unset(&[
-            "HERMES_HOME",
-            "HERMES_MANAGED_DIR",
-            "TERMINAL_ENV",
-            "TERMINAL_CWD",
-        ]);
-        let _agent = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "hermes",
-            "#!/bin/sh\nexit 0\n",
-        );
-        let mut bindings = Vec::new();
-        let mut original = None;
-        for (index, profile) in ["hermes-owner", "hermes-alias", "hermes-separate"]
-            .iter()
-            .enumerate()
-        {
-            let store = temp.path().join(profile);
-            std::fs::create_dir(&store).unwrap();
-            if index == 1 {
-                std::fs::hard_link(original.as_ref().unwrap(), store.join("state.db")).unwrap();
-            } else {
-                drop(crate::session::instance::test_helpers::create_hermes_database(&store));
-                if index == 0 {
-                    original = Some(store.join("state.db"));
-                }
-            }
-            let config =
-                crate::session::config::profile_config::get_profile_config_path(profile).unwrap();
-            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
-            let environment = vec![format!(
-                "HERMES_MANAGED_DIR={}",
-                temp.path().join("managed").display()
-            )];
-            std::fs::write(
-                config,
-                format!(
-                    "environment={}\n[session.agent_config_dir]\nhermes={:?}\n",
-                    serde_json::to_string(&environment).unwrap(),
-                    store.to_str().unwrap(),
-                ),
-            )
-            .unwrap();
-            let mut row = make_inst(profile, profile);
-            row.project_path = temp.path().to_str().unwrap().into();
-            row.tool = "hermes".into();
-            bindings.push(row.resolve_native_execution(None).unwrap().binding);
-        }
-        assert_ne!(bindings[0].stores, bindings[1].stores);
-        let mut owner = make_inst("hermes-owner", "original Hermes publisher");
-        owner.project_path = temp.path().to_str().unwrap().into();
-        owner.tool = "hermes".into();
-        owner.terminal_scopes = Some(Vec::new());
-        owner.active_execution = Some(ActiveExecution {
-            launch_id: "original Hermes".into(),
-            binding: bindings[0].clone(),
-            capture: None,
-            container: None,
-        });
-        owner.set_agent_conversation(
-            Some(VALID_SID.into()),
-            Some(ConversationBinding {
-                session_id: VALID_SID.into(),
-                execution: Some(bindings[0].clone()),
-                provenance: ConversationProvenance::Observed,
-                transcript_path: None,
-            }),
-            None,
-        );
-        let request = DeletionRequest {
-            session_id: owner.id.clone(),
-            instance: owner.clone(),
-            delete_worktree: false,
-            delete_branch: false,
-            delete_sandbox: false,
-            force_delete: false,
-            detach_hooks: true,
-            keep_scratch: true,
-        };
-        let pending = crate::session::purge_owners::PurgeOwner::record_plan(
-            &storage,
-            &owner,
-            owner.lifecycle_generation,
-            Some(&request),
-            None,
-            crate::session::purge_owners::PurgeCapture::new(&owner).unwrap(),
-        )
-        .unwrap();
-        drop(pending);
-        for retained in [false, true] {
-            if retained {
-                owner
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Trash,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now() - chrono::Duration::hours(1),
-                    )
-                    .unwrap();
-                owner.trash();
-                crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
-            }
-            let sid = if retained {
-                "late-hermes-conversation"
-            } else {
-                VALID_SID
-            };
-            for (binding, allowed) in [(&bindings[1], false), (&bindings[2], true)] {
-                let mut claimant = make_inst("hermes-owner", "new claimant");
-                claimant.tool = "hermes".into();
-                claimant.active_execution = Some(ActiveExecution {
-                    launch_id: "new Hermes".into(),
-                    binding: binding.clone(),
-                    capture: None,
-                    container: None,
-                });
-                seed("hermes-owner", &[&claimant]);
-                let before = std::fs::read(storage.sessions_path()).unwrap();
-                let mut publication = observation(sid);
-                publication.execution = claimant.active_execution.clone();
-                publication.scope_to(binding.clone());
-                let result = persist_session_with_storage(
-                    &storage,
-                    &claimant.id,
-                    &publication,
-                    &claimant.conversation_state(),
-                );
-                assert_eq!(
-                    result.outcome,
-                    if allowed {
-                        SidWrite::Applied
-                    } else {
-                        SidWrite::OwnershipConflict
-                    }
-                );
-                assert_eq!(
-                    disk_sid("hermes-owner", &claimant.id).as_deref(),
-                    allowed.then_some(sid)
-                );
-                if !allowed {
-                    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn retained_publishers_fence_late_ids_for_their_durable_qualified_namespaces() {
-        use crate::session::instance::ActiveExecution;
-        use crate::session::{
-            ConversationBinding, ConversationProvenance, ExecutionBinding, LifecycleOperation,
-        };
-        for (tool, parked, attested) in [
-            ("claude", false, true),
-            ("claude", true, true),
-            ("company-claude", false, true),
-            ("company-claude", true, true),
-            ("company-claude", true, false),
-        ] {
-            for namespace in ["same", "alias", "different", "unknown"] {
-                let profile = "publisher-fence";
-                let (temp, _home, storage) = seeded(profile, &[]);
-                let root = crate::session::get_app_dir().unwrap();
-                crate::tmux::tool_retirement::initialize(&root).unwrap();
-                let original_store = temp.path().join("original-store");
-                let other_store = temp.path().join("other-store");
-                std::fs::create_dir(&original_store).unwrap();
-                std::fs::create_dir(&other_store).unwrap();
-                let alias = temp.path().join("store-alias");
-                std::os::unix::fs::symlink(&original_store, &alias).unwrap();
-                let binding = |store: &std::path::Path| ExecutionBinding {
-                    agent: "claude".into(),
-                    stores: vec![store.to_owned()],
-                    configuration: Vec::new(),
-                    cwd: temp.path().into(),
-                    cwd_filesystem: "host".into(),
-                    filesystem: "host".into(),
-                    exported_default_store: None,
-                };
-                let mut owner = make_inst(profile, "retained publisher");
-                owner.project_path = temp.path().to_str().unwrap().into();
-                owner.tool = tool.into();
-                owner.command = "claude".into();
-                owner.active_execution = Some(ActiveExecution {
-                    launch_id: "original-publisher".into(),
-                    binding: binding(&original_store),
-                    capture: None,
-                    container: None,
-                });
-                owner.acp_session_id = Some(VALID_SID.into());
-                owner.agent_session_binding = attested.then(|| ConversationBinding {
-                    session_id: VALID_SID.into(),
-                    execution: Some(binding(&original_store)),
-                    provenance: ConversationProvenance::Observed,
-                    transcript_path: None,
-                });
-                if parked {
-                    owner.swap_tool("pi");
-                    owner.command = "pi".into();
-                    let mut current = binding(&temp.path().join("pi-store"));
-                    current.agent = "pi".into();
-                    owner.active_execution = Some(ActiveExecution {
-                        launch_id: "current-pi-publisher".into(),
-                        binding: current,
-                        capture: None,
-                        container: None,
-                    });
-                }
-                owner.terminal_scopes = Some(vec![
-                    crate::process::worker_registry::ScopeOwnership::Owned {
-                        unit: "aoe-test-retained-publisher.scope".into(),
-                    },
-                ]);
-                owner
-                    .try_acquire_lifecycle_reservation(
-                        LifecycleOperation::Trash,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now() - chrono::Duration::hours(1),
-                    )
-                    .unwrap();
-                owner.trash();
-                let mut claimant = make_inst(profile, "late claimant");
-                claimant.project_path = temp.path().to_str().unwrap().into();
-                let source = match namespace {
-                    "same" => Some(binding(&original_store)),
-                    "alias" => Some(binding(&alias)),
-                    "different" => Some(binding(&other_store)),
-                    _ => None,
-                };
-                claimant.active_execution = source.as_ref().map(|binding| ActiveExecution {
-                    launch_id: "claimant".into(),
-                    binding: binding.clone(),
-                    capture: None,
-                    container: None,
-                });
-                seed(profile, &[&owner, &claimant]);
-                if attested {
-                    let namespace_guard =
-                        crate::session::purge_owners::ConversationReadLock::namespace(&storage)
-                            .unwrap();
-                    let target = namespace_guard.conversation(&storage, VALID_SID).unwrap();
-                    drop(namespace_guard);
-                    let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
-                    let journal = std::fs::read(&journal_path).unwrap();
-                    let error =
-                        crate::session::purge_owners::retain_forgotten_trash(&storage, &owner)
-                            .unwrap_err();
-                    assert!(error.is::<crate::session::purge_owners::ConversationOwnershipBusy>());
-                    assert_eq!(std::fs::read(&journal_path).unwrap(), journal);
-                    drop(target);
-                }
-                crate::session::purge_owners::retain_forgotten_trash(&storage, &owner).unwrap();
-                storage
-                    .update(|rows, _| {
-                        rows.retain(|row| row.id != owner.id);
-                        Ok(())
-                    })
-                    .unwrap();
-                // The surviving publisher can create this previously unrecorded conversation.
-                let late = "019342ab-1234-7def-8901-abcdef012346";
-                let transcript = original_store.join(format!("{late}.jsonl"));
-                std::fs::write(&transcript, b"late retained conversation").unwrap();
-                let before = std::fs::read(storage.sessions_path()).unwrap();
-                let mut publication = observation(late);
-                publication.execution = claimant.active_execution.clone();
-                if let Some(source) = source.clone() {
-                    publication.scope_to(source);
-                }
-                let outcome = persist_session_with_storage(
-                    &storage,
-                    &claimant.id,
-                    &publication,
-                    &claimant.conversation_state(),
-                )
-                .outcome;
-                if namespace == "different" && attested {
-                    assert_eq!(outcome, SidWrite::Applied);
-                    assert_eq!(disk_sid(profile, &claimant.id).as_deref(), Some(late));
-                } else {
-                    assert_eq!(
-                        outcome,
-                        SidWrite::OwnershipConflict,
-                        "{namespace}, tool={tool}, parked={parked}, attested={attested}"
-                    );
-                    assert_eq!(std::fs::read(storage.sessions_path()).unwrap(), before);
-                }
-                let reloaded = CleanupOwners::load(&root).unwrap();
-                assert!(reloaded.blocks_conversation(&owner.id, late, source.as_ref()));
-                assert_eq!(
-                    std::fs::read(transcript).unwrap(),
-                    b"late retained conversation"
-                );
-                assert!(crate::session::purge_owners::protection(&storage, None)
-                    .unwrap()
-                    .iter()
-                    .any(|protection| protection.references_path(temp.path())));
             }
         }
     }

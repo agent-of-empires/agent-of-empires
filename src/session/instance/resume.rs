@@ -1156,7 +1156,6 @@ mod tests {
     fn cleared_bare_wrapper_launch_does_not_invent_a_managed_identity() {
         let temp = tempdir().unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("HOME", temp.path().to_path_buf()),
             ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
@@ -1229,13 +1228,16 @@ mod tests {
         }
     }
 
-    /// Carry must publish the incoming transcript before launch chooses its resume flag.
+    /// Pins the order inside `stop_carry_and_prepare`: the launch command is
+    /// built from whether the incoming account's transcript exists, so the
+    /// carry has to have published it by then. Preparing first yields
+    /// `--session-id <sid>` on an id the agent rejects as already in use once
+    /// the carry creates the transcript (#3399, #4030).
     #[test]
     #[serial]
     fn carry_runs_before_the_launch_command_picks_its_resume_flag() {
         const SID: &str = "11111111-2222-3333-4444-555555555555";
         let _app_dir = crate::session::test_support::isolate_app_dir();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let stub = tempdir().unwrap();
         let _claude = install_fake_claude(stub.path(), "#!/bin/sh\nexit 1\n");
         let home = dirs::home_dir().expect("home");
@@ -1339,7 +1341,6 @@ mod tests {
             ("CLAUDE_CONFIG_DIR", root.join(".claude")),
         ];
         let guard = crate::session::test_support::EnvGuard::set(&roots);
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })

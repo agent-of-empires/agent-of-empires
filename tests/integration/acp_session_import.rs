@@ -11,15 +11,13 @@ use agent_of_empires::session::import::Owned;
 
 use crate::common::{shim_node, shim_path, shim_ready};
 
-fn spawn_config(publisher_root: &std::path::Path, env: Vec<(String, String)>) -> SpawnConfig {
+fn spawn_config(env: Vec<(String, String)>) -> SpawnConfig {
     SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         wrapper_substitution: None,
         agent_key: "pi".into(),
         tool: "pi".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -56,8 +54,6 @@ fn spawn_config(publisher_root: &std::path::Path, env: Vec<(String, String)>) ->
 #[tokio::test]
 #[serial_test::parallel]
 async fn listed_session_imports_in_its_listed_cwd_and_replays_history() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -82,7 +78,7 @@ async fn listed_session_imports_in_its_listed_cwd_and_replays_history() {
         ("SHIM_LOAD_REPLAY".to_string(), "from history".to_string()),
     ];
 
-    let list = list_native_sessions(spawn_config(publisher_root, env.clone()), &Owned::default())
+    let list = list_native_sessions(spawn_config(env.clone()), &Owned::default())
         .await
         .expect("list shim sessions");
     assert!(!list.truncated);
@@ -96,7 +92,7 @@ async fn listed_session_imports_in_its_listed_cwd_and_replays_history() {
         "listing must not load or create a session"
     );
 
-    let mut config = spawn_config(publisher_root, env);
+    let mut config = spawn_config(env);
     config.cwd = listed.cwd.clone().into();
     config.stored_acp_session_id = Some(listed.session_id.clone());
     config.seed_history_replay = true;

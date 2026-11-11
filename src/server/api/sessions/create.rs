@@ -654,10 +654,6 @@ pub(crate) fn run_create_hooks(
     if plan.on_create().is_empty() {
         return Ok(());
     }
-    crate::session::purge_owners::consume_unpublished_before_risk(
-        &crate::session::get_app_dir()?,
-        &instance.id,
-    )?;
 
     let hook_env = repo_config::lifecycle_env_vars(instance);
     if instance.sandbox_info.is_some() {
@@ -1744,10 +1740,6 @@ async fn created_session_response(
 pub(super) fn public_create_session_error(e: &anyhow::Error) -> (&'static str, String) {
     if let Some(duplicate) = e.downcast_ref::<crate::server::session_spawn::CliDuplicateSession>() {
         return ("create_failed", duplicate.to_string());
-    }
-    if let Some(owned) = e.downcast_ref::<crate::server::session_spawn::ImportSourceAlreadyOwned>()
-    {
-        return ("create_failed", owned.to_string());
     }
     use crate::containers::error::DockerError;
     use crate::session::builder::BuildRefusal;

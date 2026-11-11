@@ -1818,7 +1818,7 @@ async fn d_then_d_confirms_the_trash_and_persists_the_marker() {
             body: crate::daemon::TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
-                expected_profile: None,
+                expected_profile: Some("test".into()),
             },
             expected_epoch,
         },
@@ -1876,7 +1876,7 @@ async fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
             body: crate::daemon::TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
-                expected_profile: None,
+                expected_profile: Some("test".into()),
             },
             expected_epoch,
         },
@@ -1923,7 +1923,7 @@ async fn confirm_delete_dont_ask_again_persists_the_opt_out() {
             body: crate::daemon::TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
-                expected_profile: None,
+                expected_profile: Some("test".into()),
             },
             expected_epoch,
         },
@@ -1994,7 +1994,7 @@ async fn d_with_confirm_delete_prompts_before_trashing() {
             body: crate::daemon::TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
-                expected_profile: None,
+                expected_profile: Some("test".into()),
             },
             expected_epoch,
         },

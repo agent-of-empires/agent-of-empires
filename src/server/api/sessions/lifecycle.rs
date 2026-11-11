@@ -746,11 +746,6 @@ pub async fn trash_session(
         let store: &dyn crate::session::SessionStore = native;
         let title = crate::session::acquire_session_title_lock(&worker_id)?;
         let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
-        anyhow::ensure!(
-            !crate::session::purge_owners::CleanupOwners::load_for(store.storage())?
-                .retains_session(&worker_id),
-            crate::session::purge_owners::ConversationOwnershipRetained
-        );
         let instance = store.update(|rows, _| {
             let row = rows.iter_mut().find(|row| row.id == worker_id)
                 .ok_or(LifecycleTargetError::Missing)?;
@@ -917,127 +912,6 @@ pub async fn trash_session(
     .await
 }
 
-pub async fn forget_trash_record(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    body: Result<Json<crate::daemon::ForgetTrashBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    if state.read_only {
-        return crate::server::api::read_only_response();
-    }
-    let Json(body) = match body {
-        Ok(body) => body,
-        Err(error) => return error.into_response(),
-    };
-    match tokio::spawn(async move {
-        let namespace = state.profile_namespace.read().await;
-        if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        if let Some(response) = cityhall_block_non_structured(&state, &id).await {
-            return response;
-        }
-        let Some(submission) = state.session_service.prompt_submission_for_session(&id).await else {
-            return crate::server::api::session_not_found();
-        };
-        let lock = state.instance_lock(&id).await;
-        let guard = lock.lock().await;
-        let profile = {
-            let instances = state.instances.read().await;
-            let Some(row) = instances.iter().find(|row| row.id == id) else {
-                return crate::server::api::session_not_found();
-            };
-            row.source_profile.clone()
-        };
-        let worker_state = state.clone();
-        let worker_id = id.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let native = crate::server::session_store::NativeSessionStore::open(
-                worker_state.clone(), &profile, Some(worker_id.clone()),
-            )?;
-            let store: &dyn crate::session::SessionStore = &native;
-            let _identity = crate::session::acquire_session_identity_lock()?;
-            let _lifecycle = store.storage().acquire_instance_lifecycle_lock(&worker_id)?;
-            if worker_state.acp_orphan_cleanups.lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter().any(|(session_id, _, _)| session_id == &worker_id)
-            {
-                return Err(LifecycleTargetError::Busy.into());
-            }
-            store.update(|rows, _| {
-                let index = rows.iter().position(|row| row.id == worker_id)
-                    .ok_or(LifecycleTargetError::Missing)?;
-                let row = &rows[index];
-                if body.expected_profile != store.storage().profile()
-                    || body.expected_generation != row.lifecycle_generation
-                    || Some(body.expected_trashed_at) != row.trashed_at
-                    || Some(body.expected_trash_lifecycle_id.as_str()) != row.trash_lifecycle_id.as_deref()
-                    || !row.has_pending_trash()
-                    || row.failed_purge_forced().is_some()
-                {
-                    return Err(crate::session::LifecycleReservationError::Superseded.into());
-                }
-                if row.has_fresh_lifecycle_reservation(chrono::Utc::now()) {
-                    return Err(LifecycleTargetError::Busy.into());
-                }
-                if worker_state.cityhall_mode && !row.is_structured() {
-                    return Err(LifecycleTargetError::CityHall.into());
-                }
-                crate::session::purge_owners::retain_forgotten_trash(store.storage(), row)
-                    .map_err(|error| {
-                        if error.is::<crate::session::purge_owners::ConversationOwnershipBusy>() {
-                            LifecycleTargetError::Busy.into()
-                        } else {
-                            error
-                        }
-                    })?;
-                rows.remove(index);
-                Ok(())
-            })
-        }).await.map_err(anyhow::Error::from).and_then(|result| result);
-        if let Err(error) = result {
-            if error.is::<crate::session::purge_owners::ForgetUnbounded>() {
-                return (
-                    StatusCode::CONFLICT,
-                    crate::daemon::ApiErrorCode::ForgetUnbounded.header(),
-                    Json(serde_json::json!({
-                        "error": "forget_unbounded",
-                        "message": error.to_string(),
-                    })),
-                ).into_response();
-            }
-            if let Some(response) = lifecycle_rejection(&state, &error) {
-                return response;
-            }
-            tracing::warn!(target: "session.trash", session = %id, %error, "forget-record ownership transfer failed");
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ownership_unavailable",
-                "Forget could not be safely confirmed. Refresh this Trash record; Retry remains available.",
-            );
-        }
-        drop(guard);
-        drop(submission);
-        drop(namespace);
-        tracing::info!(target: "session.trash", session = %id, "unfinished Trash record forgotten; cleanup ownership retained");
-        match state.runtime.publish(&state).await {
-            Ok(snapshot) => crate::server::runtime::mutation_response(
-                &snapshot.value.cursor, StatusCode::NO_CONTENT,
-            ),
-            Err(error) => {
-                tracing::warn!(target: "server.runtime", %error, "forgotten record publication failed");
-                StatusCode::SERVICE_UNAVAILABLE.into_response()
-            }
-        }
-    }).await {
-        Ok(response) => response,
-        Err(error) => {
-            tracing::error!(target: "session.trash", %error, "forget-record task failed");
-            persist_failed_response()
-        }
-    }
-}
-
 pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1086,11 +960,6 @@ pub async fn restore_session(
             let _lifecycle = store
                 .storage()
                 .acquire_instance_lifecycle_lock(&worker_id)?;
-            anyhow::ensure!(
-                !crate::session::purge_owners::CleanupOwners::load_for(store.storage())?
-                    .retains_session(&worker_id),
-                crate::session::purge_owners::ConversationOwnershipRetained
-            );
             let claimed = store.update(|rows, _| {
                 let row = rows
                     .iter()
@@ -1498,17 +1367,6 @@ pub(crate) fn lifecycle_rejection(
             ))
         }
         _ => {}
-    }
-    if error.is::<crate::session::purge_owners::ConversationOwnershipRetained>() {
-        let code = crate::daemon::ApiErrorCode::NativeConversationRetained;
-        return Some((
-            code.status(),
-            code.header(),
-            Json(serde_json::json!({
-                "error": code.as_str(),
-                "message": "Conversation belongs to retained cleanup ownership; use a proven separate native store.",
-            })),
-        ).into_response());
     }
     if let Some(blocked) = error
         .downcast_ref::<LifecycleTargetError>()

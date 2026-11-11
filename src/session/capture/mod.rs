@@ -66,43 +66,6 @@ pub(crate) fn canonicalize_allowing_missing_leaf(path: &Path) -> Option<PathBuf>
     }
 }
 
-pub(crate) fn host_publisher_execution(
-    family: &str,
-    cwd: &Path,
-    value: impl Fn(&str) -> Option<String>,
-) -> Option<crate::session::ExecutionBinding> {
-    if family != "claude" {
-        return None;
-    }
-    let cwd = canonicalize_allowing_missing_leaf(cwd)?;
-    let exported = value("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-    let home = value("HOME").map(PathBuf::from);
-    let root = exported
-        .clone()
-        .or_else(|| home.as_ref().map(|home| home.join(".claude")))?;
-    let root = if root.is_absolute() {
-        root
-    } else {
-        cwd.join(root)
-    };
-    let store = canonicalize_allowing_missing_leaf(&root)?;
-    let exported_default_store = Some(
-        exported.is_some()
-            && home
-                .as_ref()
-                .is_some_and(|home| is_default_claude_store(&store, home)),
-    );
-    Some(crate::session::ExecutionBinding {
-        agent: family.into(),
-        stores: vec![store],
-        configuration: Vec::new(),
-        cwd,
-        cwd_filesystem: "host".into(),
-        filesystem: "host".into(),
-        exported_default_store,
-    })
-}
-
 /// The capture boundary check that keeps invalid ids out of storage.
 pub(crate) fn validated_session_id(id: String) -> Option<String> {
     if is_valid_session_id(&id) {

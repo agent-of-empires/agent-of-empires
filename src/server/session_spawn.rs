@@ -85,10 +85,6 @@ pub(crate) struct CliDuplicateSession(anyhow::Error);
 #[error("CLI creation committed, but finalization was not confirmed")]
 pub(crate) struct CliCreationOutcomeUnknown;
 
-#[derive(Debug, thiserror::Error)]
-#[error("Import source is already owned by an AoE session")]
-pub(crate) struct ImportSourceAlreadyOwned;
-
 /// Marker error the core returns when the blocking build task panicked, so the
 /// HTTP handler can keep answering `500 Internal Server Error` for that case
 /// while a plain build failure stays `400`. Mirrors the existing
@@ -259,14 +255,19 @@ pub(crate) async fn spawn_structured_session(
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
         let identity = crate::session::acquire_session_identity_lock()?;
-        let cleanup_owners = crate::session::purge_owners::CleanupOwners::load(
-            &crate::session::get_app_dir()?,
-        )?;
         let (existing_titles, existing_branches): (Vec<String>, Vec<String>) = {
             let rows = worker_state.instances.blocking_read();
-            let owned_rows = || rows.iter().chain(cleanup_owners.frozen_instances());
-            (owned_rows().map(|row| row.title.clone()).collect(),
-             owned_rows().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
+            if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+                anyhow::ensure!(
+                    !rows.iter().any(|row| {
+                        row.acp_session_id.as_deref() == Some(import_id)
+                            || row.agent_session_id.as_deref() == Some(import_id)
+                    }),
+                    "import source is already owned by an AoE session"
+                );
+            }
+            (rows.iter().map(|row| row.title.clone()).collect(),
+             rows.iter().filter_map(|row| row.worktree_info.as_ref().map(|worktree| worktree.branch.clone())).collect())
         };
         let title_refs: Vec<&str> = existing_titles.iter().map(String::as_str).collect();
         let branch_refs: Vec<&str> = existing_branches.iter().map(String::as_str).collect();
@@ -279,51 +280,6 @@ pub(crate) async fn spawn_structured_session(
         )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
-        if let Some(import_id) = import_acp_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
-            let source = import_binding.as_ref().and_then(|binding| binding.execution.as_ref());
-            let publication = if instance.sandbox_info.is_none() {
-                let project = std::path::Path::new(&instance.project_path);
-                let agent = runtime.block_on(worker_state.acp_supervisor.pick_agent_for_tool(
-                    &instance.tool,
-                    agent_name.as_deref(),
-                    &profile,
-                    project,
-                ));
-                let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                    &profile,
-                    project,
-                );
-                let command = crate::acp::supervisor::command_override_for_spawn(
-                    &instance.tool,
-                    &instance.command,
-                );
-                let (spec, _) = runtime.block_on(
-                    worker_state.acp_supervisor.resolve_agent_spec_for_spawn(
-                        &agent,
-                        &resolved.session,
-                        &crate::acp::agent_policy::AgentPolicy::load(),
-                        command.as_ref(),
-                    ),
-                )?;
-                let family = spec.publisher_family().filter(|family| *family != "prime-agent");
-                crate::session::purge_owners::PublisherNamespace::host(family, source)
-            } else {
-                crate::session::purge_owners::PublisherNamespace::Unknown
-            };
-            let rows = worker_state.instances.blocking_read();
-            anyhow::ensure!(
-                !rows.iter().any(|row| {
-                    row.acp_session_id.as_deref() == Some(import_id)
-                        || row.agent_session_id.as_deref() == Some(import_id)
-                })
-                    && !cleanup_owners.blocks_acp_import(&instance.id, import_id, source, publication),
-                ImportSourceAlreadyOwned
-            );
-        }
-        anyhow::ensure!(
-            !cleanup_owners.session_ids().any(|id| id == instance.id),
-            "session identity retains protected cleanup ownership"
-        );
         // HTTP's `parent_session_id`, checked by the handler; a CLI create names its parent below.
         instance.parent_session_id = parent_session_id;
         if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
@@ -379,7 +335,22 @@ pub(crate) async fn spawn_structured_session(
         instance.agent_name = agent_name;
         let lock = runtime.block_on(worker_state.instance_lock(&instance.id));
         let store: &dyn SessionStore = &native;
-        let (generation, creation_guard) = {
+        let creation_guard = worker_state.session_service.register_creation(
+            &instance.id,
+            &instance.title,
+            &instance.source_profile,
+            instance.idempotency_key.as_deref(),
+        )?;
+        // One hook event feeds both progress channels: the live registry the
+        // web wizard polls by `idempotency_key`, and the session service's
+        // published creation progress.
+        let creation_progress = |event: crate::session::config::repo_config::HookProgress| {
+            if let Some(progress) = progress.as_deref() {
+                progress.record(event.clone());
+            }
+            creation_guard.hook_event(event)
+        };
+        let generation = {
             let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let _guard = lock.blocking_lock();
             native.check_available()?;
@@ -389,31 +360,16 @@ pub(crate) async fn spawn_structured_session(
                 LifecycleOperation::Launch, Instance::LIFECYCLE_RESERVATION_TTL, chrono::Utc::now(),
             )?;
             instance.status = Status::Creating;
-            let creation_guard = store.update(|rows, groups| {
-                let instance = &plan.result.instance;
+            store.update(|rows, groups| {
                 anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
                 if cli.is_some() && crate::session::is_duplicate_session(rows.iter(), &instance.title, &instance.project_path, None) {
                     return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
                 }
-                plan.register_fresh_creation(&crate::session::get_app_dir()?)?;
-                let instance = &plan.result.instance;
-                let creation_guard = worker_state.session_service.register_creation(
-                    &instance.id,
-                    &instance.title,
-                    &instance.source_profile,
-                    instance.idempotency_key.as_deref(),
-                )?;
                 rows.push(instance.clone());
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
-                Ok(creation_guard)
+                Ok(())
             })?;
-            (generation, creation_guard)
-        };
-        let creation_progress = |event: crate::session::config::repo_config::HookProgress| {
-            if let Some(progress) = progress.as_deref() {
-                progress.record(event.clone());
-            }
-            creation_guard.hook_event(event)
+            generation
         };
         drop(identity);
         drop(namespace);
@@ -1472,7 +1428,6 @@ mod tests {
         use axum::Json;
 
         let _home = crate::session::test_support::isolate_app_dir();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })
@@ -1540,7 +1495,6 @@ mod tests {
         use axum::Json;
 
         let _home = crate::session::test_support::isolate_app_dir();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
         })

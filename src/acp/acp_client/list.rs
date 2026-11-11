@@ -53,8 +53,8 @@ async fn list_with_timeout(
     owned: &Owned,
     step_timeout: Duration,
 ) -> Result<ImportableList, ListSessionsError> {
-    let (child, _, _prime_runtime) = spawn_subprocess(&config, "__listing__")
-        .map_err(|e| ListSessionsError::Failed(e.to_string()))?;
+    let (child, _, _prime_runtime) =
+        spawn_subprocess(&config).map_err(|e| ListSessionsError::Failed(e.to_string()))?;
     let mut child = child;
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         let _ = child.kill().await;

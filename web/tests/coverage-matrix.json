@@ -10,51 +10,25 @@
       "components": [
         "web/src/App.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
-        "web/src/components/sidebar/TrashMenu.tsx",
-        "web/src/components/ForgetTrashDialog.tsx"
+        "web/src/components/sidebar/TrashMenu.tsx"
       ],
-      "notes": "Real-daemon Retry preserves unverified files and captured generations. Mouse and keyboard Forget work for genuinely unlaunched CLI-created sessions, removing only the visible record with a matching epoch/revision receipt. Fresh owners refuse recovery without changing custody. Identity-stable publisher-proof loss closes Forget through the root authority watcher. Published or unknown ownership remains protected; Retry and read-only inspection stay available."
-    },
-    {
-      "id": "trash.forget-capability",
-      "kind": "vitest",
-      "risk": "high",
-      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
-      "components": ["web/src/components/sidebar/TrashMenu.tsx"],
-      "notes": "Identity-stable loss of the daemon capability disables Forget, refuses an old pointer action and keeps Retry usable."
+      "notes": "Real-daemon Retry preserves unverified files and captured generations. Fresh owners refuse Retry without changing custody. Retry and read-only inspection remain available; unfinished Trash never grants purge authority."
     },
     {
       "id": "trash.mixed-workspace-recovery",
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/session-trash.spec.ts"],
-      "components": [
-        "web/src/App.tsx",
-        "web/src/components/sidebar/TrashMenu.tsx",
-        "web/src/components/ForgetTrashDialog.tsx"
-      ],
-      "notes": "An unfinished Trash member remains reachable beside a live workspace sibling. Retry targets only the pending member; Forget Escape preserves the active live session route."
-    },
-    {
-      "id": "trash.forget-overlay-priority",
-      "kind": "mocked-playwright",
-      "risk": "high",
-      "specs": ["tests/session-trash.spec.ts"],
-      "components": ["web/src/App.tsx", "web/src/components/ForgetTrashDialog.tsx"],
-      "notes": "Real App Escape closes Forget without closing the underlying file viewer. Delayed first-run settings resolve while Forget remains open; welcome and tour start only after its confirmation closes."
+      "components": ["web/src/App.tsx", "web/src/components/sidebar/TrashMenu.tsx"],
+      "notes": "An unfinished Trash member remains reachable beside a live workspace sibling. Retry targets only the pending member and preserves the active live session route."
     },
     {
       "id": "trash.restore-receipt-ordering",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/hooks/useSessions.test.ts",
-        "src/hooks/useKeyboardShortcuts.test.ts",
-        "src/lib/__tests__/trashActions.test.ts",
-        "src/lib/api.test.ts"
-      ],
-      "components": ["web/src/App.tsx", "web/src/components/ForgetTrashDialog.tsx"],
-      "notes": "Restore consumes its native receipt and wins over a late older Retry without fencing unrelated rows. Mixed-workspace restore excludes live members. Consumed recovery Escape prevents later viewer listeners from closing the underlying surface."
+      "specs": ["src/hooks/useSessions.test.ts", "src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": ["web/src/App.tsx"],
+      "notes": "Restore consumes its native receipt and wins over a late older Retry without fencing unrelated rows. Mixed-workspace restore excludes live members."
     },
     {
       "id": "settings.dialog-escape",

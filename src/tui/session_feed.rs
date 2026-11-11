@@ -64,10 +64,6 @@ pub(crate) enum SessionRequest {
         body: crate::daemon::TrashSessionBody,
         expected_epoch: String,
     },
-    ForgetTrash {
-        body: crate::daemon::ForgetTrashBody,
-        expected_epoch: String,
-    },
     Purge(crate::daemon::DeleteSessionBody),
     Restore,
     Rename(crate::daemon::RenameSessionBody),
@@ -249,9 +245,6 @@ pub(crate) struct CapturedRequest {
 }
 #[cfg(test)]
 impl CapturedRequest {
-    pub fn finish_mutation(self, cursor: RuntimeCursor) {
-        assert!(self.reply.send(Ok(CommandReply::Mutation(cursor))).is_ok());
-    }
     pub fn finish(self, result: Result<SessionCommandOutcome, String>) {
         let reply = result
             .map(|outcome| match outcome {
@@ -549,13 +542,6 @@ async fn run_queued_command(
                     .trash_session(&id, &body, &expected_epoch)
                     .await
                     .map(CommandReply::Trash),
-                SessionRequest::ForgetTrash {
-                    body,
-                    expected_epoch,
-                } => client
-                    .forget_trash_record(&id, &body, &expected_epoch)
-                    .await
-                    .map(CommandReply::Mutation),
                 SessionRequest::Purge(body) => client
                     .purge_session(&id, &body, epoch)
                     .await

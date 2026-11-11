@@ -36,7 +36,6 @@ fn routing_for(provider: Option<&str>) -> Vec<(String, String)> {
 }
 
 fn spawn_config(
-    publisher_root: &std::path::Path,
     record_path: &std::path::Path,
     load_session: bool,
     provider: Option<&str>,
@@ -50,13 +49,11 @@ fn spawn_config(
         env.push(("SHIM_LOAD_SESSION".into(), "1".into()));
     }
     SpawnConfig {
-        publisher_root: publisher_root.to_path_buf(),
         launch_lease: None,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: crate::common::shim_node()
                 .expect("shim prerequisite")
                 .to_string_lossy()
@@ -133,8 +130,6 @@ fn pair(value: &str) -> Vec<(String, String)> {
 #[tokio::test]
 #[serial_test::serial]
 async fn provider_pick_reaches_the_adapter_on_load_and_new() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -162,11 +157,7 @@ async fn provider_pick_reaches_the_adapter_on_load_and_new() {
             );
             let temp = tempfile::tempdir().expect("tempdir");
             let record_path = temp.path().join("env.json");
-            run(
-                spawn_config(publisher_root, &record_path, load, pick, vec![]),
-                &label,
-            )
-            .await;
+            run(spawn_config(&record_path, load, pick, vec![]), &label).await;
 
             let env = recorded(&record_path);
             assert_eq!(
@@ -190,8 +181,6 @@ async fn provider_pick_reaches_the_adapter_on_load_and_new() {
 #[tokio::test]
 #[serial_test::parallel]
 async fn provider_pick_beats_configured_host_environment() {
-    let publisher_root_owner = crate::common::acp_publisher_root();
-    let publisher_root = publisher_root_owner.path();
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
@@ -207,7 +196,7 @@ async fn provider_pick_beats_configured_host_environment() {
         let temp = tempfile::tempdir().expect("tempdir");
         let record_path = temp.path().join("env.json");
         run(
-            spawn_config(publisher_root, &record_path, false, pick, pair(configured)),
+            spawn_config(&record_path, false, pick, pair(configured)),
             &label,
         )
         .await;

@@ -825,7 +825,6 @@ async fn create_receipts_include_published_rows_and_idempotent_retries() -> anyh
         return Ok(());
     }
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -912,7 +911,6 @@ async fn an_always_yolo_agent_records_yolo_mode_whatever_the_request_says() -> a
         return Ok(());
     }
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -1222,492 +1220,18 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
 
 #[tokio::test]
 #[serial_test::serial]
-async fn forget_trash_requires_expired_current_consent_and_keeps_resources() -> anyhow::Result<()> {
-    use axum::{body::Body, http::Request};
-    use tower::ServiceExt;
-    for case in [
-        "valid",
-        "legacy",
-        "published",
-        "unverified_scopes",
-        "journal_missing",
-        "journal_malformed",
-        "epoch_missing",
-        "epoch_duplicate",
-        "epoch_stale",
-        "profile",
-        "generation",
-        "timestamp",
-        "identity",
-        "fresh",
-        "restored",
-        "purging",
-    ] {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let root = crate::session::get_app_dir()?;
-        crate::session::purge_owners::initialize(&root)?;
-        crate::tmux::tool_retirement::initialize(&root)?;
-        let project = tempfile::tempdir()?;
-        let sentinel = project.path().join("kept.txt");
-        std::fs::write(&sentinel, b"must survive forgetting")?;
-        let mut row = if case == "legacy" {
-            Instance::new("unfinished Trash", project.path().to_str().unwrap())
-        } else {
-            crate::session::test_support::unpublished_instance(
-                "unfinished Trash",
-                project.path(),
-                "receipt",
-            )?
-        };
-        row.source_profile = "receipt".into();
-        let scopes = if case == "unverified_scopes" {
-            vec![crate::process::worker_registry::ScopeOwnership::Owned {
-                unit: format!("aoe-test-forget-{}.scope", row.id),
-            }]
-        } else {
-            Vec::new()
-        };
-        row.terminal_scopes = Some(scopes.clone());
-        if case == "published" {
-            row.agent_session_id = Some("recorded-native-history".into());
-        }
-        let now = chrono::Utc::now();
-        row.try_acquire_lifecycle_reservation(
-            crate::session::LifecycleOperation::Trash,
-            Instance::LIFECYCLE_RESERVATION_TTL,
-            if case == "fresh" {
-                now
-            } else {
-                now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1)
-            },
-        )?;
-        row.trash();
-        let mut consent = crate::daemon::ForgetTrashBody {
-            expected_profile: "receipt".into(),
-            expected_generation: row.lifecycle_generation,
-            expected_trashed_at: row.trashed_at.unwrap(),
-            expected_trash_lifecycle_id: row.trash_lifecycle_id.clone().unwrap(),
-        };
-        match case {
-            "profile" => consent.expected_profile = "other".into(),
-            "generation" => consent.expected_generation -= 1,
-            "timestamp" => consent.expected_trashed_at -= chrono::Duration::seconds(1),
-            "identity" => consent.expected_trash_lifecycle_id = uuid::Uuid::new_v4().to_string(),
-            "restored" => {
-                row.untrash();
-            }
-            "purging" => {
-                row.lifecycle_reservation.as_mut().unwrap().op =
-                    crate::session::LifecycleOperation::Purge
-            }
-            _ => {}
-        }
-        let id = row.id.clone();
-        let state = crate::server::test_support::build_test_app_state_with_policy(
-            vec![row.clone()],
-            vec!["localhost".into()],
-            Vec::new(),
-            None,
-        );
-        let storage = Storage::new("receipt", state.file_watch.clone())?;
-        storage.update(|rows, _| {
-            rows.push(row);
-            Ok(())
-        })?;
-        let journal_path = root.join(crate::session::purge_owners::FILE_NAME);
-        if case == "journal_missing" {
-            std::fs::remove_file(&journal_path)?;
-        } else if case == "journal_malformed" {
-            std::fs::write(&journal_path, b"{unreadable authority")?;
-        }
-        *state.canonical_metadata.write().await =
-            crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
-        let registry_before = std::fs::read(storage.sessions_path())?;
-        let journal_before = std::fs::read(&journal_path).ok();
-        let epoch = state
-            .runtime
-            .publish(&state)
-            .await?
-            .value
-            .cursor
-            .epoch
-            .clone();
-        let mut request = Request::builder()
-            .method("POST")
-            .uri(format!("/api/sessions/{id}/trash/forget"))
-            .header("host", "localhost")
-            .header("content-type", "application/json")
-            .extension(axum::extract::ConnectInfo(
-                crate::server::peer::ConnectionPeer::UnixOwner {
-                    uid: nix::unistd::geteuid().as_raw(),
-                },
-            ));
-        if case != "epoch_missing" {
-            request = request.header(
-                crate::daemon::RUNTIME_EPOCH_HEADER,
-                if case == "epoch_stale" {
-                    "abandoned-runtime"
-                } else {
-                    epoch.as_str()
-                },
-            );
-        }
-        if case == "epoch_duplicate" {
-            request = request.header(crate::daemon::RUNTIME_EPOCH_HEADER, &epoch);
-        }
-        let response = crate::server::test_support::build_router_for_test(state.clone())
-            .oneshot(request.body(Body::from(serde_json::to_vec(&consent)?))?)
-            .await?;
-        if case == "valid" {
-            assert_eq!(response.status(), StatusCode::NO_CONTENT, "{case}");
-            assert_eq!(
-                response.headers()[crate::daemon::RUNTIME_EPOCH_HEADER],
-                epoch
-            );
-            assert!(
-                response.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
-                    .to_str()?
-                    .parse::<u64>()?
-                    > 0
-            );
-            let journal: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&journal_path)?)?;
-            let owner = journal["owners"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|owner| owner["session_id"] == id)
-                .unwrap();
-            assert_eq!(
-                owner["purpose"]["terminal_scopes"],
-                serde_json::to_value(&scopes)?
-            );
-            assert!(storage.load()?.is_empty());
-            assert!(crate::session::purge_owners::CleanupOwners::load(&root)?
-                .protections()
-                .any(|owner| owner.references_path(project.path())));
-        } else if case.starts_with("journal_") {
-            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
-            let body = axum::body::to_bytes(response.into_body(), 4096).await?;
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body)?["error"],
-                "ownership_unavailable"
-            );
-            assert_eq!(
-                std::fs::read(storage.sessions_path())?,
-                registry_before,
-                "{case}"
-            );
-            assert_eq!(std::fs::read(&journal_path).ok(), journal_before, "{case}");
-        } else {
-            assert_eq!(response.status(), StatusCode::CONFLICT, "{case}");
-            assert_eq!(
-                response.headers()[crate::daemon::ERROR_CODE_HEADER],
-                if case.starts_with("epoch_") {
-                    crate::daemon::ApiErrorCode::RuntimeEpochMismatch.as_str()
-                } else if case == "fresh" {
-                    crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
-                } else if matches!(case, "legacy" | "published" | "unverified_scopes") {
-                    crate::daemon::ApiErrorCode::ForgetUnbounded.as_str()
-                } else {
-                    crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
-                },
-                "{case}"
-            );
-            assert_eq!(
-                std::fs::read(storage.sessions_path())?,
-                registry_before,
-                "{case}"
-            );
-            assert_eq!(std::fs::read(&journal_path).ok(), journal_before, "{case}");
-        }
-        assert_eq!(
-            std::fs::read(&sentinel)?,
-            b"must survive forgetting",
-            "{case}"
-        );
-    }
-    Ok(())
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn interrupted_forget_tombstone_refuses_retry_and_restore_before_reservation(
+async fn trash_preserves_idempotency_and_rejects_stale_generations_or_profiles(
 ) -> anyhow::Result<()> {
-    use axum::{body::Body, http::Request};
-    use tower::ServiceExt;
-    let _home = crate::session::test_support::isolate_app_dir();
-    let root = crate::session::get_app_dir()?;
-    crate::session::purge_owners::initialize(&root)?;
-    crate::tmux::tool_retirement::initialize(&root)?;
-    let project = tempfile::tempdir()?;
-    let sentinel = project.path().join("retained.txt");
-    std::fs::write(&sentinel, b"retained runtime files")?;
-    let mut row = Instance::new("interrupted Forget", project.path().to_str().unwrap());
-    row.source_profile = "interrupted-forget".into();
-    row.terminal_scopes = Some(vec![
-        crate::process::worker_registry::ScopeOwnership::Owned {
-            unit: "aoe-test-forgotten-runtime.scope".into(),
-        },
-    ]);
-    row.try_acquire_lifecycle_reservation(
-        crate::session::LifecycleOperation::Trash,
-        Instance::LIFECYCLE_RESERVATION_TTL,
-        chrono::Utc::now() - chrono::Duration::hours(1),
-    )?;
-    row.trash();
-    let state = crate::server::test_support::build_test_app_state_with_policy(
-        vec![row.clone()],
-        vec!["localhost".into()],
-        Vec::new(),
-        None,
-    );
-    let storage = Storage::new(&row.source_profile, state.file_watch.clone())?;
-    storage.update(|rows, _| {
-        rows.push(row.clone());
-        Ok(())
-    })?;
-    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-    let aborted: anyhow::Result<()> = storage.update(|rows, _| {
-        let current = rows.iter().find(|current| current.id == row.id).unwrap();
-        crate::session::purge_owners::seed_legacy_retained_for_test(&storage, current)?;
-        anyhow::bail!("abort registry transaction after durable retained ownership");
-    });
-    assert!(aborted
-        .unwrap_err()
-        .to_string()
-        .contains("abort registry transaction"));
-    assert_eq!(storage.load()?.len(), 1);
-    let registry = std::fs::read(storage.sessions_path())?;
-    let journal = std::fs::read(root.join(crate::session::purge_owners::FILE_NAME))?;
-    let retry = trash_session(
-        State(state.clone()),
-        Path(row.id.clone()),
-        Some(Json(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_profile: Some(row.source_profile.clone()),
-            expected_generation: Some(row.lifecycle_generation),
-        })),
-    )
-    .await
-    .into_response();
-    let restore = restore_session(State(state.clone()), Path(row.id.clone()))
-        .await
-        .into_response();
-    for response in [retry, restore] {
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            response.headers()[crate::daemon::ERROR_CODE_HEADER],
-            crate::daemon::ApiErrorCode::NativeConversationRetained.as_str()
-        );
-    }
-    assert_eq!(std::fs::read(storage.sessions_path())?, registry);
-    assert_eq!(
-        std::fs::read(root.join(crate::session::purge_owners::FILE_NAME))?,
-        journal
-    );
-    assert_eq!(std::fs::read(sentinel)?, b"retained runtime files");
-    let consent = crate::daemon::ForgetTrashBody {
-        expected_profile: row.source_profile.clone(),
-        expected_generation: row.lifecycle_generation,
-        expected_trashed_at: row.trashed_at.unwrap(),
-        expected_trash_lifecycle_id: row.trash_lifecycle_id.clone().unwrap(),
-    };
-    let router = crate::server::test_support::build_router_for_test(state.clone());
-    for expected in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
-        let epoch = state
-            .runtime
-            .publish(&state)
-            .await?
-            .value
-            .cursor
-            .epoch
-            .clone();
-        let request = Request::builder()
-            .method("POST")
-            .uri(format!("/api/sessions/{}/trash/forget", row.id))
-            .header("host", "localhost")
-            .header("content-type", "application/json")
-            .header(crate::daemon::RUNTIME_EPOCH_HEADER, epoch)
-            .extension(axum::extract::ConnectInfo(
-                crate::server::peer::ConnectionPeer::UnixOwner {
-                    uid: nix::unistd::geteuid().as_raw(),
-                },
-            ))
-            .body(Body::from(serde_json::to_vec(&consent)?))?;
-        let response = router.clone().oneshot(request).await?;
-        assert_eq!(response.status(), expected);
-        assert!(storage.load()?.is_empty());
-        assert_eq!(
-            std::fs::read(root.join(crate::session::purge_owners::FILE_NAME))?,
-            journal
-        );
-        assert_eq!(
-            std::fs::read(project.path().join("retained.txt"))?,
-            b"retained runtime files"
-        );
-        assert!(crate::session::purge_owners::CleanupOwners::load(&root)?
-            .blocks_publisher(&row.id, None));
-    }
-    Ok(())
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn retained_trash_parked_conversation_refuses_import() -> anyhow::Result<()> {
-    for (acp, ordinary_pi) in [(false, false), (true, false), (false, true), (true, true)] {
-        let home = tempfile::tempdir()?;
-        let _home = crate::session::test_support::isolate_app_dir_at(home.path());
-        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
-        let _native = crate::session::test_support::install_login_shell_path_command(
-            home.path(),
-            "claude",
-            "#!/bin/sh\nexit 0\n",
-        );
-        let claude = home.path().join("claude");
-        let _env = crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", &claude)]);
-        crate::session::config::update_app_state(|state| {
-            state.has_acknowledged_agent_hooks = true;
-        })?;
-        let root = crate::session::get_app_dir()?;
-        crate::session::purge_owners::initialize(&root)?;
-        crate::tmux::tool_retirement::initialize(&root)?;
-        let project = home.path().join("import-project");
-        let retained = home.path().join("retained");
-        std::fs::create_dir_all(&project)?;
-        std::fs::create_dir_all(&retained)?;
-        let project = project.canonicalize()?;
-        let history = claude.join("projects").join("-import-project");
-        std::fs::create_dir_all(&history)?;
-        std::fs::write(
-            history.join("listed.jsonl"),
-            serde_json::json!({
-                "type": "user", "cwd": project,
-                "message": {"role": "user", "content": "retained native conversation"}
-            })
-            .to_string()
-                + "\n",
-        )?;
-        let mut owner = Instance::new("forgotten owner", retained.to_str().unwrap());
-        owner.source_profile = "test".into();
-        owner.tool = "pi".into();
-        owner.terminal_scopes = Some(Vec::new());
-        if ordinary_pi && !acp {
-            owner.acp_session_id = Some("listed".into());
-        } else {
-            let parked = owner
-                .prior_tool_session_ids
-                .entry(if ordinary_pi { "pi" } else { "claude" }.into())
-                .or_default();
-            if acp {
-                parked.acp_session_id = Some("listed".into());
-            } else {
-                parked.agent_session_id = Some("listed".into());
-            }
-        }
-        owner.try_acquire_lifecycle_reservation(
-            crate::session::LifecycleOperation::Trash,
-            Instance::LIFECYCLE_RESERVATION_TTL,
-            chrono::Utc::now() - chrono::Duration::hours(1),
-        )?;
-        owner.trash();
-        let consent = crate::daemon::ForgetTrashBody {
-            expected_profile: owner.source_profile.clone(),
-            expected_generation: owner.lifecycle_generation,
-            expected_trashed_at: owner.trashed_at.unwrap(),
-            expected_trash_lifecycle_id: owner.trash_lifecycle_id.clone().unwrap(),
-        };
-        let (launcher, _) = crate::server::test_support::counting_failing_launcher();
-        let state = crate::server::test_support::build_test_app_state_with_launcher(
-            vec![owner.clone()],
-            launcher,
-        );
-        let storage = Storage::new("test", state.file_watch.clone())?;
-        storage.update(|rows, _| {
-            rows.push(owner.clone());
-            Ok(())
-        })?;
-        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        if ordinary_pi {
-            let request = crate::session::deletion::DeletionRequest {
-                session_id: owner.id.clone(),
-                instance: owner.clone(),
-                delete_worktree: false,
-                delete_branch: false,
-                delete_sandbox: false,
-                force_delete: false,
-                detach_hooks: true,
-                keep_scratch: true,
-            };
-            let pending = crate::session::purge_owners::PurgeOwner::record_plan(
-                &storage,
-                &owner,
-                owner.lifecycle_generation,
-                Some(&request),
-                None,
-                crate::session::purge_owners::PurgeCapture::new(&owner)?,
-            )?;
-            drop(pending);
-            storage.update(|rows, _| {
-                rows.clear();
-                Ok(())
-            })?;
-            state.instances.write().await.clear();
-            let owners = crate::session::purge_owners::CleanupOwners::load(&root)?;
-            assert!(!owners.blocks_conversation("native claimant", "listed", None));
-            assert!(!owners.blocks_acp_import(
-                "unrelated claimant",
-                "unrelated",
-                None,
-                crate::session::purge_owners::PublisherNamespace::Unknown,
-            ));
-            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-        } else {
-            crate::session::purge_owners::seed_legacy_retained_for_test(&storage, &owner)?;
-            let forgotten =
-                forget_trash_record(State(state.clone()), Path(owner.id), Ok(Json(consent)))
-                    .await
-                    .into_response();
-            assert_eq!(forgotten.status(), StatusCode::NO_CONTENT);
-        }
-        let journal = root.join(crate::session::purge_owners::FILE_NAME);
-        let evidence = std::fs::read(&journal)?;
-        let (status, response) = post_create(
-            &state,
-            serde_json::json!({
-                "title": "imported parked conversation", "path": project, "tool": "claude",
-                "profile": "test", "import_acp_session_id": "listed", "cli": {}
-            }),
-        )
-        .await;
-        state.runtime.work.shutdown.cancel();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            state.runtime.work.drain(),
-        )
-        .await?;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
-        assert_eq!(response["error"], "create_failed", "{response}");
-        assert!(
-            storage.load()?.is_empty(),
-            "import must not publish a claimant"
-        );
-        assert_eq!(std::fs::read(journal)?, evidence);
-    }
-    Ok(())
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::Result<()> {
     use crate::session::LifecycleOperation;
-    for (already_trashed, precondition, omit_body, peer) in [
-        (false, true, false, None),
-        (true, true, false, None),
-        (true, false, false, None),
-        (true, false, true, None),
-        (true, false, false, Some(LifecycleOperation::Purge)),
-        (true, false, false, Some(LifecycleOperation::Trash)),
+    for (already_trashed, precondition, omit_body, peer, wrong_profile) in [
+        (false, true, false, None, false),
+        (true, true, false, None, false),
+        (true, false, false, None, false),
+        (true, false, true, None, false),
+        (true, false, false, Some(LifecycleOperation::Purge), false),
+        (true, false, false, Some(LifecycleOperation::Trash), false),
+        (false, false, false, None, true),
+        (true, false, false, None, true),
     ] {
         let _guard = crate::session::test_support::isolate_app_dir();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
@@ -1742,14 +1266,14 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             (!omit_body).then_some(Json(TrashSessionBody {
                 kill_pane: true,
                 expected_generation: precondition.then_some(expected_generation),
-                expected_profile: None,
+                expected_profile: wrong_profile.then(|| "different-profile".into()),
             })),
         )
         .await
         .into_response();
         let response = assert_response_status(
             response,
-            if precondition || peer.is_some() {
+            if precondition || peer.is_some() || wrong_profile {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::OK
@@ -1757,7 +1281,7 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             "Trash generation/idempotency",
         )
         .await;
-        if precondition {
+        if precondition || wrong_profile {
             assert_eq!(
                 response.headers()[crate::daemon::ERROR_CODE_HEADER],
                 crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
@@ -1770,7 +1294,7 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             );
         }
         assert_eq!(std::fs::read(storage.sessions_path())?, before);
-        if precondition || peer.is_some() {
+        if precondition || peer.is_some() || wrong_profile {
             assert!(!response
                 .headers()
                 .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
@@ -2302,8 +1826,6 @@ async fn lifecycle_requests_reject_a_peer_reservation_without_acknowledging_it(
         ("restore", LifecycleOperation::Purge, Status::Deleting),
     ] {
         let _guard = crate::session::test_support::isolate_app_dir();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
-        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
         let mut row = Instance::new("reserved lifecycle", "/tmp/reserved-lifecycle");
         row.source_profile = "receipt".into();
         row.status = status;
@@ -2358,7 +1880,7 @@ async fn lifecycle_requests_reject_a_peer_reservation_without_acknowledging_it(
                 .into_response(),
             _ => unreachable!(),
         };
-        let response = assert_response_status(response, StatusCode::CONFLICT, action).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{action}");
         assert_eq!(
             response
                 .headers()
@@ -2511,8 +2033,6 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
         return Ok(());
     }
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
-    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -2566,7 +2086,7 @@ async fn running_restart_respawns_while_start_remains_idempotent() -> anyhow::Re
     )
     .await
     .into_response();
-    let restarted = assert_response_status(restarted, StatusCode::OK, "running restart").await;
+    assert_eq!(restarted.status(), StatusCode::OK);
     let revision = restarted.headers()[crate::daemon::RUNTIME_REVISION_HEADER]
         .to_str()?
         .parse::<u64>()?;
@@ -2617,8 +2137,6 @@ async fn restart_delivers_requested_wake_message_to_new_pane() -> anyhow::Result
         return Ok(());
     }
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
-    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -2658,7 +2176,7 @@ async fn restart_delivers_requested_wake_message_to_new_pane() -> anyhow::Result
     )
     .await
     .into_response();
-    assert_response_status(response, StatusCode::OK, "restart wake message").await;
+    assert_eq!(response.status(), StatusCode::OK);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if std::fs::read_to_string(&marker).ok().as_deref() == Some("wake-message-verified") {
@@ -2951,7 +2469,6 @@ async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> a
     for archive in [true, false] {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
         let project = tempfile::tempdir()?;
         let mut row = Instance::new("auxiliary receipt", project.path().to_str().unwrap());
         row.source_profile = "receipt".into();
@@ -2994,9 +2511,7 @@ async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> a
             .await
             .into_response()
         };
-        let response =
-            assert_response_status(response, StatusCode::OK, "archive/Trash auxiliary receipt")
-                .await;
+        assert_eq!(response.status(), StatusCode::OK);
         let receipt = response
             .headers()
             .get(crate::daemon::RUNTIME_REVISION_HEADER)
@@ -3038,8 +2553,6 @@ async fn archive_and_trash_receipts_discard_killed_auxiliary_observations() -> a
 #[serial_test::serial]
 async fn trash_restore_receipts_publish_complete_peer_bundles() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
-    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
     let root = tempfile::tempdir()?;
     let main_repo = root.path().join("main");
     let worktree = root.path().join("worktree");
@@ -3127,8 +2640,7 @@ async fn trash_restore_receipts_publish_complete_peer_bundles() -> anyhow::Resul
             "resource references changed during cleanup exclusion"
         );
         assert!(path_present, "worktree moved during cleanup exclusion");
-        let response =
-            assert_response_status(response, StatusCode::OK, "Trash/Restore peer receipt").await;
+        assert_eq!(response.status(), StatusCode::OK);
         let receipt = response
             .headers()
             .get(crate::daemon::RUNTIME_REVISION_HEADER)
@@ -3419,7 +2931,6 @@ async fn workspace_purge_retains_shared_files_when_structured_shutdown_is_unprov
 #[serial_test::serial]
 async fn workspace_purge_keeps_owner_when_a_sibling_was_restored() -> anyhow::Result<()> {
     let _guard = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     let mut owner = Instance::new("owner", "/tmp/workspace-purge");
     owner.source_profile = "workspace-purge".into();
     owner.status = Status::Stopped;
@@ -5448,6 +4959,23 @@ fn create_sources_are_mutually_exclusive() {
         }));
         assert_eq!(create_body_has_conflicting_sources(&body), conflicts);
     }
+}
+
+#[test]
+fn trash_body_default_keeps_kill_pane_true() {
+    // #2523: a no-body trash request resolves through `unwrap_or_default()`,
+    // and the derived `Default` would leave the pane running, so the hand impl
+    // must match the serde field default.
+    assert!(TrashSessionBody::default().kill_pane);
+
+    // An empty JSON object goes through serde, which honors the field
+    // default helper.
+    let from_empty: TrashSessionBody = serde_json::from_str("{}").unwrap();
+    assert!(from_empty.kill_pane);
+
+    // An explicit `false` is still respected.
+    let explicit: TrashSessionBody = serde_json::from_str(r#"{"kill_pane": false}"#).unwrap();
+    assert!(!explicit.kill_pane);
 }
 
 // Regression for #2363: a multi-repo workspace session carries
@@ -9105,9 +8633,7 @@ fn run_create_hooks_forwards_the_running_hook_and_its_output_to_progress() {
         "key",
         crate::server::create_progress::CreateProgressVisibility::WebReadable,
     );
-    let mut instance =
-        crate::session::test_support::unpublished_instance("hooked", project.path(), "default")
-            .unwrap();
+    let mut instance = Instance::new("hooked", project.path().to_str().unwrap());
 
     let storage = crate::session::Storage::new_unwatched("default").unwrap();
     let record = |event| registration.progress.record(event);
@@ -10032,7 +9558,6 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
     use crate::server::test_support as support;
     for native_origin in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true;
@@ -10170,7 +9695,6 @@ async fn a_dropped_create_finishes_and_its_retry_returns_the_same_session() {
 async fn a_failed_create_is_replayed_to_a_same_key_retry() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -10528,7 +10052,6 @@ async fn a_full_failure_map_replays_its_oldest_key_and_refuses_new_ones() {
 async fn a_retry_across_a_daemon_restart_never_reruns_a_failed_create() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -10653,7 +10176,6 @@ async fn a_retry_across_a_restart_is_fenced_before_profile_validation() {
 async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
@@ -10827,7 +10349,6 @@ done
     let _env = isolate_home(tmp.path())
         .and_set("CLAUDE_CONFIG_DIR", &claude)
         .and_set("PATH", path);
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let store = claude.join("projects").join("-proj");
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(
@@ -11548,7 +11069,6 @@ async fn recreate_container_removes_the_container_before_the_agent_restarts() ->
 {
     use std::os::unix::fs::PermissionsExt;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
     crate::session::config::update_app_state(|state| {
         state.has_acknowledged_agent_hooks = true;
     })?;
@@ -11986,7 +11506,6 @@ async fn empty_trash_keeps_a_row_retrashed_after_selection() -> anyhow::Result<(
 async fn cli_deferred_creation_runs_create_hooks_once_without_launching() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -12030,7 +11549,6 @@ async fn cli_deferred_creation_runs_create_hooks_once_without_launching() {
 async fn cli_parent_selection_preserves_prefixes_and_refuses_grandchildren() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let project = tempfile::tempdir().unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
@@ -12063,7 +11581,6 @@ async fn cli_parent_selection_preserves_prefixes_and_refuses_grandchildren() {
 async fn cli_generated_worktree_avoids_existing_directories_without_renaming_branch() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let (project, repo) = crate::git::test_support::init_repo();
     let root = tempfile::tempdir().unwrap();
     crate::session::config::update_config(|config| {
@@ -12130,7 +11647,6 @@ async fn cli_generated_worktree_avoids_existing_directories_without_renaming_bra
 async fn cli_concurrent_duplicate_creation_runs_hooks_only_for_the_winner() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -12341,7 +11857,6 @@ async fn cli_cancellation_at_final_commit_removes_provisioned_scratch() {
 async fn cli_post_commit_failure_preserves_creation_and_reports_unknown_on_replay() {
     use crate::server::test_support as support;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     support::seed_instances_on_disk_for_test("test", Vec::new());
     let state = support::build_test_app_state(Vec::new());
     support::refresh_canonical_metadata_for_test(&state).await;
@@ -12414,7 +11929,6 @@ async fn cli_shell_validation_preserves_owner_literals_and_remote_word_boundarie
     use std::os::unix::fs::{symlink, PermissionsExt};
     use tower::ServiceExt;
     let _home = crate::session::test_support::isolate_app_dir();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let root = tempfile::tempdir().unwrap();
     let script = root.path().join("agent");
     let observed = root.path().join("arguments");

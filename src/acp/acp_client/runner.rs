@@ -247,11 +247,16 @@ pub(super) async fn spawn_runner_detached(
 
     // Resolve against PATH plus the node-manager dirs so the runner finds the
     // binary even when the daemon's frozen PATH does not carry it (#1048).
-    let app_dir = &config.publisher_root;
     let resolution = if sandbox_argv.is_some() {
         None
     } else {
-        Some(resolve_agent_command(&config.spec.command, Some(app_dir)))
+        // A get_app_dir failure only costs the bundled-adapter lookup; PATH
+        // and the node-manager scan still run.
+        let app_dir = crate::session::get_app_dir().ok();
+        Some(resolve_agent_command(
+            &config.spec.command,
+            app_dir.as_deref(),
+        ))
     };
     // Trusted `Config.environment`, then the provider pick that outranks it, for
     // the adapter only: they ride a carrier key the runner strips and applies to
@@ -355,6 +360,21 @@ pub(super) async fn spawn_runner_detached(
     if let crate::process::worker_registry::ScopeOwnership::Owned { unit } = &scope {
         cmd.arg("--systemd-scope").arg(unit);
     }
+    cmd.arg("--");
+    if let Some(s) = &sandbox_argv {
+        cmd.arg(&s.docker_binary);
+        for a in &s.docker_args {
+            cmd.arg(a);
+        }
+    } else {
+        // Pass the resolved absolute path (or fall back to the bare command).
+        // The runner spawns whatever it receives, so an absolute path bypasses
+        // any PATH lookup inside the runner.
+        cmd.arg(&spawn_command);
+        for a in &config.spec.args {
+            cmd.arg(a);
+        }
+    }
 
     // The runner inherits this env when it spawns the agent, so one filter
     // pass covers both. AOE_TOKEN is stripped here and reaches neither.
@@ -381,42 +401,11 @@ pub(super) async fn spawn_runner_detached(
         // fixed container mount in build_sandbox_docker_argv (#2587).
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
-    if !extra_path_dirs.is_empty() {
-        // Prepend the resolved bin dirs so the adapter and its
-        // `#!/usr/bin/env node` shim resolve against the same install.
-        let current = std::env::var_os("PATH").unwrap_or_default();
-        cmd.env("PATH", prepend_path_dirs(&current, &extra_path_dirs));
-    }
-
-    // Reads the runner env, so it runs before the scope wrapper adds its own.
-    let family = config.publisher_family(cmd.as_std(), &host_environment);
-    if let Some(family) = family {
-        cmd.arg("--publisher-family").arg(family);
-    }
-    cmd.arg("--");
-    if let Some(s) = &sandbox_argv {
-        cmd.arg(&s.docker_binary).args(&s.docker_args);
-    } else {
-        cmd.arg(&spawn_command).args(&config.spec.args);
-    }
-    let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
     if !config.uses_native_prime() {
         if let Some(lease) = &config.launch_lease {
             lease.record_prime(crate::acp::runner_lifecycle::PrimeOwnership::NotPrime);
         }
     }
-    let publication = crate::session::purge_owners::ConversationReadLock::publisher(
-        app_dir,
-        &session_id,
-        crate::session::purge_owners::PublisherAdmission {
-            namespace: crate::session::purge_owners::PublisherNamespace::host(
-                family,
-                native_store.as_ref(),
-            ),
-            acp_session_id: config.stored_acp_session_id.as_deref(),
-        },
-    )
-    .map_err(|error| AcpError::Spawn(error.to_string()))?;
     if config.uses_native_prime() {
         let mut snapshot = std::process::Command::new(&spawn_command);
         snapshot.envs(
@@ -463,6 +452,15 @@ pub(super) async fn spawn_runner_detached(
         );
         cmd = owned;
     }
+    if !extra_path_dirs.is_empty() {
+        // Prepend the resolved bin dirs so the adapter and its
+        // `#!/usr/bin/env node` shim resolve against the same install.
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        cmd.env("PATH", prepend_path_dirs(&current, &extra_path_dirs));
+    }
+
+    // Reads the runner env, so it runs before the scope wrapper adds its own.
+    let native_store = super::spawn::native_store_snapshot(config, cmd.as_std(), &host_environment);
     let mut cmd = match &prefix {
         Some(prefix) => wrap_in_scope(cmd, prefix),
         None => cmd,
@@ -512,7 +510,6 @@ pub(super) async fn spawn_runner_detached(
     let admission = lease.as_ref().and_then(|lease| lease.admission());
     let generation = config.generation;
     let pid = crate::acp::supervisor::with_durable_launch(admission, session_id, move || {
-        let _publication = publication;
         let mut birth = lease.as_ref().map(|lease| lease.lock_birth());
         if lease
             .as_ref()

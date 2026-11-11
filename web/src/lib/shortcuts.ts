@@ -11,7 +11,7 @@ export interface ShortcutActions {
   /** Opens the wizard on the Review step for a scratch session. */
   onNewScratch: () => void;
   onDiff: () => void;
-  onEscape: () => boolean | void;
+  onEscape: () => void;
   onHelp: () => void;
   onSettings: () => void;
   onPalette: () => void;

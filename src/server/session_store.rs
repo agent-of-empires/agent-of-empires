@@ -683,9 +683,7 @@ impl SessionStore for NativeSessionStore {
             #[cfg(test)]
             before_adoption_for_test();
             self.storage.verify_bound_profile()?;
-            let forget_authority = crate::session::purge_owners::ForgetAuthoritySnapshot::load();
             let mut metadata = self.state.canonical_metadata.blocking_write();
-            metadata.forget_authority.adopt(forget_authority);
             let mut current = self.state.instances.blocking_write();
             for profile in &committed {
                 anyhow::ensure!(
@@ -2096,7 +2094,6 @@ mod tests {
     async fn shutdown_drains_abandoned_native_purge_before_releasing_authority() -> Result<()> {
         use crate::session::deletion::{DeletionRequest, PurgeTransaction};
         let _guard = crate::session::test_support::isolate_app_dir();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
         let storage = Storage::new_unwatched("purge-release")?;
         let mut row = Instance::new("purge", "/tmp/purge-release");
         row.source_profile = storage.profile().to_owned();

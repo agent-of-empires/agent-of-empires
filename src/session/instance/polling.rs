@@ -1176,7 +1176,6 @@ mod tests {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
 
         let profile = "pi-teardown-flush";
         let mut inst = Instance::new("pi-teardown", "/tmp/pi-teardown");
@@ -1466,7 +1465,6 @@ mod tests {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let home = tempfile::tempdir().unwrap();
         let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
 
         let profile = "codex-restart-resume";
         let mut inst = Instance::new("codex-restart", "/tmp/codex-restart");

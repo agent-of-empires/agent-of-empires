@@ -656,7 +656,6 @@ mod tests {
             None,
         );
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
         storage
             .update(|rows, _| {
                 rows.push(inst.clone());

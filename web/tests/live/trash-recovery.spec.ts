@@ -1,15 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, expect, bootDashboard } from "../helpers/liveTest";
 import { appDirFor, listSessions, resolveAoeBinary, seedSessionViaAoeAdd } from "../helpers/aoeServe";
 import type { SpawnOptions } from "../helpers/aoeServe";
 
-function pendingTrash(
-  title: string,
-  unverified: boolean,
-  options: { fresh?: boolean; scopes?: { state: "owned"; unit: string }[] } = {},
-) {
+function pendingTrash(title: string, unverified: boolean, options: { fresh?: boolean } = {}) {
   const fixture = { id: "", profile: "", appDir: "", sentinel: "" };
   const seedFn: NonNullable<SpawnOptions["seedFn"]> = (seed) => {
     seedSessionViaAoeAdd({ title })(seed);
@@ -45,7 +41,7 @@ function pendingTrash(
         trash_lifecycle_id: randomUUID(),
         lifecycle_generation: generation,
         lifecycle_reservation: { op: "trash", generation, at },
-        terminal_scopes: options.scopes ?? [],
+        terminal_scopes: [],
         pre_trash_project_path: unverified ? checkout : null,
         worktree_info: unverified
           ? {
@@ -104,7 +100,6 @@ for (const unverified of [false, true]) {
       .toBe(Number(before.lifecycle_generation) + 1);
     if (unverified) {
       await expect(row.getByTestId("sidebar-trash-retry")).toBeEnabled();
-      await expect(row.getByTestId("sidebar-trash-forget")).toBeVisible();
       await expect(row.getByTestId("sidebar-trash-purge")).toHaveCount(0);
       await page.evaluate(() => {
         const state = Object.assign(window, { retryPosts: 0 });
@@ -140,7 +135,6 @@ for (const unverified of [false, true]) {
         )
         .toBe(Number(before.lifecycle_generation) + 3);
       await expect(retry).toBeEnabled();
-      await expect(row.getByTestId("sidebar-trash-forget")).toBeVisible();
       const retained = (await listSessions(serve.baseUrl)).find((candidate) => candidate.id === fixture.id)!;
       expect(retained.lifecycle_reservation).toMatchObject({
         op: "trash",
@@ -166,135 +160,7 @@ for (const unverified of [false, true]) {
   });
 }
 
-for (const mouse of [false, true]) {
-  test(`Forget Trash preserves retained files with ${mouse ? "mouse" : "keyboard"} confirmation`, async ({
-    page,
-    spawnServe,
-  }, testInfo) => {
-    const { fixture, seedFn } = pendingTrash("ForgetWeb", true);
-    const serve = await spawnServe({ seedFn });
-    await bootDashboard(page, serve);
-    await page.getByTestId("sidebar-trash-toggle").click();
-    await page.getByTestId("sidebar-trash-forget").click();
-    const dialog = page.getByTestId("forget-trash-dialog");
-    await expect(dialog).toBeVisible();
-    const screenshot = testInfo.outputPath("trash-forget-confirmation.png");
-    await page.screenshot({ path: screenshot });
-    await testInfo.attach("Forget Trash confirmation", { path: screenshot, contentType: "image/png" });
-    const response = page.waitForResponse(
-      (result) =>
-        new URL(result.url()).pathname === `/api/sessions/${fixture.id}/trash/forget` &&
-        result.request().method() === "POST",
-    );
-    if (mouse) await dialog.getByRole("button", { name: "Forget record", exact: true }).click();
-    else await page.keyboard.press("Enter");
-    const receipt = await response;
-    expect(receipt.status()).toBe(204);
-    const requestEpoch = (await receipt.request().allHeaders())["aoe-runtime-epoch"];
-    expect(requestEpoch).toBeTruthy();
-    expect(receipt.headers()["aoe-runtime-epoch"]).toBe(requestEpoch);
-    const revision = Number(receipt.headers()["aoe-runtime-revision"]);
-    expect(Number.isSafeInteger(revision) && revision > 0).toBe(true);
-    await expect.poll(async () => (await listSessions(serve.baseUrl)).some((row) => row.id === fixture.id)).toBe(false);
-    await expect(page.getByTestId("sidebar-trash-toggle")).toHaveCount(0);
-    expect(readFileSync(fixture.sentinel, "utf8")).toBe("retained files");
-    const journal = JSON.parse(readFileSync(join(fixture.appDir, "pending-purge-owners.json"), "utf8"));
-    expect(journal.owners).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          session_id: fixture.id,
-          purpose: expect.objectContaining({ kind: "retained" }),
-        }),
-      ]),
-    );
-  });
-
-  test(`Concurrent retry invalidates ${mouse ? "mouse" : "keyboard"} Forget consent`, async ({ page, spawnServe }) => {
-    const { fixture, seedFn } = pendingTrash("StaleForgetWeb", true);
-    const serve = await spawnServe({ seedFn });
-    await bootDashboard(page, serve);
-    await page.evaluate(() => {
-      const state = Object.assign(window, { forgetPosts: 0 });
-      const original = window.fetch;
-      window.fetch = (...args) => {
-        const url = args[0] instanceof Request ? args[0].url : String(args[0]);
-        if (args[1]?.method === "POST" && new URL(url, location.href).pathname.endsWith("/trash/forget")) {
-          state.forgetPosts += 1;
-        }
-        return original(...args);
-      };
-    });
-    await page.getByTestId("sidebar-trash-toggle").click();
-    await page.getByTestId("sidebar-trash-forget").click();
-    const dialog = page.getByTestId("forget-trash-dialog");
-    await expect(dialog).toBeVisible();
-    if (mouse) {
-      const box = (await dialog.getByRole("button", { name: "Forget record", exact: true }).boundingBox())!;
-      await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-      await page.mouse.down();
-    }
-    const source = await fetch(`${serve.baseUrl}/api/sessions`);
-    const epoch = source.headers.get("aoe-runtime-epoch");
-    if (!epoch) throw new Error("The native runtime epoch is missing");
-    const current = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-    const retry = await fetch(`${serve.baseUrl}/api/sessions/${fixture.id}/trash`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "aoe-runtime-epoch": epoch },
-      body: JSON.stringify({
-        kill_pane: true,
-        expected_profile: fixture.profile,
-        expected_generation: current.lifecycle_generation,
-      }),
-    });
-    expect(retry.status).toBe(200);
-    await expect(dialog).toHaveCount(0);
-    if (mouse) await page.mouse.up();
-    else await page.keyboard.press("Enter");
-    expect(await page.evaluate(() => ("forgetPosts" in window ? window.forgetPosts : undefined))).toBe(0);
-    const retained = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-    expect(retained.lifecycle_generation).toBe(Number(current.lifecycle_generation) + 1);
-    expect(readFileSync(fixture.sentinel, "utf8")).toBe("retained files");
-  });
-}
-
-test("Publisher proof loss cancels Forget without changing the Trash identity", async ({ page, spawnServe }) => {
-  const { fixture, seedFn } = pendingTrash("ProofRevoked", true);
-  const serve = await spawnServe({ seedFn });
-  const before = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-  let forgetPosts = 0;
-  page.on("request", (request) => {
-    if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/trash/forget")) forgetPosts += 1;
-  });
-  await bootDashboard(page, serve);
-  await page.getByTestId("sidebar-trash-toggle").click();
-  await page.getByTestId("sidebar-trash-forget").click();
-  const dialog = page.getByTestId("forget-trash-dialog");
-  await expect(dialog).toBeVisible();
-  const journalPath = join(fixture.appDir, "pending-purge-owners.json");
-  const journal = JSON.parse(readFileSync(journalPath, "utf8"));
-  if (!(fixture.id in journal.unpublished)) throw new Error("Expected genuine unpublished creation proof");
-  delete journal.unpublished[fixture.id];
-  const replacement = `${journalPath}.fixture-taint`;
-  writeFileSync(replacement, JSON.stringify(journal));
-  renameSync(replacement, journalPath);
-  await expect(dialog).toHaveCount(0);
-  await page.keyboard.press("Enter");
-  await expect
-    .poll(async () => {
-      const current = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-      return current.forget_trash;
-    })
-    .toMatchObject({ allowed: false });
-  const after = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-  expect(after.lifecycle_generation).toBe(before.lifecycle_generation);
-  expect(after.lifecycle_reservation).toEqual(before.lifecycle_reservation);
-  expect(after.trash_lifecycle_id).toBe(before.trash_lifecycle_id);
-  expect(after.trashed_at).toBe(before.trashed_at);
-  expect(forgetPosts).toBe(0);
-  expect(readFileSync(fixture.sentinel, "utf8")).toBe("retained files");
-});
-
-test("Fresh Trash owner refuses Retry and Forget without changing custody", async ({ page, spawnServe }) => {
+test("Fresh Trash owner refuses Retry without changing custody", async ({ page, spawnServe }) => {
   const { fixture, seedFn } = pendingTrash("FreshOwner", true, { fresh: true });
   const serve = await spawnServe({ seedFn });
   const before = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
@@ -302,112 +168,19 @@ test("Fresh Trash owner refuses Retry and Forget without changing custody", asyn
   const journalBefore = readFileSync(journalPath);
   await bootDashboard(page, serve);
   await page.getByTestId("sidebar-trash-toggle").click();
-  for (const forget of [false, true]) {
-    let status: number;
-    let code: string | undefined;
-    if (forget) {
-      await expect(page.getByTestId("sidebar-trash-forget")).toBeDisabled();
-      const source = await page.request.get(`${serve.baseUrl}/api/sessions`);
-      const epoch = source.headers()["aoe-runtime-epoch"];
-      if (!epoch) throw new Error("The native runtime epoch is missing");
-      const refused = await page.request.post(`${serve.baseUrl}/api/sessions/${fixture.id}/trash/forget`, {
-        headers: { "aoe-runtime-epoch": epoch },
-        data: {
-          expected_profile: fixture.profile,
-          expected_generation: before.lifecycle_generation,
-          expected_trashed_at: before.trashed_at,
-          expected_trash_lifecycle_id: before.trash_lifecycle_id,
-        },
-      });
-      status = refused.status();
-      code = refused.headers()["aoe-error-code"];
-    } else {
-      const response = page.waitForResponse(
-        (result) =>
-          new URL(result.url()).pathname === `/api/sessions/${fixture.id}/trash` &&
-          result.request().method() === "POST",
-      );
-      await page.getByTestId("sidebar-trash-retry").click();
-      const refused = await response;
-      status = refused.status();
-      code = refused.headers()["aoe-error-code"];
-    }
-    expect(status).toBe(409);
-    expect(code).toBe("lifecycle_locked");
-    const after = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-    expect(after.lifecycle_generation).toBe(before.lifecycle_generation);
-    expect(after.lifecycle_reservation).toEqual(before.lifecycle_reservation);
-    expect(after.trash_lifecycle_id).toBe(before.trash_lifecycle_id);
-    expect(after.trashed_at).toBe(before.trashed_at);
-    expect(readFileSync(journalPath)).toEqual(journalBefore);
-    expect(readFileSync(fixture.sentinel, "utf8")).toBe("retained files");
-  }
-});
-
-test("Safe Forget leaves shared-default-store native launch, SID capture and ACP import available", async ({
-  page,
-  spawnServe,
-}) => {
-  const { fixture, seedFn } = pendingTrash("SafeSharedStore", true);
-  const replay = "shared-store-import-survives-forget";
-  const serve = await spawnServe({ acp: true, extraEnv: { FAKE_ACP_LOAD_REPLAY: replay }, seedFn });
-  const before = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
-  const source = await page.request.get(`${serve.baseUrl}/api/sessions`);
-  const forgotten = await page.request.post(`${serve.baseUrl}/api/sessions/${fixture.id}/trash/forget`, {
-    headers: { "aoe-runtime-epoch": source.headers()["aoe-runtime-epoch"] },
-    data: {
-      expected_profile: fixture.profile,
-      expected_generation: before.lifecycle_generation,
-      expected_trashed_at: before.trashed_at,
-      expected_trash_lifecycle_id: before.trash_lifecycle_id,
-    },
-  });
-  expect(forgotten.status(), await forgotten.text()).toBe(204);
-  const project = join(serve.home, "shared-publisher");
-  mkdirSync(project);
-  const launched = await page.request.post(`${serve.baseUrl}/api/sessions`, {
-    data: { title: "NativeAfterForget", path: project, profile: fixture.profile, tool: "claude", view: "terminal" },
-  });
-  expect(launched.status(), await launched.text()).toBe(201);
-  const nativeId = (await launched.json()).id;
-  const registry = join(fixture.appDir, "profiles", fixture.profile, "sessions.json");
-  await expect
-    .poll(() => {
-      const rows = JSON.parse(readFileSync(registry, "utf8")) as Record<string, unknown>[];
-      return rows.find((row) => row.id === nativeId)?.agent_session_id;
-    })
-    .toMatch(/^[a-f0-9-]{36}$/);
-
-  const sid = randomUUID();
-  const store = join(serve.home, ".claude", "projects", "shared-import");
-  mkdirSync(store, { recursive: true });
-  writeFileSync(
-    join(store, `${sid}.jsonl`),
-    `${JSON.stringify({
-      type: "user",
-      cwd: project,
-      message: { role: "user", content: "Existing shared-store conversation" },
-    })}\n`,
+  const response = page.waitForResponse(
+    (result) =>
+      new URL(result.url()).pathname === `/api/sessions/${fixture.id}/trash` && result.request().method() === "POST",
   );
-  const imported = await page.request.post(`${serve.baseUrl}/api/sessions`, {
-    data: {
-      title: "ImportAfterForget",
-      path: project,
-      profile: fixture.profile,
-      tool: "claude",
-      import_acp_session_id: sid,
-    },
-  });
-  expect(imported.status(), await imported.text()).toBe(201);
-  const importedId = (await imported.json()).id;
-  await expect
-    .poll(
-      async () => {
-        const result = await page.request.get(`${serve.baseUrl}/api/sessions/${importedId}/acp/replay?since=0`);
-        return JSON.stringify(await result.json());
-      },
-      { timeout: 20_000 },
-    )
-    .toContain(replay);
+  await page.getByTestId("sidebar-trash-retry").click();
+  const refused = await response;
+  expect(refused.status()).toBe(409);
+  expect(refused.headers()["aoe-error-code"]).toBe("lifecycle_locked");
+  const after = (await listSessions(serve.baseUrl)).find((row) => row.id === fixture.id)!;
+  expect(after.lifecycle_generation).toBe(before.lifecycle_generation);
+  expect(after.lifecycle_reservation).toEqual(before.lifecycle_reservation);
+  expect(after.trash_lifecycle_id).toBe(before.trash_lifecycle_id);
+  expect(after.trashed_at).toBe(before.trashed_at);
+  expect(readFileSync(journalPath)).toEqual(journalBefore);
   expect(readFileSync(fixture.sentinel, "utf8")).toBe("retained files");
 });

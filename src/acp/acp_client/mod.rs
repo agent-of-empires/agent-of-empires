@@ -545,7 +545,7 @@ impl AcpClient {
             return Ok(client);
         }
 
-        let (mut child, native_store, prime_runtime) = spawn_subprocess(&config, &session_id.0)?;
+        let (mut child, native_store, prime_runtime) = spawn_subprocess(&config)?;
         let stdin = child
             .stdin
             .take()

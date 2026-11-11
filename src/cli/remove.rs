@@ -86,7 +86,6 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 id,
                 &TrashSessionBody {
                     expected_generation: retrying_trash.then_some(session.lifecycle_generation),
-                    expected_profile: Some(session.profile.clone()),
                     ..Default::default()
                 },
                 &info.epoch,

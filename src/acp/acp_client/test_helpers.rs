@@ -37,22 +37,15 @@ pub(super) fn compaction_chunk(id: &str, text: &str) -> SessionUpdate {
     .expect("compaction_summary_chunk")
 }
 
-pub(super) fn initialize_publisher_root(root: &std::path::Path) {
-    std::fs::create_dir_all(root).unwrap();
-    crate::session::purge_owners::initialize(root).unwrap();
-}
-
 /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
 pub(super) fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
     SpawnConfig {
-        publisher_root: cwd.join(".aoe-publisher"),
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: "claude-agent-acp".into(),
             args: vec![],
             description: "test".into(),
@@ -96,17 +89,13 @@ pub(super) fn reset_fake_spawn_config(
     script: &std::path::Path,
     cwd: &std::path::Path,
 ) -> SpawnConfig {
-    let publisher_root = cwd.join(".aoe-publisher");
-    initialize_publisher_root(&publisher_root);
     SpawnConfig {
-        publisher_root,
         launch_lease: None,
         provider_routing: Vec::new(),
         wrapper_substitution: None,
         agent_key: "codex".into(),
         tool: "codex".into(),
         spec: AgentSpec {
-            publisher_route: None,
             command: "/bin/sh".into(),
             args: vec![script.to_string_lossy().into_owned()],
             description: "scripted reset fake".into(),

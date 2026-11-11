@@ -225,7 +225,6 @@ pub(super) fn write_sidecar(instance_id: &str, sid: &str) -> std::path::PathBuf 
 
 pub(super) fn seed_disk_for_sidecar_test(profile: &str, inst: &Instance) {
     let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
-    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
     let snapshot = inst.clone();
     storage
         .update(|i, g| {

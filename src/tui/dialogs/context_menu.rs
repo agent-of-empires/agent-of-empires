@@ -49,7 +49,6 @@ pub enum ContextMenuAction {
     /// Restore a trashed session.
     Restore,
     RetryTrash,
-    ForgetTrash,
 }
 
 pub struct SessionMenuTarget {
@@ -154,10 +153,7 @@ impl ContextMenuDialog {
         Self::new(
             anchor,
             if unfinished {
-                vec![
-                    (ContextMenuAction::RetryTrash, "Retry Trash"),
-                    (ContextMenuAction::ForgetTrash, "Forget record…"),
-                ]
+                vec![(ContextMenuAction::RetryTrash, "Retry Trash")]
             } else {
                 vec![
                     (ContextMenuAction::Restore, "Restore"),
@@ -194,7 +190,6 @@ impl ContextMenuDialog {
                 ContextMenuAction::Restore
                     | ContextMenuAction::Delete
                     | ContextMenuAction::RetryTrash
-                    | ContextMenuAction::ForgetTrash
                     | ContextMenuAction::NewSession
                     | ContextMenuAction::OpenSortPicker
                     | ContextMenuAction::OpenGroupPicker

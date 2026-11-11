@@ -4,20 +4,6 @@ use super::install_hints::{env_allowlist_for, install_hint_for, AOE_AGENT_BINARY
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy)]
-pub struct BuiltinPublisher {
-    family: &'static str,
-    command: &'static str,
-    args: &'static [&'static str],
-}
-
-pub(crate) fn publisher_family_for_environment(
-    family: Option<&str>,
-    has_value: impl FnOnce(&str) -> bool,
-) -> Option<&str> {
-    family.filter(|family| *family != "pi" || !has_value("PI_ACP_PI_COMMAND"))
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub command: String,
@@ -26,23 +12,9 @@ pub struct AgentSpec {
     pub description: String,
     /// Provider env vars forwarded on top of `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`.
     pub env_allowlist: Option<Vec<String>>,
-    /// Non-serialized provenance, valid only for the unchanged built-in command.
-    #[serde(skip)]
-    pub publisher_route: Option<BuiltinPublisher>,
 }
 
 impl AgentSpec {
-    pub(crate) fn publisher_family(&self) -> Option<&'static str> {
-        let route = self.publisher_route?;
-        (self.command == route.command
-            && self
-                .args
-                .iter()
-                .map(String::as_str)
-                .eq(route.args.iter().copied()))
-        .then_some(route.family)
-    }
-
     /// Build a spec from a custom agent's `agent_acp_cmd` string.
     pub fn from_acp_cmd(name: &str, cmd: &str) -> Result<AgentSpec, String> {
         let argv = shell_words::split(cmd).map_err(|e| {
@@ -54,7 +26,6 @@ impl AgentSpec {
             .filter(|c| !c.trim().is_empty())
             .ok_or_else(|| format!("custom agent `{name}` has an empty structured view command"))?;
         Ok(AgentSpec {
-            publisher_route: None,
             command,
             args: argv.collect(),
             description: format!("Custom ACP agent `{name}`"),
@@ -75,7 +46,7 @@ impl AgentRegistry {
         let claude_description =
             format!("Anthropic Claude via the official ACP adapter ({claude_install})");
         // (name, command, args, description)
-        let defaults: [(&'static str, &'static str, &'static [&'static str], &str); 11] = [
+        let defaults: [(&str, &str, &[&str], &str); 11] = [
             ("claude", "claude-agent-acp", &[], &claude_description),
             // Legacy alias from older session records.
             (
@@ -145,13 +116,6 @@ impl AgentRegistry {
             .map(|(name, command, args, description)| {
                 let keys = env_allowlist_for(command);
                 let spec = AgentSpec {
-                    publisher_route: super::agent_profiles::resolve(name)
-                        .native_config_agent
-                        .map(|family| BuiltinPublisher {
-                            family,
-                            command,
-                            args,
-                        }),
                     command: command.into(),
                     args: args.iter().map(|a| a.to_string()).collect(),
                     description: description.into(),

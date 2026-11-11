@@ -5,7 +5,7 @@ import type {
   DeleteSessionOptions,
   DeleteWorkspaceResult,
   SessionMutation,
-  TrashForgetConsent,
+  TrashRetryConsent,
   TrashPurgeConsent,
 } from "./api";
 import type { SessionResponse, SessionStatus, Workspace } from "./types";
@@ -23,11 +23,13 @@ export interface Notifier {
   info?: (message: string) => void;
 }
 
-export interface TrashRecoveryTarget extends TrashForgetConsent {
+export interface TrashRecoveryTarget extends TrashRetryConsent {
   id: string;
   title: string;
   created_at: string;
   epoch: string;
+  expected_trashed_at: string;
+  expected_trash_lifecycle_id: string;
 }
 
 export function hasPendingTrash(session: SessionResponse): boolean {
@@ -77,14 +79,6 @@ export function trashRecoveryTargetIsCurrent(
     session.trashed_at === target.expected_trashed_at &&
     session.trash_lifecycle_id === target.expected_trash_lifecycle_id,
   );
-}
-
-export function forgetTrashTargetIsCurrent(
-  session: SessionResponse | undefined,
-  target: TrashRecoveryTarget,
-  epoch: string | null,
-): boolean {
-  return session?.forget_trash?.allowed === true && trashRecoveryTargetIsCurrent(session, target, epoch);
 }
 
 /** Cleanup flags are on when any session in the workspace opts in; shared by the delete dialog and Empty Trash. */

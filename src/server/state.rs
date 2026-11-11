@@ -109,7 +109,6 @@ pub(crate) struct DiskWatchEntry {
     /// RAII guard from `subscribe_channel`. Drop unsubscribes and unwatches
     /// the directory if its refcount drops to zero.
     pub(super) handle: SubscriptionHandle,
-    pub(super) authority_handle: Option<SubscriptionHandle>,
     /// Abort handle for the forwarder task that drains the per-profile
     /// receiver into `disk_changed`.
     pub(super) forwarder: tokio::task::AbortHandle,

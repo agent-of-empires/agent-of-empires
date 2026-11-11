@@ -883,51 +883,12 @@ preventing explicit Restore or Purge. A retry also settles the transition when
 all known worktree paths are proven absent. Unverified existing paths, unknown
 original locations, and filesystem lookup errors keep the transition protected.
 
-## POST /api/sessions/{id}/trash/forget
+Unfinished Trash exposes Retry and read-only inspection, not record-only removal.
+Retry retains existing lifecycle, native ownership, and filesystem checks. An
+unverified checkout stays visible in Trash until those checks can settle it.
+UI requests capture their original profile, generation, and runtime epoch;
+replacement state requires fresh consent.
 
-Forget an expired, unfinished Trash record without deleting retained resources.
-New Forget admission requires durable evidence that the session has never
-published history or started a publisher. Only canonical new, unlaunched records
-can acquire this evidence. Imported, previously launched, historical or unknown
-records return `409 forget_unbounded` and remain in Trash. An unreadable ownership
-journal returns `503 ownership_unavailable` without changing the record.
-The session's `forget_trash` capability reports availability and a refusal reason;
-the daemon recomputes admission under exclusion. Retry and read-only inspection
-do not require this capability.
-Send all original consent fields: `expected_profile`, `expected_generation`,
-`expected_trashed_at`, and `expected_trash_lifecycle_id`. Changed consent returns
-`409 lifecycle_superseded`; a fresh lifecycle owner or an already admitted orphan
-cleanup returns `409 lifecycle_locked`. Completed Trash and failed-purge records
-are not eligible.
-Send exactly one `aoe-runtime-epoch` header matching the native runtime that
-issued the consent fields. Missing, duplicate, or stale epochs return
-`409 runtime_epoch_mismatch` before mutation admission. A replacement runtime
-requires fresh confirmation.
-
-Before removing the visible row, the daemon durably retains its original runtime
-evidence and cleanup protection. This ownership does not authorize purge recovery,
-hooks, process termination, filesystem deletion, or resource reclamation. Later
-purge attempts cannot bypass it if removal of the visible row was interrupted.
-A retry after journal commit but before row removal reuses the original retained
-owner for the same profile, generation and Trash operation. It does not capture
-new resources or append another owner; conflicting retained authority is refused.
-
-Retained ownership blocks profile rename/deletion, even after the row is gone.
-New, proven never-published owners preserve exact resource and session custody
-without fencing other sessions' default history stores. Existing historical
-owners keep their original namespace fences, including current and parked native
-and ACP conversation identities. Unknown historical namespace evidence remains
-conservative; migration does not release it. These fences have no TTL and are not
-released merely because a publisher PID is absent.
-Retry, Restore, and launch refuse an interrupted visible row with a committed
-retained tombstone. Conflicts return the finite `native_conversation_retained`
-error code without stopping runtimes or revealing retained metadata.
-The session cannot be restored through Trash afterward.
-
-Success returns `204` with a native runtime cursor. Refresh the canonical session
-list; do not treat an unconfirmed response as proof that the row was removed.
-This management operation survives HTTP cancellation and is unavailable in
-read-only mode.
 
 ## Explicit structured worker stop
 

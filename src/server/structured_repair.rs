@@ -121,9 +121,9 @@ pub(super) async fn persist_structured_row_repairs(
         let file_watch = state.file_watch.clone();
         let storage_profile = profile.clone();
         let transition = transition.clone();
-        let saved = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let saved = tokio::task::spawn_blocking(move || {
             let storage = crate::session::Storage::open(&storage_profile, file_watch)?;
-            let result = transition.update_with_snapshot(&storage, |all, _groups| {
+            transition.update_with_snapshot(&storage, |all, _groups| {
                 for repair in repairs {
                     let inst = all
                         .iter_mut()
@@ -139,16 +139,11 @@ pub(super) async fn persist_structured_row_repairs(
                     inst.acp_session_id = Some(repair.acp_session_id);
                 }
                 Ok(())
-            })?;
-            Ok((
-                result,
-                crate::session::purge_owners::ForgetAuthoritySnapshot::load(),
-            ))
+            })
         })
         .await;
         let error = match saved {
-            Ok(Ok((((), rows, groups), authority))) => {
-                metadata.forget_authority.adopt(authority);
+            Ok(Ok(((), rows, groups))) => {
                 super::reload::replace_committed_profiles(
                     fresh,
                     metadata,
