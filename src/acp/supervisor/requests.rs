@@ -209,6 +209,27 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub async fn resolve_permission(
+    /// A watchdog respawn clones the cached spawn config, which a live
+    /// `model_config` pick never reaches.
+    pub async fn refresh_cached_model_config(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) {
+        if let Some(WorkerKind::Runner { spawn_config }) = self
+            .workers
+            .lock()
+            .await
+            .get_mut(session_id)
+            .map(|h| &mut h.kind)
+        {
+            spawn_config
+                .default_model_config
+                .insert(config_id.to_string(), value.to_string());
+        }
+    }
+
         &self,
         session_id: &str,
         nonce: Nonce,

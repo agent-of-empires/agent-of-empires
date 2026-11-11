@@ -273,6 +273,10 @@ pub async fn acp_set_config_option(
     StatusCode::ACCEPTED.into_response()
 }
 
+        state
+            .acp_supervisor
+            .refresh_cached_model_config(&id, &req.config_id, &req.value)
+            .await;
 #[cfg(test)]
 mod tests {
     use super::*;

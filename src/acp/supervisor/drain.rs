@@ -1227,6 +1227,33 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_model_config_pick_reaches_the_respawn_config() {
+        let (_home, tmp) = isolate_home();
+        let sup = Supervisor::new(VecSink::new());
+        let socket = tmp.path().join("pick.sock");
+        worker_registry::save(&worker_record("s-pick", std::process::id(), socket.clone()))
+            .unwrap();
+        sup.test_install_runner("s-pick", runner_config(socket), None)
+            .await;
+
+        sup.refresh_cached_model_config("s-pick", "ultracode", "on")
+            .await;
+
+        let RestartDecision::Respawn(config) = restart_decision(&sup.workers, "s-pick").await
+        else {
+            panic!("a runner worker respawns");
+        };
+        assert_eq!(
+            config
+                .default_model_config
+                .get("ultracode")
+                .map(String::as_str),
+            Some("on")
+        );
+    }
+
     /// An `Attached` worker (reattached to a runner a previous daemon owned)
     /// has no spawn config to respawn from. A crash after the session was
     /// established must hand the session to the reconciler rather than park it
