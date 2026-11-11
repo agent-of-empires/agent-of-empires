@@ -2,6 +2,7 @@
 //! session and apply configured defaults.
 
 use crate::acp::agent_compat::{self, ExpectedAgent};
+use crate::acp::aoe_meta;
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
 use crate::acp::transcript::LOAD_FAILED_PREFIX;
@@ -125,14 +126,14 @@ pub(super) async fn establish(
     }
     let init: InitializeResponse = match ctx.control.as_ref() {
         Some(control) => {
-            let params = serde_json::to_value(build_initialize_request())
+            let params = serde_json::to_value(build_initialize_request(shared.profile))
                 .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
             serde_json::from_value(control.initialize(params).await?)
                 .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
         }
         None => {
             connection
-                .send_request(build_initialize_request())
+                .send_request(build_initialize_request(shared.profile))
                 .block_task()
                 .await?
         }
@@ -157,6 +158,36 @@ pub(super) async fn establish(
         }
         return Ok(None);
     }
+
+    // A proxy announces itself on the initialize response; any other agent
+    // has no hello and is not held to the `_meta.aoe` contract.
+    let proxied = match init
+        .meta
+        .as_ref()
+        .map(aoe_meta::ProxyHello::from_meta)
+        .transpose()
+    {
+        Ok(hello) => hello.flatten().is_some(),
+        Err(err) => {
+            warn!(
+                target: "acp.protocol",
+                session = %label,
+                error = %err,
+                "proxy hello rejected; refusing to enter session"
+            );
+            let detail = StartupErrorDetail::InvalidProxyHello {
+                reason: err.to_string(),
+            };
+            let message = detail.user_message();
+            if let Some(tx) = ctx.ready_tx.lock().await.take() {
+                let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
+                    IncompatibleAgentError { detail, message },
+                ))));
+            }
+            return Ok(None);
+        }
+    };
+    shared.aoe.begin_connection(proxied);
 
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter
@@ -258,6 +289,17 @@ pub(super) async fn establish(
     Ok(Some(session))
 }
 
+/// A live busy or task lease holds the turn open however long the agent is
+/// silent; the grace counts again once it expires.
+fn resume_idle_expired(
+    idle_ms: i64,
+    grace_ms: i64,
+    leases: &aoe_meta::lease::LeaseTable,
+    now: i64,
+) -> bool {
+    idle_ms >= grace_ms && !leases.working(now)
+}
+
 /// Fallback when an adopted turn neither completes nor shows activity, so the
 /// UI cannot stay "thinking" forever. Once the turn is observable, completion
 /// belongs to the between-prompt watchdog.
@@ -280,8 +322,9 @@ fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
                 );
                 return;
             }
-            let idle_ms = now_ms() - shared.last_event_at.load(Ordering::Relaxed);
-            if idle_ms >= grace_ms {
+            let now = now_ms();
+            let idle_ms = now - shared.last_event_at.load(Ordering::Relaxed);
+            if resume_idle_expired(idle_ms, grace_ms, &shared.aoe.leases, now) {
                 if shared.terminal_claim.claim() {
                     info!(
                         target: "acp.protocol",
@@ -484,7 +527,11 @@ impl Session {
             }
             let req = LoadSessionRequest::new(stored.clone(), self.agent_cwd.clone())
                 .mcp_servers(mcp_servers.clone());
-            match self.load_request(req).await {
+            // The replay precedes the reply, and holds no lease.
+            self.shared.aoe.set_loading_history(true);
+            let loaded = self.load_request(req).await;
+            self.shared.aoe.set_loading_history(false);
+            match loaded {
                 Ok(resp) => {
                     self.session_from_storage = true;
                     info!(
@@ -728,6 +775,37 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_silent_lease_holds_the_resume_idle_stop_until_it_expires() {
+        use aoe_meta::{LeaseKind, LeaseOp, LeaseVerb};
+        let leases = aoe_meta::lease::LeaseTable::default();
+        let acquire = LeaseOp {
+            id: "bg".into(),
+            kind: LeaseKind::Busy,
+            op: LeaseVerb::Acquire,
+            ttl_ms: Some(60_000),
+        };
+        leases.apply(&acquire, 0).unwrap();
+        // (now, idle since the lease frame, stop expected); grace is 30s.
+        for (now, idle, stop) in [
+            (31_000, 31_000, false),
+            (59_999, 59_999, false),
+            (60_000, 60_000, true),
+        ] {
+            assert_eq!(
+                resume_idle_expired(idle, 30_000, &leases, now),
+                stop,
+                "{now}"
+            );
+        }
+        assert!(resume_idle_expired(
+            30_000,
+            30_000,
+            &Default::default(),
+            30_000
+        ));
+    }
 
     #[test]
     fn reset_reasons_follow_prior_conversation() {

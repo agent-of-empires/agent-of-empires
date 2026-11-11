@@ -217,8 +217,8 @@ impl BetweenPromptTracker {
     /// When the idle watchdog should fire, clear all tracking (so a stale wake
     /// or latch cannot skew the next turn) and return whether accounting was
     /// seen.
-    pub(super) fn take_idle_fire(&self, now_ms: i64) -> Option<bool> {
-        let busy = self.work_state().is_busy();
+    pub(super) fn take_idle_fire(&self, now_ms: i64, leased: bool) -> Option<bool> {
+        let busy = self.work_state().is_busy() || leased;
         let mut state = self.state();
         let fire = between_prompt_should_fire(
             state.active,
@@ -485,7 +485,10 @@ mod tests {
             tracker.observe(signal.as_ref(), None, 1_000, false, &claim);
         }
         assert!(!tracker.work_state().is_busy());
-        assert_eq!(tracker.take_idle_fire(1_000 + ms(STALL)), Some(false));
+        assert_eq!(
+            tracker.take_idle_fire(1_000 + ms(STALL), false),
+            Some(false)
+        );
 
         let tracker = BetweenPromptTracker::default();
         let signal = classify_lifecycle_signal(&SessionUpdate::ToolCall(replayed_call(
@@ -494,7 +497,23 @@ mod tests {
         )));
         tracker.observe(signal.as_ref(), None, 1_000, false, &claim);
         assert!(tracker.work_state().is_busy());
-        assert_eq!(tracker.take_idle_fire(1_000 + ms(STALL)), None);
+        assert_eq!(tracker.take_idle_fire(1_000 + ms(STALL), false), None);
+    }
+
+    #[test]
+    fn a_live_lease_holds_the_idle_watchdog_until_it_expires() {
+        let tracker = BetweenPromptTracker::default();
+        let claim = TerminalClaim::new();
+        assert!(tracker.observe(
+            Some(&LifecycleSignal::TerminalUsage),
+            None,
+            1_000,
+            true,
+            &claim
+        ));
+        let due = 1_000 + ms(FAST);
+        assert_eq!(tracker.take_idle_fire(due, true), None);
+        assert_eq!(tracker.take_idle_fire(due, false), Some(true));
     }
 
     #[test]
@@ -512,9 +531,9 @@ mod tests {
         let usage = LifecycleSignal::TerminalUsage;
         assert!(!tracker.observe(Some(&usage), None, 2_000, true, &claim));
         assert!(!tracker.work_state().is_busy());
-        assert_eq!(tracker.take_idle_fire(2_000 + ms(FAST) - 1), None);
-        assert_eq!(tracker.take_idle_fire(2_000 + ms(FAST)), Some(true));
-        assert_eq!(tracker.take_idle_fire(10_000_000), None);
+        assert_eq!(tracker.take_idle_fire(2_000 + ms(FAST) - 1, false), None);
+        assert_eq!(tracker.take_idle_fire(2_000 + ms(FAST), false), Some(true));
+        assert_eq!(tracker.take_idle_fire(10_000_000, false), None);
 
         {
             assert_eq!(between_prompt_stop_reason(false, false), "agent_idle");

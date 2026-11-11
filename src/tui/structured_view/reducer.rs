@@ -30,7 +30,8 @@
 use crate::acp::elicitations::ElicitationQuestion;
 use crate::acp::state::{
     AcpState, AuthStatus, AvailableCommand, ConfigOptionDescriptor, ConfigOptionSwitchFailure,
-    DiffPreview, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage,
+    DiffPreview, ModeInfo, PlanStepStatus, SessionNotice, SessionUsage, SubagentRecord,
+    SubagentState,
 };
 use crate::acp::transcript::{
     patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
@@ -90,6 +91,8 @@ pub struct AcpTranscript {
     /// with `turn_active` for the busy spinner, never for send-vs-park or Esc.
     pub background_agent_active: bool,
     background_subagent_active: bool,
+    /// ACP subagents roster; titles and badges the parent tool cards.
+    pub subagents: Vec<SubagentRecord>,
     /// Whether the agent accepts `_session/steering`. When true the composer
     /// sends a mid-turn prompt straight through instead of parking it: the
     /// daemon injects it into the running turn. Re-derived as `false` on a
@@ -238,6 +241,7 @@ impl AcpTranscript {
             turn_active: false,
             background_agent_active: false,
             background_subagent_active: false,
+            subagents: Vec::new(),
             usage: None,
             current_plan: Vec::new(),
             lagged: false,
@@ -300,6 +304,17 @@ impl AcpTranscript {
         self.lagged = true;
     }
 
+    /// The newest running subagent that accepts `session/cancel`.
+    pub fn stoppable_subagent(&self) -> Option<&SubagentRecord> {
+        self.subagents.iter().rev().find(|record| {
+            record.cancel_capable
+                && matches!(
+                    record.state,
+                    SubagentState::Running | SubagentState::RequiresAction
+                )
+        })
+    }
+
     /// Adopt the daemon's folded control state, carried by a WS
     /// `reduced_state` frame on connect and after every event. This is the
     /// whole control reduction now: nothing here folds raw events, so the
@@ -333,6 +348,7 @@ impl AcpTranscript {
         }
         self.background_agent_active =
             self.background_subagent_active || !state.background_tasks.is_empty();
+        self.subagents = state.subagents;
         self.agent_name = Some(state.agent.0);
         self.turn_active = state.turn_active;
         self.steering = state.steering;
@@ -799,6 +815,50 @@ mod tests {
         transcript.apply_reduced_state(4, busy, &[]);
         transcript.apply_reduced_state(5, reduced(&[]), &["background_agents".into()]);
         assert!(!transcript.background_agent_active);
+    }
+
+    #[test]
+    fn stoppable_subagent_is_the_newest_running_cancel_capable() {
+        use crate::acp::state::{SubagentRecord, SubagentState::*};
+        let record = |id: &str, state, cancel_capable| SubagentRecord {
+            session_id: id.into(),
+            parent_session_id: "s-1".into(),
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state,
+            stop_reason: None,
+            cancel_capable,
+            model: None,
+        };
+        let cases = [
+            (vec![], None),
+            (
+                vec![record("a", Idle, true), record("b", Unknown, true)],
+                None,
+            ),
+            (vec![record("a", Running, false)], None),
+            (
+                vec![record("a", Running, true), record("b", Idle, true)],
+                Some("a"),
+            ),
+            (
+                vec![
+                    record("a", Running, true),
+                    record("b", RequiresAction, true),
+                ],
+                Some("b"),
+            ),
+            (
+                vec![record("a", Running, true), record("b", Running, false)],
+                Some("a"),
+            ),
+        ];
+        for (roster, want) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            t.subagents = roster;
+            assert_eq!(t.stoppable_subagent().map(|r| r.session_id.as_str()), want);
+        }
     }
 
     /// A snapshot that races live deltas must not rewind the view.

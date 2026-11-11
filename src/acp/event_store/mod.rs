@@ -35,15 +35,29 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AuthStatusUpdated",
 ];
 
-/// Background work as its (start, end, id field) events. Teardown and cold
-/// folds find open work by pairing them, so the retention prune pins both
-/// halves, and [`prune_completed_background_work`] drops a pair once it ends.
-const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str)] = &[
-    ("BackgroundTaskStarted", "BackgroundTaskFinished", "task_id"),
+/// Selects the shell starts among task starts (`recent` is the start row).
+const SHELL_START: &str =
+    "json_extract(recent.event_json, '$.BackgroundTaskStarted.workflow') IS NULL";
+const WORKFLOW_START: &str =
+    "json_extract(recent.event_json, '$.BackgroundTaskStarted.workflow') IS NOT NULL";
+
+/// Background work as its (start, end, id field, kept groups) events. Teardown
+/// and cold folds find open work by pairing them, so the retention prune pins
+/// both halves, and [`prune_completed_background_work`] drops a pair once it
+/// ends, except the newest ended starts of each kept group, so the shell panel
+/// survives a reload and workflows cannot displace shells.
+const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "BackgroundTaskStarted",
+        "BackgroundTaskFinished",
+        "task_id",
+        &[SHELL_START, WORKFLOW_START],
+    ),
     (
         "BackgroundAgentLaunched",
         "BackgroundAgentCompleted",
         "agent_id",
+        &[],
     ),
 ];
 
@@ -66,6 +80,7 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "BackgroundAgentCompleted",
     "BackgroundTaskStarted",
     "BackgroundTaskFinished",
+    "SubagentUpdated",
 ];
 
 /// Idle read connections kept open; concurrent reads beyond this open more.
@@ -418,22 +433,52 @@ fn prune_completed_background_work(
     let Some(cutoff) = cutoff else {
         return;
     };
-    for (start, end, id) in BACKGROUND_WORK_EVENTS {
+    for (start, end, id, kept_groups) in BACKGROUND_WORK_EVENTS {
         // An end closes only the starts before it: ids may be reused.
+        let closed = |started: &str| {
+            format!(
+                "EXISTS (
+                   SELECT 1 FROM {events} AS ended
+                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
+                     AND ended.seq > {started}.seq
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract({started}.event_json, '$.{start}.{id}'))"
+            )
+        };
+        // Open starts are pinned, so they do not count toward the kept ones.
+        let keep = crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+        let kept: String = kept_groups
+            .iter()
+            .map(|group| {
+                format!(
+                    "AND started.seq NOT IN (
+                       SELECT recent.seq FROM {events} AS recent
+                       WHERE recent.session_id = ?1 AND recent.discriminant = '{start}'
+                         AND {group} AND {}
+                       ORDER BY recent.seq DESC LIMIT {keep})",
+                    closed("recent")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n               ");
         let delete_started = format!(
             "DELETE FROM {events} AS started
              WHERE started.session_id = ?1 AND started.seq <= ?2
                AND started.discriminant = '{start}'
-               AND EXISTS (
-                   SELECT 1 FROM {events} AS ended
-                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
-                     AND ended.seq > started.seq
-                     AND json_extract(ended.event_json, '$.{end}.{id}') =
-                         json_extract(started.event_json, '$.{start}.{id}'))"
+               {kept}
+               AND {}",
+            closed("started")
         );
         let delete_ended = format!(
-            "DELETE FROM {events}
-             WHERE session_id = ?1 AND seq <= ?2 AND discriminant = '{end}'"
+            "DELETE FROM {events} AS ended
+             WHERE ended.session_id = ?1 AND ended.seq <= ?2
+               AND ended.discriminant = '{end}'
+               AND NOT EXISTS (
+                   SELECT 1 FROM {events} AS started
+                   WHERE started.session_id = ?1 AND started.discriminant = '{start}'
+                     AND started.seq < ended.seq
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract(started.event_json, '$.{start}.{id}'))"
         );
         for sql in [delete_started, delete_ended] {
             if let Err(e) = conn.execute(&sql, rusqlite::params![session_id, cutoff]) {

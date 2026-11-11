@@ -530,6 +530,14 @@
       "components": ["web/src/components/TokenEntryPage.tsx", "web/src/lib/token.ts"]
     },
     {
+      "id": "auth.token-stale-401",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/fetchInterceptor.test.ts"],
+      "components": ["web/src/lib/fetchInterceptor.ts"],
+      "notes": "A 401 for a request sent under no token or the previous one, landing after Connect saved and verified a new token, leaves the new token and fires no TOKEN_EXPIRED_EVENT; a 401 under the current token still expires the session. A rotated X-Aoe-Token is adopted only while the request's token is still the stored one, so a slow response cannot overwrite a newer token (#5574)."
+    },
+    {
       "id": "auth.token-rotation",
       "kind": "live-playwright",
       "risk": "high",
@@ -3148,10 +3156,13 @@
       ],
       "components": [
         "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/acp/BackgroundShells.tsx",
         "web/src/components/acp/backgroundAgentsContext.ts",
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
         "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/api.ts",
         "web/src/components/acp/CoreToolCards.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/NamedToolCards.tsx",
