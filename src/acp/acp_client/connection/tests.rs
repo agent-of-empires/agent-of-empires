@@ -3,8 +3,10 @@
 use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
+use crate::acp::acp_client::reset::ResetSessionOutcome;
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::fs_handler::FsPolicy;
+use crate::acp::state::SubagentState;
 use crate::acp::terminal_handler::TerminalManager;
 use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use std::collections::HashMap;
@@ -751,6 +753,160 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
     .await
     .expect("root cancel reaches the agent");
     assert_eq!(*cancels.lock().unwrap(), ["c-yes", "root"]);
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
+
+/// A reset is refused while a child runs, since it would orphan the child's
+/// routes, and goes through once the child reports idle.
+#[tokio::test]
+async fn reset_waits_for_a_running_subagent() {
+    let (daemon_write, agent_read) = tokio::io::duplex(1024 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(1024 * 1024);
+    let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+    let new_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let agent = tokio::spawn({
+        let (agent_write, new_sessions) = (agent_write.clone(), new_sessions.clone());
+        async move {
+            let mut reader = BufReader::new(agent_read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let id = &msg["id"];
+                match msg.get("method").and_then(|m| m.as_str()) {
+                    Some("initialize") => {
+                        write_line(&agent_write, &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                        )).await;
+                    }
+                    Some("session/new") => {
+                        let n = new_sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"root-{n}"}}}}"#
+                            ),
+                        )
+                        .await;
+                        if n == 1 {
+                            write_line(&agent_write, r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"root-1","update":{"sessionUpdate":"subagent_update","sessionId":"child","state":{"state":"running"}}}}"#).await;
+                        }
+                    }
+                    Some("session/prompt") => {
+                        write_line(&agent_write, r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"root-1","update":{"sessionUpdate":"subagent_update","sessionId":"child","state":{"state":"idle","stopReason":"end_turn"}}}}"#).await;
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"end_turn"}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "root".to_string(),
+            sandbox: None,
+        },
+        mode: ConnectMode::Fresh {
+            stored_acp_session_id: None,
+            seed_history_replay: false,
+            prior_conversation: false,
+            fork_from: None,
+        },
+        ready_tx,
+        profile: &crate::acp::agent_profiles::CLAUDE,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model_config: Default::default(),
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    ready_rx.await.unwrap().expect("handshake ok");
+    next_child_event(&mut event_rx, "child").await;
+
+    let reset = |cmd_tx: mpsc::Sender<ClientCmd>| async move {
+        let (respond_to, answer) = oneshot::channel();
+        cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/clear".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        answer.await.unwrap()
+    };
+
+    match reset(cmd_tx.clone()).await {
+        ResetSessionOutcome::Failed { message } => {
+            assert!(message.contains("subagent is still running"), "{message}");
+        }
+        other => panic!("reset must be refused: {other:?}"),
+    }
+    assert_eq!(new_sessions.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The agent reports the child idle before it ends the turn.
+    cmd_tx
+        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+            TextContent::new("go"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut idle, mut stopped) = (false, false);
+        while !(idle && stopped) {
+            match event_rx.recv().await.expect("connection remains open") {
+                Event::SubagentUpdated { subagent, .. } => {
+                    idle |= subagent.state == SubagentState::Idle
+                }
+                Event::Stopped { .. } => stopped = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("child idle and turn stopped");
+
+    assert!(matches!(
+        reset(cmd_tx.clone()).await,
+        ResetSessionOutcome::Reset { .. }
+    ));
+    assert_eq!(new_sessions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
     agent.abort();
     connection.abort();

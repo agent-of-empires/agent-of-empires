@@ -46,6 +46,20 @@ fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) 
 }
 
 impl Shared {
+    /// A running child would lose its routes if the conversation reset.
+    pub(super) fn has_active_subagent(&self) -> bool {
+        self.subagents
+            .lock()
+            .expect("subagents mutex poisoned")
+            .values()
+            .any(|record| {
+                matches!(
+                    record.state,
+                    SubagentState::Running | SubagentState::RequiresAction
+                )
+            })
+    }
+
     /// Merge `edit` into the child's snapshot and publish the result.
     async fn publish_subagent(
         &self,

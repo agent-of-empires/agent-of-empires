@@ -330,6 +330,18 @@ impl Session {
             });
             return Ok(());
         }
+        if self.shared.has_active_subagent() {
+            self.shared
+                .emit(Event::PromptRejected {
+                    reason: "agent_busy".into(),
+                    text,
+                })
+                .await;
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "a subagent is still running; wait for it to finish before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
         let work = self.shared.between_prompt.work_state();
         if work.is_busy() || !self.shared.bg_tasks.is_empty() {
             // Old-session events would be attributed to the new conversation.
