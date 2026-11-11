@@ -855,6 +855,7 @@ mod tests {
                 name: "Bash".into(),
                 kind: "execute".into(),
                 args_preview: "{}".into(),
+                prompt: None,
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,

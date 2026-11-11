@@ -75,7 +75,9 @@ interface Props {
   onOpenFileRef?: (ref: FileRef) => void;
   fileRefSession?: FileRefSession | null;
   isSandboxed?: boolean;
-  onOpenAgentsPane?: () => void;
+  onOpenAgentsPane?: (agentId?: string) => void;
+  /** The server is read-only, so the session cannot be interrupted. */
+  serverReadOnly?: boolean;
   /** Opens the switch-view confirmation; omitted on a read-only server. */
   onSwitchToTerminal?: () => void;
   /** Shows this Session's paired shell; omitted where the terminal can't be used. */
@@ -119,12 +121,14 @@ export function StructuredView(props: Props) {
               {(ctx) => (
                 <BackgroundAgentsContext.Provider
                   value={{
+                    sessionId,
                     agents: ctx.state.backgroundAgents,
                     subagents: ctx.state.subagents,
                     cancelSubagent: ctx.cancelSubagent,
                     workflowRuns: ctx.state.workflowRuns,
                     backgroundTasks: ctx.state.backgroundTasks,
                     openPane: props.onOpenAgentsPane,
+                    readOnly: !!props.serverReadOnly || !!props.trashedAt || !!props.archivedAt,
                   }}
                 >
                   <AcpChrome

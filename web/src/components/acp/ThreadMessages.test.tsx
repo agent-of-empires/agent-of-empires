@@ -313,6 +313,42 @@ describe("AssistantMessage group parts", () => {
   });
 });
 
+describe("AssistantMessage sync Task prompt", () => {
+  const at = "2026-05-12T00:00:00Z";
+  const SENTINEL = "END-OF-PROMPT";
+  const prompt = `${"x".repeat(20_000)}${SENTINEL}`;
+  const start = (id: string, tool: Partial<ToolCall>): ActivityRow => ({
+    id: `start-${id}`,
+    kind: "tool_start",
+    text: tool.name ?? "Read",
+    at,
+    toolCallId: id,
+    tool: { id, name: "Read", kind: "read", args_preview: "{}", started_at: at, ...tool },
+  });
+
+  it("carries an oversized Task prompt through to the card's Input section", async () => {
+    const rows: ActivityRow[] = [
+      { id: "u1", kind: "user_prompt", text: "go", at },
+      // The ingest cap cut `args_preview`, so only `prompt` still holds the tail.
+      start("task-1", {
+        name: "Task",
+        kind: "think",
+        args_preview: `{"prompt":"${"x".repeat(100)}\u2026[truncated]`,
+        prompt,
+      }),
+      start("c1", { parent_tool_call_id: "task-1" }),
+    ];
+    const { getByRole, getAllByRole, queryByText } = render(
+      <Harness messages={activityToThreadMessages(rows, false)} />,
+    );
+    fireEvent.click(getByRole("button", { name: /subagentTask1/ }));
+    // The first "Copy prompt" belongs to the user message; the card's Input section is the last.
+    fireEvent.click(await waitFor(() => getAllByRole("button", { name: "Copy prompt" }).at(-1)!));
+    await waitFor(() => expect(writeClipboard).toHaveBeenLastCalledWith(prompt));
+    expect(queryByText("(no prompt recorded)")).toBeNull();
+  });
+});
+
 describe("AssistantMessage tool output media", () => {
   const at = "2026-05-12T00:00:00Z";
   // The file-level URL stub has no constructor, which link-scheme checks need.
