@@ -3390,6 +3390,13 @@
       ]
     },
     {
+      "id": "acp.composer-slash-input-hint",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/acp/Composer.test.tsx"],
+      "components": ["web/src/components/acp/useComposerHooks.ts", "web/src/lib/acpTypes.ts"]
+    },
+    {
       "id": "acp.composer-usage-tooltip",
       "kind": "vitest",
       "risk": "low",
