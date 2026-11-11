@@ -693,6 +693,8 @@ export interface SuggestionPrepared {
   source_ref: string;
   project: { name: string; path: string } | null;
   tool: string;
+  /** The view a new session opens in, resolved like the wizard's default. */
+  view: "structured" | "terminal";
   yolo: boolean;
   sandbox: boolean;
   worktree: boolean;

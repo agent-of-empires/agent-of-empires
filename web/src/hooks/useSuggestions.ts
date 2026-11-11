@@ -153,6 +153,7 @@ export function useSuggestions(
           title: draft.title || undefined,
           path: draft.project.path,
           tool: draft.tool,
+          view: draft.view,
           yolo_mode: draft.yolo,
           sandbox: draft.sandbox,
           worktree_enabled: draft.worktree,

@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use super::host_api::DispatchError;
 use crate::session::config::profile_config::resolve_config_or_warn;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
+use crate::session::config::StructuredView;
 use crate::session::projects::{self, Project};
 use crate::session::Instance;
 use std::path::Path;
@@ -1397,6 +1398,16 @@ pub(crate) fn prepare(
         }
     }
     let describe = |p: &Project| json!({ "name": p.name, "path": p.path });
+    let tool = config
+        .session
+        .default_tool
+        .clone()
+        .unwrap_or_else(|| "claude".to_string());
+    // Same rule as the web wizard; the spawn fills model and effort from `acp_defaults`.
+    let structured = matches!(
+        config.acp.structured_view,
+        StructuredView::Auto | StructuredView::Structured
+    ) && crate::session::builder::structured::tool_acp_capable(&tool, &config);
     Ok(json!({
         "title": item.draft.title,
         "initial_prompt": prompt,
@@ -1405,7 +1416,8 @@ pub(crate) fn prepare(
         "source_ref": item.source_ref,
         "project": project.as_ref().map(describe),
         "extra_projects": extras.iter().map(describe).collect::<Vec<_>>(),
-        "tool": config.session.default_tool.unwrap_or_else(|| "claude".to_string()),
+        "tool": tool,
+        "view": if structured { "structured" } else { "terminal" },
         "yolo": config.session.yolo_mode_default,
         "sandbox": config.sandbox.enabled_by_default,
         "worktree": config.worktree.enabled,
@@ -1844,6 +1856,13 @@ mod tests {
         assert_eq!(templated["template_criterion"], "assigned");
         assert_eq!(out["source_ref"], "example/1");
         assert_eq!(out["extra_projects"], json!([]));
+        assert_eq!(
+            out["view"], "structured",
+            "auto picks structured for an ACP tool"
+        );
+        crate::session::config::update_config(|c| c.acp.structured_view = StructuredView::Off)
+            .unwrap();
+        assert_eq!(prepared(None)["view"], "terminal");
     }
 
     #[test]
