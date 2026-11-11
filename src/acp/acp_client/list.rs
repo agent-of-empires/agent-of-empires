@@ -85,7 +85,9 @@ async fn list_pages(
     let init: InitializeResponse = tokio::time::timeout(
         step_timeout,
         connection
-            .send_request(build_initialize_request())
+            .send_request(build_initialize_request(
+                &crate::acp::agent_profiles::DEFAULT,
+            ))
             .block_task(),
     )
     .await

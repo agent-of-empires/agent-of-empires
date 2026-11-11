@@ -15,6 +15,7 @@ import {
   type BackgroundAgent,
   type ConfigOptionDescriptor,
   type ReducedState,
+  type SubagentRecord,
 } from "./acpTypes";
 
 const ev = (state: AcpState, seq: number, event: AcpEvent) => applyEvent(state, { session_id: "s-1", seq, event });
@@ -29,11 +30,21 @@ const usage = (used: number, cost?: number, size = 200_000): AcpEvent => ({
     usage: cost === undefined ? { used, size } : { used, size, cost: { amount: cost, currency: "USD" } },
   },
 });
-const reset = (reason = "session/load failed"): AcpEvent => ({ SessionContextReset: { reason } });
+const reset = (reason = "session/load failed"): AcpEvent => ({
+  SessionContextReset: { reason },
+});
 const assigned: AcpEvent = { AcpSessionAssigned: { acp_session_id: "fresh" } };
-const switched: AcpEvent = { AgentSwitched: { from: "claude", to: "codex", reason: "rate_limited" } };
+const switched: AcpEvent = {
+  AgentSwitched: { from: "claude", to: "codex", reason: "rate_limited" },
+};
 const diffComments: AcpEvent = {
-  UserDiffCommentsPrompt: { intro: "a", outro: "b", isMultiRepo: true, comments: [], assembledMarkdown: "a\n" },
+  UserDiffCommentsPrompt: {
+    intro: "a",
+    outro: "b",
+    isMultiRepo: true,
+    comments: [],
+    assembledMarkdown: "a\n",
+  },
 };
 const incompatibleDetail = {
   kind: "incompatible_agent_version" as const,
@@ -45,7 +56,13 @@ const incompatibleDetail = {
 };
 const toolStart: AcpEvent = {
   ToolCallStarted: {
-    tool_call: { id: "tc-1", name: "Read File", kind: "read", args_preview: "{}", started_at: "2026-01-01T00:00:00Z" },
+    tool_call: {
+      id: "tc-1",
+      name: "Read File",
+      kind: "read",
+      args_preview: "{}",
+      started_at: "2026-01-01T00:00:00Z",
+    },
   },
 };
 const future = new Date(Date.now() + 95_000).toISOString();
@@ -54,7 +71,13 @@ const past = new Date(Date.now() - 5_000).toISOString();
 describe("applyEvent control state", () => {
   it.each(["plain", "diff comments"])("a %s prompt opens the turn without adding a row", (kind) => {
     const next = fold(emptyAcpState(), kind === "plain" ? prompt() : diffComments);
-    expect(next).toMatchObject({ activity: [], serverTurnActive: true, turnActive: true, promptSeq: 1, lastSeq: 1 });
+    expect(next).toMatchObject({
+      activity: [],
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 1,
+      lastSeq: 1,
+    });
   });
 
   it("drops a frame at or below lastSeq", () => {
@@ -110,7 +133,12 @@ describe("applyEvent control state", () => {
     [
       "idle_auto_stop",
       [stopped("idle_auto_stop")],
-      { workerIdleStopped: true, workerStopped: false, workerRestarting: false, turnActive: false },
+      {
+        workerIdleStopped: true,
+        workerStopped: false,
+        workerRestarting: false,
+        turnActive: false,
+      },
     ],
     ["rate_limit_exhausted_retries", [stopped("rate_limit_exhausted_retries")], { rateLimitRetriesExhausted: true }],
     [
@@ -136,7 +164,12 @@ describe("applyEvent control state", () => {
     [
       "prompt_orphaned",
       [prompt(), stopped("prompt_orphaned")],
-      { agentOrphaned: true, workerRestarting: true, workerStopped: false, agentUnresponsive: false },
+      {
+        agentOrphaned: true,
+        workerRestarting: true,
+        workerStopped: false,
+        agentUnresponsive: false,
+      },
     ],
     [
       "agent_unresponsive then prompt_orphaned",
@@ -162,7 +195,12 @@ describe("applyEvent control state", () => {
       (reason): [string, AcpEvent[], Partial<AcpState>] => [
         `AcpSessionAssigned clears the ${reason} banner`,
         [stopped(reason), assigned],
-        { workerStopped: false, workerRestarting: false, workerIdleStopped: false, agentOrphaned: false },
+        {
+          workerStopped: false,
+          workerRestarting: false,
+          workerIdleStopped: false,
+          agentOrphaned: false,
+        },
       ],
     ),
     [
@@ -181,14 +219,27 @@ describe("applyEvent control state", () => {
       { turnActive: false, startupError: "boom" },
     ],
     [
+      "IntegrationLost closes the turn and surfaces the reason",
+      [prompt(), { IntegrationLost: { reason: { kind: "contract_violation", detail: "bad key" } } }],
+      { turnActive: false, startupError: "Agent integration lost: bad key" },
+    ],
+    [
       "a reset after a prompt arms the primer",
       [usage(100), prompt(), reset("bad id")],
-      { sessionUsage: null, contextPrimerAvailable: { resetSeq: 3, reason: "bad id" } },
+      {
+        sessionUsage: null,
+        contextPrimerAvailable: { resetSeq: 3, reason: "bad id" },
+      },
     ],
     [
       "an empty reset reason gets a fallback",
       [prompt(), reset("")],
-      { contextPrimerAvailable: { resetSeq: 2, reason: expect.stringMatching(/\S/) } },
+      {
+        contextPrimerAvailable: {
+          resetSeq: 2,
+          reason: expect.stringMatching(/\S/),
+        },
+      },
     ],
     [
       "a reset before any prompt stays silent",
@@ -232,8 +283,17 @@ describe("applyEvent control state", () => {
     ]),
     [
       "ModeSwitchFailed",
-      [{ ModeSwitchFailed: { mode_id: "bypassPermissions", reason: "denied" } }],
-      { modeSwitchFailed: expect.objectContaining({ modeId: "bypassPermissions", reason: "denied" }) },
+      [
+        {
+          ModeSwitchFailed: { mode_id: "bypassPermissions", reason: "denied" },
+        },
+      ],
+      {
+        modeSwitchFailed: expect.objectContaining({
+          modeId: "bypassPermissions",
+          reason: "denied",
+        }),
+      },
     ],
     [
       "CurrentModeChanged clears a mode switch failure",
@@ -255,7 +315,12 @@ describe("applyEvent control state", () => {
 
     const one = fold(emptyAcpState(), notice("Model fallback"));
     expect(one.sessionNotices).toEqual([
-      { id: "notice-1", severity: "warning", title: "Model fallback", description: null },
+      {
+        id: "notice-1",
+        severity: "warning",
+        title: "Model fallback",
+        description: null,
+      },
     ]);
 
     const many = fold(emptyAcpState(), notice("a"), notice("b"), notice("c"), notice("d"), notice("e"));
@@ -265,7 +330,12 @@ describe("applyEvent control state", () => {
 
     // A keyed notice (a compaction's failure) is replaced in place by a later error.
     const failed = (description: string): AcpEvent => ({
-      SessionNotice: { severity: "error", title: "Compaction failed", description, key: "compaction-a" },
+      SessionNotice: {
+        severity: "error",
+        title: "Compaction failed",
+        description,
+        key: "compaction-a",
+      },
     });
     const keyed = fold(emptyAcpState(), failed("aborted"), notice("b"), failed("out of tokens"));
     expect(keyed.sessionNotices.map((n) => [n.id, n.description])).toEqual([
@@ -279,7 +349,12 @@ describe("applyEvent control state", () => {
     });
     expect(visibleSessionNotices(dismissed).map((n) => n.title)).toEqual(["b"]);
     // Re-dismissing is a no-op rather than a duplicate id.
-    expect(acpHookReducer(dismissed, { kind: "dismiss_session_notice", id: "notice-1" })).toBe(dismissed);
+    expect(
+      acpHookReducer(dismissed, {
+        kind: "dismiss_session_notice",
+        id: "notice-1",
+      }),
+    ).toBe(dismissed);
   });
 
   // The daemon's list is authoritative, and a replayed frame for a notice the
@@ -305,19 +380,121 @@ describe("applyEvent control state", () => {
         ...(notices ? { session_notices: notices } : {}),
       }) as ReducedState;
 
-    const snapshot = [{ id: "notice-7", severity: "warning", title: "Model fallback", description: null }];
+    const snapshot = [
+      {
+        id: "notice-7",
+        severity: "warning",
+        title: "Model fallback",
+        description: null,
+      },
+    ];
     const adopted = applyReducedState(emptyAcpState(), reduced(snapshot));
     expect(adopted.sessionNotices).toEqual(snapshot);
 
     const replayed = applyEvent(adopted, {
       session_id: "s-1",
       seq: 7,
-      event: { SessionNotice: { severity: "warning", title: "Model fallback" } },
+      event: {
+        SessionNotice: { severity: "warning", title: "Model fallback" },
+      },
     });
     expect(replayed.sessionNotices).toEqual(snapshot);
 
     // A daemon without the field must not blow up the picker-style adoption.
     expect(applyReducedState(adopted, reduced()).sessionNotices).toEqual([]);
+  });
+
+  it("adopts a live child whose last update is older than the replay tail", () => {
+    const child = {
+      session_id: "child-1",
+      parent_session_id: "s-1",
+      parent_tool_call_id: null,
+      title: null,
+      description: null,
+      state: "running",
+      stop_reason: null,
+      cancel_capable: true,
+      model: null,
+    } as SubagentRecord;
+    const base = {
+      agent: "claude",
+      model: null,
+      mode: "default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active: false,
+      cancelling: false,
+      compacting: false,
+      subagents: [child],
+    } as unknown as ReducedState;
+
+    const adopted = applyReducedState(emptyAcpState(), base);
+    expect(adopted.subagents).toEqual([child]);
+
+    const stopped = { ...child, state: "idle" } as SubagentRecord;
+    const replayed = applyEvent(adopted, {
+      session_id: "s-1",
+      seq: 9,
+      event: {
+        SubagentUpdated: { subagent: stopped, at: "2026-01-01T00:00:00Z" },
+      },
+    });
+    expect(replayed.subagents).toEqual([stopped]);
+    // A snapshot older than the replayed frame must not roll the record back.
+    expect(applyReducedState(replayed, base, [], 8).subagents).toEqual([stopped]);
+  });
+
+  it("refreshes a stale held subagent from a snapshot at or past lastSeq, keeping local-only children", () => {
+    const record = (id: string, state: string, cancel: boolean) =>
+      ({
+        session_id: id,
+        parent_session_id: "s-1",
+        parent_tool_call_id: null,
+        title: null,
+        description: null,
+        state,
+        stop_reason: null,
+        cancel_capable: cancel,
+        model: null,
+      }) as SubagentRecord;
+    const snapshot = (subagents: SubagentRecord[]) =>
+      ({
+        agent: "claude",
+        model: null,
+        mode: "default",
+        current_plan: null,
+        in_flight_tool: null,
+        pending_approvals: [],
+        pending_elicitations: [],
+        thinking: null,
+        rate_limit: null,
+        available_commands: [],
+        available_modes: [],
+        current_mode_id: null,
+        turn_active: false,
+        cancelling: false,
+        compacting: false,
+        subagents,
+      }) as unknown as ReducedState;
+    const held = applyReducedState(
+      emptyAcpState(),
+      snapshot([record("a", "running", true), record("local", "running", true)]),
+    );
+    const stale = { ...held, lastSeq: 7 };
+
+    const next = applyReducedState(stale, snapshot([record("a", "idle", false), record("b", "running", true)]), [], 7);
+    expect(next.subagents).toEqual([
+      record("a", "idle", false),
+      record("local", "running", true),
+      record("b", "running", true),
+    ]);
   });
 
   it("codex /new drops usage to the post-reset baseline (#2979)", () => {
@@ -353,10 +530,17 @@ describe("cost baseline (#1354)", () => {
   it("SessionCleared adds the current cost to the baseline", () => {
     const seeded: AcpState = {
       ...emptyAcpState(),
-      sessionUsage: { used: 10, size: 200_000, cost: { amount: 1.5, currency: "USD" } },
+      sessionUsage: {
+        used: 10,
+        size: 200_000,
+        cost: { amount: 1.5, currency: "USD" },
+      },
       usageBaseline: { cost: 2 },
     };
-    expect(fold(seeded, "SessionCleared")).toMatchObject({ usageBaseline: { cost: 3.5 }, sessionUsage: null });
+    expect(fold(seeded, "SessionCleared")).toMatchObject({
+      usageBaseline: { cost: 3.5 },
+      sessionUsage: null,
+    });
   });
 
   it.each<[string, AcpEvent[], number | null]>([
@@ -407,7 +591,11 @@ describe("cost baseline (#1354)", () => {
 
   it("keeps the rest of the usage snapshot", () => {
     const u = fold(emptyAcpState(), usage(10_000, 0.42), "SessionCleared", usage(5_000, 0.49)).sessionUsage;
-    expect(u).toMatchObject({ used: 5_000, size: 200_000, cost: { currency: "USD" } });
+    expect(u).toMatchObject({
+      used: 5_000,
+      size: 200_000,
+      cost: { currency: "USD" },
+    });
   });
 });
 
@@ -430,7 +618,12 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     compacting: false,
   });
   const steering: AcpEvent = {
-    PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true },
+    PromptCapabilities: {
+      image: false,
+      audio: false,
+      embedded_context: false,
+      steering: true,
+    },
   };
 
   it.each([
@@ -462,21 +655,49 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     const active = [bg(null)];
 
     expect(hasActiveBackgroundAgent({ backgroundAgents: [], backgroundTasks: [] })).toBe(false);
-    expect(hasActiveBackgroundAgent({ backgroundAgents: active, backgroundTasks: [] })).toBe(true);
-    expect(hasActiveBackgroundAgent({ backgroundAgents: [bg("2026-06-27T00:00:10Z")], backgroundTasks: [] })).toBe(
-      false,
-    );
+    expect(
+      hasActiveBackgroundAgent({
+        backgroundAgents: active,
+        backgroundTasks: [],
+      }),
+    ).toBe(true);
+    expect(
+      hasActiveBackgroundAgent({
+        backgroundAgents: [bg("2026-06-27T00:00:10Z")],
+        backgroundTasks: [],
+      }),
+    ).toBe(false);
 
-    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: [], backgroundTasks: [] })).toBe(false);
-    expect(isVisiblyBusy({ turnActive: true, backgroundAgents: [], backgroundTasks: [] })).toBe(true);
-    expect(isVisiblyBusy({ turnActive: false, backgroundAgents: active, backgroundTasks: [] })).toBe(true);
+    expect(
+      isVisiblyBusy({
+        turnActive: false,
+        backgroundAgents: [],
+        backgroundTasks: [],
+      }),
+    ).toBe(false);
+    expect(
+      isVisiblyBusy({
+        turnActive: true,
+        backgroundAgents: [],
+        backgroundTasks: [],
+      }),
+    ).toBe(true);
+    expect(
+      isVisiblyBusy({
+        turnActive: false,
+        backgroundAgents: active,
+        backgroundTasks: [],
+      }),
+    ).toBe(true);
   });
 
   it("a background task keeps the session visibly busy until it finishes", () => {
     const started = (task_id: string): AcpEvent => ({
       BackgroundTaskStarted: { task_id, description: "sleep 15" },
     });
-    const finished = (task_id: string): AcpEvent => ({ BackgroundTaskFinished: { task_id } });
+    const finished = (task_id: string): AcpEvent => ({
+      BackgroundTaskFinished: { task_id },
+    });
 
     const running = fold(emptyAcpState(), started("t1"), started("t2"), started("t1"));
     expect(running.backgroundTasks).toEqual(["t1", "t2"]);
@@ -526,33 +747,65 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
 
   it("a late Stopped from a prior turn does not clobber a fresh follow-up", () => {
     let state = fold(emptyAcpState(), prompt("first"));
-    state = acpHookReducer(state, { kind: "user_prompt", id: "cmp-fu", text: "follow-up" });
+    state = acpHookReducer(state, {
+      kind: "user_prompt",
+      id: "cmp-fu",
+      text: "follow-up",
+    });
     state = fold(state, stopped("prompt_complete"));
     expect(state).toMatchObject({ serverTurnActive: false, turnActive: true });
     expect(applyReducedState(state, reduced(false)).turnActive).toBe(true);
     state = fold(state, prompt("follow-up", "cmp-fu"));
-    expect(state).toMatchObject({ inflightPromptIds: [], turnActive: true, promptSeq: 2 });
+    expect(state).toMatchObject({
+      inflightPromptIds: [],
+      turnActive: true,
+      promptSeq: 2,
+    });
     expect(fold(state, stopped("prompt_complete")).turnActive).toBe(false);
   });
 
   it("an echo settles exactly its optimistic prompt id", () => {
-    let state = acpHookReducer(emptyAcpState(), { kind: "user_prompt", id: "cmp-echo", text: "echo me" });
+    let state = acpHookReducer(emptyAcpState(), {
+      kind: "user_prompt",
+      id: "cmp-echo",
+      text: "echo me",
+    });
     expect(state.inflightPromptIds).toEqual(["cmp-echo"]);
     state = ev(state, 5, prompt("echo me", "cmp-echo"));
-    expect(state).toMatchObject({ inflightPromptIds: [], turnActive: true, promptSeq: 1 });
+    expect(state).toMatchObject({
+      inflightPromptIds: [],
+      turnActive: true,
+      promptSeq: 1,
+    });
   });
 
   it("an idle session's own first prompt is not a steered continuation", () => {
-    let state: AcpState = { ...fold(emptyAcpState(), steering), workerStopped: true, workerRestarting: true };
-    state = acpHookReducer(state, { kind: "user_prompt", id: "cmp-first", text: "first" });
+    let state: AcpState = {
+      ...fold(emptyAcpState(), steering),
+      workerStopped: true,
+      workerRestarting: true,
+    };
+    state = acpHookReducer(state, {
+      kind: "user_prompt",
+      id: "cmp-first",
+      text: "first",
+    });
     expect(state).toMatchObject({ turnActive: true, serverTurnActive: false });
-    expect(fold(state, prompt("first", "cmp-first"))).toMatchObject({ workerStopped: false, workerRestarting: false });
+    expect(fold(state, prompt("first", "cmp-first"))).toMatchObject({
+      workerStopped: false,
+      workerRestarting: false,
+    });
   });
 
   it("a steered mid-turn prompt skips the per-turn resets", () => {
     const running: AcpState = {
       ...emptyAcpState(),
-      promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: true },
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embeddedContext: false,
+        steering: true,
+      },
       serverTurnActive: true,
       turnActive: true,
       cancelEscalatesAt: future,
@@ -605,7 +858,9 @@ describe("normaliseTurnState (persisted-state backfill)", () => {
 
 describe("compaction reminder dismissal", () => {
   it("survives climbing usage and re-arms after a context boundary", () => {
-    let state = acpHookReducer(fold(emptyAcpState(), usage(160_000)), { kind: "dismiss_compaction_reminder" });
+    let state = acpHookReducer(fold(emptyAcpState(), usage(160_000)), {
+      kind: "dismiss_compaction_reminder",
+    });
     state = fold(state, usage(180_000));
     expect(state.compactionReminderDismissed?.used).toBe(160_000);
     state = fold(state, "ConversationCompacted", usage(20_000));
@@ -615,7 +870,9 @@ describe("compaction reminder dismissal", () => {
   });
 
   it.each<AcpEvent>(["ConversationCompacted", "SessionCleared", reset(), switched])("re-arms after %o", (boundary) => {
-    const state = acpHookReducer(fold(emptyAcpState(), usage(160_000)), { kind: "dismiss_compaction_reminder" });
+    const state = acpHookReducer(fold(emptyAcpState(), usage(160_000)), {
+      kind: "dismiss_compaction_reminder",
+    });
     expect(fold(state, boundary, usage(170_000)).compactionReminderDismissed).toBeNull();
   });
 });
@@ -653,7 +910,9 @@ describe("config options (#1403)", () => {
   });
 
   it("replaces the whole snapshot", () => {
-    const state = fold(emptyAcpState(), options(), { ConfigOptionsUpdated: { options: [model("claude-sonnet-4-6")] } });
+    const state = fold(emptyAcpState(), options(), {
+      ConfigOptionsUpdated: { options: [model("claude-sonnet-4-6")] },
+    });
     expect(state.configOptions).toEqual([model("claude-sonnet-4-6")]);
   });
 
@@ -693,7 +952,17 @@ describe("config options (#1403)", () => {
 
 describe("context-window latch (upstream claude-agent-acp #596)", () => {
   const modelIs = (current_value: string): AcpEvent => ({
-    ConfigOptionsUpdated: { options: [{ id: "model", name: "Model", category: "model", current_value, options: [] }] },
+    ConfigOptionsUpdated: {
+      options: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          current_value,
+          options: [],
+        },
+      ],
+    },
   });
 
   it("keeps the largest window through a 200k downgrade", () => {
@@ -724,7 +993,10 @@ describe("auth status", () => {
     expect(emptyAcpState().authStatus).toBeNull();
 
     const reported = fold(emptyAcpState(), status("account", "Claude Max"));
-    expect(reported.authStatus).toEqual({ kind: "account", label: "Claude Max" });
+    expect(reported.authStatus).toEqual({
+      kind: "account",
+      label: "Claude Max",
+    });
 
     // A known logged-out state is a payload of its own, not an absence.
     const out = fold(reported, status("none", "Not logged in"));

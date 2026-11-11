@@ -18,6 +18,8 @@ const WORKER_LOG_DEFAULT_TAIL: usize = 200;
 const WORKER_LOG_MAX_TAIL: usize = 2000;
 /// Read window cap so a runaway log cannot pin the daemon.
 const WORKER_LOG_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+/// A modal rereads task output every couple of seconds, so its window is far smaller than a log's.
+const TASK_OUTPUT_MAX_READ_BYTES: u64 = 256 * 1024;
 
 const MAX_LISTED_FILES: usize = 5000;
 
@@ -157,17 +159,22 @@ pub(crate) fn read_log_tail(
     path: &std::path::Path,
     tail: usize,
 ) -> std::io::Result<(Vec<String>, bool, bool)> {
+    match std::fs::File::open(path) {
+        Ok(file) => read_tail(file, tail, WORKER_LOG_MAX_READ_BYTES),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), false, false)),
+        Err(e) => Err(e),
+    }
+}
+
+fn read_tail(
+    mut file: std::fs::File,
+    tail: usize,
+    max_bytes: u64,
+) -> std::io::Result<(Vec<String>, bool, bool)> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), false, false));
-        }
-        Err(e) => return Err(e),
-    };
     let len = file.metadata()?.len();
-    let read_from = len.saturating_sub(WORKER_LOG_MAX_READ_BYTES);
-    let truncated = len > WORKER_LOG_MAX_READ_BYTES;
+    let read_from = len.saturating_sub(max_bytes);
+    let truncated = len > max_bytes;
 
     // The first line is partial unless the window starts right after a newline.
     let prev_is_newline = if truncated && read_from > 0 {
@@ -191,6 +198,138 @@ pub(crate) fn read_log_tail(
     }
     let start = lines.len().saturating_sub(tail);
     Ok((lines[start..].to_vec(), truncated, true))
+}
+
+const TASK_OUTPUT_TAIL_LINES: usize = 5000;
+
+#[derive(Debug, Serialize)]
+pub struct TaskOutputResponse {
+    /// False when the file is gone or lives off this host (sandboxed session).
+    pub exists: bool,
+    pub output: String,
+    /// The output was cut: the file exceeded the read window or the line cap, so only its end is shown.
+    pub truncated: bool,
+}
+
+/// Tail of a background shell's output file. The path is rebuilt from the
+/// session and task ids, never taken from the client or the agent.
+pub async fn acp_task_output(
+    State(state): State<Arc<AppState>>,
+    Path((id, task_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    let Some(inst) = find_instance(&state, &id).await else {
+        return session_not_found();
+    };
+    let claude_session = current_conversation_id(
+        inst.acp_session_id.as_deref(),
+        inst.agent_session_id.as_deref(),
+    )
+    .unwrap_or_default()
+    .to_owned();
+    let found = tokio::task::spawn_blocking(move || {
+        let root = PathBuf::from("/tmp").join(format!("claude-{}", nix::unistd::getuid().as_raw()));
+        match open_task_output(&root, &claude_session, &task_id) {
+            Some(file) => read_task_tail(file),
+            None => Ok((Vec::new(), false, false)),
+        }
+    })
+    .await;
+    match found {
+        Ok(Ok((lines, truncated, exists))) => Json(TaskOutputResponse {
+            exists,
+            output: lines.join("\n"),
+            truncated,
+        })
+        .into_response(),
+        Ok(Err(e)) => blocking_failed("task output read failed", e),
+        Err(e) => blocking_failed("blocking task failed", e),
+    }
+}
+
+/// The task output tail; `truncated` also covers the line cap, not only the
+/// byte window.
+fn read_task_tail(file: std::fs::File) -> std::io::Result<(Vec<String>, bool, bool)> {
+    // One extra line tells whether the line cap cut the output too.
+    let (mut lines, truncated, exists) =
+        read_tail(file, TASK_OUTPUT_TAIL_LINES + 1, TASK_OUTPUT_MAX_READ_BYTES)?;
+    let cut = lines.len() > TASK_OUTPUT_TAIL_LINES;
+    if cut {
+        lines.remove(0);
+    }
+    Ok((lines, truncated || cut, exists))
+}
+
+/// The live structured conversation: the ACP assignment wins over a legacy
+/// terminal id, which is unset on a fresh session and stale after a new one.
+fn current_conversation_id<'a>(acp: Option<&'a str>, legacy: Option<&'a str>) -> Option<&'a str> {
+    [acp, legacy]
+        .into_iter()
+        .flatten()
+        .find(|id| !id.is_empty())
+}
+
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Opens `<root>/<project>/<session>/tasks/<task>.output`, where Claude Code
+/// writes a backgrounded command's output under `/tmp/claude-<uid>`. Every
+/// component is opened relative to its parent without following symlinks, and
+/// the opened file must be a regular one, so a swapped path can neither
+/// escape the tree nor block the read on a FIFO.
+fn open_task_output(
+    root: &std::path::Path,
+    session_id: &str,
+    task_id: &str,
+) -> Option<std::fs::File> {
+    use nix::fcntl::{open, openat, OFlag};
+    use nix::sys::stat::{fstat, Mode, SFlag};
+    if !is_plain_id(session_id) || !is_plain_id(task_id) {
+        tracing::debug!(target: "acp", "task output: rejected non-plain session or task id");
+        return None;
+    }
+    let dir_flags = OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY;
+    let root_fd = open(root, dir_flags, Mode::empty())
+        .inspect_err(|e| tracing::debug!(target: "acp", root = %root.display(), "task output: cannot open root: {e}"))
+        .ok()?;
+    // Another user's or a shared-writable root could serve forged output.
+    let root_stat = fstat(&root_fd).ok()?;
+    if root_stat.st_uid != nix::unistd::getuid().as_raw() || root_stat.st_mode & 0o022 != 0 {
+        tracing::debug!(target: "acp", root = %root.display(), "task output: root owned by another user or group/world writable");
+        return None;
+    }
+    let file_name = format!("{task_id}.output");
+    std::fs::read_dir(root).ok()?.flatten().find_map(|project| {
+        let project_fd = openat(
+            &root_fd,
+            project.file_name().as_os_str(),
+            dir_flags,
+            Mode::empty(),
+        )
+        .ok()?;
+        let session_fd = openat(&project_fd, session_id, dir_flags, Mode::empty()).ok()?;
+        let tasks_fd = openat(&session_fd, "tasks", dir_flags, Mode::empty()).ok()?;
+        let file_fd = openat(
+            &tasks_fd,
+            file_name.as_str(),
+            OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+            Mode::empty(),
+        )
+        .ok()?;
+        let kind = SFlag::from_bits_truncate(fstat(&file_fd).ok()?.st_mode as _) & SFlag::S_IFMT;
+        if kind != SFlag::S_IFREG {
+            tracing::debug!(target: "acp", "task output: leaf is not a regular file");
+            return None;
+        }
+        Some(std::fs::File::from(file_fd))
+    })
 }
 
 /// A markdown recap of the persisted transcript, offered after a failed
@@ -452,6 +591,100 @@ mod tests {
     use super::*;
     use crate::acp::state::Event;
     use std::io::Write;
+
+    #[test]
+    fn conversation_id_prefers_the_acp_assignment_over_a_stale_or_absent_legacy_id() {
+        assert_eq!(
+            current_conversation_id(Some("acp"), Some("old")),
+            Some("acp")
+        );
+        assert_eq!(current_conversation_id(Some("acp"), None), Some("acp"));
+        assert_eq!(
+            current_conversation_id(None, Some("legacy")),
+            Some("legacy")
+        );
+        assert_eq!(
+            current_conversation_id(Some(""), Some("legacy")),
+            Some("legacy")
+        );
+        assert_eq!(current_conversation_id(None, None), None);
+    }
+
+    #[test]
+    fn task_output_tail_flags_a_line_cut_below_the_byte_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.output");
+        let body: String = (0..TASK_OUTPUT_TAIL_LINES + 1000)
+            .map(|i| format!("l{i}\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+
+        let (lines, truncated, _) = read_task_tail(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(truncated, "the line cap cut the output");
+        assert_eq!(lines.len(), TASK_OUTPUT_TAIL_LINES);
+        assert_eq!(lines.first().map(String::as_str), Some("l1000"));
+    }
+
+    #[test]
+    fn task_output_tail_is_bounded_by_the_small_byte_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.output");
+        let line = "x".repeat(99) + "\n";
+        let count = (TASK_OUTPUT_MAX_READ_BYTES as usize / line.len()) * 2;
+        std::fs::write(&path, line.repeat(count)).unwrap();
+
+        let (lines, truncated, _) = read_task_tail(std::fs::File::open(&path).unwrap()).unwrap();
+        assert!(truncated, "the file exceeds the task output window");
+        assert!(lines.len() * line.len() <= TASK_OUTPUT_MAX_READ_BYTES as usize);
+    }
+
+    #[test]
+    fn task_output_is_opened_beneath_the_tree_as_a_regular_file() {
+        use std::io::Read;
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let tasks = root.path().join("-proj").join("sess-1").join("tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("abc123.output"), "hi").unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", tasks.join("link.output")).unwrap();
+        nix::unistd::mkfifo(&tasks.join("fifo.output"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_tasks = outside.path().join("sess-2").join("tasks");
+        std::fs::create_dir_all(&outside_tasks).unwrap();
+        std::fs::write(outside_tasks.join("abc123.output"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("-linked")).unwrap();
+
+        let open = |session: &str, task: &str| open_task_output(root.path(), session, task);
+        let mut text = String::new();
+        open("sess-1", "abc123")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(text, "hi");
+        assert!(open("sess-1", "missing").is_none());
+        assert!(
+            open("sess-1", "link").is_none(),
+            "symlinks are not followed"
+        );
+        assert!(
+            open("sess-1", "fifo").is_none(),
+            "a FIFO is not a regular file"
+        );
+        assert!(
+            open("sess-2", "abc123").is_none(),
+            "a symlinked project directory is not followed"
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(
+            open("sess-1", "abc123").is_none(),
+            "a writable root is rejected"
+        );
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        for bad in ["", "../x", "a/b", "..", "a.b"] {
+            assert!(open("sess-1", bad).is_none(), "task id {bad:?}");
+            assert!(open(bad, "abc123").is_none(), "session id {bad:?}");
+        }
+    }
 
     #[test]
     fn read_log_tail_windows_and_partial_lines() {
