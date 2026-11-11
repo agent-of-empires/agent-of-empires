@@ -417,7 +417,7 @@ pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand>
     })
 }
 
-fn render_launch_command(parsed: ParsedLaunchCommand) -> String {
+pub(super) fn render_launch_command(parsed: ParsedLaunchCommand) -> String {
     let command = shell_words::join(parsed.words);
     if parsed.assignments.is_empty() {
         return command;
@@ -3499,6 +3499,15 @@ mod tests {
             .prepare_launch_command(inst.conversation_state())
             .expect("a recorded store must still launch");
         let command = prepared.command.expect("the launch has a command");
+        // The launch is a wrapped login shell, so the arguments live inside the
+        // here-document; asserting on `parsed.assignments` would never fail.
+        // This is the end-to-end wiring check: the conflicting prefix must not
+        // reach the final command at all.
+        let prefix_store = home.join("prefix");
+        assert!(
+            !command.contains(prefix_store.to_string_lossy().as_ref()),
+            "the conflicting prefix store must not reach the launch: {command}"
+        );
         let parsed = super::parse_launch_command(&command).expect("frozen launch parses");
         assert!(
             !parsed
