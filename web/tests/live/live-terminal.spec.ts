@@ -437,11 +437,12 @@ while true; do sleep 1; done
       };
     }, PROMPT);
 
+  // The docked strip's Take control; the strip goes away once this tab has control.
   async function takeOver(page: Page) {
-    const banner = page.locator("[data-live-takeover]");
-    await banner.waitFor({ state: "visible", timeout: 10_000 });
-    await banner.click();
-    await banner.waitFor({ state: "detached", timeout: 10_000 });
+    const button = page.locator("[data-live-take-control]");
+    await button.waitFor({ state: "visible", timeout: 10_000 });
+    await button.click();
+    await button.waitFor({ state: "detached", timeout: 10_000 });
   }
 
   test("ownership ping-pong keeps the cursor on the prompt row", async ({ browser, spawnServe }) => {
@@ -450,7 +451,7 @@ while true; do sleep 1; done
     const { ctxA, ctxB, a, b, open } = await openPhones(browser, serve);
     try {
       await open(a);
-      await expect(a.locator("[data-live-takeover]")).toHaveCount(0);
+      await expect(a.locator("[data-live-take-control]")).toHaveCount(0);
       await expect.poll(() => promptAlignment(a), { timeout: 10_000 }).toEqual(ON_PROMPT);
       await open(b);
       // The reported bug drifted the cursor a row below the prompt on every take-back.
@@ -462,7 +463,7 @@ while true; do sleep 1; done
         [b, a],
       ] as const) {
         await takeOver(winner);
-        await loser.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
+        await loser.locator("[data-live-take-control]").waitFor({ state: "visible", timeout: 10_000 });
         await expect.poll(() => promptAlignment(winner), { timeout: 10_000 }).toEqual(ON_PROMPT);
       }
     } finally {
@@ -477,13 +478,13 @@ while true; do sleep 1; done
     const { ctxA, ctxB, a, b, open } = await openPhones(browser, serve);
     try {
       await open(a);
-      await expect(a.locator("[data-live-takeover]")).toHaveCount(0);
+      await expect(a.locator("[data-live-take-control]")).toHaveCount(0);
       await open(b);
       await takeOver(b);
-      await a.locator("[data-live-takeover]").waitFor({ state: "visible", timeout: 10_000 });
+      await a.locator("[data-live-take-control]").waitFor({ state: "visible", timeout: 10_000 });
       // A visible demoted viewer reclaims the vacant lock on its own.
       await ctxB.close();
-      await a.locator("[data-live-takeover]").waitFor({ state: "detached", timeout: 15_000 });
+      await a.locator("[data-live-take-control]").waitFor({ state: "detached", timeout: 15_000 });
       await expect.poll(() => promptAlignment(a), { timeout: 10_000 }).toEqual(ON_PROMPT);
     } finally {
       await ctxA.close();

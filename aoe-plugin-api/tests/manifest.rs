@@ -389,12 +389,22 @@ id = "nolabel"
     assert_eq!(m.status[1].label, "");
 
     assert!(m.host_compat("0.11.0").is_ok());
+    assert!(m.host_compat("0.11.1-nightly.20261108").is_ok());
+    assert!(m.host_compat("0.13.0-nightly.20261108").is_err());
+    assert!(m.host_compat("0.10.0-rc.1").is_err());
+    assert!(m.host_compat("0.11.0-rc.1").is_err());
+    assert!(m.host_compat("0.12.0-nightly.20261108").is_err());
+    assert!(m.host_compat("0.12.1-nightly.20261108").is_err());
     let err = m.host_compat("0.13.0").unwrap_err();
     assert!(
         err.contains("plugin requires aoe") && err.contains("0.13.0"),
         "{err}"
     );
     assert!(parse(4, "").host_compat("99.0.0").is_ok());
+    // A nightly is the stable it builds on, not the unreleased next patch.
+    let next = parse(4, "aoe_version = \">=0.11.1\"\n");
+    assert!(next.host_compat("0.11.1-nightly.20261108").is_err());
+    assert!(next.host_compat("0.11.2-nightly.20261108").is_ok());
 }
 
 #[test]

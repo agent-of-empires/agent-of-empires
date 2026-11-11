@@ -88,6 +88,7 @@ impl Instance {
             agent_model: None,
             agent_provider: None,
             acp_effort: None,
+            acp_model_config: std::collections::BTreeMap::new(),
             acp_session_id: None,
             import_pending: None,
             fork_pending: None,

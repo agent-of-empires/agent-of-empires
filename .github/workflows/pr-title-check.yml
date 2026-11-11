@@ -1,15 +1,9 @@
 name: PR Title Check
 
 # Enforce Conventional Commits on the PR title. AoE squash-merges PRs, so the
-# PR title becomes the commit subject git-cliff consumes when generating
-# CHANGELOG.md and the GitHub release body. A non-conventional title is what
-# put three commits in v1.8.0's release notes under the "Other" catch-all
-# instead of their real Bug Fixes / Features group.
-#
-# Defense in depth pairs with cliff.toml: the catch-all parser keeps non-
-# conventional commits visible (no silent drop), the release workflow fails
-# loudly if git-cliff ever emits a parse-error warning, and this check
-# refuses the merge before it can happen.
+# PR title becomes the commit subject release-plz groups into CHANGELOG.md and
+# the GitHub release body, and the type picks the version bump. Unmatched
+# titles land in release-plz.toml's "Other" catch-all instead of their group.
 
 on:
   pull_request_target:
@@ -27,7 +21,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          # Mirror the prefixes wired up in cliff.toml's commit_parsers so the
+          # Mirror the prefixes wired up in release-plz.toml's commit_parsers so the
           # set of accepted PR titles matches the set that renders into the
           # changelog. Any addition here must be mirrored there.
           types: |

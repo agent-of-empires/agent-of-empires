@@ -408,7 +408,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// Forces the resume trigger even when the worker looks alive, mirroring
     /// the handler's idle-dormant wake (#1689).
     pub woke_idle_dormant: bool,
-    pub prompt_id: Option<String>,
+    /// Transcript row id first, then the ids of queued rows folded into the same turn.
+    pub prompt_ids: Vec<String>,
     /// True when the daemon queued this turn itself (a rate-limit resume
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
@@ -999,7 +1000,7 @@ impl SessionService {
             text,
             attachments,
             woke_idle_dormant,
-            prompt_id,
+            prompt_ids,
             synthesized,
             no_revive,
         } = turn;
@@ -1076,7 +1077,7 @@ impl SessionService {
                 id,
                 text.to_string(),
                 attachments,
-                prompt_id,
+                prompt_ids,
                 synthesized,
                 caller.message_origin().map(str::to_string),
             )
@@ -1196,7 +1197,7 @@ impl SessionService {
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized,
                     no_revive: false,
                 },
@@ -1960,7 +1961,7 @@ impl SessionService {
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: sent_ids.clone(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -2724,6 +2725,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
@@ -3008,7 +3010,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3027,7 +3029,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3046,7 +3048,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3069,7 +3071,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3088,7 +3090,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3216,6 +3218,7 @@ mod tests {
                 "sess-mid-turn",
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,

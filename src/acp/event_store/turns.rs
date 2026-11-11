@@ -807,6 +807,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = Event::BackgroundTaskFinished {
             task_id: "t".into(),
@@ -1170,6 +1171,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let chunk = || Event::AgentMessageChunk {
             text: "x".into(),
@@ -1228,8 +1230,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            lifecycle_rows, 3,
-            "completed pairs age out; only the open starts stay"
+            lifecycle_rows, 7,
+            "completed agents age out; recent task pairs stay for the shell panel"
         );
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         for (seq, event) in store.replay_from("s-1", 0) {
@@ -1239,6 +1241,123 @@ mod tests {
             state.background_tasks,
             ["open".to_string(), "reused".to_string()]
         );
+    }
+
+    /// A finished shell stays replayable until it falls out of the newest
+    /// `MAX_FINISHED_BACKGROUND_SHELLS`, even past the retention cap.
+    #[test]
+    fn finished_shells_beyond_the_keep_count_age_out_of_the_log() {
+        use crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let total = MAX_FINISHED_BACKGROUND_SHELLS + 5;
+        for i in 0..total {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("t{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+            record(Event::BackgroundTaskFinished {
+                task_id: format!("t{i}"),
+                ended_at: None,
+            });
+        }
+        // Open shells newer than every finished one must not use up kept slots.
+        for i in 0..3 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("open{i}"),
+                tool_call_id: None,
+                description: "sleep".into(),
+                workflow: None,
+                started_at: None,
+            });
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let kept: Vec<String> = store
+            .replay_from("s-1", 0)
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
+            .map(|i| format!("t{i}"))
+            .chain((0..3).map(|i| format!("open{i}")))
+            .collect();
+        assert_eq!(kept, expected);
+        assert_eq!(store.unresolved_background_task_ids("s-1").len(), 3);
+    }
+
+    /// Workflows share the task events but must not use up the shells' kept
+    /// slots, on replay or in the folded state.
+    #[test]
+    fn finished_workflows_do_not_displace_a_finished_shell() {
+        use crate::acp::state::{
+            AcpSessionId, AcpState, AgentName, WorkflowLaunch, MAX_FINISHED_BACKGROUND_SHELLS,
+        };
+
+        let (_tmp, store) = open_store(3);
+        let mut seq = 0;
+        let mut record = |event: Event| {
+            seq += 1;
+            store.record("s-1", seq, &event).unwrap();
+        };
+        let finish = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        record(Event::BackgroundTaskStarted {
+            task_id: "shell".into(),
+            tool_call_id: None,
+            description: "make build".into(),
+            workflow: None,
+            started_at: None,
+        });
+        record(finish("shell"));
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 5 {
+            record(Event::BackgroundTaskStarted {
+                task_id: format!("wf{i}"),
+                tool_call_id: Some(format!("call-{i}")),
+                description: "drafts".into(),
+                workflow: Some(WorkflowLaunch {
+                    run_id: format!("wf_{i}"),
+                    name: "drafts".into(),
+                    summary: None,
+                    transcript_dir: String::new(),
+                }),
+                started_at: None,
+            });
+            record(finish(&format!("wf{i}")));
+        }
+        for _ in 0..150 {
+            record(Event::AgentMessageChunk {
+                text: "x".into(),
+                message_id: None,
+            });
+        }
+
+        let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        for (seq, event) in store.replay_from("s-1", 0) {
+            state.apply_event(seq, event).unwrap();
+        }
+        assert_eq!(state.background_shells.len(), 1);
+        assert_eq!(state.background_shells[0].command, "make build");
+        assert!(state.background_shells[0].finished);
+        assert_eq!(state.workflow_runs.len(), MAX_FINISHED_BACKGROUND_SHELLS);
     }
 
     /// Nothing guarantees an adapter task id stays unique for a session, so a
@@ -1251,6 +1370,7 @@ mod tests {
             tool_call_id: Some(tool_call_id.into()),
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = || Event::BackgroundTaskFinished {
             task_id: "t".into(),
@@ -1288,6 +1408,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         store.record("s-1", 1, &started("t-1")).unwrap();
         store.record("s-1", 2, &started("t-2")).unwrap();
@@ -1343,6 +1464,7 @@ mod tests {
                     tool_call_id: Some("toolu_wf".into()),
                     description: "drafts".into(),
                     workflow: Some(launch.clone()),
+                    started_at: None,
                 },
                 workflow_agent("a1", "wf_1"),
                 workflow_agent("a2", "wf_1"),

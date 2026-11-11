@@ -440,7 +440,7 @@ impl Instance {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
-            let config = store.launch_configuration(std::path::Path::new(&self.project_path))?;
+            let config = store.launch_configuration(self.repo_config_path())?;
             let managed_codex_home = container_config::managed_codex_home(
                 &self.tool,
                 Some(self.get_tool_command()),

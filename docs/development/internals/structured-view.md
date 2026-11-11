@@ -13,7 +13,7 @@ Each runner registers at `<app_dir>/acp-workers/<session_id>.json` (pid, socket 
 Invariants worth knowing before touching this code:
 
 - **One owner per generation.** Every spawn, attach and respawn has a local lease epoch tied to its captured runner generation. Shutdown, the reaper, the drain task and the reconciler refuse stale authority. A spawn completing after a stop tears its own runner down instead of installing it. Stop remains pending until physical runner and scope retirement is proven, holding prompts and refusing resumes while the reconciler retries.
-- **`runner_version` is an attachment-compatibility generation**, separate from liveness and `build_version`. Generation 4 requires the runner to announce authoritative native identity before session callbacks; the control wire version stays 3. An incompatible live runner is reaped before replacement, and an in-flight turn gets an explicit `Stopped { reason: "runner_protocol_upgraded" }`, since the daemon cannot truthfully drain a protocol it cannot attach to. Same-generation build changes stay attachable: idle workers are replaced immediately and busy ones respawn at the next idle boundary (`aoe ps --acp` marks them `(stale)`).
+- **`runner_version` is an attachment-compatibility generation**, separate from liveness and `build_version`. Generation 4 requires the runner to announce authoritative native identity before session callbacks; the control wire version is 4. An incompatible live runner is reaped before replacement, and an in-flight turn gets an explicit `Stopped { reason: "runner_protocol_upgraded" }`, since the daemon cannot truthfully drain a protocol it cannot attach to. Same-generation build changes stay attachable: idle workers are replaced immediately and busy ones respawn at the next idle boundary (`aoe ps --acp` marks them `(stale)`).
 - **Process-group termination.** Runners are group leaders via `setsid`, and every termination path signals the group, so the node wrapper and SDK child die with the runner rather than reparenting to PID 1. Prefer the verbs over `kill -9`, which leaves the runner no chance to clean up.
 - **Self-termination watchdog.** A runner polls its own registry record and exits when abandoned: record gone, superseded, or detached from any daemon past a 48h retention window (reset on reattach). This is the backstop for a daemon that dies without killing its runners.
 - **Detach buffer.** Only agent notifications and `PromptCompleted` survive a detach, in a queue bounded by frame count and encoded bytes that sheds the oldest first. Delivery is best effort, not durable or exactly once. Reverse calls outstanding at detach are cancelled toward the agent and queued replies are dropped; within the admitted native session `terminal/release` is idempotent cleanup, so it needs no tombstone.
@@ -24,6 +24,7 @@ Invariants worth knowing before touching this code:
 - **Exact scope retirement.** Scoped runners persist their exact transient unit alongside PID and generation; unscoped and unresolved ownership are distinct. Explicit stop waits for only the captured unit to stop and become empty before settling. Rejected or timed-out scope retirement keeps its lease and retry debt, even after the leader exits. A SID wildcard never authorizes ACP retirement or recovered purge cleanup.
 - **Callback parity and replay accounting.** Session-scoped filesystem, terminal, and permission callbacks wait for that announcement with either named or positional parameters, while request-scoped elicitation stays independent of session authority. Pending replay charges each original control frame, its four-byte prefix included, against the runner's 4096-frame / 128 MiB budget; typed re-serialization can expand native JSON and is not a substitute.
 - **Mid-turn reattach.** `ResumeSession` adopts the runner's committed session identity and never sends ACP `session/new` or `session/load`. A new local prompt supersedes adoption, and only the matching canonical request id may resolve it; a 30-second resume-idle watchdog is the fallback.
+- **Subagent sessions.** A profile with `supports_subagents` declares the ACP subagents capability, so each subagent is a child session on the same connection. `SessionIngress` admits a child only after a `subagent_update` on an admitted session names it, and answers its permission and elicitation requests but refuses its fs and terminal requests, which assume the root session's workspace. Child traffic takes `handle_child_notification`, never the root's dedup, compaction or watchdog path. The adapter hides the Agent/Task call, so aoe synthesizes the card from the parent-to-child delegation `session_message` (its message id is the card id and the child's `parent_tool_call_id`); the child's reply or hand-back `session_message` completes it, while a background child has none and its card follows the roster state. Only child tool calls and its model reach the transcript, and the tool calls nest under that card via `parent_tool_call_id`. `SubagentUpdated` carries a full merged snapshot, so replay is last-write-wins, and its state replaces the transcript tailer's heuristics for that agent. Stop sends `session/cancel` with the child id over `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`, or `ControlBody::CancelSession` through a runner (control protocol 4), and only for a child that announced `capabilities.cancel`. A child's own delegations (grandchildren) are not rendered: their `session_message`s are dropped. A conversation reset is refused while a child runs, since it would drop the child routes. Restoring children after `session/load` is not implemented, so an async agent left open by a restart is still resolved by the resumed tailer below.
 - **Background sub-agents across a restart.** The async-Task tailer (see [Stuck-turn watchdogs](#stuck-turn-watchdogs)) is per connection, so a `BackgroundAgentLaunched` can be left with no completion when its worker dies. The next owner reconciles that: `attach` re-tails every unresolved launch that still carries a transcript path, since the runner it adopted is provably alive; `spawn`, the drain task's respawn, and every terminal drain arm detach unconditionally. `output_file` is persisted for that resume and stripped from every client-facing frame.
 
 ## Terminal handoff
@@ -111,13 +112,45 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+## Retained history consistency
+
+Retained page identity combines the event-store incarnation with the session
+revision. Every append or replacement invalidates the complete snapshot.
+Bounds and identity are read in one SQLite transaction; independent indexed
+first/last lookups avoid scanning payloads for metadata. A stale identity reaches
+the HTTP client as a conflict, while coherent successful pages carrying different
+identities are rejected as inconsistent metadata. Neither may publish mixed rows.
+Unchanged incomplete histories retain their identity for cheap refresh probes.
+Identity installation reserves SQLite's writer before checking its schema, so
+concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
+the existing incarnation and session revisions; lock waiting remains bounded by
+the connection's busy policy.
+
+File-backed retained reads reuse the independent query-only search reader, not
+the event writer. Identity, bounds and raw rows share one read transaction; commit
+and release the reader before JSON decoding. Private memory and temporary
+databases use their original connection and still release it before decoding.
+Raw retained pages preserve scanned rows and cursors without turn alignment.
+Forward retained replay keeps reducer state across pages.
+
+Migration 54 installs identity only when `acp_events` exists. An existing empty
+database defers to the normal EventStore opener, which creates schema before
+identity. Corruption and access failures are not empty-database cases. Backward
+cursors remain strict within SQLite's signed sequence range; a larger unsigned
+cursor includes the maximum stored signed sequence rather than dropping it.
+
 ## Persistence and the context primer
 
 Transcripts persist in a SQLite event log. The web client mirrors each session's reduced state into `localStorage` (7-day expiry, full replay past the origin quota) so a reload hydrates instantly and fetches only the seq delta.
 
 Native ACP HTTP history decodes each existing JSON replay page incrementally, with a fixed-size read buffer and no copy of the entire encoded body. Replay pages and individual events or rows may exceed 16 MiB; the generic daemon response decoder remains size-bounded. The native history decoder retains the 15-second body-read deadline, requires a complete valid document through EOF, and cancels a pending body read if its caller is dropped. Count-based paging and raw/rows cursor metadata are unchanged. This does not change the pre-existing WebSocket message limits.
 
-A cold open loads recent-first rather than folding from seq 0 before first paint. `GET /api/sessions/{id}/acp/replay?before=<seq>&limit=N` returns the events closest below `before`, aligned to a user-turn boundary so a page never seams a split turn. The client renders the tail immediately and, on a long session, also pulls a small `since=0` prefix for the pinned handshake snapshot (capabilities, slash palette, agent and model) the composer needs. Scrolling to the top pages older history, prepending with the scroll position frozen; each page is fetched twice, once for frames and once for `view=rows`, and a failure on either leg abandons the page rather than advancing the cursor.
+An interactive cold open loads recent-first rather than folding from seq 0.
+Ordinary backward replay, including `view=rows`, trims a leading partial turn
+when older rows remain. The client paints the tail and pulls a small `since=0`
+prefix for the composer's handshake state. Scrolling to the top prepends older
+history with the scroll position frozen. Each page fetches both frames and rows;
+failure on either leg abandons the page without advancing its cursor.
 
 If context restoration fails (the agent's stored session is gone) the view falls back to a fresh session, renders a "Conversation context reset" callout, and offers `GET /api/sessions/{id}/acp/context-primer?before_seq=<reset-seq>`: a compact markdown recap of the last ~20 turns (capped ~24k chars, bulky tool I/O elided), pre-filled into the composer and never auto-sent.
 
@@ -189,7 +222,7 @@ Each agent has two profile sources, kept aligned by registry key:
 - **Server**, `src/acp/agent_profiles.rs`: `parent_meta_namespaces`, `clear_aliases`, and the `supports_exit_plan_mode` / `supports_wakeup_tools` gates.
 - **Frontend**, `web/src/lib/agentProfiles.ts`: the card-classifier alias map, claude-specialized capabilities (`todos`, `skills`, `wakeup`), the MCP prefix list, and special-title patterns matched only when the capability is on.
 
-Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId`. An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
+Profiles are conservative: an unverified tool surface is omitted rather than guessed, so the generic tool card is the fallback. Mode-picker sources resolve in order: a `category:"mode"` config option, then the ACP `SessionModeState` channel, then, for claude-family agents only, the built-in taxonomy. Subagent indentation needs the adapter to emit `_meta.<namespace>.parentToolUseId` on child tool calls; for a profile that supports subagents the link comes from the delegation `session_message` instead (see Subagent sessions). An off-protocol subagent that streams no children (opencode's `task`) is classified by `ToolCall.raw_name` through the profile's `subagentToolNames`, not by the mutable title an update overwrites. To diagnose a tool rendering as a generic card, compare the tool-start frame's `tool.kind` / `tool.name` against the profile; the alias map only fires when `kind` is `"other"`.
 
 ## Security model
 

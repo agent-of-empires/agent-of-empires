@@ -420,6 +420,8 @@ pub struct SpawnRequest {
     /// The session's logical tool (`Instance.tool`); host hooks see this as `AOE_TOOL`.
     pub tool: String,
     pub cwd: PathBuf,
+    /// Where repo config is read; a workspace's `cwd` holds none (`Instance::repo_config_path`).
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     /// LLM backend pinned on the session row, one of
@@ -429,6 +431,8 @@ pub struct SpawnRequest {
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.
     pub effort_explicit: bool,
+    /// Persisted `model_config` picks, re-applied after the model and effort.
+    pub model_config: std::collections::BTreeMap<String, String>,
     /// Prior ACP session id; loaded instead of a new session when the agent supports it.
     pub stored_acp_session_id: Option<String>,
     /// Parent ACP session id to `session/fork` from.

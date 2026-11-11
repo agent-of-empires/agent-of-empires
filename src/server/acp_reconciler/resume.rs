@@ -223,10 +223,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                 }
                 let sandbox = {
                     let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
+                    instances.iter().find(|i| i.id == id).and_then(|i| {
+                        let config_path = i.repo_config_path().to_path_buf();
+                        i.sandbox_info.clone().map(|info| (info, config_path))
+                    })
                 };
                 let attach = state.acp_supervisor.attach_inner(
                     id.clone(),
@@ -436,6 +436,7 @@ async fn build_spawn_request(
         fork_from,
         acp_mode_id,
         acp_effort,
+        acp_model_config,
         agent_model,
         agent_provider,
         claude_store_pin,
@@ -459,6 +460,7 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.acp_model_config.clone(),
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
@@ -467,12 +469,13 @@ async fn build_spawn_request(
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
         )
     };
+    let config_path = instance.repo_config_path().to_path_buf();
     let agent = supervisor
         .pick_agent_for_tool(
             &target.tool,
             target.agent_override.as_deref(),
             &target.source_profile,
-            &cwd,
+            &config_path,
         )
         .await;
     let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
@@ -520,6 +523,7 @@ async fn build_spawn_request(
         agent,
         tool: target.tool.clone(),
         cwd,
+        config_path,
         additional_dirs: vec![],
         provider_env: vec![],
         provider: agent_provider,
@@ -527,6 +531,7 @@ async fn build_spawn_request(
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
+        model_config: acp_model_config,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
@@ -903,6 +908,7 @@ mod tests {
                 text: "keep going".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
+                merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
             },
@@ -1058,6 +1064,7 @@ mod tests {
                 id,
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "original turn remains busy".into(),
                     attachments: vec![],
                     prompt_id: None,
@@ -1173,6 +1180,7 @@ mod tests {
                 text: "go".into(),
                 attachments: vec![],
                 prompt_id: None,
+                merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
             },

@@ -172,6 +172,13 @@ describe("StartupErrorScreen", () => {
       "The Claude ACP adapter speaks an ACP protocol aoe doesn't support",
       "protocol V2 · needs V1",
     ],
+    [
+      "proxy hello",
+      { kind: "invalid_proxy_hello", reason: "unsupported proxy protocol_version 9" },
+      info(),
+      "The Claude ACP adapter's proxy isn't compatible with this aoe",
+      "unsupported proxy protocol_version 9",
+    ],
   ])("%s: names the Agent and what is wrong", async (_label, detail, answer, headline, version) => {
     const { getByRole, getByTestId } = await renderScreen(detail, answer);
     expect(getByRole("heading").textContent).toBe(headline);
@@ -185,6 +192,18 @@ describe("StartupErrorScreen", () => {
     expect(block.textContent).toContain("then `opencode acp`");
     fireEvent.click(getByRole("button", { name: "Copy" }));
     await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith(OPENCODE_COMMAND));
+  });
+
+  it("explains a rejected proxy hello without blaming the version", async () => {
+    const detail: IncompatibleAgentDetail = {
+      kind: "invalid_proxy_hello",
+      reason: "proxy hello has an empty plugin_id",
+    };
+    const { getByTestId } = await renderScreen(detail);
+    fireEvent.click(getByTestId("startup-error-details"));
+    const body = getByTestId("startup-error-details-body").textContent;
+    expect(body).toContain("The plugin's proxy hello was rejected");
+    expect(body).not.toContain("contract version");
   });
 
   it("names no Agent until install-info answers", () => {
@@ -536,6 +555,7 @@ describe("StartupErrorScreen", () => {
     ["sandboxed", incompatible(), info({ ...sandbox, ...allowed })],
     ["not npm-installable", { ...incompatible(false, OPENCODE), package_name: "opencode-acp" }, opencode],
     ["protocol", { kind: "unsupported_protocol_version", expected: "V1", received: "V2" }, info()],
+    ["proxy hello", { kind: "invalid_proxy_hello", reason: "bad version" }, info()],
   ])("keeps every line on a validated text colour: %s", async (_label, detail, answer) => {
     const { getByTestId } = await renderScreen(detail, answer);
     fireEvent.click(getByTestId("startup-error-details"));

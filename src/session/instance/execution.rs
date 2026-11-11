@@ -1952,7 +1952,7 @@ impl Instance {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo(
             &self.effective_profile(),
-            std::path::Path::new(&self.project_path),
+            self.repo_config_path(),
         )?;
         if crate::agents::get_agent(&self.tool).is_none()
             && !config
