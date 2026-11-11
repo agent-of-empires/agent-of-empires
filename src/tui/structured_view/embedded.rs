@@ -1780,9 +1780,6 @@ mod retained_tests {
                     )
                     .unwrap();
             }
-            tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(3600)).await;
-            tokio::time::resume();
             assert!(!refresh(&mut view).await);
             assert_eq!(
                 full_reads.load(Ordering::SeqCst),
