@@ -232,6 +232,22 @@ failed command recovers terminal framing instead of replaying its written prefix
 Exit cleanup recovers poisoned output custody and discards an unsubmitted capture;
 ordinary rendering still refuses poisoned state.
 
+The initial guard covers failure in `App::new`. After successful construction,
+the guard is moved into a binding declared after `app`, intentionally reversing
+their drop order. On normal return, error, and unwind, the guard first cancels
+clipboard admission and work, restores input, drops its terminal wrapper (cursor
+cleanup), and attempts final display controls. Only then does `App` drop and join
+the clipboard executor. Keep this binding order when changing startup.
+Standalone owners use explicit normal-return teardown; they do not inherit this
+App unwind guarantee. Abort and fatal termination do not run Rust destructors.
+
+If a terminated process leaves input unusable, run `stty sane` from the shell.
+Input repair does not reset display modes. For supported xterm-compatible terminals,
+`printf '\030\033\\\033[?2026l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1049l\033[0m\033[?25h'`
+cancels incomplete framing and resets common display modes after exit.
+Terminal-specific reset commands may still be required. This recovery guidance
+does not strengthen the bounded best-effort shutdown guarantee.
+
 The OS layer independently opens and verifies the TTY descriptor. Duplicating
 stdout is not safe because duplicated descriptors share `O_NONBLOCK`.
 Writable readiness uses `poll` on Linux and `pselect` on Darwin, where the

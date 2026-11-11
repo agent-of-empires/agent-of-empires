@@ -178,10 +178,71 @@ pub(crate) fn drain_terminal(master: &mut File, bytes: &mut Vec<u8>) {
 }
 
 #[cfg(unix)]
+struct TerminalDrainer {
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    bytes: std::sync::Arc<Mutex<Vec<u8>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl TerminalDrainer {
+    fn start(master: &File, initial: Vec<u8>) -> Self {
+        use std::io::Read;
+        let mut master = master.try_clone().unwrap();
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bytes = std::sync::Arc::new(Mutex::new(initial));
+        let stop = stopped.clone();
+        let received = bytes.clone();
+        let thread = std::thread::spawn(move || {
+            let mut scratch = [0; 8192];
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                match master.read(&mut scratch) {
+                    Ok(0) => panic!("private terminal closed"),
+                    Ok(count) => received
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&scratch[..count]),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::yield_now()
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => panic!("drain private terminal: {error}"),
+                }
+            }
+        });
+        Self {
+            stopped,
+            bytes,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        self.stop();
+        std::mem::take(&mut *self.bytes.lock().unwrap())
+    }
+
+    fn stop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalDrainer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(unix)]
 #[test]
 #[serial_test::serial]
 fn slow_terminal_finishes_one_frame_suffix_before_osc_or_handoff() {
-    let (mut master, slave) = private_terminal();
+    let (master, slave) = private_terminal();
     let output = Mutex::new(State::new(slave));
     let payload = format!("\x1b[?2026h{}\x1b[?2026l", "FRAME-ROW|".repeat(32_768));
     let first = frame_in(&output, |_| {
@@ -221,14 +282,20 @@ fn slow_terminal_finishes_one_frame_suffix_before_osc_or_handoff() {
         !osc_called,
         "OSC must not interrupt a partially emitted frame"
     );
-    let mut received = Vec::new();
+    let drainer = TerminalDrainer::start(&master, Vec::new());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
             Instant::now() < deadline,
-            "pending frame never made progress"
+            "pending frame deadline: offset={:?}, received={}",
+            output
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .map(|frame| frame.offset),
+            drainer.bytes.lock().unwrap().len()
         );
-        drain_terminal(&mut master, &mut received);
         let started = Instant::now();
         let outcome = frame_in(&output, |_| panic!("pending frame was rebuilt")).unwrap();
         assert!(
@@ -249,11 +316,11 @@ fn slow_terminal_finishes_one_frame_suffix_before_osc_or_handoff() {
         |writer| writer.write_all(b"AFTER-FRAME"),
     )
     .unwrap();
-    while !received.ends_with(b"AFTER-FRAME") {
+    while !drainer.bytes.lock().unwrap().ends_with(b"AFTER-FRAME") {
         assert!(Instant::now() < deadline);
-        drain_terminal(&mut master, &mut received);
         std::thread::yield_now();
     }
+    let received = drainer.finish();
     assert!(received.starts_with(payload.as_bytes()));
     assert_eq!(
         received
@@ -308,7 +375,7 @@ pub(crate) fn read_terminal_until(master: &mut File, bytes: &mut Vec<u8>, needle
 #[test]
 #[serial_test::serial]
 fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
-    let (mut master, slave) = private_terminal();
+    let (master, slave) = private_terminal();
     let mut control = slave.try_clone().unwrap();
     let (_guard, output) = install_test_output(slave);
     let payload = "OLD-FRAME|".repeat(32_768);
@@ -320,11 +387,10 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
     })
     .unwrap();
     assert!(first.captured.is_some() && first.presented.is_none());
-    let mut received = Vec::new();
+    let drainer = TerminalDrainer::start(&master, Vec::new());
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut admitted = loop {
         assert!(Instant::now() < deadline);
-        drain_terminal(&mut master, &mut received);
         match suspend() {
             Ok(admitted) => break admitted,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -335,6 +401,7 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
         output.0.lock().unwrap().pending.is_none(),
         "admission flushed the real old frame"
     );
+    let received = drainer.finish();
     block_terminal(&mut control);
     assert!(
         !admitted.begin_handoff().unwrap(),
@@ -348,11 +415,11 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
         .captured
         .is_none());
     resume_terminal(&control);
+    let drainer = TerminalDrainer::start(&master, received);
     let mut captured = None;
     let mut draws = 0;
     loop {
         assert!(Instant::now() < deadline);
-        drain_terminal(&mut master, &mut received);
         let result = frame(|_| {
             draws += 1;
             let mut writer = Output::default();
@@ -368,7 +435,17 @@ fn pending_frame_flush_then_control_backpressure_retains_ordered_restore() {
             break;
         }
     }
-    read_terminal_until(&mut master, &mut received, b"AFTER-CONTROL-RESTORE");
+    while !drainer
+        .bytes
+        .lock()
+        .unwrap()
+        .windows(b"AFTER-CONTROL-RESTORE".len())
+        .any(|bytes| bytes == b"AFTER-CONTROL-RESTORE")
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let received = drainer.finish();
     assert_eq!(draws, 1);
     assert!(
         received.starts_with(payload.as_bytes()),

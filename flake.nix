@@ -56,6 +56,14 @@
                 ./docker
                 ./tests/fixtures/cli-read
                 ./web/tests/helpers/fakeAcpAgent.mjs
+                ./LICENSE
+                ./THIRD_PARTY_NOTICES.md
+                ./licenses
+                ./vendor/pulldown-cmark/LICENSE
+                ./vendor/unicode-width/LICENSE-MIT
+                ./vendor/unicode-width/LICENSE-APACHE
+                ./vendor/unicode-width/COPYRIGHT
+                ./vendor/unicode-width/tests/emoji-test.txt
               ];
             };
             strictDeps = true;
@@ -74,6 +82,8 @@
                 --bash <($out/bin/aoe completion bash) \
                 --fish <($out/bin/aoe completion fish) \
                 --zsh <($out/bin/aoe completion zsh)
+              install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$out/share/licenses/aoe"
+              install -Dm644 licenses/* -t "$out/share/licenses/aoe/licenses"
             '';
 
             meta = with pkgs.lib; {
@@ -134,6 +144,8 @@
                 --bash <($out/bin/aoe completion bash) \
                 --fish <($out/bin/aoe completion fish) \
                 --zsh <($out/bin/aoe completion zsh)
+              install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$out/share/licenses/aoe"
+              install -Dm644 licenses/* -t "$out/share/licenses/aoe/licenses"
             '';
             meta = aoe.meta;
             # Expose npmDeps so `nix-update` can automatically recompute the

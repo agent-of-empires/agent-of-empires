@@ -28,10 +28,12 @@ use crate::tui::plugin_ui;
 /// than the newest.
 const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
+#[allow(deprecated)]
 fn next_interaction_revision() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    // Match the repository's MSRV-compatible atomic update convention.
+    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_add(1)
     })
     .expect("structured interaction identity overflow")

@@ -25,7 +25,7 @@ surrounding backend, the map, and the tests are original.
 ## pulldown-cmark 0.13.6
 
 - Project: <https://github.com/raphlinus/pulldown-cmark>
-- License: MIT, full text in [`vendor/pulldown-cmark/LICENSE`](vendor/pulldown-cmark/LICENSE)
+- License: MIT, full text in [`licenses/pulldown-cmark-MIT.txt`](licenses/pulldown-cmark-MIT.txt)
 - Used in: `vendor/pulldown-cmark`
 
 Modifications: shared memory-backed and disk-backed input, parser storage,
@@ -40,12 +40,18 @@ The disk-backed Unicode folding table derives from Sean McArthur's
 
 - Project: <https://github.com/unicode-rs/unicode-width>
 - License: MIT or Apache-2.0, used under MIT; full text in
-  [`vendor/unicode-width/LICENSE-MIT`](vendor/unicode-width/LICENSE-MIT)
-- Copyright: [`vendor/unicode-width/COPYRIGHT`](vendor/unicode-width/COPYRIGHT)
+  [`licenses/unicode-width-MIT.txt`](licenses/unicode-width-MIT.txt)
+- Copyright: [`licenses/unicode-width-COPYRIGHT.txt`](licenses/unicode-width-COPYRIGHT.txt)
 - Used in: `vendor/unicode-width`
 
 Modifications: expose the existing reverse width calculation as an incremental
 accumulator shared by contiguous strings and disk-backed grapheme clusters.
+
+The unchanged upstream Unicode 17.0 emoji test data in
+`vendor/unicode-width/tests/emoji-test.txt` is copyright © 2025 Unicode, Inc.,
+under [Unicode License V3](https://www.unicode.org/license.txt). Its complete
+copyright and permission notice is shipped in
+[`licenses/Unicode-3.0.txt`](licenses/Unicode-3.0.txt).
 
 ## ansi-to-tui 8.0.1
 
@@ -55,3 +61,6 @@ accumulator shared by contiguous strings and disk-backed grapheme clusters.
 
 Modifications: the escape grammar and style transitions operate on contiguous
 or paged byte sources and emit through the shared rich-text sink.
+
+Fork provenance, update ownership, supported distribution, and required release
+checks are documented in [Vendored parser forks](docs/development/releases.md#vendored-parser-forks).

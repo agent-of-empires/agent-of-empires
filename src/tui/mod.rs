@@ -323,6 +323,7 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         startup_session_config.session_id_poller_max_threads,
     );
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
+    // Protect failed App construction before an App exists to own shutdown work.
     let guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 
     // Config warnings have no tracing subscriber in TUI mode, so they surface
@@ -355,6 +356,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         mosh_active,
         file_watch,
     )?;
+    // Rebind after app so the guard drops first on return and unwind: cancel
+    // clipboard work, restore input, drop the backend, then attempt final controls.
+    // App drops afterward and joins the already-cancelled clipboard executor.
     let mut terminal_guard = guard;
     terminal_guard.clipboard = Some(app.clipboard_stop_handle());
     if let Some(warning) = combined_warning {

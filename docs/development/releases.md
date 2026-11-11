@@ -53,3 +53,84 @@ Semver. The weekly workflow automatically picks minor when any scoped or unscope
 
 - **ClawHub** (`contrib/openclaw-skill/`) is published automatically by `release.yml` on every release. Its frontmatter must carry no top-level `version:`; ClawHub's `_meta.json` and the `--version` flag are the source of truth.
 - **Hermes** (`contrib/hermes-skill/`) is PR-based and published by hand, so the in-repo copy is the source of truth and the hub copy drifts until you re-publish. Its frontmatter must carry a `version:`. Bump it, then run `hermes skills publish contrib/hermes-skill --to github --repo NousResearch/hermes-agent` (needs the `hermes` CLI and a GitHub token with fork permissions). Cadence is on change, not every release.
+
+## Vendored parser forks
+
+Repository maintainers own both forks, including security fixes and Unicode data;
+the release approver owns the checks below. Review upstream releases and security
+advisories at each weekly release review, and immediately for a relevant advisory.
+Dependency-update PRs do not refresh path-patched sources.
+
+The exact bases are the published crates.io archives, not a moving Git branch:
+
+| Fork | Base archive | SHA-256 |
+|---|---|---|
+| pulldown-cmark | `https://static.crates.io/crates/pulldown-cmark/pulldown-cmark-0.13.6.crate` | `3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b` |
+| unicode-width | `https://static.crates.io/crates/unicode-width/unicode-width-0.2.2.crate` | `b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254` |
+
+Their archive VCS identities are pulldown-cmark
+`014b61d38d235f382935bb676bab872b7680afa2` (repository subdirectory
+`pulldown-cmark`) and unicode-width
+`9d98411769fe13c7c18cab0b3fbbab29ba8350ea` (repository root).
+
+To reproduce the local delta, download each archive into a temporary directory,
+verify the checksum above with `sha256sum`, extract with `tar -xzf`, then run:
+
+```sh
+diff -ruN "$temporary/pulldown-cmark-0.13.6" vendor/pulldown-cmark
+diff -ruN "$temporary/unicode-width-0.2.2" vendor/unicode-width
+```
+
+Archive packaging metadata, omitted upstream-only files, and standalone workspace
+manifests are not parser changes. Review those separately from the source delta.
+Pulldown's local delta adds shared memory/disk input, disk-backed parser storage,
+reference lookup and text normalization. Unicode-width's delta exposes incremental
+reverse-width accumulation; generated width data and upstream expectations must
+not change as a side effect. Keep upstream grammar tests intact. Do not regenerate
+Unicode tables merely to refresh packaging. Record any intentional grammar,
+Unicode-version, generated-table, or upstream-test change explicitly in the update PR.
+The Unicode-width upstream suite and its `emoji-test.txt` fixture are retained
+unchanged under `vendor/unicode-width/tests/`; the parser's upstream suites remain
+under `vendor/pulldown-cmark/tests/`. Run them from their standalone manifests,
+not only as dependencies of the root package.
+
+For an update, extract the new pristine archive separately, record its URL and
+checksum here, replay only the reviewed local source changes, then compare both
+old/new upstream trees and the final fork. Review upstream release notes, Rust
+minimum version, advisories, and Unicode release notes. Copy updated license texts
+to `licenses/` and update `THIRD_PARTY_NOTICES.md`. Maintainers must decide in that
+PR whether to propose the reusable disk-input and incremental-width APIs upstream.
+Until upstream can satisfy bounded-storage and parity requirements, retain the
+forks; do not replace them with stock crates merely to clear an update warning.
+
+Run these release checks sequentially, on Linux and native macOS for terminal checks:
+
+```sh
+CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/pulldown-cmark/Cargo.toml --features disk,html
+CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/unicode-width/Cargo.toml
+CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/unicode-width/Cargo.toml --no-default-features
+CARGO_BUILD_JOBS=1 cargo test --lib tui::rich_text
+CARGO_BUILD_JOBS=1 cargo test --lib tui::structured_view
+CARGO_BUILD_JOBS=1 cargo test --lib tui::terminal_output
+CARGO_BUILD_JOBS=1 cargo test --lib child_handoff_restores_real_raw_input_before_blocked_screen_controls
+```
+
+The standalone vendor suites are not covered by root workspace tests. Pulldown's
+upstream CommonMark/HTML suite needs `html`, unlike the production `disk` build.
+Require memory/disk event and byte parity, split-grapheme width parity, cancelled
+rendering, bounded retained storage, and exact frame/control ordering to remain
+green. A root-only test result is not evidence for the upstream suites.
+
+Release archives must contain `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the complete
+`licenses/` directory, including both fork MIT notices and Unicode-width copyright.
+Nix source filtering explicitly includes upstream extensionless notices; both Nix
+packages install notices under `$out/share/licenses/aoe`. Check both `nix build`
+and `nix build .#aoe-with-web`, then inspect their installed license directories
+and one generated release archive before approval.
+
+Supported source installation uses this repository's Git checkout and lockfile
+(`cargo install --path . --locked`, or the project's Git-based installer).
+Ordinary registry packaging strips patch declarations and nested packages; a
+registry archive is not a supported source distribution for these path forks.
+Do not publish one without first defining and testing a distribution that carries
+the forks and preserves their dependency resolution.

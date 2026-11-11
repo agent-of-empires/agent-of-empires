@@ -3408,12 +3408,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn child_handoff_restores_real_raw_input_before_blocked_screen_controls() {
-        use crate::tui::terminal_output::{
-            install_test_output,
-            tests::{block_terminal, private_terminal, resume_terminal},
-        };
+        use crate::tui::terminal_output::{install_test_output, tests::private_terminal};
         use std::io::{Read, Write};
-        use std::os::fd::AsRawFd;
         use std::os::unix::process::CommandExt;
         if let Some(directory) = std::env::var_os("AOE_TEST_CONTROL_RESTORE_CHILD") {
             use std::os::unix::fs::OpenOptionsExt;
@@ -3453,7 +3449,23 @@ mod tests {
                         .arg(&marker)
                         .status()
                         .unwrap();
-                    block_terminal(&mut control);
+                    std::fs::write(directory.join("pause-drainer"), b"ready").unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !directory.join("drainer-stopped").exists() {
+                        assert!(std::time::Instant::now() < deadline, "drainer did not stop");
+                        std::thread::yield_now();
+                    }
+                    // Keep output running: input must work with a naturally full queue,
+                    // independently of TCOOFF and platform-specific IXANY behavior.
+                    loop {
+                        match control.write(&[b'?'; 4096]) {
+                            Ok(0) => panic!("private terminal closed while filling"),
+                            Ok(_) => assert!(std::time::Instant::now() < deadline),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) => panic!("fill private terminal: {error}"),
+                        }
+                    }
                     std::fs::write(directory.join("output-paused"), b"ready").unwrap();
                     status
                 })
@@ -3468,19 +3480,18 @@ mod tests {
             std::fs::write(directory.join("waiting-input"), b"ready").unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if let Some(Ok(Event::Key(key))) =
-                        app.event_stream.as_mut().unwrap().next().await
-                    {
-                        if key.code == KeyCode::Char('x') {
-                            break;
-                        }
+                    match app.event_stream.as_mut().unwrap().next().await {
+                        Some(Ok(Event::Key(key))) if key.code == KeyCode::Char('x') => break,
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => panic!("private terminal input failed: {error}"),
+                        None => panic!("private terminal input stream ended"),
                     }
                 }
             })
             .await
             .unwrap();
             assert_eq!(std::fs::read(&marker).unwrap(), b"child");
-            resume_terminal(&control);
+            std::fs::write(directory.join("input-ack"), b"ready").unwrap();
             let mut refresh = tokio::time::interval(Duration::from_millis(10));
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !app.home.presentation_ready {
@@ -3527,15 +3538,26 @@ mod tests {
             });
         }
         let mut child = command.spawn().unwrap();
-        let control = slave.try_clone().unwrap();
         drop(command);
         drop(slave);
         let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let done = stopped.clone();
+        let drain_directory = directory.path().to_path_buf();
         let reader = std::thread::spawn(move || {
             let mut bytes = Vec::new();
             let mut scratch = [0; 4096];
             loop {
+                if drain_directory.join("pause-drainer").exists()
+                    && !drain_directory.join("input-ack").exists()
+                    && !done.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    std::fs::write(drain_directory.join("drainer-stopped"), b"ready").unwrap();
+                    while !drain_directory.join("input-ack").exists()
+                        && !done.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        std::thread::yield_now();
+                    }
+                }
                 match master.read(&mut scratch) {
                     Ok(0) => break,
                     Ok(count) => bytes.extend_from_slice(&scratch[..count]),
@@ -3579,13 +3601,8 @@ mod tests {
             }
             std::thread::yield_now();
         };
-        let mut resume_error = None;
         let mut kill_error = None;
         if status.is_none() {
-            // SAFETY: release only this fixture's paused output before killing its session leader.
-            if unsafe { libc::tcflow(control.as_raw_fd(), libc::TCOON) } == -1 {
-                resume_error = Some(std::io::Error::last_os_error());
-            }
             kill_error = child.kill().err();
             let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
             while child.try_wait().unwrap().is_none() && std::time::Instant::now() < reap_deadline {
@@ -3593,12 +3610,11 @@ mod tests {
             }
         }
         drop(input);
-        drop(control);
         stopped.store(true, std::sync::atomic::Ordering::Release);
         let emitted = reader.join().unwrap();
         assert!(
             status.is_some_and(|status| status.success()),
-            "child failed (paused={}, handoff_returned={}, waiting_input={}, sent={sent}, input_error={input_error:?}, resume_error={resume_error:?}, kill_error={kill_error:?}, private_child_panic={:?}): {}",
+            "child failed (backpressured={}, handoff_returned={}, waiting_input={}, sent={sent}, input_error={input_error:?}, kill_error={kill_error:?}, private_child_panic={:?}): {}",
             directory.path().join("output-paused").exists(),
             directory.path().join("handoff-returned").exists(),
             directory.path().join("waiting-input").exists(),
@@ -3607,7 +3623,7 @@ mod tests {
         );
         assert!(
             sent,
-            "private raw input was exercised while output stayed paused"
+            "private raw input was exercised before the output drainer resumed"
         );
         assert_eq!(
             std::fs::read(directory.path().join("proof")).unwrap(),
