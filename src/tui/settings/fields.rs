@@ -491,6 +491,11 @@ fn installed_oneshot_agents() -> Vec<String> {
                         .launch
                         .as_ref()
                         .is_some_and(|launch| launch.oneshot_flag.is_some())
+                    && entry
+                        .command
+                        .as_deref()
+                        .and_then(aoe_plugin_api::agent_integration::direct_launch_words)
+                        .is_some()
             })
         });
         if has_oneshot && crate::tmux::plugin_command_on_path(plugin.command) {

@@ -336,12 +336,12 @@ pub async fn list_agents(
                     .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
                     .unwrap_or_else(|| integration.tool.to_owned()),
                 host_only: launch.is_some_and(|launch| launch.host_only),
-                // A launch declaration decides this itself. Only a declaration
-                // that says nothing about YOLO inherits the built-in it aliases.
-                always_yolo: match launch.and_then(|launch| launch.yolo.as_ref()) {
-                    Some(yolo) => matches!(
-                        yolo,
-                        aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always
+                // A launch declaration decides this itself, matching the new-session
+                // dialog. Only an agent without one inherits the built-in it aliases.
+                always_yolo: match launch {
+                    Some(launch) => matches!(
+                        launch.yolo.as_ref(),
+                        Some(aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always)
                     ),
                     None => crate::acp::runs_always_yolo(
                         integration.tool,
@@ -360,7 +360,10 @@ pub async fn list_agents(
                 install_hint: launch
                     .and_then(|launch| launch.install_hint.clone())
                     .unwrap_or_else(|| format!("Provided by AoE plugin {}", integration.plugin)),
-                oneshot_capable: launch.is_some_and(|launch| launch.oneshot_flag.is_some()),
+                // The oneshot gate rejects a shell tail, so do not offer it here.
+                oneshot_capable: launch.is_some_and(|launch| launch.oneshot_flag.is_some())
+                    && aoe_plugin_api::agent_integration::direct_launch_words(integration.command)
+                        .is_some(),
                 acp_capable: false,
                 acp_installed: false,
                 acp_create_ready: false,
