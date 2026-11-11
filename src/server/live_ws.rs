@@ -350,6 +350,9 @@ struct LiveSettings {
     /// after a take-over; 0 when none.
     #[cfg(unix)]
     grid_rearm_until_ms: AtomicU64,
+    /// The holder kind the last `size_owner` sent named; `None` until the first one. Held
+    /// while a `size_owner` is built and sent, so a holder update can't overtake a claim reply.
+    sent_holder: tokio::sync::Mutex<Option<Option<LiveOwnerKind>>>,
 }
 
 impl LiveSettings {
@@ -366,6 +369,7 @@ impl LiveSettings {
             resize_settle_until_ms: AtomicU64::new(0),
             #[cfg(unix)]
             grid_rearm_until_ms: AtomicU64::new(0),
+            sent_holder: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -573,25 +577,76 @@ fn plan_patch<'a>(
 /// also learns which kind of window holds the lock, unless the lock still
 /// names this connection.
 fn size_owner_json(is_owner: bool, holder: Option<&str>, own_id: &str) -> String {
-    let owner = holder
-        .filter(|holder| !is_owner && *holder != own_id)
-        .and_then(LiveOwnerKind::from_owner_id);
+    let owner = holder_kind(is_owner, holder, own_id);
     live_json(&LiveServerMessage::SizeOwner { is_owner, owner })
 }
 
-/// [`size_owner_json`] with the holder read from tmux, which only a non-owner needs.
-async fn size_owner_message(tmux_name: &str, is_owner: bool, own_id: &str) -> Message {
+fn holder_kind(is_owner: bool, holder: Option<&str>, own_id: &str) -> Option<LiveOwnerKind> {
+    holder
+        .filter(|holder| !is_owner && *holder != own_id)
+        .and_then(LiveOwnerKind::from_owner_id)
+}
+
+/// The `size_owner` a non-owner gets after re-reading the holder: `None` when the client
+/// has had none yet, or the last one named the same kind.
+fn holder_update(
+    sent: &mut Option<Option<LiveOwnerKind>>,
+    holder: Option<&str>,
+    own_id: &str,
+) -> Option<String> {
+    let kind = holder_kind(false, holder, own_id);
+    if (*sent)? == kind {
+        return None;
+    }
+    *sent = Some(kind);
+    Some(size_owner_json(false, holder, own_id))
+}
+
+async fn read_size_holder(tmux_name: &str) -> Option<String> {
+    let name = tmux_name.to_string();
+    tokio::task::spawn_blocking(move || crate::tmux::Session::from_name(&name).size_owner())
+        .await
+        .ok()
+        .flatten()
+        .map(|(id, _)| id)
+}
+
+/// Sends [`size_owner_json`], reading the holder from tmux for a non-owner, and records the
+/// kind it named.
+async fn send_size_owner(
+    tx: &tokio::sync::mpsc::Sender<Message>,
+    settings: &LiveSettings,
+    tmux_name: &str,
+    is_owner: bool,
+    own_id: &str,
+) {
+    let mut sent = settings.sent_holder.lock().await;
     let holder = if is_owner {
         None
     } else {
-        let name = tmux_name.to_string();
-        tokio::task::spawn_blocking(move || crate::tmux::Session::from_name(&name).size_owner())
-            .await
-            .ok()
-            .flatten()
-            .map(|(id, _)| id)
+        read_size_holder(tmux_name).await
     };
-    Message::Text(size_owner_json(is_owner, holder.as_deref(), own_id).into())
+    *sent = Some(holder_kind(is_owner, holder.as_deref(), own_id));
+    let json = size_owner_json(is_owner, holder.as_deref(), own_id);
+    let _ = tx.send(Message::Text(json.into())).await;
+}
+
+/// Tells a non-owner when the kind of window holding the lock changes, such as the TUI
+/// taking it from another tab or the lock going vacant.
+async fn refresh_size_holder(
+    tx: &tokio::sync::mpsc::Sender<Message>,
+    settings: &LiveSettings,
+    tmux_name: &str,
+    own_id: &str,
+) {
+    let mut sent = settings.sent_holder.lock().await;
+    if settings.is_owner.load(Ordering::Relaxed) {
+        return;
+    }
+    let holder = read_size_holder(tmux_name).await;
+    if let Some(json) = holder_update(&mut sent, holder.as_deref(), own_id) {
+        let _ = tx.send(Message::Text(json.into())).await;
+    }
 }
 
 fn clipboard_json(text: &str) -> String {
@@ -1065,6 +1120,7 @@ async fn handle_live_ws_inner(
         let mut reassert_guard = ReassertGuard::new(STUCK_REASSERT_RETRY);
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         let mut last_reclaim = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
+        let mut last_holder_check = std::time::Instant::now();
         loop {
             if capture_cancelled.is_cancelled() {
                 break;
@@ -1249,11 +1305,14 @@ async fn handle_live_ws_inner(
                         .unwrap_or(false);
                         if !still_owner {
                             capture_settings.is_owner.store(false, Ordering::Relaxed);
-                            let _ = capture_tx
-                                .send(
-                                    size_owner_message(&capture_tmux, false, &capture_owner).await,
-                                )
-                                .await;
+                            send_size_owner(
+                                &capture_tx,
+                                &capture_settings,
+                                &capture_tmux,
+                                false,
+                                &capture_owner,
+                            )
+                            .await;
                         }
                     }
                     // Auto-reclaim.
@@ -1295,14 +1354,29 @@ async fn handle_live_ws_inner(
                             if claimed {
                                 capture_settings.is_owner.store(true, Ordering::Relaxed);
                                 last_heartbeat = std::time::Instant::now();
-                                let _ = capture_tx
-                                    .send(
-                                        size_owner_message(&capture_tmux, true, &capture_owner)
-                                            .await,
-                                    )
-                                    .await;
+                                send_size_owner(
+                                    &capture_tx,
+                                    &capture_settings,
+                                    &capture_tmux,
+                                    true,
+                                    &capture_owner,
+                                )
+                                .await;
                             }
                         }
+                    }
+                    if !read_only
+                        && !capture_settings.is_owner.load(Ordering::Relaxed)
+                        && last_holder_check.elapsed() >= SIZE_OWNER_HEARTBEAT
+                    {
+                        last_holder_check = std::time::Instant::now();
+                        refresh_size_holder(
+                            &capture_tx,
+                            &capture_settings,
+                            &capture_tmux,
+                            &capture_owner,
+                        )
+                        .await;
                     }
                     // Only the owner drives the window size.
                     if !read_only && capture_settings.is_owner.load(Ordering::Relaxed) {
@@ -1362,16 +1436,14 @@ async fn handle_live_ws_inner(
                                 capture_settings.record_owner_resize(still_owner);
                                 if !still_owner {
                                     capture_settings.is_owner.store(false, Ordering::Relaxed);
-                                    let _ = capture_tx
-                                        .send(
-                                            size_owner_message(
-                                                &capture_tmux,
-                                                false,
-                                                &capture_owner,
-                                            )
-                                            .await,
-                                        )
-                                        .await;
+                                    send_size_owner(
+                                        &capture_tx,
+                                        &capture_settings,
+                                        &capture_tmux,
+                                        false,
+                                        &capture_owner,
+                                    )
+                                    .await;
                                 }
                             }
                             if !drifted {
@@ -1743,9 +1815,7 @@ async fn handle_live_ws_inner(
                                 .unwrap_or(false);
                                 settings.record_owner_resize(owned);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
-                                let _ = out_tx
-                                    .send(size_owner_message(&tmux_name, owned, &owner_id).await)
-                                    .await;
+                                send_size_owner(&out_tx, &settings, &tmux_name, owned, &owner_id).await;
                                 nudge.notify_one();
                             }
                             LiveClientMessage::Window { lines } => {
@@ -1763,9 +1833,7 @@ async fn handle_live_ws_inner(
                             }
                             LiveClientMessage::ClaimIfVacant => {
                                 if read_only {
-                                    let _ = out_tx
-                                        .send(size_owner_message(&tmux_name, false, &owner_id).await)
-                                        .await;
+                                    send_size_owner(&out_tx, &settings, &tmux_name, false, &owner_id).await;
                                     continue;
                                 }
                                 // A keyboard-open mobile pane intentionally postpones its
@@ -1780,16 +1848,12 @@ async fn handle_live_ws_inner(
                                 .await
                                 .unwrap_or(false);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
-                                let _ = out_tx
-                                    .send(size_owner_message(&tmux_name, owned, &owner_id).await)
-                                    .await;
+                                send_size_owner(&out_tx, &settings, &tmux_name, owned, &owner_id).await;
                                 nudge.notify_one();
                             }
                             LiveClientMessage::Claim => {
                                 if read_only {
-                                    let _ = out_tx
-                                        .send(size_owner_message(&tmux_name, false, &owner_id).await)
-                                        .await;
+                                    send_size_owner(&out_tx, &settings, &tmux_name, false, &owner_id).await;
                                     continue;
                                 }
                                 // Explicit take-over.
@@ -1829,9 +1893,7 @@ async fn handle_live_ws_inner(
                                 if owned && rearm {
                                     settings.request_grid_rearm();
                                 }
-                                let _ = out_tx
-                                    .send(size_owner_message(&tmux_name, owned, &owner_id).await)
-                                    .await;
+                                send_size_owner(&out_tx, &settings, &tmux_name, owned, &owner_id).await;
                                 nudge.notify_one();
                             }
                             LiveClientMessage::Caps { deflate, patch } => {
@@ -2677,6 +2739,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_non_owner_hears_again_only_when_the_holders_kind_changes() {
+        use LiveOwnerKind::{Tui, Web};
+        let own = "live-7";
+        // (kind last sent, holder now, owner field sent (outer None: nothing sent), kind after)
+        let cases = [
+            (None, Some("tui-1"), None, None),
+            (Some(Some(Web)), Some("live-3"), None, Some(Some(Web))),
+            (
+                Some(Some(Web)),
+                Some("tui-1"),
+                Some(Some("tui")),
+                Some(Some(Tui)),
+            ),
+            (Some(Some(Tui)), None, Some(None), Some(None)),
+            (Some(None), Some(own), None, Some(None)),
+            (Some(None), Some("pty-1"), None, Some(None)),
+            (
+                Some(None),
+                Some("live-3"),
+                Some(Some("web")),
+                Some(Some(Web)),
+            ),
+        ];
+        for (before, holder, sent, after) in cases {
+            let mut state = before;
+            let json = holder_update(&mut state, holder, own)
+                .map(|j| serde_json::from_str::<serde_json::Value>(&j).unwrap());
+            if let Some(json) = &json {
+                assert_eq!(json["is_owner"], false);
+            }
+            let owner = json
+                .as_ref()
+                .map(|j| j.get("owner").and_then(|v| v.as_str()));
+            assert_eq!(owner, sent, "{before:?} {holder:?}");
+            assert_eq!(state, after, "{before:?} {holder:?}");
+        }
+    }
+
     /// A tab that opened while the TUI was in live mode is on the capture fallback. Taking
     /// control must bring it onto the grid on the same socket: reconnecting would release the
     /// lock it just took.
@@ -2813,9 +2914,38 @@ mod tests {
                 assert_eq!(fallback["grid"], false, "{fallback}");
                 assert_eq!(fallback["reason"], "pipe_owned", "{fallback}");
 
-                // The grid the socket can adopt once the pipe is free, sized to the pane as
-                // an armed channel seeds. Unit tests cannot arm a real one: the pipe helper
-                // is the `aoe` binary. Nothing samples it until the take-over below.
+                // Keep the TUI's pipe lease fresh, so an arming attempt fails on it rather than
+                // fork a real pipe helper: the pipe helper is the `aoe` binary.
+                assert!(session.claim_vt_owner(tui_vt, crate::tmux::VT_OWNER_TTL));
+                client
+                    .send(Ws::Text(r#"{"type":"claim"}"#.into()))
+                    .await
+                    .unwrap();
+                let claimed = until(&mut client, progress_timeout, "claimed size_owner", |v| {
+                    v["type"] == "size_owner"
+                })
+                .await;
+                assert_eq!(claimed["is_owner"], true, "{claimed}");
+                assert!(claimed.get("owner").is_none(), "{claimed}");
+
+                // Two frames captured after the claim: the loop pass that captured the second
+                // began after the claim, so it already made an arming attempt, which failed
+                // with no grid to adopt.
+                for marker in ["FIRST", "SECOND"] {
+                    let typed = crate::tmux::tmux_command()
+                        .args(["send-keys", "-t", &target, "-l", marker])
+                        .output()
+                        .expect("type into pane");
+                    assert!(typed.status.success());
+                    until(&mut client, progress_timeout, marker, |v| {
+                        v["type"] == "frame"
+                            && v["content"].as_str().is_some_and(|c| c.contains(marker))
+                    })
+                    .await;
+                }
+
+                // The grid a later attempt adopts, sized to the pane as an armed channel
+                // seeds. Unit tests cannot arm a real one.
                 let grid = crate::tmux::vt::register_live_for_test(
                     pane.name(),
                     grid_dir.path(),
@@ -2831,25 +2961,6 @@ mod tests {
                         &crate::tmux::TmuxCommandDeadline::new()
                     ),
                     crate::tmux::vt::VtRefreshResult::Refreshed
-                );
-                // Keep the TUI's pipe lease fresh, so no arming attempt before the
-                // release below can win it and fork a real pipe helper.
-                assert!(session.claim_vt_owner(tui_vt, crate::tmux::VT_OWNER_TTL));
-                client
-                    .send(Ws::Text(r#"{"type":"claim"}"#.into()))
-                    .await
-                    .unwrap();
-                let claimed = until(&mut client, progress_timeout, "claimed size_owner", |v| {
-                    v["type"] == "size_owner"
-                })
-                .await;
-                assert_eq!(claimed["is_owner"], true, "{claimed}");
-                assert!(claimed.get("owner").is_none(), "{claimed}");
-
-                // The TUI leaves live mode and frees its pipe.
-                session.release_vt_owner_with_deadline(
-                    tui_vt,
-                    &crate::tmux::TmuxCommandDeadline::new(),
                 );
                 let grid = until(&mut client, progress_timeout, "grid transport", |v| {
                     v["type"] == "transport"
