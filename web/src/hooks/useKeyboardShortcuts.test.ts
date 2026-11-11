@@ -166,8 +166,14 @@ describe("useKeyboardShortcuts", () => {
     document.body.appendChild(input);
     dispatch(input, { key: "n" });
     expect(actions.onNew).toHaveBeenCalledOnce();
+
+    const select = document.createElement("select");
+    document.body.appendChild(select);
+    dispatch(select, { key: "s" });
+    expect(actions.onSettings).not.toHaveBeenCalled();
     unmount();
     input.remove();
+    select.remove();
   });
 
   it("marks the document ready once the listener is attached", () => {
