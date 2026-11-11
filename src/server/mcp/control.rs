@@ -323,9 +323,9 @@ impl McpServer {
         let Some(message) = terminal_text(params.message) else {
             return Err(tool_error("invalid_request", "The message is empty"));
         };
-        // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so an MCP caller
-        // never types into a pane that is waiting on a person. HTTP `POST /send` is left as is:
-        // a person at the dashboard sees the pane.
+        // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
+        // pane whose status rules detect one; an agent without status rules gets no check. HTTP
+        // `POST /send` is left as is: a person at the dashboard sees the pane.
         if self.terminal_pane_waiting(&id).await {
             return Err(tool_error(
                 "waiting",
@@ -441,9 +441,9 @@ impl McpServer {
             .map(|i| i.view)
     }
 
-    /// Whether a terminal session's pane shows a dialog or question waiting on a person, read
-    /// once, without waiting. A check that fails to run, or a pane that cannot be captured,
-    /// counts as waiting, so `send` refuses.
+    /// Whether a terminal session's status rules detect a dialog or question waiting on a
+    /// person, read once, without waiting. A check that fails to run, or a pane that cannot be
+    /// captured, counts as waiting, so `send` refuses.
     async fn terminal_pane_waiting(&self, id: &str) -> bool {
         let instance = self
             .state
@@ -576,7 +576,8 @@ fn pane_readiness(instance: &Instance) -> PaneReadiness {
     readiness_of(instance.detect_pane_now(&instance.source_profile, &session, None))
 }
 
-/// MCP `send` types nowhere a person may be needed: a dialog, or a pane it could not read.
+/// MCP `send` refuses a pane whose status rules detect a dialog, or one it could not read. An
+/// agent without status rules (`NoPromptRule`) gets no dialog check.
 fn refuses_send(readiness: PaneReadiness) -> bool {
     matches!(
         readiness,
