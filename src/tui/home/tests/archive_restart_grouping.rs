@@ -3070,6 +3070,7 @@ fn status_grouping_orders_headers_and_persists_collapse() {
                 view.get_instance(id)
                     .map_or("?", |inst| inst.title.as_str())
             ),
+            other => panic!("unexpected row {other:?}"),
         })
         .collect();
     assert_eq!(
