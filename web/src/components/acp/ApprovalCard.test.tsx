@@ -8,8 +8,9 @@ import { AcpFileRefContext } from "./AcpFileRefContext";
 import { ApprovalCard } from "./ApprovalCard";
 import type { Approval, ApprovalOption } from "../../lib/acpTypes";
 
+const connection = vi.hoisted(() => ({ down: false }));
 vi.mock("../../lib/connectionState", () => ({
-  useServerDown: () => false,
+  useServerDown: () => connection.down,
   OFFLINE_TITLE: "Disconnected",
 }));
 
@@ -66,7 +67,15 @@ const hold = (el: HTMLElement, ms: number, start: "mouseDown" | "touchStart" = "
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  connection.down = false;
 });
+
+const flush = () => act(async () => {});
+// jsdom drops `scaleX(0)`, so an unset transform reads as an empty fill.
+const fill = (button: HTMLElement) =>
+  Number(
+    /scaleX\(([\d.]+)\)/.exec(button.querySelector<HTMLElement>('span[aria-hidden="true"]')!.style.transform)?.[1] ?? 0,
+  );
 
 describe("ApprovalCard args", () => {
   it("renders the chrome and a collapsed command preview with actions reachable", () => {
@@ -129,12 +138,45 @@ describe("ApprovalCard decisions", () => {
     expect(onResolve).toHaveBeenCalledWith(decision, undefined);
   });
 
-  it("shows the rolled-back message when onResolve rejects", async () => {
-    mount(makeApproval(), vi.fn().mockRejectedValue(new Error("network")));
-    await act(async () => {
-      fireEvent.click(screen.getByText("Allow"));
-    });
-    expect(screen.getByText(/Could not reach the server/i)).toBeTruthy();
+  it("returns to a retryable state when onResolve rejects", async () => {
+    const onResolve = mount(
+      makeApproval(),
+      vi.fn().mockRejectedValueOnce(new Error("500")).mockResolvedValue(undefined),
+    );
+    const allow = screen.getByRole("button", { name: "Allow" });
+    fireEvent.click(allow);
+    expect(allow).toHaveProperty("disabled", true);
+    await flush();
+    expect(screen.getByText(/Could not submit/i)).toBeTruthy();
+    expect(allow).toHaveProperty("disabled", false);
+    fireEvent.click(allow);
+    expect(onResolve).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["the trio", makeApproval(), ["Allow", "Always", "Deny"]],
+    ["a destructive approval", makeApproval({ destructive: true }), ["Hold to allow", "Deny"]],
+    [
+      "an answer list",
+      makeApproval({
+        choice: true,
+        options: [
+          { option_id: "a", name: "Answer A", kind: "allow_once" },
+          { option_id: "b", name: "Answer B", kind: "allow_once" },
+        ],
+      }),
+      ["Answer A", "Answer B", "Dismiss"],
+    ],
+  ])("disables and dims %s while the server is down", (_label, approval, names) => {
+    connection.down = true;
+    const onResolve = mount(approval);
+    for (const name of names) {
+      const button = screen.getByRole("button", { name: new RegExp(name) });
+      expect(button).toHaveProperty("disabled", true);
+      expect(button.className).toContain("opacity-50");
+      fireEvent.click(button);
+    }
+    expect(onResolve).not.toHaveBeenCalled();
   });
 
   describe("destructive", () => {
@@ -153,6 +195,90 @@ describe("ApprovalCard decisions", () => {
       expect(onResolve).not.toHaveBeenCalled();
       hold(button, 800);
       expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
+    });
+
+    it.each([" ", "Enter"])("allows from the keyboard after an 800ms %j hold, ignoring key repeat", (key) => {
+      const onResolve = mount(makeApproval({ destructive: true }));
+      const button = screen.getByRole("button", { name: /Hold to allow/ });
+      fireEvent.keyDown(button, { key });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(fill(button)).toBeCloseTo(0.49, 1);
+      fireEvent.keyUp(button, { key });
+      expect(fill(button)).toBe(0);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+
+      fireEvent.keyDown(button, { key });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      fireEvent.keyDown(button, { key, repeat: true });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", undefined);
+    });
+
+    it("cancels a keyboard hold when focus leaves, and ignores other keys", () => {
+      const onResolve = mount(makeApproval({ destructive: true }));
+      const button = screen.getByRole("button", { name: /Hold to allow/ });
+      fireEvent.keyDown(button, { key: "a" });
+      fireEvent.keyDown(button, { key: "Enter" });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(fill(button)).toBeGreaterThan(0);
+      fireEvent.blur(button);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["keyboard", "window blur"],
+      ["mouse", "window blur"],
+      ["keyboard", "page hidden"],
+    ])("cancels a %s hold on %s, where the release never reaches the card", (input, end) => {
+      const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+      const onResolve = mount(makeApproval({ destructive: true }));
+      const button = screen.getByRole("button", { name: /Hold to allow/ });
+      if (input === "keyboard") fireEvent.keyDown(button, { key: " " });
+      else fireEvent.mouseDown(button);
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      fireEvent(document, new Event("visibilitychange"));
+      expect(fill(button)).toBeGreaterThan(0);
+      if (end === "window blur") fireEvent.blur(window);
+      else {
+        hidden.mockReturnValue(true);
+        fireEvent(document, new Event("visibilitychange"));
+      }
+      expect(fill(button)).toBe(0);
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+      hidden.mockRestore();
+    });
+
+    it("can hold again after a rejected submit", async () => {
+      const onResolve = mount(
+        makeApproval({ destructive: true }),
+        vi.fn().mockRejectedValueOnce(new Error("500")).mockResolvedValue(undefined),
+      );
+      const button = screen.getByRole("button", { name: /Hold to allow/ });
+      hold(button, 800);
+      await flush();
+      expect(button).toHaveProperty("disabled", false);
+      fireEvent.mouseUp(button);
+      hold(button, 800);
+      expect(onResolve).toHaveBeenCalledTimes(2);
     });
 
     it("denies without a hold", () => {
@@ -259,6 +385,26 @@ describe("ApprovalCard option lists", () => {
       expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", "logs");
     });
 
+    it("answers from the keyboard with the held option, and an early release cancels", () => {
+      const onResolve = destructive();
+      const logs = option("Delete only logs");
+      fireEvent.keyDown(logs, { key: " " });
+      act(() => {
+        vi.advanceTimersByTime(400);
+      });
+      expect(fill(logs)).toBeCloseTo(0.49, 1);
+      fireEvent.keyUp(logs, { key: " " });
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+      expect(onResolve).not.toHaveBeenCalled();
+      fireEvent.keyDown(logs, { key: "Enter" });
+      act(() => {
+        vi.advanceTimersByTime(800);
+      });
+      expect(onResolve).toHaveBeenCalledExactlyOnceWith("Allow", "logs");
+    });
+
     it("keeps Dismiss a single click", () => {
       const onResolve = destructive();
       fireEvent.click(screen.getByText("Dismiss"));
@@ -292,6 +438,30 @@ describe("ApprovalCard plan viewer", () => {
     fireEvent.click(within(dialog).getByText("Close"));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(onResolve).not.toHaveBeenCalled();
+  });
+
+  it("orders the modal footer like the card", () => {
+    const footer = () =>
+      within(screen.getByRole("dialog"))
+        .getAllByRole("button")
+        .map((b) => b.textContent)
+        .filter((t) => t && !["Rendered", "Raw", ""].includes(t));
+    mount(withPlan());
+    fireEvent.click(screen.getByText("View plan"));
+    expect(footer()).toEqual(["Close", "Allow", "Always", "Deny"]);
+    cleanup();
+    mount(
+      makeApproval({
+        plan: PLAN,
+        choice: true,
+        options: [
+          { option_id: "go", name: "Go", kind: "allow_once" },
+          { option_id: "wait", name: "Keep planning", kind: "allow_once" },
+        ],
+      }),
+    );
+    fireEvent.click(screen.getByText("View plan"));
+    expect(footer()).toEqual(["Close", "Go", "Keep planning", "Dismiss"]);
   });
 
   it("resolves from the modal footer with the card's decisions", () => {

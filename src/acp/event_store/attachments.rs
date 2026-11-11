@@ -5,6 +5,7 @@ use crate::daemon::PromptAttachmentKind;
 use crate::events;
 
 /// A decoded attachment ready to persist; the storage side of `PromptAttachmentUpload`.
+#[derive(Clone)]
 pub struct AttachmentBlob {
     pub id: String,
     pub kind: PromptAttachmentKind,
