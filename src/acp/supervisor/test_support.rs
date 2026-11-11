@@ -273,14 +273,21 @@ pub(super) fn channel_sink() -> (
     broadcast::Receiver<crate::server::AcpBroadcastFrame>,
     tempfile::TempDir,
 ) {
+    channel_sink_with_cache(Arc::new(crate::acp::control_cache::ControlStateCache::new()))
+}
+
+pub(super) fn channel_sink_with_cache(
+    cache: Arc<crate::acp::control_cache::ControlStateCache>,
+) -> (
+    Arc<ChannelSink>,
+    Arc<EventStore>,
+    broadcast::Receiver<crate::server::AcpBroadcastFrame>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::TempDir::new().unwrap();
     let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
     let (tx, rx) = broadcast::channel(16);
-    let sink = Arc::new(ChannelSink::new(
-        tx,
-        event_store.clone(),
-        Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    ));
+    let sink = Arc::new(ChannelSink::new(tx, event_store.clone(), cache));
     (sink, event_store, rx, tmp)
 }
 

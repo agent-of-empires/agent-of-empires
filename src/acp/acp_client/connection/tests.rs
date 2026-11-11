@@ -338,6 +338,18 @@ async fn spawn_fake_connection(
     close_after_prompt: bool,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
+    spawn_fake_connection_with(session_id, mode, close_after_prompt, None, None, on_prompt).await
+}
+
+/// `config_options` is the raw `configOptions` array `session/new` returns.
+async fn spawn_fake_connection_with(
+    session_id: &'static str,
+    mode: Option<ConnectMode>,
+    close_after_prompt: bool,
+    default_mode: Option<&'static str>,
+    config_options: Option<&'static str>,
+    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
+) -> FakeConnection {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
@@ -374,7 +386,7 @@ async fn spawn_fake_connection(
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
-        default_mode: None,
+        default_mode: default_mode.map(str::to_string),
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
@@ -384,6 +396,9 @@ async fn spawn_fake_connection(
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
     let reply_write = agent_write.clone();
+    let set_options = Arc::new(Mutex::new(Vec::new()));
+    let recorded = set_options.clone();
+    let options_json = config_options.unwrap_or("[]");
     let agent = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_read).lines();
         let mut new_sessions = 0;
@@ -405,10 +420,20 @@ async fn spawn_fake_connection(
                         format!("{session_id}-reset-{new_sessions}")
                     };
                     new_sessions += 1;
-                    vec![
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"sessionId":native}})
-                            .to_string(),
-                    ]
+                    vec![format!(
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{native}","configOptions":{options_json}}}}}"#
+                    )]
+                }
+                Some("session/set_config_option") => {
+                    let value = msg["params"]["value"].as_str().unwrap_or_default();
+                    recorded.lock().await.push(value.to_string());
+                    vec![format!(
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"configOptions":{}}}}}"#,
+                        options_json.replace(
+                            r#""currentValue":"auto""#,
+                            &format!(r#""currentValue":"{value}""#)
+                        )
+                    )]
                 }
                 Some("session/prompt") => on_prompt(id),
                 _ => continue,
@@ -432,108 +457,6 @@ async fn spawn_fake_connection(
         agent_write,
         pending_responders,
         replies: replies_rx,
-        event_queue,
-        connection,
-        agent,
-        set_options: Arc::new(Mutex::new(Vec::new())),
-        _cwd: temp,
-    }
-}
-
-async fn spawn_fake_connection_with(
-    session_id: &'static str,
-    default_mode: Option<&'static str>,
-    config_options: Option<&'static str>,
-    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
-) -> FakeConnection {
-    let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
-    let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
-    let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
-    let (event_tx, event_rx) = mpsc::channel(64);
-    let event_queue = event_tx.downgrade();
-    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
-    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
-    let temp = tempfile::tempdir().unwrap();
-    let cwd = temp.path().to_path_buf();
-    let params = ConnectionParams {
-        claude_home: None,
-        event_tx,
-        cmd_rx,
-        child: None,
-        pending_responders: Arc::new(Mutex::new(HashMap::new())),
-        resources: SessionResources {
-            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
-            terminals: TerminalManager::new(),
-            cwd,
-            label: session_id.to_string(),
-            sandbox: None,
-        },
-        mode: ConnectMode::Fresh {
-            stored_acp_session_id: None,
-            seed_history_replay: false,
-            prior_conversation: false,
-            fork_from: None,
-        },
-        ready_tx,
-        profile: &crate::acp::agent_profiles::GEMINI,
-        expected_agent: ExpectedAgent::Gemini,
-        source_profile: None,
-        default_effort: None,
-        default_model_config: Default::default(),
-        default_mode: default_mode.map(str::to_string),
-        default_model: None,
-        mcp_servers: Vec::new(),
-        runner: None,
-        cancellation: tokio_util::sync::CancellationToken::new(),
-        shutdown: tokio_util::sync::CancellationToken::new(),
-    };
-    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
-    let connection = tokio::spawn(run_connection_task(transport, params));
-    let reply_write = agent_write.clone();
-    let set_options = Arc::new(Mutex::new(Vec::new()));
-    let recorded = set_options.clone();
-    let options_json = config_options.unwrap_or("[]");
-    let agent = tokio::spawn(async move {
-        let mut lines = BufReader::new(agent_read).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
-            let id = &msg["id"];
-            let replies = match msg["method"].as_str() {
-                Some("initialize") => vec![format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
-                )],
-                Some("session/new") => vec![format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}","configOptions":{options_json}}}}}"#
-                )],
-                Some("session/set_config_option") => {
-                    let value = msg["params"]["value"].as_str().unwrap_or_default();
-                    recorded.lock().await.push(value.to_string());
-                    vec![format!(
-                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"configOptions":{}}}}}"#,
-                        options_json.replace(
-                            r#""currentValue":"auto""#,
-                            &format!(r#""currentValue":"{value}""#)
-                        )
-                    )]
-                }
-                Some("session/prompt") => on_prompt(id),
-                _ => continue,
-            };
-            for reply in replies {
-                write_line(&reply_write, &reply).await;
-            }
-        }
-    });
-    ready_rx
-        .await
-        .expect("handshake completes")
-        .expect("handshake ok");
-    FakeConnection {
-        event_rx,
-        cmd_tx,
-        agent_write,
-        pending_responders: Arc::new(Mutex::new(HashMap::new())),
-        replies: mpsc::unbounded_channel().1,
         event_queue,
         connection,
         agent,
@@ -670,12 +593,18 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
         // The connection only dispatches a prompt once session setup, default
         // mode included, is done; `ready_rx` fires before `session/new`.
         let (prompted_tx, mut prompted_rx) = mpsc::unbounded_channel();
-        let mut fake =
-            spawn_fake_connection_with("s-mode", default_mode, Some(MODE_OPTIONS), move |_| {
+        let mut fake = spawn_fake_connection_with(
+            "s-mode",
+            None,
+            false,
+            default_mode,
+            Some(MODE_OPTIONS),
+            move |_| {
                 let _ = prompted_tx.send(());
                 Vec::new()
-            })
-            .await;
+            },
+        )
+        .await;
         fake.cmd_tx
             .send(ClientCmd::Prompt(vec![ContentBlock::Text(
                 TextContent::new("hi"),

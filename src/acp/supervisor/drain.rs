@@ -1091,8 +1091,9 @@ mod tests {
             } else {
                 "s-uninstalled-running"
             };
-            let (sink, store, mut frames, _db) = channel_sink();
-            sink.control_cache().get_or_hydrate(id, || {
+            let cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
+            let (sink, store, mut frames, _db) = channel_sink_with_cache(cache.clone());
+            cache.get_or_hydrate(id, || {
                 (
                     AcpState::new(AcpSessionId(id.into()), AgentName("gemini".into()), None),
                     0,
@@ -1133,15 +1134,14 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            sink.flush();
             assert!(store.replay_from(id, 0).is_empty());
             assert!(!supervisor.next_seqs.lock().unwrap().contains_key(id));
             assert!(matches!(
                 frames.try_recv(),
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             ));
-            let state = sink
-                .control_cache()
-                .get_or_hydrate(id, || panic!("warm state must survive"));
+            let state = cache.get_or_hydrate(id, || panic!("warm state must survive"));
             assert_eq!(state.last_seq, 0);
         }
     }
@@ -1156,8 +1156,9 @@ mod tests {
         };
         let (_home, _temp) = isolate_home();
         let id = "s-evidence-fence";
-        let (sink, store, mut frames, _db) = channel_sink();
-        sink.control_cache().get_or_hydrate(id, || {
+        let cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
+        let (sink, store, mut frames, _db) = channel_sink_with_cache(cache.clone());
+        cache.get_or_hydrate(id, || {
             (
                 AcpState::new(AcpSessionId(id.into()), AgentName("gemini".into()), None),
                 0,
@@ -1195,6 +1196,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        sink.flush();
         assert!(supervisor
             .workers
             .lock()
@@ -1209,9 +1211,7 @@ mod tests {
             frames.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
-        let state = sink
-            .control_cache()
-            .get_or_hydrate(id, || panic!("the warm fold must survive"));
+        let state = cache.get_or_hydrate(id, || panic!("the warm fold must survive"));
         assert_eq!(state.last_seq, 0);
         assert_eq!(state.operation_error, None);
         assert_eq!(supervisor.worker_state(id).await, AcpWorkerState::Running);
@@ -1241,9 +1241,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let state = sink
-            .control_cache()
-            .get_or_hydrate(id, || panic!("fold remains warm"));
+        let state = cache.get_or_hydrate(id, || panic!("fold remains warm"));
         assert_eq!(state.sidebar_status(), Status::Error);
         assert!(!state.turn_active);
         assert_eq!(
