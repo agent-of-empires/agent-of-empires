@@ -184,26 +184,36 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
         .expect("session id")
         .to_string();
 
+    // A deadline only bounds failure, so the startup waits allow a cold start after a
+    // build. The claim-to-grid wait below is bound by the daemon's re-arm window instead.
+    const STARTUP: Duration = Duration::from_secs(30);
     h.spawn_tui();
-    h.wait_for_runtime_ready();
-    h.wait_for("Takeover");
+    let runtime_state = h.home_path().join("runtime-state");
+    crate::harness::wait_until(
+        STARTUP,
+        Duration::from_millis(100),
+        || match std::fs::read_to_string(&runtime_state) {
+            Ok(state) if state == "ready" => Ok(()),
+            last => Err(format!("runtime-state is {last:?}")),
+        },
+    );
+    h.wait_for_timeout("Takeover", STARTUP);
     h.send_keys("Enter");
-    h.wait_for_timeout("LIVE", Duration::from_secs(10));
+    h.wait_for_timeout("LIVE", STARTUP);
 
     let socket = h.home_path().join("tmux.sock");
     let agent_session = list_sessions_on(&socket)
         .into_iter()
         .find(|name| name.starts_with("aoe_dev_") && !name.starts_with("aoe_e2e_"))
         .expect("agent tmux session exists");
-    let tui_pipe =
-        crate::harness::wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
-            let owner = show_option(&socket, &agent_session, "@aoe_vt_owner");
-            if owner.is_empty() {
-                Err("the TUI preview never armed its VT pipe".to_string())
-            } else {
-                Ok(owner)
-            }
-        });
+    let tui_pipe = crate::harness::wait_until(STARTUP, Duration::from_millis(50), || {
+        let owner = show_option(&socket, &agent_session, "@aoe_vt_owner");
+        if owner.is_empty() {
+            Err("the TUI preview never armed its VT pipe".to_string())
+        } else {
+            Ok(owner)
+        }
+    });
 
     let api = app_dir_in(h.home_path()).join("daemon/api.sock");
     let runtime = tokio::runtime::Builder::new_current_thread()
