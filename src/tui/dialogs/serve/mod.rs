@@ -120,7 +120,7 @@ impl From<crate::cli::serve::TuiDashboardLaunchFailure> for ServeLaunchFailure {
             ) {
             crate::session::sanitized_load_failure(&error)
         } else {
-            tracing::warn!(target: "tui.home", %error, "dashboard launch failed");
+            tracing::warn!(target: "tui.home", error = %format_args!("{error:#}"), "dashboard launch failed");
             "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
         };
         let mut captured = Self::capture(message);

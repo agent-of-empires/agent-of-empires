@@ -31,7 +31,8 @@ on a host that supports `unshare`:
 cargo test --lib cli::serve::tests::tui_control_inspection_keeps_the_async_executor_reactive -- --exact --ignored --nocapture
 ```
 
-Missing prerequisites fail explicit runs. macOS runs this test normally.
+Missing prerequisites fail explicit Linux runs. On macOS this test runs by
+default and requires Python 3, so a missing `python3` also fails normal test runs.
 
 Creation-progress events are advisory and publish independently of session
 snapshots. Tests that need a published session must wait for its ID in the

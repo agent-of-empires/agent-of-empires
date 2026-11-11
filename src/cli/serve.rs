@@ -2119,7 +2119,10 @@ async fn await_daemon_ready<'a>(
             if let Some(status) = exited()? {
                 anyhow::bail!("Daemon exited before readiness ({status}).{log}");
             }
-            if ready().await? {
+            if ready()
+                .await
+                .with_context(|| format!("Failed to check Daemon readiness (PID {pid}).{log}"))?
+            {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2755,12 +2758,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn daemon_readiness_outcomes() {
         use std::os::unix::process::ExitStatusExt;
+        let pid = 42_424_242;
+        let log_path = "/private/readiness-fixture-e7f9.log";
+        let log = format!("\nLog: {log_path}");
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let mut polls = 0;
         let mut observed_ready = false;
         await_daemon_ready(
-            7,
-            "",
+            pid,
+            &log,
             far,
             || Ok(None),
             || {
@@ -2775,36 +2781,40 @@ mod tests {
         assert!(tokio::time::Instant::now() < far);
 
         let started = tokio::time::Instant::now();
-        await_daemon_ready(
-            7,
-            "",
+        let err = await_daemon_ready(
+            pid,
+            &log,
             far,
             || Ok(Some(std::process::ExitStatus::from_raw(1 << 8))),
             || panic!("readiness must not be probed after child exit"),
         )
         .await
         .unwrap_err();
+        assert!(err.to_string().contains(log_path), "{err:#}");
         assert_eq!(tokio::time::Instant::now(), started);
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
-        await_daemon_ready(
-            7,
-            "",
+        let err = await_daemon_ready(
+            pid,
+            &log,
             deadline,
             || Ok(None),
             || Box::pin(async { Ok(false) }),
         )
         .await
         .unwrap_err();
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert!(err.to_string().contains(&pid.to_string()), "{err:#}");
         assert_eq!(tokio::time::Instant::now(), deadline);
 
+        const PROBE_FAILURE: &str = "readiness fixture failure";
         let mut probe = Some(tokio::task::spawn_blocking(|| -> bool {
-            panic!("readiness fixture failure");
+            panic!("{PROBE_FAILURE}");
         }));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let err = await_daemon_ready(
-            7,
-            "",
+            pid,
+            &log,
             deadline,
             || Ok(None),
             || {
@@ -2824,6 +2834,9 @@ mod tests {
                 .is_some_and(|error| error.is_panic()),
             "{err:#}"
         );
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert!(err.to_string().contains(&pid.to_string()), "{err:#}");
+        assert!(format!("{err:#}").contains(PROBE_FAILURE), "{err:#}");
         assert!(tokio::time::Instant::now() < deadline);
     }
 
