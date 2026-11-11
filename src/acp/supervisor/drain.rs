@@ -1697,6 +1697,7 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(5), publishing)
                 .await
                 .unwrap();
+            sink.flush();
             if supersede {
                 assert!(matches!(result, OwnedPublication::Superseded));
                 assert!(!supervisor.next_seqs.lock().unwrap().contains_key(&row.id));
