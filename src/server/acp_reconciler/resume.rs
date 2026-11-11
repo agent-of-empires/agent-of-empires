@@ -903,6 +903,7 @@ mod tests {
                 text: "keep going".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
+                merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
             },
@@ -1058,6 +1059,7 @@ mod tests {
                 id,
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "original turn remains busy".into(),
                     attachments: vec![],
                     prompt_id: None,
@@ -1173,6 +1175,7 @@ mod tests {
                 text: "go".into(),
                 attachments: vec![],
                 prompt_id: None,
+                merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
             },

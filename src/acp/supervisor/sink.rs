@@ -541,7 +541,7 @@ mod tests {
                     "stalled",
                     "look".into(),
                     &[blob],
-                    None,
+                    Vec::new(),
                     false,
                     None,
                 ));

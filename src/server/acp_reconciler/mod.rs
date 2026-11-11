@@ -853,6 +853,7 @@ mod tests {
                 text: "go".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
+                merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
             },
