@@ -98,7 +98,24 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
         name: "Group",
         description: "Optional grouping for organization (Ctrl+P to browse existing groups)",
     },
+    FieldHelp {
+        name: "Prompt",
+        description:
+            "Optional first turn, sent once the agent is ready (Ctrl+P views a suggestion's source)",
+    },
 ];
+
+/// Where a prefilled prompt came from, shown with the Prompt row.
+#[derive(Clone)]
+pub struct PromptOrigin {
+    pub provider: String,
+    pub source_ref: String,
+    pub reason: String,
+    /// Untrusted provider text behind the prompt, shown on Ctrl+P.
+    pub source_text: Option<String>,
+    /// Links the created Session to the suggestion; `None` for "Start another".
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
+}
 
 #[derive(Clone)]
 #[cfg_attr(test, derive(Default))]
@@ -135,6 +152,9 @@ pub struct NewSessionData {
     /// Create in the structured (ACP) view instead of a tmux terminal. Only
     /// true for ACP-capable tools; `validate_structured_choice` enforces it.
     pub structured: bool,
+    /// First turn typed into the agent once it is ready.
+    pub initial_prompt: Option<String>,
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
 }
 
 /// The one conversion from wizard output to builder input, so a new field
@@ -282,6 +302,11 @@ pub struct NewSessionDialog {
     pub(super) fork_seed: Option<crate::session::ForkSeed>,
     /// The title the dialog was opened with, which the user did not type.
     pub(super) suggested_title: String,
+    /// First turn for the agent; `prompt_origin` is set only for a suggestion.
+    prompt: Input,
+    prompt_origin: Option<PromptOrigin>,
+    /// Overlay with `prompt_origin.source_text`, opened by Ctrl+P on the Prompt row.
+    pub(super) show_prompt_source: bool,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -471,6 +496,7 @@ pub(super) struct FieldIndices {
     pub worktree: usize,
     pub sandbox: usize,
     pub group: usize,
+    pub prompt: usize,
     /// One past the last focusable row, where Tab wraps.
     pub count: usize,
 }
@@ -660,6 +686,9 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            prompt: Input::default(),
+            prompt_origin: None,
+            show_prompt_source: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -688,6 +717,12 @@ impl NewSessionDialog {
     pub fn set_title(&mut self, title: String) {
         self.title = Input::new(title.clone());
         self.suggested_title = title;
+    }
+
+    /// Show an editable Prompt row for text a plugin proposed.
+    pub fn set_suggestion(&mut self, prompt: String, origin: PromptOrigin) {
+        self.prompt = Input::new(prompt);
+        self.prompt_origin = Some(origin);
     }
 
     pub fn set_fork_from(&mut self, seed: crate::session::ForkSeed) {
@@ -1099,6 +1134,7 @@ impl NewSessionDialog {
             worktree: take(!is_host_only),
             sandbox: take(self.docker_available && !is_host_only),
             group: take(true),
+            prompt: take(true),
             count: next,
         }
     }
@@ -1276,6 +1312,9 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            prompt: Input::default(),
+            prompt_origin: None,
+            show_prompt_source: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1362,6 +1401,9 @@ impl NewSessionDialog {
             scratch: false,
             fork_seed: None,
             suggested_title: String::new(),
+            prompt: Input::default(),
+            prompt_origin: None,
+            show_prompt_source: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1387,6 +1429,10 @@ impl NewSessionDialog {
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<NewSessionData>> {
         if self.show_help {
             self.show_help = false;
+            return Some(DialogResult::Continue);
+        }
+        if self.show_prompt_source {
+            self.show_prompt_source = false;
             return Some(DialogResult::Continue);
         }
 
@@ -1575,6 +1621,15 @@ impl NewSessionDialog {
             return DialogResult::Continue;
         }
 
+        if self.show_prompt_source {
+            let toggle =
+                key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL);
+            if toggle || matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                self.show_prompt_source = false;
+            }
+            return DialogResult::Continue;
+        }
+
         // The workspace-repo browser opens over the worktree overlay, so it
         // routes before the overlays.
         if self.dir_picker.is_active() {
@@ -1667,6 +1722,10 @@ impl NewSessionDialog {
                 self.refresh_inherited_sandbox_settings();
                 self.sandbox_config_mode = true;
                 self.sandbox_focused_field = 0;
+                return DialogResult::Continue;
+            }
+            if self.focused_field == fields.prompt && self.prompt_origin.is_some() {
+                self.show_prompt_source = true;
                 return DialogResult::Continue;
             }
         }
@@ -2338,6 +2397,7 @@ impl NewSessionDialog {
             n if n == fields.title => &mut self.title,
             n if n == fields.path => &mut self.path,
             n if n == fields.group => &mut self.group,
+            n if n == fields.prompt => &mut self.prompt,
             _ => &mut self.title,
         }
     }
@@ -2359,6 +2419,12 @@ impl NewSessionDialog {
             &mut self.worktree_branch
         } else if self.sandbox_config_mode && self.sandbox_focused_field == 0 {
             &mut self.sandbox_image
+        } else if self.focused_field == self.field_indices().prompt {
+            // The prompt is the one multi-line input: keep newlines.
+            for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+                self.prompt.handle(tui_input::InputRequest::InsertChar(ch));
+            }
+            return;
         } else {
             self.current_input_mut()
         };
@@ -2462,6 +2528,12 @@ impl NewSessionDialog {
             scratch: self.scratch,
             fork_seed: self.fork_seed.clone(),
             structured: self.structured_enabled && self.structured_capable,
+            initial_prompt: (!self.prompt.value().trim().is_empty())
+                .then(|| self.prompt.value().to_string()),
+            suggestion: self
+                .prompt_origin
+                .as_ref()
+                .and_then(|origin| origin.suggestion.clone()),
         })
     }
 
