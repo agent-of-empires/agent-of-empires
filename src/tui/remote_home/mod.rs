@@ -3,7 +3,7 @@
 //! Each session row carries its daemon-derived context-resume state.
 mod render;
 
-use std::io::Stdout;
+use crate::tui::terminal_output::Output;
 
 use crate::acp::client::HttpClient;
 use crate::daemon::DaemonEndpoint;
@@ -114,13 +114,11 @@ impl RemoteHomeState {
 /// down. Invoked from `tui::run` when `AOE_DAEMON_URL` is set.
 pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     use crossterm::event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     };
     use crossterm::execute;
-    use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-    };
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen};
     use std::io;
     use std::io::IsTerminal;
 
@@ -129,7 +127,7 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
     }
 
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = Output::default();
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -146,7 +144,7 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
     );
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = crate::tui::terminal_output::Terminal::new(backend)?;
     let mut event_stream = EventStream::new();
     let theme_name = resolve_theme_name();
     let palette_mode = resolve_theme_palette_mode();
@@ -154,40 +152,45 @@ pub async fn run_standalone(endpoint: DaemonEndpoint) -> Result<()> {
 
     let result = run(&mut terminal, &mut event_stream, &theme, endpoint).await;
 
-    #[cfg(unix)]
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    drop(terminal);
+    crate::tui::terminal_output::restore_after_exit(true, None, deadline)?;
     result
 }
 
 async fn run(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
     event_stream: &mut EventStream,
     theme: &Theme,
     endpoint: DaemonEndpoint,
 ) -> Result<()> {
     let mut state = RemoteHomeState::new(endpoint)?;
     refresh(&mut state).await;
-    terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
     #[cfg(feature = "e2e-tests")]
     crate::tui::app::e2e_render_ack(true)?;
+    draw(terminal, theme, &state)?;
 
-    while let Some(evt) = event_stream.next().await {
-        let Ok(evt) = evt else { return Ok(()) };
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(120));
+    loop {
+        let evt = tokio::select! {
+            event = event_stream.next() => {
+                let Some(event) = event else { return Ok(()); };
+                let Ok(event) = event else { return Ok(()); };
+                event
+            }
+            _ = ticker.tick() => {
+                if crate::tui::terminal_output::needs_redraw() { draw(terminal, theme, &state)?; }
+                continue;
+            }
+        };
         let CrosstermEvent::Key(key) = evt else {
             continue;
         };
         #[cfg(feature = "e2e-tests")]
         if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
-            terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
             crate::tui::app::e2e_render_ack(false)?;
+            draw(terminal, theme, &state)?;
             continue;
         }
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -198,7 +201,7 @@ async fn run(
             KeyCode::Char('r') => {
                 state.loading = true;
                 state.status_text = Some("refreshing…".to_string());
-                terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+                draw(terminal, theme, &state)?;
                 refresh(&mut state).await;
             }
             KeyCode::Char('s') => state.cycle_sort(),
@@ -216,13 +219,27 @@ async fn run(
                     )
                     .await?;
                     // Avoid a cursor query that races the live event stream.
-                    crate::tui::clear_terminal(terminal)?;
+                    crate::tui::terminal_output::request_redraw();
                 }
             }
             _ => {}
         }
-        terminal.draw(|f| render::render(f, f.area(), theme, &state))?;
+        draw(terminal, theme, &state)?;
     }
+}
+
+fn draw(
+    terminal: &mut Terminal<CrosstermBackend<Output>>,
+    theme: &Theme,
+    state: &RemoteHomeState,
+) -> Result<()> {
+    crate::tui::terminal_output::frame(|redraw| {
+        if redraw {
+            crate::tui::clear_terminal(terminal)?;
+        }
+        terminal.draw(|f| render::render(f, f.area(), theme, state))?;
+        Ok(())
+    })?;
     Ok(())
 }
 

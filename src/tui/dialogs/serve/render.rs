@@ -624,9 +624,13 @@ fn render_active(
             Style::default().fg(theme.waiting),
         ));
     }
-    if let Some((label, _)) = view.copied.filter(|(_, at)| at.elapsed() < FLASH_TTL) {
+    if let Some((message, _)) = view
+        .copied
+        .as_ref()
+        .filter(|(_, at)| at.elapsed() < FLASH_TTL)
+    {
         header_spans.push(Span::styled(
-            format!("  copied {label}"),
+            format!("  {message}"),
             Style::default().fg(theme.running),
         ));
     }

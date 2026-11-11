@@ -8,13 +8,50 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group, try_wait_status_hook,
+    restore_environment_value, terminate_process_group, try_wait_group_status,
 };
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = false;
 
 pub(crate) fn codex_managed_preferences_present() -> bool {
     false
+}
+
+pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    std::env::var_os("WAYLAND_DISPLAY")
+        .map(|_| ("wl-copy", &[] as &'static [&'static str]))
+        .into_iter()
+        .chain([
+            ("xclip", &["-selection", "clipboard"][..]),
+            ("xsel", &["--clipboard", "--input"][..]),
+        ])
+}
+
+pub(super) fn terminal_writable(
+    file: &std::fs::File,
+    remaining: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    let milliseconds = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(i32::MAX as u128) as i32;
+    // SAFETY: poll borrows one valid descriptor until it returns.
+    match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        -1 => Err(std::io::Error::last_os_error()),
+        _ if descriptor.revents & libc::POLLOUT != 0 => Ok(()),
+        _ => Err(std::io::ErrorKind::BrokenPipe.into()),
+    }
 }
 
 struct LegacyRuntimeDirectories {

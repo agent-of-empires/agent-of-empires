@@ -57,6 +57,7 @@ pub struct RetainedView {
     state: Option<StructuredViewState>,
     unfinished_outputs: Vec<crate::acp::transcript::UnfinishedToolOutput>,
     text_cache: Option<RetainedTextCache>,
+    paint_revision: Option<u64>,
     load: Option<tokio::task::JoinHandle<()>>,
     result: tokio::sync::oneshot::Receiver<
         Result<Option<crate::acp::client::http::RetainedReplay>, String>,
@@ -106,6 +107,7 @@ impl RetainedView {
             state: None,
             unfinished_outputs: Vec::new(),
             text_cache: None,
+            paint_revision: None,
             load: None,
             result,
             known_highest: None,
@@ -193,7 +195,23 @@ impl RetainedView {
             && self.generation == inst.lifecycle_generation
     }
 
+    pub(crate) fn paint_token(&self) -> Option<u64> {
+        self.paint_revision
+    }
+
+    pub(crate) fn matches_paint(&self, revision: u64) -> bool {
+        self.paint_revision == Some(revision)
+    }
+
     pub fn tick(&mut self) -> bool {
+        let changed = self.tick_update();
+        if changed {
+            self.paint_revision = None;
+        }
+        changed
+    }
+
+    fn tick_update(&mut self) -> bool {
         if self.load.is_none() {
             if Instant::now() >= self.next_read {
                 return self.start_read();
@@ -305,6 +323,7 @@ impl RetainedView {
         focused: bool,
     ) -> (render::TranscriptGeometry, bool) {
         use ratatui::{style::Style, widgets::Paragraph};
+        self.paint_revision = None;
         let mut status = Vec::new();
         render::wrap_line_into(
             ratatui::text::Line::from(self.message.clone()),
@@ -361,6 +380,7 @@ impl RetainedView {
                 text_area.width,
             );
         }
+        self.paint_revision = Some(super::state::next_interaction_revision());
         (
             render::TranscriptGeometry {
                 text_area,
@@ -391,6 +411,18 @@ pub struct EmbeddedView {
 }
 
 impl EmbeddedView {
+    pub(crate) fn interaction_revision(&self) -> u64 {
+        self.state.interaction_revision
+    }
+
+    pub(crate) fn confirm_presentation(&mut self, revision: u64) -> bool {
+        self.state.confirm_presentation(revision)
+    }
+
+    pub(crate) fn invalidate_presentation(&mut self) {
+        self.state.presentation_ready = false;
+    }
+
     /// Connect to `session_id` on an already-located daemon: hydrate the
     /// transcript, open the WebSocket, spawn the side-channel tasks. Startup
     /// errors surface as a toast. Starts in preview (inactive) state.
@@ -421,18 +453,19 @@ impl EmbeddedView {
         Ok(view)
     }
 
-    /// Test constructor: a mounted, non-activated view over a state that
-    /// never talks to a daemon. Lets App-level tests drive the paste-drain
-    /// handoff without a live connection.
+    /// Mounted fixture with controlled HTTP and caller-fed WebSocket messages.
+    /// No automatic connection, worker startup or side-channel tasks.
     #[cfg(test)]
-    pub(crate) fn for_test(session_id: &str) -> Self {
-        let endpoint = crate::daemon::DaemonEndpoint::new(
-            "http://127.0.0.1:8080".into(),
-            None,
-            crate::daemon::Source::Env,
-        );
+    pub(crate) fn for_test(session_id: &str, endpoint: Option<DaemonEndpoint>) -> Self {
+        let endpoint = endpoint.unwrap_or_else(|| {
+            crate::daemon::DaemonEndpoint::new(
+                "http://127.0.0.1:8080".into(),
+                None,
+                crate::daemon::Source::Env,
+            )
+        });
         let http =
-            crate::acp::client::HttpClient::new(endpoint.clone()).expect("fake endpoint client");
+            crate::acp::client::HttpClient::new(endpoint.clone()).expect("test endpoint client");
         Self {
             state: crate::tui::structured_view::StructuredViewState::new(
                 session_id.into(),
@@ -468,6 +501,7 @@ impl EmbeddedView {
     /// Enter interactive mode: the composer takes the keyboard and the caret
     /// shows. A pending approval re-grabs focus on the next reconcile.
     pub fn activate(&mut self) {
+        self.state.interaction_changed();
         self.active = true;
         if matches!(self.state.focus, super::input::Focus::Transcript) {
             self.state.focus = super::input::Focus::Composer;
@@ -480,6 +514,7 @@ impl EmbeddedView {
     /// Drops the plugin pane overlay (#2467): it is modal and keyed off focus, so
     /// leaving it up would paint an unclosable panel over the home preview.
     pub fn deactivate(&mut self) {
+        self.state.interaction_changed();
         self.active = false;
         self.state.close_plugin_pane();
     }
@@ -529,6 +564,7 @@ impl EmbeddedView {
             }
             EmbeddedEvent::SessionInfo(side) => super::apply_side_info(&mut self.state, side),
         }
+        self.state.reconcile_interaction_authority();
     }
 
     /// Route one terminal event (key / paste / mouse) through the
@@ -573,6 +609,7 @@ impl EmbeddedView {
         if area.width == 0 || area.height == 0 {
             return None;
         }
+        self.state.reconcile_interaction_authority();
         // The home view may have painted placeholder content this frame; the
         // structured renderer assumes an empty buffer and skips empty cells, so
         // reset the area or stale text shows through.
@@ -597,6 +634,7 @@ impl EmbeddedView {
     /// index when the paste leaves an open `@`-mention, so a paste forwarded from
     /// the home view lands in the same state a direct one would.
     pub async fn paste_text_with_file_load(&mut self, text: &str) {
+        self.state.interaction_changed();
         super::paste_into_composer(&mut self.state, text);
         super::ensure_files_loaded(&mut self.state, &mut self.toast_deadline).await;
     }
@@ -616,6 +654,32 @@ mod retained_tests {
     fn prepared_text(view: &mut RetainedView, width: u16) -> &ratatui::text::Text<'static> {
         view.prepare_text(width, &Theme::default());
         view.rendered_text(width).unwrap()
+    }
+
+    #[tokio::test]
+    async fn retained_refresh_failure_revokes_an_older_frame_receipt() {
+        let mut row = crate::session::Instance::new("retained receipt", "/tmp");
+        row.trash();
+        let mut view = RetainedView::new(None, &row);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                view.render(frame, frame.area(), &Theme::default(), 0, true);
+            })
+            .unwrap();
+        let revision = view
+            .paint_token()
+            .expect("retained projection was captured");
+        assert!(view.matches_paint(revision));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        view.result = receiver;
+        view.load = Some(tokio::spawn(async {}));
+        sender
+            .send(Err("controlled refresh failure".into()))
+            .unwrap();
+        assert!(view.tick());
+        assert!(!view.matches_paint(revision));
     }
 
     #[tokio::test]

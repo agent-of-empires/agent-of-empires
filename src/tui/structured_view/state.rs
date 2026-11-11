@@ -28,6 +28,21 @@ use crate::tui::plugin_ui;
 /// than the newest.
 const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
+pub(super) fn next_interaction_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut current = NEXT.load(Ordering::Relaxed);
+    loop {
+        let revision = current
+            .checked_add(1)
+            .expect("structured interaction identity overflow");
+        match NEXT.compare_exchange_weak(current, revision, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return revision,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
 pub struct StructuredViewState {
     pub session_id: String,
     pub endpoint: DaemonEndpoint,
@@ -109,6 +124,13 @@ pub struct StructuredViewState {
     /// Clickable popup rows and buttons painted by the most recent draw.
     /// Interior-mutable because the render borrows the state immutably.
     pub mouse_targets: std::cell::RefCell<MouseTargets>,
+    pub(crate) presentation_ready: bool,
+    pub(crate) pending_presentation: Option<(crate::tui::terminal_output::FrameId, u64)>,
+    pub(crate) interaction_revision: u64,
+    presented_interaction: u64,
+    interaction_approval: Option<String>,
+    interaction_elicitation: Option<String>,
+    interaction_focus: Focus,
     /// The button under the pointer. Visual only; never moves keyboard focus.
     pub hover: HoverState,
     /// Floating single-choice picker: the permission-mode picker (Shift+Tab), or
@@ -276,6 +298,39 @@ pub enum ToastKind {
 }
 
 impl StructuredViewState {
+    pub(crate) fn interaction_changed(&mut self) {
+        self.interaction_revision = next_interaction_revision();
+    }
+
+    pub(crate) fn interaction_presented(&self) -> bool {
+        self.presentation_ready && self.presented_interaction == self.interaction_revision
+    }
+
+    pub(crate) fn confirm_presentation(&mut self, revision: u64) -> bool {
+        self.presentation_ready = revision == self.interaction_revision;
+        if self.presentation_ready {
+            self.presented_interaction = revision;
+        }
+        self.presentation_ready
+    }
+
+    pub(crate) fn reconcile_interaction_authority(&mut self) {
+        let elicitation = self
+            .transcript
+            .pending_elicitations
+            .first()
+            .map(|pending| pending.nonce.as_str());
+        if self.interaction_approval.as_deref() != self.selected_approval.as_deref()
+            || self.interaction_focus != self.focus
+            || self.interaction_elicitation.as_deref() != elicitation
+        {
+            self.interaction_approval = self.selected_approval.clone();
+            self.interaction_elicitation = elicitation.map(str::to_owned);
+            self.interaction_focus = self.focus;
+            self.interaction_changed();
+        }
+    }
+
     /// Notices the daemon still reports that the user has not dismissed here
     /// and the notice policy has not hidden.
     pub fn visible_notices(&self) -> impl Iterator<Item = &SessionNotice> {
@@ -311,6 +366,7 @@ impl StructuredViewState {
         http: HttpClient,
         ws: Option<WsHandle>,
     ) -> Self {
+        let interaction_revision = next_interaction_revision();
         Self {
             transcript: AcpTranscript::new(session_id.clone()),
             session_id,
@@ -345,6 +401,13 @@ impl StructuredViewState {
             last_pane_scroll_max: std::cell::Cell::new(0),
             layout: None,
             mouse_targets: Default::default(),
+            presentation_ready: true,
+            pending_presentation: None,
+            interaction_revision,
+            presented_interaction: interaction_revision,
+            interaction_approval: None,
+            interaction_elicitation: None,
+            interaction_focus: Focus::Composer,
             hover: HoverState::default(),
             choice: None,
             auto_presented_elicitation: None,
@@ -367,6 +430,7 @@ impl StructuredViewState {
     /// baselines the seq watermark; one whose max seq regressed is treated as a
     /// daemon restart and re-baselines without toasting.
     pub fn ingest_plugin_ui(&mut self, snapshot: UiSnapshot) {
+        self.interaction_changed();
         let max_seq = plugin_ui::max_notification_seq(&snapshot);
         if !self.plugin_notify.initialized || max_seq < self.plugin_notify.last_seen_seq {
             self.plugin_notify.last_seen_seq = max_seq;
@@ -613,6 +677,7 @@ impl StructuredViewState {
             if matches!(self.focus, Focus::Approval) {
                 self.focus = Focus::Composer;
             }
+            self.reconcile_interaction_authority();
             return;
         }
         let selected_still_pending = self.selected_approval.as_ref().is_some_and(|selected| {
@@ -634,6 +699,7 @@ impl StructuredViewState {
         if self.choice.is_none() {
             self.focus = Focus::Approval;
         }
+        self.reconcile_interaction_authority();
     }
 }
 

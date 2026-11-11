@@ -6,8 +6,51 @@ use std::process::Command;
 
 pub(super) use super::unix::{
     close_frozen_payload, configure_process_group, exec_command, kill_process_group,
-    restore_environment_value, terminate_process_group, try_wait_status_hook,
+    restore_environment_value, terminate_process_group, try_wait_group_status,
 };
+
+pub(super) fn clipboard_commands() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
+{
+    std::iter::once(("pbcopy", &[] as &'static [&'static str]))
+}
+
+pub(super) fn terminal_writable(
+    file: &std::fs::File,
+    remaining: std::time::Duration,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if remaining.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    let fd = file.as_raw_fd();
+    if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    let mut writable = unsafe { std::mem::zeroed::<libc::fd_set>() };
+    let timeout = libc::timespec {
+        tv_sec: remaining.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+        tv_nsec: remaining.subsec_nanos().into(),
+    };
+    // Darwin's controlling-terminal alias supports select, not poll.
+    // SAFETY: the checked descriptor fits the live set; pselect borrows both locals.
+    let ready = unsafe {
+        libc::FD_ZERO(&mut writable);
+        libc::FD_SET(fd, &mut writable);
+        libc::pselect(
+            fd + 1,
+            std::ptr::null_mut(),
+            &mut writable,
+            std::ptr::null_mut(),
+            &timeout,
+            std::ptr::null(),
+        )
+    };
+    match ready {
+        0 => Err(std::io::ErrorKind::TimedOut.into()),
+        -1 => Err(std::io::Error::last_os_error()),
+        _ => Ok(()),
+    }
+}
 
 pub(crate) const HAS_CODEX_MANAGED_PREFERENCES: bool = true;
 

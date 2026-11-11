@@ -2,9 +2,8 @@
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::prelude::*;
@@ -89,9 +88,17 @@ impl UpdateStatus {
     }
 }
 
-pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<std::io::Stdout>;
+pub type TuiBackend = crate::tui::hyperlink::HyperlinkBackend<super::terminal_output::Output>;
+
+struct PendingPresentation {
+    frame: super::terminal_output::FrameId,
+    mouse_capture: bool,
+    retained: Option<u64>,
+    structured: Option<u64>,
+}
 
 pub struct App {
+    _clipboard: super::clipboard::Executor,
     home: HomeView,
     tool_detection: Option<ToolDetection>,
     available_tools_rx: Option<tokio::sync::oneshot::Receiver<AvailableTools>>,
@@ -127,6 +134,7 @@ pub struct App {
     /// Whether config permits mouse tracking at all.
     mouse_capture_allowed: bool,
     host_title: super::host_title::HostTitleTracker,
+    pending_presentation: Option<PendingPresentation>,
     /// Mosh mangles mouse-tracking escapes, so capture is never enabled under it.
     mosh_active: bool,
     // Actions that need the async loop, picked up after `execute_action`.
@@ -291,6 +299,10 @@ impl App {
         self.home.hyperlink_cells.clone()
     }
 
+    pub(super) fn clipboard_stop_handle(&self) -> super::clipboard::StopHandle {
+        self._clipboard.stop_handle()
+    }
+
     pub fn new(
         profile: &str,
         available_tools: AvailableTools,
@@ -321,6 +333,7 @@ impl App {
 
         let mut app = Self {
             home,
+            _clipboard: super::clipboard::Executor::new()?,
             tool_detection: None,
             available_tools_rx: None,
             pending_forced_tool_detection: false,
@@ -346,6 +359,7 @@ impl App {
             mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
             mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
             host_title: super::host_title::HostTitleTracker::default(),
+            pending_presentation: None,
             mosh_active,
             pending_structured_view_open: None,
             preview_mount_pending: None,
@@ -458,19 +472,22 @@ impl App {
         self.finish_startup_dialogs(true)
     }
 
-    fn sync_mouse_capture(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
+    fn sync_mouse_capture(
+        &mut self,
+        terminal: &mut Terminal<TuiBackend>,
+        force: bool,
+    ) -> Result<bool> {
         let desired =
             self.mouse_capture_allowed && !self.mosh_active && !self.home.wants_text_selection();
-        if desired == self.mouse_captured {
-            return Ok(());
+        if !force && desired == self.mouse_captured {
+            return Ok(desired);
         }
         if desired {
             crossterm::execute!(terminal.backend_mut(), EnableMouseCapture)?;
         } else {
             crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
         }
-        self.mouse_captured = desired;
-        Ok(())
+        Ok(desired)
     }
 
     /// Write OSC 0 after the frame, so it can't interleave with OSC 8 runs.
@@ -489,6 +506,67 @@ impl App {
     /// Draw inside a synchronized update. The cursor is hidden first so an IME
     /// candidate window isn't dragged by transient cursor moves.
     fn draw(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
+        let mut mouse_capture = None;
+        let outcome = super::terminal_output::frame(|redraw| {
+            if redraw {
+                crate::tui::clear_terminal(terminal)?;
+                self.host_title.invalidate();
+            }
+            mouse_capture = Some(self.sync_mouse_capture(terminal, redraw)?);
+            self.draw_frame(terminal)
+        })?;
+        if let Some(frame) = outcome.captured {
+            self.pending_presentation = Some(PendingPresentation {
+                frame,
+                mouse_capture: mouse_capture.expect("captured frame mouse mode"),
+                retained: self
+                    .home
+                    .retained_preview
+                    .as_ref()
+                    .and_then(|view| view.paint_token()),
+                structured: self
+                    .home
+                    .structured_preview
+                    .as_ref()
+                    .map(|view| view.interaction_revision()),
+            });
+        }
+        let matching = self
+            .pending_presentation
+            .as_ref()
+            .is_some_and(|pending| outcome.presented == Some(pending.frame));
+        if matching {
+            let pending = self.pending_presentation.take().expect("presented frame");
+            self.mouse_captured = pending.mouse_capture;
+            self.home.presentation_ready = match (&pending.retained, &self.home.retained_preview) {
+                (Some(revision), Some(view)) => view.matches_paint(*revision),
+                (None, None) => true,
+                (None, Some(view)) => view.paint_token().is_none(),
+                _ => false,
+            };
+            let structured_matches =
+                match (pending.structured, self.home.structured_preview.as_mut()) {
+                    (Some(revision), Some(view)) => view.confirm_presentation(revision),
+                    (None, None) => true,
+                    _ => false,
+                };
+            self.home.presentation_ready &= structured_matches;
+        } else {
+            self.home.invalidate_presentation();
+            self.host_title.invalidate();
+        }
+        if !self.home.presentation_ready {
+            self.home.invalidate_presentation();
+            super::terminal_output::request_redraw();
+        }
+        #[cfg(feature = "e2e-tests")]
+        if self.home.presentation_ready {
+            e2e_report_runtime(self.home.runtime_settled());
+        }
+        Ok(())
+    }
+
+    fn draw_frame(&mut self, terminal: &mut Terminal<TuiBackend>) -> Result<()> {
         // A visible caret (active embedded view, or live-send without an
         // overlay) strobes if hidden before every redraw.
         let embedded_active = self
@@ -521,36 +599,47 @@ impl App {
         draw_result?;
         end_result?;
         self.sync_host_title(terminal)?;
-        #[cfg(feature = "e2e-tests")]
-        e2e_report_runtime(self.home.runtime_settled());
         Ok(())
+    }
+
+    fn admit_terminal_handoff(&mut self) -> Result<Option<super::terminal_output::Suspension>> {
+        self.pending_presentation = None;
+        self.home.invalidate_presentation();
+        self.host_title.invalidate();
+        let mut suspension = match super::terminal_output::suspend() {
+            Ok(suspension) => suspension,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.set_status(
+                    "Terminal output is busy; retry after clipboard or screen output finishes.",
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error).context("admit terminal handoff"),
+        };
+        if !suspension
+            .begin_handoff()
+            .context("prepare terminal handoff")?
+        {
+            self.set_status("Terminal output is busy; retry after terminal restoration finishes.");
+            return Ok(None);
+        }
+        self.mouse_captured = false;
+        Ok(Some(suspension))
     }
 
     /// Leave TUI mode, run `f`, and restore it. The event stream is dropped so
     /// children get exclusive stdin.
     fn with_raw_mode_disabled<F, R>(
         &mut self,
-        terminal: &mut Terminal<TuiBackend>,
+        _suspension: super::terminal_output::Suspension,
         f: F,
     ) -> Result<R>
     where
         F: FnOnce() -> R,
     {
+        self.pending_presentation = None;
+        self.home.invalidate_presentation();
         crossterm::terminal::disable_raw_mode()?;
-        // Popped and repushed around the child so tmux sees a clean terminal.
-        #[cfg(unix)]
-        let _ = crossterm::execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-        crossterm::execute!(
-            terminal.backend_mut(),
-            crossterm::terminal::LeaveAlternateScreen,
-            DisableBracketedPaste,
-        )?;
-        if self.mouse_captured {
-            crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
-        }
-        crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Show)?;
-        self.mouse_captured = false;
-        std::io::Write::flush(terminal.backend_mut())?;
         self.event_stream.take();
 
         #[cfg(unix)]
@@ -562,26 +651,12 @@ impl App {
         drop(_signals_guard);
 
         crossterm::terminal::enable_raw_mode()?;
-        crossterm::execute!(
-            terminal.backend_mut(),
-            crossterm::terminal::EnterAlternateScreen,
-            EnableBracketedPaste,
-            crossterm::cursor::Hide
-        )?;
-        #[cfg(unix)]
-        let _ = crossterm::execute!(
-            terminal.backend_mut(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        );
-        self.sync_mouse_capture(terminal)?;
+        self.needs_redraw = true;
         // Attach may have overwritten the host tab via the pane's OSC 0.
         self.host_title.invalidate();
-        self.sync_host_title(terminal)?;
-        std::io::Write::flush(terminal.backend_mut())?;
 
         // Recreated only after raw mode is back, so it isn't born on a cooked tty.
         self.event_stream = Some(EventStream::new());
-        crate::tui::clear_terminal(terminal)?;
         #[cfg(feature = "e2e-tests")]
         if let Some(path) = std::env::var_os("AOE_E2E_INPUT_BARRIER") {
             let path = std::path::PathBuf::from(path).with_extension("resumed");
@@ -629,14 +704,11 @@ impl App {
         // cache here: startup must paint before any tmux deadline.
         crate::tmux::spawn_snapshot_poller();
 
-        crate::tui::clear_terminal(terminal)?;
-        // This clear satisfies any pending redraw; honoring it on the first tick
-        // would blank the first frame until the next paint.
+        super::terminal_output::request_redraw();
         self.needs_redraw = false;
-        self.sync_mouse_capture(terminal)?;
-        self.draw(terminal)?;
         #[cfg(feature = "e2e-tests")]
         e2e_render_ack(true)?;
+        self.draw(terminal)?;
 
         self.spawn_tool_detection(false);
         tokio::spawn(async {
@@ -717,7 +789,7 @@ impl App {
 
         loop {
             if self.needs_redraw {
-                crate::tui::clear_terminal(terminal)?;
+                super::terminal_output::request_redraw();
                 self.needs_redraw = false;
             }
 
@@ -744,8 +816,8 @@ impl App {
                                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                                 #[cfg(feature = "e2e-tests")]
                                 if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
-                                    self.draw(terminal)?;
                                     e2e_render_ack(false)?;
+                                    self.draw(terminal)?;
                                     continue;
                                 }
                                 if self.handle_runtime_gate_key(key) {
@@ -848,8 +920,13 @@ impl App {
                                         match evt {
                                             Event::Key(k) => { self.handle_key(k, terminal).await?; }
                                             Event::Paste(text) => { self.home.handle_paste(&text); }
-                                            Event::Resize(_, _) => { terminal.autoresize()?; self.needs_redraw = true; }
+                                            Event::Resize(_, _) => {
+                                                self.home.invalidate_presentation();
+                                                self.needs_redraw = true;
+                                                super::terminal_output::request_redraw();
+                                            }
                                             Event::Mouse(mouse) => {
+                                                if !self.home.presentation_ready { continue; }
                                                 let hit_list = self.home.hit_list(mouse.column, mouse.row);
                                                 let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                                                 let hit_diff = self.home.is_diff_open()
@@ -917,6 +994,7 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            if !self.home.presentation_ready { continue; }
                             if !matches!(mouse.kind, MouseEventKind::Moved) {
                                 crate::session::write_tui_activity();
                             }
@@ -1032,8 +1110,8 @@ impl App {
                                         match crate::tui::open_url::open_url(&url) {
                                             Ok(()) => format!("opened {url}"),
                                             Err(e) => {
-                                                crate::tui::clipboard::copy_to_clipboard(&url);
-                                                format!("{e}; copied {url}")
+                                                let copy = crate::tui::clipboard::copy_to_clipboard(&url);
+                                                format!("{e}; {copy}")
                                             }
                                         };
                                     self.home.flash_status(status);
@@ -1171,7 +1249,8 @@ impl App {
                                 self.draw(terminal)?;
                             }
                             if let Some(text) = self.home.take_preview_copy_text() {
-                                crate::tui::clipboard::copy_to_clipboard(&text);
+                                let message = crate::tui::clipboard::copy_to_clipboard(&text);
+                                self.home.flash_status(message);
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
@@ -1301,10 +1380,14 @@ impl App {
                 }
             }
 
-            let mut refresh_needed = false;
+            let mut refresh_needed = super::terminal_output::needs_redraw();
             let mut needs_full_refresh = false;
 
             needs_full_refresh |= self.home.expire_status_flash();
+            if let Some(message) = self._clipboard.feedback() {
+                self.home.clipboard_feedback(message);
+                refresh_needed = true;
+            }
 
             // Drag scrolling uses diffed repaint, not a full terminal clear.
             needs_full_refresh |= self.home.tick_preview_autoscroll();
@@ -1346,7 +1429,7 @@ impl App {
                 use crate::tui::home::panes::PaneIntent;
                 match ready.intent {
                     PaneIntent::Preview => self.needs_redraw = true,
-                    PaneIntent::Attach => self.attach_native_target(ready, terminal)?,
+                    PaneIntent::Attach => self.attach_native_target(ready)?,
                     PaneIntent::LiveSend(target) => {
                         // The toast that covered the revive settles with the
                         // receipt, exactly as the blocking path used to.
@@ -1434,7 +1517,7 @@ impl App {
                             .unwrap_or(self.mouse_capture_allowed);
                         if mouse_capture_allowed != self.mouse_capture_allowed {
                             self.mouse_capture_allowed = mouse_capture_allowed;
-                            self.sync_mouse_capture(terminal)?;
+                            self.needs_redraw = true;
                         }
                     }
                     last_disk_refresh = std::time::Instant::now();
@@ -1893,7 +1976,6 @@ impl App {
         &mut self,
         method: crate::update::install::InstallMethod,
         version: String,
-        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         use crate::update::install::InstallMethod;
 
@@ -1904,10 +1986,13 @@ impl App {
         );
 
         if matches!(method, InstallMethod::Homebrew { .. }) || needs_sudo {
+            let Some(suspension) = self.admit_terminal_handoff()? else {
+                return Ok(());
+            };
             self.set_status(format!("updating to v{version}…"));
             let method_clone = method.clone();
             let version_clone = version.clone();
-            let result = self.with_raw_mode_disabled(terminal, move || {
+            let result = self.with_raw_mode_disabled(suspension, move || {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         crate::update::install::perform_update(&method_clone, &version_clone, None)
@@ -2190,10 +2275,7 @@ pub(crate) fn e2e_render_ack(initial: bool) -> Result<()> {
         std::fs::read_to_string(&path)?.parse::<u64>()? + 1
     };
     std::fs::write(path, sequence.to_string())?;
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::SetTitle(format!("aoe-e2e-{sequence}"))
-    )?;
+    super::terminal_output::acknowledge(sequence);
     Ok(())
 }
 
@@ -2205,8 +2287,8 @@ impl App {
     ) -> Result<()> {
         #[cfg(feature = "e2e-tests")]
         if key.code == KeyCode::F(12) && std::env::var_os("AOE_E2E_INPUT_BARRIER").is_some() {
-            self.draw(terminal)?;
             e2e_render_ack(false)?;
+            self.draw(terminal)?;
             return Ok(());
         }
         let ctrl_c = key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL;
@@ -2904,13 +2986,13 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::RecheckAgents => self.spawn_tool_detection(true),
             Action::AttachSession(id) => {
-                self.attach_session(&id, terminal)?;
+                self.attach_session(&id)?;
             }
             Action::AttachTerminal(id, mode) => {
                 self.attach_terminal(&id, mode);
             }
             Action::EditFile(path) => {
-                self.edit_file(&path, terminal)?;
+                self.edit_file(&path)?;
             }
             Action::StopSession(id) => {
                 if self.home.get_instance(&id).is_none() {
@@ -2931,7 +3013,7 @@ impl App {
                     self.set_status("update already in progress");
                     return Ok(());
                 }
-                self.spawn_update(method, version, terminal)?;
+                self.spawn_update(method, version)?;
             }
             Action::SetTransientStatus(text) => {
                 self.set_status(text);
@@ -3028,17 +3110,14 @@ impl App {
             Some(crate::session::AttachMode::LiveSend) => {
                 self.execute_action(Action::EnterLiveSend(session_id.to_string()), terminal)
             }
-            Some(crate::session::AttachMode::Tmux) | None => {
-                self.attach_session(session_id, terminal)
-            }
+            Some(crate::session::AttachMode::Tmux) | None => self.attach_session(session_id),
         }
     }
 
-    fn attach_session(
-        &mut self,
-        session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
-    ) -> Result<()> {
+    fn attach_session(&mut self, session_id: &str) -> Result<()> {
+        let Some(suspension) = self.admit_terminal_handoff()? else {
+            return Ok(());
+        };
         let instance = match self.home.get_instance(session_id) {
             Some(inst) => inst.clone(),
             None => return Ok(()),
@@ -3131,14 +3210,14 @@ impl App {
             return Ok(());
         }
 
-        self.attach_live_session(session_id, terminal)
+        self.attach_live_session(session_id, suspension)
     }
 
     /// Attach to `session_id`'s running tmux pane and settle the row on return.
     fn attach_live_session(
         &mut self,
         session_id: &str,
-        terminal: &mut Terminal<TuiBackend>,
+        suspension: super::terminal_output::Suspension,
     ) -> Result<()> {
         if !self.home.session_feed.native_interaction_available() {
             return Ok(());
@@ -3151,7 +3230,7 @@ impl App {
         // terminal, and re-assert preview geometry afterwards.
         tmux_session.reset_size_to_latest_client();
         self.home.clear_preview_pane_sync(session_id);
-        let attach_result = self.with_raw_mode_disabled(terminal, || tmux_session.attach())?;
+        let attach_result = self.with_raw_mode_disabled(suspension, || tmux_session.attach())?;
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
@@ -3210,16 +3289,18 @@ impl App {
     fn attach_native_target(
         &mut self,
         ready: crate::tui::home::ReadyNativeAttachment,
-        terminal: &mut Terminal<TuiBackend>,
     ) -> Result<()> {
         if !ready.lease.is_valid() {
             return Ok(());
         }
+        let Some(suspension) = self.admit_terminal_handoff()? else {
+            return Ok(());
+        };
         let target = crate::tmux::Session::from_name(&ready.tmux_name);
         let lease = ready.lease;
         self.home.clear_preview_pane_sync(&ready.id);
         let attach_result = self.with_raw_mode_disabled(
-            terminal,
+            suspension,
             Box::new(move || {
                 anyhow::ensure!(lease.is_valid(), "Native interaction permission revoked");
                 target.reset_size_to_latest_client();
@@ -3269,11 +3350,10 @@ impl App {
         self.set_status(status);
     }
 
-    fn edit_file(
-        &mut self,
-        path: &std::path::Path,
-        terminal: &mut Terminal<TuiBackend>,
-    ) -> Result<()> {
+    fn edit_file(&mut self, path: &std::path::Path) -> Result<()> {
+        let Some(suspension) = self.admit_terminal_handoff()? else {
+            return Ok(());
+        };
         let editor = std::env::var("EDITOR")
             .ok()
             .or_else(|| {
@@ -3293,7 +3373,7 @@ impl App {
 
         let path = path.to_owned();
         let editor_clone = editor.clone();
-        let status = self.with_raw_mode_disabled(terminal, move || {
+        let status = self.with_raw_mode_disabled(suspension, move || {
             let mut cmd = std::process::Command::new(&editor_clone);
             cmd.arg(&path);
             // SIG_IGN from `IgnoreSignalsGuard` would survive exec.
@@ -3430,6 +3510,635 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn child_handoff_restores_real_raw_input_before_blocked_screen_controls() {
+        use crate::tui::terminal_output::{install_test_output, tests::private_terminal};
+        use std::io::{Read, Write};
+        use std::os::unix::process::CommandExt;
+        if let Some(directory) = std::env::var_os("AOE_TEST_CONTROL_RESTORE_CHILD") {
+            use std::os::unix::fs::OpenOptionsExt;
+            let directory = std::path::PathBuf::from(directory);
+            let failure = directory.join("panic");
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = std::fs::write(&failure, info.to_string());
+            }));
+            let _home = crate::session::test_support::isolate_app_dir_at(&directory.join("home"));
+            crate::session::get_profile_dir("test").unwrap();
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open("/dev/tty")
+                .unwrap();
+            let mut control = slave.try_clone().unwrap();
+            let (_output_guard, _) = install_test_output(slave);
+            let mut app = App::new(
+                "test",
+                AvailableTools::with_tools(&[]),
+                true,
+                false,
+                crate::file_watch::FileWatchService::noop(),
+            )
+            .unwrap();
+            app.home.pending_paste = Some("kept draft".into());
+            let mut terminal = output_test_terminal();
+            crossterm::terminal::enable_raw_mode().unwrap();
+            app.event_stream = Some(EventStream::new());
+            let suspension = app.admit_terminal_handoff().unwrap().unwrap();
+            let marker = directory.join("child-count");
+            let result = app
+                .with_raw_mode_disabled(suspension, || {
+                    let status = std::process::Command::new("/bin/sh")
+                        .args(["-c", "printf child >> \"$1\"", "controlled-child"])
+                        .arg(&marker)
+                        .status()
+                        .unwrap();
+                    std::fs::write(directory.join("pause-drainer"), b"ready").unwrap();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !directory.join("drainer-stopped").exists() {
+                        assert!(std::time::Instant::now() < deadline, "drainer did not stop");
+                        std::thread::yield_now();
+                    }
+                    // Keep output running: input must work with a naturally full queue,
+                    // independently of TCOOFF and platform-specific IXANY behavior.
+                    loop {
+                        match control.write(&[b'?'; 4096]) {
+                            Ok(0) => panic!("private terminal closed while filling"),
+                            Ok(_) => assert!(std::time::Instant::now() < deadline),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(error) => panic!("fill private terminal: {error}"),
+                        }
+                    }
+                    std::fs::write(directory.join("output-paused"), b"ready").unwrap();
+                    status
+                })
+                .unwrap();
+            std::fs::write(directory.join("handoff-returned"), b"ready").unwrap();
+            assert!(result.success());
+            assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
+            assert!(app.event_stream.is_some());
+            assert_eq!(app.home.pending_paste.as_deref(), Some("kept draft"));
+            app.draw(&mut terminal).unwrap();
+            assert!(!app.home.presentation_ready);
+            std::fs::write(directory.join("waiting-input"), b"ready").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match app.event_stream.as_mut().unwrap().next().await {
+                        Some(Ok(Event::Key(key))) if key.code == KeyCode::Char('x') => break,
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => panic!("private terminal input failed: {error}"),
+                        None => panic!("private terminal input stream ended"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&marker).unwrap(), b"child");
+            std::fs::write(directory.join("input-ack"), b"ready").unwrap();
+            let mut refresh = tokio::time::interval(Duration::from_millis(10));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !app.home.presentation_ready {
+                    refresh.tick().await;
+                    app.draw(&mut terminal).unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            assert!(result.success());
+            assert_eq!(std::fs::read(marker).unwrap(), b"child");
+            crossterm::terminal::disable_raw_mode().unwrap();
+            std::fs::write(directory.join("proof"), b"raw-input-and-screen-restored").unwrap();
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let (mut master, slave) = private_terminal();
+        let mut input = master.try_clone().unwrap();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                &format!(
+                    "{}::child_handoff_restores_real_raw_input_before_blocked_screen_controls",
+                    module_path!().split_once("::").unwrap().1
+                ),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AOE_TEST_CONTROL_RESTORE_CHILD", directory.path())
+            .stdin(std::process::Stdio::from(slave.try_clone().unwrap()))
+            .stdout(std::process::Stdio::from(slave.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(slave.try_clone().unwrap()));
+        // SAFETY: the child executes only async-signal-safe syscalls before exec.
+        // Its controlling terminal is this private PTY, never the user's terminal.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(command);
+        drop(slave);
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stopped.clone();
+        let drain_directory = directory.path().to_path_buf();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let mut scratch = [0; 4096];
+            loop {
+                if drain_directory.join("pause-drainer").exists()
+                    && !drain_directory.join("input-ack").exists()
+                    && !done.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    std::fs::write(drain_directory.join("drainer-stopped"), b"ready").unwrap();
+                    while !drain_directory.join("input-ack").exists()
+                        && !done.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+                match master.read(&mut scratch) {
+                    Ok(0) => break,
+                    Ok(count) => bytes.extend_from_slice(&scratch[..count]),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if done.load(std::sync::atomic::Ordering::Acquire) {
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) => panic!("read child PTY: {error}"),
+                }
+            }
+            bytes
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut sent = false;
+        let mut input_error = None;
+        let status = loop {
+            if !sent && directory.path().join("waiting-input").exists() {
+                match input.write(b"x") {
+                    Ok(1) => sent = true,
+                    Ok(_) => break None,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(error) => {
+                        input_error = Some(error);
+                        break None;
+                    }
+                }
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::yield_now();
+        };
+        let mut kill_error = None;
+        if status.is_none() {
+            kill_error = child.kill().err();
+            let reap_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while child.try_wait().unwrap().is_none() && std::time::Instant::now() < reap_deadline {
+                std::thread::yield_now();
+            }
+        }
+        drop(input);
+        stopped.store(true, std::sync::atomic::Ordering::Release);
+        let emitted = reader.join().unwrap();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "child failed (backpressured={}, handoff_returned={}, waiting_input={}, sent={sent}, input_error={input_error:?}, kill_error={kill_error:?}, private_child_panic={:?}): {}",
+            directory.path().join("output-paused").exists(),
+            directory.path().join("handoff-returned").exists(),
+            directory.path().join("waiting-input").exists(),
+            std::fs::read_to_string(directory.path().join("panic")),
+            String::from_utf8_lossy(&emitted)
+        );
+        assert!(
+            sent,
+            "private raw input was exercised before the output drainer resumed"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("proof")).unwrap(),
+            b"raw-input-and-screen-restored"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("child-count")).unwrap(),
+            b"child"
+        );
+        assert!(emitted
+            .windows(b"\x1b[?1049h".len())
+            .any(|bytes| bytes == b"\x1b[?1049h"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn embedded_pending_frame_cannot_authorize_a_replacement_approval() {
+        use crate::tui::structured_view::{
+            approval_sink_for_test, approval_update_for_test,
+            embedded::{EmbeddedEvent, EmbeddedView},
+        };
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{
+                block_terminal, drain_terminal, private_terminal, read_terminal_until,
+                resume_terminal,
+            },
+        };
+        let home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut row =
+            crate::session::Instance::new("approval presentation", home.path().to_str().unwrap());
+        row.view = crate::session::View::Structured;
+        row.source_profile = "test".into();
+        crate::session::Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let (endpoint, calls, server) = approval_sink_for_test().await;
+        let mut view = EmbeddedView::for_test(&row.id, Some(endpoint));
+        view.apply_event(EmbeddedEvent::Ws(Some(Ok(approval_update_for_test(
+            "approval-A",
+            1,
+        )))))
+        .await;
+        view.activate();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.selected_session = Some(row.id.clone());
+        app.home.structured_preview = Some(view);
+        let (mut master, slave) = private_terminal();
+        let mut control = slave.try_clone().unwrap();
+        let (_guard, _) = install_test_output(slave);
+        let mut terminal = output_test_terminal();
+        let mut emitted = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+            if app.home.presentation_ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+        }
+        read_terminal_until(&mut master, &mut emitted, b"approval-A");
+        fn visible_allow(app: &mut App) -> (u16, u16) {
+            let view = app.home.structured_preview.as_mut().unwrap();
+            view.handle_hover(0, 0);
+            for row in 0..40 {
+                for col in 0..200 {
+                    if view.handle_hover(col, row) {
+                        return (col, row);
+                    }
+                }
+            }
+            panic!("visible approval has no actionable Allow button");
+        }
+        let allow = visible_allow(&mut app);
+        block_terminal(&mut control);
+        crate::tui::terminal_output::request_redraw();
+        app.draw(&mut terminal).unwrap();
+        assert!(app.pending_presentation.is_some());
+        app.home
+            .structured_preview
+            .as_mut()
+            .unwrap()
+            .apply_event(EmbeddedEvent::Ws(Some(Ok(approval_update_for_test(
+                "approval-B",
+                2,
+            )))))
+            .await;
+        resume_terminal(&control);
+        while app.pending_presentation.is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+        }
+        assert!(!app.home.presentation_ready);
+        let click = |(column, row)| {
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let view = app.home.structured_preview.as_mut().unwrap();
+        view.handle_event(click(allow)).await.unwrap();
+        view.handle_event(Event::Key(KeyEvent::from(KeyCode::Char('a'))))
+            .await
+            .unwrap();
+        view.handle_event(Event::Paste("typed while pending".into()))
+            .await
+            .unwrap();
+        assert!(calls.lock().unwrap().is_empty());
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+            if app.home.presentation_ready {
+                break;
+            }
+        }
+        let allow = visible_allow(&mut app);
+        app.home
+            .structured_preview
+            .as_mut()
+            .unwrap()
+            .handle_event(click(allow))
+            .await
+            .unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["approval-B"]);
+        assert_eq!(
+            app.home
+                .structured_preview
+                .as_ref()
+                .unwrap()
+                .composer_text(),
+            "typed while pending"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admitted_but_backpressured_handoff_controls_refuse_children_and_keep_input() {
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{
+                block_terminal, drain_terminal, private_terminal, read_terminal_until,
+                resume_terminal,
+            },
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let marker = home.path().join("editor-started");
+        let editor = home.path().join("controlled-editor");
+        std::fs::write(
+            &editor,
+            format!("#!/bin/sh\nprintf child > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _editor = crate::session::test_support::EnvGuard::set(&[("EDITOR", editor)]);
+        let row =
+            crate::session::Instance::new("control backpressure", home.path().to_str().unwrap());
+        crate::session::Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![row.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.pending_paste = Some("unsubmitted input".into());
+        let raw_before = crossterm::terminal::is_raw_mode_enabled().unwrap();
+        let stream_before = app.event_stream.is_some();
+        let (mut master, slave) = private_terminal();
+        let mut control = slave.try_clone().unwrap();
+        let (_guard, _) = install_test_output(slave);
+        let mut terminal = output_test_terminal();
+        block_terminal(&mut control);
+        // No OSC owner and no pending frame: suspend admission succeeds; the
+        // following real control transaction, not its mutex, is backpressured.
+        for action in [
+            Action::AttachSession(row.id),
+            Action::EditFile(home.path().join("file.rs")),
+        ] {
+            app.execute_action(action, &mut terminal).unwrap();
+            assert!(!app.should_quit);
+            assert_eq!(app.home.pending_paste.as_deref(), Some("unsubmitted input"));
+            assert_eq!(app.event_stream.is_some(), stream_before);
+            assert_eq!(
+                crossterm::terminal::is_raw_mode_enabled().unwrap(),
+                raw_before
+            );
+            assert!(!marker.exists());
+        }
+        resume_terminal(&control);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut emitted = Vec::new();
+        while !app.home.presentation_ready {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+        }
+        read_terminal_until(&mut master, &mut emitted, b"\x1b[?1049h");
+        let leave = emitted
+            .windows(b"\x1b[?1049l".len())
+            .position(|bytes| bytes == b"\x1b[?1049l")
+            .unwrap();
+        let restore = emitted
+            .windows(b"\x1b[?1049h".len())
+            .position(|bytes| bytes == b"\x1b[?1049h")
+            .unwrap();
+        assert!(leave < restore);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    fn output_test_terminal() -> Terminal<TuiBackend> {
+        Terminal::with_options(
+            crate::tui::hyperlink::HyperlinkBackend::new(
+                crate::tui::terminal_output::Output::default(),
+                Default::default(),
+            ),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 200, 40)),
+            },
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn clipboard_output_safely_refuses_attach_and_editor_without_consuming_input() {
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{drain_terminal, private_terminal},
+        };
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let marker = home.path().join("editor-started");
+        let editor = home.path().join("controlled-editor");
+        std::fs::write(
+            &editor,
+            format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _editor = crate::session::test_support::EnvGuard::set(&[("EDITOR", editor)]);
+        let inst = crate::session::Instance::new("live attachment", home.path().to_str().unwrap());
+        let id = inst.id.clone();
+        crate::session::Storage::new_unwatched("test")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.home.pending_paste = Some("unsubmitted input".into());
+        let (mut master, slave) = private_terminal();
+        let (_output_guard, output) = install_test_output(slave);
+        let mut terminal = output_test_terminal();
+        let (entered, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let clipboard = std::thread::spawn(move || {
+            output.osc52(
+                Duration::from_secs(5),
+                &tokio_util::sync::CancellationToken::new(),
+                |writer| {
+                    writer.write_all(b"\x1b]52;c;")?;
+                    writer.flush()?;
+                    entered.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(5)).unwrap();
+                    writer.write_all(b"\x07")
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        for action in [
+            Action::AttachSession(id),
+            Action::EditFile(home.path().join("file.rs")),
+        ] {
+            app.execute_action(action, &mut terminal).unwrap();
+            assert!(!app.should_quit);
+            assert_eq!(app.home.pending_paste.as_deref(), Some("unsubmitted input"));
+            assert!(app.update_status.as_ref().unwrap().text.contains("retry"));
+            assert!(
+                !marker.exists(),
+                "editor must not launch before terminal admission"
+            );
+        }
+        release.send(()).unwrap();
+        clipboard.join().unwrap().unwrap();
+        let mut emitted = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !emitted.ends_with(b"\x07") {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            std::thread::yield_now();
+        }
+        assert!(emitted
+            .windows(b"\x1b]52;c;\x07".len())
+            .any(|bytes| bytes == b"\x1b]52;c;\x07"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn serve_native_selection_commits_mouse_mode_only_after_actual_frame_output() {
+        use crate::tui::terminal_output::{
+            install_test_output,
+            tests::{block_terminal, drain_terminal, private_terminal, resume_terminal},
+        };
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("test").unwrap();
+        let mut app = App::new(
+            "test",
+            AvailableTools::with_tools(&[]),
+            true,
+            false,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        app.mouse_capture_allowed = true;
+        app.mosh_active = false;
+        app.mouse_captured = false;
+        let (mut master, slave) = private_terminal();
+        let mut control = slave.try_clone().unwrap();
+        let (_output_guard, _) = install_test_output(slave);
+        let mut terminal = output_test_terminal();
+        assert!(!app.home.wants_text_selection());
+        let mut emitted = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        app.draw(&mut terminal).unwrap();
+        while !app.home.presentation_ready {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+        }
+        crate::tui::terminal_output::tests::read_terminal_until(
+            &mut master,
+            &mut emitted,
+            b"\x1b[?1000h",
+        );
+        assert!(
+            app.mouse_captured,
+            "capture was actually emitted before opening Serve"
+        );
+        emitted.clear();
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        assert!(app.home.wants_text_selection());
+        block_terminal(&mut control);
+        app.draw(&mut terminal).unwrap();
+        assert!(app.pending_presentation.is_some());
+        assert!(
+            app.mouse_captured,
+            "capturing an unsent disable is not emission"
+        );
+        assert!(!app.home.presentation_ready);
+        resume_terminal(&control);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.home.presentation_ready {
+            assert!(std::time::Instant::now() < deadline);
+            drain_terminal(&mut master, &mut emitted);
+            app.draw(&mut terminal).unwrap();
+        }
+        crate::tui::terminal_output::tests::read_terminal_until(
+            &mut master,
+            &mut emitted,
+            b"\x1b[?1000l",
+        );
+        assert!(!app.mouse_captured);
+        assert!(emitted
+            .windows(b"\x1b[?1000l".len())
+            .any(|bytes| bytes == b"\x1b[?1000l"));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -3863,10 +4572,15 @@ mod tests {
         )
         .unwrap();
         app.home.selected_session = Some(inst.id.clone());
+        app.home.retained_preview = Some(crate::tui::structured_view::embedded::RetainedView::new(
+            None, &inst,
+        ));
         app.home.retained_focus = Some((inst.id.clone(), inst.lifecycle_generation));
         assert!(app.home.retained_reader_focused());
-        let backend =
-            crate::tui::hyperlink::HyperlinkBackend::new(std::io::stdout(), Default::default());
+        let backend = crate::tui::hyperlink::HyperlinkBackend::new(
+            crate::tui::terminal_output::Output::default(),
+            Default::default(),
+        );
         let mut terminal = Terminal::with_options(
             backend,
             ratatui::TerminalOptions {
@@ -3961,16 +4675,19 @@ mod tests {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
         let theme = crate::tui::styles::Theme::default();
         let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        // Match the App's invalidation-driven paints: unconditional full redraws
+        // can keep this current-thread runtime busy catching up missed ticks.
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 ticker.tick().await;
-                app.reconcile_structured_preview().await;
-                terminal
-                    .draw(|frame| {
-                        app.home
-                            .render(frame, frame.area(), &theme, None, None, None);
-                    })
-                    .unwrap();
+                if app.reconcile_structured_preview().await {
+                    terminal
+                        .draw(|frame| {
+                            app.home
+                                .render(frame, frame.area(), &theme, None, None, None);
+                        })
+                        .unwrap();
+                }
                 if app
                     .home
                     .retained_preview
@@ -4095,13 +4812,14 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 ticker.tick().await;
-                app.reconcile_structured_preview().await;
-                terminal
-                    .draw(|frame| {
-                        app.home
-                            .render(frame, frame.area(), &theme, None, None, None);
-                    })
-                    .unwrap();
+                if app.reconcile_structured_preview().await {
+                    terminal
+                        .draw(|frame| {
+                            app.home
+                                .render(frame, frame.area(), &theme, None, None, None);
+                        })
+                        .unwrap();
+                }
                 if app
                     .home
                     .retained_preview
@@ -4147,7 +4865,7 @@ mod tests {
             .pending_paste_for_structured_view
             .insert("s-2".into(), "other target".into());
         app.home.structured_preview =
-            Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1"));
+            Some(crate::tui::structured_view::embedded::EmbeddedView::for_test("s-1", None));
 
         // A failed attempt to mount s-2 can leave s-1 mounted.
         app.drain_pending_paste_for_structured_view("s-2").await;

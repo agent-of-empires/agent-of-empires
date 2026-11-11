@@ -1002,6 +1002,9 @@ impl HomeView {
     /// events are captured for wheel scroll, and one mechanism has to work on Mosh and
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if self.hit_divider(col, row) {
             self.drag_state = Some(if self.divider_row.is_some() {
                 DragKind::StackedListDivider
@@ -1042,6 +1045,9 @@ impl HomeView {
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
@@ -1135,6 +1141,9 @@ impl HomeView {
     /// ticker rather than by mouse events, so holding the cursor at an edge scrolls
     /// continuously and grows the selection past a page. Returns whether anything moved.
     pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
             return false;
         }
@@ -1257,6 +1266,9 @@ impl HomeView {
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
     pub fn handle_drag_end(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         let Some(state) = self.drag_state.take() else {
             return false;
         };
@@ -1377,7 +1389,23 @@ impl HomeView {
     /// Drain the text captured on the last render that painted a finalized preview
     /// selection. `Some` exactly once per finalized drag; `App` calls it after the draw.
     pub fn take_preview_copy_text(&mut self) -> Option<String> {
+        if !self.presentation_ready {
+            return None;
+        }
         self.preview_copy_text.take()
+    }
+
+    pub(in crate::tui) fn invalidate_presentation(&mut self) {
+        self.presentation_ready = false;
+        if let Some(view) = self.structured_preview.as_mut() {
+            view.invalidate_presentation();
+        }
+        self.clear_preview_selection();
+        self.drag_state = None;
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
+        self.preview_copy_pending = false;
+        self.preview_copy_text = None;
     }
 
     /// Discard any in-flight preview selection, so interacting with the TUI dismisses the

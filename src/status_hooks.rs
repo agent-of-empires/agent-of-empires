@@ -358,6 +358,7 @@ fn run_hook_command_blocking(
         &mut build_command(command, context, project_path),
         HOOK_COMMAND_TIMEOUT,
         Some(shutdown),
+        crate::process::ProcessGroupCleanup::Always,
     )? {
         Some(status) if status.success() => Ok(status),
         Some(status) => Err(std::io::Error::other(format!(

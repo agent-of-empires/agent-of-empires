@@ -1,4 +1,43 @@
 use std::process::{Child, Command};
+
+pub(super) fn independent_terminal_output() -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    let mut name = [0 as libc::c_char; 4096];
+    // SAFETY: ttyname_r writes only into the supplied live buffer.
+    let error = unsafe { libc::ttyname_r(libc::STDOUT_FILENO, name.as_mut_ptr(), name.len()) };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error));
+    }
+    // Opening the terminal, not dup(), gives this writer independent status flags.
+    // SAFETY: ttyname_r supplied a NUL-terminated path.
+    let descriptor = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: this successful open transfers one newly owned descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let output = std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?);
+    let actual = file.metadata()?;
+    let expected = output.metadata()?;
+    // SAFETY: both descriptors remain open throughout verification.
+    if unsafe { libc::isatty(file.as_raw_fd()) } != 1
+        || (actual.dev(), actual.ino(), actual.rdev())
+            != (expected.dev(), expected.ino(), expected.rdev())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "stdout terminal identity changed",
+        ));
+    }
+    Ok(file)
+}
+
 pub(super) fn validate_recovery_file(file: &std::fs::File) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = file.metadata()?;
@@ -73,8 +112,10 @@ pub(super) fn kill_process_group(child: &Child) {
     signal_process_group(child, nix::sys::signal::Signal::SIGKILL);
 }
 
-pub(super) fn try_wait_status_hook(
+pub(super) fn try_wait_group_status(
     child: &mut Child,
+    cleanup: super::ProcessGroupCleanup,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     use nix::libc;
     // nix gates `waitid` off on macOS, so call libc directly on every Unix.
@@ -90,8 +131,14 @@ pub(super) fn try_wait_status_hook(
     if unsafe { info.si_pid() } == 0 {
         return Ok(None);
     }
+    let transferred = cleanup == super::ProcessGroupCleanup::OnFailure
+        && info.si_code == libc::CLD_EXITED
+        && unsafe { info.si_status() } == 0
+        && cancel.is_none_or(|cancel| !cancel.is_cancelled());
     // Retain the exited leader until cleanup so its group ID cannot be reused.
-    kill_process_group(child);
+    if !transferred {
+        kill_process_group(child);
+    }
     child.wait().map(Some)
 }
 
