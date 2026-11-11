@@ -1272,6 +1272,13 @@ fn test_g_key_opens_group_picker() {
     env.view.handle_key(key(KeyCode::Enter), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Org);
+
+    // 'g' again, Down + Enter advances Org -> Status (#4867).
+    env.view.handle_key(key(KeyCode::Char('g')), None);
+    env.view.handle_key(key(KeyCode::Down), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.group_picker_dialog.is_none());
+    assert_eq!(env.view.group_by, GroupByMode::Status);
 }
 
 #[test]
