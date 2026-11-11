@@ -200,3 +200,42 @@ it("a newer committed save retires an older retry still waiting on elevation", a
   expect(committed).toEqual([{ worktree: { enabled: false } }]);
   expect(await older).toBe(false);
 });
+
+it("a newer save made while an elevated retry is out waits for it, so it lands last", async () => {
+  const committed: unknown[] = [];
+  let elevated = false;
+  let releaseRetry: (() => void) | undefined;
+  server.use(
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = await request.json();
+      if (!elevated) return HttpResponse.json({ error: "elevation_required" }, { status: 403 });
+      // Hold the first elevated write, the older save's retry.
+      if (committed.length === 0 && !releaseRetry) await new Promise<void>((r) => (releaseRetry = r));
+      committed.push(body);
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.post("*/api/login/elevate", () => {
+      elevated = true;
+      return HttpResponse.json({ elevated_until_secs: 900 });
+    }),
+  );
+  const { result } = renderHook(() => useInlineMachineSave());
+  let older: Promise<boolean> | undefined;
+  act(() => {
+    older = result.current.save({ worktree: { enabled: true } });
+  });
+  await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  act(() => {
+    void result.current.elevation!.submit("right");
+  });
+  await waitFor(() => expect(releaseRetry).toBeDefined());
+
+  let newer: Promise<boolean> | undefined;
+  act(() => {
+    newer = result.current.save({ worktree: { enabled: false } });
+  });
+  await act(async () => releaseRetry!());
+  expect(await older).toBe(true);
+  expect(await newer).toBe(true);
+  expect(committed).toEqual([{ worktree: { enabled: true } }, { worktree: { enabled: false } }]);
+});

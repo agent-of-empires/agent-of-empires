@@ -35,8 +35,10 @@ export function useInlineMachineSave() {
           if (!result.ok) return result.error ?? "That passphrase did not match.";
           // Cancelled while elevating: its edit already reverted, so it must not write.
           if (pending.current !== request) return null;
-          const retried = await updateMachineSettingsInline(updates);
-          finish(retried === "committed");
+          // Past the prompt: a newer save now queues behind this retry instead of racing it.
+          pending.current = null;
+          setElevation(null);
+          resolve((await updateMachineSettingsInline(updates)) === "committed");
           return null;
         },
       };
