@@ -291,7 +291,17 @@ export type IncompatibleAgentDetail =
       kind: "unsupported_protocol_version";
       expected: string;
       received: string;
+    }
+  | {
+      kind: "invalid_proxy_hello";
+      reason: string;
     };
+
+/** Mirror of `IntegrationLostReason` in src/acp/state.rs. */
+export type IntegrationLostReason =
+  | { kind: "contract_violation"; detail: string }
+  | { kind: "hold_overflow" }
+  | { kind: "lease_overflow" };
 
 // One variant per Event::* in src/acp/state.rs, externally tagged.
 export type AcpEvent =
@@ -350,7 +360,14 @@ export type AcpEvent =
   | "ThinkingEnded"
   | { RateLimit: { info: RateLimitInfo } }
   | { RateLimitAutoResumed: { resets_at: string; manual?: boolean } }
-  | { SessionNotice: { severity: string; title: string; description?: string | null; key?: string | null } }
+  | {
+      SessionNotice: {
+        severity: string;
+        title: string;
+        description?: string | null;
+        key?: string | null;
+      };
+    }
   | { UsageUpdated: { usage: SessionUsage } }
   | { ModeChanged: { mode: SessionMode } }
   | {
@@ -404,6 +421,7 @@ export type AcpEvent =
         ended_at: string;
       };
     }
+  | { SubagentUpdated: { subagent: SubagentRecord; at: string } }
   | { AgentMessageChunk: { text: string; message_id?: string } }
   | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
@@ -411,6 +429,7 @@ export type AcpEvent =
   | { AgentStartupError: { message: string } }
   | { PromptRuntimeError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
+  | { IntegrationLost: { reason: IntegrationLostReason } }
   | {
       UserPromptSent: {
         text: string;
@@ -449,6 +468,7 @@ export type AcpEvent =
         tool_call_id?: string;
         description: string;
         workflow?: { run_id: string; name: string; summary?: string | null } | null;
+        started_at?: string | null;
       };
     }
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
@@ -507,7 +527,11 @@ export interface AuthStatus {
   /** Usable as a UI string on its own ("Claude Max", "Anthropic API key"). */
   label: string;
   detail?: string | null;
-  account?: { email?: string | null; organization?: string | null; plan?: string | null } | null;
+  account?: {
+    email?: string | null;
+    organization?: string | null;
+    plan?: string | null;
+  } | null;
 }
 
 /** Fields this client adopts from the daemon's folded `AcpState`. */
@@ -522,7 +546,11 @@ export interface ReducedState {
   thinking: { started_at: string } | null;
   rate_limit: RateLimitInfo | null;
   available_commands: AvailableCommand[];
-  available_modes: Array<{ id: string; name: string; description?: string | null }>;
+  available_modes: Array<{
+    id: string;
+    name: string;
+    description?: string | null;
+  }>;
   current_mode_id: string | null;
   auth_status?: AuthStatus | null;
   turn_active: boolean;
@@ -532,7 +560,17 @@ export interface ReducedState {
   session_notices?: SessionNotice[];
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
+  /** Background shells, running and recently finished; omitted when there are none. */
+  background_shells?: {
+    task_id: string;
+    command: string;
+    started_at?: string | null;
+    ended_at?: string | null;
+    finished?: boolean;
+  }[];
   /** The session's workflow runs; omitted when there are none. */
+  /** The subagent roster; the Web projection keeps it for children older than the replay tail. */
+  subagents?: SubagentRecord[];
   workflow_runs?: {
     task_id: string;
     tool_call_id: string;
@@ -649,8 +687,12 @@ export interface AcpState {
   agentOrphaned: boolean;
   /** Async sub-agents launched this session, oldest first. */
   backgroundAgents: BackgroundAgent[];
+  /** Subagent roster from the ACP subagents RFD, one record per child session. */
+  subagents: SubagentRecord[];
   /** Ids of running background tasks that are not sub-agents (backgrounded commands, workflow runs). */
   backgroundTasks: string[];
+  /** Backgrounded shell commands, running and recently finished, oldest first. */
+  backgroundShells: BackgroundShell[];
   /** Workflow runs by the `Workflow` tool call that launched them. */
   workflowRuns: Record<string, WorkflowRun>;
   /** Agent-pushed advisories for the current turn, oldest first. */
@@ -668,7 +710,29 @@ export interface SessionNotice {
   description?: string | null;
 }
 
-export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+export type BackgroundAgentStatus =
+  | "running"
+  | "stalled"
+  | "completed"
+  | "detached"
+  | "error"
+  | "requires_action"
+  | "unknown";
+
+export type SubagentState = "running" | "requires_action" | "idle" | "unknown";
+
+/** Wire mirror of the Rust `SubagentRecord` (src/acp/state.rs). */
+export interface SubagentRecord {
+  session_id: string;
+  parent_session_id: string;
+  parent_tool_call_id?: string | null;
+  title?: string | null;
+  description?: string | null;
+  state: SubagentState;
+  stop_reason?: string | null;
+  cancel_capable: boolean;
+  model?: string | null;
+}
 
 export interface BackgroundAgentTool {
   name: string;
@@ -682,6 +746,23 @@ export interface WorkflowRef {
   run_id: string;
   name: string;
   phase: string;
+}
+
+/** Mirrors the daemon's cap on finished shells kept per session. */
+export const MAX_FINISHED_BACKGROUND_SHELLS = 20;
+
+export interface BackgroundShell {
+  taskId: string;
+  command: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  finished: boolean;
+}
+
+/** Drops the oldest finished shells beyond the cap. */
+function capFinishedShells(shells: BackgroundShell[]): BackgroundShell[] {
+  let drop = shells.filter((s) => s.finished).length - MAX_FINISHED_BACKGROUND_SHELLS;
+  return drop > 0 ? shells.filter((s) => !(s.finished && drop-- > 0)) : shells;
 }
 
 export interface WorkflowRun {
@@ -879,7 +960,12 @@ export function mergeServerRows(existing: ActivityRow[], incoming: ActivityRow[]
       const merged = mergeToolStart(prev.tool, row.tool);
       // Keep the earliest raw_name across a retitling merge for subagent classification.
       if (prev.tool.raw_name) merged.raw_name = prev.tool.raw_name;
-      out[idx] = { ...prev, tool: merged, text: merged.name, at: merged.started_at };
+      out[idx] = {
+        ...prev,
+        tool: merged,
+        text: merged.name,
+        at: merged.started_at,
+      };
     } else {
       out[idx] = row;
     }
@@ -957,7 +1043,9 @@ export function emptyAcpState(): AcpState {
     agentUnresponsive: false,
     agentOrphaned: false,
     backgroundAgents: [],
+    subagents: [],
     backgroundTasks: [],
+    backgroundShells: [],
     workflowRuns: {},
     modeSwitchFailed: null,
     lastAgentSwitch: null,
@@ -1181,6 +1269,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.agentUnresponsive = false;
     return next;
   }
+  if ("IntegrationLost" in event) {
+    const { reason } = event.IntegrationLost;
+    next.startupError = `Agent integration lost: ${
+      reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
+    }`;
+    next.agentUnresponsive = false;
+    closeTurn(next);
+    return next;
+  }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
     endRestart(next);
@@ -1302,6 +1399,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
     next.pendingConfigOption = null;
+    next.subagents = [];
     return next;
   }
   if ("PromptRejected" in event) {
@@ -1335,6 +1433,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       result: null,
       warning: null,
     };
+    // A child's snapshot may predate the launch event.
+    const child = next.subagents.find((s) => s.parent_tool_call_id === e.tool_call_id);
+    if (child) Object.assign(record, reconcileChild(record, child, e.started_at));
     // Idempotent on replay.
     const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
     next.backgroundAgents =
@@ -1380,14 +1481,38 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     );
     return next;
   }
+  if ("SubagentUpdated" in event) {
+    const { subagent, at } = event.SubagentUpdated;
+    const parent = subagent.parent_tool_call_id;
+    if (parent) {
+      next.backgroundAgents = next.backgroundAgents.map((a) =>
+        a.toolCallId === parent ? reconcileChild(a, subagent, at) : a,
+      );
+    }
+    const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
+    next.subagents =
+      i >= 0 ? next.subagents.map((s, idx) => (idx === i ? subagent : s)) : [...next.subagents, subagent];
+    return next;
+  }
   if ("BackgroundTaskStarted" in event) {
-    const { task_id: id, tool_call_id: toolCallId, workflow } = event.BackgroundTaskStarted;
+    const { task_id: id, tool_call_id: toolCallId, workflow, description, started_at } = event.BackgroundTaskStarted;
     if (!next.backgroundTasks.includes(id)) next.backgroundTasks = [...next.backgroundTasks, id];
+    next.backgroundShells = next.backgroundShells.filter((s) => s.taskId !== id);
+    if (!workflow) {
+      next.backgroundShells = [
+        ...next.backgroundShells,
+        { taskId: id, command: description, startedAt: started_at ?? null, endedAt: null, finished: false },
+      ];
+    }
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, null);
     if (workflow && toolCallId) {
       next.workflowRuns = {
         ...next.workflowRuns,
-        [toolCallId]: { taskId: id, name: workflow.name, summary: workflow.summary ?? null },
+        [toolCallId]: {
+          taskId: id,
+          name: workflow.name,
+          summary: workflow.summary ?? null,
+        },
       };
     }
     return next;
@@ -1395,11 +1520,26 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("BackgroundTaskFinished" in event) {
     const { task_id: id, ended_at: endedAt } = event.BackgroundTaskFinished;
     next.backgroundTasks = next.backgroundTasks.filter((t) => t !== id);
+    next.backgroundShells = capFinishedShells(
+      next.backgroundShells.map((s) => (s.taskId === id ? { ...s, finished: true, endedAt: endedAt ?? null } : s)),
+    );
     next.workflowRuns = closeWorkflowRun(next.workflowRuns, id, endedAt ?? null);
     return next;
   }
   // Remaining events carry no client control state.
   return next;
+}
+
+/** Folds a child's RFD snapshot into its agent; `at` stamps a newly ended one. */
+function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): BackgroundAgent {
+  const status = subagentStatus(child);
+  return child.state === "idle" ? { ...a, status, endedAt: a.endedAt ?? at } : { ...a, status, endedAt: null };
+}
+
+/** The agent status a child's session state stands for. */
+export function subagentStatus(child: SubagentRecord): BackgroundAgentStatus {
+  if (child.state !== "idle") return child.state;
+  return child.stop_reason === "error" ? "error" : "completed";
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */
@@ -1423,8 +1563,30 @@ export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
 }
 
+/**
+ * A snapshot at or past `lastSeq` refreshes held records, which may have missed frames after a lag; an older one
+ * (a replay already folded past it) only adds records we lack. Local-only records always stay.
+ */
+function mergeSubagents(
+  held: SubagentRecord[],
+  snapshot: SubagentRecord[],
+  snapshotIsNewer: boolean,
+): SubagentRecord[] {
+  const fromSnapshot = new Map(snapshot.map((r) => [r.session_id, r]));
+  const heldIds = new Set(held.map((r) => r.session_id));
+  return [
+    ...held.map((r) => (snapshotIsNewer ? (fromSnapshot.get(r.session_id) ?? r) : r)),
+    ...snapshot.filter((r) => !heldIds.has(r.session_id)),
+  ];
+}
+
 /** Adopt the daemon's folded control state. Leaves `lastSeq` to the raw frames that dedupe replays. */
-export function applyReducedState(state: AcpState, reduced: ReducedState, unchanged: string[] = []): AcpState {
+export function applyReducedState(
+  state: AcpState,
+  reduced: ReducedState,
+  unchanged: string[] = [],
+  seq?: number,
+): AcpState {
   // Omitted cold fields arrive as empty defaults; adopting them would blank the pickers.
   const holds = (field: string) => unchanged.includes(field);
   const stillPending = new Set<string>([
@@ -1462,9 +1624,31 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // Likewise authoritative: a task that started before the replay window
     // has no start event here, yet the session is still busy.
     backgroundTasks: reduced.background_tasks ?? [],
+    backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
+    subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], seq === undefined || seq >= state.lastSeq),
     locallyResolved,
   };
+}
+
+/** A snapshot older than a finish already applied must not reopen the shell.
+ *  A reused task id has a different start time, so it still replaces the run. */
+function restoreBackgroundShells(
+  local: BackgroundShell[],
+  records: NonNullable<ReducedState["background_shells"]>,
+): BackgroundShell[] {
+  return records.map((r) => {
+    const startedAt = r.started_at ?? null;
+    const done = local.find((s) => s.taskId === r.task_id && s.finished && s.startedAt === startedAt);
+    if (done && !r.finished) return done;
+    return {
+      taskId: r.task_id,
+      command: r.command,
+      startedAt,
+      endedAt: r.ended_at ?? null,
+      finished: r.finished ?? false,
+    };
+  });
 }
 
 /** The replay window can miss a run's launch or finish. Adopts runs it
@@ -1483,7 +1667,10 @@ function restoreWorkflowRuns(
       taskId: record.task_id,
       name: record.name,
       summary: local?.summary ?? record.summary ?? null,
-      ...(record.finished && { finished: true, endedAt: record.ended_at ?? null }),
+      ...(record.finished && {
+        finished: true,
+        endedAt: record.ended_at ?? null,
+      }),
     };
   }
   return next;
@@ -1533,7 +1720,12 @@ export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: Activ
       // The placeholder carried the completion time, which would zero the duration.
       if (row.tool.started_at) merged.started_at = row.tool.started_at;
       tail = tail.slice();
-      tail[idx] = { ...existing, tool: merged, text: merged.name, at: merged.started_at };
+      tail[idx] = {
+        ...existing,
+        tool: merged,
+        text: merged.name,
+        at: merged.started_at,
+      };
     }
   }
   return prepended.concat(tail);

@@ -793,7 +793,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
     // Reject disabled or unsupported naming before creating a child process.
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         &inst.source_profile,
-        Path::new(&inst.project_path),
+        inst.repo_config_path(),
     );
     let smart_rename_override = crate::session::projects::resolve_smart_rename_override(
         &inst.source_profile,
@@ -1180,7 +1180,7 @@ fn prepare_terminal_rename(
     }
     let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
         profile,
-        Path::new(&instance.project_path),
+        instance.repo_config_path(),
     );
     let smart_rename_override = crate::session::projects::resolve_smart_rename_override(
         profile,
@@ -1452,6 +1452,7 @@ mod serve {
             tool,
             command,
             project_path,
+            config_path,
             repo_path,
             sandboxed,
             container_workdir,
@@ -1466,6 +1467,7 @@ mod serve {
                     i.tool.clone(),
                     i.command.clone(),
                     i.project_path.clone(),
+                    i.repo_config_path().to_path_buf(),
                     i.repo_path().to_string(),
                     i.is_sandboxed(),
                     i.container_workdir(),
@@ -1481,7 +1483,7 @@ mod serve {
 
         let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
-            Path::new(&project_path),
+            &config_path,
         );
         let smart_rename_override = crate::session::projects::resolve_smart_rename_override(
             &profile,

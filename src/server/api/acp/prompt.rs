@@ -417,6 +417,9 @@ fn diff_comments_not_now(reason: QueueReason) -> Response {
         QueueReason::Compacting => {
             "the agent is compacting its context; send the comments again when it finishes"
         }
+        QueueReason::IntegrationLost => {
+            "the agent's integration was lost; restart the session, then send the comments again"
+        }
     };
     (StatusCode::CONFLICT, message).into_response()
 }
@@ -580,6 +583,28 @@ pub async fn acp_cancel(
         Err(e) => {
             tracing::warn!(target: "acp.supervisor", session = %id, error = %e, "turn cancel failed");
             supervisor_error_response("cancel failed", &e)
+        }
+    }
+}
+
+/// Cancel one subagent without ending the turn. The child's own id must have
+/// been announced with the `cancel` capability.
+pub async fn acp_cancel_subagent(
+    State(state): State<Arc<AppState>>,
+    Path((id, child_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
+    if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    match state.acp_supervisor.cancel_subagent(&id, &child_id).await {
+        Ok(true) => StatusCode::ACCEPTED.into_response(),
+        Ok(false) => (StatusCode::CONFLICT, "subagent cannot be cancelled").into_response(),
+        Err(e) => {
+            tracing::warn!(target: "acp.supervisor", session = %id, child = %child_id, error = %e, "subagent cancel failed");
+            supervisor_error_response("subagent cancel failed", &e)
         }
     }
 }

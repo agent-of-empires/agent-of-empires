@@ -2,10 +2,11 @@
 //! consolidated restatement of text it already streamed.
 
 use crate::acp::agent_profiles;
+use crate::acp::aoe_meta;
 use crate::acp::approvals::is_destructive;
 use crate::acp::state::{
-    AvailableCommand, ConfigOptionDescriptor, Event, Plan, PlanStep, SessionMode, SessionUsage,
-    ToolCall, UsageCost,
+    AvailableCommand, ConfigOptionDescriptor, Event, MemoryRecall, Plan, PlanStep, SessionMode,
+    SessionUsage, ToolCall, UsageCost,
 };
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::schema::{
@@ -16,7 +17,9 @@ use tracing::debug;
 
 use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
-use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
+use super::plan::{
+    extract_plan_from_switch_mode, map_plan_status, plan_from_markdown, plan_status_to_str,
+};
 use super::raw_input::{
     background_agent_launched_from_value, background_command_launched_from_value,
     background_task_started_from_value, background_task_stopped_from_value, monitor_event_from_raw,
@@ -356,7 +359,11 @@ pub(super) fn map_update_to_events(
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty rather than "null" without raw_input (#1713).
             let args_preview = preview_optional_args(tc.raw_input.as_ref());
-            let parent_tool_call_id = profile.parent_tool_use_id_from_meta(&tc.meta);
+            let aoe = aoe_meta::envelope_of(&tc.meta);
+            let parent_tool_call_id = aoe
+                .as_ref()
+                .and_then(|e| e.parent_tool_call.clone())
+                .or_else(|| profile.parent_tool_use_id_from_meta(&tc.meta));
             if let Some(parent) = parent_tool_call_id.as_deref() {
                 debug!(
                     target: "acp.protocol",
@@ -366,10 +373,16 @@ pub(super) fn map_update_to_events(
                     "subagent child tool_call linked to parent via _meta.claudeCode.parentToolUseId"
                 );
             }
-            let memory_recall = if profile.supports_memory_recall_tool() {
-                extract_memory_recall(&tc.meta, &tc.locations, &tc.content)
-            } else {
-                None
+            let memory_recall = match aoe.as_ref().and_then(|e| e.memory_recall.clone()) {
+                Some(m) => Some(MemoryRecall {
+                    mode: m.mode,
+                    paths: m.paths,
+                    synthesized_text: m.synthesized_text,
+                }),
+                None if profile.supports_memory_recall_tool() => {
+                    extract_memory_recall(&tc.meta, &tc.locations, &tc.content)
+                }
+                None => None,
             };
             let diffs = extract_diffs_from_content(&tc.content);
             let tool_call = ToolCall {
@@ -405,8 +418,13 @@ pub(super) fn map_update_to_events(
             if is_destructive(&tc.title, &args_preview) {
                 debug!(target: "acp.protocol", "tool {} flagged destructive on tool_call ingest", tc.title);
             }
-            // ExitPlanMode arrives as a switch_mode tool, not a Plan update.
-            if profile.supports_exit_plan_mode
+            if let Some(plan) = aoe
+                .as_ref()
+                .and_then(|e| e.plan_proposal.as_ref())
+                .and_then(|p| plan_from_markdown(&p.markdown))
+            {
+                events.push(Event::PlanUpdated { plan });
+            } else if profile.supports_exit_plan_mode
                 && matches!(
                     tc.kind,
                     agent_client_protocol::v1::schema::ToolKind::SwitchMode
@@ -1761,5 +1779,83 @@ mod tests {
         assert!(!armed(&codex));
         assert!(!started(&codex));
         assert_eq!(kinds(&codex), ["raw_agent_update"]);
+    }
+
+    /// The `_meta.aoe` form of a Claude sequence, mapped with no Claude
+    /// profile, reduces to the same events as the `claudeCode` form.
+    #[test]
+    fn aoe_primitives_match_the_claude_meta_events() {
+        use agent_client_protocol::v1::schema::{ToolCallLocation, ToolKind};
+        use serde_json::json;
+
+        fn tool_call(
+            meta: serde_json::Value,
+            locations: Vec<ToolCallLocation>,
+            plan_args: bool,
+        ) -> SessionUpdate {
+            let mut tc = AcpToolCall::new("t1", "Tool").locations(locations);
+            if plan_args {
+                tc = tc
+                    .kind(ToolKind::SwitchMode)
+                    .raw_input(json!({"plan": "- first\n- second"}));
+            }
+            tc.meta = meta.as_object().cloned();
+            SessionUpdate::ToolCall(tc)
+        }
+        // Wall-clock fields differ per call.
+        fn stable(events: Vec<Event>) -> serde_json::Value {
+            fn scrub(v: &mut serde_json::Value) {
+                match v {
+                    serde_json::Value::Object(m) => {
+                        m.remove("started_at");
+                        m.remove("plan_id");
+                        m.values_mut().for_each(scrub);
+                    }
+                    serde_json::Value::Array(a) => a.iter_mut().for_each(scrub),
+                    _ => {}
+                }
+            }
+            let mut v = serde_json::to_value(events).unwrap();
+            scrub(&mut v);
+            v
+        }
+        let path = || vec![ToolCallLocation::new("/m/a.md")];
+        let aoe = |primitive: serde_json::Value| {
+            let mut aoe = json!({"v": 1, "key": "k1"});
+            aoe.as_object_mut()
+                .unwrap()
+                .extend(primitive.as_object().unwrap().clone());
+            json!({ "aoe": aoe })
+        };
+        // (name, claudeCode meta, locations on that form, aoe primitive)
+        let cases = [
+            (
+                "parent",
+                json!({"claudeCode": {"parentToolUseId": "p1"}}),
+                vec![],
+                json!({"parent_tool_call": "p1"}),
+            ),
+            (
+                "memory recall",
+                json!({"claudeCode": {"toolName": "memory_recall", "toolResponse": {"mode": "recall"}}}),
+                path(),
+                json!({"memory_recall": {"mode": "recall", "paths": ["/m/a.md"]}}),
+            ),
+            (
+                "plan",
+                json!({}),
+                vec![],
+                json!({"plan_proposal": {"markdown": "- first\n- second"}}),
+            ),
+        ];
+        for (name, claude_meta, locations, primitive) in cases {
+            let plan_args = name == "plan";
+            let claude_events = claude(tool_call(claude_meta, locations, plan_args));
+            let aoe_events = map_update_to_events(
+                tool_call(aoe(primitive), Vec::new(), plan_args),
+                &agent_profiles::DEFAULT,
+            );
+            assert_eq!(stable(aoe_events), stable(claude_events), "{name}");
+        }
     }
 }

@@ -32,6 +32,8 @@ import {
   classifySpecialTool,
   classifyWorkflow,
 } from "./NamedToolCards";
+import { useSubagentFor } from "./backgroundAgentsContext";
+import { SubagentCard } from "./GroupToolCards";
 import { classifyTodoWrite, TodoUpdateCard } from "./TodoCards";
 import { statusFor } from "./ToolCardChrome";
 import { ToolIdProvider } from "./ToolExpansion";
@@ -46,7 +48,14 @@ interface Props {
 
 export function ToolCard({ tool, result, nested }: Props) {
   const profile = useAgentProfile();
-  const card = renderToolCard(tool, result, profile);
+  // A child's launch card, however the transcript folded it, shows its roster state.
+  const hasRecord = useSubagentFor(tool.id) !== undefined;
+  const delegated = hasRecord && !nested && !classifyWorkflow(tool, profile);
+  const card = delegated ? (
+    <SubagentCard tool={tool} result={result} children={[]} />
+  ) : (
+    renderToolCard(tool, result, profile)
+  );
   // The read card shows its own output media inside its body.
   const content =
     result?.output?.length && card.type !== ReadToolCard ? (

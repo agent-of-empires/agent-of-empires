@@ -239,8 +239,14 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/hooks/useLiveTerminal.test.ts", "src/components/__tests__/LiveTerminalView.recover.test.tsx"],
-      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/LiveTerminalView.tsx"],
-      "notes": "A transport message with reason pipe_owned shows the contention notice while connected; a grid transport, an absent reason, or a newly opened socket clears it. Retry reconnects; a per-session dismissal persists until a grid transport or a user-initiated reconnect."
+      "components": [
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/LiveSlowNotice.tsx",
+        "web/src/components/TopBar.tsx",
+        "web/src/lib/liveControl.ts"
+      ],
+      "notes": "While this tab holds control on a transport with reason pipe_owned, \"Updates are slower.\" shows in the Session's top bar, outside the pane, so it never resizes the terminal; view only, the docked strip adds \"· Updates may lag\" instead. A grid transport, an absent reason, or a newly opened socket clears it. Reconnect redials and sends an explicit claim on the new socket, not claim_if_vacant; a per-pane dismissal persists until a grid transport or a user-initiated reconnect."
     },
     {
       "id": "terminal.live-alt-screen-scroll",
@@ -406,8 +412,23 @@
       "id": "terminal.live-size-owner",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/live-terminal.spec.ts", "src/hooks/useLiveTerminal.test.ts"],
-      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "specs": [
+        "tests/live/live-terminal.spec.ts",
+        "tests/live-control-strip.spec.ts",
+        "src/hooks/useLiveTerminal.test.ts",
+        "src/components/__tests__/LiveTerminalView.controlStrip.test.tsx",
+        "src/components/live-terminal/useTerminalInput.test.ts",
+        "src/hooks/__tests__/useCommandActions.test.tsx"
+      ],
+      "components": [
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/LiveControlStrip.tsx",
+        "web/src/components/live-terminal/useTerminalInput.ts",
+        "web/src/hooks/useLiveTerminal.ts",
+        "web/src/hooks/useCommandActions.ts",
+        "web/src/lib/liveControl.ts"
+      ],
+      "notes": "A view-only tab docks one strip above where you type (above the key bar on phones): \"Open in the TUI.\", \"Open in another Web dashboard window.\" or, without the Daemon's owner kind (#5543), \"Open in another window.\", then \"Take control to type.\"; Take control and the command palette's Take control send claim. × collapses it to a View only button, remembered per Session, surface and pane. A blocked key holds \"Not sent. Take control to type.\" for 2 s, restarted per key, and only then does a plain Tab from the terminal's input or App's keyboard proxy reach Take control; otherwise Tab stays terminal input. Take control from that escape gives focus back to the input or proxy it came from (a fine-pointer click falls back to the terminal's input; a touch tap moves nothing), and the claim follows the grid without the strip even when a fit was already queued at the click. A read-only Daemon shows a steady strip; disconnects keep the connection banner. The live ping-pong cases take control through the strip; at 375px the owner's taller grid crops from the top so its input line stays visible."
     },
     {
       "id": "terminal.mobile-live-wheel-forward",
@@ -528,6 +549,14 @@
       "risk": "medium",
       "specs": ["tests/live/auth.spec.ts"],
       "components": ["web/src/components/TokenEntryPage.tsx", "web/src/lib/token.ts"]
+    },
+    {
+      "id": "auth.token-stale-401",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/fetchInterceptor.test.ts"],
+      "components": ["web/src/lib/fetchInterceptor.ts"],
+      "notes": "A 401 for a request sent under no token or the previous one, landing after Connect saved and verified a new token, leaves the new token and fires no TOKEN_EXPIRED_EVENT; a 401 under the current token still expires the session. A rotated X-Aoe-Token is adopted only while the request's token is still the stored one, so a slow response cannot overwrite a newer token (#5574)."
     },
     {
       "id": "auth.token-rotation",
@@ -1247,6 +1276,7 @@
         "tests/wizard.spec.ts",
         "tests/wizard-project.spec.ts",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/lib/__tests__/acpEligibility.test.ts",
         "src/components/session-wizard/__tests__/SandboxPanel.test.tsx",
         "src/components/session-wizard/wizardReducer.test.ts",
         "src/lib/api.test.ts",
@@ -1273,7 +1303,7 @@
         "web/src/components/session-wizard/createFailureView.ts",
         "web/src/components/Toasts.tsx"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and at 375px the summary wraps under the label and segments. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1321,6 +1351,26 @@
       "specs": ["src/components/session-wizard/__tests__/WorktreePanel.test.tsx", "src/lib/api.test.ts"],
       "components": ["web/src/components/session-wizard/steps/WorktreePanel.tsx"],
       "notes": "Attach mode lists the repo's existing worktrees via GET /api/git/worktrees; picking one fills the branch name. Empty and failed listings show distinct messages, and create mode does not fetch."
+    },
+    {
+      "id": "wizard.single-repo-workspace",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/workspaces.spec.ts",
+        "src/components/session-wizard/createRequest.test.ts",
+        "src/components/session-wizard/wizardReducer.test.ts",
+        "src/components/session-wizard/__tests__/WorktreePanel.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx",
+        "web/src/components/session-wizard/createRequest.ts",
+        "web/src/components/session-wizard/profileDefaults.ts",
+        "web/src/components/session-wizard/wizardReducer.ts"
+      ],
+      "notes": "The Workspace toggle starts a one-repo worktree session in a workspace directory, seeded from worktree.workspace_by_default. Attaching to an existing branch turns it off."
     },
     {
       "id": "wizard.rows-and-panels",
@@ -3148,10 +3198,13 @@
       ],
       "components": [
         "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/acp/BackgroundShells.tsx",
         "web/src/components/acp/backgroundAgentsContext.ts",
         "web/src/components/acp/ToolCards.tsx",
         "web/src/lib/acpTypes.ts",
         "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/api.ts",
         "web/src/components/acp/CoreToolCards.tsx",
         "web/src/components/acp/GroupToolCards.tsx",
         "web/src/components/acp/NamedToolCards.tsx",

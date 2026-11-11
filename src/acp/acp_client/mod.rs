@@ -4,6 +4,7 @@
 //! connection task (see `connection`) that owns the session; this module holds
 //! the public surface, and each concern lives in a submodule.
 
+mod aoe_ingress;
 mod batch;
 mod between_prompt;
 mod close;
@@ -406,6 +407,7 @@ impl AcpClient {
             let name = match cmd {
                 ClientCmd::Prompt(_) => "prompt",
                 ClientCmd::Cancel => "cancel",
+                ClientCmd::CancelChild { .. } => "cancel_child",
                 ClientCmd::ForceStop => "force_stop",
                 ClientCmd::SetMode(_) => "set_mode",
                 ClientCmd::SetConfigOption { .. } => "set_config_option",
@@ -478,10 +480,11 @@ impl AcpClient {
         let sandbox = match &config.sandbox_info {
             // Resolving the workdir touches git2 and may shell out to docker.
             Some(info) => {
-                let (info, cwd) = (info.clone(), config.cwd.clone());
+                let (info, cwd, config_path) =
+                    (info.clone(), config.cwd.clone(), config.config_path.clone());
                 let profile = config.source_profile.clone();
                 let resolved = tokio::task::spawn_blocking(move || {
-                    SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                    SessionSandbox::from_info(&info, cwd.as_path(), &config_path, profile)
                 })
                 .await
                 .map_err(|e| AcpError::Spawn(format!("sandbox resolve task panicked: {e}")))??;
@@ -737,6 +740,18 @@ impl AcpClient {
     /// Best-effort `session/cancel`; Ok even with no turn in flight.
     pub async fn cancel_prompt(&self) -> Result<(), AcpError> {
         self.send_cmd(ClientCmd::Cancel).await
+    }
+
+    /// Cancel one subagent's work without ending the root turn. False when the
+    /// child is unknown or cannot be cancelled.
+    pub async fn cancel_child(&self, session_id: &str) -> Result<bool, AcpError> {
+        let (respond_to, sent) = oneshot::channel();
+        self.send_cmd(ClientCmd::CancelChild {
+            session_id: session_id.to_string(),
+            respond_to,
+        })
+        .await?;
+        sent.await.map_err(|_| AcpError::AgentExited)
     }
 
     /// Skip the cancel-escalation grace: an in-flight turn ends as

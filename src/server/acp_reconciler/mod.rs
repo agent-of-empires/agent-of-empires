@@ -1021,6 +1021,7 @@ mod tests {
             tool_call_id: None,
             description: "build".into(),
             workflow: None,
+            started_at: None,
         };
         let agent = Event::BackgroundAgentLaunched {
             agent_id: "agent".into(),

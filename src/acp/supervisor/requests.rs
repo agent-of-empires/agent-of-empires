@@ -159,6 +159,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    /// Cancel one subagent of the session; the root turn keeps running. False
+    /// when the child is unknown or did not advertise `cancel`.
+    pub async fn cancel_subagent(
+        &self,
+        session_id: &str,
+        child_id: &str,
+    ) -> Result<bool, SupervisorError> {
+        debug!(target: "acp.supervisor", session = %session_id, child = %child_id, "subagent cancel requested");
+        let client = self.ready_client(session_id).await?;
+        match client.cancel_child(child_id).await {
+            Ok(sent) => Ok(sent),
+            Err(AcpError::AgentExited) => Ok(false),
+            Err(e) => Err(SupervisorError::Acp(e)),
+        }
+    }
+
     /// User-initiated "Force stop".
     pub async fn force_end_turn(&self, session_id: &str) {
         debug!(target: "acp.supervisor", session = %session_id, "force stop requested");

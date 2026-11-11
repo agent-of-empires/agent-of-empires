@@ -375,6 +375,90 @@ describe("transport reason", () => {
 });
 
 describe("size owner", () => {
+  it("names the owner's kind only for a non-owner and only for a kind it knows (#5543)", () => {
+    const cases: [Record<string, unknown>, string | null][] = [
+      [{ is_owner: false, owner: "tui" }, "tui"],
+      [{ is_owner: false, owner: "web" }, "web"],
+      [{ is_owner: false }, null],
+      [{ is_owner: false, owner: "tmux" }, null],
+      [{ is_owner: true, owner: "tui" }, null],
+    ];
+    for (const [msg, kind] of cases) {
+      const { result, ws, unmount } = mount();
+      ws.deliver({ type: "size_owner", ...msg });
+      expect(result.current.state.ownerKind, JSON.stringify(msg)).toBe(kind);
+      unmount();
+      FakeWS.sockets.length = 0;
+    }
+  });
+
+  it("claims after the next grid report, so the Daemon resizes the pane to that grid once", () => {
+    vi.useFakeTimers();
+    try {
+      const controls = (ws: FakeWS) =>
+        ws
+          .json()
+          .filter(({ type }) => type === "resize" || type === "claim")
+          .map((m) => (m.type === "claim" ? "claim" : `resize ${m.rows}`));
+      // (what the view does after Take control, controls sent after the initial 20-row report)
+      const cases: [string, (r: ReturnType<typeof mount>["result"]) => void, string[]][] = [
+        ["a larger grid", (r) => act(() => r.current.sendResize(80, 24)), ["resize 24", "claim"]],
+        ["the same grid", (r) => act(() => r.current.sendResize(80, 20)), ["claim"]],
+        ["no report before the deadline", () => act(() => vi.advanceTimersByTime(1000)), ["claim"]],
+        [
+          "a report after the deadline",
+          (r) => {
+            act(() => vi.advanceTimersByTime(1000));
+            act(() => r.current.sendResize(80, 24));
+          },
+          ["claim", "resize 24"],
+        ],
+      ];
+      for (const [name, then, expected] of cases) {
+        const { result, ws, unmount } = mount();
+        act(() => result.current.sendResize(80, 20));
+        const before = controls(ws).length;
+        act(() => result.current.claimAfterResize(1000));
+        expect(controls(ws).slice(before), name).toEqual([]);
+        then(result);
+        // At once: a report claims without waiting for the deadline.
+        expect(controls(ws).slice(before), name).toEqual(expected);
+        act(() => vi.advanceTimersByTime(5000));
+        expect(controls(ws).slice(before), `${name}, no second claim`).toEqual(expected);
+        unmount();
+        FakeWS.sockets.length = 0;
+      }
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("claims outright on a Reconnect from the top bar, and waits for a vacant lock on any other redial", () => {
+    const redial = (ws: FakeWS) => {
+      ws.readyState = FakeWS.CLOSED;
+      act(() => ws.onclose?.(new CloseEvent("close")));
+    };
+    const claims = (ws: FakeWS) =>
+      ws
+        .json()
+        .filter(({ type }) => type === "claim" || type === "claim_if_vacant")
+        .map(({ type }) => type);
+    const { result, ws } = mount();
+    act(() => result.current.reconnectAndClaim());
+    redial(ws);
+    const claimed = FakeWS.sockets[1]!;
+    claimed.open();
+    expect(claims(claimed)).toEqual(["claim"]);
+
+    // The explicit claim is for that one socket; the next redial goes back to claim_if_vacant.
+    act(() => result.current.manualReconnect());
+    redial(claimed);
+    const next = FakeWS.sockets[2]!;
+    next.open();
+    expect(claims(next)).toEqual(["claim_if_vacant"]);
+  });
+
   it("claims a vacant lock on open and waits for the owner verdict", () => {
     const { result, ws } = mount();
     expect(result.current.state).toMatchObject({ isOwner: false, ownerKnown: false });

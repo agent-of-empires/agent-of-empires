@@ -1160,6 +1160,17 @@ describe("fetchProfileAgents", () => {
     expect(lastCall().url).toBe("/api/agents?profile=work");
   });
 
+  it.each([
+    ["a project", "work", { path: "/r/a b", scratch: false }, "/api/agents?profile=work&path=%2Fr%2Fa+b"],
+    ["scratch, which drops the path", "work", { path: "/r/a", scratch: true }, "/api/agents?profile=work&scratch=true"],
+    ["no project", "work", { path: "", scratch: false }, "/api/agents?profile=work"],
+    ["neither", undefined, undefined, "/api/agents"],
+  ] as const)("sends %s", async (_name, profile, project, url) => {
+    fetchSpy.mockResolvedValueOnce(json([]));
+    await api.fetchProfileAgents(profile, project);
+    expect(lastCall().url).toBe(url);
+  });
+
   it("is null for fetchAgents when the profile is unknown", async () => {
     fetchSpy.mockResolvedValueOnce(json({ error: "profile_not_found" }, 404));
     expect(await api.fetchAgents("work")).toBeNull();
@@ -1817,5 +1828,18 @@ describe("restartSessionForUpdate", () => {
 
     offline();
     expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false });
+  });
+});
+
+describe("fetchTaskOutput", () => {
+  it("requests the task output of a session with both ids encoded", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ exists: true, output: "hi", truncated: false }));
+    expect(await api.fetchTaskOutput("s 1", "t/2")).toEqual({ exists: true, output: "hi", truncated: false });
+    expect(lastCall().url).toBe("/api/sessions/s%201/acp/tasks/t%2F2/output");
+  });
+
+  it("is null on a non-2xx answer", async () => {
+    fetchSpy.mockResolvedValueOnce(json({}, 404));
+    expect(await api.fetchTaskOutput("s", "t")).toBeNull();
   });
 });

@@ -77,6 +77,27 @@ impl Session {
         }
     }
 
+    /// A subagent session only honours `session/cancel` when it announced the
+    /// capability; the root turn is unaffected either way.
+    pub(super) async fn cancel_child(&self, session_id: String) -> bool {
+        let child = SessionId::from(session_id.clone());
+        if !self
+            .shared
+            .ingress
+            .child_route(&child)
+            .is_some_and(|route| route.cancel_capable)
+        {
+            return false;
+        }
+        match self.control.as_ref() {
+            Some(control) => control.cancel_session(session_id).await,
+            None => self
+                .connection
+                .send_notification(CancelNotification::new(child))
+                .is_ok(),
+        }
+    }
+
     pub(super) fn dispatch_config_option(
         &mut self,
         config_id: String,
@@ -146,6 +167,12 @@ impl Session {
                     if self.run_prompt(blocks).await? {
                         break;
                     }
+                }
+                Some(ClientCmd::CancelChild {
+                    session_id,
+                    respond_to,
+                }) => {
+                    let _ = respond_to.send(self.cancel_child(session_id).await);
                 }
                 Some(ClientCmd::Cancel) => {
                     info!(target: "acp.protocol", "sending session/cancel (no prompt in flight)");
@@ -233,7 +260,10 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
-        let Some(cost_seen) = shared.between_prompt.take_idle_fire(now_ms()) else {
+        let Some(cost_seen) = shared
+            .between_prompt
+            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
+        else {
             return false;
         };
         // An adopted turn races the detached resume-idle task for its
@@ -297,8 +327,29 @@ impl Session {
             });
             return Ok(());
         };
+        if ingress.has_parked() {
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "an approval is waiting for an answer; resolve it before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
+        if self.shared.has_active_subagent() {
+            self.shared
+                .emit(Event::PromptRejected {
+                    reason: "agent_busy".into(),
+                    text,
+                })
+                .await;
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "a subagent is still running; wait for it to finish before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
         let work = self.shared.between_prompt.work_state();
-        if work.is_busy() || !self.shared.bg_tasks.is_empty() {
+        if work.is_busy()
+            || !self.shared.bg_tasks.is_empty()
+            || self.shared.aoe.leases.any_live(now_ms())
+        {
             // Old-session events would be attributed to the new conversation.
             warn!(
                 target: "acp.protocol",
@@ -355,6 +406,8 @@ impl Session {
                 // session/new is the irreversible commit; the loop picks the
                 // id back up from the ingress on its next iteration.
                 self.session_from_storage = false;
+                self.shared.aoe.session_reset();
+                self.shared.settle_discarded().await;
                 self.channels = SessionChannels::new(
                     new_session.modes.as_ref(),
                     new_session.config_options.as_deref(),
