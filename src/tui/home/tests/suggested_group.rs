@@ -181,6 +181,28 @@ fn enter_on_a_suggestion_opens_the_prefilled_dialog() {
 
 #[test]
 #[serial]
+fn enter_on_a_started_suggestion_opens_its_session_instead_of_preparing() {
+    let mut env = create_test_env_with_sessions(2);
+    let target = env.view.instances().last().unwrap().id.clone();
+    let mut snap = snapshot(1, &[]);
+    snap["items"][0]["started_session"] = serde_json::json!({ "id": target, "status": "Idle" });
+    let (sink, requests) = mpsc::channel();
+    env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snap.clone(), sink);
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    env.view.rebuild_flat_items();
+    select_suggested_header(&mut env);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    assert_eq!(env.view.selected_session.as_deref(), Some(target.as_str()));
+    assert!(requests.try_recv().is_err(), "no prepare request");
+    assert!(env.view.new_dialog.is_none());
+}
+
+#[test]
+#[serial]
 fn a_prepare_answered_after_the_cursor_moved_is_dropped() {
     let (mut env, requests) = expanded_env(2);
     env.view.cursor += 1;

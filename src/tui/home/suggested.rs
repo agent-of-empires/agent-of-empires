@@ -83,12 +83,19 @@ impl HomeView {
         })
     }
 
-    /// Enter on a suggestion row prepares it and opens the prefilled dialog;
-    /// on "View all" it opens the full view. False when the cursor is on
-    /// neither.
+    /// Enter on a suggestion row opens its started Session, or prepares it
+    /// and opens the prefilled dialog; on "View all" it opens the full view.
+    /// False when the cursor is on neither.
     pub(super) fn activate_suggestion_row(&mut self) -> bool {
         if let Some(key) = self.cursor_suggestion() {
-            self.suggestions_feed.prepare(key);
+            match self
+                .suggestions_feed
+                .entry(&key)
+                .and_then(|e| e.started_session)
+            {
+                Some(id) => self.jump_to_session_id(&id),
+                None => self.suggestions_feed.prepare(key),
+            }
             return true;
         }
         if matches!(

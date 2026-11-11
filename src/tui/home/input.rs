@@ -4608,7 +4608,7 @@ impl HomeView {
         }
     }
 
-    fn jump_to_session_id(&mut self, id: &str) {
+    pub(super) fn jump_to_session_id(&mut self, id: &str) {
         if let Some(idx) = self
             .flat_items
             .iter()

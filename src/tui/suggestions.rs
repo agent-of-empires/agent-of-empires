@@ -924,6 +924,8 @@ pub(super) struct Entry {
     /// The item's `source_url` when it is an http(s) address; core validates
     /// it, this is a second check before anything is opened.
     pub source_url: Option<String>,
+    /// The id of the live Session the item was started as.
+    pub started_session: Option<String>,
 }
 
 pub(super) struct FeedPoll {
@@ -1084,6 +1086,7 @@ impl SuggestionsFeed {
             prompt: plain(&item.draft.prompt),
             provider_error: provider.error.as_deref().map(plain),
             source_url: crate::util::is_http_url(&item.source_url).then(|| item.source_url.clone()),
+            started_session: item.started_session.as_ref().map(|s| s.id.clone()),
         })
     }
 
