@@ -267,6 +267,15 @@ pub(in crate::tui) struct LiveSendState {
     pub leader: Option<(KeyCode, KeyModifiers)>,
 }
 
+/// A Session whose live control another window took. The footer names `taker`, and the
+/// preview reads `tmux_name` through capture-pane so the new owner can arm its VT pipe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::tui) struct TakenLive {
+    pub session_id: String,
+    pub tmux_name: String,
+    pub taker: LiveTakeover,
+}
+
 /// Which kind of window took a Session's live control from this TUI, read from the
 /// size-owner id: the Web dashboard registers `live-*`, a TUI `tui-*`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

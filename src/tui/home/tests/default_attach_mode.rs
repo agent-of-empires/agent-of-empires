@@ -531,7 +531,11 @@ fn takeover_footer_names_enter_when_enter_is_live() {
     env.view.flat_items = env.view.build_flat_items();
     env.view.cursor = 0;
     env.view.update_selected();
-    env.view.live_takeover = Some((id, crate::tui::home::live_send::LiveTakeover::Web));
+    env.view.live_takeover = Some(crate::tui::home::live_send::TakenLive {
+        session_id: id,
+        tmux_name: "aoe_taken".into(),
+        taker: crate::tui::home::live_send::LiveTakeover::Web,
+    });
     let out = render_home(&mut env);
     let footer = out.lines().last().unwrap_or_default();
     assert!(
@@ -547,7 +551,7 @@ fn takeover_footer_names_enter_when_enter_is_live() {
 #[test]
 #[serial]
 fn a_takeover_flashes_when_the_shortcut_bar_is_hidden() {
-    use crate::tui::home::live_send::LiveTakeover;
+    use crate::tui::home::live_send::{LiveTakeover, TakenLive};
     // (default attach mode, shortcut bar shown, flash)
     for (mode, bar, flash) in [
         (
@@ -569,12 +573,13 @@ fn a_takeover_flashes_when_the_shortcut_bar_is_hidden() {
         env.view.cursor = 0;
         env.view.update_selected();
         env.view.show_shortcut_bar = bar;
-        env.view.note_live_takeover(id.clone(), LiveTakeover::Web);
-        assert_eq!(
-            env.view.live_takeover,
-            Some((id, LiveTakeover::Web)),
-            "{mode:?} {bar}"
-        );
+        let taken = TakenLive {
+            session_id: id,
+            tmux_name: "aoe_taken".into(),
+            taker: LiveTakeover::Web,
+        };
+        env.view.note_live_takeover(taken.clone());
+        assert_eq!(env.view.live_takeover, Some(taken), "{mode:?} {bar}");
         assert_eq!(env.view.status_flash_text(), flash, "{mode:?} {bar}");
         if let Some(flash) = flash {
             let out = render_home(&mut env);

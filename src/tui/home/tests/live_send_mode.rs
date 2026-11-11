@@ -109,10 +109,18 @@ fn degraded_snapshot_closes_live_send_without_disconnecting_sidebar() {
 #[test]
 #[serial]
 fn a_takeover_ends_live_mode_with_a_footer_line_not_a_dialog() {
-    use crate::tui::home::live_send::{LiveSendWorker, LiveTakeover};
+    use crate::tui::home::live_send::{LiveSendWorker, LiveTakeover, TakenLive};
     let mut env = create_test_env_with_sessions(2);
     let _native_driver = env.view.session_feed.terminal_driver_for_test();
     let id = install_live_for_first_session(&mut env);
+    let tmux_name = env.view.live_send.as_ref().unwrap().tmux_name.clone();
+    let taken = |taker| {
+        Some(TakenLive {
+            session_id: id.clone(),
+            tmux_name: tmux_name.clone(),
+            taker,
+        })
+    };
     env.view.live_send_worker = Some(LiveSendWorker::spawn(
         "fake".to_string(),
         None,
@@ -136,10 +144,7 @@ fn a_takeover_ends_live_mode_with_a_footer_line_not_a_dialog() {
     );
     assert!(env.view.info_dialog.is_none(), "a takeover opens no dialog");
     // The fake pane has no size-owner lock, so the holder is unknown.
-    assert_eq!(
-        env.view.live_takeover,
-        Some((id.clone(), LiveTakeover::Other))
-    );
+    assert_eq!(env.view.live_takeover, taken(LiveTakeover::Other));
     assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
 
     // (lock owner id, footer line)
@@ -150,7 +155,7 @@ fn a_takeover_ends_live_mode_with_a_footer_line_not_a_dialog() {
         (None, "Another window took control"),
     ] {
         let taker = LiveTakeover::from_owner_id(owner);
-        env.view.live_takeover = Some((id.clone(), taker));
+        env.view.live_takeover = taken(taker);
         for width in [80, 120] {
             let out = render_home_to_string(&mut env.view, width, 24);
             let footer = out.lines().last().unwrap_or_default();
@@ -171,10 +176,15 @@ fn a_takeover_ends_live_mode_with_a_footer_line_not_a_dialog() {
     env.view.update_selected();
     assert!(env.view.live_takeover.is_none());
 
-    // Tab, which starts live mode and takes control back, clears it too.
-    env.view.live_takeover = Some((id.clone(), LiveTakeover::Web));
-    env.view.handle_key(key(KeyCode::Tab), None);
-    assert!(env.view.live_takeover.is_none());
+    // Tab only queues live entry, which may still be refused; entering live mode clears it
+    // (see a_takeover_yields_the_previewed_panes_vt_pipe_until_live_or_reselect).
+    env.view.live_takeover = taken(LiveTakeover::Web);
+    let action = env.view.handle_key(key(KeyCode::Tab), None);
+    assert!(
+        matches!(&action, Some(Action::EnterLiveSend(sid)) if *sid == id),
+        "{action:?}"
+    );
+    assert_eq!(env.view.live_takeover, taken(LiveTakeover::Web));
 }
 
 /// A takeover leaves the taken pane on capture-pane, so the new owner can arm the VT
@@ -241,6 +251,7 @@ fn a_takeover_yields_the_previewed_panes_vt_pipe_until_live_or_reselect() {
             }
         }
         assert!(env.view.preview_vt_enabled(Some(&tmux_name)), "{lifts_by}");
+        assert!(env.view.live_takeover.is_none(), "{lifts_by}");
     }
 }
 

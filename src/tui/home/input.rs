@@ -4920,7 +4920,6 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
-                self.vt_yield = None;
                 self.live_takeover = None;
                 self.retained_preview = None;
                 self.retained_focus = None;
@@ -6900,7 +6899,6 @@ impl HomeView {
     /// that is already the live-send target, so clicking the same row twice does not
     /// re-run ensure_pane_ready or drop the live worker.
     pub(super) fn start_live_send(&mut self) -> Option<Action> {
-        self.live_takeover = None;
         let id = self.selected_session.clone()?;
         if self.live_send.as_ref().is_some_and(|s| s.session_id == id) {
             return None;
@@ -7303,27 +7301,26 @@ impl HomeView {
         let taker =
             live_send::LiveTakeover::from_owner_id(owner.as_ref().map(|(id, _)| id.as_str()));
         self.teardown_live_send();
-        self.vt_yield = Some(state.tmux_name);
-        self.note_live_takeover(state.session_id, taker);
+        self.note_live_takeover(live_send::TakenLive {
+            session_id: state.session_id,
+            tmux_name: state.tmux_name,
+            taker,
+        });
         true
     }
 
     /// A footer line, not a dialog: the live key takes control back. With the shortcut bar
     /// hidden that line never shows, so a flash says the same once.
-    pub(super) fn note_live_takeover(
-        &mut self,
-        session_id: String,
-        taker: live_send::LiveTakeover,
-    ) {
+    pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
         if !self.show_shortcut_bar {
-            let key = if self.tab_enters_live(&session_id) {
+            let key = if self.tab_enters_live(&taken.session_id) {
                 "Tab"
             } else {
                 "Enter"
             };
-            self.flash_status(format!("{}: {key} to take it back", taker.label()));
+            self.flash_status(format!("{}: {key} to take it back", taken.taker.label()));
         }
-        self.live_takeover = Some((session_id, taker));
+        self.live_takeover = Some(taken);
     }
 
     /// Whether Tab, not Enter, enters live mode on this Session's row (see the footer).

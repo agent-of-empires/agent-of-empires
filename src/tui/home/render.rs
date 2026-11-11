@@ -2624,7 +2624,10 @@ impl HomeView {
     pub(super) fn preview_vt_enabled(&self, target: Option<&str>) -> bool {
         self.vt_live_enabled
             && !matches!(self.view_mode, ViewMode::Terminal)
-            && (self.vt_yield.is_none() || self.vt_yield.as_deref() != target)
+            && self
+                .live_takeover
+                .as_ref()
+                .is_none_or(|taken| Some(taken.tmux_name.as_str()) != target)
     }
 
     /// Point the capture worker at `desired` (the displayed pane's tmux session) and
@@ -4526,8 +4529,8 @@ impl HomeView {
             let takeover = self
                 .live_takeover
                 .as_ref()
-                .filter(|(id, _)| self.selected_session.as_deref() == Some(id.as_str()))
-                .map(|(_, taker)| *taker);
+                .filter(|taken| self.selected_session.as_deref() == Some(taken.session_id.as_str()))
+                .map(|taken| taken.taker);
             let live_key = takeover.map(|taker| {
                 let tab_is_live = self
                     .selected_session
