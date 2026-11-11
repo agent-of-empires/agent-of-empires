@@ -157,6 +157,8 @@ impl AoeIngress {
 
     fn lose(&self, reason: IntegrationLostReason) -> Ingested {
         self.lost.store(true, Ordering::Relaxed);
+        // Later frames are swallowed, so no release can arrive.
+        self.leases.clear();
         Ingested::Lost(reason)
     }
 }
@@ -345,5 +347,18 @@ mod tests {
         let again = json!({"v":1,"key":"l2","lease":{"id":"bg2","kind":"task","ttl_ms":60000}});
         ids(i.ingest(frame("t2", again), true, 0, 2));
         assert!(i.leases.working(3));
+    }
+
+    #[test]
+    fn a_lost_integration_drops_its_leases() {
+        let i = ingress(true);
+        let lease = json!({"v":1,"key":"l1","lease":{"id":"bg","kind":"busy","ttl_ms":3600000}});
+        ids(i.ingest(frame("t1", lease), true, 0, 0));
+        assert!(i.leases.any_live(1));
+        assert!(matches!(
+            i.ingest(frame("bad", json!({"v": 1})), true, 0, 1),
+            Ingested::Lost(_)
+        ));
+        assert!(!i.leases.any_live(1) && !i.leases.working(1));
     }
 }
