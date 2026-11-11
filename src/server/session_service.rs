@@ -1885,6 +1885,10 @@ impl SessionService {
                 || inst.is_archived()
                 || inst.is_snoozed()
                 || inst.is_trashed()
+                || !matches!(
+                    inst.status,
+                    crate::session::Status::Idle | crate::session::Status::Running
+                )
             {
                 return;
             }

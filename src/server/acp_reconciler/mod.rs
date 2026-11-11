@@ -504,7 +504,14 @@ async fn drain_queued_prompts(state: &Arc<AppState>) {
         let instances = state.instances.read().await;
         instances
             .iter()
-            .filter(|i| !i.queued_prompts.is_empty() && is_untriaged_structured(i))
+            .filter(|i| {
+                !i.queued_prompts.is_empty()
+                    && matches!(
+                        i.status,
+                        crate::session::Status::Idle | crate::session::Status::Running
+                    )
+                    && is_untriaged_structured(i)
+            })
             .map(|i| (i.id.clone(), i.is_idle_dormant()))
             .collect()
     };
@@ -970,6 +977,35 @@ mod tests {
             attempts + 1,
             "the kept request respawns the session once the teardown ends"
         );
+    }
+
+    #[tokio::test]
+    async fn queue_drain_preserves_a_deliberately_stopped_dormant_session() {
+        use crate::session::{Instance, Status, View};
+
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let id = "stopped-with-queue";
+        let mut inst = Instance::new(id, "/tmp/aoe-stopped-with-queue");
+        inst.id = id.into();
+        inst.view = View::Structured;
+        inst.status = Status::Stopped;
+        inst.mark_idle_dormant();
+        inst.queued_prompts.push(test_fixtures::queued_prompt());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let mut tick = test_fixtures::Tick::default();
+        for _ in 0..3 {
+            tick.run(&state).await;
+        }
+        let instances = state.instances.read().await;
+        assert!(
+            instances[0].is_idle_dormant(),
+            "a deliberate stop must stay dormant"
+        );
+        assert!(
+            !tick.attempted.contains(id),
+            "queue drain must not attempt a stopped session"
+        );
+        assert_eq!(instances[0].queued_prompts.len(), 1);
     }
 
     #[tokio::test]
