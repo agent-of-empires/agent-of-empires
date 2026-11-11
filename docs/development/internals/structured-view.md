@@ -133,6 +133,10 @@ with independent indexed first/last sequence lookups. A stale token produces HTT
 409; two successful blocks with different identities fail metadata validation.
 Mixed snapshots never replace the last readable window. Unchanged incomplete
 histories use identity probes instead of full replays.
+Identity installation reserves SQLite's writer before checking its schema, so
+concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
+the existing incarnation and session revisions; lock waiting remains bounded by
+the connection's busy policy.
 
 File-backed retained reads reuse the independent query-only search reader, not
 the event writer. Identity, bounds and raw rows share one read transaction; commit
