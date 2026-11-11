@@ -26,22 +26,93 @@ interface Toast {
 const ToastContext = createContext<ToastApi | null>(null);
 
 const TOAST_LIFETIME_MS = 6000;
+// The least time a toast stays once hover and focus have both ended.
+const TOAST_GRACE_MS = 2000;
+
+interface TimerState {
+  handle: ReturnType<typeof setTimeout> | null;
+  remaining: number;
+  startedAt: number;
+  hover: boolean;
+  focus: boolean;
+}
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const nextId = useRef(1);
 
+  // Per-toast lifetime state. A timer is paused when its handle is null.
+  const timers = useRef(new Map<number, TimerState>());
+
   const dismiss = useCallback((id: number) => {
     setToasts((t) => t.filter((toast) => toast.id !== id));
+    const entry = timers.current.get(id);
+    if (entry?.handle) clearTimeout(entry.handle);
+    timers.current.delete(id);
+  }, []);
+
+  const startTimer = useCallback(
+    (id: number, ms: number) => {
+      const entry = timers.current.get(id);
+      if (!entry) return;
+      entry.startedAt = Date.now();
+      entry.handle = setTimeout(() => dismiss(id), ms);
+    },
+    [dismiss],
+  );
+
+  const scheduleDismiss = useCallback(
+    (id: number) => {
+      timers.current.set(id, {
+        handle: null,
+        remaining: TOAST_LIFETIME_MS,
+        startedAt: 0,
+        hover: false,
+        focus: false,
+      });
+      startTimer(id, TOAST_LIFETIME_MS);
+    },
+    [startTimer],
+  );
+
+  const pause = useCallback((id: number, source: "hover" | "focus") => {
+    const entry = timers.current.get(id);
+    if (!entry) return;
+    entry[source] = true;
+    if (entry.handle !== null) {
+      clearTimeout(entry.handle);
+      entry.remaining = Math.max(entry.remaining - (Date.now() - entry.startedAt), 0);
+      entry.handle = null;
+    }
+  }, []);
+
+  const resume = useCallback(
+    (id: number, source: "hover" | "focus") => {
+      const entry = timers.current.get(id);
+      if (!entry) return;
+      entry[source] = false;
+      if (!entry.hover && !entry.focus && entry.handle === null) {
+        startTimer(id, Math.max(entry.remaining, TOAST_GRACE_MS));
+      }
+    },
+    [startTimer],
+  );
+
+  useEffect(() => {
+    const map = timers.current;
+    return () => {
+      for (const t of map.values()) if (t.handle !== null) clearTimeout(t.handle);
+      map.clear();
+    };
   }, []);
 
   const push = useCallback(
     (message: string, kind: ToastKind = "info") => {
       const id = nextId.current++;
       setToasts((t) => [...t, { id, kind, message }]);
-      setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
+      scheduleDismiss(id);
     },
-    [dismiss],
+    [scheduleDismiss],
   );
 
   // Pushes a toast with an associated session so tapping it jumps to that session.
@@ -49,9 +120,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     (message: string, sessionId: string) => {
       const id = nextId.current++;
       setToasts((t) => [...t, { id, kind: "info", message, sessionId }]);
-      setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
+      scheduleDismiss(id);
     },
-    [dismiss],
+    [scheduleDismiss],
   );
 
   // A click-to-open toast (worker `ui.open_url`): a browser blocks `window.open`
@@ -60,9 +131,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     (message: string, href: string, kind: ToastKind = "info") => {
       const id = nextId.current++;
       setToasts((t) => [...t, { id, kind, message, href }]);
-      setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
+      scheduleDismiss(id);
     },
-    [dismiss],
+    [scheduleDismiss],
   );
 
   const pushWithAction = useCallback((message: string, label: string, run: () => void) => {
@@ -151,6 +222,12 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               key={t.id}
               role={t.kind === "error" ? "alert" : "status"}
               onClick={clickable ? onToastClick : undefined}
+              onPointerEnter={() => pause(t.id, "hover")}
+              onPointerLeave={() => resume(t.id, "hover")}
+              onFocus={() => pause(t.id, "focus")}
+              onBlur={(e) => {
+                if (!e.currentTarget.contains(e.relatedTarget)) resume(t.id, "focus");
+              }}
               className={`flex items-start gap-2 px-3 py-2 rounded-md border shadow-lg animate-slide-up text-sm ${
                 t.kind === "error"
                   ? "bg-status-error/10 border-status-error/40 text-status-error"

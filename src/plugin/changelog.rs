@@ -253,6 +253,7 @@ mod tests {
     fn release(tag: &str, body: Option<&str>, prerelease: bool, draft: bool) -> GitHubRelease {
         GitHubRelease {
             tag_name: tag.to_string(),
+            name: None,
             body: body.map(str::to_string),
             published_at: Some("2026-01-01T00:00:00Z".to_string()),
             draft,

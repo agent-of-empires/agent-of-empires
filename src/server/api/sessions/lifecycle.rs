@@ -2665,7 +2665,7 @@ async fn finish_structured_restart(
                                     text: &wake,
                                     attachments: &[],
                                     woke_idle_dormant: false,
-                                    prompt_id: None,
+                                    prompt_ids: Vec::new(),
                                     synthesized: true,
                                     no_revive: true,
                                 },

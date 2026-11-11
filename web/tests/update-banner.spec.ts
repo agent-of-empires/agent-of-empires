@@ -103,5 +103,55 @@ test.describe("Update banner (#984, #1140)", () => {
       await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth),
     ).toBeLessThanOrEqual(0);
     expect(await banner.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(0);
+    // #5514: on a phone the lines stack left-aligned and × stays at the top right.
+    const dismiss = (await banner.getByRole("button", { name: "Dismiss update notice" }).boundingBox())!;
+    expect(dismiss.y - box.y).toBeLessThanOrEqual(12);
+    expect(box.x + box.width - (dismiss.x + dismiss.width)).toBeLessThanOrEqual(12);
+    const lines = banner.locator("[data-banner-line]");
+    const [first, second] = [(await lines.nth(0).boundingBox())!, (await lines.nth(1).boundingBox())!];
+    expect(Math.abs(first.x - second.x)).toBeLessThanOrEqual(1);
+    expect(first.x - box.x).toBeLessThanOrEqual(40);
+  });
+
+  test("on a wide screen the banner's text is centered, × is pinned right, and line two starts under line one (#5514)", async ({
+    page,
+  }) => {
+    await mockBase(page);
+    await page.route("**/api/system/update-status", (r) =>
+      r.fulfill({
+        json: {
+          update_check_mode: "notify",
+          current_version: "1.21.0",
+          latest_version: "1.22.1",
+          update_available: true,
+          release_url: null,
+          error: null,
+          dismissed_version: null,
+          install_method: "homebrew",
+          update_command: "aoe update",
+        },
+      }),
+    );
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    const banner = page.getByRole("status", { name: /Update available/i });
+    await expect(banner).toBeVisible();
+    const box = (await banner.boundingBox())!;
+    const lines = banner.locator("[data-banner-line]");
+    await expect(lines).toHaveCount(2);
+    const [first, second] = [(await lines.nth(0).boundingBox())!, (await lines.nth(1).boundingBox())!];
+    // The dot and the lines form one block, centered in the banner.
+    const block = (await lines.nth(0).locator("xpath=../..").boundingBox())!;
+    const leftGap = block.x - box.x;
+    const rightGap = box.x + box.width - (block.x + block.width);
+    expect(Math.abs(leftGap - rightGap)).toBeLessThanOrEqual(2);
+    expect(Math.abs(first.x - second.x)).toBeLessThanOrEqual(1);
+    // The dot and × sit on the first line's center line.
+    const firstMid = first.y + first.height / 2;
+    const dot = (await banner.locator("span.rounded-full").first().boundingBox())!;
+    expect(Math.abs(dot.y + dot.height / 2 - firstMid)).toBeLessThanOrEqual(2);
+    const dismiss = (await banner.getByRole("button", { name: "Dismiss update notice" }).boundingBox())!;
+    expect(Math.abs(dismiss.y + dismiss.height / 2 - firstMid)).toBeLessThanOrEqual(2);
+    expect(box.x + box.width - (dismiss.x + dismiss.width)).toBeLessThanOrEqual(12);
   });
 });

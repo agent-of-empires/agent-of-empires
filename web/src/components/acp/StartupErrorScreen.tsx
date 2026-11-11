@@ -13,7 +13,7 @@ interface Props {
   isSandboxed?: boolean;
 }
 
-const SETTING_PATH = 'TUI › Settings › Global › Acp › Advanced › "Allow agent install from web"';
+const SETTING_PATH = 'TUI › Settings › Global › Acp › Advanced › "Let the Web dashboard install Agents"';
 
 function Code({ children }: { children: React.ReactNode }) {
   return <code className="rounded bg-surface-950 px-1 font-mono text-[12px]">{children}</code>;
