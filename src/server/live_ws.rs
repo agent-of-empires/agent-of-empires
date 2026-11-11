@@ -1147,6 +1147,9 @@ async fn handle_live_ws_inner(
                     *capture_slot.lock().unwrap() = Some(Arc::clone(&ch));
                     capture_vt = Some(ch);
                     vt_pipe_owned = false;
+                    // A fresh seed gets the same settle wait as a socket that opened on it.
+                    last_published = None;
+                    first_publish_wait_started = None;
                 }
             }
             // The grid serves single-pane windows within its scrollback depth;
