@@ -255,7 +255,11 @@ fn validate_item(spec: &SuggestionsSpec, item: &Suggestion) -> Result<(), String
         ("source_ref", item.source_ref.len(), MAX_URL_BYTES),
         ("preview", item.preview.len(), MAX_PREVIEW_BYTES),
         ("draft.title", item.draft.title.len(), MAX_TITLE_BYTES),
-        ("draft.prompt", item.draft.prompt.len(), MAX_PROMPT_BYTES),
+        (
+            "draft.prompt",
+            item.draft.prompt.len(),
+            MAX_INITIAL_PROMPT_BYTES,
+        ),
         (
             "project",
             item.project.as_ref().map_or(0, String::len),

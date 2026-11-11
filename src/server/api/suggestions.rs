@@ -379,7 +379,7 @@ pub async fn prepare_suggestion(
             "validation_failed",
             format!(
                 "The expanded prompt exceeds {} bytes",
-                suggestions::MAX_PROMPT_BYTES
+                crate::session::MAX_INITIAL_PROMPT_BYTES
             ),
         ),
         Ok(Ok(None)) => stale_item(),
@@ -425,13 +425,13 @@ fn check_template_put(
     template: &str,
 ) -> Result<(), axum::response::Response> {
     check_declared(provider, criterion)?;
-    if template.len() > suggestions::MAX_PROMPT_BYTES {
+    if template.len() > crate::session::MAX_INITIAL_PROMPT_BYTES {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             format!(
                 "Template is limited to {} bytes",
-                suggestions::MAX_PROMPT_BYTES
+                crate::session::MAX_INITIAL_PROMPT_BYTES
             ),
         ));
     }
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn template_put_is_bounded_and_needs_a_declared_source() {
-        let max = suggestions::MAX_PROMPT_BYTES;
+        let max = crate::session::MAX_INITIAL_PROMPT_BYTES;
         let status = |provider: Option<Provider>, criterion: &str, len: usize| {
             check_template_put(provider, criterion, &"x".repeat(len))
                 .err()
