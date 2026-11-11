@@ -1362,6 +1362,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       result: null,
       warning: null,
     };
+    // A child's snapshot may predate the launch event.
+    const child = next.subagents.find((s) => s.parent_tool_call_id === e.tool_call_id);
+    if (child) Object.assign(record, reconcileChild(record, child, e.started_at));
     // Idempotent on replay.
     const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
     next.backgroundAgents =
@@ -1411,14 +1414,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     const { subagent, at } = event.SubagentUpdated;
     const parent = subagent.parent_tool_call_id;
     if (parent) {
-      next.backgroundAgents = next.backgroundAgents.map((a) => {
-        if (a.toolCallId !== parent) return a;
-        if (subagent.state === "idle") {
-          const status = subagent.stop_reason === "error" ? "error" : "completed";
-          return { ...a, status, endedAt: a.endedAt ?? at };
-        }
-        return { ...a, status: subagent.state, endedAt: null };
-      });
+      next.backgroundAgents = next.backgroundAgents.map((a) =>
+        a.toolCallId === parent ? reconcileChild(a, subagent, at) : a,
+      );
     }
     const i = next.subagents.findIndex((s) => s.session_id === subagent.session_id);
     next.subagents =
@@ -1445,6 +1443,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   // Remaining events carry no client control state.
   return next;
+}
+
+/** Folds a child's RFD snapshot into its agent; `at` stamps a newly ended one. */
+function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): BackgroundAgent {
+  if (child.state === "idle") {
+    const status = child.stop_reason === "error" ? "error" : "completed";
+    return { ...a, status, endedAt: a.endedAt ?? at };
+  }
+  return { ...a, status: child.state, endedAt: null };
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */

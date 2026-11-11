@@ -1217,23 +1217,32 @@ impl AcpState {
                 output_file: _,
                 workflow,
                 started_at,
-            } => self.launch_background_agent(BackgroundAgentRecord {
-                agent_id,
-                tool_call_id,
-                description,
-                prompt,
-                model,
-                workflow,
-                status: BackgroundAgentStatus::Running,
-                started_at,
-                ended_at: None,
-                tool_count: 0,
-                tools: Vec::new(),
-                last_tool: None,
-                last_text: None,
-                result: None,
-                warning: None,
-            }),
+            } => {
+                let mut record = BackgroundAgentRecord {
+                    agent_id,
+                    tool_call_id,
+                    description,
+                    prompt,
+                    model,
+                    workflow,
+                    status: BackgroundAgentStatus::Running,
+                    started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                };
+                // A child's snapshot may predate the launch event.
+                if let Some(child) = self.subagents.iter().find(|s| {
+                    s.parent_tool_call_id.as_deref() == Some(record.tool_call_id.as_str())
+                }) {
+                    record.reconcile(child, started_at);
+                }
+                self.launch_background_agent(record);
+            }
             Event::BackgroundAgentProgress {
                 agent_id,
                 status,
@@ -1419,17 +1428,7 @@ impl AcpState {
                 .iter_mut()
                 .find(|a| a.tool_call_id == tool_call_id)
             {
-                let (status, ended) = match subagent.state {
-                    SubagentState::Running => (BackgroundAgentStatus::Running, false),
-                    SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
-                    SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
-                    SubagentState::Idle if subagent.stop_reason.as_deref() == Some("error") => {
-                        (BackgroundAgentStatus::Error, true)
-                    }
-                    SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
-                };
-                agent.status = status;
-                agent.ended_at = ended.then(|| agent.ended_at.unwrap_or(at));
+                agent.reconcile(&subagent, at);
             }
         }
         match self
@@ -1446,6 +1445,23 @@ impl AcpState {
         self.background_agents
             .iter_mut()
             .find(|a| a.agent_id == agent_id)
+    }
+}
+
+impl BackgroundAgentRecord {
+    /// Folds a child's RFD snapshot in; `at` stamps a newly ended agent.
+    fn reconcile(&mut self, child: &SubagentRecord, at: DateTime<Utc>) {
+        let (status, ended) = match child.state {
+            SubagentState::Running => (BackgroundAgentStatus::Running, false),
+            SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
+            SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
+            SubagentState::Idle if child.stop_reason.as_deref() == Some("error") => {
+                (BackgroundAgentStatus::Error, true)
+            }
+            SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+        };
+        self.status = status;
+        self.ended_at = ended.then(|| self.ended_at.unwrap_or(at));
     }
 }
 
@@ -2300,6 +2316,36 @@ mod tests {
                 model: None,
             },
             at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn launch_reconciles_a_child_snapshot_that_arrived_first() {
+        let cases = [
+            (
+                SubagentState::Idle,
+                Some("end_turn"),
+                BackgroundAgentStatus::Completed,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("error"),
+                BackgroundAgentStatus::Error,
+                true,
+            ),
+            (
+                SubagentState::RequiresAction,
+                None,
+                BackgroundAgentStatus::RequiresAction,
+                false,
+            ),
+        ];
+        for (state, stop, expected, ended) in cases {
+            let s = applied([subagent(state, stop), launched()]);
+            let agent = &s.background_agents[0];
+            assert_eq!(agent.status, expected);
+            assert_eq!(agent.ended_at.is_some(), ended);
         }
     }
 

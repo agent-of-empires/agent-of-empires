@@ -373,6 +373,16 @@ describe("applyEvent / subagent roster", () => {
     });
   });
 
+  it("reconciles a child snapshot that arrived before the launch", () => {
+    const agentAfter = (u: AcpEvent) => run(u, launched).backgroundAgents[0];
+    expect(agentAfter(update("idle", "t1", { stop_reason: "end_turn" }))).toMatchObject({
+      status: "completed",
+      endedAt: "2026-06-27T00:00:00Z",
+    });
+    expect(agentAfter(update("idle", "t1", { stop_reason: "error" }))).toMatchObject({ status: "error" });
+    expect(agentAfter(update("requires_action", "t1"))).toMatchObject({ status: "requires_action", endedAt: null });
+  });
+
   it("keeps requires_action and unknown agents active", () => {
     for (const state of ["requires_action", "unknown"]) {
       expect(isVisiblyBusy(run(launched, update(state, "t1")))).toBe(true);
