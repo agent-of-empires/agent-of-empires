@@ -6,7 +6,9 @@ import { useState } from "react";
 import { reportError } from "../../../lib/toastBus";
 
 export function StopSession({ sessionId, running }: { sessionId: string; running: number }) {
-  const [confirming, setConfirming] = useState(false);
+  // Holds the session the confirmation was opened for, so switching sessions closes it.
+  const [confirmingFor, setConfirmingFor] = useState<string | null>(null);
+  const confirming = confirmingFor === sessionId;
   const [busy, setBusy] = useState(false);
   const stop = async () => {
     setBusy(true);
@@ -17,7 +19,7 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
       reportError("Could not interrupt the session. Try again.");
     } finally {
       setBusy(false);
-      setConfirming(false);
+      setConfirmingFor(null);
     }
   };
   return (
@@ -25,7 +27,7 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
       <button
         type="button"
         title="Interrupt the session and stop running sub-agents"
-        onClick={() => setConfirming(true)}
+        onClick={() => setConfirmingFor(sessionId)}
         className={[
           "inline-flex items-center gap-1 rounded-md border border-surface-600 bg-surface-800 px-2 py-0.5",
           "text-[11px] text-text-secondary transition-colors",
@@ -57,7 +59,7 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
             <button
               type="button"
               disabled={busy}
-              onClick={() => setConfirming(false)}
+              onClick={() => setConfirmingFor(null)}
               className="px-2 py-0.5 hover:text-text-bright disabled:opacity-50"
             >
               Cancel

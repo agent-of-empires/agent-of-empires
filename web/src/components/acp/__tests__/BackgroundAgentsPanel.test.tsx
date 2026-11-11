@@ -432,6 +432,19 @@ describe("BackgroundAgentsPanel", () => {
     vi.unstubAllGlobals();
   });
 
+  it("closes an open Stop confirmation when the panel switches to another session", () => {
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+    agentsMock.mockReturnValue([agent({ status: "running" })]);
+    const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(view.getByRole("button", { name: /stop/i }));
+    expect(view.getByRole("alertdialog")).toBeTruthy();
+    view.rerender(<BackgroundAgentsPanel sessionId="s-2" />);
+    expect(view.queryByRole("alertdialog")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
   it("hides the Stop button for finished or stalled agents (cancel would be a no-op)", () => {
     for (const over of [{ status: "completed", endedAt: new Date().toISOString() }, { status: "stalled" }] as const) {
       agentsMock.mockReturnValue([agent(over)]);
