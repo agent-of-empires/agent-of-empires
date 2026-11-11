@@ -344,7 +344,7 @@ With `api_version >= 9` a worker can discover ACP capabilities and create host-o
 | `sessions.turn.send` | `session.prompt` | Deliver a turn to a session **this plugin created**. |
 | `sessions.message.send` | `session.message` | Deliver a short text message to **any** session, like `aoe send`. See [Messaging any session](#messaging-any-session). `api_version >= 15`. |
 | `plugin.storage.get` / `set` / `cas` / `remove` | `runtime.worker` | Plugin-private durable key/value storage (see [Plugin storage](#plugin-storage)). |
-| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 22`. |
+| `suggestions.set` / `error` / `sources` / `checks.set` | `runtime.worker` | Publish suggested sessions (see [Suggested sessions](#suggested-sessions)). `api_version >= 22`. Not served until the store layer lands. |
 | `projects.list` | `session.read` | Registered projects of the host profile, `{ projects: [{ name, path }] }`. |
 
 **Project selection (`api_version >= 11`).** `sessions.create` takes an optional `project_path` (the trust-checked primary repo) and `extra_project_paths` (the other repos of a multi-repo session). Omitting `project_path` creates a **scratch** session: a throwaway directory with no repository, so extras alongside it are refused. Every path is canonicalized and existence-checked host-side, fail-closed and capped per call.
@@ -415,6 +415,8 @@ A worker has a host-backed private key/value store, namespaced by its plugin id,
 Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swap) enables safe concurrent updates: the write applies only when the stored value equals `expected`.
 
 ## Suggested sessions
+
+> **Availability:** the `[suggestions]` manifest block and the worker types in `aoe-plugin-api` are available now. The `suggestions.*` RPCs, the `/api/suggestions` routes and the web and TUI workflows below are not served by this host until the store layer of the suggested-sessions stack (#5179) lands.
 
 For using suggestions from the web dashboard and the TUI, see the [suggested sessions guide](guides/suggested-sessions.md).
 
