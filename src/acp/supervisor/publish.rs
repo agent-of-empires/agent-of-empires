@@ -258,7 +258,20 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// The session's worker agent key; see [`Self::worker_agent`].
     pub(crate) async fn worker_agent_key(&self, session_id: &str) -> Option<String> {
-        self.worker_agent(session_id).await.map(|(key, ..)| key)
+        #[cfg(test)]
+        let gate = self.agent_key_gate.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            gate.before_read.wait().await;
+            gate.before_read.wait().await;
+        }
+        let key = self.worker_agent(session_id).await.map(|(key, ..)| key);
+        #[cfg(test)]
+        if let Some(gate) = gate {
+            gate.after_read.wait().await;
+            gate.after_read.wait().await;
+        }
+        key
     }
 
     /// [`Self::worker_agent_key`] for each of `session_ids` that has one, under one workers lock,

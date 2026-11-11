@@ -1088,8 +1088,12 @@ impl SessionService {
         let profile = match classified_as {
             // A turn cut for one agent must not reach a worker a resume started as another.
             Some(cut) => {
-                let receiving = self.acp_supervisor.worker_agent_key(id).await;
-                if receiving.as_deref().is_some_and(|agent| agent != cut.agent) {
+                let receiving = self
+                    .acp_supervisor
+                    .worker_agent_key(id)
+                    .await
+                    .ok_or(SendTurnError::WorkerNotReady)?;
+                if receiving != cut.agent {
                     tracing::info!(
                         target: "acp.queue",
                         session = %id,
@@ -2008,7 +2012,9 @@ impl SessionService {
             )
             .await
         {
-            tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
+            if !matches!(e, SendTurnError::AgentChanged) {
+                tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
+            }
             return;
         }
         tracing::info!(
@@ -3438,6 +3444,92 @@ mod tests {
         assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
         assert_eq!(queued(Arc::clone(&service)).await, ["after"]);
         crate::process::worker_registry::delete(id).ok();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_lost_ready_receiver_preserves_the_batch_for_a_replacement() {
+        use crate::acp::supervisor::test_support::AgentKeyGate;
+        use std::time::Duration;
+        let _home = crate::session::test_support::isolate_app_dir();
+        declare_custom_reset("/new");
+        let id = "lost-ready-receiver";
+        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+            id, "bridge",
+        )])
+        .session_service
+        .clone();
+        for (n, text) in ["/clear", "after"].iter().enumerate() {
+            service
+                .enqueue_prompt(
+                    id,
+                    format!("q{n}"),
+                    text.to_string(),
+                    Vec::new(),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        let starting = service.acp_supervisor.test_hold_starting(id);
+        let mut waits = service.acp_supervisor.watch_worker_waits();
+        let drain = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move { service.drain_queued_prompts_once(id).await }
+        });
+        tokio::time::timeout(Duration::from_secs(10), waits.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let before_read = Arc::new(tokio::sync::Barrier::new(2));
+        let after_read = Arc::new(tokio::sync::Barrier::new(2));
+        service.acp_supervisor.test_gate_agent_key(AgentKeyGate {
+            before_read: Arc::clone(&before_read),
+            after_read: Arc::clone(&after_read),
+        });
+        let live = save_agent_record(id, "bridge", true);
+        service
+            .acp_supervisor
+            .test_land_worker_cmd_recording(id, &starting)
+            .await;
+        tokio::time::timeout(Duration::from_secs(10), before_read.wait())
+            .await
+            .unwrap();
+        // Remove the ready receiver before identity validation.
+        service.acp_supervisor.test_remove_worker(id).await;
+        drop(live);
+        crate::process::worker_registry::delete(id).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), before_read.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+            .await
+            .unwrap();
+        // The identity read observes no receiver; replacement bypasses submission locking.
+        let recorded = service
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(id)
+            .await;
+        let _replacement = save_agent_record(id, "claude", true);
+        tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert!(recorded.lock().unwrap().is_empty());
+        assert!(!service.fold_control_state(id).await.turn_active);
+        assert_eq!(service.queued_prompts_snapshot(id).await.len(), 2);
+        service.drain_queued_prompts_once(id).await;
+        service.acp_supervisor.test_flush_worker_commands(id).await;
+        assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
+        let rows = service.queued_prompts_snapshot(id).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "after");
+        crate::process::worker_registry::delete(id).unwrap();
     }
 
     /// A batch cut for one agent is withheld from a worker a resume started as another, so the

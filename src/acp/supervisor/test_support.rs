@@ -17,7 +17,16 @@ use crate::acp::runner_lifecycle::{Lease, ProcessControl, RunnerIdentity, Settle
 use crate::acp::state::{AcpSessionId, Event};
 use crate::process::worker_registry::{self, WorkerRecord};
 
+pub(crate) struct AgentKeyGate {
+    pub(crate) before_read: Arc<tokio::sync::Barrier>,
+    pub(crate) after_read: Arc<tokio::sync::Barrier>,
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
+    pub(crate) fn test_gate_agent_key(&self, gate: AgentKeyGate) {
+        *self.agent_key_gate.lock().unwrap() = Some(gate);
+    }
+
     pub(crate) fn with_process_control(mut self, control: Arc<dyn ProcessControl>) -> Self {
         self.process_control = control;
         self
@@ -77,7 +86,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 native_session_id: None,
                 drain_task: tokio::spawn(async {}),
                 restart_history: vec![],
-                kind: WorkerKind::Stdio,
+                kind: WorkerKind::Attached,
                 launch_epoch: lease.epoch(),
                 lease: lease.clone(),
             },

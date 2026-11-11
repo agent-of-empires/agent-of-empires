@@ -203,10 +203,10 @@ impl SessionAgent {
                 agent: key.clone(),
                 profile: resolve(key),
             },
-            Self::Next { tool, .. } => Classified {
-                agent: tool.clone(),
-                profile: &crate::acp::agent_profiles::DEFAULT,
-            },
+            Self::Next { .. } => self.classify_with(
+                &AgentRegistry::with_defaults(),
+                &crate::session::config::Config::default(),
+            ),
         };
         with_resolved_config(profile, project_path, move |cfg| {
             self.classify_with(&AgentRegistry::with_defaults(), &cfg)
