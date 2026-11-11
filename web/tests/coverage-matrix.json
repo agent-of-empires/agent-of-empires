@@ -3862,7 +3862,8 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts", "src/components/acp/useTranscriptScroll.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/useTranscriptScroll.ts"],
+      "notes": "The existing five mobile stories preserve reader escape, streaming follow, reload and collapse behavior. Composer growth waits for its real final textarea and grid heights, observes the pin beyond the chrome-follow window and captures the grown pinned surface. Hook consumers distinguish a coarse viewport resize from an actual reader gesture while retaining the unchanged coarse fold-movement contract."
     },
     {
       "id": "acp.tool-stopped-sweep",
