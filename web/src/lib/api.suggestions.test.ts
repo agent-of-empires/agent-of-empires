@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  createSession,
   dismissSuggestion,
   fetchSuggestions,
   prepareSuggestion,
   refreshSuggestions,
   updateSuggestionSource,
 } from "./api";
+import { onSuggestionsChanged } from "./suggestionEvents";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -48,5 +50,19 @@ describe("suggestion API", () => {
       error: "Suggestion is no longer published",
       stale: true,
     });
+  });
+
+  it("a successful create linked to a suggestion tells mounted views to reload", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ id: "s1" }))),
+    );
+    const listener = vi.fn();
+    const off = onSuggestionsChanged(listener);
+    await createSession({ path: "/w", tool: "claude" });
+    expect(listener).not.toHaveBeenCalled();
+    await createSession({ path: "/w", tool: "claude", suggestion: { provider_id: "gh", id: "i1" } });
+    expect(listener).toHaveBeenCalledTimes(1);
+    off();
   });
 });

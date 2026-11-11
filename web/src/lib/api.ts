@@ -2370,7 +2370,12 @@ export async function createSession(body: CreateSessionRequest): Promise<{
         trustChanged: true,
       };
     }
-    if (res.ok) return { ok: true, session: await res.json() };
+    if (res.ok) {
+      const session = await res.json();
+      // The linked item now shows as started in every mounted suggestions view.
+      if (body.suggestion) notifySuggestionsChanged();
+      return { ok: true, session };
+    }
     const text = await res.text();
     let data: { error?: unknown; message?: string; [k: string]: unknown } | null = null;
     try {
