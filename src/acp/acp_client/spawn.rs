@@ -395,6 +395,10 @@ pub(super) fn prime_runtime_for_spawn(
             .args(&argv.docker_args[..argv.exec_prefix_len])
             .args(["sh", "-c", &script])
             .envs(argv.inherit_env.iter().map(|(key, value)| (key, value)));
+        if let Some(file) = &argv.target_env {
+            file.attach(&mut probe)
+                .map_err(|e| AcpError::Spawn(e.to_string()))?;
+        }
         let bytes = crate::session::capture::run_with_timeout_limit(
             probe,
             std::time::Duration::from_secs(5),

@@ -358,7 +358,7 @@ To forward everything else too:
 inherit_host_environment = true
 ```
 
-Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs ride `tmux new-session -e`, so a secret is briefly visible in `ps` while that command runs.
+Every variable AoE holds then reaches host sessions, except `AOE_*` and `AGENT_OF_EMPIRES_*` (its own wiring) and `TERM` (owned by tmux). Off by default, since it widens what every agent can read, including tokens exported in your shell. In the terminal view the pairs are exported from a mode 0600 launch script, so values stay out of `ps`. The terminal view skips names that tmux and the shell set for each pane, such as `TMUX`, `PWD`, `UID`, `USERNAME` and `TERM_PROGRAM`, so each pane keeps its own values. Panes you open yourself inside a session do not receive them.
 
 Managed OpenCode selects this policy before probing or launching the native agent. It also retains process essentials and OpenCode database, configuration and workspace selector inputs for validation when wholesale inheritance is off. Unsupported selectors remain unsupported. Explicit profile `environment` entries and before-session overrides take precedence; login-only exports are not imported. See [managed OpenCode contexts](session-resume.md#supported-managed-contexts).
 
@@ -440,9 +440,9 @@ Sandbox launch reservations use a minimum 30-minute recovery window, shared with
 
 `before_session` runs before every host agent launch, including restart and a view switch that respawns it. It uses the same stdout and failure contract as `before_start`, and persists no values between launches.
 
-Minted pairs override the static `environment` list in both views. Structured view uses process environment; terminal view uses `tmux new-session -e` and drops conflicting shell-assignment prefixes.
+Minted pairs override the static `environment` list in both views. Structured view uses process environment; terminal view exports them from a mode 0600 launch script, deleted when the pane starts, and drops conflicting shell-assignment prefixes.
 
-A minted terminal value stays out of the pane command's argv, unlike static `environment` entries. It remains readable through `tmux show-environment` by any client of that server. For values that must stay out of both argv and tmux environment, use a sandboxed session with `before_start`.
+Terminal values stay out of tmux argv and the tmux session environment.
 
 For example, an account switcher can print `CLAUDE_CONFIG_DIR=/absolute/account/path` and an endpoint for the account selected at launch.
 
