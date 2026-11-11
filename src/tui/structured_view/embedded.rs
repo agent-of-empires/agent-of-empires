@@ -1738,6 +1738,7 @@ mod retained_tests {
             )
             .unwrap();
         assert!(refresh(&mut view).await);
+        assert!(!view.message.contains("incomplete"));
         assert!(prepared_text(&mut view, 80)
             .to_string()
             .contains("BACKFILLED"));
