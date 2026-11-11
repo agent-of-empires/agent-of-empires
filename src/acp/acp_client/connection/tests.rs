@@ -576,7 +576,8 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), prompted_rx.recv())
             .await
-            .expect("session setup must finish and dispatch the prompt");
+            .expect("session setup must finish and dispatch the prompt")
+            .expect("fake agent must receive the prompt");
         let mut last_mode = None;
         while let Ok(event) = fake.event_rx.try_recv() {
             if let Event::ConfigOptionsUpdated { options } = event {
@@ -643,12 +644,15 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
     let started = seen
         .iter()
         .position(|e| matches!(e, Event::ConversationCompactionStarted));
+    let completed = seen
+        .iter()
+        .position(|e| matches!(e, Event::ConversationCompacted));
     let stopped = seen
         .iter()
         .position(|e| matches!(e, Event::Stopped { reason } if reason == "agent_idle"));
     assert!(
-        started.is_some() && started < stopped,
-        "compaction then Stopped(agent_idle) expected: {seen:?}"
+        matches!((started, completed, stopped), (Some(a), Some(b), Some(c)) if a < b && b < c),
+        "compaction start, completion, then Stopped(agent_idle) expected: {seen:?}"
     );
     assert!(
         !prompted.load(std::sync::atomic::Ordering::SeqCst),
