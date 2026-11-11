@@ -9,7 +9,7 @@ use agent_client_protocol::{
     Agent, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, UntypedMessage,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StateMutex;
 use tokio::sync::{oneshot, Mutex, MutexGuard, Notify};
@@ -150,6 +150,8 @@ impl SessionIngressNotification {
 pub(super) struct SessionIngress {
     state: StateMutex<IdentityState>,
     pub(super) fence: Mutex<()>,
+    /// Requests awaiting the human with the fence released.
+    parked: AtomicUsize,
     changed: Notify,
     failure: Notify,
 }
@@ -438,6 +440,23 @@ impl SessionIngress {
         }
     }
 
+    /// Mark a request as waiting on the human. Call while holding the fence,
+    /// so a transition that takes the fence next sees it.
+    pub(super) fn park(&self) -> ParkedRequest<'_> {
+        self.parked.fetch_add(1, Ordering::AcqRel);
+        ParkedRequest(self)
+    }
+
+    pub(super) fn has_parked(&self) -> bool {
+        self.parked.load(Ordering::Acquire) > 0
+    }
+
+    /// Whether `id` is still admitted, for a handler that released the fence
+    /// across a wait and must not answer for a replaced session.
+    pub(super) fn still_admitted(&self, id: &SessionId, policy: RequestPolicy) -> bool {
+        self.request_admission(id, policy) == RequestAdmission::Active
+    }
+
     pub(super) async fn request(
         &self,
         id: &SessionId,
@@ -484,6 +503,14 @@ impl SessionIngress {
 
     fn overflow_error() -> agent_client_protocol::Error {
         acp_internal_error("pending native session updates exceed replay capacity".into())
+    }
+}
+
+pub(super) struct ParkedRequest<'a>(&'a SessionIngress);
+
+impl Drop for ParkedRequest<'_> {
+    fn drop(&mut self) {
+        self.0.parked.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

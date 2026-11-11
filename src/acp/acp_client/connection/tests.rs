@@ -1,7 +1,9 @@
 //! The connection task driven against a fake agent over in-memory pipes.
 
+use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
+use crate::acp::approvals::ApprovalDecision;
 use crate::acp::fs_handler::FsPolicy;
 use crate::acp::terminal_handler::TerminalManager;
 use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
@@ -321,6 +323,9 @@ struct FakeConnection {
     event_rx: mpsc::Receiver<Event>,
     cmd_tx: mpsc::Sender<ClientCmd>,
     agent_write: SharedWrite,
+    pending_responders: PendingResponders,
+    /// Replies the daemon sent to the agent's own requests.
+    responses: mpsc::UnboundedReceiver<serde_json::Value>,
     connection: tokio::task::JoinHandle<()>,
     agent: tokio::task::JoinHandle<()>,
     _cwd: tempfile::TempDir,
@@ -338,12 +343,14 @@ async fn spawn_fake_connection(
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
+    let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
+    let (response_tx, responses) = mpsc::unbounded_channel();
     let params = ConnectionParams {
         claude_home: None,
         event_tx,
         cmd_rx,
         child: None,
-        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        pending_responders: pending_responders.clone(),
         resources: SessionResources {
             fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
             terminals: TerminalManager::new(),
@@ -386,6 +393,10 @@ async fn spawn_fake_connection(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}"}}}}"#
                 )],
                 Some("session/prompt") => on_prompt(id),
+                None => {
+                    let _ = response_tx.send(msg);
+                    continue;
+                }
                 _ => continue,
             };
             for reply in replies {
@@ -401,6 +412,8 @@ async fn spawn_fake_connection(
         event_rx,
         cmd_tx,
         agent_write,
+        pending_responders,
+        responses,
         connection,
         agent,
         _cwd: temp,
@@ -737,6 +750,92 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
     .await
     .expect("root cancel reaches the agent");
     assert_eq!(*cancels.lock().unwrap(), ["c-yes", "root"]);
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
+
+async fn next_child_event(event_rx: &mut mpsc::Receiver<Event>, child: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Event::SubagentUpdated { subagent, .. } =
+                event_rx.recv().await.expect("connection remains open")
+            {
+                if subagent.session_id == child {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{child} announced"));
+}
+
+/// A child's approval waits on the human without holding the dispatch fence:
+/// a sibling's announcement is handled first, and the child's answer then
+/// reaches the adapter on the child's own request id.
+#[tokio::test]
+async fn child_approval_wait_does_not_stall_other_sessions() {
+    let FakeConnection {
+        mut event_rx,
+        agent_write,
+        cmd_tx: _cmd_tx,
+        pending_responders,
+        mut responses,
+        connection,
+        agent,
+        ..
+    } = spawn_fake_connection("root", |_| Vec::new()).await;
+    let announce = |child: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"root","update":{{"sessionUpdate":"subagent_update","sessionId":"{child}","state":{{"state":"running"}}}}}}}}"#
+        )
+    };
+    write_line(&agent_write, &announce("c1")).await;
+    next_child_event(&mut event_rx, "c1").await;
+    write_line(
+        &agent_write,
+        r#"{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"c1","toolCall":{"toolCallId":"t1"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}"#,
+    )
+    .await;
+    let nonce = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Event::ApprovalRequested { approval } =
+                event_rx.recv().await.expect("connection remains open")
+            {
+                break approval.nonce;
+            }
+        }
+    })
+    .await
+    .expect("approval requested");
+
+    // The approval is still unanswered, yet a sibling announcement is handled.
+    write_line(&agent_write, &announce("c2")).await;
+    next_child_event(&mut event_rx, "c2").await;
+
+    let PendingResponder { resolver } = pending_responders
+        .lock()
+        .await
+        .remove(&nonce)
+        .expect("approval parked");
+    let PendingResolver::Approval(tx) = resolver else {
+        panic!("approval resolver expected");
+    };
+    tx.send(ApprovalResolutionMessage::Decision {
+        decision: ApprovalDecision::Allow,
+        option_id: None,
+    })
+    .map_err(|_| "resolver gone")
+    .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), responses.recv())
+        .await
+        .expect("response reaches the adapter")
+        .expect("agent still reading");
+    assert_eq!(response["id"], 900);
+    assert_eq!(response["result"]["outcome"]["outcome"], "selected");
+    assert_eq!(response["result"]["outcome"]["optionId"], "allow");
 
     agent.abort();
     connection.abort();

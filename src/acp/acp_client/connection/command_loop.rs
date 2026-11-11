@@ -324,6 +324,12 @@ impl Session {
             });
             return Ok(());
         };
+        if ingress.has_parked() {
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "an approval is waiting for an answer; resolve it before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
         let work = self.shared.between_prompt.work_state();
         if work.is_busy() || !self.shared.bg_tasks.is_empty() {
             // Old-session events would be attributed to the new conversation.
