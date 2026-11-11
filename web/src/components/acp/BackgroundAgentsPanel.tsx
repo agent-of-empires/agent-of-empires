@@ -50,14 +50,6 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
       </div>
     );
   }
-  if (agents.length === 0) {
-    return (
-      <div className="flex h-full flex-col overflow-y-auto">
-        {sessionId && <BackgroundShells sessionId={sessionId} />}
-      </div>
-    );
-  }
-
   // Running first, then most-recently-started within each group.
   const sorted = [...agents].sort((a, b) => {
     const ra = isActiveAgent(a) ? 0 : 1;
@@ -68,34 +60,42 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   // A stalled agent is no longer writing, so cancel would be a no-op.
   const anyRunning = agents.some((a) => a.status === "running");
 
+  // One stable slot for the shells: moving it remounts the shell dialog and closes it.
+  const hasAgents = agents.length > 0;
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
-        <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
-          Background agents · {agents.length}
-        </span>
-        {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
-      </div>
+      {hasAgents && (
+        <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
+          <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
+            Background agents · {agents.length}
+          </span>
+          {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
+        </div>
+      )}
       {sessionId && <BackgroundShells sessionId={sessionId} />}
-      <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-        Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
-        <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
-        transcript.
-      </p>
-      <div className="flex flex-col">
-        {entries(sorted, agents).map((entry) =>
-          entry.kind === "agent" ? (
-            <AgentRow key={entry.agent.agentId} agent={entry.agent} />
-          ) : (
-            <WorkflowGroup
-              key={entry.runId}
-              name={entry.name}
-              agents={entry.agents}
-              live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
-            />
-          ),
-        )}
-      </div>
+      {hasAgents && (
+        <>
+          <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
+            Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
+            <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
+            transcript.
+          </p>
+          <div className="flex flex-col">
+            {entries(sorted, agents).map((entry) =>
+              entry.kind === "agent" ? (
+                <AgentRow key={entry.agent.agentId} agent={entry.agent} />
+              ) : (
+                <WorkflowGroup
+                  key={entry.runId}
+                  name={entry.name}
+                  agents={entry.agents}
+                  live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
+                />
+              ),
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -77,12 +77,25 @@ describe("BackgroundAgentsPanel shells", () => {
     agentsMock.mockReturnValue([]);
     shellsMock.mockReturnValue([shell({ finished: true })]);
     taskOutputMock.mockResolvedValue({ exists: true, output: "listening on 3000", truncated: false });
-    const { container, getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const { getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     fireEvent.click(getByTitle("Open command and output"));
     await waitFor(() => expect(document.body.textContent).toContain("listening on 3000"));
     expect(document.body.textContent).toContain("npm run dev");
     expect(taskOutputMock).toHaveBeenCalledWith("s-1", "bx1");
-    expect(container).toBeTruthy();
+  });
+
+  it("keeps an open shell dialog when the first background agent appears", async () => {
+    agentsMock.mockReturnValue([]);
+    shellsMock.mockReturnValue([shell({ finished: true })]);
+    taskOutputMock.mockResolvedValue({ exists: true, output: "listening on 3000", truncated: false });
+    const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(view.getByTitle("Open command and output"));
+    await waitFor(() => expect(view.getByRole("dialog")).toBeTruthy());
+
+    agentsMock.mockReturnValue([agent()]);
+    view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(view.getByText("Background agents · 1")).toBeTruthy();
+    expect(view.getByRole("dialog")).toBeTruthy();
   });
 
   it("says when the output is not available", async () => {
