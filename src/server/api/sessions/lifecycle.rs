@@ -832,16 +832,21 @@ pub async fn trash_session(
         } else {
             outcome
         };
+        let relocation = matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. })
+            .then(|| crate::session::trash::TrashRelocation {
+                new_project_path: instance.project_path.clone(),
+                pre_trash_project_path: instance.pre_trash_project_path.clone(),
+            });
+        let mut superseded = false;
         store.update(|rows, _| {
-            if matches!(outcome, crate::session::trash::RelocateOutcome::Relocated { .. }) {
-                let relocation = crate::session::trash::TrashRelocation {
-                    new_project_path: instance.project_path,
-                    pre_trash_project_path: instance.pre_trash_project_path,
-                };
-                match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, &relocation) {
+            if let Some(relocation) = &relocation {
+                match crate::session::claim::commit_trash_relocation(rows, &worker_id, generation, relocation) {
                     crate::session::claim::RelocationCommit::Persisted => {}
                     crate::session::claim::RelocationCommit::AlreadyGone => return Err(LifecycleTargetError::Missing.into()),
-                    crate::session::claim::RelocationCommit::Superseded => return Err(LifecycleTargetError::Busy.into()),
+                    crate::session::claim::RelocationCommit::Superseded => {
+                        superseded = true;
+                        return Ok(());
+                    }
                 }
             } else {
                 let row = rows.iter_mut().find(|row| row.id == worker_id)
@@ -863,6 +868,14 @@ pub async fn trash_session(
             }
             Ok(())
         })?;
+        if let Some(relocation) = relocation.filter(|_| superseded) {
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::undo_raced_relocation(&instance, &relocation)
+            {
+                tracing::warn!(target: "session.trash", session = %worker_id, %reason, "could not move superseded trash relocation back");
+            }
+            return Err(LifecycleTargetError::Busy.into());
+        }
         retirement.generation = None;
         Ok((outcome, stopped.err().map(|error| error.to_string())))
     }).await.map_err(anyhow::Error::from).and_then(|result| result);
