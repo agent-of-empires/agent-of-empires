@@ -1569,6 +1569,7 @@
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
+        "web/src/components/session-wizard/steps/CloneRepoForm.tsx",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
         "web/src/components/session-wizard/steps/LaunchFields.tsx",
