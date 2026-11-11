@@ -162,6 +162,19 @@ impl EventStore {
         }
     }
 
+    /// Make every query on the event table fail, or restore it.
+    #[cfg(test)]
+    pub(crate) fn test_set_unavailable(&self, unavailable: bool) {
+        let (from, to) = if unavailable {
+            ("acp_events", "acp_events_offline")
+        } else {
+            ("acp_events_offline", "acp_events")
+        };
+        self.conn()
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .unwrap();
+    }
+
     /// Append one event (a duplicate seq is ignored), then prune past the retention cap.
     pub fn record(&self, session_id: &str, seq: u64, event: &Event) -> Result<()> {
         let json = serde_json::to_string(event)

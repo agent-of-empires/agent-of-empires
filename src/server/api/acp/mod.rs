@@ -82,6 +82,7 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> Response {
         SupervisorError::Superseded(_) => (StatusCode::CONFLICT, err.to_string()),
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
+        | SupervisorError::EventStoreUnavailable(_)
         | SupervisorError::NativeStoreUnavailable => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
