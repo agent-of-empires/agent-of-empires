@@ -1,6 +1,6 @@
 [package]
 name = "aoe-plugin-api"
-version = "0.1.0"
+version = "1.23.0"
 edition = "2021"
 rust-version = "1.89"
 publish = false
@@ -12,6 +12,7 @@ keywords = ["aoe", "agent-of-empires", "plugin"]
 categories = ["development-tools"]
 
 [dependencies]
+unicode-general-category = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"

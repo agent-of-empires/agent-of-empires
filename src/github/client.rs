@@ -37,6 +37,8 @@ pub struct GitHubClient {
 pub struct GitHubRelease {
     pub tag_name: String,
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub body: Option<String>,
     pub published_at: Option<String>,
     #[serde(default)]

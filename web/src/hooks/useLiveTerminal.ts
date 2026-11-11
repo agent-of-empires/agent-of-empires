@@ -44,6 +44,8 @@ export interface LiveTerminalState {
   reading: boolean;
   isOwner: boolean;
   ownerKnown: boolean;
+  /** Which kind of window holds control, when this socket isn't the owner and the Daemon says (#5543). */
+  ownerKind: LiveOwnerKind | null;
   transport: "grid" | "snapshot" | null;
   /** Why the server is on the snapshot fallback, when it said. */
   transportReason: "pipe_owned" | null;
@@ -61,11 +63,20 @@ const INITIAL_STATE: LiveTerminalState = {
   reading: false,
   isOwner: false,
   ownerKnown: false,
+  ownerKind: null,
   transport: null,
   transportReason: null,
   paneDead: false,
   stats: { frames: 0, patches: 0, wireBytes: 0, resyncs: 0 },
 };
+
+export type LiveOwnerKind = "web" | "tui";
+
+/** `size_owner.owner` arrives with #5543; any other value reads as unknown. */
+function ownerKindOf(msg: object): LiveOwnerKind | null {
+  const owner = (msg as { owner?: unknown }).owner;
+  return owner === "web" || owner === "tui" ? owner : null;
+}
 
 export function useLiveTerminal(
   sessionId: string | null,
@@ -83,6 +94,8 @@ export function useLiveTerminal(
   const retryCountRef = useRef(0);
   // The live socket a user redial closed; its onclose reconnects instead of backing off.
   const redialRef = useRef<WebSocket | null>(null);
+  // The next socket takes control outright instead of waiting for a vacant lock.
+  const claimOnOpenRef = useRef(false);
   const connectRef = useRef<(() => void) | null>(null);
   const desiredRef = useRef<{
     resize: { cols: number; rows: number } | null;
@@ -197,7 +210,8 @@ export function useLiveTerminal(
         }));
         const desired = desiredRef.current;
         if (!readOnlyRef.current) {
-          ws.send(encodeControl({ type: "claim_if_vacant" }));
+          ws.send(encodeControl({ type: claimOnOpenRef.current ? "claim" : "claim_if_vacant" }));
+          claimOnOpenRef.current = false;
           if (desired.resize) ws.send(encodeControl({ type: "resize", ...desired.resize }));
         }
         if (desired.window != null) {
@@ -220,9 +234,12 @@ export function useLiveTerminal(
         }
         if (msg.type === "size_owner") {
           const owner = msg.is_owner;
+          const ownerKind = owner ? null : ownerKindOf(msg);
           ownerKnownRef.current = true;
           setState((prev) =>
-            prev.isOwner === owner && prev.ownerKnown ? prev : { ...prev, isOwner: owner, ownerKnown: true },
+            prev.isOwner === owner && prev.ownerKnown && prev.ownerKind === ownerKind
+              ? prev
+              : { ...prev, isOwner: owner, ownerKnown: true, ownerKind },
           );
           if (owner) flushPendingInput();
           return;
@@ -317,7 +334,14 @@ export function useLiveTerminal(
         const redial = redialRef.current === ws;
         redialRef.current = null;
         if (redial && retryTimerRef.current) clearTimeout(retryTimerRef.current);
-        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, paneDead }));
+        setState((prev) => ({
+          ...prev,
+          connected: false,
+          isOwner: false,
+          ownerKnown: false,
+          ownerKind: null,
+          paneDead,
+        }));
         if (paneDead) {
           retryCountRef.current = MAX_RETRIES;
         } else if (redial) {
@@ -424,7 +448,33 @@ export function useLiveTerminal(
     [sendInput],
   );
 
-  const claim = useCallback(() => sendMutationIfOpen(encodeControl({ type: "claim" })), [sendMutationIfOpen]);
+  // The Daemon resizes the pane to this socket's last reported grid when it grants a claim.
+  const claimAfterResizeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Set while a claim waits for that report; sendResize runs it.
+  const pendingClaimRef = useRef<(() => void) | null>(null);
+  const claim = useCallback(() => {
+    if (claimAfterResizeRef.current) clearTimeout(claimAfterResizeRef.current);
+    claimAfterResizeRef.current = null;
+    pendingClaimRef.current = null;
+    sendMutationIfOpen(encodeControl({ type: "claim" }));
+  }, [sendMutationIfOpen]);
+  /** Claims once the view's next grid report goes out, so the claim resizes the pane to that grid only; a view
+   *  that reports nothing within `deadlineMs` claims with the grid it last reported. */
+  const claimAfterResize = useCallback(
+    (deadlineMs: number) => {
+      if (readOnlyRef.current) return;
+      if (claimAfterResizeRef.current) clearTimeout(claimAfterResizeRef.current);
+      claimAfterResizeRef.current = setTimeout(claim, deadlineMs);
+      pendingClaimRef.current = claim;
+    },
+    [claim],
+  );
+  useEffect(
+    () => () => {
+      if (claimAfterResizeRef.current) clearTimeout(claimAfterResizeRef.current);
+    },
+    [],
+  );
 
   const forwardWheel = useCallback(
     (up: boolean, sgr: boolean, col: number, row: number) => sendMutationIfOpen(wheelMouseBytes(up, sgr, col, row)),
@@ -441,9 +491,11 @@ export function useLiveTerminal(
     (cols: number, rows: number) => {
       if (readOnlyRef.current) return;
       const prev = desiredRef.current.resize;
-      if (prev && prev.cols === cols && prev.rows === rows) return;
-      desiredRef.current.resize = { cols, rows };
-      sendIfOpen(encodeControl({ type: "resize", cols, rows }));
+      if (!prev || prev.cols !== cols || prev.rows !== rows) {
+        desiredRef.current.resize = { cols, rows };
+        sendIfOpen(encodeControl({ type: "resize", cols, rows }));
+      }
+      pendingClaimRef.current?.();
     },
     [sendIfOpen],
   );
@@ -494,7 +546,7 @@ export function useLiveTerminal(
       retryTimerRef.current = setTimeout(() => {
         if (redialRef.current !== ws) return;
         redialRef.current = null;
-        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false, ownerKind: null }));
         connectRef.current?.();
       }, REDIAL_CLOSE_TIMEOUT_MS);
       ws.close();
@@ -514,6 +566,13 @@ export function useLiveTerminal(
     }
   }, [setState]);
 
+  /** Redials and takes control on the new socket: a vacant-lock claim could lose to another visible tab. */
+  const reconnectAndClaim = useCallback(() => {
+    if (readOnlyRef.current) return;
+    claimOnOpenRef.current = true;
+    manualReconnect();
+  }, [manualReconnect]);
+
   return {
     state,
     sendData,
@@ -526,7 +585,9 @@ export function useLiveTerminal(
     enterReading,
     returnToLive,
     manualReconnect,
+    reconnectAndClaim,
     claim,
+    claimAfterResize,
     maxRetries: MAX_RETRIES,
   };
 }

@@ -276,10 +276,8 @@ impl Instance {
         let store = self
             .sandbox_capture_store_dir()
             .context("managed Prime store is unavailable")?;
-        let launch_config = stores.launch_configuration(
-            &self.effective_profile(),
-            std::path::Path::new(&self.project_path),
-        )?;
+        let launch_config =
+            stores.launch_configuration(&self.effective_profile(), self.repo_config_path())?;
         let config = self
             .build_container_config(&launch_config)
             .context("cannot build Prime container configuration")?;

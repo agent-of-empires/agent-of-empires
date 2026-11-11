@@ -37,6 +37,7 @@ const WT_NAME_FIELD: usize = 0;
 const WT_NEW_BRANCH_FIELD: usize = 1;
 const WT_BASE_BRANCH_FIELD: usize = 2;
 const WT_EXTRA_REPOS_FIELD: usize = 3;
+const WT_WORKSPACE_FIELD: usize = 4;
 const SANDBOX_IMAGE_FIELD: usize = 0;
 const SANDBOX_ENV_FIELD: usize = 1;
 const SANDBOX_HOOK_ENV_FIELD: usize = 2;
@@ -75,7 +76,7 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
     FieldHelp {
         name: "Worktree",
         description:
-            "Create a git worktree (Ctrl+P to configure name, branch mode, and extra repos)",
+            "Create a git worktree (Ctrl+P to configure name, branch mode, extra repos, and workspace)",
     },
     FieldHelp {
         name: "Sandbox",
@@ -113,6 +114,8 @@ pub struct NewSessionData {
     /// `None` falls back to the repository's default branch.
     pub base_branch: Option<String>,
     pub extra_repo_paths: Vec<String>,
+    /// Create the worktree inside a workspace directory even with no extra repos.
+    pub workspace: bool,
     pub sandbox: bool,
     pub sandbox_image: String,
     pub yolo_mode: bool,
@@ -158,6 +161,7 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
+            workspace: data.workspace,
             // The dialog collects one base for the whole session; per-repo
             // bases are a CLI and web-wizard input.
             repo_base_branches: Vec::new(),
@@ -221,6 +225,8 @@ pub struct NewSessionDialog {
     pub(super) agent_acp_cmd: std::collections::HashMap<String, String>,
     pub(super) agent_detect_as: std::collections::HashMap<String, String>,
     pub(super) workspace_repos: Vec<String>,
+    /// Workspace toggle in the worktree overlay; extra repos force a workspace regardless.
+    pub(super) workspace: bool,
     pub(super) workspace_repos_expanded: bool,
     pub(super) workspace_repo_selected_index: usize,
     pub(super) workspace_repo_editing_input: Option<Input>,
@@ -228,7 +234,7 @@ pub struct NewSessionDialog {
     pub(super) workspace_repo_ghost: Option<path_input::PathGhostCompletion>,
     pub(super) workspace_repo_dir_picker_active: bool,
     pub(super) worktree_config_mode: bool,
-    /// Focused field within the worktree config overlay (0=name, 1=new_branch, 2=extra_repos)
+    /// Focused field within the worktree config overlay, one of the `WT_*` consts.
     pub(super) worktree_config_focused_field: usize,
     /// Session env: `KEY` passes through, `KEY=VALUE` sets.
     pub(super) extra_env: Vec<String>,
@@ -598,6 +604,7 @@ impl NewSessionDialog {
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
             worktree_enabled,
+            workspace: config.worktree.workspace_by_default,
             worktree_dirty: false,
             sandbox_dirty: false,
             overrides_unresolved,
@@ -1087,6 +1094,7 @@ impl NewSessionDialog {
             .and_then(|o| o.worktree_enabled)
             .unwrap_or(config.worktree.enabled)
             && !self.selected_tool_host_only();
+        self.workspace = config.worktree.workspace_by_default;
         self.worktree_dirty = false;
         self.sandbox_dirty = false;
 
@@ -1160,6 +1168,7 @@ impl NewSessionDialog {
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
             worktree_enabled: config.worktree.enabled,
+            workspace: config.worktree.workspace_by_default,
             worktree_dirty: false,
             sandbox_dirty: false,
             overrides_unresolved: false,
@@ -1241,6 +1250,7 @@ impl NewSessionDialog {
             available_projects: Vec::new(),
             dir_picker: DirPicker::new(),
             worktree_enabled: false,
+            workspace: false,
             worktree_dirty: false,
             sandbox_dirty: false,
             overrides_unresolved: false,
@@ -1431,8 +1441,10 @@ impl NewSessionDialog {
                 self.workspace_repos_expanded = true;
                 self.workspace_repo_selected_index = 0;
             }
-            if field == WT_NEW_BRANCH_FIELD {
-                self.create_new_branch = !self.create_new_branch;
+            match field {
+                WT_NEW_BRANCH_FIELD => self.create_new_branch = !self.create_new_branch,
+                WT_WORKSPACE_FIELD => self.toggle_workspace(),
+                _ => {}
             }
             self.worktree_config_focused_field = field;
         }
@@ -1960,8 +1972,22 @@ impl NewSessionDialog {
         }
     }
 
+    pub(super) fn workspace_forced(&self) -> bool {
+        !self.workspace_repos.is_empty()
+    }
+
+    pub(super) fn workspace_effective(&self) -> bool {
+        self.workspace_forced() || (self.workspace && self.create_new_branch)
+    }
+
+    fn toggle_workspace(&mut self) {
+        if !self.workspace_forced() && self.create_new_branch {
+            self.workspace = !self.workspace;
+        }
+    }
+
     fn handle_worktree_config_key(&mut self, key: KeyEvent) -> DialogResult<NewSessionData> {
-        const WT_MAX: usize = 4;
+        const WT_MAX: usize = 5;
 
         if self.branch_picker.is_active() {
             if let ListPickerResult::Selected(value) = self.branch_picker.handle_key(key) {
@@ -2036,6 +2062,12 @@ impl NewSessionDialog {
                 if self.worktree_config_focused_field == WT_NEW_BRANCH_FIELD =>
             {
                 self.create_new_branch = !self.create_new_branch;
+                DialogResult::Continue
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if self.worktree_config_focused_field == WT_WORKSPACE_FIELD =>
+            {
+                self.toggle_workspace();
                 DialogResult::Continue
             }
             _ if self.worktree_config_focused_field == WT_NAME_FIELD => {
@@ -2347,6 +2379,7 @@ impl NewSessionDialog {
             } else {
                 Vec::new()
             },
+            workspace: !self.scratch && self.worktree_enabled && self.workspace_effective(),
             sandbox: self.sandbox_enabled,
             sandbox_image: self.sandbox_image.value().trim().to_string(),
             yolo_mode: self.yolo_mode || self.selected_tool_always_yolo(),

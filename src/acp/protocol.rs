@@ -194,6 +194,9 @@ pub struct ReplayQuery {
     /// Optional projection selector.
     #[serde(default)]
     pub view: Option<String>,
+    /// Required retained snapshot identity after the first page.
+    #[serde(default)]
+    pub history_identity: Option<String>,
 }
 
 /// `GET /api/sessions/{id}/acp/replay` response.
@@ -223,6 +226,9 @@ pub struct ReplayResponse {
     /// `frames`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<crate::acp::transcript::TranscriptRow>>,
+    /// Content identity for `view=retained`, including empty histories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_identity: Option<String>,
 }
 
 /// `GET /api/sessions/{id}/acp/files` response.
@@ -353,6 +359,7 @@ mod tests {
                 summary: None,
                 transcript_dir: "/home/user/.claude/transcripts/wf_1".into(),
             }),
+            started_at: None,
         });
         for frame in [agent, workflow] {
             let json = serde_json::to_string(&frame).unwrap();

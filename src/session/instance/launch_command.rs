@@ -202,23 +202,33 @@ fn apply_no_daemon_flag(
     if invocation.words.first().map(String::as_str) != Some(agent.binary) {
         return;
     }
-    let Ok(mut words) = shell_words::split(cmd) else {
+    insert_no_daemon_flag(cmd, agent, program, &probe);
+}
+
+fn insert_no_daemon_flag(
+    cmd: &mut String,
+    agent: &crate::agents::AgentDef,
+    program: &std::path::Path,
+    probe: &std::process::Command,
+) {
+    let Some(mut parsed) = parse_launch_command(cmd) else {
         return;
     };
+    let words = &mut parsed.words;
     if words.first().map(String::as_str) != program.to_str() {
         return;
     }
     // Past `--` every word is a positional, so only the options before it count.
     let options_end = words.iter().position(|w| w == "--").unwrap_or(words.len());
     let options = &words[1..options_end];
-    let Some(flag) = agent.supported_no_daemon_flag(&probe, options) else {
+    let Some(flag) = agent.supported_no_daemon_flag(probe, options) else {
         return;
     };
     if options.iter().any(|w| w == flag) {
         return;
     }
     words.insert(options_end, flag.to_owned());
-    *cmd = shell_words::join(words);
+    *cmd = render_launch_command(parsed);
 }
 
 /// Write the Pi session-id extension into the app dir and return its path.
@@ -341,56 +351,84 @@ pub(super) fn build_fork_flags(
 
 pub(super) struct ParsedLaunchCommand {
     pub(super) words: Vec<String>,
+    pub(super) assignments: Vec<(String, String)>,
     pub(super) executable_end: usize,
 }
 
 pub(super) fn parse_launch_command(command: &str) -> Option<ParsedLaunchCommand> {
-    let words = shell_words::split(command).ok()?;
-    words.first()?;
-
-    let mut started = false;
+    let mut spans = Vec::new();
+    let mut start = None;
     let mut quote = None;
     let mut escaped = false;
     for (offset, ch) in command.char_indices() {
-        let separator = matches!(ch, ' ' | '\t' | '\n' | '\r');
-        if !started {
-            if separator {
+        if start.is_none() {
+            if ch.is_ascii_whitespace() {
                 continue;
             }
-            started = true;
+            start = Some(offset);
         }
         if escaped {
             escaped = false;
             continue;
         }
         match quote {
-            Some('\'') => {
-                if ch == '\'' {
-                    quote = None;
-                }
-            }
-            Some('"') => match ch {
-                '"' => quote = None,
-                '\\' => escaped = true,
-                _ => {}
-            },
-            _ => match ch {
+            Some('\'') if ch == '\'' => quote = None,
+            Some('"') if ch == '"' => quote = None,
+            Some('"') if ch == '\\' => escaped = true,
+            Some(_) => {}
+            None => match ch {
                 '\'' | '"' => quote = Some(ch),
                 '\\' => escaped = true,
-                _ if separator => {
-                    return Some(ParsedLaunchCommand {
-                        words,
-                        executable_end: offset,
-                    });
+                _ if ch.is_ascii_whitespace() => {
+                    spans.push((start.take()?, offset));
                 }
                 _ => {}
             },
         }
     }
+    if let Some(start) = start {
+        spans.push((start, command.len()));
+    }
+    let mut words = shell_words::split(command).ok()?;
+    if spans.len() != words.len() {
+        return None;
+    }
+    let mut assignments = Vec::new();
+    for ((start, end), word) in spans.iter().zip(&words) {
+        let raw = &command[*start..*end];
+        let Some((key, _)) = raw.split_once('=') else {
+            break;
+        };
+        let mut chars = key.chars();
+        if !matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            break;
+        }
+        let (_, value) = word.split_once('=')?;
+        assignments.push((key.to_owned(), value.to_owned()));
+    }
+    let executable_end = spans.get(assignments.len())?.1;
+    words.drain(..assignments.len());
     Some(ParsedLaunchCommand {
         words,
-        executable_end: command.len(),
+        assignments,
+        executable_end,
     })
+}
+
+pub(super) fn render_launch_command(parsed: ParsedLaunchCommand) -> String {
+    let command = shell_words::join(parsed.words);
+    if parsed.assignments.is_empty() {
+        return command;
+    }
+    let assignments = parsed
+        .assignments
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{assignments} {command}")
 }
 
 /// Insert a subcommand at the parsed executable boundary, or append flags.
@@ -494,13 +532,16 @@ pub(super) fn wrap_command_ignore_suspend(
 }
 
 fn pin_host_program(cmd: &mut String, snapshot: &std::process::Command) -> Result<()> {
-    let mut words = shell_words::split(cmd)?;
-    *words.first_mut().context("host program is missing")? = snapshot
+    let mut parsed = parse_launch_command(cmd).context("host program is missing")?;
+    *parsed
+        .words
+        .first_mut()
+        .context("host program is missing")? = snapshot
         .get_program()
         .to_str()
         .context("host executable path is not UTF-8")?
         .to_owned();
-    *cmd = shell_words::join(words);
+    *cmd = render_launch_command(parsed);
     Ok(())
 }
 
@@ -1188,7 +1229,7 @@ impl Instance {
                     None,
                     &crate::session::config::repo_config::resolve_config_with_repo(
                         &self.effective_profile(),
-                        std::path::Path::new(&self.project_path),
+                        self.repo_config_path(),
                     )?,
                 )?)
             } else {
@@ -1704,6 +1745,45 @@ mod tests {
     use super::*;
     use crate::agents::AgentGeneration;
     use crate::session::instance::test_helpers::*;
+
+    #[test]
+    fn parses_assignments_and_quoted_executable_for_resume() {
+        let command = "TOKEN='a b' PATH=/bin '/opt/my tools/omp' --verbose";
+        let parsed = parse_launch_command(command).unwrap();
+        assert_eq!(
+            parsed.assignments,
+            [
+                ("TOKEN".into(), "a b".into()),
+                ("PATH".into(), "/bin".into())
+            ]
+        );
+        assert_eq!(parsed.words, ["/opt/my tools/omp", "--verbose"]);
+        let mut resumed = command.to_string();
+        splice_subcommand_or_append(&mut resumed, "resume", Some(parsed.executable_end));
+        assert_eq!(
+            resumed,
+            "TOKEN='a b' PATH=/bin '/opt/my tools/omp' resume --verbose"
+        );
+        let quoted = parse_launch_command("'TOKEN=value' omp").unwrap();
+        assert!(quoted.assignments.is_empty());
+        assert_eq!(quoted.words[0], "TOKEN=value");
+        assert!(parse_launch_command("TOKEN=value").is_none());
+    }
+
+    #[test]
+    fn pinned_host_program_preserves_assignment_environment() {
+        let mut command = "AOE_PREFIX_TEST='a b' opencode".to_owned();
+        pin_host_program(&mut command, &std::process::Command::new("/usr/bin/env")).unwrap();
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .any(|line| line == "AOE_PREFIX_TEST=a b"));
+    }
     use crate::session::test_support::EnvGuard;
 
     fn host_command(inst: &mut Instance) -> String {
@@ -3355,6 +3435,138 @@ mod tests {
         );
     }
 
+    /// A literal `NAME=value` prefix must not outrank the attested store: the
+    /// frozen launch runs `env`, which would otherwise reassign the key the
+    /// snapshot already exports.
+    #[test]
+    #[serial_test::serial]
+    fn a_recorded_store_outranks_a_literal_prefix_assignment() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        let project = home.join("project-prefix-conflict");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        let sid = "99999999-8888-7777-6666-555555555555";
+        for root in ["recorded", "prefix"] {
+            std::fs::create_dir_all(home.join(root)).unwrap();
+        }
+        std::fs::write(
+            app.join("config.toml"),
+            "[session.agent_config_dir]\nclaude = \"~/recorded\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("claude-prefix-conflict", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        // The stored command carries a different store than the recorded binding.
+        inst.command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(&home.join("prefix").to_string_lossy()),
+        );
+        inst.source_profile = profile.clone();
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            provenance: crate::session::ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(
+                inst.resolve_native_execution(None)
+                    .expect("the recorded entry attests a store")
+                    .binding,
+            ),
+        });
+        inst.resume_intent = crate::session::ResumeIntent::Default;
+        let transcript = home
+            .join("recorded/projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "conversation\n").unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("a recorded store must still launch");
+        let command = prepared.command.expect("the launch has a command");
+        // The launch is a wrapped login shell, so the arguments live inside the
+        // here-document; asserting on `parsed.assignments` would never fail.
+        // This is the end-to-end wiring check: the conflicting prefix must not
+        // reach the final command at all.
+        let prefix_store = home.join("prefix");
+        assert!(
+            !command.contains(prefix_store.to_string_lossy().as_ref()),
+            "the conflicting prefix store must not reach the launch: {command}"
+        );
+        let execution = prepared.execution.expect("managed launch execution");
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                home.join("recorded")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the effective launch environment must match the attested binding"
+        );
+
+        // The same conflict with no recorded conversation: the configured store
+        // is then the only authority the prefix must yield to.
+        let mut configured = Instance::new("claude-configured-conflict", project.to_str().unwrap());
+        configured.tool = "claude".into();
+        configured.command = inst.command.clone();
+        configured.source_profile = profile.clone();
+        let prepared = configured
+            .prepare_launch_command(configured.conversation_state())
+            .expect("a configured store must still launch");
+        let command = prepared.command.expect("the launch has a command");
+        assert!(
+            !command.contains(prefix_store.to_string_lossy().as_ref()),
+            "a configured store must outrank the prefix too: {command}"
+        );
+        let execution = prepared.execution.expect("configured launch execution");
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                home.join("recorded")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the configured store must be the launched store"
+        );
+    }
+
     /// A typed title rides the first launch as the agent's own session name, quoted, and only
     /// once the setting is on: with it off the agent is not even probed for the flag.
     #[test]
@@ -3911,6 +4123,21 @@ mod tests {
             "#!/bin/sh\ncase \"$1\" in --help) echo '      --no-daemon  Run without the daemon';; esac\nexit 0\n",
         );
         let codex = tool_instance("codex", project.to_str().unwrap());
+        let path = temp_home.path().join("bin/codex");
+        let program = shell_escape(path.to_str().unwrap());
+        let mut command = format!("AOE_PREFIX_TEST='a b' {program} -- 'fix the build'");
+        insert_no_daemon_flag(
+            &mut command,
+            crate::agents::get_agent("codex").unwrap(),
+            &path,
+            &std::process::Command::new(&path),
+        );
+        let parsed = parse_launch_command(&command).unwrap();
+        assert_eq!(
+            parsed.assignments,
+            [("AOE_PREFIX_TEST".into(), "a b".into())]
+        );
+        assert_eq!(&parsed.words[1..], ["--no-daemon", "--", "fix the build"]);
         if crate::process::HAS_CODEX_MANAGED_PREFERENCES {
             let error = codex
                 .resolve_native_execution(None)

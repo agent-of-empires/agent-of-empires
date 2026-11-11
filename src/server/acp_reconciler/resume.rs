@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use super::{is_resumable, query_store, AppState, ResumeOutcome};
+use super::{is_resumable, query_flushed, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
     command_override_for_spawn, BroadcastSink, ResumeKind, ResumeReservationOutcome, SpawnRequest,
     Supervisor, SupervisorError,
@@ -28,6 +28,10 @@ pub(super) struct ResumeTarget {
     stored_acp_session_id: Option<String>,
     pub(super) source_profile: String,
     pub(super) in_flight_turn: bool,
+    /// A turn the agent started itself, which attach must not treat as a prompt in flight.
+    pub(super) agent_turn_open: bool,
+    /// In-flight work, or a background finish the agent has not yet answered.
+    pub(super) holds_live_work: bool,
     yolo_mode: bool,
     /// The resolved launch command, honored like tmux does (#1766).
     command: String,
@@ -44,6 +48,8 @@ impl ResumeTarget {
             stored_acp_session_id: inst.acp_session_id.clone(),
             source_profile: inst.source_profile.clone(),
             in_flight_turn: false,
+            agent_turn_open: false,
+            holds_live_work: false,
             yolo_mode: inst.yolo_mode,
             command: inst.command.clone(),
         }
@@ -80,9 +86,9 @@ fn adopt_decision(
     live: bool,
     build_current: bool,
     runner_current: bool,
-    in_flight_turn: bool,
+    holds_live_work: bool,
 ) -> AdoptDecision {
-    match (live, runner_current, build_current, in_flight_turn) {
+    match (live, runner_current, build_current, holds_live_work) {
         (false, ..) => AdoptDecision::FreshSpawn,
         (true, false, ..) => AdoptDecision::ReplaceIncompatibleRunner,
         (true, true, true, _) => AdoptDecision::Attach,
@@ -163,7 +169,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
             worker_registry::is_record_live(r),
             worker_registry::is_build_current(r),
             worker_registry::is_runner_current(r),
-            in_flight_turn,
+            target.holds_live_work,
         )
     });
     let kind = match decision {
@@ -217,10 +223,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                 }
                 let sandbox = {
                     let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
+                    instances.iter().find(|i| i.id == id).and_then(|i| {
+                        let config_path = i.repo_config_path().to_path_buf();
+                        i.sandbox_info.clone().map(|info| (info, config_path))
+                    })
                 };
                 let attach = state.acp_supervisor.attach_inner(
                     id.clone(),
@@ -330,7 +336,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
         }
     }
 
-    publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
+    publish_orphaned_turn_stop(
+        &state.acp_supervisor,
+        &id,
+        decision,
+        in_flight_turn || target.agent_turn_open,
+    );
     requeue_interrupted_monitor(&state, &id).await;
     let req = match build_spawn_request(&state.session_service, &target).await {
         Ok(req) => req,
@@ -425,6 +436,7 @@ async fn build_spawn_request(
         fork_from,
         acp_mode_id,
         acp_effort,
+        acp_model_config,
         agent_model,
         agent_provider,
         claude_store_pin,
@@ -448,6 +460,7 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.acp_model_config.clone(),
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
@@ -456,12 +469,13 @@ async fn build_spawn_request(
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
         )
     };
+    let config_path = instance.repo_config_path().to_path_buf();
     let agent = supervisor
         .pick_agent_for_tool(
             &target.tool,
             target.agent_override.as_deref(),
             &target.source_profile,
-            &cwd,
+            &config_path,
         )
         .await;
     let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
@@ -509,6 +523,7 @@ async fn build_spawn_request(
         agent,
         tool: target.tool.clone(),
         cwd,
+        config_path,
         additional_dirs: vec![],
         provider_env: vec![],
         provider: agent_provider,
@@ -516,6 +531,7 @@ async fn build_spawn_request(
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
+        model_config: acp_model_config,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
@@ -564,6 +580,19 @@ pub(crate) async fn trigger_resume_background(
     {
         return Ok(ResumeTrigger::NotFound);
     }
+    // Unknown turn state defers the wake: replacing the worker without closing an
+    // orphaned turn would leave the session Running.
+    let Some(orphaned_turn) = query_flushed(
+        &service.acp_supervisor,
+        &service.acp_event_store,
+        id,
+        "open turn",
+        |s, id| s.has_open_turn(id),
+    )
+    .await
+    .flatten() else {
+        return Err(SupervisorError::EventStoreUnavailable(id.to_string()));
+    };
     let has_stored_id = service
         .instances
         .read()
@@ -587,15 +616,7 @@ pub(crate) async fn trigger_resume_background(
         crate::task_util::PanicPolicy::Log,
         async move {
             // Close a turn a dead worker left open before a new prompt lands (#3686).
-            let in_flight = query_store(
-                &service.acp_event_store,
-                &target.id,
-                "in-flight turn",
-                |s, id| s.has_in_flight_turn(id),
-            )
-            .await
-            .unwrap_or(false);
-            if in_flight {
+            if orphaned_turn {
                 service
                     .acp_supervisor
                     .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
@@ -631,15 +652,17 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         // A failed probe counts as busy so a live turn is never killed.
-        let in_flight = query_store(
+        let busy = query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
-            "draining stale worker in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "draining stale worker live work",
+            |s, id| s.holds_live_work(id),
         )
         .await
+        .flatten()
         .unwrap_or(true);
-        if in_flight {
+        if busy {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
@@ -816,11 +839,11 @@ mod tests {
             ((true, false, false, false), ReplaceIncompatibleRunner),
             ((true, false, false, true), ReplaceIncompatibleRunner),
         ];
-        for ((live, build, runner, in_flight), expected) in cases {
+        for ((live, build, runner, holds_live_work), expected) in cases {
             assert_eq!(
-                adopt_decision(live, build, runner, in_flight),
+                adopt_decision(live, build, runner, holds_live_work),
                 expected,
-                "live={live} build={build} runner={runner} in_flight={in_flight}"
+                "live={live} build={build} runner={runner} holds_live_work={holds_live_work}"
             );
         }
     }
@@ -879,34 +902,89 @@ mod tests {
     #[serial_test::serial]
     async fn prompt_wake_closes_an_orphaned_turn_before_resuming() {
         let id = "sess-3686-orphan";
+        // An agent-initiated turn opens with no `UserPromptSent` (a Monitor woke the agent).
+        let opening_events = [
+            crate::acp::Event::UserPromptSent {
+                text: "keep going".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                merged_prompt_ids: Vec::new(),
+                synthesized: false,
+                origin_plugin: None,
+            },
+            crate::acp::Event::AgentMessageChunk {
+                text: "woken".into(),
+                message_id: None,
+            },
+        ];
+        for opening in opening_events {
+            let (_home, state, _project) = test_state(id);
+            state.acp_event_store.record(id, 1, &opening).unwrap();
+            state.acp_supervisor.hydrate_seqs([(id.to_string(), 1)]);
+
+            let trigger = trigger_resume_background(
+                &state.session_service,
+                id,
+                crate::process::worker_registry::ResumeAuthority::Explicit,
+            )
+            .await
+            .expect("resume is admitted");
+            assert!(matches!(trigger, ResumeTrigger::Started));
+
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !state.acp_event_store.replay_from(id, 0).into_iter().any(
+                |(_, e)| matches!(e, crate::acp::Event::Stopped { reason } if reason == "orphaned_at_restart"),
+            ) {
+                assert!(tokio::time::Instant::now() < deadline, "orphaned turn was not closed: {opening:?}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                state.acp_event_store.has_open_turn(id),
+                Some(false),
+                "{opening:?}"
+            );
+        }
+    }
+
+    /// A wake that cannot read the event log defers instead of spawning past an
+    /// orphaned turn; the retry after recovery closes it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_wake_defers_while_the_open_turn_is_unknown() {
+        let id = "sess-wake-unknown";
         let (_home, state, _project) = test_state(id);
-        let prompt = crate::acp::Event::UserPromptSent {
-            text: "keep going".into(),
-            attachments: Vec::new(),
-            prompt_id: None,
-            synthesized: false,
-            origin_plugin: None,
+        let chunk = crate::acp::Event::AgentMessageChunk {
+            text: "woken".into(),
+            message_id: None,
         };
-        state.acp_event_store.record(id, 1, &prompt).unwrap();
+        state.acp_event_store.record(id, 1, &chunk).unwrap();
         state.acp_supervisor.hydrate_seqs([(id.to_string(), 1)]);
+        let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
 
-        let trigger = trigger_resume_background(
-            &state.session_service,
-            id,
-            crate::process::worker_registry::ResumeAuthority::Explicit,
-        )
-        .await
-        .expect("resume is admitted");
+        state.acp_event_store.test_set_unavailable(true);
+        let deferred = trigger_resume_background(&state.session_service, id, authority).await;
+        assert!(matches!(
+            deferred,
+            Err(SupervisorError::EventStoreUnavailable(_))
+        ));
+        assert!(
+            !state.acp_supervisor.is_running(id).await,
+            "nothing spawned"
+        );
+
+        state.acp_event_store.test_set_unavailable(false);
+        let trigger = trigger_resume_background(&state.session_service, id, authority)
+            .await
+            .expect("the retry is admitted");
         assert!(matches!(trigger, ResumeTrigger::Started));
-
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !state.acp_event_store.replay_from(id, 0).into_iter().any(
-            |(_, e)| matches!(e, crate::acp::Event::Stopped { reason } if reason == "orphaned_at_restart"),
-        ) {
-            assert!(tokio::time::Instant::now() < deadline, "orphaned turn was not closed");
+        while state.acp_event_store.has_open_turn(id) != Some(false) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the orphaned turn was lost"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!state.acp_event_store.has_in_flight_turn(id));
     }
 
     /// A session that left the live set after the snapshot is never spawned.
@@ -986,6 +1064,7 @@ mod tests {
                 id,
                 1,
                 &Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "original turn remains busy".into(),
                     attachments: vec![],
                     prompt_id: None,
@@ -1064,6 +1143,119 @@ mod tests {
             event,
             Event::AgentMessageChunk { text, .. } if text == "original producer completed"
         )));
+        state.acp_supervisor.detach_all().await;
+    }
+
+    /// The runner replays the completion of its last user prompt on every attach. Across the
+    /// reconciler's real classification and attach, that replay must neither publish a
+    /// `Stopped` for an open agent-initiated turn nor release its live-work hold; only the
+    /// turn's own terminal does.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retained_prompt_completion_does_not_close_an_agent_turn_on_reattach() {
+        use super::super::test_fixtures::Tick;
+        use crate::acp::supervisor::test_support::{HeldAttachRunner, ObservedProcessControl};
+        use crate::acp::Event;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let id = "reconciler-agent-turn-reattach";
+        let row = structured_instance(id, project.path().to_str().unwrap());
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let control = Arc::new(ObservedProcessControl::default());
+        let state = crate::server::test_support::build_test_app_state_impl(
+            vec![row],
+            vec![],
+            vec![],
+            None,
+            false,
+            |_| {},
+            |supervisor| supervisor.with_process_control(control.clone()),
+        );
+        let mut runner =
+            HeldAttachRunner::new(id, project.path(), 17, Some("default")).with_trailing_chunk();
+        // A finished user prompt, then an agent-initiated turn that has not stopped.
+        let seeded = [
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: vec![],
+                prompt_id: None,
+                merged_prompt_ids: Vec::new(),
+                synthesized: false,
+                origin_plugin: None,
+            },
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            Event::AgentMessageChunk {
+                text: "woken".into(),
+                message_id: None,
+            },
+        ];
+        for (i, event) in seeded.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(id, i as u64 + 1, event)
+                .unwrap();
+        }
+        state.acp_supervisor.hydrate_seqs([(id.into(), 3)]);
+        let mut rx = state.acp_events_tx.subscribe();
+        let first = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let mut tick = Tick::default();
+                tick.run(&state).await;
+                tick
+            }
+        });
+        runner.entered().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::resume();
+        let mut tick = first.await.unwrap();
+        runner.disconnected().await;
+
+        tick.run(&state).await;
+        assert_eq!(
+            state.acp_supervisor.running_identity(id),
+            Some(runner.identity)
+        );
+        runner.complete_turn();
+        let store = &state.acp_event_store;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.replay_from(id, 0).iter().any(|(_, e)| {
+                matches!(e, Event::AgentMessageChunk { text, .. } if text == "after the retained completion")
+            }) {
+                rx.recv().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        // The completion precedes that chunk on the same stream, so it has been handled.
+        let stops = |store: &crate::acp::event_store::EventStore| {
+            store
+                .replay_from(id, 0)
+                .iter()
+                .filter(|(_, e)| matches!(e, Event::Stopped { .. }))
+                .count()
+        };
+        assert_eq!(
+            stops(store),
+            1,
+            "the retained completion published a Stopped"
+        );
+        assert_eq!(store.holds_live_work(id), Some(true));
+
+        store
+            .record(
+                id,
+                1000,
+                &Event::Stopped {
+                    reason: "agent_idle".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.holds_live_work(id), Some(false));
         state.acp_supervisor.detach_all().await;
     }
 }

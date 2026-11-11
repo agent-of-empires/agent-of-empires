@@ -5,8 +5,8 @@ export default defineConfig({
   globalSetup: "./tests/helpers/liveGlobalSetup.ts",
   timeout: 60_000,
   fullyParallel: true,
-  // More workers starve live specs under coverage on the 4-core CI runner.
-  workers: 3,
+  // About 0.75 workers per core; more starve live specs under coverage.
+  workers: Number(process.env.PW_LIVE_WORKERS) || 3,
   retries: 0,
   use: {
     headless: true,

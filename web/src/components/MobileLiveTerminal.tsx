@@ -70,6 +70,8 @@ export interface MobileLiveTerminalProps {
   uploadPastedImage: (file: File, canWrite: () => boolean) => Promise<string | null>;
   /** Captures this gesture's policy/terminal identity before any asynchronous work. */
   captureWriteAdmission: () => () => boolean;
+  /** Takes a plain Tab from either input instead of the pane when it returns true. */
+  onTabEscape?: () => boolean;
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
   forwardButton: (
     baseButton: number,
@@ -132,6 +134,7 @@ export function MobileLiveTerminal({
   sendPaste,
   uploadPastedImage,
   captureWriteAdmission,
+  onTabEscape,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -683,6 +686,7 @@ export function MobileLiveTerminal({
     sendPaste,
     uploadPastedImage,
     captureWriteAdmission,
+    onTabEscape,
   });
 
   const cursorRow = connected && !reading ? live.row : -1;

@@ -327,6 +327,7 @@ pub fn scan(
     // Clamp before the cast so a `u64::MAX` cursor does not wrap negative.
     let (op, value) = match bound {
         SeqBound::After(v) => (">", v),
+        SeqBound::Before(v) if v > i64::MAX as u64 => ("<=", v),
         SeqBound::Before(v) => ("<", v),
     };
     let value_i64 = i64::try_from(value).unwrap_or(i64::MAX);

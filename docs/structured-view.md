@@ -100,6 +100,7 @@ Features depend on the ACP adapter and its profile:
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
 | Subagent indentation | ✓ | — | unverified | — | — |
+| Per-subagent state and Stop | ✓ | — | — | — | — |
 | Workflow agents in the Sub agents pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
@@ -118,7 +119,7 @@ aoe add . --agent codex --model gpt-5
 aoe add . --agent codex --effort high
 ```
 
-`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
+`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. The web wizard also disables Structured view ahead of time, as "ACP adapter not installed", when the server reports that the selected Profile and project would refuse it (counting both their hooks), Sandbox is off and there is no command override. Until the server answers for a newly chosen project, Structured view stays available for an agent that is ACP-capable without the repository, and the create's own check decides; an agent that only the repository's `agent_detect_as` makes ACP-capable shows Structured view as unavailable until the answer arrives. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
 
 ## Requirements
 
@@ -179,10 +180,16 @@ Unfinished text snapshots remain readable even when their start or completion
 event is unavailable. They are labeled **completion unavailable**, not marked
 successful or stopped. Wrapping and copy preserve painted Unicode graphemes.
 
-The reader refreshes available content automatically and preserves focus and
-scroll position. Read failures keep the last loaded content visible with an
-error. Content, size, or theme changes clear the previous text selection.
-Reopen the reader after in-place edits to already retained events.
+The reader refreshes available content automatically, including replacements or
+backfills that leave sequence bounds unchanged, and preserves focus and scroll
+position. Read failures keep the last loaded content visible with an error.
+Content, size, or theme changes clear the previous text selection.
+
+Retained reads use one complete history snapshot. If stored history changes,
+including an append, the reader rejects mixed content and retries while keeping
+the last readable view. An incomplete but unchanged history does not repeatedly
+reload. See [retained history internals](development/internals/structured-view.md#retained-history-consistency)
+for the storage and migration contract.
 
 Dialogs close when their target session changes or disappears. Trash context
 menus reject actions if the original session, profile, or lifecycle generation
@@ -226,7 +233,7 @@ mode = "plan"             # default mode, applied when the agent advertises one
 "anthropic/opus" = "low"
 ```
 
-`model` applies at worker start. `effort` and `mode` use advertised ACP config options and are skipped with a warning when unsupported. A matching `effort_by_model` entry overrides flat `effort`. Web **Structured View Defaults** exposes the same values from each agent's last advertised choices.
+`model` applies at worker start. `effort` and `mode` use advertised ACP config options and are skipped with a warning when unsupported. A matching `effort_by_model` entry overrides flat `effort`. Web **Agent defaults** exposes the same values from each agent's last advertised choices.
 
 The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
 
