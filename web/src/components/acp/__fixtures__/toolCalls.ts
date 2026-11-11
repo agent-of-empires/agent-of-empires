@@ -177,6 +177,16 @@ export const fixtures = {
     kind: "other",
     args_preview: JSON.stringify({ task_id: "task-abc123" }),
   }),
+  sendMessage: makeToolCall({
+    id: "sendmessage-1",
+    name: "SendMessage",
+    kind: "other",
+    args_preview: JSON.stringify({
+      to: "ace246fde7e3ac073",
+      summary: "Fix graph diff bug",
+      message: "Follow-up fix details",
+    }),
+  }),
   mcp: makeToolCall({
     id: "mcp-1",
     name: "mcp__slack__send_message",

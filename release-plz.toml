@@ -1,0 +1,112 @@
+# Release automation; see docs/development/releases.md.
+# The PR title check mirrors the commit_parsers groups below.
+
+[workspace]
+# Versions come from `vX.Y.Z` tags; nothing is published to crates.io.
+git_only = true
+publish = false
+release = false
+git_tag_name = "v{{ version }}"
+# release.yml creates the GitHub release once the tag builds.
+git_release_enable = false
+# release-plz.yml only runs `release` on a merged release PR.
+release_always = true
+dependencies_update = false
+semver_check = false
+pr_labels = ["release"]
+
+# Cargo leaves the nested crates out of the root package, so they share its version
+# group: their changes bump the release and land in its changelog, with no tag or
+# changelog of their own. Their versions must equal the root's to find its `v*` tag.
+[[package]]
+name = "agent-of-empires"
+release = true
+version_group = "aoe"
+changelog_include = ["aoe-plugin-api", "aoe-settings-derive", "xtask"]
+
+[[package]]
+name = "aoe-plugin-api"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "aoe-settings-derive"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
+
+[[package]]
+name = "xtask"
+release = true
+version_group = "aoe"
+git_tag_enable = false
+changelog_update = false
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to Agent of Empires will be documented in this file.
+
+The format follows [Conventional Commits](https://www.conventionalcommits.org/).
+
+"""
+body = """
+## [{{ version }}](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | split(pat="\n") | first | upper_first }}\
+{% if commit.remote.pr_number %} in [#{{ commit.remote.pr_number }}](https://github.com/agent-of-empires/agent-of-empires/pull/{{ commit.remote.pr_number }}){% endif %}\
+{% if commit.remote.username %} by [@{{ commit.remote.username }}](https://github.com/{{ commit.remote.username }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/agent-of-empires/agent-of-empires/commit/{{ commit.id }}))
+{% endfor %}
+{% endfor %}
+{%- if remote.contributors | filter(attribute="is_first_time", value=true) | length > 0 %}
+
+### New Contributors
+
+{% for contributor in remote.contributors | filter(attribute="is_first_time", value=true) -%}
+- [@{{ contributor.username }}](https://github.com/{{ contributor.username }}) made their first contribution in [#{{ contributor.pr_number }}](https://github.com/agent-of-empires/agent-of-empires/pull/{{ contributor.pr_number }})
+{% endfor %}
+{%- endif %}
+{% if previous and previous.version -%}
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v{{ previous.version }}...v{{ version }}
+{% endif %}
+"""
+trim = true
+protect_breaking_commits = true
+sort_commits = "oldest"
+
+# GitHub appends " (#1234)" to squash subjects; the template links the PR already.
+# Keep this narrow: looser patterns break conventional-commit parsing and drop the scope.
+commit_preprocessors = [
+  { pattern = '(?m) \(#\d+\)$', replace = "" },
+]
+
+# Unmatched commits land in "Other" rather than being dropped.
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^security", group = "Security" },
+  { message = "^revert", group = "Reverts" },
+
+  { message = "^chore\\(deps\\)", skip = true },
+  { message = "^chore: update Nix npmDepsHash", skip = true },
+
+  { message = "^chore", skip = true },
+  { message = "^build", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^docs", skip = true },
+  { message = "^style", skip = true },
+  { message = "^refactor", skip = true },
+  { message = "^test", skip = true },
+
+  { message = ".*", group = "Other" },
+]

@@ -1744,6 +1744,7 @@ mod tests {
     async fn recover_structured_unread_after_lag_keeps_running_for_work_past_the_stopped() {
         use crate::acp::Event;
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "go".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -2463,6 +2464,7 @@ mod tests {
             // The pre-restart log, persisted but never folded into this cold cache.
             let log = [
                 Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "spawn and go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
@@ -3137,6 +3139,7 @@ mod tests {
         let cases = [
             (
                 Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
@@ -3180,6 +3183,7 @@ mod tests {
             let state = test_support::build_test_app_state(vec![instance]);
             let mut events = vec![
                 crate::acp::Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),

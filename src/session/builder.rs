@@ -1464,14 +1464,13 @@ pub mod structured {
     }
 
     /// Whether `agent` is ACP-capable and its adapter passes the create check, for the agent
-    /// list. There is no project to search from, so relative PATH entries pass. With
-    /// `count_profile_hooks`, `config`'s own hooks may install the adapter first; the
-    /// repository's depend on the project.
+    /// list. No launch directory is searched, so relative PATH entries pass and the list is
+    /// never stricter than a create. `preparation_hooks` is the create's hook question.
     pub fn adapter_installed(
         agent: &str,
         config: &crate::session::Config,
         host_environment: &[(String, String)],
-        count_profile_hooks: bool,
+        preparation_hooks: &dyn Fn() -> bool,
     ) -> bool {
         let choice = StructuredChoice {
             tool: agent,
@@ -1479,7 +1478,7 @@ pub mod structured {
             command_override: "",
             sandboxed: false,
             project_path: None,
-            preparation_hooks: &|| count_profile_hooks && prepares(&config.hooks),
+            preparation_hooks,
         };
         validate_structured_choice_with(
             &choice,
@@ -2129,54 +2128,6 @@ mod tests {
                     "{label}: asked about hooks for a reachable adapter"
                 );
             }
-        }
-    }
-
-    /// Only the create-ready answer counts the profile's own preparation hooks, as the create
-    /// check does; the strict one reports whether the adapter runs now.
-    #[test]
-    #[serial_test::serial]
-    fn adapter_installed_counts_profile_preparation_hooks_only_when_asked() {
-        use crate::session::HooksConfig;
-        let _home = crate::session::test_support::isolate_app_dir();
-        // Absolute, so no PATH is searched: a relative entry in the caller's PATH would pass.
-        let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("missing-adapter");
-        let hook = || vec!["npm install".to_string()];
-        for (label, hooks, create_ready) in [
-            ("no hooks", HooksConfig::default(), false),
-            (
-                "on_create",
-                HooksConfig {
-                    on_create: hook(),
-                    ..Default::default()
-                },
-                true,
-            ),
-            (
-                "on_launch",
-                HooksConfig {
-                    on_launch: hook(),
-                    ..Default::default()
-                },
-                true,
-            ),
-        ] {
-            let mut config = crate::session::Config::default();
-            config
-                .session
-                .agent_acp_cmd
-                .insert("fake".into(), missing.display().to_string());
-            config.hooks = hooks;
-            assert!(
-                !structured::adapter_installed("fake", &config, &[], false),
-                "{label}: strict"
-            );
-            assert_eq!(
-                structured::adapter_installed("fake", &config, &[], true),
-                create_ready,
-                "{label}: create-ready"
-            );
         }
     }
 

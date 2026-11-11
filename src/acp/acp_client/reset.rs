@@ -963,6 +963,7 @@ done
             let mut events = Vec::new();
             if stored {
                 events.push(Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     prompt_id: None,
                     text: "prior user turn".into(),
                     attachments: vec![],

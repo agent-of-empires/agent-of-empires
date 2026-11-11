@@ -86,8 +86,8 @@ Cargo.lock                              @agent-of-empires/protected
 
 # Releases
 /.github/workflows/release.yml          @agent-of-empires/release
-/.github/workflows/prepare-release.yml  @agent-of-empires/release
-/.github/workflows/open-release-pr.yml  @agent-of-empires/release
-/.github/workflows/tag-release-pr.yml   @agent-of-empires/release
-/cliff.toml                             @agent-of-empires/release
+/.github/workflows/release-plz.yml      @agent-of-empires/release
+/.github/workflows/build-binaries.yml   @agent-of-empires/release
+/.github/workflows/nightly.yml          @agent-of-empires/release
+/release-plz.toml                       @agent-of-empires/release
 /docs/development/releases.md           @agent-of-empires/release
