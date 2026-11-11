@@ -4529,7 +4529,11 @@ impl HomeView {
                 .filter(|(id, _)| self.selected_session.as_deref() == Some(id.as_str()))
                 .map(|(_, taker)| *taker);
             let live_key = takeover.map(|taker| {
-                let (click, key) = if tab_action_text == Some("Live") {
+                let tab_is_live = self
+                    .selected_session
+                    .as_deref()
+                    .is_some_and(|id| self.tab_enters_live(id));
+                let (click, key) = if tab_is_live {
                     (ktab, "Tab")
                 } else {
                     (kenter, "↵")

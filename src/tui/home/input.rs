@@ -7304,9 +7304,37 @@ impl HomeView {
             live_send::LiveTakeover::from_owner_id(owner.as_ref().map(|(id, _)| id.as_str()));
         self.teardown_live_send();
         self.vt_yield = Some(state.tmux_name);
-        // A footer line, not a dialog: the live key takes control back.
-        self.live_takeover = Some((state.session_id, taker));
+        self.note_live_takeover(state.session_id, taker);
         true
+    }
+
+    /// A footer line, not a dialog: the live key takes control back. With the shortcut bar
+    /// hidden that line never shows, so a flash says the same once.
+    pub(super) fn note_live_takeover(
+        &mut self,
+        session_id: String,
+        taker: live_send::LiveTakeover,
+    ) {
+        if !self.show_shortcut_bar {
+            let key = if self.tab_enters_live(&session_id) {
+                "Tab"
+            } else {
+                "Enter"
+            };
+            self.flash_status(format!("{}: {key} to take it back", taker.label()));
+        }
+        self.live_takeover = Some((session_id, taker));
+    }
+
+    /// Whether Tab, not Enter, enters live mode on this Session's row (see the footer).
+    pub(super) fn tab_enters_live(&self, id: &str) -> bool {
+        !self
+            .get_instance(id)
+            .is_some_and(|inst| inst.is_structured())
+            && !matches!(
+                self.default_attach_mode(id),
+                Some(crate::session::AttachMode::LiveSend)
+            )
     }
 
     /// Open the shared permission-response dialog for the selected session.
