@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { McpSecretEntry, McpServerInput, McpServerView } from "../lib/api";
+import { hasFinePointer } from "../lib/platform";
 
 type Transport = McpServerInput["transport"];
 
@@ -154,6 +155,7 @@ export function McpServerForm({
             <span className="font-mono text-[11px] text-text-muted">Name</span>
             <input
               aria-label="Name"
+              autoFocus={!initial && hasFinePointer()}
               className={inputClass}
               value={name}
               readOnly={!!initial}
@@ -164,6 +166,7 @@ export function McpServerForm({
             <span className="font-mono text-[11px] text-text-muted">Transport</span>
             <select
               aria-label="Transport"
+              autoFocus={!!initial && hasFinePointer()}
               className={inputClass}
               value={transport}
               onChange={(e) => setTransport(e.target.value as Transport)}

@@ -1562,18 +1562,34 @@
       ]
     },
     {
-      "id": "wizard.search-autofocus",
+      "id": "wizard.first-field-autofocus",
       "kind": "mocked-playwright",
       "risk": "low",
-      "specs": ["tests/wizard-project.spec.ts"],
+      "specs": ["tests/wizard-project.spec.ts", "tests/wizard.spec.ts"],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
+        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx",
         "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
         "web/src/components/session-wizard/steps/ImportSessionPicker.tsx",
+        "web/src/components/session-wizard/steps/LaunchFields.tsx",
         "web/src/components/session-wizard/steps/ProjectSearchList.tsx",
-        "web/src/components/session-wizard/steps/ProjectStep.tsx"
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/steps/SandboxPanel.tsx",
+        "web/src/components/session-wizard/steps/WorktreePanel.tsx"
       ],
-      "notes": "Opening the Project panel (Recent and Browse tabs) or the Extra repos panel focuses its search box, and the Import tab focuses its agent select, on a fine-pointer device."
+      "notes": "On a fine-pointer device each wizard sub-panel focuses its first editable control on open: the Project and Extra repos search, the Browse filter, the Import agent select, the Worktree branch name, the Sandbox image, and the selected agent. A touch device focuses nothing."
+    },
+    {
+      "id": "modals.first-field-autofocus",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/modalAutofocus.test.tsx"],
+      "components": [
+        "web/src/components/McpServerForm.tsx",
+        "web/src/components/ProjectFormModal.tsx",
+        "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ],
+      "notes": "On a fine-pointer device the MCP server form focuses Name when adding and Transport when editing, the project form focuses Path when adding and the base branch when editing, and Send diff comments focuses the intro. A touch device focuses nothing."
     },
     {
       "id": "wizard.scratch-toggle-visible",
