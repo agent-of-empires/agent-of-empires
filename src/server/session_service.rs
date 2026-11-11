@@ -1085,12 +1085,13 @@ impl SessionService {
         {
             return Err(SendTurnError::RevivalRefused);
         }
+        let mut receiver = None;
         let profile = match classified_as {
             // A turn cut for one agent must not reach a worker a resume started as another.
             Some(cut) => {
-                let receiving = self
+                let (client, receiving) = self
                     .acp_supervisor
-                    .worker_agent_key(id)
+                    .classified_receiver(id)
                     .await
                     .ok_or(SendTurnError::WorkerNotReady)?;
                 if receiving != cut.agent {
@@ -1103,6 +1104,7 @@ impl SessionService {
                     );
                     return Err(SendTurnError::AgentChanged);
                 }
+                receiver = Some((client, receiving));
                 Some(cut.profile)
             }
             None => self
@@ -1125,12 +1127,20 @@ impl SessionService {
             .await;
         let outcome = match published.disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
-                self.acp_supervisor.send_prompt(id, text, attachments).await
+                match &receiver {
+                    Some((client, _)) => client.send_prompt(text, attachments).await.map_err(Into::into),
+                    None => self.acp_supervisor.send_prompt(id, text, attachments).await,
+                }
             }
             crate::acp::supervisor::PromptDisposition::ResetContext => {
-                self.acp_supervisor
-                    .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
-                    .await
+                match &receiver {
+                    Some((client, agent)) => self.acp_supervisor.reset_client_context(
+                        client, id, agent, text, acp_mode_id.as_deref(), yolo_mode,
+                    ).await,
+                    None => self.acp_supervisor
+                        .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
+                        .await,
+                }
             }
         };
         match outcome {
@@ -3451,6 +3461,7 @@ mod tests {
     async fn a_lost_ready_receiver_preserves_the_batch_for_a_replacement() {
         use crate::acp::supervisor::test_support::AgentKeyGate;
         use std::time::Duration;
+        for matching_identity in [false, true] {
         let _home = crate::session::test_support::isolate_app_dir();
         declare_custom_reset("/new");
         let id = "lost-ready-receiver";
@@ -3497,20 +3508,26 @@ mod tests {
             .await
             .unwrap();
         // Remove the ready receiver before identity validation.
-        service.acp_supervisor.test_remove_worker(id).await;
-        drop(live);
-        crate::process::worker_registry::delete(id).unwrap();
+        if !matching_identity {
+            service.acp_supervisor.test_remove_worker(id).await;
+            drop(live);
+            crate::process::worker_registry::delete(id).unwrap();
+        }
         tokio::time::timeout(Duration::from_secs(10), before_read.wait())
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), after_read.wait())
             .await
             .unwrap();
-        // The identity read observes no receiver; replacement bypasses submission locking.
+        // Replace after the identity read, without taking the submission lock.
+        service.acp_supervisor.test_remove_worker(id).await;
+        crate::process::worker_registry::delete(id).ok();
         let recorded = service
             .acp_supervisor
             .test_insert_worker_cmd_recording(id)
             .await;
+        let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
+        std::fs::remove_file(crate::process::worker::control_socket_sibling(&socket)).ok();
         let _replacement = save_agent_record(id, "claude", true);
         tokio::time::timeout(Duration::from_secs(10), after_read.wait())
             .await
@@ -3530,6 +3547,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "after");
         crate::process::worker_registry::delete(id).unwrap();
+            }
     }
 
     /// A batch cut for one agent is withheld from a worker a resume started as another, so the

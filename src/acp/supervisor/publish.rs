@@ -271,6 +271,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         key
     }
 
+    /// Bind identity validation to the client that will receive the classified turn.
+    pub(crate) async fn classified_receiver(
+        &self,
+        session_id: &str,
+    ) -> Option<(std::sync::Arc<crate::acp::acp_client::AcpClient>, String)> {
+        let (client, epoch) = {
+            let workers = self.workers.lock().await;
+            let handle = workers.get(session_id)?;
+            (std::sync::Arc::clone(&handle.client), handle.launch_epoch)
+        };
+        let agent = self.worker_agent_key(session_id).await?;
+        self.is_current_launch(session_id, epoch)
+            .await
+            .then_some((client, agent))
+    }
+
     /// [`Self::worker_agent_key`] for each of `session_ids` that has one, under one workers lock,
     /// reading registry records off the runtime.
     pub(crate) async fn worker_agent_keys(
