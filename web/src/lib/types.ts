@@ -317,7 +317,8 @@ export interface AgentInfo {
   acp_capable: boolean;
   /** The ACP adapter resolves on the host now; `on_create`/`on_launch` hooks don't count. Import and usage-limit alternatives need this. */
   acp_installed: boolean;
-  /** A non-sandboxed structured create in the served profile will accept this agent; its own hooks count. */
+  /** A non-sandboxed structured create will accept this agent, in the requested profile and project
+   *  (`path`, or `scratch`), counting their config and hooks. Without a project only the profile's count. */
   acp_create_ready?: boolean;
   /** Allowed by `[acp] allowed_agents`; `acp_capable` stays the intrinsic fact. Absent means permitted. */
   acp_allowed?: boolean;

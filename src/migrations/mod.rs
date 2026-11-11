@@ -63,8 +63,9 @@ mod v051_structured_view;
 mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
 mod v054_retained_history_identity;
-mod v055_retained_trash_ownership;
-mod v056_unpublished_trash_authority;
+mod v055_global_max_concurrent_workers;
+mod v056_retained_trash_ownership;
+mod v057_unpublished_trash_authority;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -105,7 +106,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 56;
+const CURRENT_VERSION: u32 = 57;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -288,13 +289,18 @@ const MIGRATIONS: &[Migration] = &[
     ),
     (
         55,
-        "retained_trash_ownership",
-        v055_retained_trash_ownership::run,
+        "global_max_concurrent_workers",
+        v055_global_max_concurrent_workers::run,
     ),
     (
         56,
+        "retained_trash_ownership",
+        v056_retained_trash_ownership::run,
+    ),
+    (
+        57,
         "unpublished_trash_authority",
-        v056_unpublished_trash_authority::run,
+        v057_unpublished_trash_authority::run,
     ),
 ];
 
@@ -412,6 +418,13 @@ pub(crate) fn reconcile_serve_launch_under_transaction(
     transaction: &crate::daemon::lifecycle::Transaction,
 ) -> Result<()> {
     v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)
+}
+
+/// Whether reconciliation accepts this `serve.launch` schema and shape.
+pub(crate) fn validate_serve_launch_schema(
+    record: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    v044_reconcile_serve_passphrase_policy::validate_record_schema(record)
 }
 
 pub(crate) fn run_migrations_under_exclusion(

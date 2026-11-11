@@ -707,6 +707,7 @@ done
             message_id: Some(message_id.into()),
         };
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "status".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -809,6 +810,7 @@ done
             message_id: None,
         };
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "go".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -874,6 +876,7 @@ done
             message_id: Some("m-a".into()),
         };
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "go".into(),
             attachments: Vec::new(),
             prompt_id: None,
@@ -907,6 +910,7 @@ done
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
         let events = [
             Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: "hello".into(),
                 attachments: Vec::new(),
                 prompt_id: None,

@@ -51,6 +51,7 @@ fn spawn_config(
         provider_env: env,
         host_environment: vec![],
         default_effort_explicit: default_effort.is_some(),
+        default_model_config: Default::default(),
         default_effort,
         default_mode: None,
         default_model,
@@ -350,7 +351,10 @@ async fn reset_reapplies_the_live_model_pick() {
         .await
         .expect("spawn shim");
     drive_one_turn(&mut client).await;
-    client.set_config_option("model", "opus").await.unwrap();
+    client
+        .set_config_option("model", "opus", false)
+        .await
+        .unwrap();
     client.reset_session("/clear").await.unwrap();
     let _ = client.shutdown().await;
 
@@ -374,6 +378,114 @@ async fn reset_reapplies_the_live_model_pick() {
         Some("thought_level_v2=high"),
         "the reset must resolve the effort id from its own model switch \
      (recorded: {recorded:?})"
+    );
+}
+
+/// A reset re-sends the model_config toggles at their live value, not the
+/// spawn-time one.
+#[tokio::test]
+#[serial_test::parallel]
+async fn reset_reapplies_the_live_model_config_pick() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let record_path = temp.path().join("config-option-calls.log");
+    let mut env = shim_env(&record_path, false, false);
+    env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+    config.default_model_config = [("fast".to_string(), "on".to_string())].into();
+    let mut client = AcpClient::spawn(config, AcpSessionId("model-config-reset".into()))
+        .await
+        .expect("spawn shim");
+    drive_one_turn(&mut client).await;
+    // The pick is dispatched in the background; the reset must not overtake it.
+    client.set_config_option("fast", "off", true).await.unwrap();
+    client
+        .set_config_option("ultracode", "on", true)
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count()) < 4 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "live picks never recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.reset_session("/clear").await.unwrap();
+    let _ = client.shutdown().await;
+
+    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        [
+            "model=opus",
+            "fast=on",
+            "fast=off",
+            "ultracode=on",
+            "model=opus",
+            "ultracode=on",
+        ],
+        "a reset must re-send the live toggle values (recorded: {recorded:?})"
+    );
+}
+
+/// A toggle turned off after one reset must stay off on the next one.
+#[tokio::test]
+#[serial_test::parallel]
+async fn second_reset_keeps_a_toggle_turned_off_after_the_first() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let record_path = temp.path().join("config-option-calls.log");
+    let mut env = shim_env(&record_path, false, false);
+    env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+    config.default_model_config = [
+        ("fast".to_string(), "on".to_string()),
+        ("ultracode".to_string(), "on".to_string()),
+    ]
+    .into();
+    let mut client = AcpClient::spawn(config, AcpSessionId("model-config-second-reset".into()))
+        .await
+        .expect("spawn shim");
+    drive_one_turn(&mut client).await;
+    let recorded_lines = || std::fs::read_to_string(&record_path).map_or(0, |r| r.lines().count());
+    let wait_for = |count: usize| async move {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while recorded_lines() < count {
+            assert!(std::time::Instant::now() < deadline, "calls never recorded");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    client.reset_session("/clear").await.unwrap();
+    client
+        .set_config_option("ultracode", "off", true)
+        .await
+        .unwrap();
+    wait_for(7).await;
+    client.reset_session("/clear").await.unwrap();
+    let _ = client.shutdown().await;
+
+    let recorded = std::fs::read_to_string(&record_path).unwrap_or_default();
+    assert_eq!(
+        recorded.lines().collect::<Vec<_>>(),
+        [
+            "model=opus",
+            "fast=on",
+            "ultracode=on",
+            "model=opus",
+            "fast=on",
+            "ultracode=on",
+            "ultracode=off",
+            "model=opus",
+            "fast=on",
+        ],
+        "the second reset must not turn ultracode back on (recorded: {recorded:?})"
     );
 }
 
@@ -422,4 +534,56 @@ async fn effort_id_is_re_read_from_the_model_switch_response() {
         matches!((model_at, effort_at), (Some(m), Some(e)) if m < e),
         "model must be applied before the effort (recorded: {recorded:?})"
     );
+}
+
+/// Fast mode and Ultracode picks are re-sent after the model and effort, and an
+/// option the model does not advertise (`ultracode` off `opus`) is skipped.
+#[tokio::test]
+#[serial_test::parallel]
+async fn model_config_picks_reapplied_after_model_and_effort() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+    // (model, expected record lines in order)
+    let cases = [
+        (
+            "opus",
+            vec![
+                "model=opus",
+                "thought_level=high",
+                "fast=on",
+                "ultracode=on",
+            ],
+        ),
+        (
+            "sonnet",
+            vec!["model=sonnet", "thought_level=high", "fast=on"],
+        ),
+    ];
+    for (model, expected) in cases {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let record_path = temp.path().join("config-option-calls.log");
+        let mut env = shim_env(&record_path, true, true);
+        env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+        let mut config = spawn_config(
+            shim_path(),
+            env,
+            Some("stored-model-config-session".into()),
+            Some(model.into()),
+            Some("high".into()),
+        );
+        config.default_model_config = [("fast", "on"), ("ultracode", "on")]
+            .into_iter()
+            .map(|(id, value)| (id.to_string(), value.to_string()))
+            .collect();
+        run(config, "model-config").await;
+
+        let recorded = std::fs::read_to_string(&record_path).expect("record file");
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            expected,
+            "{model}: recorded {recorded:?}"
+        );
+    }
 }

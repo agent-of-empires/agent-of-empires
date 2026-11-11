@@ -878,6 +878,102 @@ describe("ensureTerminal", () => {
     offline();
     expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "offline" });
   });
+
+  describe("lifecycle_busy", () => {
+    const busy = (operation = "launch") => json({ error: "lifecycle_busy", operation, message: "busy" }, 409);
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("retries until the launch releases the reservation", async () => {
+      fetchSpy.mockResolvedValueOnce(busy()).mockResolvedValueOnce(busy()).mockResolvedValueOnce(empty());
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await result).toEqual({ ok: true });
+      expect(fetchSpy).toHaveBeenCalledTimes(3);
+    });
+
+    it("does not wait out a busy operation other than a launch", async () => {
+      fetchSpy.mockResolvedValue(busy("stop"));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives the busy error back once the budget is spent", async () => {
+      fetchSpy.mockImplementation(async () => busy());
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      const calls = fetchSpy.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(calls);
+    });
+
+    // The budget bounds when retries start; a request already in flight is not aborted.
+    it("starts no retry once slow busy responses have spent the budget", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 20_000)));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("sends no request at or after the deadline", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 29_900)));
+      const result = api.ensureTerminal("s1");
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await result).toEqual({ ok: false, error: "lifecycle_busy", message: "busy" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports an abort that lands during the final wait", async () => {
+      fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(busy()), 29_900)));
+      const controller = new AbortController();
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(29_950);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports an abort that lands during the body read", async () => {
+      const controller = new AbortController();
+      fetchSpy.mockResolvedValueOnce({
+        ok: false,
+        status: 409,
+        json: () =>
+          new Promise((_, reject) =>
+            controller.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))),
+          ),
+      } as Response);
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(0);
+      controller.abort();
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops retrying once its signal aborts", async () => {
+      fetchSpy.mockImplementation(async () => busy());
+      const controller = new AbortController();
+      const result = api.ensureTerminal("s1", 0, false, controller.signal);
+      await vi.advanceTimersByTimeAsync(300);
+      const calls = fetchSpy.mock.calls.length;
+      expect(calls).toBeGreaterThan(0);
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(await result).toEqual({ ok: false, error: "aborted" });
+      expect(fetchSpy).toHaveBeenCalledTimes(calls);
+    });
+
+    it("does not retry other refusals", async () => {
+      fetchSpy.mockResolvedValueOnce(empty(500));
+      expect(await api.ensureTerminal("s1")).toEqual({ ok: false, message: "Server error (500)" });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 describe("startSession", () => {
   it.each([

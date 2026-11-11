@@ -275,6 +275,7 @@ impl HomeView {
             runtime_outcome_messages: Vec::new(),
             sidebar_source: crate::tui::session_feed::SidebarSource::Disconnected,
             runtime_failure_reason: None,
+            offline_attention: crate::tui::dialogs::DaemonAttention::Offline,
             restart_in_flight: std::collections::HashSet::new(),
             pending_creation: None,
             structured_transcript_painted: false,

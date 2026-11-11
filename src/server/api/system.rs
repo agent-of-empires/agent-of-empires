@@ -93,14 +93,17 @@ pub struct AgentInfo {
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
-    /// Whether this agent's ACP adapter resolves on the host now, for the served profile with no
-    /// sandbox. Relative PATH entries and a host `before_session` hook count, as for a spawn;
-    /// preparation hooks (`on_create`/`on_launch`) don't. The wizard's Import tab and the usage
-    /// limit banner's installed alternatives read it: both run the adapter before those hooks.
+    /// Whether this agent's ACP adapter resolves on the host now, for the requested profile with
+    /// no sandbox and no project. Relative PATH entries and a host `before_session` hook count,
+    /// as for a spawn; preparation hooks (`on_create`/`on_launch`) don't. The wizard's Import
+    /// tab and the usage limit banner's installed alternatives read it: both run the adapter
+    /// before those hooks.
     pub acp_installed: bool,
-    /// Whether a non-sandboxed structured create in the served profile will accept this agent:
-    /// the adapter resolves, or the profile's own `on_create`/`on_launch` hooks may install it
-    /// first. The repository's hooks depend on the project, so they are left to the create.
+    /// Whether a non-sandboxed structured create in the requested profile, and in the requested
+    /// project when given, will accept this agent: the adapter resolves, or an
+    /// `on_create`/`on_launch` hook may install it first (the profile's, or the project
+    /// repository's while its trust isn't declined). The repository's `agent_detect_as` can
+    /// make this true for an agent that isn't `acp_capable`.
     pub acp_create_ready: bool,
     /// True when `[acp] allowed_agents` permits this agent in the structured
     /// view. Deliberately separate from `acp_capable`, which states an intrinsic
@@ -213,13 +216,19 @@ fn build_custom_agent_infos(
     entries
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub struct AgentsQuery {
     profile: Option<String>,
+    /// The create's project `path`, whose repository config and hooks `acp_create_ready`
+    /// then counts as that create would. CityHall uses the operator's project instead.
+    path: Option<String>,
+    /// A scratch create has no repository, so `path` is ignored.
+    #[serde(default)]
+    scratch: bool,
 }
 
-/// `GET /api/agents[?profile=]`: the agents as the profile resolves them, so the
-/// wizard reads a custom agent's base from the profile it creates in.
+/// `GET /api/agents[?profile=&path=&scratch=]`: the agents as the profile resolves them, so
+/// the wizard reads a custom agent's base from the profile it creates in.
 pub async fn list_agents(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<AgentsQuery>,
@@ -245,7 +254,21 @@ pub async fn list_agents(
         }
         None => state.served_profile().to_string(),
     };
+    let (path, scratch) = (query.path, query.scratch);
+    let cityhall = state.cityhall_mode;
+    let served = state.served_profile().to_string();
     let result = tokio::task::spawn_blocking(move || {
+        // CityHall's create launches in the operator's first registered project, whatever the
+        // caller sends, so the caller's path and scratch don't apply there.
+        let project = if cityhall {
+            crate::session::projects::load_merged(&served)
+                .ok()
+                .and_then(|projects| projects.into_iter().next())
+                .map(|project| std::path::PathBuf::from(project.path))
+        } else {
+            path.filter(|path| !path.is_empty() && !scratch)
+                .map(std::path::PathBuf::from)
+        };
         let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = &config.session.custom_agents;
         let agent_acp_cmd = &config.session.agent_acp_cmd;
@@ -331,21 +354,34 @@ pub async fn list_agents(
             agent_detect_as,
             &policy,
         ));
+        use crate::session::builder::structured::{adapter_installed, preparation_hooks_apply};
         let host_environment =
             crate::session::environment::resolve_host_environment_pairs(&config.environment);
-        for agent in agents.iter_mut().filter(|a| a.acp_capable) {
-            let check = |count_profile_hooks| {
-                crate::session::builder::structured::adapter_installed(
-                    &agent.name,
-                    &config,
-                    &host_environment,
-                    count_profile_hooks,
-                )
-            };
-            // An installed adapter is create-ready, so the hooked check runs only when it isn't.
-            let installed = check(false);
-            agent.acp_create_ready = installed || check(true);
-            agent.acp_installed = installed;
+        // The create resolves the repository's config over the profile's, which may re-alias
+        // an agent through `agent_detect_as`.
+        let create_config = project.as_deref().map(|path| {
+            crate::session::config::repo_config::resolve_config_with_repo_or_warn(&profile, path)
+        });
+        let create_environment = create_config.as_ref().map(|config| {
+            crate::session::environment::resolve_host_environment_pairs(&config.environment)
+        });
+        // Without a project only the profile's hooks can run, as for scratch.
+        let hooks_apply = || match project.as_deref() {
+            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None),
+            None => preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None),
+        };
+        for agent in agents.iter_mut() {
+            if agent.acp_capable {
+                agent.acp_installed =
+                    adapter_installed(&agent.name, &config, &host_environment, &|| false);
+            }
+            // Every row, since the repository may give a profile-terminal agent an ACP base.
+            agent.acp_create_ready = adapter_installed(
+                &agent.name,
+                create_config.as_ref().unwrap_or(&config),
+                create_environment.as_deref().unwrap_or(&host_environment),
+                &hooks_apply,
+            );
         }
         agents
     })
@@ -3753,6 +3789,7 @@ mod tests {
         for (profile, always_yolo) in [("alpha", true), ("beta", false)] {
             let query = AgentsQuery {
                 profile: Some(profile.into()),
+                ..Default::default()
             };
             let Ok(Json(agents)) =
                 list_agents(State(state.clone()), axum::extract::Query(query)).await
@@ -3764,6 +3801,7 @@ mod tests {
         }
         let unknown = AgentsQuery {
             profile: Some("gone".into()),
+            ..Default::default()
         };
         let Err(response) = list_agents(State(state), axum::extract::Query(unknown)).await else {
             panic!("an unknown profile must not list agents");
@@ -3772,11 +3810,13 @@ mod tests {
     }
 
     /// Both fields follow the structured create check, so a custom agent counts when its
-    /// adapter is on the configured `environment` PATH. A profile hook makes a missing adapter
-    /// create-ready but never installed, which the Import tab relies on.
+    /// adapter is on the configured `environment` PATH. A preparation hook makes a missing
+    /// adapter create-ready but never installed, which the Import tab relies on: the
+    /// profile's, or the requested project repository's unless the create is scratch.
     #[tokio::test]
     #[serial_test::serial]
     async fn acp_installed_and_create_ready_match_the_structured_create_check() {
+        use crate::session::config::repo_config::{compute_hooks_hash, trust_repo};
         use std::os::unix::fs::PermissionsExt;
         let _home = crate::session::test_support::isolate_app_dir();
         let bin = tempfile::tempdir().unwrap();
@@ -3787,7 +3827,22 @@ mod tests {
             std::fs::Permissions::from_mode(0o755),
         )
         .unwrap();
+        // A custom agent runs its registry base's adapter, and only `vibe`'s is on the fixture PATH.
+        std::fs::write(bin.path().join("vibe-acp"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            bin.path().join("vibe-acp"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         crate::session::config::update_config(|config| {
+            config
+                .session
+                .custom_agents
+                .insert("repo-loses".into(), "true".into());
+            config
+                .session
+                .agent_detect_as
+                .insert("repo-loses".into(), "vibe".into());
             for (name, acp) in [
                 ("on-path", Some(format!("{adapter} acp"))),
                 ("missing", Some(format!("{adapter}-missing acp"))),
@@ -3804,50 +3859,161 @@ mod tests {
             config.environment = vec![format!("PATH={}", bin.path().display())];
         })
         .unwrap();
-        // (agent, installed, create-ready) without hooks, then with a profile on_create hook.
-        let passes = [
+        let repo_with_on_launch = || {
+            let repo = tempfile::tempdir().unwrap();
+            let dir = repo.path().join(".agent-of-empires");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("config.toml"),
+                "[hooks]\non_launch = [\"npm install\"]\n",
+            )
+            .unwrap();
+            repo
+        };
+        let plain = tempfile::tempdir().unwrap();
+        let realiased = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(realiased.path().join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            realiased.path().join(".agent-of-empires/config.toml"),
+            "[session.agent_detect_as]\nrepo-loses = \"cursor\"\nterminal = \"vibe\"\n",
+        )
+        .unwrap();
+        let awaiting = repo_with_on_launch();
+        let trusted = repo_with_on_launch();
+        let on_launch = crate::session::HooksConfig {
+            on_launch: vec!["npm install".into()],
+            ..Default::default()
+        };
+        trust_repo(trusted.path(), Some(&compute_hooks_hash(&on_launch)), None).unwrap();
+        // CityHall's create uses the operator's first registered project.
+        crate::session::projects::add(
+            "default",
+            crate::session::ProjectScope::Global,
+            crate::session::Project::new(
+                "hooked",
+                trusted.path().to_string_lossy(),
+                crate::session::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        // (label, profile on_create hook, CityHall, project, scratch, then create-ready for
+        // `missing`, `repo-loses` and the profile-terminal `terminal`). The profile hook persists
+        // once set, so its case comes last.
+        let cases = [
+            ("no project", false, false, None, false, false, true, false),
             (
+                "no hooks",
                 false,
-                [
-                    ("on-path", true, true),
-                    ("missing", false, false),
-                    ("terminal", false, false),
-                ],
+                false,
+                Some(plain.path()),
+                false,
+                false,
+                true,
+                false,
             ),
             (
+                "trusted repo hook",
+                false,
+                false,
+                Some(trusted.path()),
+                false,
                 true,
-                [
-                    ("on-path", true, true),
-                    ("missing", false, true),
-                    ("terminal", false, false),
-                ],
+                true,
+                false,
             ),
+            (
+                "repo hook awaiting trust",
+                false,
+                false,
+                Some(awaiting.path()),
+                false,
+                true,
+                true,
+                false,
+            ),
+            (
+                "scratch with a repo hook",
+                false,
+                false,
+                Some(trusted.path()),
+                true,
+                false,
+                true,
+                false,
+            ),
+            (
+                "repo re-aliases the agents",
+                false,
+                false,
+                Some(realiased.path()),
+                false,
+                false,
+                false,
+                true,
+            ),
+            (
+                "CityHall ignores the caller's path",
+                false,
+                true,
+                Some(plain.path()),
+                false,
+                true,
+                true,
+                false,
+            ),
+            (
+                "CityHall ignores scratch",
+                false,
+                true,
+                Some(plain.path()),
+                true,
+                true,
+                true,
+                false,
+            ),
+            ("profile hook", true, false, None, false, true, true, false),
         ];
-        for (hooked, rows) in passes {
-            if hooked {
+        for (label, profile_hook, cityhall, project, scratch, missing, loses, terminal) in cases {
+            if profile_hook {
                 crate::session::config::update_config(|config| {
                     config.hooks.on_create = vec!["npm install".into()];
                 })
                 .unwrap();
             }
-            let state = crate::server::test_support::build_test_app_state(Vec::new());
-            let Ok(Json(agents)) = list_agents(
-                State(state),
-                axum::extract::Query(AgentsQuery { profile: None }),
-            )
-            .await
-            else {
-                panic!("list_agents failed");
+            let state = if cityhall {
+                crate::server::test_support::build_test_app_state_cityhall(Vec::new())
+            } else {
+                crate::server::test_support::build_test_app_state(Vec::new())
             };
-            for (name, installed, create_ready) in rows {
+            let query = AgentsQuery {
+                path: project.map(|path: &std::path::Path| path.display().to_string()),
+                scratch,
+                ..Default::default()
+            };
+            let Ok(Json(agents)) = list_agents(State(state), axum::extract::Query(query)).await
+            else {
+                panic!("{label}: list_agents failed");
+            };
+            for (name, installed, create_ready) in [
+                ("on-path", true, true),
+                ("missing", false, missing),
+                ("terminal", false, terminal),
+                ("repo-loses", true, loses),
+            ] {
                 let agent = agents.iter().find(|a| a.name == name).unwrap();
-                assert_eq!(agent.acp_installed, installed, "{name} (hook: {hooked})");
+                assert_eq!(agent.acp_installed, installed, "{label}: {name} installed");
                 assert_eq!(
                     agent.acp_create_ready, create_ready,
-                    "{name} (hook: {hooked})"
+                    "{label}: {name} create-ready"
                 );
                 assert_eq!(agent.display_name, name);
             }
+            let terminal_agent = agents.iter().find(|a| a.name == "terminal").unwrap();
+            assert!(
+                !terminal_agent.acp_capable,
+                "{label}: capability stays profile-only"
+            );
             let claude = agents.iter().find(|a| a.name == "claude").unwrap();
             assert_eq!(claude.display_name, "Claude Code");
         }

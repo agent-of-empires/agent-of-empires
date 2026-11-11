@@ -552,6 +552,7 @@ pub(crate) async fn spawn_structured_session(
                 instance.agent_model = explicit_model;
                 // acp_effort is ACP-only too: nothing applies it in tmux mode.
                 instance.acp_effort = None;
+                instance.acp_model_config.clear();
             }
 
             agent_effort
@@ -1000,6 +1001,7 @@ pub(crate) async fn spawn_structured_session(
                                     model,
                                     effort,
                                     effort_explicit,
+                                    model_config: Default::default(),
                                     stored_acp_session_id,
                                     fork_from,
                                     sandbox_continuation:
