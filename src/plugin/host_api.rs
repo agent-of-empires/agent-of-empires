@@ -979,6 +979,38 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn projects_list_merges_profile_projects_over_global() {
+        use crate::session::projects::{add, Project, ProjectScope};
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let put = |scope, name: &str, path: &str| {
+            add("work", scope, Project::new(name, path, scope), true).unwrap();
+        };
+        put(ProjectScope::Global, "shared", "/tmp/project-shared");
+        put(ProjectScope::Global, "only-global", "/tmp/project-global");
+        put(ProjectScope::Profile, "renamed", "/tmp/project-shared");
+        put(ProjectScope::Profile, "only-work", "/tmp/project-work");
+        let tmp = tempfile::tempdir().unwrap();
+        let state = HostApiState::open(&tmp.path().join("plugin_events.db"), "work", 100).unwrap();
+        let result = dispatch(
+            &state,
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [
+                { "name": "renamed", "path": "/tmp/project-shared" },
+                { "name": "only-global", "path": "/tmp/project-global" },
+                { "name": "only-work", "path": "/tmp/project-work" },
+            ] })
+        );
+    }
+
+    #[test]
     fn ungranted_capability_is_forbidden() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
