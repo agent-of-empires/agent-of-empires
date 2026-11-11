@@ -227,11 +227,6 @@ impl Envelope {
         }
         Ok(())
     }
-
-    /// Tailer-emitted frames are not adapter frames.
-    pub fn counts_as_adapter_frame(&self) -> bool {
-        self.after_adapter_sequence.is_none()
-    }
 }
 
 /// The `_meta.aoe` of a serialized `session/update` update object.
