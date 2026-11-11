@@ -11,6 +11,7 @@ import { useWebSettings } from "../hooks/useWebSettings";
 import type { AttentionBadgeColors } from "../lib/attentionBadgeColors";
 import { StrokeIcon } from "./icons";
 import { Tooltip } from "./Tooltip";
+import { LiveSlowNotice } from "./LiveSlowNotice";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
@@ -205,6 +206,7 @@ export function TopBar({
         <div className="flex-1 flex justify-center items-center gap-1 px-2">
           <PaletteTriggerPill onClick={onOpenPalette} />
           <PluginPageButtons />
+          <LiveSlowNotice sessionId={activeSession?.id ?? null} />
         </div>
       </div>
 

@@ -3759,7 +3759,7 @@ impl HomeView {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &inst.source_profile,
-            std::path::Path::new(&inst.project_path),
+            inst.repo_config_path(),
         );
         // The reverse direction stays available regardless, so a session can always get out.
         (config.acp.structured_view.is_offered()
@@ -4194,14 +4194,24 @@ impl HomeView {
             return;
         };
 
-        let repo_path = std::path::PathBuf::from(&inst.project_path);
         let session_id_owned = inst.id.clone();
         let profile = inst.source_profile.clone();
-        let base_override = inst.base_branch_override.clone();
-        let worktree_base = inst
-            .worktree_info
-            .as_ref()
-            .and_then(|w| w.base_branch.clone());
+        // A single-repo workspace's cwd is the workspace dir, not a checkout, so
+        // diff its one repo; the daemon routes an unnamed base write there too.
+        let (repo_path, base_override, worktree_base) = match inst.all_repos() {
+            [only] => (
+                std::path::PathBuf::from(&only.worktree_path),
+                only.base_branch_override.clone(),
+                only.base_branch.clone(),
+            ),
+            _ => (
+                std::path::PathBuf::from(&inst.project_path),
+                inst.base_branch_override.clone(),
+                inst.worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone()),
+            ),
+        };
 
         // A session on a non-git project runs in place, so there is no repo to diff
         // against; say so rather than surfacing the git layer's raw error.
@@ -4298,7 +4308,15 @@ impl HomeView {
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| inst.project_path.clone());
+            .map(|inst| {
+                if inst.workspace_info.is_some() {
+                    repo_config::repo_config_source_path(inst.repo_config_path())
+                        .to_string_lossy()
+                        .into_owned()
+                } else {
+                    inst.project_path.clone()
+                }
+            });
         match SettingsView::new(&self.config_profile(), project_path) {
             Ok(view) => self.settings_view = Some(view),
             Err(e) => {
@@ -6211,7 +6229,7 @@ impl HomeView {
                         .map(|wt| wt.branch.clone())
                         .or_else(|| inst.workspace_info.as_ref().map(|w| w.branch.clone())),
                     has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
-                    project_path: Some(inst.project_path.clone()),
+                    config_path: Some(inst.repo_config_path().to_string_lossy().into_owned()),
                     is_scratch: inst.scratch,
                 };
 
@@ -8135,6 +8153,7 @@ mod tests {
             create_new_branch: false,
             base_branch: None,
             extra_repo_paths: Vec::new(),
+            workspace: false,
             sandbox: true,
             sandbox_image: "ubuntu:latest".to_string(),
             yolo_mode: false,
