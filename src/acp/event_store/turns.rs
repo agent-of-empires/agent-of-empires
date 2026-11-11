@@ -548,7 +548,7 @@ impl EventStore {
     /// A native prompt completion may be adopted only for an open main turn.
     /// Background work is restored independently and does not reopen its parent.
     pub fn has_in_flight_main_turn(&self, session_id: &str) -> bool {
-        self.latest_prompt_state(session_id) == Some(true)
+        self.latest_prompt_state(session_id) == Some(Some(true))
     }
 
     /// Restore the unsuccessful-main fence, not display activity or replay

@@ -489,7 +489,6 @@ async fn spawn_fake_connection_with(
                     )]
                 }
                 Some("session/prompt") => on_prompt(id),
-                Some("session/set_config_option") => on_prompt(id),
                 _ => continue,
             };
             for reply in replies {
@@ -546,6 +545,7 @@ async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
         .send(ClientCmd::SetConfigOption {
             config_id: "model".into(),
             value: "selected".into(),
+            remember: false,
         })
         .await
         .unwrap();
@@ -779,9 +779,12 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
 async fn adapter_started_idle_compaction_ends_without_a_prompt() {
     let prompted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen_prompt = prompted.clone();
-    let mut fake = spawn_fake_connection("s-idle", None, false, move |_| {
+    let mut fake = spawn_fake_connection("s-idle", None, false, move |id| {
         seen_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
-        Vec::new()
+        vec![
+            serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}})
+                .to_string(),
+        ]
     })
     .await;
 
@@ -835,8 +838,17 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
         .send(ClientCmd::Prompt(Vec::new()))
         .await
         .unwrap();
-    let next = collect_terminal(&mut fake).await;
+    let mut next = collect_terminal(&mut fake).await;
     assert!(matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete"));
+    fake.cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), fake.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    while let Ok(event) = fake.event_rx.try_recv() {
+        next.push(event);
+    }
+    assert!(prompted.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
         next.iter()
             .filter(|event| matches!(event, Event::Stopped { .. }))
@@ -846,11 +858,10 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
     assert!(!next
         .iter()
         .any(|event| matches!(event, Event::AcpSessionAssigned { .. })));
-    fake.cmd_tx.send(ClientCmd::Shutdown).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), fake.connection)
-        .await
-        .unwrap()
-        .unwrap();
+    assert!(!next.iter().any(|event| matches!(
+        event,
+        Event::SessionContextReset { .. } | Event::CancelRequested { .. }
+    )));
     fake.agent.abort();
     let _ = fake.agent.await;
 }

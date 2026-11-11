@@ -793,6 +793,7 @@ impl Session {
                 Some(_) => {
                     let result = apply_config_default(
                         &self.connection,
+                        &self.shared.connection_state,
                         &self.shared.event_tx,
                         self.acp_session_id.clone(),
                         SessionConfigId::new(id.clone()),

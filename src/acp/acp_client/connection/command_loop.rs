@@ -327,7 +327,7 @@ impl Session {
                 .await;
             return;
         }
-        if adopted && !shared.terminal_claim.claim() {
+        if !shared.terminal_claim.claim() {
             return;
         }
         let reason = between_prompt_stop_reason(adopted, cost_seen);

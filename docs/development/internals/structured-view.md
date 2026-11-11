@@ -232,6 +232,8 @@ successful intentional conversation reset, or new runtime ownership releases
 the local outcome fence. This is producer ownership, not permission to retry,
 replace a provider, or create a conversation. Rate-limit parking for owned
 outcomes is unchanged. Error and Idle alone never authorize effects.
+A completed adapter-initiated idle turn consumes its terminal claim, so a stale
+Cancel cannot terminate it again.
 
 Optional `PromptRuntimeError.evidence` carries source, operation, independently
 observed runtime facts, blocking scope, reported code, ingestion time and the

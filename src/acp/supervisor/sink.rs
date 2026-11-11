@@ -301,7 +301,8 @@ impl BroadcastSink for ChannelSink {
     }
 
     fn unsuccessful_main(&self, session_id: &str) -> bool {
-        self.flushed_store().has_unsuccessful_main_outcome(session_id)
+        self.flushed_store()
+            .has_unsuccessful_main_outcome(session_id)
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {

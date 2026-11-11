@@ -19,8 +19,8 @@ use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
     lock_recover, publish_next_persisted, publish_with_next_seq, BroadcastSink, Launcher,
     PendingContextReset,
-    ResumeReservation, SeqMap, SharedSet, StartupFailure, Supervisor, SupervisorError, WorkerKind,
-    Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    ResumeReservation, SeqMap, SharedSet, StartupFailure, Supervisor, SupervisorError,
+    WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -2296,6 +2296,8 @@ mod tests {
                 inbound_tx
                     .send(Event::AcpSessionAssigned {
                         acp_session_id: "acp-1".into(),
+                        connection_ready: false,
+                        native_subject: None,
                     })
                     .await
                     .unwrap();
@@ -2303,6 +2305,7 @@ mod tests {
             inbound_tx
                 .send(Event::AgentStartupError {
                     message: "ACP connection failed: agent transport closed".into(),
+                    native_subject: None,
                 })
                 .await
                 .unwrap();

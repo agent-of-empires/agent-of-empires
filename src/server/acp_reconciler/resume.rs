@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::time::timeout_at;
 
-use super::{is_resumable, query_flushed, AppState, ResumeOutcome};
+use super::{is_resumable, query_flushed, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
     command_override_for_spawn, BroadcastSink, ResumeKind, ResumeReservation,
     ResumeReservationOutcome, SpawnRequest, Supervisor, SupervisorError,
@@ -1420,8 +1420,9 @@ mod tests {
             |_| {},
             |supervisor| supervisor.with_process_control(control.clone()),
         );
-        let mut runner =
-            HeldAttachRunner::new(id, project.path(), 17, Some("default")).await.with_trailing_chunk();
+        let mut runner = HeldAttachRunner::new(id, project.path(), 17, Some("default"))
+            .await
+            .with_trailing_chunk();
         // A finished user prompt, then an agent-initiated turn that has not stopped.
         let seeded = [
             Event::UserPromptSent {
