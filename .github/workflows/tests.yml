@@ -329,6 +329,10 @@ jobs:
       id-token: write
     # Allow cold compilation and both test stages within a bounded job.
     timeout-minutes: 90
+    env:
+      # The 7 GB runner compiles the crate twice (lib and lib tests); skipping
+      # debug info shrinks both. Backtraces lose file and line numbers.
+      CARGO_PROFILE_DEV_DEBUG: '0'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -349,10 +353,20 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      # Two steps so the two crate compiles (lib, then lib tests) never run at
+      # once: together they overflow the runner's 7 GB and swap.
+      - name: Build lib and bins (macOS)
+        run: cargo nextest run --features e2e-tests --bins --no-run
       - name: Build tests (macOS)
         run: |
           cargo nextest run --features e2e-tests --lib --bins --test integration --no-run
           cargo test --features e2e-tests --test e2e --no-run
+      # Experiment readout; remove before merge.
+      - name: Report memory and swap
+        if: ${{ !cancelled() }}
+        run: |
+          sysctl vm.swapusage hw.memsize hw.ncpu
+          memory_pressure -Q || true
       - name: Cargo test (macOS, lib + bins)
         run: cargo nextest run --features e2e-tests --lib --bins --no-fail-fast
       - name: Cargo test (macOS, daemon-only CLI reads)
