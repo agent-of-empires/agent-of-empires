@@ -362,7 +362,11 @@ describe("prompt queue", () => {
 
   it("a late queued response does not duplicate a row hydration already added", () => {
     const initial = empty();
-    const hydrated = reducer(initial, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "one")], queueAtRead: initial.queuedPrompts });
+    const hydrated = reducer(initial, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("q1", 0, "one")],
+      queueAtRead: initial.queuedPrompts,
+    });
     const late = run(
       hydrated,
       { kind: "enqueue_prompt", id: "q1", text: "one", preserveExisting: true },
@@ -374,15 +378,29 @@ describe("prompt queue", () => {
   it("a late queued response restores local attachment bytes on a hydrated row", () => {
     const ref = { id: "att1", kind: "image" as const, mime_type: "image/png", name: "a.png", size: 9 };
     const initial = empty();
-    const hydrated = reducer(initial, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])], queueAtRead: initial.queuedPrompts });
+    const hydrated = reducer(initial, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("q1", 0, "srv", [ref])],
+      queueAtRead: initial.queuedPrompts,
+    });
     expect(hydrated.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("");
 
-    const late = reducer(hydrated, { kind: "enqueue_prompt", id: "q1", text: "local", attachments: [image], preserveExisting: true });
+    const late = reducer(hydrated, {
+      kind: "enqueue_prompt",
+      id: "q1",
+      text: "local",
+      attachments: [image],
+      preserveExisting: true,
+    });
     expect(late.queuedPrompts).toHaveLength(1);
     expect(late.queuedPrompts[0]).toMatchObject({ id: "q1", text: "srv" });
     expect(late.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
 
-    const again = reducer(late, { kind: "hydrate_server_queue", rows: [serverRow("q1", 0, "srv", [ref])], queueAtRead: late.queuedPrompts });
+    const again = reducer(late, {
+      kind: "hydrate_server_queue",
+      rows: [serverRow("q1", 0, "srv", [ref])],
+      queueAtRead: late.queuedPrompts,
+    });
     expect(again.queuedPrompts).toHaveLength(1);
     expect(again.queuedPrompts[0]?.attachments?.[0]?.dataB64).toBe("REALBYTES");
   });

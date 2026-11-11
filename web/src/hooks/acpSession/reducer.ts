@@ -51,7 +51,13 @@ export type Action =
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
-  | { kind: "enqueue_prompt"; id: string; text: string; attachments?: PromptAttachmentInput[]; preserveExisting?: boolean }
+  | {
+      kind: "enqueue_prompt";
+      id: string;
+      text: string;
+      attachments?: PromptAttachmentInput[];
+      preserveExisting?: boolean;
+    }
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
@@ -299,13 +305,13 @@ export function reducer(state: AcpState, action: Action): AcpState {
           : state;
       }
       const entry: QueuedPrompt = {
-      id: action.id,
-      text: action.text,
-      queuedAt: existing?.queuedAt ?? new Date().toISOString(),
-      pending: true,
-      ...(existing?.attachments ? { attachments: existing.attachments } : {}),
-      ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
-    };
+        id: action.id,
+        text: action.text,
+        queuedAt: existing?.queuedAt ?? new Date().toISOString(),
+        pending: true,
+        ...(existing?.attachments ? { attachments: existing.attachments } : {}),
+        ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
+      };
       return {
         ...state,
         queuedPrompts: existing
