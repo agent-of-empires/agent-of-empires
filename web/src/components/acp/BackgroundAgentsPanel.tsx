@@ -4,9 +4,17 @@
 import { useEffect, useState } from "react";
 import { Bot, ChevronDown, Maximize2, Square, Workflow, X } from "lucide-react";
 
-import { useBackgroundAgents, useBackgroundTasks, useWorkflowRuns } from "../../hooks/useAcpSession";
-import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool } from "../../lib/acpTypes";
-import { isActiveAgent, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
+import {
+  useBackgroundAgents,
+  useBackgroundShells,
+  useBackgroundTasks,
+  useSubagents,
+  useWorkflowRuns,
+} from "../../hooks/useAcpSession";
+import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool, SubagentRecord } from "../../lib/acpTypes";
+import { cancelSubagent } from "../../lib/api";
+import { findSubagent, isActiveAgent, paneAgents, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
+import { BackgroundShells } from "./BackgroundShells";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
 
 type Entry =
@@ -31,20 +39,20 @@ function entries(sorted: BackgroundAgent[], all: BackgroundAgent[]): Entry[] {
 }
 
 export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null }) {
-  const agents = useBackgroundAgents(sessionId);
+  const subagents = useSubagents(sessionId);
+  const agents = paneAgents(useBackgroundAgents(sessionId), subagents);
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
+  const shells = useBackgroundShells(sessionId);
 
-  if (agents.length === 0) {
+  if (agents.length === 0 && shells.length === 0) {
     return (
       <div className="flex h-full items-center justify-center px-4 text-center text-xs text-text-dim">
-        No background sub-agents launched yet. When the agent dispatches an async{" "}
-        <span className="font-mono">Task</span> or runs a <span className="font-mono">Workflow</span>, its agents show
-        up here with live progress.
+        No background work yet. Async <span className="font-mono">Task</span> sub-agents,{" "}
+        <span className="font-mono">Workflow</span> runs and background shell commands show up here.
       </div>
     );
   }
-
   // Running first, then most-recently-started within each group.
   const sorted = [...agents].sort((a, b) => {
     const ra = isActiveAgent(a) ? 0 : 1;
@@ -55,38 +63,61 @@ export function BackgroundAgentsPanel({ sessionId }: { sessionId: string | null 
   // A stalled agent is no longer writing, so cancel would be a no-op.
   const anyRunning = agents.some((a) => a.status === "running");
 
+  // One stable slot for the shells: moving it remounts the shell dialog and closes it.
+  const hasAgents = agents.length > 0;
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
-        <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
-          Background agents · {agents.length}
-        </span>
-        {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
-      </div>
-      <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-        Only async (background) <span className="font-mono">Task</span> sub-agents and{" "}
-        <span className="font-mono">Workflow</span> agents show here. Synchronous sub-agents run inline in the
-        transcript.
-      </p>
-      <div className="flex flex-col">
-        {entries(sorted, agents).map((entry) =>
-          entry.kind === "agent" ? (
-            <AgentRow key={entry.agent.agentId} agent={entry.agent} />
-          ) : (
-            <WorkflowGroup
-              key={entry.runId}
-              name={entry.name}
-              agents={entry.agents}
-              live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
-            />
-          ),
-        )}
-      </div>
+      {hasAgents && (
+        <div className="flex items-center gap-2 border-b border-surface-700 px-3 py-1.5">
+          <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
+            Background agents · {agents.length}
+          </span>
+          {anyRunning && sessionId && <StopButton sessionId={sessionId} />}
+        </div>
+      )}
+      {sessionId && <BackgroundShells sessionId={sessionId} />}
+      {hasAgents && (
+        <>
+          <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
+            Delegated sub-agents, async (background) <span className="font-mono">Task</span> sub-agents and{" "}
+            <span className="font-mono">Workflow</span> agents show here. Inline sub-agents also appear in the
+            transcript.
+          </p>
+          <div className="flex flex-col">
+            {entries(sorted, agents).map((entry) =>
+              entry.kind === "agent" ? (
+                <AgentRow key={entry.agent.agentId} agent={entry.agent} sessionId={sessionId} subagents={subagents} />
+              ) : (
+                <WorkflowGroup
+                  key={entry.runId}
+                  name={entry.name}
+                  agents={entry.agents}
+                  sessionId={sessionId}
+                  subagents={subagents}
+                  live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
+                />
+              ),
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-function WorkflowGroup({ name, agents, live }: { name: string; agents: BackgroundAgent[]; live: boolean }) {
+function WorkflowGroup({
+  name,
+  agents,
+  live,
+  sessionId,
+  subagents,
+}: {
+  name: string;
+  agents: BackgroundAgent[];
+  live: boolean;
+  sessionId: string | null;
+  subagents: SubagentRecord[];
+}) {
   const [open, setOpen] = useState(true);
   const done = agents.filter((a) => !isActiveAgent(a)).length;
   return (
@@ -115,7 +146,7 @@ function WorkflowGroup({ name, agents, live }: { name: string; agents: Backgroun
               </div>
             )}
             {phaseAgents.map((a) => (
-              <AgentRow key={a.agentId} agent={a} />
+              <AgentRow key={a.agentId} agent={a} sessionId={sessionId} subagents={subagents} />
             ))}
           </div>
         ))}
@@ -123,14 +154,14 @@ function WorkflowGroup({ name, agents, live }: { name: string; agents: Backgroun
   );
 }
 
-/** ACP has no per-agent cancel; cancelling the session stops its async sub-agents. */
+/** Stops the whole turn, and with it every running sub-agent. A row's own Stop ends just that one. */
 function StopButton({ sessionId }: { sessionId: string }) {
   const [busy, setBusy] = useState(false);
   return (
     <button
       type="button"
       disabled={busy}
-      title="Interrupt the session and stop running sub-agents"
+      title="Stop the whole turn, including every running sub-agent"
       onClick={async () => {
         setBusy(true);
         try {
@@ -154,9 +185,21 @@ function StopButton({ sessionId }: { sessionId: string }) {
   );
 }
 
-function AgentRow({ agent }: { agent: BackgroundAgent }) {
+function AgentRow({
+  agent,
+  sessionId,
+  subagents,
+}: {
+  agent: BackgroundAgent;
+  sessionId: string | null;
+  subagents: SubagentRecord[];
+}) {
   const [open, setOpen] = useState(false);
   const [modal, setModal] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
+  const record = findSubagent(subagents, agent.toolCallId);
+  const model = record?.model || agent.model;
+  const stoppable = !!record?.cancel_capable && !!sessionId && isActiveAgent(agent);
   return (
     <div className="border-b border-surface-800">
       <div className="flex items-center hover:bg-surface-800">
@@ -176,6 +219,17 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
             className={`h-3.5 w-3.5 shrink-0 text-text-dim transition-transform ${open ? "rotate-180" : ""}`}
           />
         </button>
+        {stoppable && (
+          <button
+            type="button"
+            title="Stop this sub-agent"
+            aria-label="Stop sub-agent"
+            onClick={async () => setStopError(await cancelSubagent(sessionId, record.session_id))}
+            className="shrink-0 px-1.5 py-2 text-text-dim hover:text-rose-300"
+          >
+            <Square className="h-3 w-3 fill-current" strokeWidth={0} />
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setModal(true)}
@@ -186,26 +240,27 @@ function AgentRow({ agent }: { agent: BackgroundAgent }) {
           <Maximize2 className="h-3.5 w-3.5" />
         </button>
       </div>
+      {stopError && <div className="px-3 pb-1.5 pl-9 text-[11px] text-status-error">{stopError}</div>}
       {!open && agent.lastText && (
         <div className="truncate px-3 pb-1.5 pl-9 text-[11px] text-text-dim">{agent.lastText}</div>
       )}
       {open && (
         <div className="space-y-2 border-t border-surface-800 bg-surface-900/30 px-3 py-2 pl-9 text-[11px]">
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
-          <Field label="model" value={agent.model || "unknown"} mono />
+          <Field label="model" value={model || "unknown"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
           <Field label="prompt" value={agent.prompt || "(none)"} clamp copy={!!agent.prompt} />
           {agent.result && <Field label="result" value={agent.result} clamp copy />}
         </div>
       )}
-      {modal && <AgentDetailModal agent={agent} onClose={() => setModal(false)} />}
+      {modal && <AgentDetailModal agent={agent} model={model} onClose={() => setModal(false)} />}
     </div>
   );
 }
 
 /** Full-detail modal for one sub-agent: the prompt, result, and every
  *  tool call shown in full (the panel is narrow and clamps long text). */
-function AgentDetailModal({ agent, onClose }: { agent: BackgroundAgent; onClose: () => void }) {
+function AgentDetailModal({ agent, model, onClose }: { agent: BackgroundAgent; model: string; onClose: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -241,7 +296,7 @@ function AgentDetailModal({ agent, onClose }: { agent: BackgroundAgent; onClose:
         </div>
         <div className="space-y-3 overflow-y-auto px-4 py-3 text-[12px]">
           {agent.warning && <Field label="warning" value={agent.warning} tone="warn" />}
-          <Field label="model" value={agent.model || "unknown"} mono />
+          <Field label="model" value={model || "unknown"} mono />
           {agent.tools.length > 0 && <ToolList tools={agent.tools} />}
           <Field label="prompt" value={agent.prompt || "(none)"} copy={!!agent.prompt} />
           {agent.result && <Field label="result" value={agent.result} copy />}
@@ -317,13 +372,24 @@ function StatusDot({ status }: { status: BackgroundAgentStatus }) {
   const cls =
     status === "running"
       ? "bg-status-waiting animate-pulse"
-      : status === "completed"
-        ? "bg-status-running"
-        : status === "error"
-          ? "bg-status-error"
-          : "bg-text-dim/60"; // stalled / detached
+      : status === "requires_action"
+        ? "bg-status-waiting"
+        : status === "completed"
+          ? "bg-status-running"
+          : status === "error"
+            ? "bg-status-error"
+            : "bg-text-dim/60"; // stalled / detached / unknown
   return <span className={`h-2 w-2 shrink-0 rounded-full ${cls}`} />;
 }
+
+const STATUS_LABELS: Record<Exclude<BackgroundAgentStatus, "running">, string> = {
+  completed: "done",
+  stalled: "stalled",
+  detached: "detached",
+  error: "error",
+  requires_action: "Waiting on you",
+  unknown: "Unknown",
+};
 
 function StatusLabel({ status, toolCount }: { status: BackgroundAgentStatus; toolCount: number }) {
   if (status === "running") {
@@ -333,8 +399,7 @@ function StatusLabel({ status, toolCount }: { status: BackgroundAgentStatus; too
       </span>
     );
   }
-  const label =
-    status === "completed" ? "done" : status === "stalled" ? "stalled" : status === "detached" ? "detached" : "error";
+  const label = STATUS_LABELS[status];
   const tone = status === "error" ? "text-status-error" : "text-text-dim";
   return <span className={`shrink-0 text-[11px] ${tone}`}>{label}</span>;
 }

@@ -1819,3 +1819,16 @@ describe("restartSessionForUpdate", () => {
     expect(await api.restartSessionForUpdate("s1")).toEqual({ ok: false });
   });
 });
+
+describe("fetchTaskOutput", () => {
+  it("requests the task output of a session with both ids encoded", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ exists: true, output: "hi", truncated: false }));
+    expect(await api.fetchTaskOutput("s 1", "t/2")).toEqual({ exists: true, output: "hi", truncated: false });
+    expect(lastCall().url).toBe("/api/sessions/s%201/acp/tasks/t%2F2/output");
+  });
+
+  it("is null on a non-2xx answer", async () => {
+    fetchSpy.mockResolvedValueOnce(json({}, 404));
+    expect(await api.fetchTaskOutput("s", "t")).toBeNull();
+  });
+});

@@ -1357,7 +1357,8 @@ pub(crate) fn status_policy(event: &crate::acp::Event) -> Option<StatusPolicy> {
         | Event::Stopped { .. }
         | Event::PromptRuntimeError { .. }
         | Event::AgentStartupError { .. }
-        | Event::IncompatibleAgent { .. } => Some(StatusPolicy::Authoritative),
+        | Event::IncompatibleAgent { .. }
+        | Event::IntegrationLost { .. } => Some(StatusPolicy::Authoritative),
         Event::BackgroundAgentLaunched { .. }
         | Event::BackgroundTaskStarted { .. }
         | Event::BackgroundAgentProgress {
@@ -3195,6 +3196,7 @@ mod tests {
                     tool_call_id: Some("toolu_1".into()),
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             ];
             if !main_running {
