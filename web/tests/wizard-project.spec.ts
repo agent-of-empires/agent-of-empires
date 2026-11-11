@@ -80,6 +80,7 @@ test.describe("project tabs", () => {
     await page.getByRole("button", { name: "Clone URL", exact: true }).click();
     const cloneBtn = page.getByRole("button", { name: "Clone repository" });
     const urlInput = page.locator("#clone-url");
+    await expect(urlInput).toBeFocused();
     await expect(cloneBtn).toBeDisabled();
     await urlInput.fill("https://github.com/user/repo.git");
     await expect(cloneBtn).toBeEnabled();
@@ -127,6 +128,37 @@ test.describe("extra repos", () => {
   test("search box is focused on open", async ({ page }) => {
     const { picker } = await openPicker(page);
     await expect(picker.getByLabel("Search projects")).toBeFocused();
+  });
+
+  test("path input is focused when there are no other projects", async ({ page }) => {
+    await startWizard(page, { projects: [{ name: "primary", path: "/tmp/example", scope: "global" }] });
+    await openPanel(page, "Extra repos");
+    await expect(page.getByText(/No other projects to add/)).toBeVisible();
+    await expect(page.getByPlaceholder("/path/to/another/repo")).toBeFocused();
+  });
+
+  test("projects loading late do not steal focus from a typed path", async ({ page }) => {
+    await startWizard(page, {
+      projects: [
+        { name: "primary", path: "/tmp/example", scope: "global" },
+        { name: "shared-lib", path: "/tmp/shared-lib", scope: "global" },
+      ],
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    await page.route("**/api/recent-projects", async (r) => {
+      await gate;
+      await r.fulfill({ json: { projects: [] } });
+    });
+    await openPanel(page, "Extra repos");
+    const input = page.getByPlaceholder("/path/to/another/repo");
+    await input.click();
+    await input.pressSequentially("/tmp/other");
+    release();
+    const picker = page.getByTestId("extra-repos-picker");
+    await expect(picker.getByLabel("Search projects")).toBeVisible();
+    await expect(input).toBeFocused();
+    await expect(input).toHaveValue("/tmp/other");
   });
 
   test("saved projects render without the primary and toggle as chips", async ({ page }) => {

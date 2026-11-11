@@ -203,7 +203,7 @@ export function ExtraReposPicker({
             filteredRecent={filteredRecent}
             isSelected={isSelected}
             onSelect={toggle}
-            autoFocus={hasFinePointer()}
+            autoFocus={hasFinePointer() && freeText === ""}
           />
         </div>
       )}
@@ -226,6 +226,7 @@ export function ExtraReposPicker({
           type="text"
           value={freeText}
           onChange={(e) => setFreeText(e.target.value)}
+          autoFocus={hasFinePointer()}
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
