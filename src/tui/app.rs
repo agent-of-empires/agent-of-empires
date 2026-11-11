@@ -3512,9 +3512,9 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    mod retained_copy_completion;
-    #[cfg(unix)]
     mod confirmation_presentation;
+    #[cfg(unix)]
+    mod retained_copy_completion;
 
     #[cfg(unix)]
     #[tokio::test]

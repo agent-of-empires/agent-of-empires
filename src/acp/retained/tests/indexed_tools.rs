@@ -106,7 +106,9 @@ fn compare(events: &[Event], split: usize) {
 fn retained_distinct_tool_starts_have_linear_row_read_work() {
     let mut counts = Vec::new();
     for count in [32, 64] {
-        let events = (0..count).map(|id| tool(&format!("tool-{id}"))).collect::<Vec<_>>();
+        let events = (0..count)
+            .map(|id| tool(&format!("tool-{id}")))
+            .collect::<Vec<_>>();
         super::super::records::ROW_READS.with(|reads| reads.set(0));
         compare(&events, 0);
         counts.push(super::super::records::ROW_READS.with(|reads| reads.replace(0)));
@@ -165,7 +167,9 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
         Event::SessionCleared,
         tool("a"),
         update("a"),
-        Event::Stopped { reason: "done".into() },
+        Event::Stopped {
+            reason: "done".into(),
+        },
         tool("a"),
     ];
     for split in 0..=events.len() {

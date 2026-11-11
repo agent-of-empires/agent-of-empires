@@ -12,7 +12,8 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     let root = tempfile::tempdir().unwrap();
     let _home = crate::session::test_support::isolate_app_dir_at(root.path());
     crate::session::get_profile_dir("test").unwrap();
-    let mut row = crate::session::Instance::new("retained completion", root.path().to_str().unwrap());
+    let mut row =
+        crate::session::Instance::new("retained completion", root.path().to_str().unwrap());
     row.source_profile = "test".into();
     row.trash();
     crate::session::Storage::new_unwatched("test")
@@ -58,9 +59,11 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     .unwrap();
     crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
     let snapshot = state.runtime.publish(&state).await.unwrap().value.clone();
-    app.home.session_feed.publish_for_test(
-        crate::tui::session_feed::SessionFeedResult::Snapshot(std::sync::Arc::new(snapshot)),
-    );
+    app.home
+        .session_feed
+        .publish_for_test(crate::tui::session_feed::SessionFeedResult::Snapshot(
+            std::sync::Arc::new(snapshot),
+        ));
     app.home.apply_session_feed();
     app.home.selected_session = Some(row.id.clone());
     app.home.retained_focus = Some((row.id.clone(), row.lifecycle_generation));
@@ -133,10 +136,18 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     let (x, y) = (pane.y..pane.bottom())
         .find_map(|y| {
             let line = (pane.x..pane.right())
-                .map(|x| screen.screen().cell(y, x).map_or("", |cell| cell.contents()))
+                .map(|x| {
+                    screen
+                        .screen()
+                        .cell(y, x)
+                        .map_or("", |cell| cell.contents())
+                })
                 .collect::<String>();
             line.find(CONTENT).map(|offset| {
-                (pane.x + unicode_width::UnicodeWidthStr::width(&line[..offset]) as u16, y)
+                (
+                    pane.x + unicode_width::UnicodeWidthStr::width(&line[..offset]) as u16,
+                    y,
+                )
             })
         })
         .expect("copy target must be in the actually emitted preview");
@@ -145,7 +156,10 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     assert!(app.home.handle_drag_end());
     // The production release path redraws before polling; that render admits the selection copy.
     app.draw(&mut terminal).unwrap();
-    assert!(!app.home.preview_copy_pending, "the finalized selection must be consumed by its repaint");
+    assert!(
+        !app.home.preview_copy_pending,
+        "the finalized selection must be consumed by its repaint"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             app.reconcile_structured_preview().await;
@@ -184,8 +198,13 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         }
     })
     .await
-    .expect("an admitted copy must report actual completion, not leave a permanent Writing caption");
-    assert!(!screen.screen().contents().contains("Writing clipboard content"));
+    .expect(
+        "an admitted copy must report actual completion, not leave a permanent Writing caption",
+    );
+    assert!(!screen
+        .screen()
+        .contents()
+        .contains("Writing clipboard content"));
     assert_eq!(std::fs::read(&sink).unwrap(), CONTENT.as_bytes());
     drop(app);
     server.abort();

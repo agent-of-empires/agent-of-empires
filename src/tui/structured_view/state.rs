@@ -29,7 +29,6 @@ use crate::tui::terminal_output::next_interaction_revision;
 /// than the newest.
 const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
-
 pub struct StructuredViewState {
     pub session_id: String,
     pub endpoint: DaemonEndpoint,
