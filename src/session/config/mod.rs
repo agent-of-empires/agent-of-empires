@@ -2657,7 +2657,7 @@ pub struct ServeConfig {
         max = 65535,
         validate = "range:1:65535",
         global_only,
-        summary = "Port for a newly started Daemon. Applies after the Daemon restarts."
+        summary = "Port for a newly started Daemon. A restart keeps the running Daemon's port."
     )]
     pub port: u16,
 }

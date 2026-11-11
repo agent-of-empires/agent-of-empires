@@ -545,7 +545,7 @@ Checks hit GitHub at most once a day; the dashboard re-polls the cached status h
 port = 8080               # debug builds default to 8081
 ```
 
-A newly started daemon, including TUI autostart, takes its port from `--port`, then `AOE_SERVE_PORT`, then this key. `aoe serve --restart` and the TUI restart keep the running daemon's recorded port unless a port is passed explicitly. Global only; applies after the daemon restarts.
+A newly started daemon, including TUI autostart, takes its port from `--port`, then `AOE_SERVE_PORT`, then this key. `aoe serve --restart` and the TUI restart keep the running daemon's recorded port unless a port is passed explicitly, so a changed value applies after a stop and start. Global only.
 
 ## Tools
 

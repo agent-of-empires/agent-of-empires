@@ -263,7 +263,11 @@ fn resolve_serve_port(
     configured: impl FnOnce() -> u16,
 ) -> Result<u16> {
     let Some(raw) = env.filter(|raw| !raw.is_empty()) else {
-        return Ok(configured());
+        // config.toml bypasses the settings validator, and port 0 binds an ephemeral port.
+        let port = configured();
+        return (port != 0)
+            .then_some(port)
+            .context("Invalid [serve] port 0: expected 1-65535");
     };
     raw.to_str()
         .and_then(|value| value.trim().parse::<u16>().ok())
@@ -1134,7 +1138,9 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
             .stdin(std::process::Stdio::null()),
         std::time::Duration::from_secs(3),
     ) {
-        Ok(Some(out)) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(out)) if !out.status.success() || out.stdout.trim_ascii().is_empty() => {
+            DaemonProcessIdentity::Indeterminate
+        }
         Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
         Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
             DaemonProcessIdentity::Indeterminate
@@ -2979,6 +2985,7 @@ mod tests {
                 "{env:?}"
             );
         }
+        assert!(resolve_serve_port(None, || 0).is_err());
     }
 
     #[test]
