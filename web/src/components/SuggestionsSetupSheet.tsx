@@ -53,9 +53,14 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
     void market.install(head).then((ok) => ok || setQueue([]));
   };
 
-  const jobClosed = () => {
+  const jobClosed = (succeeded: boolean) => {
     const [, next, ...after] = queue;
     setJob(null);
+    // A failed install stops the queue and stays on the pick step, so Install can be retried.
+    if (!succeeded) {
+      setQueue([]);
+      return;
+    }
     setQueue(next ? [next, ...after] : []);
     if (next) void market.install(next).then((ok) => ok || setQueue([]));
     else setStep("checks");

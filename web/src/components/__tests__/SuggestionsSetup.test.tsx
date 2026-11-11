@@ -33,7 +33,12 @@ vi.mock("../settings/PluginInstallConsentModal", () => ({
   ),
 }));
 vi.mock("../settings/PluginJobProgressModal", () => ({
-  PluginJobProgressModal: ({ onClose }: { onClose: () => void }) => <button onClick={onClose}>close-job</button>,
+  PluginJobProgressModal: ({ onClose }: { onClose: (succeeded: boolean) => void }) => (
+    <>
+      <button onClick={() => onClose(true)}>close-job</button>
+      <button onClick={() => onClose(false)}>fail-job</button>
+    </>
+  ),
 }));
 
 const github = {
@@ -221,6 +226,16 @@ describe("setup sheet", () => {
     expect(api.previewPluginInstall).toHaveBeenCalledWith("gh:agent-of-empires/plugin-github");
     fireEvent.click(await screen.findByText("close-job"));
     await waitFor(() => expect(api.previewPluginInstall).toHaveBeenCalledWith("gh:agent-of-empires/plugin-linear"));
+    expect(screen.queryByTestId("suggestions-setup-checks")).toBeNull();
+  });
+
+  it("stops the queue on a failed install job and leaves Install retryable", async () => {
+    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [github, linear] });
+    await openSheet();
+    await approveInstall();
+    fireEvent.click(await screen.findByText("fail-job"));
+    await waitFor(() => expect(screen.getByTestId("suggestions-setup-install")).toHaveProperty("disabled", false));
+    expect(api.previewPluginInstall).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId("suggestions-setup-checks")).toBeNull();
   });
 

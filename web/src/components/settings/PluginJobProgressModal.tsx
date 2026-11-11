@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { fetchPluginJob, type PluginJob } from "../../lib/api";
 
 interface PluginJobProgressModalProps {
   jobId: string;
   title: string;
-  /** Closing mid-run only stops polling; the job keeps running. */
-  onClose: () => void;
+  /** Closing mid-run only stops polling; the job keeps running. `succeeded` is false for a failed or vanished job. */
+  onClose: (succeeded: boolean) => void;
 }
 
 /// Polls a plugin lifecycle job and its log tail until it finishes.
@@ -53,6 +53,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
   const state = job?.job.status.state ?? "running";
   const done = state === "succeeded" || state === "failed" || gone;
   const failedError = job?.job.status.state === "failed" ? job.job.status.error : null;
+  const close = useCallback(() => onClose(!gone && state === "succeeded"), [onClose, gone, state]);
 
   useEffect(() => {
     if (!done) return;
@@ -62,11 +63,11 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
         .composedPath()
         .find((node) => node instanceof HTMLElement && node.getAttribute("aria-modal") === "true");
       if (dialog && dialog !== dialogRef.current) return;
-      onClose();
+      close();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [done, onClose]);
+  }, [done, close]);
 
   return (
     <div
@@ -91,7 +92,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
             type="button"
             className="rounded border border-surface-700 px-2 py-0.5 text-xs hover:bg-surface-800 disabled:opacity-50"
             disabled={!done}
-            onClick={onClose}
+            onClick={close}
             data-testid="plugin-job-close"
           >
             {done ? "Close" : "Running…"}
@@ -118,7 +119,7 @@ export function PluginJobProgressModal({ jobId, title, onClose }: PluginJobProgr
             <button
               type="button"
               className="rounded bg-brand-600 px-3 py-1 text-xs font-medium text-white hover:bg-brand-500"
-              onClick={onClose}
+              onClick={close}
               data-testid="plugin-job-done"
             >
               Close
