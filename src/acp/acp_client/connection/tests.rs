@@ -323,11 +323,23 @@ struct FakeConnection {
     agent_write: SharedWrite,
     connection: tokio::task::JoinHandle<()>,
     agent: tokio::task::JoinHandle<()>,
+    /// Values of each `session/set_config_option` the agent received.
+    set_options: Arc<Mutex<Vec<String>>>,
     _cwd: tempfile::TempDir,
 }
 
 async fn spawn_fake_connection(
     session_id: &'static str,
+    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
+) -> FakeConnection {
+    spawn_fake_connection_with(session_id, None, None, on_prompt).await
+}
+
+/// `config_options` is the raw `configOptions` array `session/new` returns.
+async fn spawn_fake_connection_with(
+    session_id: &'static str,
+    default_mode: Option<&'static str>,
+    config_options: Option<&'static str>,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
@@ -363,7 +375,7 @@ async fn spawn_fake_connection(
         source_profile: None,
         default_effort: None,
         default_model_config: Default::default(),
-        default_mode: None,
+        default_mode: default_mode.map(str::to_string),
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
@@ -373,6 +385,9 @@ async fn spawn_fake_connection(
     let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
     let connection = tokio::spawn(run_connection_task(transport, params));
     let reply_write = agent_write.clone();
+    let set_options = Arc::new(Mutex::new(Vec::new()));
+    let recorded = set_options.clone();
+    let options_json = config_options.unwrap_or("[]");
     let agent = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -383,8 +398,19 @@ async fn spawn_fake_connection(
                     r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
                 )],
                 Some("session/new") => vec![format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}"}}}}"#
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"{session_id}","configOptions":{options_json}}}}}"#
                 )],
+                Some("session/set_config_option") => {
+                    let value = msg["params"]["value"].as_str().unwrap_or_default();
+                    recorded.lock().await.push(value.to_string());
+                    vec![format!(
+                        r#"{{"jsonrpc":"2.0","id":{id},"result":{{"configOptions":{}}}}}"#,
+                        options_json.replace(
+                            r#""currentValue":"auto""#,
+                            &format!(r#""currentValue":"{value}""#)
+                        )
+                    )]
+                }
                 Some("session/prompt") => on_prompt(id),
                 _ => continue,
             };
@@ -403,6 +429,7 @@ async fn spawn_fake_connection(
         agent_write,
         connection,
         agent,
+        set_options,
         _cwd: temp,
     }
 }
@@ -517,6 +544,47 @@ async fn idle_remote_control_message_records_and_returns_to_idle() {
     );
     fake.agent.abort();
     let _ = fake.agent.await;
+}
+
+const MODE_OPTIONS: &str = r#"[{"id":"mode","name":"Mode","category":"mode","type":"select","currentValue":"auto","options":[{"value":"auto","name":"Auto"},{"value":"default","name":"Manual"}]}]"#;
+
+/// An adapter that starts in Auto (claude-agent-acp 0.101.0+) keeps it when no
+/// default mode is configured; a configured `default` reaches the live mode
+/// option and lands as Manual.
+#[tokio::test]
+async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
+    // (default_mode, config values the agent received, mode the daemon last saw)
+    let cases: [(Option<&'static str>, &[&str], Option<&str>); 2] = [
+        (None, &[], None),
+        (Some("default"), &["default"], Some("default")),
+    ];
+    for (default_mode, want_sets, want_mode) in cases {
+        let mut fake =
+            spawn_fake_connection_with("s-mode", default_mode, Some(MODE_OPTIONS), |_| Vec::new())
+                .await;
+        // The default is applied before the handshake reports ready, so the
+        // events and recorded requests are complete here.
+        fake.event_rx.close();
+        let mut last_mode = None;
+        while let Some(event) = fake.event_rx.recv().await {
+            if let Event::ConfigOptionsUpdated { options } = event {
+                last_mode = options
+                    .iter()
+                    .find(|o| o.id == "mode")
+                    .map(|o| o.current_value.clone());
+            }
+        }
+        assert_eq!(
+            *fake.set_options.lock().await,
+            want_sets,
+            "{default_mode:?}"
+        );
+        if let Some(want) = want_mode {
+            assert_eq!(last_mode.as_deref(), Some(want), "{default_mode:?}");
+        }
+        fake.agent.abort();
+        let _ = fake.agent.await;
+    }
 }
 
 /// claude-agent-acp 0.101.0+ sends `/compact` itself when a session sits idle,
