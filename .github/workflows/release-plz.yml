@@ -1,0 +1,91 @@
+name: Release-plz
+
+# Tags `vX.Y.Z` when the release PR merges, and refreshes that PR daily or on dispatch;
+# release.yml takes it from the tag. Config: release-plz.toml. RELEASE_TOKEN is required
+# because pushes and PRs made with GITHUB_TOKEN start no workflows (neither CI on the PR
+# nor release.yml on the tag).
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  # Not on push: every refresh force-pushes the release PR and dismisses its approvals.
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Tag release
+    # The merge queue can land the release PR mid-batch, so tag its own squash commit
+    # rather than main's HEAD.
+    if: >-
+      github.repository == 'agent-of-empires/agent-of-empires' &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Commits merged after the release PR's last refresh ship in the tag without a
+      # CHANGELOG.md entry; see docs/development/releases.md.
+      - name: Warn about commits missing from the changelog
+        continue-on-error: true
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          MERGE: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin "refs/pull/$PR/head"
+          BASE="$(git merge-base FETCH_HEAD "$MERGE~1")"
+          MISSED="$(git log --oneline "$BASE..$MERGE~1")"
+          if [ -n "$MISSED" ]; then
+            echo "::warning title=Missing from CHANGELOG.md::$(echo "$MISSED" | wc -l) commit(s) merged after the release PR's last refresh are tagged but not in CHANGELOG.md. See the job summary."
+            { echo '### Tagged but missing from CHANGELOG.md'; echo '```'; echo "$MISSED"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Run release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+  release-pr:
+    name: Update release PR
+    if: >-
+      github.repository == 'agent-of-empires/agent-of-empires' &&
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Never cancel: a cancelled run can leave the release PR half-updated.
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Run release-plz
+        uses: release-plz/action@66b324fd6c72d05d2a08568492ecdd62bfb8a62b # v0.5.148
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}

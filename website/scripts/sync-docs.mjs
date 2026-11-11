@@ -186,7 +186,7 @@ const PAGES = [
     dest: "docs/development/releases.md",
     title: "Releases",
     description:
-      "Weekly release cadence, automated staging PR, post-merge tagger, and emergency-release path for Agent of Empires maintainers.",
+      "Release-plz release PRs, the release pipeline, and the nightly channel for Agent of Empires maintainers.",
   },
   {
     source: "docs/development/internals/structured-view.md",

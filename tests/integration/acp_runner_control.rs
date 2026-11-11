@@ -2255,11 +2255,11 @@ fn supervisor_with_prompt_in_flight(
     use agent_of_empires::acp::supervisor::{BroadcastSink, ChannelSink, Supervisor};
     let store = Arc::new(EventStore::open(&held.scratch.0.join("consumer.db"), 1000).unwrap());
     let (tx, rx) = tokio::sync::broadcast::channel(64);
-    let sink = Arc::new(ChannelSink {
+    let sink = Arc::new(ChannelSink::new(
         tx,
-        event_store: store.clone(),
-        control_cache: Arc::new(agent_of_empires::acp::control_cache::ControlStateCache::new()),
-    });
+        store.clone(),
+        Arc::new(agent_of_empires::acp::control_cache::ControlStateCache::new()),
+    ));
     sink.publish(
         held.id,
         1,
@@ -2285,8 +2285,15 @@ async fn assert_original_turn_completed(
 ) {
     use agent_of_empires::acp::state::Event;
     let id = held.id;
+    // The turn's Stopped is stored before the reattached runner's last
+    // chunk, so wait for that chunk as well.
+    let completed = || {
+        store.replay_from(id, 0).iter().any(|(_, event)| {
+            matches!(event, Event::AgentMessageChunk { text, .. } if text == "real original turn completed")
+        })
+    };
     tokio::time::timeout(Duration::from_secs(10), async {
-        while store.has_in_flight_turn(id) {
+        while store.has_in_flight_turn(id) || !completed() {
             rx.recv().await.unwrap();
         }
     })
@@ -2295,8 +2302,6 @@ async fn assert_original_turn_completed(
     let events = store.replay_from(id, 0);
     assert!(events.iter().any(|(_, event)| matches!(event,
         Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "owned-native-session")));
-    assert!(events.iter().any(|(_, event)| matches!(event,
-        Event::AgentMessageChunk { text, .. } if text == "real original turn completed")));
     let stops: Vec<_> = events
         .iter()
         .filter_map(|(_, event)| match event {

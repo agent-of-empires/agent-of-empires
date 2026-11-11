@@ -205,16 +205,19 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
             continue;
         }
-        // Re-check mid-turn: a turn may have started since the snapshot.
-        let in_flight = query_store(
+        // Re-check mid-turn: work may have started since the snapshot. A failed probe counts
+        // as busy so live work is never stopped.
+        let holds_live_work = super::query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
-            "idle-reap in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "idle-reap live work",
+            |s, id| s.holds_live_work(id),
         )
         .await
-        .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight)
+        .flatten()
+        .unwrap_or(true);
+        if !should_auto_stop(now_ms, last_ms, idle_secs, holds_live_work)
             || !set_dormant_in_memory(state, &id, true).await
         {
             continue;
@@ -301,6 +304,8 @@ mod tests {
             },
             /// Quiet for an hour, but a prompt was admitted and not yet stored.
             PromptPending,
+            /// Quiet for an hour, but an agent-initiated turn never got its `Stopped`.
+            OpenAgentTurn,
         }
         // (worker, reaped)
         let cases = [
@@ -319,6 +324,7 @@ mod tests {
                 true,
             ),
             (Worker::PromptPending, false),
+            (Worker::OpenAgentTurn, false),
         ];
         for (worker, reaped) in cases {
             let id = "resuming-session";
@@ -356,6 +362,24 @@ mod tests {
                     lease.test_backdate_idle_baseline(
                         Utc::now().timestamp_millis() - admitted_secs_ago * 1000,
                     );
+                    (None, Running)
+                }
+                Worker::OpenAgentTurn => {
+                    state
+                        .acp_event_store
+                        .record_at(
+                            id,
+                            2,
+                            &Event::AgentMessageChunk {
+                                text: "woken".into(),
+                                message_id: None,
+                            },
+                            stale_ms,
+                        )
+                        .unwrap();
+                    sup.test_insert_worker(id).await;
+                    let lease = sup.running_lease(id).unwrap();
+                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
                     (None, Running)
                 }
                 Worker::PromptPending => {
