@@ -96,6 +96,9 @@ export function useLiveTerminal(
   const redialRef = useRef<WebSocket | null>(null);
   // The next socket takes control outright instead of waiting for a vacant lock.
   const claimOnOpenRef = useRef(false);
+  // Defer takeover until this scope reports its next grid.
+  const claimAfterResizeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingClaimRef = useRef<(() => void) | null>(null);
   const connectRef = useRef<(() => void) | null>(null);
   const desiredRef = useRef<{
     resize: { cols: number; rows: number } | null;
@@ -113,18 +116,26 @@ export function useLiveTerminal(
   const ownerKnownRef = useRef(false);
   const readOnlyRef = useRef(readOnly);
   const inputScopeRef = useRef({ sessionId, wsPath });
+  const cancelPendingTakeover = useCallback(() => {
+    clearTimeout(claimAfterResizeRef.current ?? undefined);
+    claimAfterResizeRef.current = null;
+    pendingClaimRef.current = null;
+    claimOnOpenRef.current = false;
+  }, []);
   useLayoutEffect(() => {
     inputScopeRef.current = { sessionId, wsPath };
     pendingInputRef.current = null;
     ownerKnownRef.current = false;
-  }, [sessionId, wsPath]);
+    return cancelPendingTakeover;
+  }, [sessionId, wsPath, cancelPendingTakeover]);
   useLayoutEffect(() => {
     readOnlyRef.current = readOnly;
     if (pendingInputRef.current) pendingInputRef.current.messages = [];
     if (readOnly) {
       desiredRef.current.resize = null;
+      cancelPendingTakeover();
     }
-  }, [readOnly]);
+  }, [readOnly, cancelPendingTakeover]);
 
   const { state, read, setState } = useSnapshotStore(() => INITIAL_STATE);
 
@@ -480,10 +491,6 @@ export function useLiveTerminal(
     [sendInput],
   );
 
-  // The Daemon resizes the pane to this socket's last reported grid when it grants a claim.
-  const claimAfterResizeRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Set while a claim waits for that report; sendResize runs it.
-  const pendingClaimRef = useRef<(() => void) | null>(null);
   const claim = useCallback(() => {
     if (claimAfterResizeRef.current) clearTimeout(claimAfterResizeRef.current);
     claimAfterResizeRef.current = null;
@@ -500,12 +507,6 @@ export function useLiveTerminal(
       pendingClaimRef.current = claim;
     },
     [claim],
-  );
-  useEffect(
-    () => () => {
-      if (claimAfterResizeRef.current) clearTimeout(claimAfterResizeRef.current);
-    },
-    [],
   );
 
   const forwardWheel = useCallback(
