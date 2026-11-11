@@ -338,12 +338,14 @@ async fn spawn_fake_connection(
     close_after_prompt: bool,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
-    spawn_fake_connection_with(session_id, None, None, on_prompt).await
+    spawn_fake_connection_with(session_id, mode, close_after_prompt, None, None, on_prompt).await
 }
 
 /// `config_options` is the raw `configOptions` array `session/new` returns.
 async fn spawn_fake_connection_with(
     session_id: &'static str,
+    mode: Option<ConnectMode>,
+    close_after_prompt: bool,
     default_mode: Option<&'static str>,
     config_options: Option<&'static str>,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
@@ -523,7 +525,7 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
 /// between-prompt watchdog.
 #[tokio::test]
 async fn idle_remote_control_message_records_and_returns_to_idle() {
-    let mut fake = spawn_fake_connection("s-remote", |_| Vec::new()).await;
+    let mut fake = spawn_fake_connection("s-remote", None, false, |_| Vec::new()).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         while !matches!(
             fake.event_rx.recv().await.expect("connection remains open"),
@@ -591,12 +593,18 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
         // The connection only dispatches a prompt once session setup, default
         // mode included, is done; `ready_rx` fires before `session/new`.
         let (prompted_tx, mut prompted_rx) = mpsc::unbounded_channel();
-        let mut fake =
-            spawn_fake_connection_with("s-mode", default_mode, Some(MODE_OPTIONS), move |_| {
+        let mut fake = spawn_fake_connection_with(
+            "s-mode",
+            None,
+            false,
+            default_mode,
+            Some(MODE_OPTIONS),
+            move |_| {
                 let _ = prompted_tx.send(());
                 Vec::new()
-            })
-            .await;
+            },
+        )
+        .await;
         fake.cmd_tx
             .send(ClientCmd::Prompt(vec![ContentBlock::Text(
                 TextContent::new("hi"),
@@ -636,7 +644,7 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
 async fn adapter_started_idle_compaction_ends_without_a_prompt() {
     let prompted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let seen_prompt = prompted.clone();
-    let mut fake = spawn_fake_connection("s-idle", move |_| {
+    let mut fake = spawn_fake_connection("s-idle", None, false, move |_| {
         seen_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
         Vec::new()
     })
