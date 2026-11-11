@@ -134,9 +134,6 @@ fn settings_repo_scope_saves_where_a_workspace_runtime_reads() {
 #[serial]
 fn settings_mouse_discard_reverts_theme_preview() {
     use crate::tui::dialogs::ConfirmDialog;
-    use crate::tui::styles::load_theme;
-    use ratatui::backend::TestBackend;
-    use ratatui::Terminal;
 
     let mut env = create_test_env_empty();
     let view = &mut env.view;
@@ -155,14 +152,7 @@ fn settings_mouse_discard_reverts_theme_preview() {
 
     // Render once so the dialog's [Yes] button hit-rect is populated at the
     // exact coordinates it draws.
-    let theme = load_theme("empire");
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-    terminal
-        .draw(|f| {
-            let area = f.area();
-            view.render(f, area, &theme, None, None, None);
-        })
-        .unwrap();
+    render_geometry(view);
 
     let yes = view
         .confirm_dialog
