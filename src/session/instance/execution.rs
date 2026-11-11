@@ -2003,7 +2003,7 @@ impl Instance {
         let direct_capture = self.launch_invokes_resolved_agent_directly(agent);
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut resolved_target_session_id = None;
-        let mut inputs = self.native_launch_inputs(agent, &config)?;
+        let mut inputs = self.native_launch_inputs(agent, config)?;
         let parsed = super::launch_command::parse_launch_command(self.get_tool_command())
             .context("native program is missing")?;
         inputs.environment.extend(parsed.assignments);
