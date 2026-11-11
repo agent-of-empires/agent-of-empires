@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 struct Frame {
     notification: SessionNotification,
     local_prompt_signals: bool,
+    /// Whether its lease may be taken: live, not replayed history. Decided on
+    /// arrival, as a held frame is released after the load ends.
+    admit_leases: bool,
     /// The prompt epoch when the frame arrived, not when it is released.
     epoch: u64,
     envelope: Option<Envelope>,
@@ -38,6 +41,8 @@ pub(super) struct AoeIngress {
     pub(super) leases: Arc<LeaseTable>,
     proxied: AtomicBool,
     lost: AtomicBool,
+    /// A `session/load` is replaying stored history, which holds no lease.
+    loading_history: AtomicBool,
     order: Mutex<ArrivalOrder<Frame>>,
 }
 
@@ -48,6 +53,10 @@ impl AoeIngress {
         self.lost.store(false, Ordering::Relaxed);
         self.leases.clear();
         *self.order.lock().expect("aoe ordering mutex poisoned") = ArrivalOrder::default();
+    }
+
+    pub(super) fn set_loading_history(&self, loading: bool) {
+        self.loading_history.store(loading, Ordering::Relaxed);
     }
 
     /// A reset commit starts a new native session: its keys are fresh, frames
@@ -113,6 +122,7 @@ impl AoeIngress {
         let frame = Frame {
             notification,
             local_prompt_signals,
+            admit_leases: local_prompt_signals && !self.loading_history.load(Ordering::Relaxed),
             epoch,
             envelope: envelope.clone(),
         };
@@ -138,7 +148,7 @@ impl AoeIngress {
                 .envelope
                 .as_ref()
                 .and_then(|e| e.lease.as_ref())
-                .filter(|_| frame.local_prompt_signals)
+                .filter(|_| frame.admit_leases)
             {
                 if self.leases.apply(lease, now_ms).is_err() && proxied {
                     return self.lose(IntegrationLostReason::LeaseOverflow);
@@ -372,6 +382,30 @@ mod tests {
         let again = json!({"v":1,"key":"l2","lease":{"id":"bg2","kind":"task","ttl_ms":60000}});
         ids(i.ingest(frame("t2", again), true, 0, 2));
         assert!(i.leases.working(3));
+    }
+
+    #[test]
+    fn history_replayed_by_a_load_takes_no_lease() {
+        let i = ingress(true);
+        let lease = |key: &str, anchor: Option<u64>| {
+            let mut aoe = json!({"v":1,"key":key,"lease":{"id":key,"kind":"busy","ttl_ms":60000}});
+            if let Some(n) = anchor {
+                aoe["after_adapter_sequence"] = json!(n);
+            }
+            aoe
+        };
+        i.set_loading_history(true);
+        ids(i.ingest(frame("h1", lease("old", None)), true, 0, 0));
+        // Held past the end of the load, then released: still history.
+        let held = lease("held", Some(3));
+        assert!(ids(i.ingest(frame("h2", held), true, 0, 0)).is_empty());
+        i.set_loading_history(false);
+        for n in 0..2 {
+            ids(i.ingest(frame("f", json!(null)), true, 0, n));
+        }
+        assert!(!i.leases.any_live(1), "no historical lease is taken");
+        ids(i.ingest(frame("live", lease("new", None)), true, 0, 1));
+        assert!(i.leases.working(2), "a live lease after the load applies");
     }
 
     #[test]

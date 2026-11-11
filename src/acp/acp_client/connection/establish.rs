@@ -527,7 +527,11 @@ impl Session {
             }
             let req = LoadSessionRequest::new(stored.clone(), self.agent_cwd.clone())
                 .mcp_servers(mcp_servers.clone());
-            match self.load_request(req).await {
+            // The replay precedes the reply, and holds no lease.
+            self.shared.aoe.set_loading_history(true);
+            let loaded = self.load_request(req).await;
+            self.shared.aoe.set_loading_history(false);
+            match loaded {
                 Ok(resp) => {
                     self.session_from_storage = true;
                     info!(
