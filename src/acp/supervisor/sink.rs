@@ -217,11 +217,6 @@ impl ChannelSink {
     }
 
     /// Reads that must see this sink's earlier publications.
-    #[cfg(test)]
-    pub(crate) fn control_cache(&self) -> &Arc<crate::acp::control_cache::ControlStateCache> {
-        &self.persister.control_cache
-    }
-
     fn flushed_store(&self) -> &EventStore {
         self.flush();
         self.store()
