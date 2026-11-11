@@ -446,6 +446,7 @@ fn user_prompt(text: &str) -> crate::acp::Event {
         text: text.into(),
         attachments: Vec::new(),
         prompt_id: None,
+        merged_prompt_ids: Vec::new(),
         synthesized: false,
         origin_plugin: None,
     }
