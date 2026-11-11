@@ -1836,7 +1836,7 @@
       "id": "sidebar.groups",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-grouping.spec.ts"],
+      "specs": ["tests/sidebar-grouping.spec.ts", "src/components/__tests__/WorkspaceSidebarGroupSlices.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SidebarGroupHeader.tsx",

@@ -94,6 +94,16 @@ describe("SessionWizard last-project memory", () => {
     });
   }
 
+  it("keeps the remembered project for a group-only prefill and sends the group", async () => {
+    localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
+    const { getByText } = renderWizard({ group: "alpha" });
+
+    await clickLaunch(getByText);
+
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(createSession.mock.calls[0][0]).toMatchObject({ path: "/tmp/remembered", group: "alpha" });
+  });
+
   it("leaves the memory alone on a scratch launch and does not seed a scratch open", async () => {
     localStorage.setItem(PROJECT_KEY, "/tmp/remembered");
     const { getByText } = renderWizard({ scratch: true });
