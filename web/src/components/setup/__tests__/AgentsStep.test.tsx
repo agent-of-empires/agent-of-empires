@@ -66,7 +66,8 @@ it("a failed Agent check asks to check again instead of reporting none installed
   expect(radio(/^claude/).checked).toBe(true);
 });
 
-it("a pick cancelled by a newer one at the passphrase prompt doesn't roll back the newer pick", async () => {
+/** Two installed Agents behind the real inline save hook, with every machine write needing the passphrase. */
+function elevationHarness() {
   const attempts: unknown[] = [];
   const committed: unknown[] = [];
   let elevated = false;
@@ -100,17 +101,38 @@ it("a pick cancelled by a newer one at the passphrase prompt doesn't roll back t
           onAgentsChecked={() => {}}
         />
         {elevation && <button onClick={() => void elevation.submit("right")}>Unlock</button>}
+        {elevation && <button onClick={elevation.cancel}>Cancel</button>}
       </>
     );
   }
   render(<Harness />);
+  return { attempts, committed };
+}
+
+/** Picks claude, then codex while claude waits at the passphrase prompt. */
+async function pickTwiceAtThePrompt(attempts: unknown[]) {
   fireEvent.click(await screen.findByRole("radio", { name: /^claude/ }));
   await screen.findByRole("button", { name: "Unlock" });
   fireEvent.click(radio(/^codex/));
   await waitFor(() => expect(attempts).toHaveLength(2));
+}
+
+it("a pick cancelled by a newer one at the passphrase prompt doesn't roll back the newer pick", async () => {
+  const { attempts, committed } = elevationHarness();
+  await pickTwiceAtThePrompt(attempts);
   fireEvent.click(await screen.findByRole("button", { name: "Unlock" }));
 
   await waitFor(() => expect(committed).toEqual([{ session: { default_tool: "codex" } }]));
   await waitFor(() => expect(screen.queryByRole("button", { name: "Unlock" })).toBeNull());
   expect(radio(/^codex/).checked).toBe(true);
+});
+
+it("cancelling the prompt after two picks rolls back to the saved value, not the unsaved first pick", async () => {
+  const { attempts, committed } = elevationHarness();
+  await pickTwiceAtThePrompt(attempts);
+  fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+
+  await waitFor(() => expect(radio(/^codex/).checked).toBe(false));
+  expect(radio(/^claude/).checked).toBe(false);
+  expect(committed).toEqual([]);
 });

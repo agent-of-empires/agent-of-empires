@@ -44,23 +44,26 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
   const installed = (agents ?? []).filter((a) => a.installed);
   const missing = (agents ?? []).filter((a) => !a.installed && SUGGESTED.includes(a.name));
   const [tool, setTool] = useState(defaultTool);
-  const [view, setView] = useState(
-    structuredView === "terminal" || structuredView === "off" ? structuredView : "structured",
-  );
+  const savedView = structuredView === "terminal" || structuredView === "off" ? structuredView : "structured";
+  const [view, setView] = useState(savedView);
   // No fallback pick: an unsaved selection would read as the default without being one.
   const chosen = tool && installed.some((a) => a.name === tool) ? tool : undefined;
 
-  // A newer pick supersedes an older one, whose failure then means nothing.
-  const picks = useRef({ tool: 0, view: 0 });
+  // A failed pick rolls back to the last saved value, unless a newer pick superseded it.
+  const picks = useRef({ tool: { id: 0, saved: defaultTool }, view: { id: 0, saved: savedView } });
   const pickTool = async (name: string) => {
-    const id = ++picks.current.tool;
+    const pick = picks.current.tool;
+    const id = ++pick.id;
     setTool(name);
-    if (!(await save("session", "default_tool", name)) && id === picks.current.tool) setTool(tool);
+    if (await save("session", "default_tool", name)) pick.saved = name;
+    else if (id === pick.id) setTool(pick.saved);
   };
   const pickView = async (next: string) => {
-    const id = ++picks.current.view;
+    const pick = picks.current.view;
+    const id = ++pick.id;
     setView(next);
-    if (!(await save("acp", "structured_view", next)) && id === picks.current.view) setView(view);
+    if (await save("acp", "structured_view", next)) pick.saved = next;
+    else if (id === pick.id) setView(pick.saved);
   };
 
   return (

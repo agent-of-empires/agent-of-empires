@@ -49,13 +49,13 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
   const [selected, setSelected] = useState(
     typeof values.container_runtime === "string" ? values.container_runtime : "docker",
   );
-  // A newer pick supersedes an older one, whose failure then means nothing.
-  const picks = useRef(0);
+  // A failed pick rolls back to the last saved value, unless a newer pick superseded it.
+  const picks = useRef({ id: 0, saved: selected });
   const pick = async (kind: ContainerRuntimeKind) => {
-    const previous = selected;
-    const id = ++picks.current;
+    const id = ++picks.current.id;
     setSelected(kind);
-    if (!(await onSaveField("sandbox", "container_runtime", kind)) && id === picks.current) setSelected(previous);
+    if (await onSaveField("sandbox", "container_runtime", kind)) picks.current.saved = kind;
+    else if (id === picks.current.id) setSelected(picks.current.saved);
   };
 
   const none = !failed && runtimes !== null && !runtimes.some((r) => r.installed);
