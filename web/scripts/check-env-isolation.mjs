@@ -10,7 +10,7 @@ const helper = join(web, "tests/helpers/isolatedEnv.ts");
 const compiled = ts.transpileModule(readFileSync(helper, "utf8"), {
   compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
 }).outputText;
-const { isolateEnv, INHERITED_PATH_VARS } = await import(
+const { isolateEnv, INHERITED_PATH_VARS, HOST_STATE_VARS } = await import(
   "data:text/javascript;base64," + Buffer.from(compiled).toString("base64")
 );
 /** Production reads require isolation or explicit inheritance. */
@@ -74,12 +74,16 @@ const TEST_BINARY_READS = new Set([
   "AOE_AGENT_PROBE_TEST_CHILD",
   "AOE_FISH_BIN",
   "AOE_FROZEN_NATIVE_TEST_CHILD",
+  "AOE_VT_BRIDGE_TEST_SOCKET",
   "AOE_LOOPBACK_PROXY_TEST_CHILD",
   "AOE_NAMING_PROBE_TEST_CHILD",
   "AOE_PRIME_REWIND_TEST_CHILD",
   "AOE_RECHECK_TEST_CHILD",
+  "AOE_S1_OPERATOR_BINARY",
   "AOE_TEST_APP_DIR_UMASK_CHILD",
   "AOE_TEST_KILL_LAST_PANE_CHILD",
+  "AOE_TEST_PIPE_SOCKET_CHILD",
+  "AOE_TEST_READY_UNKNOWN_CHILD",
   "AOE_TEST_TMUX_EMPTY_CHILD",
   "AOE_TEST_TMUX_ABSENCE_CHILD",
   "AOE_TEST_TMUX_KILL_CHILD",
@@ -159,7 +163,12 @@ const env = isolateEnv(hostile, {
   tmp: join(home, "tmp"),
   tmuxTmp: join(home, "tmux"),
 });
-const unsafe = [...names].filter((name) => env[name]?.startsWith(host) && !INHERITED_BY_CONTRACT.has(name));
+// Exercise explicit host-state drops for observed test reads too, even when
+// TEST_BINARY_READS already classifies them as unreachable in production.
+const unsafe = [...allNames].filter(
+  (name) =>
+    (names.has(name) || HOST_STATE_VARS.has(name)) && env[name]?.startsWith(host) && !INHERITED_BY_CONTRACT.has(name),
+);
 const missing = [...names].filter((name) => INHERITED_BY_CONTRACT.has(name) && !env[name]?.startsWith(host));
 const unclassifiedTests = [...allNames].filter(
   (name) =>

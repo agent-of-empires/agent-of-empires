@@ -273,14 +273,21 @@ pub(super) fn channel_sink() -> (
     broadcast::Receiver<crate::server::AcpBroadcastFrame>,
     tempfile::TempDir,
 ) {
+    channel_sink_with_cache(Arc::new(crate::acp::control_cache::ControlStateCache::new()))
+}
+
+pub(super) fn channel_sink_with_cache(
+    cache: Arc<crate::acp::control_cache::ControlStateCache>,
+) -> (
+    Arc<ChannelSink>,
+    Arc<EventStore>,
+    broadcast::Receiver<crate::server::AcpBroadcastFrame>,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::TempDir::new().unwrap();
     let event_store = Arc::new(EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap());
     let (tx, rx) = broadcast::channel(16);
-    let sink = Arc::new(ChannelSink::new(
-        tx,
-        event_store.clone(),
-        Arc::new(crate::acp::control_cache::ControlStateCache::new()),
-    ));
+    let sink = Arc::new(ChannelSink::new(tx, event_store.clone(), cache));
     (sink, event_store, rx, tmp)
 }
 
@@ -613,6 +620,7 @@ pub(crate) struct HeldAttachRunner {
     entered: Option<tokio::sync::oneshot::Receiver<()>>,
     disconnected: Option<tokio::sync::oneshot::Receiver<()>>,
     completion: Option<tokio::sync::oneshot::Sender<()>>,
+    resumed: mpsc::Receiver<String>,
     trailer: Arc<std::sync::atomic::AtomicBool>,
     peer: tokio::task::JoinHandle<()>,
     child: std::process::Child,
@@ -625,6 +633,26 @@ impl HeldAttachRunner {
         cwd: &std::path::Path,
         generation: u64,
         profile: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(session_id, cwd, generation, profile, true)
+    }
+
+    /// Complete both real attach handshakes without an outstanding native prompt.
+    pub(crate) fn ready(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+    ) -> Self {
+        Self::with_initialize_hold(session_id, cwd, generation, profile, false)
+    }
+
+    fn with_initialize_hold(
+        session_id: &str,
+        cwd: &std::path::Path,
+        generation: u64,
+        profile: Option<&str>,
+        hold_first_initialize: bool,
     ) -> Self {
         use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
         use std::os::unix::process::CommandExt as _;
@@ -663,6 +691,7 @@ impl HeldAttachRunner {
         let (entered_tx, entered) = tokio::sync::oneshot::channel();
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
         let (completion, completion_rx) = tokio::sync::oneshot::channel();
+        let (resumed_tx, resumed) = mpsc::channel(2);
         let trailer = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let peer_trailer = trailer.clone();
         let id = session_id.to_owned();
@@ -691,7 +720,7 @@ impl HeldAttachRunner {
                                 control_protocol::CONTROL_PROTOCOL_VERSION
                             );
                         }
-                        ControlBody::Initialize { .. } if attempt == 0 => {
+                        ControlBody::Initialize { .. } if attempt == 0 && hold_first_initialize => {
                             entered_tx.take().unwrap().send(()).unwrap();
                             // A failed observation may close only this connection.
                             assert_eq!(
@@ -725,6 +754,10 @@ impl HeldAttachRunner {
                             )
                             .await
                             .unwrap();
+                            resumed_tx.send(native_id.clone()).await.unwrap();
+                            if !hold_first_initialize {
+                                continue;
+                            }
                             completion_rx.take().unwrap().await.unwrap();
                             control_protocol::write_frame(
                                 &mut stream,
@@ -787,6 +820,7 @@ impl HeldAttachRunner {
             entered: Some(entered),
             disconnected: Some(disconnected),
             completion: Some(completion),
+            resumed,
             trailer,
             peer,
             child,
@@ -808,6 +842,11 @@ impl HeldAttachRunner {
 
     pub(crate) async fn disconnected(&mut self) {
         self.disconnected.take().unwrap().await.unwrap();
+    }
+
+    /// Observe an actual ResumeSession request after its SessionReady was written.
+    pub(crate) async fn resumed_session(&mut self) -> String {
+        self.resumed.recv().await.unwrap()
     }
 
     pub(crate) fn complete_turn(&mut self) {

@@ -137,6 +137,11 @@ impl Instance {
         &mut self,
         store: &dyn crate::session::SessionStore,
     ) -> Result<(crate::session::StorageFlock, crate::session::StorageFlock)> {
+        let expected = (
+            self.created_at,
+            self.lifecycle_generation,
+            self.source_profile.clone(),
+        );
         let title = crate::session::storage::acquire_session_title_lock(&self.id)?;
         let lifecycle = store.storage().acquire_instance_lifecycle_lock(&self.id)?;
         store.check_available()?;
@@ -162,6 +167,12 @@ impl Instance {
         // lifecycle (#4116). A launch keeps a fresh reservation for as long as
         // it owns the row, which is what keeps a peer from shelving it.
         self.ensure_startable()?;
+        anyhow::ensure!(
+            self.created_at == expected.0
+                && self.lifecycle_generation == expected.1
+                && self.source_profile == expected.2,
+            LifecycleReservationError::Superseded
+        );
         anyhow::ensure!(
             !matches!(self.status, Status::Creating | Status::Deleting),
             LifecycleReservationError::Superseded

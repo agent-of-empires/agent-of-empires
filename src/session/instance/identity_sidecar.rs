@@ -253,6 +253,7 @@ impl Instance {
             &self.id,
             &observation,
             &expected,
+            None,
         );
         match commit.outcome {
             SidWrite::Applied => {

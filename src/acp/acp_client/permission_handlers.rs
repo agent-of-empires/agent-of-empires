@@ -14,7 +14,7 @@ use agent_client_protocol::v1::schema::{
     SelectedPermissionOutcome,
 };
 
-use tokio::sync::{mpsc, oneshot, MutexGuard};
+use tokio::sync::{mpsc, oneshot, RwLockReadGuard};
 use tracing::{trace, warn};
 
 use super::fs_handlers::enter_timestamp_ns;
@@ -147,7 +147,7 @@ pub(super) async fn handle_permission_request(
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
     tool_context_cache: ToolContextCache,
-    admission: Option<MutexGuard<'_, ()>>,
+    admission: Option<RwLockReadGuard<'_, ()>>,
 ) -> Result<RequestPermissionResponse, agent_client_protocol::Error> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
@@ -330,7 +330,7 @@ pub(super) async fn handle_elicitation_request(
     request: CreateElicitationRequest,
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
-    admission: Option<MutexGuard<'_, ()>>,
+    admission: Option<RwLockReadGuard<'_, ()>>,
 ) -> Result<CreateElicitationResponse, agent_client_protocol::Error> {
     let nonce = Nonce::new();
     let elicitation = match parse_elicitation(nonce.clone(), &request, chrono::Utc::now()) {

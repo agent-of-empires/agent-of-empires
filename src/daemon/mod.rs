@@ -40,15 +40,15 @@ pub use wire::{
     CreationTrustReview, DefaultProfileBody, DeleteGroupBody, DeleteGroupMode, DeleteGroupOutcome,
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
     GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
-    ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary,
-    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
-    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
-    RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse, SessionsEnvelope,
-    SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize, TerminalTarget,
-    TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody, Tristate,
-    UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody,
-    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
-    WorkspaceRepoSummary, WorktreeEditOutcome,
+    InputRecencyBody, ListSessionsQuery, MoveDirection, MoveGroupBody, NativePreparationIdentity,
+    PendingApproval, PlanSummary, PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome,
+    QueuedPromptEntry, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartOutcome, RestartSessionBody, RestoreOutcome,
+    SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody,
+    TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome,
+    TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody,
+    UpdateFavoriteBody, UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody,
+    UpdateUnreadBody, WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -233,6 +233,9 @@ fn committed_failure_message(code: ApiErrorCode) -> &'static str {
     }
     match code {
         ApiErrorCode::ManagedResumeRefused(cause) => cause.message(),
+        ApiErrorCode::LaunchIndeterminate => {
+            "Launch committed but readiness is unconfirmed; runtime preserved"
+        }
         ApiErrorCode::PurgeFailed => "Purge failed; apply its committed state before retrying",
         ApiErrorCode::ResumeFailed => {
             "Resume failed after start committed; the conversation is preserved for explicit retry"
@@ -249,6 +252,7 @@ fn daemon_status_message(status: StatusCode, code: Option<ApiErrorCode>, body: &
         Some(ApiErrorCode::ManagedResumeRefused(cause)) => cause.message().into(),
         Some(ApiErrorCode::AgentHooksNotApproved) =>
             "Agent hook paths have not been approved; run `aoe hooks approve` on the Daemon host before launching".into(),
+        Some(ApiErrorCode::LaunchIndeterminate) => committed_failure_message(ApiErrorCode::LaunchIndeterminate).into(),
         Some(ApiErrorCode::SmartRenameSkipped) => {
             "Auto-name is unavailable for this session; check its repository and tool configuration"
                 .into()
@@ -1086,6 +1090,7 @@ impl DaemonClient {
                         | ApiErrorCode::SandboxMigrationDeferred
                         | ApiErrorCode::SandboxMigrationFailed
                         | ApiErrorCode::ResumeFailed
+                        | ApiErrorCode::LaunchIndeterminate
                         | ApiErrorCode::ManagedResumeRefused(_)
                         | ApiErrorCode::PurgeFailed
                 )
@@ -1119,6 +1124,7 @@ impl DaemonClient {
                         | ApiErrorCode::TrashIncomplete
                         | ApiErrorCode::LifecycleSuperseded
                         | ApiErrorCode::ManagedResumeRefused(_)
+                        | ApiErrorCode::LaunchIndeterminate
                         | ApiErrorCode::SandboxMigrationDeferred
                         | ApiErrorCode::SandboxMigrationFailed
                 )
@@ -1856,6 +1862,7 @@ mod tests {
                         .ensure_tool(
                             "session",
                             &EnsureToolBody {
+                                expected: None,
                                 tool_name: "shell".into(),
                                 size: None,
                                 adoption: None,
@@ -1996,6 +2003,64 @@ mod tests {
         let captured = next_request(rx).await;
         assert_eq!(captured.path, "/api/sessions/sess%2Fa%3Fb/restart");
     }
+    #[tokio::test]
+    async fn launch_indeterminate_does_not_wait_for_anonymous_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            DaemonClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap();
+        let (headers_sent, headers_seen) = tokio::sync::oneshot::channel();
+        let (release_body, body_released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 409 Conflict\r\n{ERROR_CODE_HEADER}: launch_indeterminate\r\nContent-Length: 100\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            headers_sent.send(()).unwrap();
+            let _ = body_released.await;
+        });
+        let mut request = tokio::spawn(async move {
+            client
+                .mutate_session(
+                    "session",
+                    &SessionMutation::Start(StartSessionBody::default()),
+                    "epoch",
+                )
+                .await
+        });
+        headers_seen.await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut request).await;
+        let _ = release_body.send(());
+        server.await.unwrap();
+        if result.is_err() {
+            request.abort();
+            let _ = request.await;
+        }
+        assert!(
+            matches!(
+                result,
+                Ok(Ok(Err(DaemonClientError::Status {
+                    status: StatusCode::CONFLICT,
+                    code: Some(ApiErrorCode::LaunchIndeterminate),
+                    ref body,
+                    truncated: false,
+                }))) if body.is_empty()
+            ),
+            "finite refusal must precede response-body release: {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn conflict_lifecycle_locked_maps_without_reading_body() {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2164,6 +2229,16 @@ mod tests {
         for (status, code, epoch, revision, committed, invalid) in [
             (500, "start_failed", "epoch-1", "3", true, false),
             (409, "resume_failed", "epoch-1", "3", true, false),
+            (409, "launch_indeterminate", "epoch-1", "3", true, false),
+            (409, "launch_indeterminate", "foreign", "3", false, true),
+            (
+                409,
+                "launch_indeterminate",
+                "absent",
+                "absent",
+                false,
+                false,
+            ),
             (409, "purge_failed", "epoch-1", "3", true, false),
             (409, "managed_resume_refused", "epoch-1", "3", true, false),
             (
@@ -2473,6 +2548,27 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    #[test]
+    fn indeterminate_launch_never_reflects_private_probe_diagnostics() {
+        let error = DaemonClientError::Status {
+            status: StatusCode::CONFLICT,
+            code: Some(ApiErrorCode::LaunchIndeterminate),
+            body: "private-path=/secret/store credential=secret-token".into(),
+            truncated: false,
+        };
+        let public = error.to_string();
+        assert!(public.contains("preserved"));
+        assert!(!public.contains("secret"));
+        let committed = DaemonClientError::Committed {
+            cursor: RuntimeCursor {
+                epoch: "epoch-1".into(),
+                revision: 3,
+            },
+            code: ApiErrorCode::LaunchIndeterminate,
+        };
+        assert_eq!(committed.to_string(), public);
     }
 
     #[test]

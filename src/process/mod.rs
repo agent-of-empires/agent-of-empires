@@ -150,7 +150,7 @@ pub(crate) mod test_support {
             });
         }
     }
-    pub(super) fn executable() -> Option<std::path::PathBuf> {
+    pub(crate) fn executable() -> Option<std::path::PathBuf> {
         EXECUTABLE.with(|slot| slot.borrow().clone())
     }
 }

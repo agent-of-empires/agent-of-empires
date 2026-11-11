@@ -1443,11 +1443,48 @@ printf done > "{completed}"
                 &first,
             ]);
             tmux(&["new-session", "-d", "-s", &second, "sleep 120"]);
+            let inventory = || {
+                let output = std::process::Command::new("tmux")
+                    .arg("-S")
+                    .arg(h.home_path().join("tmux.sock"))
+                    .args([
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        "#{session_id}|#{session_name}|#{pane_id}|#{pane_pid}|#{pid}",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let mut rows = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                rows.sort();
+                rows
+            };
+            let before = inventory();
+            assert_eq!(
+                before.len(),
+                2,
+                "fixture must contain both physical candidates"
+            );
+            let ambiguous = sdk
+                .ensure_agent(&id, &StartSessionBody::default(), &epoch)
+                .await;
+            assert_eq!(
+                inventory(),
+                before,
+                "ambiguous admission changed physical sessions; SDK result: {ambiguous:?}"
+            );
             assert!(
-                sdk.ensure_agent(&id, &StartSessionBody::default(), &epoch)
-                    .await
-                    .is_err(),
-                "ambiguous existing agents admitted another launch"
+                ambiguous.is_err(),
+                "ambiguous existing agents admitted another launch: {ambiguous:?}"
             );
             assert_eq!(
                 std::fs::read_to_string(&launched).unwrap(),

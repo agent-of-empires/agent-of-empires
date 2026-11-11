@@ -1239,7 +1239,12 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             let title = inst.title.clone();
             let res = tokio::task::spawn_blocking(move || {
                 let result = inst.restart_with_size(size);
-                if result.is_ok() {
+                if matches!(
+                    result,
+                    Ok(StartOutcome::Fresh
+                        | StartOutcome::Resumed
+                        | StartOutcome::FreshAfterFailedResume { .. })
+                ) {
                     let file_watch = crate::file_watch::FileWatchService::noop();
                     crate::session::sync::capture_launched_session_id_blocking(
                         &mut inst,
@@ -1277,7 +1282,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
             }
         }
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
-        if let Some(inst) = inst_opt {
+        if let Some(inst) =
+            inst_opt.filter(|_| !matches!(&result, Ok(StartOutcome::Indeterminate { .. })))
+        {
             restarted.push(inst);
         }
         match result {
@@ -1285,6 +1292,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 title,
                 format!("resume failed for sid {sid}; preserved for explicit retry"),
             )),
+            Ok(StartOutcome::Indeterminate { cause }) => {
+                failed.push((title, cause.message().to_owned()))
+            }
             Ok(StartOutcome::FreshAfterFailedResume { sid }) => {
                 fresh_after_failed_resume.push((title.clone(), sid));
                 succeeded.push((id, title));
@@ -1294,22 +1304,24 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         }
     }
 
-    let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
-        let mut orphaned = Vec::new();
-        for restarted_inst in restarted {
-            if let Some(stored) = instances.iter_mut().find(|i| i.id == restarted_inst.id) {
-                stored.merge_post_restart(&restarted_inst);
+    // Each launch and its capture drain already committed under native ownership.
+    // A later reporting pass must not merge an obsolete lifecycle over a peer's outcome.
+    let current = storage.load_instances_complete()?;
+    let orphaned: Vec<(String, String)> = restarted
+        .into_iter()
+        .filter_map(|instance| {
+            if current.iter().any(|row| row.id == instance.id) {
+                None
             } else {
                 tracing::warn!(
                     target: "session.cli",
-                    session_id = %restarted_inst.id,
-                    "session row removed by peer between phase 1 and phase 3 of restart --all; tmux session is now orphan"
+                    session_id = %instance.id,
+                    "session row removed by peer after restart --all"
                 );
-                orphaned.push((restarted_inst.id.clone(), restarted_inst.title.clone()));
+                Some((instance.id, instance.title))
             }
-        }
-        Ok(orphaned)
-    })?;
+        })
+        .collect();
 
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
     succeeded.retain(|(id, _)| !orphaned_ids.contains(id));
@@ -1326,7 +1338,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     }
     if !orphaned.is_empty() {
         println!(
-            "⚠ {} orphaned (row removed by peer mid-flight; tmux running but unrooted):",
+            "⚠ {} rows removed by peer after restart completed:",
             orphaned.len()
         );
         for (_, title) in &orphaned {
@@ -1389,16 +1401,64 @@ fn pick_targets_for_restart_all(
 /// the relaunch wins and nothing is typed into the shelved pane.
 fn send_restart_wake(
     working: &Instance,
-    tmux_session: &crate::tmux::Session,
     wake_msg: &str,
+    profile_identity: (u64, u64),
 ) -> Result<bool> {
-    if !tmux_session.exists() {
-        return Ok(false);
-    }
-    let _input_lock = working.lock_for_input()?;
+    let name = working
+        .agent_pane
+        .tmux_session
+        .as_deref()
+        .ok_or(crate::session::NativeInputError::Ownership)?;
+    let physical = working
+        .agent_pane
+        .physical
+        .clone()
+        .ok_or(crate::session::NativeInputError::Ownership)?;
+    let fence = crate::session::NativeInputFence::capture(
+        &working.effective_profile(),
+        &working.id,
+        working.created_at,
+        working.lifecycle_generation,
+        true,
+        Some(profile_identity),
+    )?;
+    let tmux_session = working.agent_input_session(name, physical, true, Some(fence))?;
     let delay = crate::agents::send_keys_enter_delay(&working.tool);
     tmux_session.send_keys_with_delay(wake_msg, delay)?;
     Ok(true)
+}
+
+#[cfg(test)]
+struct CliRestartMergeGate {
+    session_id: String,
+    reached: std::sync::mpsc::SyncSender<bool>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static CLI_RESTART_MERGE_GATE: std::sync::Mutex<Option<CliRestartMergeGate>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn pause_before_cli_restart_merge(session_id: &str, wake_succeeded: bool) {
+    let gate = {
+        let mut slot = CLI_RESTART_MERGE_GATE.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.session_id == session_id)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        if gate.reached.send(wake_succeeded).is_ok() {
+            gate.release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("release the CLI restart completion gate");
+        }
+    }
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -1415,23 +1475,29 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         false,
         crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
     )?;
+    if let StartOutcome::Indeterminate { cause } = outcome {
+        bail!("{}", cause.message());
+    }
     let title = working.title.clone();
     let session_id = working.id.clone();
-    let tool = working.tool.clone();
 
     let wake_msg = crate::session::resolve_config(profile)
         .map(|c| c.session.restart_wake_message.clone())
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
     let mut wake_succeeded = false;
-    if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
-        let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
-        tmux_session.wait_until_ready(
-            std::time::Duration::from_secs(5),
-            crate::agents::ready_marker(&tool),
-        );
-
-        match send_restart_wake(&working, &tmux_session, &wake_msg) {
+    if !wake_msg.is_empty()
+        && matches!(
+            outcome,
+            StartOutcome::Fresh
+                | StartOutcome::Resumed
+                | StartOutcome::FreshAfterFailedResume { .. }
+        )
+    {
+        match storage
+            .bound_profile_identity()
+            .and_then(|identity| send_restart_wake(&working, &wake_msg, identity))
+        {
             Ok(sent) => wake_succeeded = sent,
             Err(e) => eprintln!("Warning: failed to send wake-up message: {}", e),
         }
@@ -1444,29 +1510,45 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         crate::session::sync::CLI_SESSION_ID_CAPTURE_TIMEOUT,
         true,
     );
+    #[cfg(test)]
+    pause_before_cli_restart_merge(&session_id, wake_succeeded);
 
-    let _merge_lock = storage
+    let _completion_lock = storage
         .acquire_instance_lifecycle_lock(&session_id)
-        .context("failed to acquire instance restart merge lock")?;
-    let landed = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
-            stored.merge_post_restart(&working);
-            if wake_succeeded {
-                stored.touch_after_input();
-            }
-            Ok(true)
-        } else {
-            tracing::warn!(
-                target: "session.cli",
-                session_id = %session_id,
-                "session row removed by peer between phase 1 and phase 3 of restart; tmux session is now orphan"
+        .context("failed to acquire restart completion lock")?;
+    let landed = if wake_succeeded {
+        match storage.update_complete(|instances, _groups| {
+            let stored = instances
+                .iter_mut()
+                .find(|row| row.id == session_id)
+                .ok_or(crate::session::SessionGone)?;
+            anyhow::ensure!(
+                stored.created_at == working.created_at
+                    && stored.lifecycle_generation == working.lifecycle_generation,
+                crate::session::LifecycleReservationError::Superseded
             );
-            Ok(false)
+            stored.last_accessed_at = Some(chrono::Utc::now());
+            Ok(())
+        }) {
+            Ok(()) => true,
+            Err(error)
+                if error.downcast_ref::<crate::session::LifecycleReservationError>()
+                    == Some(&crate::session::LifecycleReservationError::Superseded) =>
+            {
+                true
+            }
+            Err(error) if error.is::<crate::session::SessionGone>() => false,
+            Err(error) => return Err(error),
         }
-    })?;
+    } else {
+        storage
+            .load_instances_complete()?
+            .iter()
+            .any(|row| row.id == session_id)
+    };
     if !landed {
         bail!(
-            "Session {} was removed by another process before restart could land; tmux session is now orphan",
+            "Session {} was removed by another process after restart completed",
             title
         );
     }
@@ -1475,6 +1557,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         StartOutcome::ResumeFailed { sid } => {
             bail!("Resume failed for sid {sid}; preserved for explicit retry");
         }
+        StartOutcome::Indeterminate { cause } => bail!("{}", cause.message()),
         StartOutcome::FreshAfterFailedResume { sid } => {
             println!(
                 "Restarted session: {} (started fresh after a prior resume failed for sid {}; the old conversation remains in the agent's history)",
@@ -1504,17 +1587,21 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "attach")?;
-    let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
-
-    if !tmux_session.exists() {
-        bail!(
-            "Session is not running. Start it first with: aoe session start {}",
-            args.identifier
-        );
-    }
 
     let mut working = inst.clone();
     working.source_profile = profile.to_string();
+    let tmux_session = {
+        let _input_lock = working.native_input_fence(false)?.lock()?;
+        let (name, physical, state) = working.observe_native_pane()?;
+        anyhow::ensure!(
+            state == crate::tmux::utils::PaneProbe::Alive,
+            "Native pane is unavailable; inspect it before starting the session"
+        );
+        crate::tmux::Session::from_observation(
+            &name,
+            std::sync::Arc::new(physical.ok_or(crate::session::NativeInputError::Ownership)?),
+        )
+    };
     supervise_attach_capture(&mut working, |_| tmux_session.attach())
 }
 
@@ -2762,7 +2849,8 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             if let Some((_, stage)) = pending_recovery {
                 anyhow::ensure!(matches!(stage,
                     crate::session::TerminalHandoffStage::TerminalCommitOwed
-                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed),
+                        | crate::session::TerminalHandoffStage::TerminalLaunchOwed
+                        | crate::session::TerminalHandoffStage::ProjectionCleanupOwed),
                     "terminal handoff must finish original retirement before its native target can change");
                 let pending = inst.terminal_handoff.as_ref().expect("pending recovery");
                 anyhow::ensure!(pending.final_event_seq.is_some(),
@@ -2772,14 +2860,35 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     && pending.generation == inst.lifecycle_generation,
                     crate::session::LifecycleReservationError::Superseded);
                 pending.ensure_original_stopped(&inst.id)?;
-                let pane = inst.tmux_session()?;
-                if pane.exists_live() {
-                    anyhow::ensure!(pane.is_pane_dead(),
-                        "terminal handoff pane is live; retry disable to complete adoption before changing its target");
-                    let launch = pending.launch.as_ref().ok_or_else(|| anyhow::anyhow!(
-                        "existing dead pane has no handoff receipt; pane retained"))?;
-                    crate::session::Instance::ensure_terminal_handoff_pane_matches(pane.name(),
-                        crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                // The target launch may own newer units than the retired Native Original.
+                // Observe those exact obligations without stopping or adopting a new peer.
+                let target_scopes = crate::process::systemd::resolve_unknown_scopes(
+                    &inst.id, inst.terminal_scopes.as_deref(),
+                ).context("terminal target scope ownership remains unresolved")?;
+                for scope in &target_scopes {
+                    anyhow::ensure!(crate::process::systemd::scope_stopped(&inst.id, scope)?,
+                        "terminal target scope remains live; complete its explicit shutdown before selecting a target");
+                }
+                let launch = pending.launch.as_ref().context(
+                    "terminal handoff has no pre-birth checkpoint; cannot prove an unknown birth absent")?;
+                let socket = launch.receipt.as_ref().map(|receipt| receipt.server.socket.as_str())
+                    .or_else(|| launch.birth_inventory.as_ref().map(|inventory| inventory.socket()))
+                    .context("terminal handoff has no captured physical socket; restore its original ownership evidence")?;
+                let complete = crate::tmux::utils::capture_pane_birth_inventory(
+                    Some(socket), &crate::tmux::TmuxCommandDeadline::new(),
+                ).context("cannot prove terminal pane absence from its complete physical inventory")?;
+                if let Some(receipt) = launch.receipt.as_deref() {
+                    if complete.receipt_present(receipt)? {
+                        let actual = inst.tmux_session()?;
+                        let probe = crate::session::Instance::ensure_terminal_handoff_pane_matches(actual.name(),
+                            crate::session::TerminalHandoffKey { id: pending.id, generation: pending.generation }, launch)?;
+                        anyhow::ensure!(probe == crate::tmux::utils::PaneProbe::Dead,
+                            "terminal handoff pane is live; close it explicitly in tmux before selecting a target");
+                    }
+                } else {
+                    complete.ensure_only_preexisting_panes(
+                        launch.birth_inventory.as_ref().context("missing pre-birth physical inventory")?,
+                    )?;
                 }
             }
             inst.source_profile = storage.profile().to_string();
@@ -2796,7 +2905,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             inst.resume_binding = binding;
             inst.resume_intent = new_intent.clone();
             inst.resume_probe_failed_sid = None;
-            if let Some((intent_id, _)) = pending_recovery {
+            if let Some((intent_id, stage)) = pending_recovery {
                 let context = match &new_intent {
                     crate::session::ResumeIntent::Use(_) => {
                         let native_store = inst.resume_binding.as_ref().and_then(|binding| binding.execution.clone())
@@ -2822,7 +2931,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 pending.source_acp_session_id = source_acp_session_id;
                 pending.terminal = Some(target);
                 pending.launch_started = false;
-                // Retain the original checkpoint solely as the owned dead-pane receipt.
+                if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
+                    pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
+                }
+                // Retain the prior attempt as evidence, never as proof of an unrecorded birth.
             }
             Ok(inst.title.clone())
         })
@@ -3357,9 +3469,20 @@ mod start_blocked_tests {
             return;
         }
         crate::tmux::refresh_session_cache();
+        let (physical, probe, _) =
+            crate::tmux::utils::observe_pane(&pane, &crate::tmux::TmuxCommandDeadline::new())
+                .unwrap()
+                .expect("the native fixture pane exists");
+        assert_eq!(probe, crate::tmux::utils::PaneProbe::Alive);
+        working.agent_pane.tmux_session = Some(pane.clone());
+        working.agent_pane.physical = Some(std::sync::Arc::new(physical));
 
-        let session = crate::tmux::Session::new(&working.id, &working.title).unwrap();
-        let result = send_restart_wake(&working, &session, "wake-4116");
+        let binding = Storage::open_reference(profile).unwrap();
+        let result = send_restart_wake(
+            &working,
+            "wake-4116",
+            binding.bound_profile_identity().unwrap(),
+        );
         let captured = crate::tmux::tmux_command()
             .args(["capture-pane", "-p", "-t", &pane])
             .output()
@@ -3373,6 +3496,144 @@ mod start_blocked_tests {
         assert!(!String::from_utf8_lossy(&captured.stdout).contains("wake-4116"));
         let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert!(stored[0].is_archived());
+    }
+
+    #[test]
+    #[serial]
+    fn restart_completion_preserves_shelving_committed_after_wake_ack() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+
+        struct ReleaseGate(mpsc::SyncSender<()>);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+                super::CLI_RESTART_MERGE_GATE.lock().unwrap().take();
+            }
+        }
+
+        let mut lost_shelving = Vec::new();
+        for (case, advance_generation, later_status) in [
+            ("newer generation", true, None),
+            ("same generation", false, None),
+            ("later Error", false, Some(crate::session::Status::Error)),
+            (
+                "later Stopped",
+                false,
+                Some(crate::session::Status::Stopped),
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_home(root.path());
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let _env = crate::session::test_support::EnvGuard::unset(&[
+                "TMUX",
+                "TMUX_PANE",
+                "AOE_DAEMON_URL",
+            ])
+            .and_set("AOE_TMUX_SOCKET", root.path().join("tmux.sock"));
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.session.smart_rename = false;
+                config.session.auto_resume_on_restart = false;
+                config.session.restart_wake_message = "CLI_COMPLETED_WAKE".into();
+            })
+            .unwrap();
+            let profile = "cli-restart-completion";
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut row = Instance::new("cli-restart-completion", root.path().to_str().unwrap());
+            row.source_profile = profile.into();
+            // A declared native terminal producer, not a provider or frozen agent launcher.
+            row.tool = "bash".into();
+            row.command = "/bin/sh -c 'exec cat'".into();
+            let id = row.id.clone();
+            let name = crate::tmux::Session::generate_name(&id, &row.title);
+            let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+            storage
+                .update(|rows, _| {
+                    rows.push(row.clone());
+                    Ok(())
+                })
+                .unwrap();
+
+            std::thread::scope(|scope| {
+                let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let release = ReleaseGate(release_tx);
+                assert!(super::CLI_RESTART_MERGE_GATE
+                    .lock()
+                    .unwrap()
+                    .replace(super::CliRestartMergeGate {
+                        session_id: id.clone(),
+                        reached: reached_tx,
+                        release: release_rx,
+                    })
+                    .is_none());
+                let child = scope.spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(restart_session(
+                            profile,
+                            SessionIdArgs {
+                                identifier: id.clone(),
+                            },
+                        ))
+                });
+                assert!(
+                    reached_rx.recv_timeout(Duration::from_secs(20)).unwrap(),
+                    "the actual native wake must have acknowledged before shelving"
+                );
+                let shelved = {
+                    let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                    storage
+                        .update(|rows, _| {
+                            let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                            if advance_generation {
+                                row.lifecycle_generation += 1;
+                            }
+                            row.snooze(30);
+                            row.mark_idle_dormant();
+                            if let Some(status) = later_status {
+                                row.status = status;
+                            }
+                            Ok(row.clone())
+                        })
+                        .unwrap()
+                };
+                release.0.send(()).unwrap();
+                child.join().unwrap().unwrap();
+                let after = storage
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert_eq!(after.lifecycle_generation, shelved.lifecycle_generation);
+                assert!(
+                    shelved.conversation_state().matches(&after),
+                    "{case}: selection changed"
+                );
+                if (after.snoozed_until, after.idle_dormant_since, after.status)
+                    != (
+                        shelved.snoozed_until,
+                        shelved.idle_dormant_since,
+                        shelved.status,
+                    )
+                {
+                    lost_shelving.push(case);
+                }
+            });
+        }
+        assert!(
+            lost_shelving.is_empty(),
+            "old CLI completion rewrote later state: {lost_shelving:?}"
+        );
     }
 
     #[tokio::test]
