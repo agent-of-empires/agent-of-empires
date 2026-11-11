@@ -923,6 +923,22 @@ describe("delegation card from the session identity", () => {
     expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
   });
 
+  it("stays active when the turn end stopped the launch call but the child runs", () => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container } = render(view(child, stopped));
+    expect(container.textContent).toContain("running");
+    expect(container.textContent).not.toMatch(/done|stopped/);
+    expect(container.querySelector(".animate-pulse")).not.toBeNull();
+  });
+
+  it("settles from the record, with no duration, when the child went idle after a stop", () => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container } = render(view({ ...child, state: "idle", stop_reason: "end_turn" }, stopped));
+    expect(container.textContent).toContain("idle · end_turn");
+    expect(container.textContent).toContain("done");
+    expect(container.textContent).not.toMatch(/stopped|\d+(ms|s)\b/);
+  });
+
   it("keeps the reply as the card's report", () => {
     const { container, getByRole } = render(
       view({ ...child, state: "idle" }, makeCompletion({ toolCallId: "msg-1", text: "the answer" })),

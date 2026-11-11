@@ -210,9 +210,12 @@ export function extractTaskResult(text: string): string {
 
 /** A sub-agent Task or delegation. With children it nests their calls; childless it
  *  only reports a final result (opencode, or a delegation with no calls yet). */
-export function SubagentCard({ tool, result, children }: ToolCardProps & { children: ToolCardProps[] }) {
+export function SubagentCard({ tool, result: toolResult, children }: ToolCardProps & { children: ToolCardProps[] }) {
   const { args, description: toolDescription } = useTaskDescription(tool);
   const record = useSubagentFor(tool.id);
+  // A background child outlives the turn that stopped its launch call, so the
+  // roster, not that stop, says whether the card is still active.
+  const result = record && record.state !== "unknown" && toolResult?.kind === "tool_stopped" ? undefined : toolResult;
   const description = record?.title || toolDescription;
   const hasChildren = children.length > 0;
   const prompt = pickStr(args, "prompt");
@@ -229,7 +232,8 @@ export function SubagentCard({ tool, result, children }: ToolCardProps & { child
     <>
       <CardChrome
         status={status}
-        {...spanTimes([{ tool, result }, ...children])}
+        // The roster has no end time, so a child settled without a reply shows no duration.
+        {...(idle && !result ? {} : spanTimes([{ tool, result }, ...children]))}
         icon={<Sparkles className={ICON} />}
         label="subagent"
         meta={

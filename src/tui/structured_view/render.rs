@@ -1719,17 +1719,29 @@ impl ToolBlocks<'_> {
             retained_tool_lines(row, completion, self.theme, self.path_roots)
         } else {
             let mut card = tool_card_from_rows(row, self.completions);
-            // An idle child may never send a reply that completes its card.
-            if let (None, Some(record)) = (&card.completed, record) {
-                if record.state == SubagentState::Idle {
-                    card.completed = Some(ToolCompletion {
-                        outcome: if record.stop_reason.as_deref() == Some("error") {
-                            ToolOutcome::Error
-                        } else {
-                            ToolOutcome::Ok
-                        },
-                        content: String::new(),
-                    });
+            // The roster, not the launch call, says whether the child is still
+            // active: a stop at turn end must not close a running child's card,
+            // and an idle child may never send a reply.
+            if let Some(record) = record {
+                let stopped = matches!(
+                    &card.completed,
+                    Some(c) if c.outcome == ToolOutcome::Stopped
+                );
+                match record.state {
+                    SubagentState::Running | SubagentState::RequiresAction if stopped => {
+                        card.completed = None;
+                    }
+                    SubagentState::Idle if card.completed.is_none() || stopped => {
+                        card.completed = Some(ToolCompletion {
+                            outcome: if record.stop_reason.as_deref() == Some("error") {
+                                ToolOutcome::Error
+                            } else {
+                                ToolOutcome::Ok
+                            },
+                            content: String::new(),
+                        });
+                    }
+                    _ => {}
                 }
             }
             if let Some(title) = record
@@ -3144,6 +3156,43 @@ mod tests {
             assert_eq!(
                 t.stoppable_subagent().map(|r| r.session_id.as_str()),
                 matches!(state, Running | RequiresAction).then_some("child")
+            );
+        }
+    }
+
+    /// A background child outlives the turn whose end stopped its launch call.
+    #[test]
+    fn turn_end_stop_does_not_close_a_card_whose_child_is_active() {
+        use crate::acp::state::SubagentState::*;
+        let cases = [
+            (Running, "tool ▶ · Explore repo · running"),
+            (RequiresAction, "tool ▶ · Explore repo · waiting on you"),
+            (Idle, "✓ Explore repo · idle"),
+            (Unknown, "tool ◼ · Explore repo · unknown"),
+        ];
+        for (state, head) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            let mut events = vec![tool_event("msg-1", "Explore repo", None)];
+            events.push(Event::Stopped {
+                reason: "end_turn".into(),
+            });
+            t.server_rows = server_rows(&events);
+            t.subagents = vec![SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "s-1".into(),
+                parent_tool_call_id: Some("msg-1".into()),
+                title: Some("Explore repo".into()),
+                description: None,
+                state,
+                stop_reason: None,
+                cancel_capable: true,
+                model: None,
+            }];
+            let lines = tool_lines(&t);
+            assert_eq!(lines[0], head);
+            assert!(
+                lines.iter().all(|l| !l.contains("stopped when the turn")) || state == Unknown,
+                "{lines:?}"
             );
         }
     }
