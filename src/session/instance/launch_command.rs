@@ -3508,14 +3508,6 @@ mod tests {
             !command.contains(prefix_store.to_string_lossy().as_ref()),
             "the conflicting prefix store must not reach the launch: {command}"
         );
-        let parsed = super::parse_launch_command(&command).expect("frozen launch parses");
-        assert!(
-            !parsed
-                .assignments
-                .iter()
-                .any(|(key, _)| key == "CLAUDE_CONFIG_DIR"),
-            "the prefix must not re-assert a routed store: {command}"
-        );
         let execution = prepared.execution.expect("managed launch execution");
         let routed = execution
             .host_command()
@@ -3536,6 +3528,42 @@ mod tests {
                     .into_owned()
             )),
             "the effective launch environment must match the attested binding"
+        );
+
+        // The same conflict with no recorded conversation: the configured store
+        // is then the only authority the prefix must yield to.
+        let mut configured = Instance::new("claude-configured-conflict", project.to_str().unwrap());
+        configured.tool = "claude".into();
+        configured.command = inst.command.clone();
+        configured.source_profile = profile.clone();
+        let prepared = configured
+            .prepare_launch_command(configured.conversation_state())
+            .expect("a configured store must still launch");
+        let command = prepared.command.expect("the launch has a command");
+        assert!(
+            !command.contains(prefix_store.to_string_lossy().as_ref()),
+            "a configured store must outrank the prefix too: {command}"
+        );
+        let execution = prepared.execution.expect("configured launch execution");
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                home.join("recorded")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the configured store must be the launched store"
         );
     }
 
