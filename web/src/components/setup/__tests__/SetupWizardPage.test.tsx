@@ -6,6 +6,7 @@ import { useState } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { resetSettingsSchemaCache, type SetupStatus, type SetupStepKey } from "../../../lib/api";
+import type { SettingsFieldDescriptor } from "../../../lib/types";
 import { SetupWizardPage } from "../SetupWizardPage";
 
 const server = setupServer();
@@ -33,6 +34,19 @@ beforeEach(() => {
     }),
   );
 });
+
+const FIELD: SettingsFieldDescriptor = {
+  section: "worktree",
+  field: "enabled",
+  category: "worktree",
+  label: "Use worktrees",
+  description: "",
+  widget: { kind: "toggle" },
+  web_write: { policy: "allow" },
+  profile_overridable: true,
+  validation: { rule: "bool" },
+  advanced: false,
+};
 
 const KEYS: SetupStepKey[] = ["theme_telemetry", "agents", "project", "worktrees", "sandbox", "notifications"];
 const status = (configured: SetupStepKey[] = []): SetupStatus => ({
@@ -222,15 +236,26 @@ it("a failed settings read offers a retry instead of showing defaults as the sav
 
 it("a failed schema read offers a retry instead of a step with no fields", async () => {
   let fail = true;
+  let release: (() => void) | undefined;
   server.use(
-    http.get("*/api/settings/schema", () => (fail ? new HttpResponse(null, { status: 500 }) : HttpResponse.json([]))),
+    http.get("*/api/settings/schema", async () => {
+      if (fail) return new HttpResponse(null, { status: 500 });
+      await new Promise<void>((resolve) => (release = resolve));
+      return HttpResponse.json([FIELD]);
+    }),
   );
   renderPage(status(["agents"]), "/setup?step=worktrees");
   expect((await screen.findByRole("alert")).textContent).toContain("Couldn't load the settings for this step");
-  expect((screen.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true);
+  const next = screen.getByRole("button", { name: "Next" }) as HTMLButtonElement;
+  expect(next.disabled).toBe(true);
   fail = false;
   fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+  await waitFor(() => expect(release).toBeDefined());
+  // The retry is still out: confirming now would accept defaults the user never saw.
+  expect(next.disabled).toBe(true);
+  await act(async () => release!());
   await enabled("Next");
+  expect(screen.getByText(FIELD.label)).toBeTruthy();
   expect(screen.queryByRole("alert")).toBeNull();
 });
 

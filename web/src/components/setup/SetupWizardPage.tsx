@@ -48,7 +48,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
     return requested >= 0 ? requested : firstOpenIndex(steps);
   });
   const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
-  const [schemaFailed, setSchemaFailed] = useState(false);
+  const [schemaLoad, setSchemaLoad] = useState<TelemetryLoad>("loading");
   const [schemaChecks, setSchemaChecks] = useState(0);
   // `null` until loaded, so steps seed their selections from saved values.
   const [machine, setMachine] = useState<MachineValues | null>(null);
@@ -68,15 +68,15 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
     let live = true;
     void getSettingsSchema().then((s) => {
       if (!live) return;
-      setSchemaFailed(s === null);
       if (s) setSchema(s);
+      setSchemaLoad(s ? "loaded" : "failed");
     });
     return () => {
       live = false;
     };
   }, [schemaChecks]);
   const retrySchema = () => {
-    setSchemaFailed(false);
+    setSchemaLoad("loading");
     setSchemaChecks((n) => n + 1);
   };
 
@@ -255,7 +255,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
     (step.required && !step.configured) ||
     (step.key === "theme_telemetry" && telemetry !== "loaded") ||
     (needsMachine && machine === null) ||
-    (needsSchema && schemaFailed);
+    (needsSchema && schemaLoad !== "loaded");
   const info = SETUP_STEP_INFO[step.key];
   const values = (section: string) => machine?.[section] ?? {};
 
@@ -341,7 +341,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
                 <GhostButton onClick={retryMachine}>Check again</GhostButton>
               </div>
             )}
-            {needsSchema && schemaFailed && (
+            {needsSchema && schemaLoad === "failed" && (
               <div className="flex items-center gap-3">
                 <p role="alert" className="text-sm text-status-error-text">
                   Couldn't load the settings for this step.
