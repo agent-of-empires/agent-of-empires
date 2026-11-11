@@ -136,3 +136,51 @@ it("cancelling the prompt after two picks rolls back to the saved value, not the
   expect(radio(/^claude/).checked).toBe(false);
   expect(committed).toEqual([]);
 });
+
+it("a failed pick after two out-of-order saves rolls back to the newer saved pick", async () => {
+  const committed: unknown[] = [];
+  let failed = false;
+  let releaseFirst: (() => void) | undefined;
+  server.use(
+    http.get("*/api/agents", () =>
+      HttpResponse.json([
+        claude,
+        { ...claude, name: "codex", display_name: "Codex CLI" },
+        { ...claude, name: "gemini", display_name: "Gemini CLI" },
+      ]),
+    ),
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = (await request.json()) as { session: { default_tool: string } };
+      const tool = body.session.default_tool;
+      if (tool === "gemini") {
+        failed = true;
+        return new HttpResponse(null, { status: 500 });
+      }
+      if (tool === "claude") await new Promise<void>((r) => (releaseFirst = r));
+      committed.push(body);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  function Harness() {
+    const { save } = useInlineMachineSave();
+    return (
+      <AgentsStep
+        profile=""
+        defaultTool={undefined}
+        structuredView={undefined}
+        save={(section, field, value) => save({ [section]: { [field]: value } })}
+        onAgentsChecked={() => {}}
+      />
+    );
+  }
+  render(<Harness />);
+  fireEvent.click(await screen.findByRole("radio", { name: /^claude/ }));
+  await waitFor(() => expect(releaseFirst).toBeDefined());
+  fireEvent.click(radio(/^codex/));
+  fireEvent.click(radio(/^gemini/));
+  releaseFirst!();
+
+  await waitFor(() => expect(failed).toBe(true));
+  await waitFor(() => expect(radio(/^codex/).checked).toBe(true));
+  expect(committed).toEqual([{ session: { default_tool: "claude" } }, { session: { default_tool: "codex" } }]);
+});

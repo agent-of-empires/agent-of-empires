@@ -11,17 +11,15 @@ export function useInlineMachineSave() {
   const [elevation, setElevation] = useState<ElevationRequest | null>(null);
   const pending = useRef<ElevationRequest | null>(null);
   const latest = useRef(0);
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   useEffect(() => () => pending.current?.cancel(), []);
 
-  const save = useCallback(async (updates: Record<string, unknown>): Promise<boolean> => {
-    const id = ++latest.current;
+  const write = useCallback(async (id: number, updates: Record<string, unknown>): Promise<boolean> => {
     const outcome = await updateMachineSettingsInline(updates);
     // `uncertain` isn't success: the caller can't know the value it shows was saved.
     if (outcome !== "elevation_required") return outcome === "committed";
-    // A newer write started first owns the prompt; this late 403 must not replace it.
+    // A newer save was issued while this one was out; it owns any prompt.
     if (id !== latest.current) return false;
-    // A newer write cancels the pending one, so every save promise settles.
-    pending.current?.cancel();
     return new Promise<boolean>((resolve) => {
       const finish = (ok: boolean) => {
         if (pending.current === request) {
@@ -46,6 +44,19 @@ export function useInlineMachineSave() {
       setElevation(request);
     });
   }, []);
+
+  // Writes run one at a time so acknowledgements resolve in issue order.
+  const save = useCallback(
+    (updates: Record<string, unknown>): Promise<boolean> => {
+      const id = ++latest.current;
+      // Settles a waiting prompt so it can't block this write or retry over it.
+      pending.current?.cancel();
+      const run = queue.current.then(() => write(id, updates));
+      queue.current = run.catch(() => {});
+      return run;
+    },
+    [write],
+  );
 
   return { save, elevation };
 }

@@ -69,8 +69,8 @@ it("a newer write cancels the pending prompt, and cancel resolves as not saved",
     second = result.current.save({ sandbox: { default_image: "x" } });
   });
   await expect(first).resolves.toBe(false);
-  await waitFor(() => expect(result.current.elevation).not.toBe(firstPrompt));
-  expect(result.current.elevation).not.toBeNull();
+  await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  expect(result.current.elevation).not.toBe(firstPrompt);
   act(() => result.current.elevation!.cancel());
   await expect(second).resolves.toBe(false);
   expect(result.current.elevation).toBeNull();
@@ -147,14 +147,56 @@ it("an older write's late 403 doesn't replace the newer write's prompt", async (
   act(() => {
     newer = result.current.save({ sandbox: { container_runtime: "podman" } });
   });
-  await waitFor(() => expect(result.current.elevation).not.toBeNull());
-  const prompt = result.current.elevation;
-
   releaseOlder!();
   expect(await older).toBe(false);
-  expect(result.current.elevation).toBe(prompt);
+  await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  const prompt = result.current.elevation;
 
   await act(async () => void (await prompt!.submit("right")));
   expect(await newer).toBe(true);
   expect(committed).toEqual([{ sandbox: { container_runtime: "podman" } }]);
+});
+
+it("a newer committed save retires an older retry still waiting on elevation", async () => {
+  const committed: unknown[] = [];
+  let elevated = false;
+  let elevate: (() => void) | undefined;
+  server.use(
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = await request.json();
+      if (!elevated) return HttpResponse.json({ error: "elevation_required" }, { status: 403 });
+      committed.push(body);
+      return new HttpResponse(null, { status: 204 });
+    }),
+    // The server grants elevation, but its reply reaches the browser late.
+    http.post("*/api/login/elevate", async () => {
+      elevated = true;
+      await new Promise<void>((r) => (elevate = r));
+      return HttpResponse.json({ elevated_until_secs: 900 });
+    }),
+  );
+  const { result } = renderHook(() => useInlineMachineSave());
+  let older: Promise<boolean> | undefined;
+  act(() => {
+    older = result.current.save({ worktree: { enabled: true } });
+  });
+  await waitFor(() => expect(result.current.elevation).not.toBeNull());
+  let submitted: Promise<string | null> | undefined;
+  act(() => {
+    submitted = result.current.elevation!.submit("right");
+  });
+  await waitFor(() => expect(elevate).toBeDefined());
+
+  let newer: Promise<boolean> | undefined;
+  act(() => {
+    newer = result.current.save({ worktree: { enabled: false } });
+  });
+  expect(await newer).toBe(true);
+
+  await act(async () => {
+    elevate!();
+    await submitted;
+  });
+  expect(committed).toEqual([{ worktree: { enabled: false } }]);
+  expect(await older).toBe(false);
 });
