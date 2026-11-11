@@ -216,7 +216,12 @@ impl Shared {
                     .handle_subagent_update(notification.session_id, update)
                     .await;
             }
-            SessionUpdate::SessionMessage(_) | SessionUpdate::SessionMessageChunk(_) => return,
+            SessionUpdate::SessionMessage(message) => {
+                return self
+                    .handle_session_message(notification.session_id, message)
+                    .await;
+            }
+            SessionUpdate::SessionMessageChunk(_) => return,
             update if from_child => {
                 return self
                     .handle_child_notification(notification.session_id, update)

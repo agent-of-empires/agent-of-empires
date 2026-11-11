@@ -456,8 +456,8 @@ pub enum SubagentState {
 pub struct SubagentRecord {
     pub session_id: String,
     pub parent_session_id: String,
-    /// The `Task`/`Agent` tool call that spawned it, from the adapter's
-    /// `_meta.<ns>.parentToolUseId`. Unset renders the child in a flat roster.
+    /// The card for the delegation message that launched it (its message id).
+    /// Unset renders the child in a flat roster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -2,13 +2,18 @@
 //! parent's connection and arrive addressed to their own session id.
 
 use agent_client_protocol::schema::MaybeUndefined;
-use agent_client_protocol::v1::schema::{SessionId, SessionUpdate, StateUpdate, SubagentUpdate};
+use agent_client_protocol::v1::schema::{
+    ContentBlock, SessionId, SessionMessage, SessionUpdate, StateUpdate, SubagentUpdate,
+};
 
 use super::notifications::Shared;
 use crate::acp::acp_client::config_options::map_acp_config_option;
 use crate::acp::acp_client::tool_context::update_tool_context_cache;
+use crate::acp::acp_client::tool_output::preview_args;
 use crate::acp::acp_client::update_events::map_update_to_events;
-use crate::acp::state::{ConfigOptionCategory, Event, SubagentRecord, SubagentState};
+use crate::acp::state::{
+    ConfigOptionCategory, Event, SubagentRecord, SubagentState, ToolCall, ToolOutputBlock,
+};
 
 fn patch<T>(slot: &mut Option<T>, incoming: MaybeUndefined<T>) {
     match incoming {
@@ -89,20 +94,113 @@ impl Shared {
         {
             return;
         }
-        let link = match &update.meta {
-            MaybeUndefined::Value(meta) => self
-                .profile
-                .parent_tool_use_id_from_meta(&Some(meta.clone())),
-            _ => None,
-        };
         self.publish_subagent(&parent, &child, |record| {
             record.parent_session_id = parent.0.to_string();
-            if link.is_some() {
-                record.parent_tool_call_id = link;
-            }
             patch(&mut record.title, update.title);
             patch(&mut record.description, update.description);
             apply_state(record, update.state);
+        })
+        .await;
+    }
+
+    /// `session` is the session the message arrived on. The adapter hides the
+    /// Agent call, so the delegation prompt (parent to child) becomes the card
+    /// that nests the child's tool calls, and the child's reply or hand-back
+    /// report (child to parent) completes it. Other messages are dropped.
+    pub(super) async fn handle_session_message(&self, session: SessionId, message: SessionMessage) {
+        let (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient)) =
+            (&message.sender_session_id, &message.recipient_session_id)
+        else {
+            return;
+        };
+        let child_of_session = |id: &SessionId| {
+            self.ingress
+                .child_route(id)
+                .is_some_and(|route| route.parent == session)
+        };
+        let text: String = match &message.content {
+            MaybeUndefined::Value(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            _ => String::new(),
+        };
+        if *sender == session && child_of_session(recipient) {
+            self.start_delegation_card(&session, recipient, message.message_id.0.to_string(), text)
+                .await;
+        } else if *recipient == session && child_of_session(sender) {
+            self.complete_delegation_card(sender, text).await;
+        }
+    }
+
+    /// The first parent-to-child message links the child to its launch. Later
+    /// ones are follow-ups, not new launches.
+    async fn start_delegation_card(
+        &self,
+        parent: &SessionId,
+        child: &SessionId,
+        message_id: String,
+        prompt: String,
+    ) {
+        let (title, description, outer) = {
+            let subagents = self.subagents.lock().expect("subagents mutex poisoned");
+            let Some(record) = subagents.get(child.0.as_ref()) else {
+                return;
+            };
+            if record.parent_tool_call_id.is_some() {
+                return;
+            }
+            (
+                record.title.clone(),
+                record.description.clone(),
+                subagents
+                    .get(parent.0.as_ref())
+                    .and_then(|record| record.parent_tool_call_id.clone()),
+            )
+        };
+        let name = title.clone().or(description.clone()).unwrap_or_default();
+        let args = serde_json::json!({ "description": description.or(title), "prompt": prompt });
+        self.emit(Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: message_id.clone(),
+                name,
+                kind: "think".into(),
+                args_preview: preview_args(&args),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: outer,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        })
+        .await;
+        self.publish_subagent(parent, child, |record| {
+            record.parent_tool_call_id = Some(message_id);
+        })
+        .await;
+    }
+
+    async fn complete_delegation_card(&self, child: &SessionId, reply: String) {
+        let Some(tool_call_id) = self
+            .subagents
+            .lock()
+            .expect("subagents mutex poisoned")
+            .get(child.0.as_ref())
+            .and_then(|record| record.parent_tool_call_id.clone())
+        else {
+            return;
+        };
+        self.emit(Event::ToolCallCompleted {
+            tool_call_id,
+            is_error: false,
+            output: vec![ToolOutputBlock::Text {
+                text: reply.clone(),
+            }],
+            content: reply,
+            completed_at: chrono::Utc::now(),
+            async_subagent: false,
         })
         .await;
     }
@@ -191,9 +289,213 @@ mod tests {
                 "title": "Explore",
                 "state": { "state": state },
                 "capabilities": { "cancel": {} },
-                "_meta": { "claudeCode": { "parentToolUseId": "tool-1" } },
             },
         }))
+    }
+
+    /// The parent-view delegation message `linkedSessionMessages` publishes.
+    fn delegation(id: &str, child: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": "root",
+            "update": {
+                "sessionUpdate": "session_message",
+                "messageId": id,
+                "senderSessionId": "root",
+                "recipientSessionId": child,
+                "recipientMessageId": id,
+                "content": [{ "type": "text", "text": text }],
+            },
+        })
+    }
+
+    /// A child's message to its parent: a foreground reply (`<launch>:reply`)
+    /// or a hand-back report.
+    fn to_parent(id: &str, sender: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": "root",
+            "update": {
+                "sessionUpdate": "session_message",
+                "messageId": id,
+                "senderSessionId": sender,
+                "recipientSessionId": "root",
+                "content": [{ "type": "text", "text": text }],
+            },
+        })
+    }
+
+    fn harness() -> (Arc<SessionIngress>, Shared, mpsc::Receiver<Event>) {
+        let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+        let (event_tx, events) = mpsc::channel(16);
+        let (lifecycle_tx, _lifecycle) = mpsc::channel(16);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &CLAUDE,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            ingress.clone(),
+            None,
+        );
+        (ingress, shared, events)
+    }
+
+    async fn drain(shared: Shared, mut events: mpsc::Receiver<Event>) -> Vec<Event> {
+        drop(shared);
+        let mut all = Vec::new();
+        while let Some(event) = events.recv().await {
+            all.push(event);
+        }
+        all
+    }
+
+    /// The announcement precedes the prompt pair: the delegation message
+    /// becomes the card and patches the link into a full snapshot. The
+    /// child's own view of the prompt and a later follow-up add nothing.
+    #[tokio::test]
+    async fn delegation_message_links_the_child_and_starts_its_card() {
+        let (ingress, shared, events) = harness();
+        feed(
+            &ingress,
+            &shared,
+            serde_json::to_value(announce("root", "running")).unwrap(),
+        )
+        .await;
+        feed(
+            &ingress,
+            &shared,
+            delegation("tool-1", "child", "find the bug"),
+        )
+        .await;
+        let mut child_view = delegation("tool-1", "child", "find the bug");
+        child_view["sessionId"] = "child".into();
+        child_view["update"]["senderMessageId"] = "tool-1".into();
+        feed(&ingress, &shared, child_view).await;
+        feed(
+            &ingress,
+            &shared,
+            delegation("send-2", "child", "and another"),
+        )
+        .await;
+
+        let events = drain(shared, events).await;
+        let [Event::SubagentUpdated {
+            subagent: first, ..
+        }, Event::ToolCallStarted { tool_call }, Event::SubagentUpdated {
+            subagent: linked, ..
+        }] = events.as_slice()
+        else {
+            panic!("unexpected events: {events:?}");
+        };
+        assert_eq!(first.parent_tool_call_id, None);
+        assert_eq!(tool_call.id, "tool-1");
+        assert_eq!(tool_call.name, "Explore");
+        assert_eq!(tool_call.kind, "think");
+        assert_eq!(tool_call.parent_tool_call_id, None);
+        assert!(tool_call.args_preview.contains("find the bug"));
+        assert_eq!(linked.parent_tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(linked.title.as_deref(), Some("Explore"));
+        assert!(linked.cancel_capable);
+        assert_eq!(linked.state, SubagentState::Running);
+    }
+
+    /// A foreground reply and a hand-back report both complete the card with
+    /// the child's text; a stranger's message or one before the link does not.
+    #[tokio::test]
+    async fn child_message_to_the_parent_completes_the_card() {
+        let (ingress, shared, events) = harness();
+        feed(
+            &ingress,
+            &shared,
+            serde_json::to_value(announce("root", "running")).unwrap(),
+        )
+        .await;
+        feed(
+            &ingress,
+            &shared,
+            to_parent("tool-1:reply", "child", "too early"),
+        )
+        .await;
+        feed(&ingress, &shared, delegation("tool-1", "child", "go")).await;
+        feed(
+            &ingress,
+            &shared,
+            to_parent("tool-1:reply", "stranger", "forged"),
+        )
+        .await;
+        feed(
+            &ingress,
+            &shared,
+            to_parent("tool-1:reply", "child", "the answer"),
+        )
+        .await;
+        feed(
+            &ingress,
+            &shared,
+            to_parent("handback-9", "child", "the report"),
+        )
+        .await;
+
+        let events = drain(shared, events).await;
+        let completions: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallCompleted {
+                    tool_call_id,
+                    content,
+                    output,
+                    is_error,
+                    ..
+                } => Some((
+                    tool_call_id.as_str(),
+                    content.as_str(),
+                    output.len(),
+                    *is_error,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            [
+                ("tool-1", "the answer", 1, false),
+                ("tool-1", "the report", 1, false)
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolCallStarted { .. }))
+                .count(),
+            1
+        );
+    }
+
+    /// A message naming a child nobody announced creates no card, link or
+    /// route, so a later announcement still starts unlinked.
+    #[tokio::test]
+    async fn delegation_for_an_unannounced_child_is_ignored() {
+        let (ingress, shared, events) = harness();
+        feed(&ingress, &shared, delegation("tool-1", "child", "early")).await;
+        feed(
+            &ingress,
+            &shared,
+            delegation("tool-2", "stranger", "nobody"),
+        )
+        .await;
+        feed(
+            &ingress,
+            &shared,
+            serde_json::to_value(announce("root", "running")).unwrap(),
+        )
+        .await;
+
+        let events = drain(shared, events).await;
+        let [Event::SubagentUpdated { subagent, .. }] = events.as_slice() else {
+            panic!("unexpected events: {events:?}");
+        };
+        assert_eq!(subagent.parent_tool_call_id, None);
     }
 
     async fn feed(ingress: &SessionIngress, shared: &Shared, value: serde_json::Value) {
@@ -291,6 +593,12 @@ mod tests {
         feed(
             &ingress,
             &shared,
+            delegation("tool-1", "child", "look around"),
+        )
+        .await;
+        feed(
+            &ingress,
+            &shared,
             serde_json::json!({
                 "sessionId": "child",
                 "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
@@ -331,10 +639,19 @@ mod tests {
         };
         assert_eq!(subagent.session_id, "child");
         assert_eq!(subagent.parent_session_id, "root");
-        assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
+        assert_eq!(subagent.parent_tool_call_id, None);
         assert_eq!(subagent.title.as_deref(), Some("Explore"));
         assert_eq!(subagent.state, SubagentState::Running);
         assert!(subagent.cancel_capable);
+
+        let Some(Event::ToolCallStarted { tool_call: card }) = events.recv().await else {
+            panic!("expected the delegation card");
+        };
+        assert_eq!(card.id, "tool-1");
+        let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
+            panic!("expected the linked snapshot");
+        };
+        assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
 
         let Some(Event::ToolCallStarted { tool_call }) = events.recv().await else {
             panic!("expected the child's tool call");
