@@ -240,7 +240,7 @@ impl ServeArgs {
             if self.port.is_none() {
                 self.port = Some(resolve_serve_port(
                     std::env::var_os("AOE_SERVE_PORT"),
-                    || crate::session::config::Config::load_or_warn().serve.port,
+                    || Ok(crate::session::config::Config::load()?.serve.port),
                 )?);
             }
         }
@@ -260,11 +260,11 @@ impl ServeArgs {
 /// `AOE_SERVE_PORT` wins over the configured port; an empty value counts as unset.
 fn resolve_serve_port(
     env: Option<std::ffi::OsString>,
-    configured: impl FnOnce() -> u16,
+    configured: impl FnOnce() -> Result<u16>,
 ) -> Result<u16> {
     let Some(raw) = env.filter(|raw| !raw.is_empty()) else {
         // config.toml bypasses the settings validator, and port 0 binds an ephemeral port.
-        let port = configured();
+        let port = configured()?;
         return (port != 0)
             .then_some(port)
             .context("Invalid [serve] port 0: expected 1-65535");
@@ -2980,12 +2980,13 @@ mod tests {
         ];
         for (env, expected) in cases {
             assert_eq!(
-                resolve_serve_port(env.clone(), || 9000).ok(),
+                resolve_serve_port(env.clone(), || Ok(9000)).ok(),
                 expected,
                 "{env:?}"
             );
         }
-        assert!(resolve_serve_port(None, || 0).is_err());
+        assert!(resolve_serve_port(None, || Ok(0)).is_err());
+        assert!(resolve_serve_port(None, || anyhow::bail!("bad config")).is_err());
     }
 
     #[test]
