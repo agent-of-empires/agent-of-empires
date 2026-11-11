@@ -415,6 +415,7 @@ export type AcpEvent =
         attachments?: PromptAttachmentRefWire[];
         /** Client-minted id echoed back so the optimistic row reconciles by id. */
         prompt_id?: string | null;
+        synthesized?: boolean;
       };
     }
   | {

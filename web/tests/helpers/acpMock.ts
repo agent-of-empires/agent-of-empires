@@ -15,6 +15,8 @@ export interface AcpSessionMockOptions {
   initialEvents?: unknown[];
   /** Events replayed after a prompt POST, standing in for the agent's turn. */
   onPrompt?: (body: AcpPromptBody) => unknown[];
+  /** Retain canonical prompt rows for replay, but hold their live transcript deltas. */
+  holdPromptTranscript?: boolean;
   onConfigOption?: (body: { config_id: string; value: string }) => unknown[];
   about?: Record<string, unknown>;
   /** Report the session trashed with a stopped worker (#2529). */
@@ -47,6 +49,8 @@ export interface AcpSessionMock {
   telemetryPings: Array<{ surface?: string }>;
   /** Deliver events as frames, buffered until the WS connects. */
   pushEvents: (events: unknown[]) => void;
+  /** Override text to make a late delta's React commit observable. */
+  releasePromptTranscript: (text?: string) => void;
 }
 
 /**
@@ -121,6 +125,7 @@ function foldEventToRow(event: unknown, seq: number, nextGroup: () => string, op
   return null;
 }
 
+/** Provide ordered REST/WS session history, optionally holding live prompt rows for recovery tests. */
 export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {}): Promise<AcpSessionMock> {
   const sessionId = opts.sessionId ?? "sess-1";
   const title = opts.title ?? "acp-mock";
@@ -133,6 +138,7 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   let groupCounter = 0;
   const nextGroup = () => `g${++groupCounter}`;
   const openMessageGroup: { id: string | null } = { id: null };
+  const heldPromptTranscript: string[] = [];
   const pushEvents = (events: unknown[]) => {
     for (const event of events) {
       const at = ++seq;
@@ -142,7 +148,9 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
       const row = foldEventToRow(event, at, nextGroup, openMessageGroup);
       if (row) {
         rowLog.push({ seq: at, row });
-        ws?.send(JSON.stringify({ kind: "transcript_delta", delta: { Append: row } }));
+        const payload = JSON.stringify({ kind: "transcript_delta", delta: { Append: row } });
+        if (opts.holdPromptTranscript && row.kind === "user_prompt") heldPromptTranscript.push(payload);
+        else ws?.send(payload);
       }
     }
   };
@@ -154,6 +162,13 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     configOptionBodies: [],
     telemetryPings: [],
     pushEvents,
+    releasePromptTranscript: (text) => {
+      for (const payload of heldPromptTranscript.splice(0)) {
+        const delta = JSON.parse(payload);
+        if (text !== undefined) delta.delta.Append.text = text;
+        ws?.send(JSON.stringify(delta));
+      }
+    },
   };
 
   await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));

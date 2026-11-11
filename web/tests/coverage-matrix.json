@@ -3839,6 +3839,22 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.sent-prompt-recovery",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/acp-sent-prompt-recovery.spec.ts",
+        "src/hooks/useAcpPromptRecovery.test.ts",
+        "src/hooks/acpSession/reducer.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/acpSession/useAcpConnection.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "An acknowledged local prompt with a missed canonical row is recovered by prompt seq and canonical successor IDs, not by text or time. Only raw starts with known earliest post-prompt provenance attest tool anchors; repeated starts cannot overwrite their origin, and cached/snapshot rows of unknown origin stay conservative. Live/replay/cache/snapshot regressions and a repeated-start browser case keep an existing tool before the recovered prompt while genuine new tools remain successors. Recovery rechecks after optimistic-row commits and ignores fresh/late foreign ACKs. Older pages deduplicate canonical prompts while retaining tool reconciliation. Live rows remain unchanged. Stable IDs first observed before the ACK cannot anchor recovery, including patched compaction summaries, keyed notices, reused tool completions, and message rows. Batched live, replay, snapshot, cache and older-history observations retain that provenance; older pages use their cursor as an upper sequence bound. A genuinely new eligible successor can re-arm an exhausted budget once, with at most six reads per prompt per dial even while new rows keep streaming; non-row frames and repeated patches do not re-arm. No prompt is resent. Normal row delivery needs no recovery. The browser fixture holds the live delta while preserving its row in replay, then awaits a visible late-delta commit before checking order and uniqueness."
+    },
+    {
       "id": "acp.typing-keeps-transcript-pinned",
       "kind": "mocked-playwright",
       "risk": "medium",
