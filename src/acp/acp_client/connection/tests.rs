@@ -559,14 +559,26 @@ async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
         (Some("default"), &["default"], Some("default")),
     ];
     for (default_mode, want_sets, want_mode) in cases {
+        // The connection only dispatches a prompt once session setup, default
+        // mode included, is done; `ready_rx` fires before `session/new`.
+        let (prompted_tx, mut prompted_rx) = mpsc::unbounded_channel();
         let mut fake =
-            spawn_fake_connection_with("s-mode", default_mode, Some(MODE_OPTIONS), |_| Vec::new())
-                .await;
-        // The default is applied before the handshake reports ready, so the
-        // events and recorded requests are complete here.
-        fake.event_rx.close();
+            spawn_fake_connection_with("s-mode", default_mode, Some(MODE_OPTIONS), move |_| {
+                let _ = prompted_tx.send(());
+                Vec::new()
+            })
+            .await;
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                TextContent::new("hi"),
+            )]))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), prompted_rx.recv())
+            .await
+            .expect("session setup must finish and dispatch the prompt");
         let mut last_mode = None;
-        while let Some(event) = fake.event_rx.recv().await {
+        while let Ok(event) = fake.event_rx.try_recv() {
             if let Event::ConfigOptionsUpdated { options } = event {
                 last_mode = options
                     .iter()
