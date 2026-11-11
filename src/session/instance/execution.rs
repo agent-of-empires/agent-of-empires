@@ -2003,7 +2003,7 @@ impl Instance {
         let direct_capture = self.launch_invokes_resolved_agent_directly(agent);
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut resolved_target_session_id = None;
-        let mut inputs = self.native_launch_inputs(agent, config)?;
+        let mut inputs = self.native_launch_inputs(agent, &config)?;
         let parsed = super::launch_command::parse_launch_command(self.get_tool_command())
             .context("native program is missing")?;
         inputs.environment.extend(parsed.assignments);
@@ -3180,11 +3180,25 @@ impl Instance {
                 ),
             }
         }
-        if parsed.assignments.is_empty() {
+        // A literal prefix assignment for a routing key would override the
+        // attested store: the host wrapper exports the snapshot, then `env`
+        // reassigns from the prefix, so the agent would read a different store
+        // than its binding records. The frozen snapshot is authoritative; keep
+        // only prefixes it does not route.
+        let routing_keys: Vec<&str> = execution
+            .map(|execution| execution.routing.iter())
+            .or_else(|| unpinned.map(|unpinned| unpinned.routing.iter()))
+            .map(|routing| routing.map(|(key, _)| key.as_str()).collect())
+            .unwrap_or_default();
+        let assignments: Vec<(String, String)> = parsed
+            .assignments
+            .into_iter()
+            .filter(|(key, _)| !routing_keys.contains(&key.as_str()))
+            .collect();
+        if assignments.is_empty() {
             Ok(shell_words::join(words))
         } else {
-            let assignments = parsed
-                .assignments
+            let assignments = assignments
                 .into_iter()
                 .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
                 .collect::<Vec<_>>()
@@ -3939,12 +3953,98 @@ mod tests {
             .unwrap();
         let parsed = super::super::launch_command::parse_launch_command(&frozen).unwrap();
         assert_eq!(parsed.words[0], execution.program.to_str().unwrap());
+        assert!(
+            parsed.assignments.is_empty(),
+            "both prefix keys are routed by the attested snapshot: {frozen}"
+        );
+        // The effective environment must match the binding, not the literal prefix.
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
         assert_eq!(
-            parsed.assignments,
-            [
-                ("PATH".into(), bin.to_str().unwrap().into()),
-                ("CLAUDE_CONFIG_DIR".into(), store.to_str().unwrap().into()),
-            ]
+            routed,
+            Some(Some(
+                store.canonicalize().unwrap().to_string_lossy().into_owned()
+            ))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_conflicting_prefix_store_yields_to_the_attested_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _config = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let attested = root.path().join("attested-store");
+        let conflicting = root.path().join("prefix-store");
+        std::fs::create_dir_all(&attested).unwrap();
+        std::fs::create_dir_all(&conflicting).unwrap();
+        let mut instance = Instance::new("prefix-conflict", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(conflicting.to_str().unwrap()),
+        );
+        // Store A is what resolution attests; store B reaches the frozen launch
+        // only as a literal prefix (a recorded conversation, or an explicit
+        // `agent_config_dir`, can disagree with the stored command's prefix).
+        instance.command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(attested.to_str().unwrap()),
+        );
+        let execution = instance.resolve_native_execution(None).unwrap();
+        assert_eq!(
+            execution.binding.stores,
+            [attested.canonicalize().unwrap()],
+            "the attested store governs the binding"
+        );
+        let conflicting_command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(conflicting.to_str().unwrap()),
+        );
+        let frozen = instance
+            .freeze_native_invocation(
+                conflicting_command,
+                Some(&execution),
+                None,
+                &AgentLaunchContext::host(execution.agent.builtin(), None),
+            )
+            .unwrap();
+        let parsed = super::super::launch_command::parse_launch_command(&frozen).unwrap();
+        assert!(
+            parsed.assignments.is_empty(),
+            "a conflicting prefix must not re-assert a routed key: {frozen}"
+        );
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                attested
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the effective environment must match the attested binding, not the prefix"
         );
     }
 

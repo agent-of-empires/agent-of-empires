@@ -3508,6 +3508,101 @@ mod tests {
         );
     }
 
+    /// A literal `NAME=value` prefix must not outrank the attested store: the
+    /// frozen launch runs `env`, which would otherwise reassign the key the
+    /// snapshot already exports.
+    #[test]
+    #[serial_test::serial]
+    fn a_recorded_store_outranks_a_literal_prefix_assignment() {
+        let _app = crate::session::test_support::isolate_app_dir();
+        let stub = tempfile::tempdir().unwrap();
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            stub.path(),
+            "claude",
+            "#!/bin/sh\nexit 1\n",
+        );
+        let home = dirs::home_dir().unwrap();
+        let app = crate::session::get_app_dir().unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        let project = home.join("project-prefix-conflict");
+        std::fs::create_dir_all(&project).unwrap();
+        let profile = crate::session::config::effective_profile("");
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take(&profile);
+        let sid = "99999999-8888-7777-6666-555555555555";
+        for root in ["recorded", "prefix"] {
+            std::fs::create_dir_all(home.join(root)).unwrap();
+        }
+        std::fs::write(
+            app.join("config.toml"),
+            "[session.agent_config_dir]\nclaude = \"~/recorded\"\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("claude-prefix-conflict", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        // The stored command carries a different store than the recorded binding.
+        inst.command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(&home.join("prefix").to_string_lossy()),
+        );
+        inst.source_profile = profile.clone();
+        inst.agent_session_id = Some(sid.into());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: sid.into(),
+            provenance: crate::session::ConversationProvenance::Asserted,
+            transcript_path: None,
+            execution: Some(
+                inst.resolve_native_execution(None)
+                    .expect("the recorded entry attests a store")
+                    .binding,
+            ),
+        });
+        inst.resume_intent = crate::session::ResumeIntent::Default;
+        let transcript = home
+            .join("recorded/projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &crate::session::capture::canonicalize_or_raw(project.to_str().unwrap())
+                    .to_string_lossy(),
+            ))
+            .join(format!("{sid}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, "conversation\n").unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("a recorded store must still launch");
+        let command = prepared.command.expect("the launch has a command");
+        let parsed = super::parse_launch_command(&command).expect("frozen launch parses");
+        assert!(
+            !parsed
+                .assignments
+                .iter()
+                .any(|(key, _)| key == "CLAUDE_CONFIG_DIR"),
+            "the prefix must not re-assert a routed store: {command}"
+        );
+        let execution = prepared.execution.expect("managed launch execution");
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                home.join("recorded")
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the effective launch environment must match the attested binding"
+        );
+    }
+
     /// A typed title rides the first launch as the agent's own session name, quoted, and only
     /// once the setting is on: with it off the agent is not even probed for the flag.
     #[test]
