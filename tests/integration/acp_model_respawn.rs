@@ -394,7 +394,16 @@ async fn reset_reapplies_the_live_model_config_pick() {
     let record_path = temp.path().join("config-option-calls.log");
     let mut env = shim_env(&record_path, false, false);
     env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
-    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
+    let mut config = spawn_config(
+        publisher_root,
+        shim_path(),
+        env,
+        None,
+        Some("opus".into()),
+        None,
+    );
     config.default_model_config = [("fast".to_string(), "on".to_string())].into();
     let mut client = AcpClient::spawn(config, AcpSessionId("model-config-reset".into()))
         .await
@@ -444,7 +453,16 @@ async fn second_reset_keeps_a_toggle_turned_off_after_the_first() {
     let record_path = temp.path().join("config-option-calls.log");
     let mut env = shim_env(&record_path, false, false);
     env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
-    let mut config = spawn_config(shim_path(), env, None, Some("opus".into()), None);
+    let publisher_root_owner = crate::common::acp_publisher_root();
+    let publisher_root = publisher_root_owner.path();
+    let mut config = spawn_config(
+        publisher_root,
+        shim_path(),
+        env,
+        None,
+        Some("opus".into()),
+        None,
+    );
     config.default_model_config = [
         ("fast".to_string(), "on".to_string()),
         ("ultracode".to_string(), "on".to_string()),
@@ -566,7 +584,10 @@ async fn model_config_picks_reapplied_after_model_and_effort() {
         let record_path = temp.path().join("config-option-calls.log");
         let mut env = shim_env(&record_path, true, true);
         env.push(("SHIM_MODEL_CONFIG".into(), "1".into()));
+        let publisher_root_owner = crate::common::acp_publisher_root();
+        let publisher_root = publisher_root_owner.path();
         let mut config = spawn_config(
+            publisher_root,
             shim_path(),
             env,
             Some("stored-model-config-session".into()),
