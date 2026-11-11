@@ -1145,7 +1145,8 @@ pub(crate) async fn create_session_with(
             || !body.extra_repo_paths.is_empty());
         let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
         let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
-        let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
+        let (scratch, trust_hooks, skip_on_create) =
+            (body.scratch, body.trust_hooks, body.skip_on_create);
         let missing = tokio::task::spawn_blocking(move || {
             use crate::session::builder::structured::{
                 preparation_hooks_apply, validate_structured_choice, StructuredChoice,
@@ -1169,6 +1170,7 @@ pub(crate) async fn create_session_with(
                         &project_path,
                         scratch,
                         trust_hooks,
+                        skip_on_create,
                     )
                 },
             };

@@ -2829,6 +2829,41 @@ mod tests {
         Ok(())
     }
 
+    /// Skipping setup skips only on_create: on_launch still runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_create_without_setup_still_runs_on_launch() -> anyhow::Result<()> {
+        let home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        let launched = home.path().join("on-launch-ran");
+        crate::session::config::update_config(|config| {
+            config.hooks.on_create = vec!["exit 3".into()];
+            config.hooks.on_launch = vec![format!("touch '{}'", launched.display())];
+        })?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut spec = test_spec();
+        spec.scratch = true;
+        spec.view = crate::session::View::Terminal;
+        spec.skip_on_create = true;
+        let created =
+            crate::server::session_spawn::spawn_structured_session(&state.session_service, spec)
+                .await;
+        assert!(
+            launched.exists(),
+            "on_launch did not run: {:?}",
+            created.err()
+        );
+        assert!(storage.load()?.iter().any(|row| row.created_without_setup));
+        Ok(())
+    }
+
     #[test]
     fn idempotent_match_survives_triage_but_not_removal() {
         let mut archived = plugin_instance("cron", "k", "h");

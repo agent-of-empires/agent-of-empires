@@ -451,6 +451,7 @@ pub(crate) async fn spawn_structured_session(
                         std::path::Path::new(&original_path),
                         scratch,
                         trust_hooks,
+                        skip_on_create,
                     ),
                 };
                 if let Err(error) = validate_structured_choice(&choice, &resolved_config) {

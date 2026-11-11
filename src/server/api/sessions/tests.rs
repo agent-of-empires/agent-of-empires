@@ -11211,22 +11211,44 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
     }
-    // A repository on_create hook may install the adapter before launch, so it isn't refused,
-    // unless the create skips the repository's hooks.
+    // An on_create hook may install the adapter before launch, so it isn't refused, unless
+    // the create skips the repository's hooks or skips on_create.
     let hooked = project_with_on_create_hooks(&["npm install"]);
     let hooked_path = hooked.path().display().to_string();
-    for (trust_hooks, refused) in [(None, false), (Some(true), false), (Some(false), true)] {
-        let mut extra = serde_json::json!({ "view": "structured", "path": hooked_path });
+    let refused_for = |extra: serde_json::Value| {
+        let (state, request) = (state.clone(), base(extra.clone()));
+        async move {
+            let (_, bytes) = post_create_bytes(&state, request).await;
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (
+                body["error"] == "acp_adapter_missing",
+                format!("{extra}: {body}"),
+            )
+        }
+    };
+    for (trust_hooks, skip, refused) in [
+        (None, false, false),
+        (Some(true), false, false),
+        (Some(false), false, true),
+        (None, true, true),
+    ] {
+        let mut extra = serde_json::json!({
+            "view": "structured", "path": hooked_path, "skip_on_create": skip,
+        });
         if let Some(trust) = trust_hooks {
             extra["trust_hooks"] = serde_json::json!(trust);
         }
-        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        assert_eq!(
-            body["error"] == "acp_adapter_missing",
-            refused,
-            "{extra}: {body}"
-        );
+        let (got, detail) = refused_for(extra).await;
+        assert_eq!(got, refused, "{detail}");
+    }
+    crate::session::config::update_config(|config| {
+        config.hooks.on_create = vec!["npm install".into()];
+    })
+    .unwrap();
+    for (skip, refused) in [(false, false), (true, true)] {
+        let extra = serde_json::json!({ "view": "structured", "skip_on_create": skip });
+        let (got, detail) = refused_for(extra).await;
+        assert_eq!(got, refused, "profile on_create: {detail}");
     }
 }
 

@@ -2329,6 +2329,7 @@ impl NewSessionDialog {
                     std::path::Path::new(&path),
                     self.scratch,
                     None,
+                    false,
                 )
             },
         };
