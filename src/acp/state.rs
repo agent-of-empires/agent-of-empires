@@ -267,6 +267,9 @@ pub struct AvailableCommand {
     pub input_hint: Option<String>,
 }
 
+/// The `Other` category claude-agent-acp uses for Fast mode and Ultracode.
+pub const MODEL_CONFIG_CATEGORY: &str = "model_config";
+
 /// Semantic category of an ACP `SessionConfigOption`; unknown values round-trip as `Other`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -296,6 +299,16 @@ pub struct ConfigOptionDescriptor {
     pub category: ConfigOptionCategory,
     pub current_value: String,
     pub options: Vec<ConfigOptionChoice>,
+}
+
+impl ConfigOptionDescriptor {
+    /// A `model_config` option whose only choices are `on` and `off`.
+    pub fn is_model_config_toggle(&self) -> bool {
+        let mut values: Vec<&str> = self.options.iter().map(|o| o.value.as_str()).collect();
+        values.sort_unstable();
+        self.category == ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into())
+            && values == ["off", "on"]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

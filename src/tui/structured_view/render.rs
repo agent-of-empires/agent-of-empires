@@ -1193,6 +1193,13 @@ fn render_status(
             Style::default().fg(theme.title),
         ));
     }
+    for toggle in state.transcript.toggles() {
+        let on = toggle.current_value == "on";
+        spans.push(Span::styled(
+            format!("· {} {} ", toggle.name, if on { "on" } else { "off" }),
+            Style::default().fg(if on { theme.title } else { theme.hint }),
+        ));
+    }
     // Label only: the payload can carry the account email, which has no place
     // in a status bar that lives in screenshots and recordings.
     if let Some(auth) = state.transcript.auth_status.as_ref() {
@@ -3200,6 +3207,33 @@ mod tests {
         state.compaction_reminder_percent = Some(75);
         state.transcript.usage = Some(usage(160_000, 200_000));
         assert!(render_dump(&state, 100, 24).contains("/compact"));
+    }
+
+    #[test]
+    fn status_line_shows_toggle_state() {
+        use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
+        let toggle = |id: &str, name: &str, current: &str| ConfigOptionDescriptor {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            category: ConfigOptionCategory::Other("model_config".into()),
+            current_value: current.into(),
+            options: ["on", "off"]
+                .map(|v| ConfigOptionChoice {
+                    value: v.into(),
+                    name: v.into(),
+                    description: None,
+                })
+                .to_vec(),
+        };
+        let mut state = test_state();
+        state.transcript.config_options = vec![
+            toggle("fast", "Fast mode", "on"),
+            toggle("ultracode", "Ultracode", "off"),
+        ];
+        let dump = render_dump(&state, 120, 24);
+        assert!(dump.contains("Fast mode on"), "{dump}");
+        assert!(dump.contains("Ultracode off"), "{dump}");
     }
 
     /// #4001: the banner lights up for a background sub-agent even while the

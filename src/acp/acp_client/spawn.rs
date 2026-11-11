@@ -33,6 +33,9 @@ pub struct SpawnConfig {
     /// The effort was set per session, not inherited from the model's profile
     /// default, so a model change must not re-resolve it.
     pub default_effort_explicit: bool,
+    /// `Instance.acp_model_config`, re-asserted through `model_config` options
+    /// after the model and effort on every establish.
+    pub default_model_config: std::collections::BTreeMap<String, String>,
     /// Applied strictly through a `category:"mode"` option on fresh sessions.
     pub default_mode: Option<String>,
     /// `Instance.agent_model`, re-asserted through a `category:"model"` option

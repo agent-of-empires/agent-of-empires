@@ -591,6 +591,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 base_host_environment,
                 default_effort: effort,
                 default_effort_explicit: req.effort_explicit,
+                default_model_config: req.model_config.clone(),
                 default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
                 default_model: model,
                 socket_path: Some(socket_path),

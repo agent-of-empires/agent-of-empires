@@ -154,6 +154,9 @@ const MODEL_VALUES = ["default", "opus", "sonnet"];
 // client that re-reads the id from the set-model response follows it; one that
 // kept the establish-time id addresses an option that no longer exists.
 let thoughtLevelId = "thought_level";
+// SHIM_MODEL_CONFIG=1 advertises `fast` always and `ultracode` only on the
+// `opus` model, as claude-agent-acp rebuilds its toggles around a model switch.
+const modelConfig = { fast: "off", ultracode: "off" };
 
 function configOptions() {
   const options = [];
@@ -180,6 +183,22 @@ function configOptions() {
       ],
     });
   }
+  if (process.env.SHIM_MODEL_CONFIG === "1") {
+    for (const [id, value] of Object.entries(modelConfig)) {
+      if (id === "ultracode" && model !== "opus") continue;
+      options.push({
+        id,
+        name: id,
+        category: "model_config",
+        type: "select",
+        currentValue: value,
+        options: [
+          { value: "on", name: "On" },
+          { value: "off", name: "Off" },
+        ],
+      });
+    }
+  }
   return options.length > 0 ? options : undefined;
 }
 
@@ -187,6 +206,7 @@ function configOptions() {
 async function handleSetConfigOption(params) {
   await record("SHIM_CONFIG_OPTION_RECORD_FILE", `${params.configId}=${params.value}\n`);
   if (params.configId === thoughtLevelId) thoughtLevel = params.value;
+  if (params.configId in modelConfig) modelConfig[params.configId] = params.value;
   if (params.configId === "model") {
     if (!MODEL_VALUES.includes(params.value)) throw new Error(`unknown model ${params.value}`);
     model = params.value;
@@ -232,6 +252,7 @@ async function handleNewSession(params) {
   model = "default";
   thoughtLevel = "medium";
   thoughtLevelId = "thought_level";
+  for (const id of Object.keys(modelConfig)) modelConfig[id] = "off";
   return withConfigOptions({ sessionId });
 }
 

@@ -865,6 +865,7 @@ async fn persist_agent_switch(
             instance.acp_session_id = None;
             instance.import_pending = None;
             instance.acp_effort = None;
+            instance.acp_model_config.clear();
             instance.agent_model = model.clone();
             instance.terminal_rebind_pending = true;
             Ok(())
@@ -971,6 +972,7 @@ pub async fn switch_acp_agent(
         model: model.clone(),
         effort: None,
         effort_explicit: false,
+        model_config: Default::default(),
         stored_acp_session_id: None,
         fork_from: None,
         seed_history_replay: false,
