@@ -77,7 +77,12 @@ impl Session {
         }
     }
 
-    pub(super) fn dispatch_config_option(&mut self, config_id: String, value: String) {
+    pub(super) fn dispatch_config_option(
+        &mut self,
+        config_id: String,
+        value: String,
+        remember: bool,
+    ) {
         // A reset re-applies `default_model`, so it follows the live pick.
         if self
             .channels
@@ -87,7 +92,7 @@ impl Session {
         {
             self.default_model = Some(value.clone());
         }
-        if self.channels.model_config.contains_key(&config_id) {
+        if remember {
             self.default_model_config
                 .insert(config_id.clone(), value.clone());
         }
@@ -175,9 +180,11 @@ impl Session {
                     acp_session_id,
                     respond_to,
                 }) => handle_delete_session_cmd(&self.connection, acp_session_id, respond_to),
-                Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                    self.dispatch_config_option(config_id, value)
-                }
+                Some(ClientCmd::SetConfigOption {
+                    config_id,
+                    value,
+                    remember,
+                }) => self.dispatch_config_option(config_id, value, remember),
                 Some(ClientCmd::ResumeBackgroundTailing(launches)) => {
                     self.shared.resume_background_tailing(launches)
                 }
@@ -483,7 +490,9 @@ impl Session {
                 .await
             {
                 Some(Ok(options)) => toggles = model_config_values(&options),
-                Some(Err(reason)) => debug!("post-reset {id} rejected: {reason}"),
+                Some(Err(reason)) => {
+                    debug!(target: "acp.protocol", "post-reset {id} rejected: {reason}")
+                }
                 None => return,
             }
         }

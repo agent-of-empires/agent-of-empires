@@ -750,10 +750,16 @@ impl AcpClient {
         self.send_cmd(ClientCmd::SetMode(mode_id.to_string())).await
     }
 
-    pub async fn set_config_option(&self, config_id: &str, value: &str) -> Result<(), AcpError> {
+    pub async fn set_config_option(
+        &self,
+        config_id: &str,
+        value: &str,
+        remember: bool,
+    ) -> Result<(), AcpError> {
         self.send_cmd(ClientCmd::SetConfigOption {
             config_id: config_id.to_string(),
             value: value.to_string(),
+            remember,
         })
         .await
     }

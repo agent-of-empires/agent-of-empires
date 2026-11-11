@@ -188,9 +188,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         config_id: &str,
         value: &str,
+        remember: bool,
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.set_config_option(config_id, value).await?;
+        client.set_config_option(config_id, value, remember).await?;
         Ok(())
     }
 
@@ -208,7 +209,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
-    pub async fn resolve_permission(
     /// A watchdog respawn clones the cached spawn config, which a live
     /// `model_config` pick never reaches.
     pub async fn refresh_cached_model_config(
@@ -230,6 +230,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
+    pub async fn resolve_permission(
         &self,
         session_id: &str,
         nonce: Nonce,

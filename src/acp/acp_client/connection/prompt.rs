@@ -411,9 +411,11 @@ impl Session {
                 turn.flags.shutdown = true;
                 return Ok(Flow::Break);
             }
-            Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                self.dispatch_config_option(config_id, value)
-            }
+            Some(ClientCmd::SetConfigOption {
+                config_id,
+                value,
+                remember,
+            }) => self.dispatch_config_option(config_id, value, remember),
             Some(ClientCmd::SetMode(mode_id)) => self.dispatch_mode(mode_id, true),
             Some(ClientCmd::DeleteSession {
                 acp_session_id,
