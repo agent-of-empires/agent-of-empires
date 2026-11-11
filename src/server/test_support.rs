@@ -219,11 +219,11 @@ pub(crate) fn build_test_app_state_impl_with_event_store(
     });
     let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
     let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
-    let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
-        tx: acp_events_tx.clone(),
-        event_store: event_store.clone(),
-        control_cache: acp_control_cache.clone(),
-    });
+    let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink::new(
+        acp_events_tx.clone(),
+        event_store.clone(),
+        acp_control_cache.clone(),
+    ));
     let supervisor = std::sync::Arc::new(
         customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
             .with_native_admission(),
