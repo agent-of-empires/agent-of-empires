@@ -438,6 +438,52 @@ jobs:
           set -euo pipefail
           nix build --no-link .#packages.x86_64-linux.aoe-web-frontend
 
+  release-pr-fresh:
+    # A release PR queued after main moved would tag commits that its CHANGELOG.md
+    # section lacks. Passes on other events so it can be a required check.
+    name: Release PR Up To Date
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Look up the queued PR
+        id: pr
+        if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+        run: |
+          set -euo pipefail
+          # refs/heads/gh-readonly-queue/main/pr-<N>-<sha>
+          PR="${HEAD_REF##*/pr-}"
+          PR="${PR%%-*}"
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid \
+            --jq '"ref=\(.headRefName)\noid=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: startsWith(steps.pr.outputs.ref, 'release-plz-')
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail if main moved past the release PR
+        if: startsWith(steps.pr.outputs.ref, 'release-plz-')
+        env:
+          PR: ${{ steps.pr.outputs.number }}
+          PR_HEAD: ${{ steps.pr.outputs.oid }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch -q --no-tags origin "refs/pull/$PR/head"
+          MISSED="$(git log --oneline "$PR_HEAD..$GROUP_HEAD~1")"
+          if [ -n "$MISSED" ]; then
+            { echo '### Would ship without CHANGELOG.md entries'; echo '```'; echo "$MISSED"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=Release PR is stale::$(echo "$MISSED" | wc -l) commit(s) landed after the release PR's last refresh and would ship without CHANGELOG.md entries. Dispatch release-plz.yml to refresh the PR, then queue it again. See the job summary."
+            exit 1
+          fi
+
   website:
     name: Website Build
     runs-on: ubuntu-latest
