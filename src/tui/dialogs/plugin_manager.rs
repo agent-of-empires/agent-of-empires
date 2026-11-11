@@ -2207,6 +2207,7 @@ mod mouse_tests {
             stars: 0,
             badge: DiscoveryBadge::Unvetted,
             featured: false,
+            suggestions: false,
             install_command: String::new(),
             source_avatar_url: String::new(),
         }

@@ -66,6 +66,7 @@ pub struct DiscoveryResult {
     pub stars: u64,
     pub badge: DiscoveryBadge,
     pub featured: bool,
+    pub suggestions: bool,
     pub install_command: String,
     pub source_avatar_url: String,
 }
@@ -213,12 +214,14 @@ fn badge_repos(
             } else {
                 DiscoveryBadge::Unvetted
             };
+            let suggestions = featured.declares_suggestions(&slug);
             let owner = repo.full_name.split('/').next().unwrap_or_default();
             Some(DiscoveryResult {
                 install_command: format!("aoe plugin install {slug}"),
                 slug,
                 html_url: repo.html_url,
                 featured: is_featured,
+                suggestions,
                 description: repo.description.filter(|d| !d.is_empty()),
                 stars: repo.stargazers_count,
                 badge,
@@ -498,6 +501,19 @@ mod tests {
         let out = ranked(&[]);
         assert_eq!(out[0].slug, "gh:acme/vetted");
         assert_eq!(out[1].slug, "gh:acme/popular");
+
+        let flagged = FeaturedIndex::from_toml_str(
+            "[plugins.\"x.y\"]\nsource = \"gh:acme/vetted\"\nsuggestions = true\nversions = {}\n",
+        )
+        .unwrap();
+        let out = badge_repos(
+            vec![repo("acme/vetted", 1), repo("acme/random", 1)],
+            &flagged,
+            &[],
+        );
+        let flag = |slug: &str| out.iter().find(|r| r.slug == slug).unwrap().suggestions;
+        assert!(flag("gh:acme/vetted"));
+        assert!(!flag("gh:acme/random"));
 
         let out = ranked(&["gh:acme/vetted".to_string()]);
         assert_eq!(out[0].slug, "gh:acme/vetted");
