@@ -7993,7 +7993,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
                         text: "/new",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -12831,6 +12831,7 @@ async fn an_account_swap_out_of_a_rate_limit_park_continues_the_interrupted_prom
     let prompt = || Event::UserPromptSent {
         text: "finish the migration".into(),
         attachments: Vec::new(),
+        merged_prompt_ids: Vec::new(),
         prompt_id: None,
         synthesized: false,
         origin_plugin: None,
@@ -12990,6 +12991,7 @@ async fn the_selected_work_verdict_survives_a_concurrent_pending_turn_drain() {
         Event::UserPromptSent {
             text: "finish the migration".into(),
             attachments: Vec::new(),
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             synthesized: false,
             origin_plugin: None,

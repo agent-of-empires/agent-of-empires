@@ -411,7 +411,8 @@ pub(crate) struct SendTurnRequest<'a> {
     /// Forces the resume trigger even when the worker looks alive, mirroring
     /// the handler's idle-dormant wake (#1689).
     pub woke_idle_dormant: bool,
-    pub prompt_id: Option<String>,
+    /// Transcript row id first, then the ids of queued rows folded into the same turn.
+    pub prompt_ids: Vec<String>,
     /// True when the daemon queued this turn itself (a rate-limit resume
     /// continuation) rather than the user typing it just now, so the
     /// transcript model can skip rendering a duplicate row for it.
@@ -1015,7 +1016,7 @@ impl SessionService {
             text,
             attachments,
             woke_idle_dormant,
-            prompt_id,
+            prompt_ids,
             synthesized,
             no_revive,
         } = turn;
@@ -1119,29 +1120,39 @@ impl SessionService {
                 id,
                 text.to_string(),
                 attachments,
-                prompt_id,
+                prompt_ids,
                 synthesized,
                 caller.message_origin().map(str::to_string),
                 profile,
             )
             .await;
         let outcome = match published.disposition {
-            crate::acp::supervisor::PromptDisposition::Forward => {
-                match &receiver {
-                    Some((client, _)) => client.send_prompt(text, attachments).await.map_err(Into::into),
-                    None => self.acp_supervisor.send_prompt(id, text, attachments).await,
+            crate::acp::supervisor::PromptDisposition::Forward => match &receiver {
+                Some((client, _)) => client
+                    .send_prompt(text, attachments)
+                    .await
+                    .map_err(Into::into),
+                None => self.acp_supervisor.send_prompt(id, text, attachments).await,
+            },
+            crate::acp::supervisor::PromptDisposition::ResetContext => match &receiver {
+                Some((client, agent)) => {
+                    self.acp_supervisor
+                        .reset_client_context(
+                            client,
+                            id,
+                            agent,
+                            text,
+                            acp_mode_id.as_deref(),
+                            yolo_mode,
+                        )
+                        .await
                 }
-            }
-            crate::acp::supervisor::PromptDisposition::ResetContext => {
-                match &receiver {
-                    Some((client, agent)) => self.acp_supervisor.reset_client_context(
-                        client, id, agent, text, acp_mode_id.as_deref(), yolo_mode,
-                    ).await,
-                    None => self.acp_supervisor
+                None => {
+                    self.acp_supervisor
                         .reset_session_context(id, text, acp_mode_id.as_deref(), yolo_mode)
-                        .await,
+                        .await
                 }
-            }
+            },
         };
         match outcome {
             Ok(()) => Ok(published.seq),
@@ -1248,7 +1259,7 @@ impl SessionService {
                     text: &text,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized,
                     no_revive: false,
                 },
@@ -2014,7 +2025,7 @@ impl SessionService {
                     text: &combined,
                     attachments: &attachments,
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: sent_ids.clone(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -3103,7 +3114,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3122,7 +3133,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3141,7 +3152,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3164,7 +3175,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3183,7 +3194,7 @@ mod tests {
                         text: "hi",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },
@@ -3371,7 +3382,7 @@ mod tests {
                     text: "/new",
                     attachments: &[],
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -3462,92 +3473,93 @@ mod tests {
         use crate::acp::supervisor::test_support::AgentKeyGate;
         use std::time::Duration;
         for matching_identity in [false, true] {
-        let _home = crate::session::test_support::isolate_app_dir();
-        declare_custom_reset("/new");
-        let id = "lost-ready-receiver";
-        let service = crate::server::test_support::build_test_app_state(vec![structured_idle_row(
-            id, "bridge",
-        )])
-        .session_service
-        .clone();
-        for (n, text) in ["/clear", "after"].iter().enumerate() {
+            let _home = crate::session::test_support::isolate_app_dir();
+            declare_custom_reset("/new");
+            let id = "lost-ready-receiver";
+            let service =
+                crate::server::test_support::build_test_app_state(vec![structured_idle_row(
+                    id, "bridge",
+                )])
+                .session_service
+                .clone();
+            for (n, text) in ["/clear", "after"].iter().enumerate() {
+                service
+                    .enqueue_prompt(
+                        id,
+                        format!("q{n}"),
+                        text.to_string(),
+                        Vec::new(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let starting = service.acp_supervisor.test_hold_starting(id);
+            let mut waits = service.acp_supervisor.watch_worker_waits();
+            let drain = tokio::spawn({
+                let service = Arc::clone(&service);
+                async move { service.drain_queued_prompts_once(id).await }
+            });
+            tokio::time::timeout(Duration::from_secs(10), waits.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let before_read = Arc::new(tokio::sync::Barrier::new(2));
+            let after_read = Arc::new(tokio::sync::Barrier::new(2));
+            service.acp_supervisor.test_gate_agent_key(AgentKeyGate {
+                before_read: Arc::clone(&before_read),
+                after_read: Arc::clone(&after_read),
+            });
+            let live = save_agent_record(id, "bridge", true);
             service
-                .enqueue_prompt(
-                    id,
-                    format!("q{n}"),
-                    text.to_string(),
-                    Vec::new(),
-                    None,
-                    None,
-                )
+                .acp_supervisor
+                .test_land_worker_cmd_recording(id, &starting)
+                .await;
+            tokio::time::timeout(Duration::from_secs(10), before_read.wait())
                 .await
                 .unwrap();
-        }
-        let starting = service.acp_supervisor.test_hold_starting(id);
-        let mut waits = service.acp_supervisor.watch_worker_waits();
-        let drain = tokio::spawn({
-            let service = Arc::clone(&service);
-            async move { service.drain_queued_prompts_once(id).await }
-        });
-        tokio::time::timeout(Duration::from_secs(10), waits.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let before_read = Arc::new(tokio::sync::Barrier::new(2));
-        let after_read = Arc::new(tokio::sync::Barrier::new(2));
-        service.acp_supervisor.test_gate_agent_key(AgentKeyGate {
-            before_read: Arc::clone(&before_read),
-            after_read: Arc::clone(&after_read),
-        });
-        let live = save_agent_record(id, "bridge", true);
-        service
-            .acp_supervisor
-            .test_land_worker_cmd_recording(id, &starting)
-            .await;
-        tokio::time::timeout(Duration::from_secs(10), before_read.wait())
-            .await
-            .unwrap();
-        // Remove the ready receiver before identity validation.
-        if !matching_identity {
+            // Remove the ready receiver before identity validation.
+            if !matching_identity {
+                service.acp_supervisor.test_remove_worker(id).await;
+                drop(live);
+                crate::process::worker_registry::delete(id).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(10), before_read.wait())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+                .await
+                .unwrap();
+            // Replace after the identity read, without taking the submission lock.
             service.acp_supervisor.test_remove_worker(id).await;
-            drop(live);
+            crate::process::worker_registry::delete(id).ok();
+            let recorded = service
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(id)
+                .await;
+            let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
+            std::fs::remove_file(crate::process::worker::control_socket_sibling(&socket)).ok();
+            let _replacement = save_agent_record(id, "claude", true);
+            tokio::time::timeout(Duration::from_secs(10), after_read.wait())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            service.acp_supervisor.test_flush_worker_commands(id).await;
+            assert!(recorded.lock().unwrap().is_empty());
+            assert!(!service.fold_control_state(id).await.turn_active);
+            assert_eq!(service.queued_prompts_snapshot(id).await.len(), 2);
+            service.drain_queued_prompts_once(id).await;
+            service.acp_supervisor.test_flush_worker_commands(id).await;
+            assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
+            let rows = service.queued_prompts_snapshot(id).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].text, "after");
             crate::process::worker_registry::delete(id).unwrap();
         }
-        tokio::time::timeout(Duration::from_secs(10), before_read.wait())
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), after_read.wait())
-            .await
-            .unwrap();
-        // Replace after the identity read, without taking the submission lock.
-        service.acp_supervisor.test_remove_worker(id).await;
-        crate::process::worker_registry::delete(id).ok();
-        let recorded = service
-            .acp_supervisor
-            .test_insert_worker_cmd_recording(id)
-            .await;
-        let socket = crate::process::worker_registry::socket_path_for(id).unwrap();
-        std::fs::remove_file(crate::process::worker::control_socket_sibling(&socket)).ok();
-        let _replacement = save_agent_record(id, "claude", true);
-        tokio::time::timeout(Duration::from_secs(10), after_read.wait())
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), drain)
-            .await
-            .unwrap()
-            .unwrap();
-        service.acp_supervisor.test_flush_worker_commands(id).await;
-        assert!(recorded.lock().unwrap().is_empty());
-        assert!(!service.fold_control_state(id).await.turn_active);
-        assert_eq!(service.queued_prompts_snapshot(id).await.len(), 2);
-        service.drain_queued_prompts_once(id).await;
-        service.acp_supervisor.test_flush_worker_commands(id).await;
-        assert_eq!(*recorded.lock().unwrap(), ["reset_session"]);
-        let rows = service.queued_prompts_snapshot(id).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].text, "after");
-        crate::process::worker_registry::delete(id).unwrap();
-            }
     }
 
     /// A batch cut for one agent is withheld from a worker a resume started as another, so the
@@ -3580,7 +3592,7 @@ mod tests {
                     text: "/clear\n\nafter",
                     attachments: &[],
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
                 },
@@ -3694,6 +3706,7 @@ mod tests {
                     text: "go".into(),
                     attachments: Vec::new(),
                     prompt_id: None,
+                    merged_prompt_ids: Vec::new(),
                     synthesized: false,
                     origin_plugin: None,
                 },

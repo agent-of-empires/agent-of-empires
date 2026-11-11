@@ -116,7 +116,15 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
         let agent_key = self.agent_key_for_session(session_id).await;
-        self.reset_client_context(&client, session_id, &agent_key, text, acp_mode_id, yolo_mode).await
+        self.reset_client_context(
+            &client,
+            session_id,
+            &agent_key,
+            text,
+            acp_mode_id,
+            yolo_mode,
+        )
+        .await
     }
 
     pub(crate) async fn reset_client_context(
@@ -144,20 +152,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         // An explicit persisted mode wins over the yolo bool, as on spawn.
         let mode_id = match (acp_mode_id, yolo_mode) {
             (Some(id), _) => Some(id.to_string()),
-            (None, true) => {
-                crate::acp::agent_profiles::resolve(agent_key)
-                    .yolo_mode_id
-                    .map(str::to_string)
-            }
+            (None, true) => crate::acp::agent_profiles::resolve(agent_key)
+                .yolo_mode_id
+                .map(str::to_string),
             (None, false) => None,
         };
-        apply_mode(
-            &client,
-            session_id,
-            mode_id.as_deref(),
-            "conversation reset",
-        )
-        .await;
+        apply_mode(client, session_id, mode_id.as_deref(), "conversation reset").await;
         Ok(())
     }
 
@@ -167,6 +167,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         let client = self.ready_client(session_id).await?;
         match client.cancel_prompt().await {
             Ok(()) | Err(AcpError::AgentExited) => Ok(()),
+            Err(e) => Err(SupervisorError::Acp(e)),
+        }
+    }
+
+    /// Cancel one subagent of the session; the root turn keeps running. False
+    /// when the child is unknown or did not advertise `cancel`.
+    pub async fn cancel_subagent(
+        &self,
+        session_id: &str,
+        child_id: &str,
+    ) -> Result<bool, SupervisorError> {
+        debug!(target: "acp.supervisor", session = %session_id, child = %child_id, "subagent cancel requested");
+        let client = self.ready_client(session_id).await?;
+        match client.cancel_child(child_id).await {
+            Ok(sent) => Ok(sent),
+            Err(AcpError::AgentExited) => Ok(false),
             Err(e) => Err(SupervisorError::Acp(e)),
         }
     }
@@ -200,9 +216,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         config_id: &str,
         value: &str,
+        remember: bool,
     ) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.set_config_option(config_id, value).await?;
+        client.set_config_option(config_id, value, remember).await?;
         Ok(())
     }
 
@@ -217,6 +234,27 @@ impl<S: BroadcastSink> Supervisor<S> {
             .map(|h| &mut h.kind)
         {
             set_spawn_model(spawn_config, Some(model.to_string()));
+        }
+    }
+
+    /// A watchdog respawn clones the cached spawn config, which a live
+    /// `model_config` pick never reaches.
+    pub async fn refresh_cached_model_config(
+        &self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) {
+        if let Some(WorkerKind::Runner { spawn_config }) = self
+            .workers
+            .lock()
+            .await
+            .get_mut(session_id)
+            .map(|h| &mut h.kind)
+        {
+            spawn_config
+                .default_model_config
+                .insert(config_id.to_string(), value.to_string());
         }
     }
 

@@ -491,13 +491,14 @@ pub struct AcpConfig {
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue.
+    /// additional sessions queue. Takes effect when the Daemon starts.
     #[serde(default = "default_max_workers")]
     #[setting(
         label = "Most Agents running at once",
         widget = "number",
         min = 1,
         validate = "range:1",
+        global_only,
         advanced,
         summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
     )]

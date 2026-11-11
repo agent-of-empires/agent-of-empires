@@ -762,7 +762,7 @@ async fn sessions_turn_send(
                 SendTurnRequest { resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false, },
             )
@@ -965,7 +965,7 @@ async fn deliver_structured(
                 text: &req.message,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false,
             },
@@ -1648,6 +1648,7 @@ mod tests {
             "sess-msg-busy",
             1,
             &Event::UserPromptSent {
+                merged_prompt_ids: Vec::new(),
                 text: "the user's turn".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
@@ -1945,7 +1946,7 @@ mod tests {
                 "sess-3649",
                 "the winning turn".into(),
                 &[],
-                None,
+                Vec::new(),
                 false,
                 None,
                 None,
@@ -2005,6 +2006,7 @@ mod tests {
             );
         };
         let prompt = || Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "the owner's turn".into(),
             attachments: Vec::new(),
             prompt_id: None,

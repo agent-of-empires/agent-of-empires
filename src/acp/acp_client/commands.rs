@@ -14,6 +14,12 @@ pub(super) enum ClientCmd {
     /// forwards them to `session/prompt`. See #1000.
     Prompt(Vec<ContentBlock>),
     Cancel,
+    /// `session/cancel` for one subagent session. Answers whether it was sent:
+    /// false when the child is unknown or did not advertise `cancel`.
+    CancelChild {
+        session_id: String,
+        respond_to: oneshot::Sender<bool>,
+    },
     /// Force-stop now: end the in-flight turn with `user_forced` and let
     /// the drain task kill the worker process group + respawn. See #1727.
     ForceStop,
@@ -25,6 +31,8 @@ pub(super) enum ClientCmd {
     SetConfigOption {
         config_id: String,
         value: String,
+        /// A `model_config` pick that a conversation reset must re-send.
+        remember: bool,
     },
     /// Send the experimental `session/delete` RPC for the given ACP
     /// session id and report the outcome via `respond_to`. Issued by

@@ -28,8 +28,18 @@ import type { ServerQueuedPrompt } from "../../lib/api";
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
-  | { kind: "reduced_state"; state: ReducedState; unchanged: string[] }
-  | { kind: "frames"; frames: AcpFrame[]; rows?: ActivityRow[]; oldestSeq?: number }
+  | {
+      kind: "reduced_state";
+      state: ReducedState;
+      unchanged: string[];
+      seq?: number;
+    }
+  | {
+      kind: "frames";
+      frames: AcpFrame[];
+      rows?: ActivityRow[];
+      oldestSeq?: number;
+    }
   | { kind: "prepend"; rows: ActivityRow[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "transcript_snapshot"; rows: ActivityRow[] }
@@ -37,18 +47,32 @@ export type Action =
   | { kind: "transcript_patch"; row: ActivityRow }
   | { kind: "transcript_remove"; id: string }
   | { kind: "lagged"; skipped: number }
-  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
+  | {
+      kind: "user_prompt";
+      text: string;
+      attachments?: AcpAttachment[];
+      id?: string;
+    }
   | { kind: "prompt_send_rejected"; id: string }
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
-  | { kind: "elicitation_resolved_locally"; nonce: string; resolution: ElicitationResolution }
+  | {
+      kind: "elicitation_resolved_locally";
+      nonce: string;
+      resolution: ElicitationResolution;
+    }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
-  | { kind: "enqueue_prompt"; id: string; text: string; attachments?: PromptAttachmentInput[] }
+  | {
+      kind: "enqueue_prompt";
+      id: string;
+      text: string;
+      attachments?: PromptAttachmentInput[];
+    }
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
@@ -56,7 +80,12 @@ export type Action =
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
-  | { kind: "restart_failed"; epoch: number; message: string; stoppedSent: boolean }
+  | {
+      kind: "restart_failed";
+      epoch: number;
+      message: string;
+      stoppedSent: boolean;
+    }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -64,7 +93,11 @@ export type Action =
   | { kind: "set_pending_config_option"; configId: string; value: string }
   | { kind: "clear_pending_config_option" }
   // Only clears when still matching, so a stale failed request can't wipe a newer click.
-  | { kind: "clear_pending_config_option_if_match"; configId: string; value: string }
+  | {
+      kind: "clear_pending_config_option_if_match";
+      configId: string;
+      value: string;
+    }
   | { kind: "dismiss_config_option_switch_failed" };
 
 export type ApprovalResolveOutcome = { kind: "resolved" } | { kind: "error"; message: string };
@@ -82,7 +115,10 @@ export function classifyResolveResponse(
     return { kind: "resolved" };
   }
   const noun = target === "approval" ? "approval" : "question";
-  return { kind: "error", message: `Could not resolve ${noun} (${status}). ${detail}`.trim() };
+  return {
+    kind: "error",
+    message: `Could not resolve ${noun} (${status}). ${detail}`.trim(),
+  };
 }
 
 export function toActivityRows(rows: readonly TranscriptRow[], sessionId: string): ActivityRow[] {
@@ -95,7 +131,10 @@ function settleInflightPrompt(state: AcpState, id: string): AcpState {
   return {
     ...state,
     inflightPromptIds,
-    turnActive: deriveTurnActive({ serverTurnActive: state.serverTurnActive, inflightPromptIds }),
+    turnActive: deriveTurnActive({
+      serverTurnActive: state.serverTurnActive,
+      inflightPromptIds,
+    }),
   };
 }
 
@@ -108,12 +147,42 @@ function pruneOptimisticRows(state: AcpState): AcpState {
   return { ...state, optimisticRows: kept };
 }
 
+// A server prompt row proves the daemon has the prompt, so its own and merged ids stop being pending
+// even when the live event that would have settled them was missed.
+function settleServerPrompts(state: AcpState, rows: readonly ActivityRow[]): AcpState {
+  if (state.optimisticRows.length === 0 && state.inflightPromptIds.length === 0) return state;
+  const serverIds = new Set(
+    rows.flatMap((r) => (r.kind === "user_prompt" ? [r.id, ...(r.mergedPromptIds ?? [])] : [])),
+  );
+  return retireQueuedOptimistics(state, serverIds);
+}
+
 function withServerRows(state: AcpState, activity: ActivityRow[]): AcpState {
-  return pruneOptimisticRows({ ...state, activity });
+  return settleServerPrompts(pruneOptimisticRows({ ...state, activity }), activity);
 }
 
 function mapQueued(state: AcpState, id: string, update: (q: QueuedPrompt) => QueuedPrompt): AcpState {
-  return { ...state, queuedPrompts: state.queuedPrompts.map((q) => (q.id === id ? update(q) : q)) };
+  return {
+    ...state,
+    queuedPrompts: state.queuedPrompts.map((q) => (q.id === id ? update(q) : q)),
+  };
+}
+
+// The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
+function rollbackOptimisticPrompt(state: AcpState, id: string): AcpState {
+  const idx = state.optimisticRows.findIndex((r) => r.id === id);
+  if (idx === -1) return settleInflightPrompt(state, id);
+  const optimisticRows = state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1));
+  return settleInflightPrompt({ ...state, optimisticRows }, id);
+}
+
+// A queue row proves the daemon accepted the prompt even when the POST response never reached this tab.
+// Absence proves nothing (it may have been dispatched), so rows are only ever retired on a match.
+function retireQueuedOptimistics(state: AcpState, serverIds: ReadonlySet<string>): AcpState {
+  const queued = state.inflightPromptIds
+    .concat(state.optimisticRows.map((r) => r.id))
+    .filter((id) => serverIds.has(id));
+  return queued.reduce(rollbackOptimisticPrompt, state);
 }
 
 // Keeps local attachment bytes for rows queued here, builds metadata-only views for the rest,
@@ -127,7 +196,12 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
     const attachments: PromptAttachmentInput[] | undefined = local?.attachments?.length
       ? local.attachments
       : r.attachments && r.attachments.length > 0
-        ? r.attachments.map((a) => ({ kind: a.kind, mimeType: a.mime_type, name: a.name ?? undefined, dataB64: "" }))
+        ? r.attachments.map((a) => ({
+            kind: a.kind,
+            mimeType: a.mime_type,
+            name: a.name ?? undefined,
+            dataB64: "",
+          }))
         : undefined;
     return {
       id: r.id,
@@ -137,7 +211,7 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
     };
   });
   const stillPending = state.queuedPrompts.filter((q) => q.pending && !serverIds.has(q.id));
-  return { ...state, queuedPrompts: merged.concat(stillPending) };
+  return retireQueuedOptimistics({ ...state, queuedPrompts: merged.concat(stillPending) }, serverIds);
 }
 
 export function reducer(state: AcpState, action: Action): AcpState {
@@ -145,7 +219,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "frame":
       return applyEvent(state, action.frame);
     case "reduced_state":
-      return applyReducedState(state, action.state, action.unchanged);
+      return applyReducedState(state, action.state, action.unchanged, action.seq);
     case "frames": {
       // Frames feed control state; the transcript comes from the server-folded rows.
       let next = action.frames.reduce(applyEvent, state);
@@ -159,7 +233,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       const next = { ...state, oldestSeq: action.oldestSeq };
       if (action.rows.length === 0) return next;
       next.activity = mergePrependedActivity(action.rows, state.activity);
-      return next;
+      return settleServerPrompts(next, action.rows);
     }
     case "transcript_snapshot":
       if (action.rows.length === 0) return state;
@@ -252,14 +326,17 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return settleInflightPrompt({ ...state, inFlightTool: null }, action.id);
     case "settle_inflight_prompt":
       return settleInflightPrompt(state, action.id);
-    case "rollback_optimistic_prompt": {
-      // The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
-      const idx = state.optimisticRows.findIndex((r) => r.id === action.id);
-      if (idx === -1) return settleInflightPrompt(state, action.id);
-      const optimisticRows = state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1));
-      return settleInflightPrompt({ ...state, optimisticRows }, action.id);
-    }
+    case "rollback_optimistic_prompt":
+      return rollbackOptimisticPrompt(state, action.id);
     case "enqueue_prompt": {
+      // A late POST response can land after hydration already added the row: keep its server text and
+      // order, but restore the local bytes hydration could only see as metadata.
+      if (state.queuedPrompts.some((q) => q.id === action.id)) {
+        const attachments = action.attachments;
+        return attachments && attachments.length > 0
+          ? mapQueued(state, action.id, (q) => ({ ...q, attachments }))
+          : state;
+      }
       const entry: QueuedPrompt = {
         id: action.id,
         text: action.text,
@@ -270,7 +347,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
       return { ...state, queuedPrompts: state.queuedPrompts.concat(entry) };
     }
     case "dequeue_prompt":
-      return { ...state, queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id) };
+      return {
+        ...state,
+        queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id),
+      };
     case "edit_queued_prompt":
       return mapQueued(state, action.id, (q) => ({ ...q, text: action.text }));
     case "clear_queue":
@@ -284,7 +364,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "restart_started":
       // The restart already ended when `epoch` moved on; its replacement's stops are real, but its stop still stopped the sent prompt.
       if (action.epoch !== state.restartEpoch)
-        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+        return {
+          ...state,
+          restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        };
       // The stop this restart caused may already be applied; it isn't the Worker stopping.
       return {
         ...state,
@@ -296,7 +379,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
       };
     case "restart_failed":
       if (action.epoch !== state.restartEpoch)
-        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+        return {
+          ...state,
+          restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        };
       return {
         ...state,
         restartFailure: action.message,
@@ -305,7 +391,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "dismiss_compaction_reminder":
       return { ...state, compactionReminderDismissed: state.sessionUsage };
     case "dismiss_rejected_prompt":
-      return { ...state, rejectedPrompts: state.rejectedPrompts.filter((r) => r.id !== action.id) };
+      return {
+        ...state,
+        rejectedPrompts: state.rejectedPrompts.filter((r) => r.id !== action.id),
+      };
     case "dismiss_mode_switch_failed":
       return { ...state, modeSwitchFailed: null };
     case "dismiss_session_notice":
@@ -313,9 +402,15 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // snapshot would otherwise bring the notice back.
       return state.dismissedNoticeIds.includes(action.id)
         ? state
-        : { ...state, dismissedNoticeIds: [...state.dismissedNoticeIds, action.id] };
+        : {
+            ...state,
+            dismissedNoticeIds: [...state.dismissedNoticeIds, action.id],
+          };
     case "set_pending_config_option":
-      return { ...state, pendingConfigOption: { configId: action.configId, value: action.value } };
+      return {
+        ...state,
+        pendingConfigOption: { configId: action.configId, value: action.value },
+      };
     case "clear_pending_config_option":
       return { ...state, pendingConfigOption: null };
     case "clear_pending_config_option_if_match": {
@@ -333,11 +428,17 @@ export function reducer(state: AcpState, action: Action): AcpState {
 export function transcriptDeltaAction(delta: TranscriptDelta, sessionId: string): Action | null {
   if ("Append" in delta) {
     if (!webRendersServerRow(delta.Append)) return null;
-    return { kind: "transcript_append", row: transcriptRowToActivity(delta.Append, sessionId) };
+    return {
+      kind: "transcript_append",
+      row: transcriptRowToActivity(delta.Append, sessionId),
+    };
   }
   if ("Patch" in delta) {
     if (!webRendersServerRow(delta.Patch.row)) return null;
-    return { kind: "transcript_patch", row: transcriptRowToActivity(delta.Patch.row, sessionId) };
+    return {
+      kind: "transcript_patch",
+      row: transcriptRowToActivity(delta.Patch.row, sessionId),
+    };
   }
   if ("Remove" in delta) return { kind: "transcript_remove", id: delta.Remove };
   return null;

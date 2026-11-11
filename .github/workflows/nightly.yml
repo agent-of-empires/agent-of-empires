@@ -1,0 +1,138 @@
+name: Nightly
+
+# Prerelease builds of main for the nightly channel; see docs/development/releases.md.
+# Tags are `nightly-YYYYMMDD`, outside `v*`, so release.yml, docker.yml and release-plz
+# never treat one as a stable release.
+
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Older nightlies are deleted along with their tags.
+  NIGHTLY_KEEP: 7
+
+jobs:
+  prepare:
+    name: Prepare
+    # Every job builds the triggering commit, so binaries and images always match.
+    # Off until NIGHTLY_ENABLED is set; see "Enabling nightlies" in docs/development/releases.md.
+    if: >-
+      github.repository == 'agent-of-empires/agent-of-empires' &&
+      github.ref == 'refs/heads/main' &&
+      vars.NIGHTLY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      stable: ${{ steps.plan.outputs.stable }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          TAG="nightly-$(date -u +%Y%m%d)"
+          LAST="$(git tag -l 'nightly-*' --sort=-v:refname | head -1)"
+          if [ -n "$LAST" ] && [ "$(git rev-parse "$LAST^{commit}")" = "$SHA" ]; then
+            echo "::notice::main has not moved since $LAST"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::notice::$TAG already exists"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Next patch, so a nightly sorts above the stable release it builds on.
+          BASE="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]*)"/\1/')"
+          IFS=. read -r MAJOR MINOR PATCH <<< "${BASE%%-*}"
+          {
+            echo "skip=false"
+            echo "sha=$SHA"
+            echo "tag=$TAG"
+            echo "version=${MAJOR}.${MINOR}.$((PATCH + 1))-nightly.${TAG#nightly-}"
+            echo "stable=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*')"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.skip == 'false'
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+      version: ${{ needs.prepare.outputs.version }}
+
+  publish:
+    name: Publish
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Write release notes
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+          STABLE: ${{ needs.prepare.outputs.stable }}
+        run: |
+          cat > release-notes.md <<EOF
+          Nightly build of \`main\` at ${SHA}.
+
+          Changes since ${STABLE}: https://github.com/${GITHUB_REPOSITORY}/compare/${STABLE}...${SHA}
+
+          Moving from a nightly back to a stable release may not work until the next stable ships. See https://www.agent-of-empires.com/docs/installation/#nightly-channel
+          EOF
+
+      - name: Create prerelease
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
+          name: Agent of Empires v${{ needs.prepare.outputs.version }}
+          prerelease: true
+          make_latest: false
+          body_path: release-notes.md
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+
+      - name: Prune old nightlies
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep '^nightly-' | sort -r | tail -n +"$((NIGHTLY_KEEP + 1))" \
+            | while read -r tag; do
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              done
+
+  docker:
+    needs: [prepare, build]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: nightly

@@ -109,9 +109,17 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None, None)
-            .await
-            .disposition
+        self.publish_user_prompt_with_attachments(
+            session_id,
+            text,
+            &[],
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .disposition
     }
 
     /// Record a `UserPromptSent` (attachments stored as blobs keyed to its seq)
@@ -127,7 +135,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[AttachmentBlob],
-        prompt_id: Option<String>,
+        prompt_ids: Vec<String>,
         synthesized: bool,
         origin_plugin: Option<String>,
         classified_as: Option<&'static crate::acp::agent_profiles::AgentProfile>,
@@ -148,6 +156,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             disposition,
             seq: None,
         };
+        // The first id names the transcript row; the rest were folded into it by a queue drain or send-now.
+        let mut prompt_ids = prompt_ids.into_iter();
         let event = Event::UserPromptSent {
             text,
             attachments: attachments
@@ -160,7 +170,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                     size: blob.data.len() as u64,
                 })
                 .collect(),
-            prompt_id,
+            prompt_id: prompt_ids.next(),
+            merged_prompt_ids: prompt_ids.collect(),
             synthesized,
             origin_plugin,
         };
@@ -805,7 +816,7 @@ inherits-claude = "claude"
             "s-1",
             "resent after rate limit".into(),
             &[],
-            None,
+            Vec::new(),
             true,
             None,
             None,
@@ -823,6 +834,51 @@ inherits-claude = "claude"
             })
             .collect();
         assert_eq!(flags, [false, true]);
+    }
+
+    /// A queue drain folds several rows into one turn: the first id names the
+    /// event and the rest ride in `merged_prompt_ids` so a client settles all of them (#5401).
+    #[tokio::test]
+    async fn publish_user_prompt_splits_leading_id_from_merged_ids() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        for ids in [vec![], vec!["a"], vec!["a", "b", "c"]] {
+            let ids: Vec<String> = ids.into_iter().map(String::from).collect();
+            sup.publish_user_prompt_with_attachments(
+                "s-1",
+                "t".into(),
+                &[],
+                ids,
+                false,
+                None,
+                None,
+            )
+            .await;
+        }
+
+        let got: Vec<(Option<String>, Vec<String>)> = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, event)| match event {
+                Event::UserPromptSent {
+                    prompt_id,
+                    merged_prompt_ids,
+                    ..
+                } => (prompt_id.clone(), merged_prompt_ids.clone()),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [
+                (None, vec![]),
+                (Some("a".into()), vec![]),
+                (Some("a".into()), s(&["b", "c"])),
+            ]
+        );
     }
 
     /// The published seq is the `UserPromptSent` event's, and there is none when the
@@ -845,7 +901,7 @@ inherits-claude = "claude"
                 "s-1",
                 "second".into(),
                 &[],
-                None,
+                Vec::new(),
                 false,
                 None,
                 None,
@@ -866,7 +922,7 @@ inherits-claude = "claude"
                 "s-1",
                 "lost".into(),
                 &[],
-                None,
+                Vec::new(),
                 false,
                 None,
                 None,

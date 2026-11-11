@@ -108,7 +108,7 @@ pub async fn run(args: UpdateArgs) -> Result<()> {
         );
         handle_daemon_restart_after_update(binary_path, args.yes)?;
         println!("{}", completion_refresh_hint());
-    } else if matches!(&method, InstallMethod::Homebrew) {
+    } else if matches!(&method, InstallMethod::Homebrew { .. }) {
         println!("✓ brew upgrade complete.");
         if !matches!(
             crate::cli::serve::daemon_status(),

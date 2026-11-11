@@ -27,13 +27,14 @@ mod worker;
 pub(crate) use attachments::{sniff_image_mime, validate_attachments};
 pub use config::{acp_set_config_option, acp_set_mode};
 pub use history::{
-    acp_context_primer, acp_files, acp_replay, acp_worker_log, list_importable_sessions,
+    acp_context_primer, acp_files, acp_replay, acp_task_output, acp_worker_log,
+    list_importable_sessions,
 };
 pub(crate) use history::{importable_sessions, list_error_response, read_log_tail};
 pub use install::{agent_install_info, install_agent};
 pub use prompt::{
-    acp_attachment, acp_cancel, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments,
-    resolve_approval, resolve_elicitation,
+    acp_attachment, acp_cancel, acp_cancel_subagent, acp_force_end_turn, acp_prompt,
+    acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
 pub use view::{acp_disable, acp_enable};
 pub(crate) use view::{
@@ -184,6 +185,7 @@ pub(crate) fn spawn_request_for(
         model: instance.agent_model.clone(),
         effort: instance.acp_effort.clone(),
         effort_explicit: instance.acp_effort.is_some(),
+        model_config: instance.acp_model_config.clone(),
         stored_acp_session_id: instance.acp_session_id.clone(),
         fork_from: instance.fork_pending.clone(),
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
