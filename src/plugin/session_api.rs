@@ -1761,6 +1761,7 @@ mod tests {
             text: "queued before the park".to_string(),
             attachments: Vec::new(),
             synthesized: true,
+            error: None,
         };
         parked.pending_initial_turn = Some(seeded.clone());
         let (deps, state, _dir) = test_deps(vec![parked]);

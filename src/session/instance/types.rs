@@ -373,6 +373,9 @@ pub struct PluginCreateIdempotency {
     pub payload_hash: String,
 }
 
+/// Largest accepted `initial_prompt`, in bytes.
+pub const MAX_INITIAL_PROMPT_BYTES: usize = 64 * 1024;
+
 #[cfg(test)]
 mod tests {
     use super::*;

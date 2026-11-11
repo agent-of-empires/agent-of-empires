@@ -658,6 +658,7 @@ fn wizard_create_body(
         repo_bases: Vec::new(),
         command_override: data.command_override.clone(),
         custom_instruction: None,
+        initial_prompt: None,
         profile: Some(data.profile.clone()),
         view: if data.structured {
             crate::session::View::Structured
