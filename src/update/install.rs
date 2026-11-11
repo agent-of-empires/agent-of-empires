@@ -26,7 +26,12 @@ const HOMEBREW_PREFIXES: [&str; 3] = ["/opt/homebrew", "/usr/local", "/home/linu
 /// The prefix whose `<prefix>/Cellar/aoe/<version>/bin/aoe` is `path`, where a canonicalized
 /// Homebrew `aoe` lives. Read from the path alone, so it holds when `brew` itself can't run (#5515).
 fn homebrew_cellar_prefix(path: &Path) -> Option<&'static Path> {
-    HOMEBREW_PREFIXES.iter().map(Path::new).find(|prefix| {
+    let prefixes = HOMEBREW_PREFIXES.map(Path::new);
+    cellar_prefix_in(&prefixes, path)
+}
+
+fn cellar_prefix_in<'a>(prefixes: &[&'a Path], path: &Path) -> Option<&'a Path> {
+    prefixes.iter().copied().find(|prefix| {
         let Ok(rest) = path.strip_prefix(prefix.join("Cellar").join("aoe")) else {
             return false;
         };
@@ -35,12 +40,60 @@ fn homebrew_cellar_prefix(path: &Path) -> Option<&'static Path> {
     })
 }
 
+/// A prefix's own `brew`, so a second Homebrew earlier on PATH never acts for it.
+pub fn homebrew_brew(prefix: &Path) -> PathBuf {
+    prefix.join("bin").join("brew")
+}
+
+/// Every known Homebrew prefix whose own `brew` lists `aoe`, plus the prefix whose Cellar holds
+/// `running` even when its `brew` can't answer, so that removal is still attempted (#5547).
+pub fn homebrew_aoe_prefixes(running: Option<&Path>) -> Vec<PathBuf> {
+    let prefixes = HOMEBREW_PREFIXES.map(Path::new);
+    select_homebrew_prefixes(&prefixes, running, |brew| {
+        brew_lists_aoe(brew, BREW_INFO_TIMEOUT)
+    })
+}
+
+fn select_homebrew_prefixes(
+    prefixes: &[&Path],
+    running: Option<&Path>,
+    mut lists_aoe: impl FnMut(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let owner = running.and_then(|path| cellar_prefix_in(prefixes, path));
+    prefixes
+        .iter()
+        .filter(|prefix| Some(**prefix) == owner || lists_aoe(&homebrew_brew(prefix)))
+        .map(|prefix| prefix.to_path_buf())
+        .collect()
+}
+
+fn brew_lists_aoe(brew: &Path, timeout: std::time::Duration) -> bool {
+    let mut cmd = Command::new(brew);
+    cmd.args(["list", "aoe"]);
+    crate::process::run_with_timeout(&mut cmd, timeout)
+        .ok()
+        .flatten()
+        .is_some_and(|output| output.status.success())
+}
+
+/// Removes `aoe` with `brew`, failing when `brew uninstall` doesn't succeed.
+pub fn uninstall_via_brew(brew: &Path) -> Result<()> {
+    let status = Command::new(brew)
+        .args(["uninstall", "aoe"])
+        .status()
+        .with_context(|| format!("running `{} uninstall aoe`", brew.display()))?;
+    if !status.success() {
+        anyhow::bail!("`{} uninstall aoe` failed ({})", brew.display(), status);
+    }
+    Ok(())
+}
+
 fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     let path = binary_path;
 
     if let Some(prefix) = homebrew_cellar_prefix(path) {
         return InstallMethod::Homebrew {
-            brew: prefix.join("bin").join("brew"),
+            brew: homebrew_brew(prefix),
         };
     }
 
@@ -1201,6 +1254,134 @@ mod tests {
                     "owner installed {owner_installed}: PATH's brew ran {decoy_calls:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn homebrew_prefixes_are_found_by_their_own_brew() {
+        let (a, b) = (Path::new("/a"), Path::new("/b"));
+        let in_a = Path::new("/a/Cellar/aoe/1.5.2/bin/aoe");
+        // (case, prefixes whose brew lists aoe, running binary, expected prefixes)
+        let cases: [(&str, &[&Path], Option<&Path>, &[&Path]); 6] = [
+            ("none", &[], None, &[]),
+            ("one", &[b], None, &[b]),
+            ("both", &[a, b], None, &[a, b]),
+            ("running from a silent prefix", &[], Some(in_a), &[a]),
+            (
+                "running from one, both listed",
+                &[a, b],
+                Some(in_a),
+                &[a, b],
+            ),
+            (
+                "running outside every Cellar",
+                &[],
+                Some(Path::new("/usr/bin/aoe")),
+                &[],
+            ),
+        ];
+        for (case, listing, running, expected) in cases {
+            let mut asked = Vec::new();
+            let found = select_homebrew_prefixes(&[a, b], running, |brew| {
+                asked.push(brew.to_path_buf());
+                listing.iter().any(|prefix| homebrew_brew(prefix) == brew)
+            });
+            assert_eq!(
+                found,
+                expected.iter().map(|p| p.to_path_buf()).collect::<Vec<_>>(),
+                "{case}"
+            );
+            assert!(
+                asked
+                    .iter()
+                    .all(|brew| [a, b].iter().any(|p| homebrew_brew(p) == *brew)),
+                "{case}: asked {asked:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    mod brew_uninstall_tests {
+        use super::*;
+        use serial_test::serial;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::TempDir;
+
+        /// A Homebrew prefix whose `bin/brew` logs its argv and exits `list` / `uninstall`.
+        fn prefix_with_brew(list: i32, uninstall: i32) -> (TempDir, PathBuf) {
+            let prefix = TempDir::new().unwrap();
+            let log = prefix.path().join("brew.log");
+            std::fs::create_dir(prefix.path().join("bin")).unwrap();
+            let brew = homebrew_brew(prefix.path());
+            std::fs::write(
+                &brew,
+                format!(
+                    "#!/bin/sh\necho \"$@\" >> {log}\ncase \"$1\" in\n  list) exit {list} ;;\n  uninstall) exit {uninstall} ;;\nesac\nexit 0\n",
+                    log = log.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755)).unwrap();
+            (prefix, log)
+        }
+
+        fn calls(log: &Path) -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        #[test]
+        #[serial]
+        fn detection_and_uninstall_run_each_prefixs_brew_never_paths() {
+            let (installed, installed_log) = prefix_with_brew(0, 0);
+            let (other, other_log) = prefix_with_brew(1, 0);
+            let (pinned, pinned_log) = prefix_with_brew(0, 1);
+            let without_brew = TempDir::new().unwrap();
+            // PATH's `brew` claims `aoe` and would remove it: it must never be asked.
+            let (decoy, decoy_log) = prefix_with_brew(0, 0);
+            let _path = crate::session::test_support::path_prepended(&decoy.path().join("bin"));
+
+            let prefixes = [
+                installed.path(),
+                other.path(),
+                pinned.path(),
+                without_brew.path(),
+            ];
+            let found = select_homebrew_prefixes(&prefixes, None, |brew| {
+                brew_lists_aoe(brew, BREW_INFO_TIMEOUT)
+            });
+            assert_eq!(found, [installed.path(), pinned.path()]);
+            assert_eq!(calls(&other_log), ["list aoe"]);
+
+            uninstall_via_brew(&homebrew_brew(installed.path())).unwrap();
+            assert_eq!(calls(&installed_log), ["list aoe", "uninstall aoe"]);
+
+            let brew = homebrew_brew(pinned.path());
+            let error = format!(
+                "{:#}",
+                uninstall_via_brew(&brew).expect_err("exit 1 must fail")
+            );
+            assert!(
+                error.contains(&format!("`{} uninstall aoe` failed", brew.display())),
+                "{error}"
+            );
+            assert_eq!(calls(&pinned_log), ["list aoe", "uninstall aoe"]);
+
+            let missing = homebrew_brew(without_brew.path());
+            let error = format!(
+                "{:#}",
+                uninstall_via_brew(&missing).expect_err("no brew must fail")
+            );
+            assert!(error.contains(&missing.display().to_string()), "{error}");
+
+            assert!(
+                calls(&decoy_log).is_empty(),
+                "PATH's brew ran: {:?}",
+                calls(&decoy_log)
+            );
         }
     }
 
