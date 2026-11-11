@@ -40,6 +40,14 @@ fn cellar_prefix_in<'a>(prefixes: &[&'a Path], path: &Path) -> Option<&'a Path> 
     })
 }
 
+/// The `<prefix>` of a running `<prefix>/Cellar/aoe/<version>/bin/aoe` that has its own `brew`,
+/// which finds a custom prefix PATH's `brew` doesn't report.
+fn running_cellar_prefix(path: &Path) -> Option<&Path> {
+    let prefix = path.ancestors().nth(5)?;
+    (cellar_prefix_in(&[prefix], path).is_some() && homebrew_brew(prefix).is_file())
+        .then_some(prefix)
+}
+
 /// A prefix's own `brew`, so a second Homebrew earlier on PATH never acts for it.
 pub fn homebrew_brew(prefix: &Path) -> PathBuf {
     prefix.join("bin").join("brew")
@@ -47,7 +55,8 @@ pub fn homebrew_brew(prefix: &Path) -> PathBuf {
 
 /// Every Homebrew prefix whose own `brew` lists `aoe`, plus the prefix whose Cellar holds
 /// `running` even when its `brew` can't answer, so that removal is still attempted (#5547).
-/// The candidates are the known prefixes and PATH's `brew --prefix`, which covers a custom one.
+/// The candidates are the known prefixes, PATH's `brew --prefix`, and the running binary's
+/// own Cellar prefix, so a custom prefix counts when either reports it.
 pub fn homebrew_aoe_prefixes(running: Option<&Path>) -> Vec<PathBuf> {
     let path_prefix = path_brew_prefix(BREW_PROBE_TIMEOUT);
     select_homebrew_prefixes(
@@ -65,8 +74,13 @@ fn select_homebrew_prefixes(
     mut lists_aoe: impl FnMut(&Path) -> bool,
 ) -> Vec<PathBuf> {
     let mut candidates = known.to_vec();
-    if let Some(prefix) = path_prefix.filter(|prefix| !known.contains(prefix)) {
-        candidates.push(prefix);
+    for prefix in [path_prefix, running.and_then(running_cellar_prefix)]
+        .into_iter()
+        .flatten()
+    {
+        if !candidates.contains(&prefix) {
+            candidates.push(prefix);
+        }
     }
     let owner = running.and_then(|path| cellar_prefix_in(&candidates, path));
     candidates
@@ -1284,8 +1298,17 @@ mod tests {
         let custom = Path::new("/home/me/homebrew");
         let in_a = Path::new("/a/Cellar/aoe/1.5.2/bin/aoe");
         let in_custom = Path::new("/home/me/homebrew/Cellar/aoe/1.5.2/bin/aoe");
+        let with_brew = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(with_brew.path().join("bin")).unwrap();
+        std::fs::write(homebrew_brew(with_brew.path()), "").unwrap();
+        let without_brew = tempfile::TempDir::new().unwrap();
+        let cellar_aoe = |prefix: &Path| prefix.join("Cellar/aoe/1.5.2/bin/aoe");
+        let (in_unreported, in_brewless) = (
+            cellar_aoe(with_brew.path()),
+            cellar_aoe(without_brew.path()),
+        );
         // (case, PATH brew's prefix, prefixes whose brew lists aoe, running binary, expected)
-        let cases: [(&str, Option<&Path>, &[&Path], Option<&Path>, &[&Path]); 10] = [
+        let cases: [(&str, Option<&Path>, &[&Path], Option<&Path>, &[&Path]); 12] = [
             ("none", None, &[], None, &[]),
             ("one", None, &[b], None, &[b]),
             ("both", None, &[a, b], None, &[a, b]),
@@ -1332,6 +1355,20 @@ mod tests {
                 Some(in_custom),
                 &[custom],
             ),
+            (
+                "running from a custom Cellar PATH's brew doesn't report",
+                Some(custom),
+                &[],
+                Some(&in_unreported),
+                &[with_brew.path()],
+            ),
+            (
+                "running from a Cellar-shaped path with no brew",
+                None,
+                &[],
+                Some(&in_brewless),
+                &[],
+            ),
         ];
         for (case, path_prefix, listing, running, expected) in cases {
             let mut asked = Vec::new();
@@ -1347,6 +1384,7 @@ mod tests {
             // Each candidate's own brew, once, except the running binary's owner: never a prefix twice.
             let mut candidates = vec![a, b];
             candidates.extend(path_prefix.filter(|p| ![a, b].contains(p)));
+            candidates.extend(running.and_then(running_cellar_prefix));
             let owner = running.and_then(|r| cellar_prefix_in(&candidates, r));
             let expected_asked: Vec<PathBuf> = candidates
                 .iter()
@@ -1397,6 +1435,9 @@ mod tests {
             let (other, other_log) = prefix_with_brew(1, 0);
             let (pinned, pinned_log) = prefix_with_brew(0, 1);
             let (custom, custom_log) = prefix_with_brew(0, 0);
+            // The running binary's prefix, unknown to PATH, whose `brew` doesn't list `aoe`.
+            let (running, running_log) = prefix_with_brew(1, 0);
+            let running_aoe = running.path().join("Cellar/aoe/1.5.2/bin/aoe");
             let without_brew = TempDir::new().unwrap();
             // PATH's `brew` lives elsewhere and names the custom prefix; it may only be asked that.
             let decoy = TempDir::new().unwrap();
@@ -1422,16 +1463,30 @@ mod tests {
                 pinned.path(),
                 without_brew.path(),
             ];
-            let found = select_homebrew_prefixes(&known, path_prefix.as_deref(), None, |brew| {
-                brew_lists_aoe(brew, BREW_INFO_TIMEOUT)
-            });
-            assert_eq!(found, [installed.path(), pinned.path(), custom.path()]);
+            let found = select_homebrew_prefixes(
+                &known,
+                path_prefix.as_deref(),
+                Some(&running_aoe),
+                |brew| brew_lists_aoe(brew, BREW_INFO_TIMEOUT),
+            );
+            assert_eq!(
+                found,
+                [
+                    installed.path(),
+                    pinned.path(),
+                    custom.path(),
+                    running.path()
+                ]
+            );
             assert_eq!(calls(&other_log), ["list aoe"]);
+            assert!(calls(&running_log).is_empty());
 
             for (prefix, log) in [(&installed, &installed_log), (&custom, &custom_log)] {
                 uninstall_via_brew(&homebrew_brew(prefix.path())).unwrap();
                 assert_eq!(calls(log), ["list aoe", "uninstall aoe"]);
             }
+            uninstall_via_brew(&homebrew_brew(running.path())).unwrap();
+            assert_eq!(calls(&running_log), ["uninstall aoe"]);
 
             let brew = homebrew_brew(pinned.path());
             let error = format!(
