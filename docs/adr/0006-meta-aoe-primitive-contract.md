@@ -10,7 +10,7 @@ Core read each adapter's private `_meta` directly (`_meta.claudeCode.*`, `_claud
 - The translator is an inline, per-session proxy between the worker and the adapter, not a sidecar behind an RPC. One ordered stream needs one write lock and works the same in TUI-only mode and under `docker exec`.
 - A proxy announces itself with a hello on the `initialize` response. Only a proxied agent is held to the contract; any other agent's malformed `_meta.aoe` is ignored.
 - State primitives are self-healing: leases expire on their own, every primitive has an idempotency key, and tailer-emitted frames carry `after_adapter_sequence` so core orders them against adapter frames.
-- Failure is closed mid-session (`IntegrationLost`) and may degrade at startup, because a text turn still works with no translator.
+- Failure is closed: mid-session it emits `IntegrationLost`, and an invalid proxy hello at startup refuses the session (`InvalidProxyHello`).
 - `aoe acp lint-stream` is the conformance check plugins run in CI. See [the contract](../development/internals/acp-primitive-contract.md).
 
 ## Considered options
