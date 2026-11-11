@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::bindings::ActionId;
+use super::ConfirmationToken;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
