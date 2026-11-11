@@ -1125,13 +1125,17 @@ export function MobileLiveTerminal({
   // typing and nothing shows up for a bit"). Every input path in this
   // component (keydown, beforeinput, composition, paste) funnels through
   // here, so wrapping once covers them all; a no-op outside a coast.
+  // Typing is also the moment a reader leaves scrollback: the keystroke lands
+  // at the live prompt, so show it. (A click alone only focuses the input and
+  // keeps their place; see the soft-keyboard effect below.)
   const sendData = useCallback(
     (data: string) => {
       stopMomentum();
       cancelTouchWheelQueue();
+      if (!forwardModeRef.current && (readingRef.current || liveDetachedRef.current)) jumpToLatest();
       sendDataRaw(data);
     },
-    [sendDataRaw, stopMomentum, cancelTouchWheelQueue],
+    [sendDataRaw, stopMomentum, cancelTouchWheelQueue, forwardModeRef, jumpToLatest],
   );
 
   // Mouse button (click/drag) forwarding for a full-screen mouse app, the
@@ -1461,9 +1465,13 @@ export function MobileLiveTerminal({
   // Opening the soft keyboard is an intent to type, not to continue reading
   // scrollback. Return to the live prompt before the keyboard reduces the
   // viewport; otherwise a stale reading position can leave the agent's input
-  // box below the visible rows until the user scrolls manually.
+  // box below the visible rows until the user scrolls manually. On touch,
+  // focusing the input IS opening the keyboard (and `keyboardOpen` lags it).
+  // On a fine pointer a click focuses the input only so the physical keyboard
+  // types; that must keep the reader's place, and typing returns to live.
+  const focusOpensKeyboard = focused && coarse;
   useEffect(() => {
-    if (!keyboardOpen && !focused) return;
+    if (!keyboardOpen && !focusOpensKeyboard) return;
     const id = requestAnimationFrame(() => {
       const el = scrollerRef.current;
       if (!el) return;
@@ -1474,7 +1482,7 @@ export function MobileLiveTerminal({
       syncView();
     });
     return () => cancelAnimationFrame(id);
-  }, [focused, keyboardOpen, liveScrollTarget, returnToLive, syncView]);
+  }, [focusOpensKeyboard, keyboardOpen, liveScrollTarget, returnToLive, syncView]);
 
   // Cadence: fast only while this pane is the active, visible surface AND
   // at the live edge. Reading scrollback drops to idle: the window is
