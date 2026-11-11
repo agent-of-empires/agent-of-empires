@@ -96,6 +96,14 @@ impl AoeIngress {
                 }
                 return self.lose(IntegrationLostReason::ContractViolation { detail });
             }
+            // Invalid but anchored: a tailer frame, takes no number.
+            Err(_) if !is_adapter_frame => {
+                return Ingested::Deliver(vec![Delivered {
+                    notification,
+                    local_prompt_signals,
+                    epoch,
+                }]);
+            }
             Err(_) => None,
         };
         let arrival = Arrival {
@@ -324,6 +332,23 @@ mod tests {
         // Swallowed while lost: also uncounted.
         assert!(ids(i.ingest(frame("bad2", bad), true, 0, 0)).is_empty());
         i.session_reset();
+        let anchored = json!({"v":1,"key":"t","after_adapter_sequence":2});
+        assert!(
+            ids(i.ingest(frame("t", anchored), true, 0, 0)).is_empty(),
+            "held for frame 2"
+        );
+        assert_eq!(
+            ids(i.ingest(frame("f2", json!(null)), true, 0, 0)),
+            ["f2", "t"]
+        );
+    }
+
+    #[test]
+    fn a_plain_agent_invalid_anchored_frame_takes_no_adapter_frame_number() {
+        let i = ingress(false);
+        assert_eq!(ids(i.ingest(frame("f1", json!(null)), true, 0, 0)), ["f1"]);
+        let bad = json!({"v":1,"key":"","after_adapter_sequence":9});
+        assert_eq!(ids(i.ingest(frame("bad", bad), true, 0, 0)), ["bad"]);
         let anchored = json!({"v":1,"key":"t","after_adapter_sequence":2});
         assert!(
             ids(i.ingest(frame("t", anchored), true, 0, 0)).is_empty(),
