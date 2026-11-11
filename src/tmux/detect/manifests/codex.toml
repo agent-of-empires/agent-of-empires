@@ -34,6 +34,22 @@ line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*(?:[^\s1-9]|[1-9][^.\s])']
 [markers.choice_cursor]
 line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*[1-9]\.']
 
+# The first-run folder-trust dialog. A composer row on screen means the session
+# is past it, and the text is only quoted in the transcript.
+[[rules]]
+id = "folder_trust_prompt"
+state = "waiting"
+priority = 960
+region = "collapsed_recent"
+visible = true
+contains = [
+  "trust this folder? codex can read, edit, and run files here",
+  "1. trust and continue",
+]
+not = [
+  { region = "whole_recent", line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*(?:[^\s1-9]|[1-9][^.\s])'] },
+]
+
 # Codex's Plan-mode radio prompt: a question, its cursored choice rows and the
 # submit hint, in that order, with nothing running after the hint.
 [[rules]]
@@ -91,6 +107,8 @@ contains_any = [
   "enter to select",
   "esc to cancel",
 ]
+# The welcome screen's command list says "allowed"; it is gone once a turn starts.
+not = [{ contains = ["/permissions - choose what codex is allowed to do"] }]
 
 # A cursored choice row near the bottom with nothing live below it: the menu is
 # still up and waiting.
