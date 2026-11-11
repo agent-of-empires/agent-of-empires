@@ -1188,7 +1188,7 @@ impl Instance {
                     None,
                     &crate::session::config::repo_config::resolve_config_with_repo(
                         &self.effective_profile(),
-                        std::path::Path::new(&self.project_path),
+                        self.repo_config_path(),
                     )?,
                 )?)
             } else {

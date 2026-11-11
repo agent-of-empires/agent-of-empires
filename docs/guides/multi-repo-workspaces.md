@@ -45,6 +45,16 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them with ordinary `cd` and git commands; AoE imposes no cross-repo orchestration.
 
+### Starting as a single-repo workspace
+
+A workspace can hold just one repo. Starting that way puts the session in the workspace root from the first turn, so a later **Add project** joins the existing workspace without moving the session or its conversation.
+
+```bash
+aoe add /path/to/backend -w feat/auth-rewrite -b --workspace
+```
+
+TUI: in the worktree configuration (`Ctrl+P` on **Worktree**), tick **Workspace**. Web: turn on **Workspace directory** in the wizard's Worktree panel. Either way it is on and locked whenever extra repos are listed. To make this the default for new worktree sessions, set `workspace_by_default = true` under `[worktree]` (Settings, Worktree tab); `aoe add --no-workspace` opts one session out. The default only applies when the session creates its branch: attaching to an existing branch stays a plain worktree.
+
 ### Adding a repo to an existing session
 
 Add a repository without recreating the session:
@@ -59,7 +69,7 @@ What that means for the session depends on the shape it started in:
 
 | Session was | What happens | Working directory |
 |---|---|---|
-| A multi-repo workspace | The new repo's worktree joins the existing workspace | Unchanged |
+| A workspace (one repo or more) | The new repo's worktree joins the existing workspace | Unchanged |
 | A worktree session | A workspace is created and the session's worktree moves into it, so uncommitted work travels | Moves |
 | An in-place session | A workspace is created with a *fresh* worktree of the session's repo | Moves |
 
@@ -114,6 +124,7 @@ Multi-repo sessions are bucketed into a single **Multi-repo** group at the botto
 - **No agent-driven repo pull-in**: the agent cannot add a repo to its own session; attaching may restart the agent without resuming its conversation.
 - **No saved workspace templates**: each session picks the repo set fresh.
 - **No per-repo PR tracking**: coordinated PR workflow happens outside AoE.
+- **First repo's settings only**: a workspace uses repo config, hooks and project MCP servers from its first repo. Other repos' settings are ignored.
 
 ## Related
 

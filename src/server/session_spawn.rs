@@ -29,6 +29,7 @@ pub(crate) struct StructuredSessionSpec {
     pub extra_args: String,
     pub command_override: String,
     pub extra_repo_paths: Vec<String>,
+    pub workspace: bool,
     /// Per-repo creation bases as `(selector, base)` pairs. See #3329.
     pub repo_base_branches: Vec<(String, String)>,
     pub scratch: bool,
@@ -143,6 +144,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            workspace,
             repo_base_branches,
             scratch,
             trust_hooks,
@@ -238,6 +240,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            workspace,
             repo_base_branches: if create_new_branch {
                 repo_base_branches
             } else {
@@ -390,7 +393,7 @@ pub(crate) async fn spawn_structured_session(
         let agent_effort = if provision_error.is_none() {
             let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                 &instance.source_profile,
-                std::path::Path::new(&instance.project_path),
+                instance.repo_config_path(),
             );
             let acp_registry = crate::acp::AgentRegistry::with_defaults();
             // The defaults, and the pin, are keyed by the agent the spawn
@@ -815,6 +818,7 @@ pub(crate) async fn spawn_structured_session(
                     agent_effort,
                     instance.acp_effort.is_some(),
                     instance.project_path.clone(),
+                    instance.repo_config_path().to_path_buf(),
                     instance.acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
@@ -841,6 +845,7 @@ pub(crate) async fn spawn_structured_session(
                 effort,
                 effort_explicit,
                 project_path,
+                config_path,
                 stored_acp_session_id,
                 source_profile,
                 yolo_mode,
@@ -857,7 +862,7 @@ pub(crate) async fn spawn_structured_session(
                         &tool,
                         agent_override.as_deref(),
                         &source_profile,
-                        std::path::Path::new(&project_path),
+                        &config_path,
                     )
                     .await;
                 let command_override =
@@ -889,6 +894,7 @@ pub(crate) async fn spawn_structured_session(
                         return;
                     };
                     let check_id = id.clone();
+                    let check_config_path = config_path.clone();
                     let checked = tokio::task::spawn_blocking(move || {
                         use crate::session::SessionStore;
                         let validation = (|| -> anyhow::Result<()> {
@@ -896,7 +902,8 @@ pub(crate) async fn spawn_structured_session(
                             let _lifecycle = native
                                 .storage()
                                 .acquire_instance_lifecycle_lock(&check_id)?;
-                            (native.as_ref() as &dyn SessionStore).launch_configuration(&cwd)?;
+                            (native.as_ref() as &dyn SessionStore)
+                                .launch_configuration(&check_config_path)?;
                             let rows = native.load()?;
                             let row = rows
                                 .iter()
@@ -951,6 +958,7 @@ pub(crate) async fn spawn_structured_session(
                                     agent: agent.clone(),
                                     tool,
                                     cwd,
+                                    config_path,
                                     additional_dirs: vec![],
                                     provider_env: vec![],
                                     provider: None,
@@ -1163,6 +1171,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: true,
             trust_hooks: None,
@@ -1318,6 +1327,7 @@ mod tests {
                 extra_args: String::new(),
                 command_override: String::new(),
                 extra_repo_paths: Vec::new(),
+                workspace: false,
                 repo_base_branches: Vec::new(),
                 scratch: false,
                 trust_hooks: None,
@@ -1346,6 +1356,7 @@ mod tests {
                     fork_source: None,
                     generated_name: false,
                     no_submodules: false,
+                    workspace: None,
                     worktree_path_id: None,
                 }),
             };
