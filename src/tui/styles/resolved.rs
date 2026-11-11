@@ -464,7 +464,7 @@ fn active_frame(accent: Color, bg: Color, fill: Color) -> Color {
 
 /// `color` mixed toward `bg`'s readable pole in 10% steps until it clears
 /// `floor` against every surface. When no step does (surfaces on both sides of
-/// mid-grey), the step whose worst surface reads best.
+/// mid-grey), it returns the step whose worst surface reads best.
 fn lift_until(color: Color, bg: Color, surfaces: &[Color], floor: f32) -> Color {
     let pole = readable_on(bg);
     let worst = |c: Color| {
@@ -473,14 +473,15 @@ fn lift_until(color: Color, bg: Color, surfaces: &[Color], floor: f32) -> Color 
             .map(|s| contrast_ratio(c, *s))
             .fold(f32::INFINITY, f32::min)
     };
-    let steps = (0..=10).map(|step| mix(color, pole, step as f32 / 10.0));
+    let steps: [Color; 11] = std::array::from_fn(|step| mix(color, pole, step as f32 / 10.0));
     steps
-        .clone()
+        .into_iter()
         .find(|c| worst(*c) >= floor)
         .unwrap_or_else(|| {
             steps
+                .into_iter()
                 .max_by(|a, b| worst(*a).total_cmp(&worst(*b)))
-                .unwrap_or(pole)
+                .expect("eleven steps")
         })
 }
 
@@ -622,7 +623,14 @@ mod tests {
                 .fold(f32::INFINITY, f32::min)
         };
         let lifted = lift_until(WHITE, bg, &surfaces, TEXT_CONTRAST_RATIO);
-        assert!(worst(WHITE) < TEXT_CONTRAST_RATIO && worst(BLACK) < worst(WHITE));
+        assert!(
+            worst(WHITE) < TEXT_CONTRAST_RATIO,
+            "raw white must miss the floor for the fallback to run"
+        );
+        assert!(
+            worst(BLACK) < worst(WHITE),
+            "the pole must read worse than raw white on the worst surface"
+        );
         assert_eq!(lifted, WHITE, "raw white reads best on the worst surface");
     }
 
