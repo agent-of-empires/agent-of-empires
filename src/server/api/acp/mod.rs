@@ -83,7 +83,8 @@ pub(super) fn supervisor_error_response(context: &str, err: &SupervisorError) ->
         SupervisorError::CapacityFull { .. }
         | SupervisorError::TeardownPending(_)
         | SupervisorError::EventStoreUnavailable(_)
-        | SupervisorError::NativeStoreUnavailable| SupervisorError::RegistryBusy
+        | SupervisorError::NativeStoreUnavailable
+        | SupervisorError::RegistryBusy
         | SupervisorError::Acp(AcpError::RegistryBusy) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string())
         }
