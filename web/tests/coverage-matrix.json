@@ -403,16 +403,18 @@
         "tests/live-control-strip.spec.ts",
         "src/hooks/useLiveTerminal.test.ts",
         "src/components/__tests__/LiveTerminalView.controlStrip.test.tsx",
+        "src/components/live-terminal/useTerminalInput.test.ts",
         "src/hooks/__tests__/useCommandActions.test.tsx"
       ],
       "components": [
         "web/src/components/LiveTerminalView.tsx",
         "web/src/components/LiveControlStrip.tsx",
+        "web/src/components/live-terminal/useTerminalInput.ts",
         "web/src/hooks/useLiveTerminal.ts",
         "web/src/hooks/useCommandActions.ts",
         "web/src/lib/liveControl.ts"
       ],
-      "notes": "A view-only tab docks one strip above where you type (above the key bar on phones): \"Open in the TUI.\", \"Open in another Web dashboard window.\" or, without the Daemon's owner kind (#5543), \"Open in another window.\", then \"Take control to type.\"; Take control and the command palette's Take control send claim. × collapses it to a View only button, remembered per Session, surface and pane. A blocked key holds \"Not sent. Take control to type.\" for 2 s, restarted per key, and Tab reaches Take control only then. A read-only Daemon shows a steady strip; disconnects keep the connection banner. The live ping-pong cases take control through the strip; at 375px the owner's taller grid crops from the top so its input line stays visible."
+      "notes": "A view-only tab docks one strip above where you type (above the key bar on phones): \"Open in the TUI.\", \"Open in another Web dashboard window.\" or, without the Daemon's owner kind (#5543), \"Open in another window.\", then \"Take control to type.\"; Take control and the command palette's Take control send claim. × collapses it to a View only button, remembered per Session, surface and pane. A blocked key holds \"Not sent. Take control to type.\" for 2 s, restarted per key, and only then does a plain Tab from the terminal's input or App's keyboard proxy reach Take control; otherwise Tab stays terminal input. A read-only Daemon shows a steady strip; disconnects keep the connection banner. The live ping-pong cases take control through the strip; at 375px the owner's taller grid crops from the top so its input line stays visible."
     },
     {
       "id": "terminal.mobile-live-wheel-forward",

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 import { useLiveTerminal } from "../hooks/useLiveTerminal";
@@ -222,16 +222,11 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     [sendData, noteBlocked, notOwner, readOnly],
   );
   // While view only the terminal sends no keys, so during a hold Tab can reach Take control.
-  const onPaneKeyDownCapture = useCallback(
-    (e: KeyboardEvent) => {
-      if (e.key !== "Tab" || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey) return;
-      if (!viewOnly || holdShown === null || e.target !== inputRef.current || !takeControlRef.current) return;
-      e.preventDefault();
-      e.stopPropagation();
-      takeControlRef.current.focus();
-    },
-    [viewOnly, holdShown],
-  );
+  const escapeTabToTakeControl = useCallback(() => {
+    if (!viewOnly || holdShown === null || !takeControlRef.current) return false;
+    takeControlRef.current.focus();
+    return true;
+  }, [viewOnly, holdShown]);
   const slowWhileOwner =
     !readOnly && live.state.connected && live.state.isOwner && live.state.transportReason === "pipe_owned";
   const reconnectClaiming = useCallback(() => {
@@ -465,7 +460,6 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
       style={rootStyle}
       data-term={dataTerm}
       data-pane-focused={inputFocused || undefined}
-      onKeyDownCapture={onPaneKeyDownCapture}
     >
       {/* Frame the pane like the TUI does: a faint always-on border marks the box edges and brightens to the teal
          `terminal-active` color when this pane is selected (its input has focus), so on a multi-pane desktop it
@@ -525,6 +519,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           sendPaste={sendPasteOrReport}
           uploadPastedImage={uploadPastedImage}
           captureWriteAdmission={captureWriteAdmission}
+          onTabEscape={escapeTabToTakeControl}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}

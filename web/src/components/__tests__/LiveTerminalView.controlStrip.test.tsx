@@ -29,6 +29,7 @@ const live = vi.hoisted(() => ({
   // What LiveTerminalView handed the terminal: typed keys and pastes go through these.
   typed: null as ((data: string) => boolean) | null,
   pasted: null as ((text: string, submit: boolean) => boolean) | null,
+  tabEscape: null as (() => boolean) | null,
 }));
 
 vi.mock("../../hooks/useLiveTerminal", () => ({
@@ -58,9 +59,11 @@ vi.mock("../MobileLiveTerminal", () => ({
     inputRef: RefObject<HTMLTextAreaElement | null>;
     sendData: (data: string) => boolean;
     sendPaste: (text: string, submit: boolean) => boolean;
+    onTabEscape?: () => boolean;
   }) => {
     live.typed = props.sendData;
     live.pasted = props.sendPaste;
+    live.tabEscape = props.onTabEscape ?? null;
     return <textarea aria-label="Live terminal input" ref={props.inputRef} />;
   },
 }));
@@ -182,21 +185,25 @@ describe("LiveTerminalView control strip", () => {
     expect(strip()).toBeNull();
   });
 
-  it("lets Tab reach Take control only during the hold", async () => {
-    await mount();
+  it("takes Tab to Take control only during the hold, and leaves it to the terminal otherwise", async () => {
+    const { rerender } = await mount();
     const input = screen.getByLabelText<HTMLTextAreaElement>("Live terminal input");
-    const button = screen.getByRole("button", { name: "Take control" });
-    input.focus();
-    fireEvent.keyDown(input, { key: "Tab" });
+    const takeControl = () => screen.getByRole("button", { name: "Take control" });
+    const tab = () => {
+      input.focus();
+      return live.tabEscape!();
+    };
+    expect(tab(), "view only, no hold").toBe(false);
     expect(document.activeElement).toBe(input);
 
     typeBlocked();
-    fireEvent.keyDown(input, { key: "Tab", shiftKey: true });
+    expect(tab(), "during the hold").toBe(true);
+    expect(document.activeElement).toBe(takeControl());
+
+    live.state.isOwner = true;
+    rerender(<View />);
+    expect(tab(), "holding control, right after a hold").toBe(false);
     expect(document.activeElement).toBe(input);
-    const tab = fireEvent.keyDown(input, { key: "Tab" });
-    expect(tab).toBe(false);
-    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Take control" }));
-    expect(button.isConnected).toBe(true);
   });
 
   it("collapses to View only, remembered per Session, surface and pane", async () => {

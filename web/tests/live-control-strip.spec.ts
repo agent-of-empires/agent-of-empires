@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import { test, expect, pressShortcut } from "./helpers/mockedTest";
+import { test, expect, observeFor, pressShortcut } from "./helpers/mockedTest";
 import { liveTexts, openLiveSession } from "./helpers/liveTerminal";
 import { mockTerminalApis, type MockHandle } from "./helpers/terminal-mocks";
 import { iPhone13 } from "./helpers/viewports";
@@ -25,6 +25,14 @@ const sizing = (handle: MockHandle) =>
       return [];
     }
   });
+
+// Only an owner's input reaches the pane, so a key from App's keyboard proxy arriving shows the claim was granted.
+const sendFromProxyUntilDelivered = (page: Page, handle: MockHandle, key: string, bytes: string) =>
+  expect(async () => {
+    await page.locator("[data-keyboard-proxy]").focus();
+    await page.keyboard.press(key);
+    expect(handle.liveInput.map(String)).toContain(bytes);
+  }).toPass();
 
 test.describe("Live terminal control strip at 375px", () => {
   test.use({ ...iPhone13, viewport: { width: 375, height: 667 } });
@@ -116,15 +124,36 @@ test.describe("Live terminal control strip at 375px", () => {
       const full = sent.slice(0, claimAt).at(-1);
       // The claim resizes the pane to the last grid before it: the one without the strip.
       expect(typeof full === "number" && full > docked, JSON.stringify(sent)).toBe(true);
-      await expect
-        .poll(() =>
+      await sendFromProxyUntilDelivered(page, handle, "Enter", "\r");
+      // Well past the 150ms fit debounce the grant's layout change triggers.
+      await observeFor(page, 1000, async () => {
+        expect(
           sizing(handle)
             .slice(claimAt + 1)
             .filter((rows) => rows !== full),
-        )
-        .toEqual([]);
+        ).toEqual([]);
+      });
     });
   }
+
+  test("Tab on App's keyboard proxy reaches Take control only during a blocked key's hold", async ({ page }) => {
+    const handle = await mockTerminalApis(page, { viewOnly: { owner: "tui" } });
+    await openLiveSession(page, handle, { mobile: true });
+    const strip = page.locator("[data-live-control-strip]");
+    await expect(strip.getByRole("status")).toHaveText("Open in the TUI. Take control to type.");
+    const proxy = page.locator("[data-keyboard-proxy]");
+    await proxy.focus();
+    // Outside the hold Tab is terminal input: view only blocks it, which starts the hold.
+    await page.keyboard.press("Tab");
+    await expect(strip.getByRole("status")).toHaveText("Not sent. Take control to type.");
+    await expect(proxy).toBeFocused();
+    await page.keyboard.press("Tab");
+    await expect(page.locator("[data-live-take-control]")).toBeFocused();
+    await page.keyboard.press("Enter");
+    await expect(strip).toHaveCount(0);
+    // Holding control, Tab goes to the pane again.
+    await sendFromProxyUntilDelivered(page, handle, "Tab", "\t");
+  });
 
   test("after Take control, the top bar's slower-updates notice leaves the header's controls in view", async ({
     page,
