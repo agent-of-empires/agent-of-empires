@@ -598,8 +598,8 @@ impl<S: BroadcastSink> Drain<S> {
                     established = true;
                     end.startup_rate_limited = false;
                 }
-            _ => {}
-        }
+                _ => {}
+            }
         }
         end
     }
@@ -1786,8 +1786,7 @@ mod tests {
                 frames.try_recv(),
                 Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             ));
-            let state = cache
-                .get_or_hydrate(id, || panic!("warm state must survive"));
+            let state = cache.get_or_hydrate(id, || panic!("warm state must survive"));
             assert_eq!(state.last_seq, 0);
         }
     }
@@ -1858,8 +1857,7 @@ mod tests {
             frames.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
-        let state = cache
-            .get_or_hydrate(id, || panic!("the warm fold must survive"));
+        let state = cache.get_or_hydrate(id, || panic!("the warm fold must survive"));
         assert_eq!(state.last_seq, 0);
         assert_eq!(state.operation_error, None);
         assert_eq!(supervisor.worker_state(id).await, AcpWorkerState::Running);
@@ -1889,8 +1887,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let state = cache
-            .get_or_hydrate(id, || panic!("fold remains warm"));
+        let state = cache.get_or_hydrate(id, || panic!("fold remains warm"));
         assert_eq!(state.sidebar_status(), Status::Error);
         assert!(!state.turn_active);
         assert_eq!(
