@@ -13,15 +13,36 @@ use crate::update::is_newer_version;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallMethod {
-    Homebrew,
+    Homebrew { brew: PathBuf },
     Tarball { binary_path: PathBuf },
     Nix,
     Cargo,
     Unknown { binary_path: PathBuf },
 }
 
+/// Where Homebrew installs: Apple silicon, Intel macOS, and Linuxbrew.
+const HOMEBREW_PREFIXES: [&str; 3] = ["/opt/homebrew", "/usr/local", "/home/linuxbrew/.linuxbrew"];
+
+/// The prefix whose `<prefix>/Cellar/aoe/<version>/bin/aoe` is `path`, where a canonicalized
+/// Homebrew `aoe` lives. Read from the path alone, so it holds when `brew` itself can't run (#5515).
+fn homebrew_cellar_prefix(path: &Path) -> Option<&'static Path> {
+    HOMEBREW_PREFIXES.iter().map(Path::new).find(|prefix| {
+        let Ok(rest) = path.strip_prefix(prefix.join("Cellar").join("aoe")) else {
+            return false;
+        };
+        let parts: Vec<_> = rest.components().map(|c| c.as_os_str()).collect();
+        matches!(parts.as_slice(), [_, bin, name] if *bin == "bin" && *name == "aoe")
+    })
+}
+
 fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     let path = binary_path;
+
+    if let Some(prefix) = homebrew_cellar_prefix(path) {
+        return InstallMethod::Homebrew {
+            brew: prefix.join("bin").join("brew"),
+        };
+    }
 
     if path.starts_with("/nix/store/") {
         return InstallMethod::Nix;
@@ -49,7 +70,7 @@ fn classify_path_prefix(binary_path: &Path, home: &Path) -> InstallMethod {
     }
 }
 
-/// `Homebrew` only when `brew list aoe` resolves to the running binary.
+/// `Homebrew`, run by PATH's `brew`, only when `brew list aoe` resolves to the running binary.
 fn classify_with_brew(
     prefix: InstallMethod,
     brew_path: Option<&Path>,
@@ -57,7 +78,9 @@ fn classify_with_brew(
 ) -> InstallMethod {
     if let Some(bp) = brew_path {
         if paths_canonicalize_equal(bp, binary_path) {
-            return InstallMethod::Homebrew;
+            return InstallMethod::Homebrew {
+                brew: PathBuf::from("brew"),
+            };
         }
     }
     prefix
@@ -79,6 +102,10 @@ pub fn detect_install_method() -> Result<InstallMethod> {
     let home = dirs::home_dir().context("locating home directory")?;
     let home = home.canonicalize().unwrap_or(home);
     let prefix = classify_path_prefix(&exe, &home);
+    // A Cellar path already says Homebrew, and `brew` may not be on a Daemon's PATH.
+    if matches!(prefix, InstallMethod::Homebrew { .. }) {
+        return Ok(prefix);
+    }
     let brew_path = probe_brew_aoe_path();
     Ok(classify_with_brew(prefix, brew_path.as_deref(), &exe))
 }
@@ -303,12 +330,15 @@ struct BrewVersions {
     stable: Option<String>,
 }
 
-fn brew_available_version() -> Option<String> {
-    brew_available_version_with_timeout(BREW_INFO_TIMEOUT)
+fn brew_available_version(brew: &Path) -> Option<String> {
+    brew_available_version_with_timeout(brew, BREW_INFO_TIMEOUT)
 }
 
-fn brew_available_version_with_timeout(timeout: std::time::Duration) -> Option<String> {
-    let mut cmd = Command::new("brew");
+fn brew_available_version_with_timeout(
+    brew: &Path,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let mut cmd = Command::new(brew);
     cmd.args(["info", "aoe", "--json=v2"]);
     // Runs inside `IgnoreSignalsGuard`'s window; see `extract_tarball`.
     #[cfg(unix)]
@@ -347,7 +377,7 @@ fn brew_formula_lag_message(target_version: &str) -> String {
 /// formula version keeps the update on offer.
 fn supports_target(method: &InstallMethod, brew_version: Option<&str>, target: &str) -> bool {
     match (method, brew_version) {
-        (InstallMethod::Homebrew, Some(v)) => !is_newer_version(target, v),
+        (InstallMethod::Homebrew { .. }, Some(v)) => !is_newer_version(target, v),
         _ => true,
     }
 }
@@ -359,9 +389,10 @@ pub fn install_method_supports_target(target_version: &str) -> bool {
     let Ok(method) = detect_install_method() else {
         return true;
     };
-    let brew_version = matches!(method, InstallMethod::Homebrew)
-        .then(brew_available_version)
-        .flatten();
+    let brew_version = match &method {
+        InstallMethod::Homebrew { brew } => brew_available_version(brew),
+        _ => None,
+    };
     let supported = supports_target(&method, brew_version.as_deref(), target_version);
     if !supported {
         tracing::info!(
@@ -456,7 +487,7 @@ pub enum InstallKind {
 impl From<&InstallMethod> for InstallKind {
     fn from(method: &InstallMethod) -> Self {
         match method {
-            InstallMethod::Homebrew => InstallKind::Homebrew,
+            InstallMethod::Homebrew { .. } => InstallKind::Homebrew,
             InstallMethod::Tarball { .. } => InstallKind::Release,
             InstallMethod::Cargo => InstallKind::Cargo,
             InstallMethod::Nix => InstallKind::Nix,
@@ -507,34 +538,38 @@ async fn install_kind_detached(
     .unwrap_or(InstallKind::Unknown)
 }
 
-fn update_via_brew(target_version: &str) -> Result<()> {
-    let mut update_cmd = Command::new("brew");
+/// `brew` is the install's own Homebrew, so a second prefix on PATH is never updated instead.
+fn update_via_brew(brew: &Path, target_version: &str) -> Result<()> {
+    let mut update_cmd = Command::new(brew);
     update_cmd.args(["update"]);
     // Runs inside `IgnoreSignalsGuard`'s window; see `extract_tarball`.
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut update_cmd);
-    let status = update_cmd.status().context("running `brew update`")?;
+    let status = update_cmd
+        .status()
+        .with_context(|| format!("running `{} update`", brew.display()))?;
     if !status.success() {
-        anyhow::bail!("`brew update` failed (exit {})", status);
+        anyhow::bail!("`{} update` failed (exit {})", brew.display(), status);
     }
 
     // A lagging formula makes `brew upgrade aoe` exit 0 without upgrading.
-    let brew_version = brew_available_version();
-    if !supports_target(
-        &InstallMethod::Homebrew,
-        brew_version.as_deref(),
-        target_version,
-    ) {
+    let brew_version = brew_available_version(brew);
+    let method = InstallMethod::Homebrew {
+        brew: brew.to_path_buf(),
+    };
+    if !supports_target(&method, brew_version.as_deref(), target_version) {
         anyhow::bail!(brew_formula_lag_message(target_version));
     }
 
-    let mut upgrade_cmd = Command::new("brew");
+    let mut upgrade_cmd = Command::new(brew);
     upgrade_cmd.args(["upgrade", "aoe"]);
     #[cfg(unix)]
     crate::process::reset_signals_on_exec(&mut upgrade_cmd);
-    let status = upgrade_cmd.status().context("running `brew upgrade aoe`")?;
+    let status = upgrade_cmd
+        .status()
+        .with_context(|| format!("running `{} upgrade aoe`", brew.display()))?;
     if !status.success() {
-        anyhow::bail!("`brew upgrade aoe` failed (exit {})", status);
+        anyhow::bail!("`{} upgrade aoe` failed (exit {})", brew.display(), status);
     }
     Ok(())
 }
@@ -581,7 +616,7 @@ pub fn format_prompt_block(
     let mut out = String::new();
     out.push_str(&format!("Update v{current_version} → v{latest_version}\n"));
     let (method_label, location_label) = match method {
-        InstallMethod::Homebrew => ("homebrew", "managed by Homebrew".to_string()),
+        InstallMethod::Homebrew { .. } => ("homebrew", "managed by Homebrew".to_string()),
         InstallMethod::Tarball { binary_path } => {
             ("tarball install", binary_path.display().to_string())
         }
@@ -603,7 +638,7 @@ pub async fn perform_update(
     on_progress: Option<&mut dyn FnMut(u64, Option<u64>)>,
 ) -> Result<()> {
     match method {
-        InstallMethod::Homebrew => update_via_brew(version)?,
+        InstallMethod::Homebrew { brew } => update_via_brew(brew, version)?,
         InstallMethod::Tarball { binary_path } => {
             update_via_tarball(binary_path, version, on_progress).await?
         }
@@ -644,6 +679,14 @@ mod tests {
         let home = home();
         let nix = |_: &Path| InstallMethod::Nix;
         let cargo = |_: &Path| InstallMethod::Cargo;
+        let brew_at = |brew: &'static str| {
+            move |_: &Path| InstallMethod::Homebrew {
+                brew: PathBuf::from(brew),
+            }
+        };
+        let arm = brew_at("/opt/homebrew/bin/brew");
+        let intel = brew_at("/usr/local/bin/brew");
+        let linuxbrew = brew_at("/home/linuxbrew/.linuxbrew/bin/brew");
         let tarball = |p: &Path| InstallMethod::Tarball {
             binary_path: p.to_path_buf(),
         };
@@ -657,6 +700,33 @@ mod tests {
             (home.join(".local/bin/aoe"), &tarball),
             (home.join("bin/aoe"), &tarball),
             (PathBuf::from("/opt/aoe-custom/bin/aoe"), &unknown),
+            // #5515: a Cellar binary is Homebrew, run by its own prefix's `brew`.
+            (
+                PathBuf::from("/opt/homebrew/Cellar/aoe/1.22.3/bin/aoe"),
+                &arm,
+            ),
+            (
+                PathBuf::from("/usr/local/Cellar/aoe/1.22.3/bin/aoe"),
+                &intel,
+            ),
+            (
+                PathBuf::from("/home/linuxbrew/.linuxbrew/Cellar/aoe/1.22.3/bin/aoe"),
+                &linuxbrew,
+            ),
+            // Look-alikes stay Unknown.
+            (
+                PathBuf::from("/opt/homebrew/Cellar/aoe-fork/1.0/bin/aoe"),
+                &unknown,
+            ),
+            (
+                PathBuf::from("/opt/homebrew/Cellar/aoe/1.22.3/libexec/aoe"),
+                &unknown,
+            ),
+            (PathBuf::from("/opt/homebrew/Cellar/aoe/bin/aoe"), &unknown),
+            (
+                PathBuf::from("/srv/opt/homebrew/Cellar/aoe/1.22.3/bin/aoe"),
+                &unknown,
+            ),
         ];
         for (path, expected) in cases {
             assert_eq!(
@@ -669,6 +739,9 @@ mod tests {
 
     #[test]
     fn only_a_lagging_homebrew_formula_hides_the_update() {
+        let homebrew = InstallMethod::Homebrew {
+            brew: PathBuf::from("brew"),
+        };
         let tarball = InstallMethod::Tarball {
             binary_path: home().join(".local/bin/aoe"),
         };
@@ -676,11 +749,11 @@ mod tests {
             binary_path: PathBuf::from("/opt/aoe"),
         };
         let cases = [
-            (InstallMethod::Homebrew, Some("1.0.0"), false),
-            (InstallMethod::Homebrew, Some("1.1.0"), true),
-            (InstallMethod::Homebrew, Some("1.2.0"), true),
+            (homebrew.clone(), Some("1.0.0"), false),
+            (homebrew.clone(), Some("1.1.0"), true),
+            (homebrew.clone(), Some("1.2.0"), true),
             // `brew info` failed: keep the update on offer.
-            (InstallMethod::Homebrew, None, true),
+            (homebrew, None, true),
             (tarball, Some("1.0.0"), true),
             (InstallMethod::Cargo, Some("1.0.0"), true),
             (InstallMethod::Nix, Some("1.0.0"), true),
@@ -784,7 +857,13 @@ mod tests {
             binary_path: PathBuf::from("/opt/aoe"),
         };
         let cases = [
-            (InstallMethod::Homebrew, "homebrew", "aoe update"),
+            (
+                InstallMethod::Homebrew {
+                    brew: PathBuf::from("brew"),
+                },
+                "homebrew",
+                "aoe update",
+            ),
             (tarball, "release", "aoe update"),
             (InstallMethod::Cargo, "cargo", CARGO_UPDATE_COMMAND),
             (InstallMethod::Nix, "nix", NIX_UPDATE_COMMAND),
@@ -850,7 +929,9 @@ mod tests {
                 InstallMethod::Unknown {
                     binary_path: brew_exe.clone(),
                 },
-                InstallMethod::Homebrew,
+                InstallMethod::Homebrew {
+                    brew: PathBuf::from("brew"),
+                },
             ),
             (
                 &other_exe,
@@ -921,7 +1002,9 @@ mod tests {
                 "Sudo:      required (write-protected directory)",
             ),
             (
-                InstallMethod::Homebrew,
+                InstallMethod::Homebrew {
+                    brew: PathBuf::from("/opt/homebrew/bin/brew"),
+                },
                 false,
                 "Method:    homebrew|Location:  managed by Homebrew",
             ),
@@ -1061,8 +1144,9 @@ mod tests {
                 let dir = TempDir::new().unwrap();
                 let log = write_recording_brew_shim(dir.path(), formula_version, fail_on);
 
+                // PATH holds the same shim, so a stray PATH `brew` never reaches a real one.
                 let _path = crate::session::test_support::path_prepended(dir.path());
-                let result = update_via_brew("1.5.2");
+                let result = update_via_brew(&dir.path().join("brew"), "1.5.2");
                 match expected_error {
                     [] => {
                         result.unwrap_or_else(|e| panic!("{formula_version} {fail_on:?}: {e}"));
@@ -1080,6 +1164,41 @@ mod tests {
                     invocations.lines().collect::<Vec<_>>(),
                     expected_calls,
                     "{formula_version} {fail_on:?}"
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn brew_update_runs_the_owning_brew_never_paths() {
+            for owner_installed in [true, false] {
+                let owner_dir = TempDir::new().unwrap();
+                let decoy_dir = TempDir::new().unwrap();
+                let decoy_log = write_recording_brew_shim(decoy_dir.path(), "1.5.2", None);
+                let owner_log = owner_installed
+                    .then(|| write_recording_brew_shim(owner_dir.path(), "1.5.2", None));
+                let owner = owner_dir.path().join("brew");
+
+                let _path = crate::session::test_support::path_prepended(decoy_dir.path());
+                let result = update_via_brew(&owner, "1.5.2");
+                match owner_log {
+                    Some(log) => {
+                        result.unwrap();
+                        let calls = std::fs::read_to_string(log).unwrap();
+                        assert_eq!(
+                            calls.lines().collect::<Vec<_>>(),
+                            ["update", "info aoe --json=v2", "upgrade aoe"]
+                        );
+                    }
+                    None => {
+                        let msg = result.expect_err("a missing owner brew fails").to_string();
+                        assert!(msg.contains(&owner.display().to_string()), "{msg}");
+                    }
+                }
+                let decoy_calls = std::fs::read_to_string(&decoy_log).unwrap_or_default();
+                assert!(
+                    decoy_calls.is_empty(),
+                    "owner installed {owner_installed}: PATH's brew ran {decoy_calls:?}"
                 );
             }
         }

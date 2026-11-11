@@ -4324,7 +4324,7 @@ impl HomeView {
                 use crate::update::install::InstallMethod;
                 if !matches!(
                     &method,
-                    InstallMethod::Homebrew | InstallMethod::Tarball { .. }
+                    InstallMethod::Homebrew { .. } | InstallMethod::Tarball { .. }
                 ) {
                     let msg = match &method {
                         InstallMethod::Nix => {

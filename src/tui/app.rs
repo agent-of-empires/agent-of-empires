@@ -1903,7 +1903,7 @@ impl App {
                 if !crate::update::install::parent_is_writable(binary_path)
         );
 
-        if matches!(method, InstallMethod::Homebrew) || needs_sudo {
+        if matches!(method, InstallMethod::Homebrew { .. }) || needs_sudo {
             self.set_status(format!("updating to v{version}…"));
             let method_clone = method.clone();
             let version_clone = version.clone();
