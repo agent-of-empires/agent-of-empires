@@ -545,6 +545,60 @@ mod tests {
     }
 
     #[test]
+    fn cancel_capable_follows_the_capabilities_field() {
+        // Table: absent keeps the current value, null clears it, an object
+        // is capable only when it carries `cancel`.
+        let cases = [
+            ("undefined keeps true", None, true, true),
+            ("undefined keeps false", None, false, false),
+            (
+                "null clears true",
+                Some(serde_json::Value::Null),
+                true,
+                false,
+            ),
+            (
+                "null keeps false",
+                Some(serde_json::Value::Null),
+                false,
+                false,
+            ),
+            (
+                "cancel sets from false",
+                Some(serde_json::json!({"cancel": {}})),
+                false,
+                true,
+            ),
+            (
+                "cancel keeps true",
+                Some(serde_json::json!({"cancel": {}})),
+                true,
+                true,
+            ),
+            (
+                "no cancel clears true",
+                Some(serde_json::json!({})),
+                true,
+                false,
+            ),
+            (
+                "no cancel keeps false",
+                Some(serde_json::json!({})),
+                false,
+                false,
+            ),
+        ];
+        for (name, capabilities, current, expected) in cases {
+            let mut update = serde_json::json!({"sessionId": "child"});
+            if let Some(capabilities) = capabilities {
+                update["capabilities"] = capabilities;
+            }
+            let update: SubagentUpdate = serde_json::from_value(update).unwrap();
+            assert_eq!(cancel_capable(&update, current), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn auth_status_update_parses_without_a_session_id() {
         // Table: the wire payloads the extension can send, including a kind
         // added after this code was written and the vendor bag it drops.
