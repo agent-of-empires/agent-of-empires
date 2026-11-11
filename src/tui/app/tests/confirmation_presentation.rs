@@ -319,7 +319,9 @@ async fn home_visible_mouse_discard_restores_the_actual_theme_preview() {
     let mut terminal = output_test_terminal();
     let mut emitted = Vec::new();
     present(&mut app, &mut terminal, &mut master, &mut emitted);
-    app.home.open_settings();
+    app.handle_key(key(KeyCode::Char('s')), &mut terminal)
+        .await
+        .unwrap();
 
     let categories = app.home.settings_view.as_ref().unwrap().categories.len();
     for _ in 0..categories {
