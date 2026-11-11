@@ -997,8 +997,10 @@ fn a_custom_agent_locks_yolo_only_in_the_views_that_run_an_always_yolo_base() {
 #[serial_test::serial]
 fn declared_always_yolo_does_not_overwrite_the_submitted_preference() {
     let home = tempfile::tempdir().unwrap();
-    let _home = crate::session::test_support::isolate_home(home.path());
+    // Declared first so it drops last: the registry reloads after HOME is
+    // restored, never while it still points at the temporary fixture.
     let _reload = crate::plugin::ReloadRegistryOnDrop;
+    let _home = crate::session::test_support::isolate_home(home.path());
     let manifest = r#"
 id = "acme.yolo"
 name = "Yolo"

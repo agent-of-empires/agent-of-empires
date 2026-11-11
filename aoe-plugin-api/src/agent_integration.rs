@@ -302,6 +302,25 @@ pub fn launch_prefix(command: &str) -> Option<(Vec<&str>, usize)> {
     None
 }
 
+/// Every word of a direct launch command and how many leading ones are
+/// assignments, or `None` when the whole command is not one.
+///
+/// A direct launch is [`launch_prefix`]'s executable plus only literal words
+/// after it, so arguments appended to the command reach that executable instead
+/// of a pipe, redirection or separate command. [`launch_prefix`] itself stops at
+/// the executable and never inspects the tail.
+pub fn direct_launch_words(command: &str) -> Option<(Vec<&str>, usize)> {
+    let (prefix, assignments) = launch_prefix(command)?;
+    let words: Vec<&str> = command
+        .split([' ', '\t'])
+        .filter(|word| !word.is_empty())
+        .collect();
+    words
+        .iter()
+        .all(|word| literal_word(word))
+        .then_some((words, assignments))
+}
+
 /// Whether the launch shell leaves a word intact: no separators, redirections,
 /// globs, braces, expansions, quoting or whitespace other than what
 /// `launch_prefix` already split on. A newline is a command separator to the
@@ -344,7 +363,7 @@ fn valid_env_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::launch_prefix;
+    use super::{direct_launch_words, launch_prefix};
 
     #[test]
     fn launch_prefix_stops_at_the_executable() {
@@ -402,6 +421,28 @@ mod tests {
             "TOKEN=local\u{a0}acmebot",
         ] {
             assert_eq!(launch_prefix(command), None, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn direct_launch_words_keep_the_literal_tail() {
+        assert_eq!(
+            direct_launch_words("TOKEN=local acmebot --flag"),
+            Some((vec!["TOKEN=local", "acmebot", "--flag"], 1))
+        );
+        assert_eq!(direct_launch_words("acmebot"), Some((vec!["acmebot"], 0)));
+        for command in [
+            // Appended arguments would land on the pipe or the next command.
+            "acmebot | tee /tmp/acmebot.log",
+            "acmebot; echo done",
+            "acmebot && echo done",
+            "acmebot > /tmp/acmebot.log",
+            "acmebot # trailing comment",
+            // A quoted argument cannot be re-formed from words `env` receives.
+            "acmebot --flag='a b'",
+            "",
+        ] {
+            assert_eq!(direct_launch_words(command), None, "{command}");
         }
     }
 

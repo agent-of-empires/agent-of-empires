@@ -336,20 +336,20 @@ pub async fn list_agents(
                     .and_then(|(prefix, _)| prefix.last().map(|word| (*word).to_owned()))
                     .unwrap_or_else(|| integration.tool.to_owned()),
                 host_only: launch.is_some_and(|launch| launch.host_only),
-                always_yolo: launch
-                    .and_then(|launch| launch.yolo.as_ref())
-                    .is_some_and(|yolo| {
-                        matches!(
-                            yolo,
-                            aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always
-                        )
-                    })
-                    || crate::acp::runs_always_yolo(
+                // A launch declaration decides this itself. Only a declaration
+                // that says nothing about YOLO inherits the built-in it aliases.
+                always_yolo: match launch.and_then(|launch| launch.yolo.as_ref()) {
+                    Some(yolo) => matches!(
+                        yolo,
+                        aoe_plugin_api::agent_integration::AgentYoloDeclaration::Always
+                    ),
+                    None => crate::acp::runs_always_yolo(
                         integration.tool,
                         crate::session::View::Terminal,
                         agent_acp_cmd,
                         agent_detect_as,
                     ),
+                },
                 acp_always_yolo: crate::acp::runs_always_yolo(
                     integration.tool,
                     crate::session::View::Structured,

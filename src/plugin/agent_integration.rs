@@ -1056,6 +1056,58 @@ deny = [{ kind = "literal", value = "n" }]
         );
     }
     #[test]
+    fn declared_shell_tail_is_not_a_oneshot_candidate() {
+        let manifest: aoe_plugin_api::PluginManifest = toml::from_str(
+            r#"
+id = "acme.tail"
+name = "Tail"
+version = "1.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "tail-helper"
+command = "tail-helper | tee /tmp/tail-helper.log"
+[agent_integrations.launch]
+oneshot_flag = "-p"
+"#,
+        )
+        .unwrap();
+        let registry = std::sync::Arc::new(super::super::PluginRegistry::from_test_plugins(vec![
+            super::super::LoadedPlugin {
+                manifest,
+                enabled: true,
+                trust: aoe_plugin_api::TrustLevel::Community,
+                validation: super::super::registry::ValidationState::Local,
+                source: None,
+                dir: None,
+                manifest_hash: String::new(),
+                granted: true,
+            },
+        ]));
+        let agent = declared_agent(registry, "tail-helper", std::iter::empty()).unwrap();
+        assert!(
+            crate::session::smart_rename::OneshotAgent::Declared(agent)
+                .argv("hello", None)
+                .is_none(),
+            "a piped launch must not receive the oneshot flags"
+        );
+        assert_eq!(
+            crate::session::smart_rename::check_eligible_with_declarations(
+                true,
+                true,
+                true,
+                "New session",
+                "tail-helper",
+                "",
+                false,
+                "tail-helper | tee /tmp/tail-helper.log",
+                &crate::session::config::SessionConfig::default(),
+            )
+            .err(),
+            Some(crate::session::smart_rename::SkipReason::NoOneshot)
+        );
+    }
+
+    #[test]
     fn catalog_suppresses_duplicate_provider_and_custom_or_builtin_collisions() {
         let entries = unique_candidates(
             [

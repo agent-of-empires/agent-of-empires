@@ -217,9 +217,10 @@ impl OneshotAgent {
             Self::Declared(declared) => {
                 let argv = declared.with_definition(build)??;
                 let command = declared.contribution().command.as_deref()?;
+                let (words, _) = aoe_plugin_api::agent_integration::direct_launch_words(command)?;
                 let script = format!(
                     "exec env {} {}",
-                    command,
+                    words.join(" "),
                     shell_words::join(argv.into_iter().skip(1))
                 );
                 Some(vec!["/bin/sh".into(), "-c".into(), script])
@@ -278,6 +279,17 @@ pub(crate) fn check_eligible_with_declarations(
             check_eligible(structured, setting_on, force, title, Some(agent), "", false)
         })
         .ok_or(SkipReason::NoOneshot)??;
+    // Flags and the prompt are appended to the declared command, so a shell tail
+    // (`helper | tee log`) would send them to the wrong program.
+    if declared
+        .contribution()
+        .command
+        .as_deref()
+        .and_then(aoe_plugin_api::agent_integration::direct_launch_words)
+        .is_none()
+    {
+        return Err(SkipReason::NoOneshot);
+    }
     if sandboxed && tool != session_tool {
         return Err(SkipReason::SandboxRenameAgentMismatch);
     }
