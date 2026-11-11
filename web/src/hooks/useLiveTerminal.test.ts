@@ -466,6 +466,151 @@ describe("read-only policy", () => {
   });
 });
 
+describe("takeover intent retirement", () => {
+  const ownershipMessages = (socket: FakeWS) =>
+    socket.json().filter(({ type }) => type === "claim" || type === "claim_if_vacant");
+
+  it.each(["deadline", "resize"] as const)(
+    "retires a deferred takeover across read-only restoration before %s",
+    (trigger) => {
+      vi.useFakeTimers();
+      try {
+        const { result, rerender } = renderHook(({ readOnly }) => useLiveTerminal("s1", readOnly, "live-ws"), {
+          initialProps: { readOnly: false },
+        });
+        const ws = FakeWS.sockets[0]!;
+        ws.open();
+        ws.deliver({ type: "size_owner", is_owner: false });
+        act(() => result.current.claimAfterResize(1000));
+        expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }]);
+        rerender({ readOnly: true });
+        rerender({ readOnly: false });
+        expect(FakeWS.sockets).toHaveLength(1);
+        if (trigger === "deadline") {
+          act(() => vi.advanceTimersByTime(1000));
+        } else {
+          act(() => result.current.sendResize(100, 31));
+          expect(ws.json()).toContainEqual({ type: "resize", cols: 100, rows: 31 });
+        }
+        expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }]);
+        if (trigger === "resize") {
+          act(() => vi.advanceTimersByTime(1000));
+          expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }]);
+        }
+        act(() => result.current.claimAfterResize(1000));
+        if (trigger === "deadline") {
+          act(() => vi.advanceTimersByTime(1000));
+        } else {
+          act(() => result.current.sendResize(101, 33));
+        }
+        expect(ownershipMessages(ws)).toEqual([{ type: "claim_if_vacant" }, { type: "claim" }]);
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it("retires reconnect takeover after an observer open and a later writable redial", () => {
+    vi.useFakeTimers();
+    try {
+      const { result, rerender } = renderHook(({ readOnly }) => useLiveTerminal("s1", readOnly, "live-ws"), {
+        initialProps: { readOnly: false },
+      });
+      const first = FakeWS.sockets[0]!;
+      first.open();
+      act(() => result.current.reconnectAndClaim());
+      rerender({ readOnly: true });
+      act(() => first.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(2);
+      const observer = FakeWS.sockets[1]!;
+      observer.open();
+      expect(ownershipMessages(observer)).toEqual([]);
+      observer.deliver(frame(1, "still observing\n"));
+      expect(result.current.state.frame?.content).toBe("still observing\n");
+      rerender({ readOnly: false });
+      observer.readyState = FakeWS.CLOSED;
+      act(() => window.dispatchEvent(new Event("online")));
+      expect(FakeWS.sockets).toHaveLength(3);
+      const writable = FakeWS.sockets[2]!;
+      writable.open();
+      expect(ownershipMessages(writable)).toEqual([{ type: "claim_if_vacant" }]);
+      act(() => result.current.reconnectAndClaim());
+      act(() => writable.onclose?.(new CloseEvent("close")));
+      expect(FakeWS.sockets).toHaveLength(4);
+      const explicit = FakeWS.sockets[3]!;
+      explicit.open();
+      expect(ownershipMessages(explicit)).toEqual([{ type: "claim" }]);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each<["deadline" | "resize" | "reconnect", string, string | null, string]>([
+    ["deadline", "session change", "s2", "live-ws"],
+    ["resize", "session change", "s2", "live-ws"],
+    ["reconnect", "session change", "s2", "live-ws"],
+    ["deadline", "route change", "s1", "/other/live-ws"],
+    ["resize", "route change", "s1", "/other/live-ws"],
+    ["reconnect", "route change", "s1", "/other/live-ws"],
+    ["deadline", "session deselection", null, "live-ws"],
+    ["resize", "session deselection", null, "live-ws"],
+    ["reconnect", "session deselection", null, "live-ws"],
+  ])("retires %s takeover before same-hook %s", (pending, _label, sessionId, wsPath) => {
+    vi.useFakeTimers();
+    try {
+      const { result, rerender } = renderHook(
+        ({ sessionId, wsPath }) => useLiveTerminal(sessionId, false, wsPath),
+        { initialProps: { sessionId: "s1" as string | null, wsPath: "live-ws" } },
+      );
+      const first = FakeWS.sockets[0]!;
+      first.open();
+      first.deliver({ type: "size_owner", is_owner: false });
+      act(() => {
+        if (pending === "reconnect") result.current.reconnectAndClaim();
+        else result.current.claimAfterResize(1000);
+      });
+      rerender({ sessionId, wsPath });
+      if (sessionId === null) {
+        expect(FakeWS.sockets).toHaveLength(1);
+        rerender({ sessionId: "s2", wsPath });
+      }
+      expect(FakeWS.sockets).toHaveLength(2);
+      const next = FakeWS.sockets[1]!;
+      next.open();
+      expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }]);
+      if (pending === "deadline") {
+        act(() => vi.advanceTimersByTime(1000));
+      } else if (pending === "resize") {
+        act(() => result.current.sendResize(100, 31));
+        expect(next.json()).toContainEqual({ type: "resize", cols: 100, rows: 31 });
+      }
+      expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }]);
+      if (pending === "resize") {
+        act(() => vi.advanceTimersByTime(1000));
+        expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }]);
+      }
+      if (pending === "reconnect") {
+        act(() => result.current.reconnectAndClaim());
+        act(() => next.onclose?.(new CloseEvent("close")));
+        const explicit = FakeWS.sockets[2]!;
+        explicit.open();
+        expect(ownershipMessages(explicit)).toEqual([{ type: "claim" }]);
+      } else {
+        act(() => {
+          result.current.claimAfterResize(1000);
+          result.current.sendResize(101, 33);
+        });
+        expect(ownershipMessages(next)).toEqual([{ type: "claim_if_vacant" }, { type: "claim" }]);
+      }
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("transport reason", () => {
   it("keeps the reason only while on the snapshot fallback", () => {
     const { result, ws } = mount();
