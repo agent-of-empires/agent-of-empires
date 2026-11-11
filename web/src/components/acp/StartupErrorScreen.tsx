@@ -359,7 +359,7 @@ function rationaleFor(detail: IncompatibleAgentDetail): string {
     case "unsupported_protocol_version":
       return `The adapter is from an older or newer generation than this aoe build supports.`;
     case "invalid_proxy_hello":
-      return `The plugin's proxy and this aoe build disagree on the proxy contract version.`;
+      return `The plugin's proxy hello was rejected; the reason above says why.`;
   }
 }
 

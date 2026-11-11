@@ -194,6 +194,18 @@ describe("StartupErrorScreen", () => {
     await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith(OPENCODE_COMMAND));
   });
 
+  it("explains a rejected proxy hello without blaming the version", async () => {
+    const detail: IncompatibleAgentDetail = {
+      kind: "invalid_proxy_hello",
+      reason: "proxy hello has an empty plugin_id",
+    };
+    const { getByTestId } = await renderScreen(detail);
+    fireEvent.click(getByTestId("startup-error-details"));
+    const body = getByTestId("startup-error-details-body").textContent;
+    expect(body).toContain("The plugin's proxy hello was rejected");
+    expect(body).not.toContain("contract version");
+  });
+
   it("names no Agent until install-info answers", () => {
     fetchAgentInstallInfo.mockReturnValue(new Promise(() => {}));
     const { getByRole } = render(<StartupErrorScreen detail={incompatible()} sessionId="s1" />);
