@@ -725,7 +725,7 @@ impl ServeLaunch {
             args.auth = requested.auth;
         }
         args.core_only = requested.core_only;
-        args.port = requested.port;
+        args.port = requested.port.or(args.port);
         args.host = requested.host;
         args.remote = requested.remote;
         if !args.remote {
@@ -3443,6 +3443,8 @@ mod tests {
         }
         assert!(!local.remote && local.host == "0.0.0.0");
         assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+        let portless = recorded.overlay_tui_args(tui_args(&["aoe", "serve", "--daemon"]));
+        assert_eq!(portless.port, Some(recorded.port));
         // clap requires `--remote` for the tunnel flags, so a Local restart must not replay them.
         assert_eq!((&local.tunnel_name, &local.tunnel_url), (&None, &None));
         assert_eq!(tunnel.tunnel_name, recorded.tunnel_name);
