@@ -162,6 +162,22 @@ impl Session {
             .prompt_sent_since_attach
             .store(true, Ordering::Relaxed);
         shared.adopted_turn_active.store(false, Ordering::Relaxed);
+        *shared
+            .last_prompt
+            .lock()
+            .expect("last prompt mutex poisoned") = (
+            blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_owned(),
+            0,
+        );
         shared.prompt_in_flight.store(true, Ordering::Relaxed);
         shared.terminal_claim.begin_turn();
         shared.between_prompt.reset_for_prompt();
@@ -410,6 +426,12 @@ impl Session {
 
     async fn on_command(&mut self, turn: &mut Turn, cmd: Option<ClientCmd>) -> AcpResult<Flow> {
         match cmd {
+            Some(ClientCmd::CancelChild {
+                session_id,
+                respond_to,
+            }) => {
+                let _ = respond_to.send(self.cancel_child(session_id).await);
+            }
             Some(ClientCmd::Cancel) => {
                 info!(target: "acp.protocol", "sending session/cancel during in-flight prompt");
                 // Only the first cancel arms escalation and tells the UI. Arm it
@@ -431,9 +453,11 @@ impl Session {
                 turn.flags.shutdown = true;
                 return Ok(Flow::Break);
             }
-            Some(ClientCmd::SetConfigOption { config_id, value }) => {
-                self.dispatch_config_option(config_id, value)
-            }
+            Some(ClientCmd::SetConfigOption {
+                config_id,
+                value,
+                remember,
+            }) => self.dispatch_config_option(config_id, value, remember),
             Some(ClientCmd::SetMode(mode_id)) => self.dispatch_mode(mode_id, true),
             Some(ClientCmd::DeleteSession {
                 acp_session_id,
@@ -537,7 +561,8 @@ impl Session {
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
         let label = self.shared.session_label.clone();
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
+        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+            && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
             // The turn finished but the PromptResponse never came: end cleanly
@@ -674,6 +699,11 @@ impl Session {
         shared.terminal_claim.claim();
         shared.publish_terminal(reason.into(), preceding).await;
         shared.reset_message_dedup();
+        shared
+            .last_prompt
+            .lock()
+            .expect("last prompt mutex poisoned")
+            .1 = now_ms();
         shared.prompt_in_flight.store(false, Ordering::Relaxed);
         *shared.cancel_deadline.lock().unwrap() = None;
         // Missing after a Stopped, this line signals a stranded prompt (#3190).

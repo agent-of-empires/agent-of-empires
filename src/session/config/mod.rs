@@ -491,13 +491,14 @@ pub struct AcpConfig {
     )]
     pub allowed_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
-    /// additional sessions queue.
+    /// additional sessions queue. Takes effect when the Daemon starts.
     #[serde(default = "default_max_workers")]
     #[setting(
         label = "Most Agents running at once",
         widget = "number",
         min = 1,
         validate = "range:1",
+        global_only,
         advanced,
         summary = "How many Structured view Sessions can have their Agent running at the same time. Lower it to save memory. Applies after the Daemon restarts."
     )]
@@ -2908,6 +2909,18 @@ pub struct WorktreeConfig {
     )]
     pub workspace_path_template: String,
 
+    /// Create new worktree sessions inside a workspace directory even with one
+    /// repository, so more projects can be attached later without moving the
+    /// session.
+    #[serde(default)]
+    #[setting(
+        label = "Workspace by Default",
+        widget = "toggle",
+        web = "elevation:worktree config affects host filesystem",
+        repo = "deny"
+    )]
+    pub workspace_by_default: bool,
+
     /// Run `git submodule update --init --recursive` after creating a worktree
     /// when the checkout contains a `.gitmodules` file. Disable for repos with
     /// large or deeply-nested submodule trees that you don't need inside agent
@@ -2957,6 +2970,7 @@ impl Default for WorktreeConfig {
             auto_cleanup: true,
             delete_branch_on_cleanup: false,
             workspace_path_template: default_workspace_template(),
+            workspace_by_default: false,
             init_submodules: true,
             default_base_branch: None,
         }

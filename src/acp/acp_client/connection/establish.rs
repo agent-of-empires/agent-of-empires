@@ -2,6 +2,7 @@
 //! session and apply configured defaults.
 
 use crate::acp::agent_compat::{self, ExpectedAgent};
+use crate::acp::aoe_meta;
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
 use crate::acp::transcript::LOAD_FAILED_PREFIX;
@@ -12,7 +13,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{Agent, JsonRpcRequest};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -26,7 +27,8 @@ use super::ReadyTx;
 use crate::acp::acp_client::commands::{ClientCmd, ConnectMode};
 use crate::acp::acp_client::config_options::{
     apply_config_default, config_option_failure_event, config_options_event, mode_config_id,
-    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
+    model_config_values, modes_available_event, thought_level_config_id,
+    ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::{establish_session_v3, DaemonControlClient};
 use crate::acp::acp_client::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
@@ -98,6 +100,7 @@ pub(super) struct EstablishCtx {
     pub(super) expected_agent: ExpectedAgent,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
+    pub(super) default_model_config: BTreeMap<String, String>,
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
@@ -123,14 +126,14 @@ pub(super) async fn establish(
     }
     let init: InitializeResponse = match ctx.control.as_ref() {
         Some(control) => {
-            let params = serde_json::to_value(build_initialize_request())
+            let params = serde_json::to_value(build_initialize_request(shared.profile))
                 .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
             serde_json::from_value(control.initialize(params).await?)
                 .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
         }
         None => {
             connection
-                .send_request(build_initialize_request())
+                .send_request(build_initialize_request(shared.profile))
                 .block_task()
                 .await?
         }
@@ -155,6 +158,36 @@ pub(super) async fn establish(
         }
         return Ok(None);
     }
+
+    // A proxy announces itself on the initialize response; any other agent
+    // has no hello and is not held to the `_meta.aoe` contract.
+    let proxied = match init
+        .meta
+        .as_ref()
+        .map(aoe_meta::ProxyHello::from_meta)
+        .transpose()
+    {
+        Ok(hello) => hello.flatten().is_some(),
+        Err(err) => {
+            warn!(
+                target: "acp.protocol",
+                session = %label,
+                error = %err,
+                "proxy hello rejected; refusing to enter session"
+            );
+            let detail = StartupErrorDetail::InvalidProxyHello {
+                reason: err.to_string(),
+            };
+            let message = detail.user_message();
+            if let Some(tx) = ctx.ready_tx.lock().await.take() {
+                let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
+                    IncompatibleAgentError { detail, message },
+                ))));
+            }
+            return Ok(None);
+        }
+    };
+    shared.aoe.begin_connection(proxied);
 
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter
@@ -217,6 +250,7 @@ pub(super) async fn establish(
         close_capable: init.agent_capabilities.session_capabilities.close.is_some(),
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
+        default_model_config: ctx.default_model_config,
         default_mode: ctx.default_mode,
         default_model: ctx.default_model,
         agent_cwd: ctx.agent_cwd,
@@ -251,6 +285,7 @@ pub(super) async fn establish(
     };
     session.apply_default_model().await;
     session.apply_default_effort().await;
+    session.apply_default_model_config().await;
     if adopted_turn && live_recovery.is_none() {
         spawn_resume_idle_watchdog(
             shared,
@@ -261,6 +296,17 @@ pub(super) async fn establish(
         );
     }
     Ok(Some(session))
+}
+
+/// A live busy or task lease holds the turn open however long the agent is
+/// silent; the grace counts again once it expires.
+fn resume_idle_expired(
+    idle_ms: i64,
+    grace_ms: i64,
+    leases: &aoe_meta::lease::LeaseTable,
+    now: i64,
+) -> bool {
+    idle_ms >= grace_ms && !leases.working(now)
 }
 
 /// Fallback when an adopted turn neither completes nor shows activity, so the
@@ -297,8 +343,9 @@ fn spawn_resume_idle_watchdog(
                 );
                 return;
             }
-            let idle_ms = now_ms() - shared.last_event_at.load(Ordering::Relaxed);
-            if idle_ms >= grace_ms {
+            let now = now_ms();
+            let idle_ms = now - shared.last_event_at.load(Ordering::Relaxed);
+            if resume_idle_expired(idle_ms, grace_ms, &shared.aoe.leases, now) {
                 if shared.terminal_claim.claim() {
                     info!(
                         target: "acp.protocol",
@@ -511,7 +558,11 @@ impl Session {
             }
             let req = LoadSessionRequest::new(stored.clone(), self.agent_cwd.clone())
                 .mcp_servers(mcp_servers.clone());
-            match self.load_request(req).await {
+            // The replay precedes the reply, and holds no lease.
+            self.shared.aoe.set_loading_history(true);
+            let loaded = self.load_request(req).await;
+            self.shared.aoe.set_loading_history(false);
+            match loaded {
                 Ok(resp) => {
                     self.session_from_storage = true;
                     info!(
@@ -669,6 +720,7 @@ impl Session {
             Ok(options) => {
                 self.channels.thought_level_config_option_id =
                     thought_level_config_id(&options).map(|id| id.0.to_string());
+                self.channels.model_config = model_config_values(&options);
             }
             Err(reason) => {
                 let event = config_option_failure_event(
@@ -684,13 +736,13 @@ impl Session {
 
     /// Effort is a pin carried across respawns, which resume via load or fork,
     /// so it applies after any establish path. Resume captures no option id.
-    async fn apply_default_effort(&self) {
+    async fn apply_default_effort(&mut self) {
         let Some(effort) = self.default_effort.as_deref() else {
             return;
         };
         match self.channels.thought_level_config_option_id.as_deref() {
             Some(config_id) => {
-                let _ = apply_config_default(
+                let result = apply_config_default(
                     &self.connection,
                     &self.shared.event_tx,
                     self.acp_session_id.clone(),
@@ -699,6 +751,9 @@ impl Session {
                     &self.shared.session_label,
                 )
                 .await;
+                if let Ok(options) = result {
+                    self.channels.model_config = model_config_values(&options);
+                }
             }
             None => debug!(
                 target: "acp.protocol",
@@ -709,9 +764,79 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Runs last: a model switch rebuilds the option set, so each pick is
+    /// checked against what the model now advertises. An option the model
+    /// lacks is skipped; a rejection is only warned.
+    async fn apply_default_model_config(&mut self) {
+        let label = &self.shared.session_label;
+        for (id, value) in &self.default_model_config {
+            match self.channels.model_config.get(id) {
+                None => debug!(
+                    target: "acp.protocol",
+                    session = %label,
+                    config_id = %id,
+                    "structured view model_config skipped; option not advertised"
+                ),
+                Some(current) if current == value => debug!(
+                    target: "acp.protocol",
+                    session = %label,
+                    config_id = %id,
+                    "structured view model_config already current"
+                ),
+                Some(_) => {
+                    let result = apply_config_default(
+                        &self.connection,
+                        &self.shared.event_tx,
+                        self.acp_session_id.clone(),
+                        SessionConfigId::new(id.clone()),
+                        value,
+                        label,
+                    )
+                    .await;
+                    if let Ok(options) = result {
+                        self.channels.model_config = model_config_values(&options);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_silent_lease_holds_the_resume_idle_stop_until_it_expires() {
+        use aoe_meta::{LeaseKind, LeaseOp, LeaseVerb};
+        let leases = aoe_meta::lease::LeaseTable::default();
+        let acquire = LeaseOp {
+            id: "bg".into(),
+            kind: LeaseKind::Busy,
+            op: LeaseVerb::Acquire,
+            ttl_ms: Some(60_000),
+        };
+        leases.apply(&acquire, 0).unwrap();
+        // (now, idle since the lease frame, stop expected); grace is 30s.
+        for (now, idle, stop) in [
+            (31_000, 31_000, false),
+            (59_999, 59_999, false),
+            (60_000, 60_000, true),
+        ] {
+            assert_eq!(
+                resume_idle_expired(idle, 30_000, &leases, now),
+                stop,
+                "{now}"
+            );
+        }
+        assert!(resume_idle_expired(
+            30_000,
+            30_000,
+            &Default::default(),
+            30_000
+        ));
+    }
 
     #[test]
     fn reset_reasons_follow_prior_conversation() {

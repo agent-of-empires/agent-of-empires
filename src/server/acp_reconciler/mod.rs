@@ -411,18 +411,9 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Live served-profile config bounds cold resumes; the supervisor owns the total cap.
-    let namespace = state.profile_namespace.read().await;
-    let served = state.served_profile().to_string();
-    let live_max_workers = tokio::task::spawn_blocking(move || {
-        crate::session::config::profile_config::resolve_config_or_warn(&served)
-            .acp
-            .max_concurrent_workers
-    })
-    .await
-    .unwrap_or_else(|_| state.acp_supervisor.max_concurrent_workers());
-    drop(namespace);
-    let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
+    let resume_limit = MAX_CONCURRENT_RESUMES
+        .min(state.acp_supervisor.max_concurrent_workers())
+        .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
     for target in tasks {
@@ -862,6 +853,7 @@ mod tests {
                 text: "go".into(),
                 attachments: Vec::new(),
                 prompt_id: None,
+                merged_prompt_ids: Vec::new(),
                 synthesized: false,
                 origin_plugin: None,
             },

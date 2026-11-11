@@ -1366,6 +1366,24 @@ mod tests {
             created_at: Utc::now(),
             cleanup_on_delete: true,
         });
+        // A single-repo workspace with a bound conversation still appends: its
+        // cwd is already the workspace dir, so the conversation stays resumable.
+        inst.agent_session_id = Some("conversation".to_string());
+        inst.agent_session_binding = Some(crate::session::ConversationBinding {
+            session_id: "conversation".into(),
+            execution: Some(crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: workspace.clone(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            }),
+            provenance: crate::session::ConversationProvenance::Observed,
+            transcript_path: None,
+        });
+        assert!(conversation_cannot_follow(&inst));
 
         let plan = plan(&inst, "attach-append", &frontend, ExistingBranch::Refuse)
             .expect("attaching to a workspace session must be accepted");

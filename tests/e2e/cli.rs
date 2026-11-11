@@ -2399,6 +2399,27 @@ fn cli_review_boundary_repo_base_from_a_linked_worktree() {
         let row = crate::harness::session_by_title(&rows, &title);
         let checkout = git2::Repository::open(row["project_path"].as_str().unwrap()).unwrap();
         assert_eq!(checkout.head().unwrap().target(), Some(expected));
+
+        let title = format!("linked-workspace-{index}");
+        let branch = format!("workspace-from-linked-{index}");
+        h.add_session(&[
+            linked.to_str().unwrap(),
+            "-t",
+            &title,
+            "-w",
+            &branch,
+            "-b",
+            "--workspace",
+            "--repo-base",
+            &format!("{selector}=develop"),
+        ]);
+        let rows = h.read_sessions();
+        let row = crate::harness::session_by_title(&rows, &title);
+        let worktree = row["workspace_info"]["repos"][0]["worktree_path"]
+            .as_str()
+            .unwrap();
+        let checkout = git2::Repository::open(worktree).unwrap();
+        assert_eq!(checkout.head().unwrap().target(), Some(expected));
     }
     let before = h.read_sessions();
     h.run_cli_err(&[

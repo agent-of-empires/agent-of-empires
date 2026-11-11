@@ -134,7 +134,7 @@ pub async fn acp_enable(
     // default fallback, which would accept every tool.
     let resolvable = {
         let profile = instance.source_profile.clone();
-        let project_path = PathBuf::from(&instance.project_path);
+        let project_path = instance.repo_config_path().to_path_buf();
         let tool = instance.tool.clone();
         let agent_name = instance.agent_name.clone();
         tokio::task::spawn_blocking(move || {
@@ -866,7 +866,7 @@ fn record_retired_handoff_in(
                     let config =
                         crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                             &row.source_profile,
-                            std::path::Path::new(&row.project_path),
+                            row.repo_config_path(),
                         );
                     let yolo = row.yolo_mode;
                     crate::session::builder::apply_agent_launch_config(

@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Contract",
+  "description": "The published schema: `proxy` is the hello, `primitive` an update's\n`_meta.aoe`.",
+  "type": "object",
+  "properties": {
+    "proxy": {
+      "$ref": "#/$defs/ProxyHello"
+    },
+    "primitive": {
+      "$ref": "#/$defs/Envelope"
+    }
+  },
+  "required": [
+    "proxy",
+    "primitive"
+  ],
+  "$defs": {
+    "ProxyHello": {
+      "description": "`_meta.aoe.proxy` on the initialize response, next to the adapter's own\nunchanged `agent_info`.",
+      "type": "object",
+      "properties": {
+        "plugin_id": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 1
+        },
+        "primitive_schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "plugin_id",
+        "protocol_version",
+        "primitive_schema_version"
+      ]
+    },
+    "Envelope": {
+      "description": "`_meta.aoe` on a `session/update` or tool call. `key` is the idempotency\nkey: a repeat within a session is dropped.\n\nA frame with `after_adapter_sequence` is tailer-emitted: it is not an\nadapter frame, and core delivers it only after adapter frame N.",
+      "type": "object",
+      "properties": {
+        "v": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 1,
+          "maximum": 1
+        },
+        "key": {
+          "type": "string",
+          "minLength": 1
+        },
+        "after_adapter_sequence": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lease": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LeaseOp"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "parent_tool_call": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ephemeral": {
+          "description": "`true` drops the frame before the reducer.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "memory_recall": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryRecallPrimitive"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan_proposal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PlanProposal"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_presentation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolPresentation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "option_preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OptionPreview"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "v",
+        "key"
+      ]
+    },
+    "LeaseOp": {
+      "description": "An expiring hold. `ttl_ms` is required for acquire and renew.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/LeaseKind"
+        },
+        "op": {
+          "$ref": "#/$defs/LeaseVerb"
+        },
+        "ttl_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "maximum": 3600000
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind"
+      ]
+    },
+    "LeaseKind": {
+      "type": "string",
+      "enum": [
+        "busy",
+        "task",
+        "compaction"
+      ]
+    },
+    "LeaseVerb": {
+      "type": "string",
+      "enum": [
+        "acquire",
+        "renew",
+        "release"
+      ]
+    },
+    "MemoryRecallPrimitive": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "synthesized_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "mode"
+      ]
+    },
+    "PlanProposal": {
+      "description": "Markdown whose bullet lines become the plan steps.",
+      "type": "object",
+      "properties": {
+        "markdown": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "markdown"
+      ]
+    },
+    "ToolPresentation": {
+      "description": "A card header hint. Validated and carried in v1; no surface renders it yet.",
+      "type": "object",
+      "properties": {
+        "icon": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "primary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chips": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "OptionPreview": {
+      "description": "Preview text for one option of a form elicitation. Validated and carried\nin v1.",
+      "type": "object",
+      "properties": {
+        "option_id": {
+          "type": "string"
+        },
+        "markdown": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "option_id",
+        "markdown"
+      ]
+    }
+  }
+}

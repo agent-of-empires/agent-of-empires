@@ -151,6 +151,33 @@ fn refuse_unresolved_adapter(
 
 /// `current_exe()` keeps returning the original path after the binary is
 /// unlinked, so the spawn would otherwise fail with a bare ENOENT.
+/// Splices `__prime-agent` between the runner's own arguments and the agent's.
+/// `rewind_container_env` makes the frontend reread fd 9 after the daemon's
+/// container client consumed it.
+fn prime_runner_args(
+    original: &[std::ffi::OsString],
+    encoded: &str,
+    current_exe: &std::path::Path,
+    socket: &std::path::Path,
+    rewind_container_env: bool,
+) -> Result<Vec<std::ffi::OsString>, AcpError> {
+    let separator = original
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| AcpError::Spawn("runner argument separator missing".into()))?;
+    let mut args = original[..separator].to_vec();
+    args.extend(["--prime-runtime", encoded, "--"].map(Into::into));
+    args.extend([current_exe.as_os_str().to_owned(), "__prime-agent".into()]);
+    args.extend(["--runtime", encoded].map(Into::into));
+    if rewind_container_env {
+        args.push("--rewind-container-env".into());
+    }
+    args.push("--".into());
+    args.extend_from_slice(&original[separator + 1..]);
+    args.extend(["--daemon-socket".into(), socket.as_os_str().to_owned()]);
+    Ok(args)
+}
+
 fn ensure_runner_exe(exe: &std::path::Path) -> Result<(), AcpError> {
     // A stat failure is not proof of removal; spawn reports the real error.
     if exe.try_exists().unwrap_or(true) {
@@ -406,25 +433,18 @@ pub(super) async fn spawn_runner_detached(
             .get_args()
             .map(std::ffi::OsStr::to_owned)
             .collect();
-        let separator = original
-            .iter()
-            .position(|arg| arg == "--")
-            .ok_or_else(|| AcpError::Spawn("runner argument separator missing".into()))?;
+        let rewind = sandbox_argv
+            .as_ref()
+            .is_some_and(|s| s.target_env.is_some());
 
         let mut owned = tokio::process::Command::new(&current_exe);
-        owned
-            .args(&original[..separator])
-            .arg("--prime-runtime")
-            .arg(&encoded)
-            .arg("--")
-            .arg(&current_exe)
-            .arg("__prime-agent")
-            .arg("--runtime")
-            .arg(&encoded)
-            .arg("--")
-            .args(&original[separator + 1..])
-            .arg("--daemon-socket")
-            .arg(runtime.socket());
+        owned.args(prime_runner_args(
+            &original,
+            &encoded,
+            &current_exe,
+            &runtime.socket(),
+            rewind,
+        )?);
         owned.env_clear().envs(
             cmd.as_std()
                 .get_envs()
@@ -456,6 +476,12 @@ pub(super) async fn spawn_runner_detached(
                 Ok(())
             });
         }
+    }
+
+    // Outlives the runner's exec, so the `docker` it spawns inherits it too.
+    if let Some(file) = sandbox_argv.as_ref().and_then(|s| s.target_env.as_ref()) {
+        file.attach(cmd.as_std_mut())
+            .map_err(|e| AcpError::Spawn(e.to_string()))?;
     }
 
     // The runner writes its own log file. Inheriting our stdio would put
@@ -716,6 +742,94 @@ mod tests {
             let mut want = vec!["A=1".to_string()];
             want.extend(own.map(|v| format!("INVOCATION_ID={v}")));
             assert_eq!(seen, want, "own INVOCATION_ID {own:?}");
+        }
+    }
+
+    /// The daemon's and frontend's container clients both read the env-file
+    /// on fd 9. `<&9` shares one offset across them, as Darwin `/dev/fd` does.
+    #[test]
+    fn prime_frontend_rereads_the_env_file_after_the_daemon() {
+        use crate::session::environment::shell_escape;
+        use std::os::unix::fs::PermissionsExt as _;
+        const CHILD: &str = "AOE_PRIME_REWIND_TEST_CHILD";
+        const TEST: &str =
+            "acp::acp_client::runner::tests::prime_frontend_rereads_the_env_file_after_the_daemon";
+        if std::env::var_os(CHILD).is_none() {
+            let file = crate::containers::container_interface::TargetEnvFile::create(&[(
+                "SECRET".into(),
+                "value".into(),
+            )])
+            .unwrap()
+            .unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1");
+            file.attach(&mut child).unwrap();
+            let output =
+                crate::process::run_with_timeout(&mut child, std::time::Duration::from_secs(30))
+                    .unwrap()
+                    .expect("Prime child must finish");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(root.path());
+        let seen = |reader: &str| root.path().join(reader).to_string_lossy().into_owned();
+        let read_fd = |reader: &str| {
+            let path = shell_escape(&seen(reader));
+            format!("cat <&9 > {path}.part && mv {path}.part {path}")
+        };
+        let program = root.path().join("native");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\ncase $1 in\nlist) [ -f {} ];;\nshutdown) printf '%s' '{{\"failed\":[]}}';;\nesac\n",
+                shell_escape(&seen("daemon"))
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime =
+            crate::process::prime::PrimeRuntime::new(program, root.path().into(), None).unwrap();
+        let encoded = serde_json::to_string(&runtime).unwrap();
+        let original = os(&["__acp-runner", "--", "sh", "-c", &read_fd("frontend")]);
+        let args = prime_runner_args(
+            &original,
+            &encoded,
+            std::path::Path::new("aoe"),
+            &runtime.socket(),
+            true,
+        )
+        .unwrap();
+        let start = args.iter().position(|arg| arg == "__prime-agent").unwrap();
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: crate::process::prime::PrimeRunnerArgs,
+        }
+        let mut prime = <Cli as clap::Parser>::try_parse_from(&args[start..])
+            .unwrap()
+            .args;
+        prime.daemon_command = Some(format!("{}; exec sleep 30", read_fd("daemon")));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::process::prime::run(prime))
+            .unwrap();
+        for reader in ["daemon", "frontend"] {
+            assert_eq!(
+                std::fs::read_to_string(seen(reader)).unwrap(),
+                "SECRET=value\n",
+                "{reader}"
+            );
         }
     }
 

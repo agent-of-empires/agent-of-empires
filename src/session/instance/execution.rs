@@ -1754,11 +1754,12 @@ impl Instance {
                     &self.effective_profile(),
                 );
                 let entries = self.resolved_host_environment_from(config.environment);
-                let (environment, raw_environment) = host_launch_environment_from(
+                let (mut environment, raw_environment) = host_launch_environment_from(
                     std::env::vars_os(),
                     &entries,
                     (agent.name == "opencode").then_some(config.session.inherit_host_environment),
                 );
+                environment.extend(parsed.assignments);
                 let path = environment
                     .get("PATH")
                     .map(std::ffi::OsStr::new)
@@ -1844,9 +1845,9 @@ impl Instance {
                 "managed conversation requires a direct native command or an explicitly declared wrapper"
             ).context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let words =
-            shell_words::split(command).context(ManagedResumeCause::UnsupportedManagedArguments)?;
-        let program = words.first().context("empty agent command")?;
+        let parsed = super::launch_command::parse_launch_command(command)
+            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        let program = parsed.words.first().context("empty agent command")?;
         let direct = AGENTS.iter().find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
@@ -1897,8 +1898,9 @@ impl Instance {
             )
             .context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let mut words = shell_words::split(self.get_tool_command())
-            .context(ManagedResumeCause::UnsupportedManagedArguments)?;
+        let mut words = super::launch_command::parse_launch_command(self.get_tool_command())
+            .context(ManagedResumeCause::UnsupportedManagedArguments)?
+            .words;
         words.extend(
             shell_words::split(&extra).context(ManagedResumeCause::UnsupportedManagedArguments)?,
         );
@@ -1916,7 +1918,7 @@ impl Instance {
         }
         let config = crate::session::config::repo_config::resolve_config_with_repo(
             &self.effective_profile(),
-            std::path::Path::new(&self.project_path),
+            self.repo_config_path(),
         )?;
         let agent =
             Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;
@@ -1925,15 +1927,17 @@ impl Instance {
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut resolved_target_session_id = None;
         let mut inputs = self.native_launch_inputs(agent, &config)?;
+        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())
+            .context("native program is missing")?;
+        inputs.environment.extend(parsed.assignments);
         anyhow::ensure!(
             inputs.container.as_ref().is_none_or(|container| {
                 container.runtime.kind != crate::session::ContainerRuntimeName::AppleContainer
             }),
             "managed conversation requires an immutable container execution identity"
         );
-        let words = shell_words::split(self.get_tool_command())?;
         let program =
-            inputs.resolve_program(words.first().context("native program is missing")?)?;
+            inputs.resolve_program(parsed.words.first().context("native program is missing")?)?;
         anyhow::ensure!(
             program.is_absolute() && program.to_str().is_some(),
             "native program must have an absolute UTF-8 path"
@@ -3056,7 +3060,9 @@ impl Instance {
         else {
             return Ok(command);
         };
-        let mut words = shell_words::split(&command)?;
+        let parsed = super::launch_command::parse_launch_command(&command)
+            .context("native program is missing")?;
+        let mut words = parsed.words;
         *words.first_mut().context("native program is missing")? = program
             .to_str()
             .context("native executable path is not UTF-8")?
@@ -3071,7 +3077,28 @@ impl Instance {
                 ),
             }
         }
-        Ok(shell_words::join(words))
+        // A literal prefix assignment for a routing key would override the
+        // attested store: the host wrapper exports the snapshot, then `env`
+        // reassigns from the prefix, so the agent would read a different store
+        // than its binding records. The frozen snapshot is authoritative; keep
+        // only prefixes it does not route.
+        let routing_keys: Vec<&str> = execution
+            .map(|execution| execution.routing.iter())
+            .or_else(|| unpinned.map(|unpinned| unpinned.routing.iter()))
+            .map(|routing| routing.map(|(key, _)| key.as_str()).collect())
+            .unwrap_or_default();
+        let assignments: Vec<(String, String)> = parsed
+            .assignments
+            .into_iter()
+            .filter(|(key, _)| !routing_keys.contains(&key.as_str()))
+            .collect();
+        Ok(super::launch_command::render_launch_command(
+            super::launch_command::ParsedLaunchCommand {
+                words,
+                assignments,
+                executable_end: parsed.executable_end,
+            },
+        ))
     }
 }
 
@@ -3781,6 +3808,152 @@ mod tests {
         ));
         assert_eq!(execution.target_session_id.as_deref(), Some(sid));
         assert_eq!(instance.agent_session_binding, Some(original));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_launch_attests_prefix_environment_and_executable() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _config = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let store = root.path().join("store with spaces");
+        std::fs::create_dir_all(&store).unwrap();
+        let bin = root.path().join("bin");
+        let mut instance = Instance::new("prefix-attestation", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = format!(
+            "PATH={} CLAUDE_CONFIG_DIR={} 'claude'",
+            shell_words::quote(bin.to_str().unwrap()),
+            shell_words::quote(store.to_str().unwrap())
+        );
+        let execution = instance.resolve_native_execution(None).unwrap();
+        assert_eq!(
+            execution.program.canonicalize().unwrap(),
+            bin.join("claude").canonicalize().unwrap()
+        );
+        assert_eq!(execution.binding.stores, [store.canonicalize().unwrap()]);
+        let frozen = instance
+            .freeze_native_invocation(
+                instance.command.clone(),
+                Some(&execution),
+                None,
+                &AgentLaunchContext::host(Some(execution.agent), None),
+            )
+            .unwrap();
+        let parsed = super::super::launch_command::parse_launch_command(&frozen).unwrap();
+        assert_eq!(parsed.words[0], execution.program.to_str().unwrap());
+        assert!(
+            parsed.assignments.is_empty(),
+            "both prefix keys are routed by the attested snapshot: {frozen}"
+        );
+        // The effective environment must match the binding, not the literal prefix.
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                store.canonicalize().unwrap().to_string_lossy().into_owned()
+            ))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_conflicting_prefix_store_yields_to_the_attested_binding() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _config = crate::session::test_support::EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\nexit 0\n",
+        );
+        let attested = root.path().join("attested-store");
+        let conflicting = root.path().join("prefix-store");
+        std::fs::create_dir_all(&attested).unwrap();
+        std::fs::create_dir_all(&conflicting).unwrap();
+        let mut instance = Instance::new("prefix-conflict", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        // Store A is what resolution attests; store B reaches the frozen launch
+        // only as a literal prefix (a recorded conversation, or an explicit
+        // `agent_config_dir`, can disagree with the stored command's prefix).
+        instance.command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(attested.to_str().unwrap()),
+        );
+        let execution = instance.resolve_native_execution(None).unwrap();
+        assert_eq!(
+            execution.binding.stores,
+            [attested.canonicalize().unwrap()],
+            "the attested store governs the binding"
+        );
+        let conflicting_command = format!(
+            "CLAUDE_CONFIG_DIR={} claude",
+            shell_words::quote(conflicting.to_str().unwrap()),
+        );
+        let frozen = instance
+            .freeze_native_invocation(
+                conflicting_command,
+                Some(&execution),
+                None,
+                &AgentLaunchContext::host(Some(execution.agent), None),
+            )
+            .unwrap();
+        let parsed = super::super::launch_command::parse_launch_command(&frozen).unwrap();
+        assert!(
+            parsed.assignments.is_empty(),
+            "a conflicting prefix must not re-assert a routed key: {frozen}"
+        );
+        let routed = execution
+            .host_command()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CLAUDE_CONFIG_DIR"))
+            .map(|(_, value)| {
+                value
+                    .map(std::ffi::OsStr::to_string_lossy)
+                    .map(|v| v.into_owned())
+            });
+        assert_eq!(
+            routed,
+            Some(Some(
+                attested
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )),
+            "the effective environment must match the attested binding, not the prefix"
+        );
+    }
+
+    #[test]
+    fn assignments_and_quoted_executable_keep_direct_capture_identity() {
+        let mut instance = Instance::new("prefix", "/tmp");
+        instance.tool = "omp".into();
+        instance.command = "TOKEN='a b' 'omp' --verbose".into();
+        let agent = crate::agents::get_agent("omp").unwrap();
+        assert!(instance.launch_invokes_resolved_agent_directly(agent));
+        assert_eq!(
+            Instance::execution_agent_for("omp", &instance.command, &Default::default())
+                .unwrap()
+                .name,
+            "omp"
+        );
+        assert!(instance.managed_user_argv(agent).is_ok());
+        instance.command = "'TOKEN=value' omp".into();
+        assert!(!instance.launch_invokes_resolved_agent_directly(agent));
     }
 
     #[test]

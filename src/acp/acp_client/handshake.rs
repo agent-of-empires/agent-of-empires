@@ -4,13 +4,14 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v1::schema::{
     ClientCapabilities, ClientSessionCapabilities, CompactionCapabilities, ElicitationCapabilities,
     ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
-    NoticeCapabilities,
+    NoticeCapabilities, SubagentCapabilities,
 };
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::warn;
 
 use super::errors::AcpError;
+use crate::acp::agent_profiles::AgentProfile;
 
 /// A fork needs both a requested parent and the agent's fork capability;
 /// otherwise the normal new/load handshake runs, which surfaces an unfulfilled
@@ -21,7 +22,7 @@ pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) 
 
 /// `client_info` is mandatory: a strict backend rejects the empty strings that
 /// omitting it serializes to (#2767).
-pub(super) fn build_initialize_request() -> InitializeRequest {
+pub(super) fn build_initialize_request(profile: &AgentProfile) -> InitializeRequest {
     let capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
@@ -40,7 +41,9 @@ pub(super) fn build_initialize_request() -> InitializeRequest {
             ClientSessionCapabilities::new()
                 .notices(NoticeCapabilities::new())
                 .compaction(CompactionCapabilities::new()),
-        );
+        )
+        // Each subagent then arrives as a child session on this connection.
+        .subagents(profile.supports_subagents.then(SubagentCapabilities::new));
     InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(capabilities)
         .client_info(
@@ -113,7 +116,7 @@ mod tests {
     /// #2767: a strict backend rejects an empty client_name/client_version.
     #[test]
     fn handshake_wire_shapes() {
-        let req = build_initialize_request();
+        let req = build_initialize_request(&crate::acp::agent_profiles::CLAUDE);
         let info = req.client_info.expect("client_info must be set");
         assert_eq!(info.name, "agent-of-empires");
         assert!(!info.version.is_empty());
@@ -145,7 +148,10 @@ mod tests {
     /// path (the Read card would show only "completed").
     #[test]
     fn initialize_does_not_declare_the_air_extension() {
-        let wire = serde_json::to_value(build_initialize_request()).expect("serialize");
+        let wire = serde_json::to_value(build_initialize_request(
+            &crate::acp::agent_profiles::CLAUDE,
+        ))
+        .expect("serialize");
         assert_eq!(
             wire.pointer("/clientCapabilities/_meta/jetbrains"),
             None,
@@ -158,12 +164,31 @@ mod tests {
     /// update, so a drift here would kill the feature with the suite green.
     #[test]
     fn initialize_advertises_the_session_capabilities() {
-        let wire = serde_json::to_value(build_initialize_request()).expect("serialize");
+        let wire = serde_json::to_value(build_initialize_request(
+            &crate::acp::agent_profiles::CLAUDE,
+        ))
+        .expect("serialize");
         for key in ["notices", "compaction"] {
             assert_eq!(
                 wire.pointer(&format!("/clientCapabilities/session/{key}")),
                 Some(&serde_json::json!({})),
                 "session {key} capability missing from {wire}"
+            );
+        }
+    }
+
+    /// Declaring `subagents` moves every child's traffic off the root session
+    /// id, so only profiles that handle child sessions may advertise it.
+    #[test]
+    fn initialize_advertises_subagents_only_for_supporting_profiles() {
+        use crate::acp::agent_profiles::{CLAUDE, CODEX};
+        for (profile, expected) in [(&CLAUDE, Some(serde_json::json!({}))), (&CODEX, None)] {
+            let wire = serde_json::to_value(build_initialize_request(profile)).expect("serialize");
+            assert_eq!(
+                wire.pointer("/clientCapabilities/subagents").cloned(),
+                expected,
+                "{}: {wire}",
+                profile.key
             );
         }
     }

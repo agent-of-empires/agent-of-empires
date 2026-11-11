@@ -21,6 +21,8 @@ pub struct SpawnConfig {
     pub tool: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
+    /// Where repo config is re-read on respawn; see `SpawnRequest::config_path`.
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     /// Request-sourced provider env, filtered by `provider_env_denyreason`.
     pub provider_env: Vec<(String, String)>,
@@ -33,6 +35,9 @@ pub struct SpawnConfig {
     /// The effort was set per session, not inherited from the model's profile
     /// default, so a model change must not re-resolve it.
     pub default_effort_explicit: bool,
+    /// `Instance.acp_model_config`, re-asserted through `model_config` options
+    /// after the model and effort on every establish.
+    pub default_model_config: std::collections::BTreeMap<String, String>,
     /// Applied strictly through a `category:"mode"` option on fresh sessions.
     pub default_mode: Option<String>,
     /// `Instance.agent_model`, re-asserted through a `category:"model"` option
@@ -395,6 +400,10 @@ pub(super) fn prime_runtime_for_spawn(
             .args(&argv.docker_args[..argv.exec_prefix_len])
             .args(["sh", "-c", &script])
             .envs(argv.inherit_env.iter().map(|(key, value)| (key, value)));
+        if let Some(file) = &argv.target_env {
+            file.attach(&mut probe)
+                .map_err(|e| AcpError::Spawn(e.to_string()))?;
+        }
         let bytes = crate::session::capture::run_with_timeout_limit(
             probe,
             std::time::Duration::from_secs(5),

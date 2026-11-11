@@ -30,6 +30,9 @@ pub enum QueueReason {
     /// No live worker, and not a case this POST would wake (idle dormancy or a
     /// rate-limit park).
     WorkerDown,
+    /// The agent's proxy broke the `_meta.aoe` contract, so core discards its
+    /// output; the queue drains once a new connection restores the integration.
+    IntegrationLost,
 }
 
 /// Worker-liveness inputs the endpoint already computes.
@@ -51,6 +54,11 @@ pub fn decide(state: &AcpState, worker: WorkerLiveness) -> PromptDispatch {
     if !worker.running && !worker.idle_dormant && !worker.rate_limit_parked {
         return PromptDispatch::Queued {
             reason: QueueReason::WorkerDown,
+        };
+    }
+    if state.integration_lost.is_some() {
+        return PromptDispatch::Queued {
+            reason: QueueReason::IntegrationLost,
         };
     }
     if !state.turn_active {
@@ -107,6 +115,20 @@ mod tests {
             idle_dormant: flags.1,
             rate_limit_parked: flags.2,
         }
+    }
+
+    /// A lost integration discards the agent's output, so a prompt must not
+    /// reach it even when the session looks idle.
+    #[test]
+    fn a_lost_integration_queues_even_an_idle_session() {
+        let mut s = state((false, false, false, false));
+        s.integration_lost = Some(crate::acp::state::IntegrationLostReason::HoldOverflow);
+        assert_eq!(
+            decide(&s, worker((true, false, false))),
+            PromptDispatch::Queued {
+                reason: QueueReason::IntegrationLost
+            }
+        );
     }
 
     /// The decision table, keyed by the incident each row exists for.
