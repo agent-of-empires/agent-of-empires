@@ -1816,6 +1816,19 @@ export async function acpDisable(
   }
 }
 
+/** Stop one subagent without ending the root turn. Resolves to an error message, or null on success. */
+export async function cancelSubagent(sessionId: string, childId: string): Promise<string | null> {
+  const url = `/api/sessions/${encodeURIComponent(sessionId)}/acp/subagents/${encodeURIComponent(childId)}/cancel`;
+  try {
+    const res = await fetch(url, { method: "POST" });
+    if (res.ok) return null;
+    const detail = (await res.text().catch(() => "")).slice(0, 200);
+    return `Could not stop subagent (${res.status}). ${detail}`.trim();
+  } catch (e) {
+    return `Network error stopping subagent: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 // The daemon owns the structured-view prompt queue; /queue reads it on demand.
 // Queued follow-ups survive client reloads and drain server-side.
 

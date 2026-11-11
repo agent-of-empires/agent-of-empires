@@ -120,6 +120,8 @@ export function StructuredView(props: Props) {
                 <BackgroundAgentsContext.Provider
                   value={{
                     agents: ctx.state.backgroundAgents,
+                    subagents: ctx.state.subagents,
+                    cancelSubagent: ctx.cancelSubagent,
                     workflowRuns: ctx.state.workflowRuns,
                     backgroundTasks: ctx.state.backgroundTasks,
                     openPane: props.onOpenAgentsPane,

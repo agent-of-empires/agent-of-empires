@@ -124,6 +124,8 @@ pub enum HttpError {
     PluginJobActive,
     #[error("plugin is already installed; run `aoe plugin update <id>` or `aoe plugin uninstall <id>` on the same Daemon endpoint")]
     PluginAlreadyInstalled,
+    #[error("subagent cannot be cancelled")]
+    SubagentNotCancellable,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
     RevivalRequired,
     #[error("Auto-name skipped: the session changed or no title could be applied")]
@@ -577,6 +579,23 @@ impl HttpClient {
             path_segment(session_id)?
         );
         let res = self.execute(self.http.post(&url)).await?;
+        check_status(res, session_id)?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/subagents/{child_id}/cancel`; the parent
+    /// turn keeps running. A 409 means the child cannot be cancelled.
+    pub async fn cancel_subagent(&self, session_id: &str, child_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/subagents/{}/cancel",
+            self.endpoint.base_url,
+            path_segment(session_id)?,
+            path_segment(child_id)?
+        );
+        let res = self.execute(self.http.post(&url)).await?;
+        if res.status() == StatusCode::CONFLICT {
+            return Err(HttpError::SubagentNotCancellable);
+        }
         check_status(res, session_id)?;
         Ok(())
     }

@@ -945,6 +945,42 @@ async fn handle_terminal_event(
             }
             Ok(false)
         }
+        Intent::StopSubagent => {
+            let Some(target) = state.transcript.stoppable_subagent() else {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    "no stoppable subagent".into(),
+                    ToastKind::Info,
+                );
+                return Ok(false);
+            };
+            let child_id = target.session_id.clone();
+            let label = target
+                .title
+                .clone()
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| child_id.chars().take(8).collect());
+            match state
+                .http
+                .cancel_subagent(&state.session_id, &child_id)
+                .await
+            {
+                Ok(()) => set_toast(
+                    state,
+                    toast_deadline,
+                    format!("stop sent to subagent: {label}"),
+                    ToastKind::Info,
+                ),
+                Err(e) => set_toast(
+                    state,
+                    toast_deadline,
+                    format!("stop subagent failed: {e}"),
+                    ToastKind::Error,
+                ),
+            }
+            Ok(false)
+        }
         Intent::OpenModePicker => {
             open_mode_picker(state);
             Ok(false)
