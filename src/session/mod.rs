@@ -99,8 +99,8 @@ pub use instance::{
     LegacyToolObservation, LifecycleOperation, LifecycleReservation, LifecycleReservationError,
     ManagedResumeCause, PaneObservation, PanePresence, PendingInitialTurn, PluginCreateIdempotency,
     PollerStart, SandboxInfo, SessionBucket, SessionGone, StartBlocked, StartOutcome, Status,
-    TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
-    MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
+    SuggestionOrigin, TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo,
+    WorktreeInfo, MAX_INITIAL_PROMPT_BYTES, SESSION_COLORS, TMUX_SERVER_UNREACHABLE_ERROR,
     TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{

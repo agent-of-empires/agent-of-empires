@@ -877,6 +877,18 @@ pub(crate) async fn create_session_with(
         );
     }
 
+    if body.suggestion.as_ref().is_some_and(|s| {
+        [&s.provider_id, &s.id]
+            .iter()
+            .any(|v| v.trim().is_empty() || v.len() > aoe_plugin_api::suggestions::MAX_KEY_BYTES)
+    }) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "suggestion ids must be non-empty and within the key size limit",
+        );
+    }
+
     // Idempotency first: a known key is answered from its result, replayed failure or
     // restart fence before any validation that reads mutable state (profiles, agents,
     // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
@@ -1488,6 +1500,7 @@ pub(crate) async fn create_session_with(
         // stamps these, through create_structured_session (#2897).
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        suggestion: body.suggestion,
         pending_initial_turn: None,
         parent_session_id: body.parent_session_id,
         cli: body.cli,

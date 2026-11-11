@@ -376,6 +376,13 @@ pub struct PluginCreateIdempotency {
 /// Largest accepted `initial_prompt`, in bytes.
 pub const MAX_INITIAL_PROMPT_BYTES: usize = 64 * 1024;
 
+/// The suggestion a session was started from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuggestionOrigin {
+    pub provider_id: String,
+    pub id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

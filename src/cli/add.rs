@@ -434,6 +434,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             .collect::<Result<_>>()?,
         command_override: args.cmd_override.unwrap_or_default(),
         custom_instruction: None,
+        suggestion: None,
         profile: Some(profile.clone()),
         view: if args.structured_view || args.agent.is_some() {
             crate::session::View::Structured
