@@ -592,12 +592,17 @@ export async function fetchLogs(lines: number, signal?: AbortSignal): Promise<Lo
 // save. A failed fetch is not cached, so the next call retries.
 let schemaPromise: Promise<SettingsFieldDescriptor[] | null> | null = null;
 
+/** A stalled request fails instead of holding up setup, so the user can retry. */
+const SETUP_REQUEST_TIMEOUT_MS = 15_000;
+
 /** Fetch the settings schema (single source of truth, #1692). The generic
  *  settings renderer builds form rows from these descriptors instead of
  *  hand-written per-field JSX. */
 export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
   if (!schemaPromise) {
-    schemaPromise = fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema").then((s) => {
+    schemaPromise = fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema", {
+      signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+    }).then((s) => {
       if (!s) schemaPromise = null;
       return s;
     });
@@ -1198,7 +1203,8 @@ export async function updateMachineSettingsInline(
   updates: Record<string, unknown>,
 ): Promise<SaveOutcome | "elevation_required"> {
   const headers = { [INLINE_ELEVATION_HEADER]: "1", "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
-  const reply = await send("/api/settings?layer=machine", jsonInit("PATCH", updates, headers)).catch(() => null);
+  const init = { ...jsonInit("PATCH", updates, headers), signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS) };
+  const reply = await send("/api/settings?layer=machine", init).catch(() => null);
   if (reply?.status === 403 && stringField(reply.payload, "error") === "elevation_required")
     return "elevation_required";
   const outcome = reply ? saveOutcome(reply) : "uncertain";

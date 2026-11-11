@@ -1653,6 +1653,20 @@ describe("profile settings write guard", () => {
     expect([...writable].sort()).toEqual(["description", "session", "theme"]);
   });
 
+  it("a stalled schema read or inline save times out as a failure", async () => {
+    const stalls = new AbortController();
+    vi.spyOn(AbortSignal, "timeout").mockReturnValue(stalls.signal);
+    const stall = (_: unknown, init?: RequestInit) =>
+      new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("timeout"))));
+    fetchSpy.mockImplementationOnce(stall).mockImplementationOnce(stall);
+    const schemaRead = api.getSettingsSchema();
+    const save = api.updateMachineSettingsInline({ worktree: { enabled: true } });
+    stalls.abort();
+    expect(await schemaRead).toBeNull();
+    expect(await save).toBe("uncertain");
+    vi.restoreAllMocks();
+  });
+
   it("caches a successful schema fetch and retries a failed one", async () => {
     fetchSpy.mockResolvedValueOnce(empty(503));
     expect(await api.getSettingsSchema()).toBeNull();
