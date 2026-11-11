@@ -1496,13 +1496,15 @@ mod tests {
         let socket = tmp.path().join("pick.sock");
         worker_registry::save(&worker_record("s-pick", std::process::id(), socket.clone()))
             .unwrap();
-        sup.test_install_runner("s-pick", runner_config(socket), None)
+        let lease = sup
+            .test_install_runner("s-pick", runner_config(socket), None)
             .await;
 
         sup.refresh_cached_model_config("s-pick", "ultracode", "on")
             .await;
 
-        let RestartDecision::Respawn(config) = restart_decision(&sup.workers, "s-pick").await
+        let RestartDecision::Respawn(config) =
+            restart_decision(&sup.workers, &sup.lifecycle, "s-pick", &lease).await
         else {
             panic!("a runner worker respawns");
         };
