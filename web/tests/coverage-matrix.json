@@ -151,8 +151,17 @@
       "id": "app-shell.dashboard-update-banner",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/DashboardUpdateBanner.test.tsx", "src/lib/webBuildId.test.ts"],
-      "components": ["web/src/components/DashboardUpdateBanner.tsx", "web/src/hooks/useDashboardUpdate.ts"]
+      "specs": [
+        "src/components/__tests__/DashboardUpdateBanner.test.tsx",
+        "src/lib/webBuildId.test.ts",
+        "src/components/__tests__/BannerStack.test.tsx"
+      ],
+      "components": [
+        "web/src/components/DashboardUpdateBanner.tsx",
+        "web/src/hooks/useDashboardUpdate.ts",
+        "web/src/components/BannerStack.tsx"
+      ],
+      "notes": "Names the version the Daemon now serves (\"Dashboard updated to v1.22.1.\"), from the same /api/about answer that showed the bundle changed (#5514)."
     },
     {
       "id": "app-shell.loading-skeleton",
@@ -3037,7 +3046,7 @@
       "risk": "medium",
       "specs": ["tests/update-banner.spec.ts", "src/components/__tests__/UpdateBanner.test.tsx"],
       "components": ["web/src/components/UpdateBanner.tsx"],
-      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control."
+      "notes": "The dismiss test asserts text-subtle, not text-muted or text-secondary, on the dismiss control. #5514: each install method's lines are pinned in UpdateBanner.test.tsx (an unknown install reads \"Run aoe update on the machine running AoE.\"; a release install has no second line). The mocked spec checks the layout: at 1280px the dot and lines form one centered block, line two starts under line one, and the dot and × share line one's center, × pinned right; at 375px the lines stack left-aligned with × at the top right and nothing scrolls sideways."
     },
     {
       "id": "connectivity.banner-stack",
