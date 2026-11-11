@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll, expect, it } from "vitest";
+import { useInlineMachineSave } from "../../../hooks/useInlineMachineSave";
 import { AgentsStep } from "../steps/AgentsStep";
 
 const server = setupServer();
@@ -63,4 +64,53 @@ it("a failed Agent check asks to check again instead of reporting none installed
   fireEvent.click(screen.getByRole("button", { name: /Check again/ }));
   expect(await screen.findByText("Structured view ready")).toBeTruthy();
   expect(radio(/^claude/).checked).toBe(true);
+});
+
+it("a pick cancelled by a newer one at the passphrase prompt doesn't roll back the newer pick", async () => {
+  const attempts: unknown[] = [];
+  const committed: unknown[] = [];
+  let elevated = false;
+  server.use(
+    http.get("*/api/agents", () =>
+      HttpResponse.json([claude, { ...claude, name: "codex", display_name: "Codex CLI" }]),
+    ),
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = await request.json();
+      if (!elevated) {
+        attempts.push(body);
+        return HttpResponse.json({ error: "elevation_required" }, { status: 403 });
+      }
+      committed.push(body);
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.post("*/api/login/elevate", () => {
+      elevated = true;
+      return HttpResponse.json({ elevated_until_secs: 900 });
+    }),
+  );
+  function Harness() {
+    const { save, elevation } = useInlineMachineSave();
+    return (
+      <>
+        <AgentsStep
+          profile=""
+          defaultTool={undefined}
+          structuredView={undefined}
+          save={(section, field, value) => save({ [section]: { [field]: value } })}
+          onAgentsChecked={() => {}}
+        />
+        {elevation && <button onClick={() => void elevation.submit("right")}>Unlock</button>}
+      </>
+    );
+  }
+  render(<Harness />);
+  fireEvent.click(await screen.findByRole("radio", { name: /^claude/ }));
+  await screen.findByRole("button", { name: "Unlock" });
+  fireEvent.click(radio(/^codex/));
+  await waitFor(() => expect(attempts).toHaveLength(2));
+  fireEvent.click(await screen.findByRole("button", { name: "Unlock" }));
+
+  await waitFor(() => expect(committed).toEqual([{ session: { default_tool: "codex" } }]));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Unlock" })).toBeNull());
+  expect(radio(/^codex/).checked).toBe(true);
 });

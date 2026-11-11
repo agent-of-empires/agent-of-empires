@@ -1,5 +1,5 @@
 import { RefreshCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchSetupRuntimes, type ContainerRuntimeKind, type RuntimeStatus } from "../../../lib/api";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 import { SchemaSection } from "../../settings/SchemaSection";
@@ -49,10 +49,13 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
   const [selected, setSelected] = useState(
     typeof values.container_runtime === "string" ? values.container_runtime : "docker",
   );
+  // A newer pick supersedes an older one, whose failure then means nothing.
+  const picks = useRef(0);
   const pick = async (kind: ContainerRuntimeKind) => {
     const previous = selected;
+    const id = ++picks.current;
     setSelected(kind);
-    if (!(await onSaveField("sandbox", "container_runtime", kind))) setSelected(previous);
+    if (!(await onSaveField("sandbox", "container_runtime", kind)) && id === picks.current) setSelected(previous);
   };
 
   const none = !failed && runtimes !== null && !runtimes.some((r) => r.installed);

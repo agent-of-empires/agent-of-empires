@@ -1,5 +1,5 @@
 import { RefreshCw } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { fetchProfileAgents } from "../../../lib/api";
 import type { AgentInfo } from "../../../lib/types";
 import { CopyCommand, GhostButton, PANEL, RadioRow, Section } from "../ui";
@@ -50,13 +50,17 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
   // No fallback pick: an unsaved selection would read as the default without being one.
   const chosen = tool && installed.some((a) => a.name === tool) ? tool : undefined;
 
+  // A newer pick supersedes an older one, whose failure then means nothing.
+  const picks = useRef({ tool: 0, view: 0 });
   const pickTool = async (name: string) => {
+    const id = ++picks.current.tool;
     setTool(name);
-    if (!(await save("session", "default_tool", name))) setTool(tool);
+    if (!(await save("session", "default_tool", name)) && id === picks.current.tool) setTool(tool);
   };
   const pickView = async (next: string) => {
+    const id = ++picks.current.view;
     setView(next);
-    if (!(await save("acp", "structured_view", next))) setView(view);
+    if (!(await save("acp", "structured_view", next)) && id === picks.current.view) setView(view);
   };
 
   return (
