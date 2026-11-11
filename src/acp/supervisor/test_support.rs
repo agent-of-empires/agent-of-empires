@@ -1046,7 +1046,11 @@ for attempt in range(2):
         self.completion
             .take()
             .unwrap()
-            .write_all(if self.trailer { b"complete-trailer\n" } else { b"complete\n" })
+            .write_all(if self.trailer {
+                b"complete-trailer\n"
+            } else {
+                b"complete\n"
+            })
             .unwrap();
     }
 

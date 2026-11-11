@@ -1376,8 +1376,9 @@ mod tests {
             |_| {},
             |supervisor| supervisor.with_process_control(control.clone()),
         );
-        let mut runner =
-            HeldAttachRunner::new(id, project.path(), 17, Some("default")).await.with_trailing_chunk();
+        let mut runner = HeldAttachRunner::new(id, project.path(), 17, Some("default"))
+            .await
+            .with_trailing_chunk();
         // A finished user prompt, then an agent-initiated turn that has not stopped.
         let seeded = [
             Event::UserPromptSent {
