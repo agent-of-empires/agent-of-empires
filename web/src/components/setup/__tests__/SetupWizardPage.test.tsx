@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { useState } from "react";
+import { useSetupStatus } from "../../../hooks/useSetupStatus";
 import { MemoryRouter } from "react-router-dom";
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import { resetSettingsSchemaCache, type SetupStatus, type SetupStepKey } from "../../../lib/api";
@@ -324,6 +325,93 @@ it("stays on setup when the reload after Go to dashboard fails", async () => {
   expect((await screen.findByRole("alert")).textContent).toContain("couldn't reload setup");
   expect(patches).toEqual([{ deferred: true }]);
   expect(onLeave).not.toHaveBeenCalled();
+});
+
+/** Hands each `AbortSignal.timeout` a signal that `expire` aborts, standing in for the request deadline. */
+function controlTimeouts() {
+  const pending: AbortController[] = [];
+  const spy = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+    const controller = new AbortController();
+    pending.push(controller);
+    return controller.signal;
+  });
+  return { expire: () => pending.splice(0).forEach((c) => c.abort()), restore: () => spy.mockRestore() };
+}
+
+/** The wizard wired to the real setup status hook, as App wires it. */
+function LiveSetup({ onLeave }: { onLeave: () => void }) {
+  const setup = useSetupStatus(true);
+  if (!setup.status) return null;
+  return <SetupWizardPage status={setup.status} about={null} profile="" refresh={setup.refresh} onLeave={onLeave} />;
+}
+
+it(
+  "a stalled reload after Go to dashboard times out, reports it, and frees the wizard",
+  { timeout: 3000 },
+  async () => {
+    const timeouts = controlTimeouts();
+    try {
+      let reads = 0;
+      let started!: () => void;
+      const reloadStarted = new Promise<void>((resolve) => (started = resolve));
+      server.use(
+        http.get("*/api/setup", () => {
+          if (++reads !== 2) return HttpResponse.json(status(["agents"]));
+          started();
+          return new Promise<Response>(() => {});
+        }),
+      );
+      const onLeave = vi.fn();
+      render(
+        <MemoryRouter initialEntries={["/setup"]}>
+          <LiveSetup onLeave={onLeave} />
+        </MemoryRouter>,
+      );
+      await screen.findByRole("heading", { name: "Theme and telemetry" });
+      const skip = await enabled("Skip for now");
+      const leave = () => fireEvent.click(screen.getAllByRole("button", { name: /Go to dashboard/ })[0]!);
+
+      leave();
+      await reloadStarted;
+      expect(skip.disabled).toBe(true);
+      timeouts.expire();
+      expect((await screen.findByRole("alert")).textContent).toBe("Saved, but couldn't reload setup. Try again.");
+      await enabled("Skip for now");
+      await enabled("Next");
+      expect(onLeave).not.toHaveBeenCalled();
+
+      leave();
+      await waitFor(() => expect(onLeave).toHaveBeenCalledOnce());
+      expect(patches).toEqual([{ deferred: true }, { deferred: true }]);
+    } finally {
+      timeouts.restore();
+    }
+  },
+);
+
+it("a stalled Skip times out, reports it, and frees the wizard", { timeout: 3000 }, async () => {
+  const timeouts = controlTimeouts();
+  try {
+    let started!: () => void;
+    const skipStarted = new Promise<void>((resolve) => (started = resolve));
+    server.use(
+      http.patch("*/api/setup", () => {
+        started();
+        return new Promise<Response>(() => {});
+      }),
+    );
+    renderPage(status(["agents"]), "/setup?step=sandbox");
+    fireEvent.click(await enabled("Skip for now"));
+    await skipStarted;
+    expect((screen.getByRole("button", { name: "Skip for now" }) as HTMLButtonElement).disabled).toBe(true);
+    timeouts.expire();
+    expect((await screen.findByRole("alert")).textContent).toBe("Couldn't skip this step.");
+    await enabled("Skip for now");
+    await enabled("Next");
+    expect(screen.getByRole("heading", { name: "Sandbox" })).toBeTruthy();
+  } finally {
+    timeouts.restore();
+  }
 });
 
 const agent = (name: string) => ({

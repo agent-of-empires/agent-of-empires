@@ -1653,22 +1653,31 @@ describe("profile settings write guard", () => {
     expect([...writable].sort()).toEqual(["description", "session", "theme"]);
   });
 
-  it("a stalled setup read or inline save times out as a failure", async () => {
+  it("a stalled setup read or save times out as a failure", { timeout: 1000 }, async () => {
     const stalls = new AbortController();
-    vi.spyOn(AbortSignal, "timeout").mockReturnValue(stalls.signal);
-    const stall = (_: unknown, init?: RequestInit) =>
-      new Promise<Response>((_, reject) => init?.signal?.addEventListener("abort", () => reject(new Error("timeout"))));
-    fetchSpy.mockImplementation(stall);
-    const schemaRead = api.getSettingsSchema();
-    const machineRead = api.fetchMachineSettings();
-    const telemetryRead = api.fetchTelemetryStatus();
-    const save = api.updateMachineSettingsInline({ worktree: { enabled: true } });
-    stalls.abort();
-    expect(await schemaRead).toBeNull();
-    expect(await machineRead).toBeNull();
-    expect(await telemetryRead).toBeNull();
-    expect(await save).toBe("uncertain");
-    vi.restoreAllMocks();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(stalls.signal);
+    try {
+      const stall = (_: unknown, init?: RequestInit) =>
+        new Promise<Response>((_, reject) =>
+          init?.signal?.addEventListener("abort", () => reject(new Error("timeout"))),
+        );
+      fetchSpy.mockImplementation(stall);
+      const schemaRead = api.getSettingsSchema();
+      const machineRead = api.fetchMachineSettings();
+      const telemetryRead = api.fetchTelemetryStatus();
+      const save = api.updateMachineSettingsInline({ worktree: { enabled: true } });
+      const setupRead = api.fetchSetup();
+      const setupSave = api.updateSetup({ deferred: true });
+      stalls.abort();
+      expect(await schemaRead).toBeNull();
+      expect(await machineRead).toBeNull();
+      expect(await telemetryRead).toBeNull();
+      expect(await save).toBe("uncertain");
+      expect(await setupRead).toBeNull();
+      expect(await setupSave).toEqual({ ok: false });
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it("caches a successful schema fetch and retries a failed one", async () => {

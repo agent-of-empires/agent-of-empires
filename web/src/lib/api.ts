@@ -3483,11 +3483,14 @@ export interface RuntimeStatus {
 }
 
 export function fetchSetup(): Promise<SetupStatus | null> {
-  return fetchJson<SetupStatus>("/api/setup");
+  return fetchJson<SetupStatus>("/api/setup", { signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS) });
 }
 
 export function updateSetup(patch: SetupPatch): Promise<{ ok: boolean; message?: string }> {
-  return okWithMessage("/api/setup", jsonInit("PATCH", patch));
+  return okWithMessage("/api/setup", {
+    ...jsonInit("PATCH", patch),
+    signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+  });
 }
 
 export function fetchSetupRuntimes(): Promise<RuntimeStatus[] | null> {
