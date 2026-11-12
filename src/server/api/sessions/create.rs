@@ -1150,17 +1150,25 @@ pub(crate) async fn create_session_with(
         let host = state.plugin_host.clone();
         let published = tokio::task::spawn_blocking(move || {
             let Some(host) = host else {
-                return Ok(false);
+                return Ok(None);
             };
             let providers = crate::plugin::suggestions::providers();
             host.with_suggestions_db(|conn, profile| {
-                crate::plugin::suggestions::is_published(conn, profile, &providers, &origin)
+                let published =
+                    crate::plugin::suggestions::is_published(conn, profile, &providers, &origin)?;
+                Ok::<_, anyhow::Error>(published.then(|| profile.to_string()))
             })
         })
         .await;
         match published {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => {
+            // The session may be created in another profile than the one the
+            // suggestion lives in; keep the latter so the link survives.
+            Ok(Ok(Some(profile))) => {
+                if let Some(origin) = body.suggestion.as_mut() {
+                    origin.profile = Some(profile);
+                }
+            }
+            Ok(Ok(None)) => {
                 return api_error(
                     StatusCode::CONFLICT,
                     "stale_suggestion",

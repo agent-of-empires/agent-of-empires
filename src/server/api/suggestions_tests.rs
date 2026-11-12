@@ -218,6 +218,7 @@ async fn cityhall_hides_terminal_sessions_from_started_session() {
     linked.suggestion = Some(crate::session::SuggestionOrigin {
         provider_id: PROVIDER.into(),
         id: "a".into(),
+        profile: None,
     });
     for (cityhall, shown) in [(false, true), (true, false)] {
         let f = fixture_with(vec![linked.clone()], cityhall);
