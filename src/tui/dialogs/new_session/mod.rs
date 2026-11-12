@@ -517,6 +517,7 @@ impl FieldIndices {
             (before.worktree, self.worktree),
             (before.sandbox, self.sandbox),
             (before.group, self.group),
+            (before.prompt, self.prompt),
         ]
         .into_iter()
         .find(|(old, _)| *old == index)
@@ -2403,6 +2404,9 @@ impl NewSessionDialog {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.show_prompt_source {
+            return;
+        }
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
             input
         } else if let Some(ref mut input) = self.hook_env.editing_input {

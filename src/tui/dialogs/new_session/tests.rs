@@ -179,6 +179,19 @@ fn pasting_into_the_prompt_keeps_newlines_but_other_fields_stay_single_line() {
 }
 
 #[test]
+#[serial_test::serial]
+fn clicking_the_prompt_row_while_path_is_focused_focuses_the_prompt() {
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.path_field();
+    let prompt = dialog.field_indices().prompt;
+    dialog
+        .focusable_rects
+        .push((prompt, ratatui::layout::Rect::new(0, 9, 30, 1)));
+    dialog.handle_click(10, 9);
+    assert_eq!(dialog.focused_field, dialog.field_indices().prompt);
+}
+
+#[test]
 fn hostile_suggestion_text_is_neutralised_and_a_blank_one_is_omitted() {
     let mut dialog = single_tool_dialog();
     dialog.set_suggestion("run \u{1b}[31mnow\nthen stop".to_string(), github_origin());
@@ -221,6 +234,7 @@ fn ctrl_p_on_the_prompt_row_shows_the_source_text_and_esc_closes_it() {
 
     // Keys stay in the overlay until it closes; the prompt is untouched.
     type_str(&mut dialog, "x");
+    dialog.handle_paste("pasted");
     assert_eq!(dialog.prompt.value(), "Review PR 4562");
     dialog.handle_key(key(KeyCode::Esc));
     assert!(!dialog.show_prompt_source);
