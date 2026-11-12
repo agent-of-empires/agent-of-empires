@@ -264,6 +264,17 @@ describe("SuggestionsSettings", () => {
     expect(again.value).toBe("typed during reset");
   });
 
+  it("says so when the reload after a change fails, and Retry reloads", async () => {
+    open();
+    const sidebar = await screen.findByRole("switch", { name: "Show in sidebar" });
+    api.fetchSuggestions.mockResolvedValueOnce(null);
+    fireEvent.click(sidebar);
+    expect((await screen.findByRole("alert")).textContent).toContain("Could not reload suggestions");
+    api.fetchSuggestions.mockResolvedValue(snapshot());
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
   it("opens straight on a focused template and returns to the suggestions view", async () => {
     const openFull = open({
       templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
