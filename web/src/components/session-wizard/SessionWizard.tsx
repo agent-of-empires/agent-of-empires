@@ -243,6 +243,15 @@ export function SessionWizard({
   const [progress, setProgress] = useState<CreateProgress | null>(restore?.progress ?? null);
   // The latest snapshot, which a backgrounded create keeps polling once the wizard is gone.
   const lastProgressRef = useRef<CreateProgress | null>(null);
+  // Polls can overlap, so a response older than the last one accepted is dropped.
+  const progressSeqRef = useRef({ sent: 0, accepted: 0 });
+  const fetchNewerProgress = async (key: string) => {
+    const seq = ++progressSeqRef.current.sent;
+    const p = await fetchCreateProgress(key);
+    if (!p || seq <= progressSeqRef.current.accepted) return null;
+    progressSeqRef.current.accepted = seq;
+    return p;
+  };
   const backgroundPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopBackgroundPoll = () => {
     if (backgroundPollRef.current) clearInterval(backgroundPollRef.current);
@@ -487,7 +496,7 @@ export function SessionWizard({
     let cancelled = false;
     const delay = setTimeout(() => !cancelled && setShowProgress(true), PROGRESS_DELAY_MS);
     const poll = setInterval(() => {
-      void fetchCreateProgress(progressKey).then((p) => {
+      void fetchNewerProgress(progressKey).then((p) => {
         if (cancelled || !p) return;
         lastProgressRef.current = p;
         setProgress(p);
@@ -774,7 +783,7 @@ export function SessionWizard({
       const key = progressKeyRef.current;
       if (key) {
         backgroundPollRef.current = setInterval(() => {
-          void fetchCreateProgress(key).then((p) => {
+          void fetchNewerProgress(key).then((p) => {
             if (p && backgroundPollRef.current) lastProgressRef.current = p;
           });
         }, PROGRESS_POLL_MS);

@@ -1868,6 +1868,21 @@ describe("SessionWizard create failures", () => {
       expect(screen.getByTestId("create-failure-output").textContent).toContain("npm ERR! late");
     });
 
+    it("keeps the newer snapshot when an older poll answers last", async () => {
+      const { finish, onReopenFailure } = await launchAndBackground();
+      const answers: ((p: unknown) => void)[] = [];
+      vi.mocked(fetchCreateProgress).mockImplementation(() => new Promise((r) => answers.push(r)));
+      await vi.advanceTimersByTimeAsync(1_400);
+      expect(answers.length).toBeGreaterThanOrEqual(2);
+      const snapshot = (line: string) => ({ stage: "running_hooks", hook: null, output: [line] });
+      await act(async () => answers[1]!(snapshot("newer")));
+      await act(async () => answers[0]!(snapshot("older")));
+      await finish(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."));
+      await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+      toastAction.mock.calls[0]![2]();
+      expect(onReopenFailure.mock.calls[0]![0].progress.output).toEqual(["newer"]);
+    });
+
     it.each([
       ["succeeds", { ok: true, session: { id: "s1" } }],
       ["fails", failure("create_failed", "preparing", "boom")],
