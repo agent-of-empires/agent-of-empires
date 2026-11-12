@@ -67,17 +67,19 @@ function TemplateBlock({
   const value = edited ?? override ?? "";
   const effective = edited ?? override;
 
-  const run = async (request: Promise<SuggestionResult<unknown>>) => {
+  // Clears the draft only if it is still what the request submitted; a newer edit survives.
+  const run = async (request: Promise<SuggestionResult<unknown>>, submitted: string | null) => {
     const result = await request;
     if (!result.ok) {
       onError(result.error);
       return;
     }
-    setEdited(null);
+    setEdited((current) => (current === submitted ? null : current));
     await onSaved();
   };
   const commit = () => {
-    if (edited !== null && edited !== override) void run(putSuggestionTemplate(provider.id, source.criterion, edited));
+    if (edited !== null && edited !== override)
+      void run(putSuggestionTemplate(provider.id, source.criterion, edited), edited);
     else setEdited(null);
   };
 
@@ -115,7 +117,7 @@ function TemplateBlock({
           className={GHOST}
           disabled={disabled || override === null}
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => void run(resetSuggestionTemplate(provider.id, source.criterion))}
+          onClick={() => void run(resetSuggestionTemplate(provider.id, source.criterion), edited)}
         >
           Reset to the plugin&apos;s default
         </button>
