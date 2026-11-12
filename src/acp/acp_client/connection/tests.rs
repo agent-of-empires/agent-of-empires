@@ -1,9 +1,13 @@
 //! The connection task driven against a fake agent over in-memory pipes.
 
+use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::prompt::{SelectProbe, SELECT_PROBE};
 use super::*;
+use crate::acp::acp_client::reset::ResetSessionOutcome;
+use crate::acp::approvals::ApprovalDecision;
 use crate::acp::approvals::Nonce;
 use crate::acp::fs_handler::FsPolicy;
+use crate::acp::state::{IntegrationLostReason, StartupErrorDetail, SubagentState};
 use crate::acp::terminal_handler::TerminalManager;
 use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use std::collections::HashMap;
@@ -372,8 +376,10 @@ struct FakeConnection {
     event_rx: mpsc::Receiver<Event>,
     cmd_tx: mpsc::Sender<ClientCmd>,
     agent_write: SharedWrite,
-    pending_responders: super::super::pending::PendingResponders,
-    replies: mpsc::UnboundedReceiver<serde_json::Value>,
+    pending_responders: PendingResponders,
+    /// Replies the daemon sent to the agent's own requests.
+    responses: mpsc::UnboundedReceiver<serde_json::Value>,
+    received: Arc<Mutex<Vec<serde_json::Value>>>,
     event_queue: mpsc::WeakSender<Event>,
     connection_state: Arc<ConnectionState>,
     connection: tokio::task::JoinHandle<()>,
@@ -401,6 +407,31 @@ async fn spawn_fake_connection_with(
     config_options: Option<&'static str>,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
+    let (ready, fake) = spawn_fake_connection_raw(
+        session_id,
+        mode,
+        close_after_prompt,
+        "",
+        default_mode,
+        config_options,
+        on_prompt,
+    )
+    .await;
+    ready.expect("handshake ok");
+    fake
+}
+
+/// `init_extra` is spliced into the `initialize` result after
+/// `agentCapabilities`, e.g. a `_meta` hello.
+async fn spawn_fake_connection_raw(
+    session_id: &'static str,
+    mode: Option<ConnectMode>,
+    close_after_prompt: bool,
+    init_extra: &'static str,
+    default_mode: Option<&'static str>,
+    config_options: Option<&'static str>,
+    on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
+) -> (Result<(), AcpError>, FakeConnection) {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
     let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
@@ -408,11 +439,11 @@ async fn spawn_fake_connection_with(
     let event_queue = event_tx.downgrade();
     let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(1);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
-    let pending_responders = Arc::new(Mutex::new(HashMap::new()));
-    let (reply_tx, replies_rx) = mpsc::unbounded_channel();
     let temp = tempfile::tempdir().unwrap();
     let cwd = temp.path().to_path_buf();
     let connection_state = Arc::new(ConnectionState::default());
+    let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
+    let (response_tx, responses) = mpsc::unbounded_channel();
     let params = ConnectionParams {
         connection_state: Arc::clone(&connection_state),
         claude_home: None,
@@ -452,19 +483,18 @@ async fn spawn_fake_connection_with(
     let set_options = Arc::new(Mutex::new(Vec::new()));
     let recorded = set_options.clone();
     let options_json = config_options.unwrap_or("[]");
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let received_frames = received.clone();
     let agent = tokio::spawn(async move {
         let mut lines = BufReader::new(agent_read).lines();
         let mut new_sessions = 0;
         while let Ok(Some(line)) = lines.next_line().await {
             let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if msg.get("method").is_none() {
-                let _ = reply_tx.send(msg);
-                continue;
-            }
+            received_frames.lock().await.push(msg.clone());
             let id = &msg["id"];
             let replies = match msg["method"].as_str() {
                 Some("initialize") => vec![format!(
-                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}{init_extra}}}}}"#
                 )],
                 Some("session/new") => {
                     let native = if new_sessions == 0 {
@@ -489,6 +519,10 @@ async fn spawn_fake_connection_with(
                     )]
                 }
                 Some("session/prompt") => on_prompt(id),
+                None => {
+                    let _ = response_tx.send(msg);
+                    continue;
+                }
                 _ => continue,
             };
             for reply in replies {
@@ -500,23 +534,22 @@ async fn spawn_fake_connection_with(
             }
         }
     });
-    ready_rx
-        .await
-        .expect("handshake completes")
-        .expect("handshake ok");
-    FakeConnection {
+    let ready = ready_rx.await.expect("handshake completes");
+    let fake = FakeConnection {
         event_rx,
         cmd_tx,
         agent_write,
         pending_responders,
-        replies: replies_rx,
         event_queue,
         connection_state,
+        responses,
+        received,
         connection,
         agent,
         set_options,
         _cwd: temp,
-    }
+    };
+    (ready, fake)
 }
 
 #[tokio::test]
@@ -1371,7 +1404,7 @@ async fn request_failure_keeps_the_pending_permission_responder_usable() {
                 })
                 .unwrap_or_else(|_| panic!("elicitation callback must remain alive")),
         }
-        let response = tokio::time::timeout(Duration::from_secs(10), fake.replies.recv())
+        let response = tokio::time::timeout(Duration::from_secs(10), fake.responses.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1554,7 +1587,7 @@ async fn malformed_json_retains_the_sdk_parse_error_policy_and_live_connection()
     })
     .await;
     write_line(&fake.agent_write, "{not valid JSON").await;
-    let response = tokio::time::timeout(Duration::from_secs(10), fake.replies.recv())
+    let response = tokio::time::timeout(Duration::from_secs(10), fake.responses.recv())
         .await
         .unwrap()
         .unwrap();
@@ -1604,18 +1637,38 @@ fn pending_interaction_line(kind: &str, session_id: &str) -> String {
         .to_string()
 }
 
-async fn registered_interaction(fake: &mut FakeConnection) -> Nonce {
-    let nonce = tokio::time::timeout(Duration::from_secs(10), async {
+async fn collect_connection_events_until(
+    fake: &mut FakeConnection,
+    observed: &mut Vec<Event>,
+    done: impl Fn(&Event) -> bool,
+) {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            match fake.event_rx.recv().await.expect("connection remains live") {
-                Event::ApprovalRequested { approval } => break approval.nonce,
-                Event::ElicitationRequested { elicitation } => break elicitation.nonce,
-                _ => {}
+            let event = fake.event_rx.recv().await.expect("connection remains live");
+            let complete = done(&event);
+            observed.push(event);
+            if complete {
+                return;
             }
         }
     })
     .await
-    .unwrap();
+    .expect("expected connection event arrives within the existing bound");
+}
+
+async fn registered_interaction(fake: &mut FakeConnection, observed: &mut Vec<Event>) -> Nonce {
+    collect_connection_events_until(fake, observed, |event| {
+        matches!(
+            event,
+            Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. }
+        )
+    })
+    .await;
+    let nonce = match observed.last().unwrap() {
+        Event::ApprovalRequested { approval } => approval.nonce.clone(),
+        Event::ElicitationRequested { elicitation } => elicitation.nonce.clone(),
+        _ => unreachable!(),
+    };
     assert!(fake.pending_responders.lock().await.contains_key(&nonce));
     nonce
 }
@@ -1650,104 +1703,248 @@ async fn resolve_registered_interaction(fake: &FakeConnection, nonce: &Nonce) {
 }
 
 #[tokio::test]
-async fn pending_callback_reset_write_waits_for_resolution_or_deadline() {
-    use super::super::reset::ResetSessionOutcome;
-    for kind in ["permission", "elicitation"] {
-        for resolve_before_deadline in [true, false] {
-            let mut fake =
-                spawn_fake_connection("s-pending-reset", None, false, |_| Vec::new()).await;
-            write_line(
-                &fake.agent_write,
-                &pending_interaction_line(kind, "s-pending-reset"),
-            )
-            .await;
-            let nonce = registered_interaction(&mut fake).await;
-            let (respond_to, mut response) = oneshot::channel();
-            let bound = if resolve_before_deadline {
-                Duration::from_secs(10)
-            } else {
-                Duration::from_millis(100)
-            };
-            fake.cmd_tx
-                .send(ClientCmd::ResetSession {
-                    text: "/clear".into(),
-                    deadline: tokio::time::Instant::now() + bound,
-                    respond_to,
-                })
-                .await
-                .unwrap();
-            // The capacity-one channel cannot accept another command until
-            // the foreground dequeues reset and polls its blocked write fence.
-            drop(
-                tokio::time::timeout(Duration::from_secs(10), fake.cmd_tx.reserve())
-                    .await
-                    .unwrap()
-                    .unwrap(),
-            );
-            write_line(&fake.agent_write, &serde_json::json!({
-                "jsonrpc":"2.0","method":"session/update","params":{
-                    "sessionId":"s-pending-reset","update":{
-                        "sessionUpdate":"agent_message_chunk",
-                        "content":{"type":"text","text":"old-session progress while reset waits"}
-                    }
-                }
-            }).to_string()).await;
-            if resolve_before_deadline {
-                assert!(matches!(
-                    response.try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-                resolve_registered_interaction(&fake, &nonce).await;
-                let reply = tokio::time::timeout(Duration::from_secs(10), fake.replies.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(reply["id"], "pending-interaction");
-                assert!(matches!(
-                    tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap(),
-                    ResetSessionOutcome::Reset { new_acp_session_id } if new_acp_session_id == "s-pending-reset-reset-1"
-                ));
-                let events = collect_terminal(&mut fake).await;
-                assert!(events
-                    .iter()
-                    .any(|event| matches!(event, Event::SessionCleared)));
-                assert!(
-                    matches!(events.last(), Some(Event::Stopped { reason }) if reason == "session_reset")
-                );
-                assert!(!events.iter().any(|event| matches!(event, Event::AgentMessageChunk { text, .. } if text == "old-session progress while reset waits")),
-                    "old-session notification cannot cross the reset identity boundary");
-            } else {
-                assert!(matches!(
-                    tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap(),
-                    ResetSessionOutcome::Failed { message } if message.contains("agent callbacks")
-                ));
-                assert!(fake.pending_responders.lock().await.contains_key(&nonce));
-                tokio::time::timeout(Duration::from_secs(10), async {
-                    loop {
-                        let event = fake.event_rx.recv().await.unwrap();
-                        assert!(!matches!(event, Event::SessionCleared));
-                        if matches!(event, Event::AgentMessageChunk { text, .. } if text == "old-session progress while reset waits") { break; }
-                    }
-                }).await.unwrap();
-                assert!(
-                    fake.pending_responders.lock().await.contains_key(&nonce),
-                    "expired reset writer releases progress without resolving the card"
-                );
-                resolve_registered_interaction(&fake, &nonce).await;
-                let reply = tokio::time::timeout(Duration::from_secs(10), fake.replies.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(reply["id"], "pending-interaction");
-                while let Ok(event) = fake.event_rx.try_recv() {
-                    assert!(!matches!(event, Event::SessionCleared));
+async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
+    use crate::acp::elicitations::ElicitationOutcome;
+    let update = |session_id: &str, text: &str| {
+        serde_json::json!({
+            "jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":session_id,"update":{
+                    "sessionUpdate":"agent_message_chunk",
+                    "content":{"type":"text","text":text}
                 }
             }
-            fake.connection.abort();
-            let _ = fake.connection.await;
-            fake.agent.abort();
-            let _ = fake.agent.await;
+        })
+        .to_string()
+    };
+    let boundary = |event: &Event| match event {
+        Event::SessionCleared
+        | Event::SessionContextReset { .. }
+        | Event::AcpSessionAssigned { .. } => true,
+        Event::Stopped { reason } => reason == "session_reset",
+        _ => false,
+    };
+    for kind in ["permission", "elicitation"] {
+        let mut fake = spawn_fake_connection("s-pending-reset", None, false, |id| {
+            vec![serde_json::json!({
+                "jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}
+            })
+            .to_string()]
+        })
+        .await;
+        let mut observed = Vec::new();
+        collect_connection_events_until(&mut fake, &mut observed, |event| {
+            matches!(event, Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. } if acp_session_id == "s-pending-reset")
+        }).await;
+        let initial_end = observed.len();
+        assert_eq!(
+            fake.received
+                .lock()
+                .await
+                .iter()
+                .filter(|frame| frame["method"] == "session/new")
+                .count(),
+            1
+        );
+        write_line(
+            &fake.agent_write,
+            &pending_interaction_line(kind, "s-pending-reset"),
+        )
+        .await;
+        let nonce = registered_interaction(&mut fake, &mut observed).await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset", "unanswered before refusal"),
+        )
+        .await;
+        collect_connection_events_until(&mut fake, &mut observed, |event| {
+            matches!(event, Event::AgentMessageChunk { text, .. } if text == "unanswered before refusal")
+        }).await;
+        let (respond_to, response) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/clear".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap(),
+            ResetSessionOutcome::Failed { message } if message.contains("resolve it before clearing the conversation")
+        ));
+        assert!(fake.pending_responders.lock().await.contains_key(&nonce));
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset", "unanswered after refusal"),
+        )
+        .await;
+        collect_connection_events_until(&mut fake, &mut observed, |event| {
+            matches!(event, Event::AgentMessageChunk { text, .. } if text == "unanswered after refusal")
+        }).await;
+        assert!(
+            !observed[initial_end..].iter().any(&boundary),
+            "{kind}: {observed:?}"
+        );
+        assert!(fake.pending_responders.lock().await.contains_key(&nonce));
+        assert!(!fake.received.lock().await.iter().any(|frame| {
+            frame.get("method").is_none() && frame["id"] == "pending-interaction"
+        }));
+        resolve_registered_interaction(&fake, &nonce).await;
+        let reply = tokio::time::timeout(Duration::from_secs(10), fake.responses.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["id"], "pending-interaction");
+        assert!(reply.get("error").is_none(), "{reply:?}");
+        if kind == "permission" {
+            assert_eq!(reply["result"]["outcome"]["outcome"], "selected");
+            assert_eq!(reply["result"]["outcome"]["optionId"], "allow");
+        } else {
+            assert_eq!(reply["result"]["action"], "decline");
         }
+        collect_connection_events_until(&mut fake, &mut observed, |event| match event {
+            Event::ApprovalResolved {
+                nonce: actual,
+                decision: ApprovalDecision::Allow,
+            } => kind == "permission" && actual == &nonce,
+            Event::ElicitationResolved {
+                nonce: actual,
+                outcome: ElicitationOutcome::Declined,
+                ..
+            } => kind == "elicitation" && actual == &nonce,
+            _ => false,
+        })
+        .await;
+        let (done, flushed) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::FlushForTest(done))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), flushed)
+            .await
+            .unwrap()
+            .unwrap();
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(Vec::new()))
+            .await
+            .unwrap();
+        collect_connection_events_until(
+            &mut fake,
+            &mut observed,
+            |event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete"),
+        )
+        .await;
+        assert!(
+            !observed[initial_end..].iter().any(&boundary),
+            "{kind}: {observed:?}"
+        );
+        {
+            let received = fake.received.lock().await;
+            assert_eq!(
+                received
+                    .iter()
+                    .filter(|frame| frame["method"] == "session/new")
+                    .count(),
+                1
+            );
+            assert!(received
+                .iter()
+                .filter(|frame| frame["method"] == "session/prompt")
+                .map(|frame| frame["params"]["sessionId"].as_str().unwrap())
+                .eq(["s-pending-reset"]));
+        }
+        let (respond_to, response) = oneshot::channel();
+        fake.cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/clear".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(10),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(10), response).await.unwrap().unwrap(),
+            ResetSessionOutcome::Reset { new_acp_session_id } if new_acp_session_id == "s-pending-reset-reset-1"
+        ));
+        collect_connection_events_until(
+            &mut fake,
+            &mut observed,
+            |event| matches!(event, Event::Stopped { reason } if reason == "session_reset"),
+        )
+        .await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset", "stale after explicit reset"),
+        )
+        .await;
+        write_line(
+            &fake.agent_write,
+            &update("s-pending-reset-reset-1", "fresh after explicit reset"),
+        )
+        .await;
+        collect_connection_events_until(&mut fake, &mut observed, |event| {
+            matches!(event, Event::AgentMessageChunk { text, .. } if text == "fresh after explicit reset")
+        }).await;
+        fake.cmd_tx
+            .send(ClientCmd::Prompt(Vec::new()))
+            .await
+            .unwrap();
+        collect_connection_events_until(
+            &mut fake,
+            &mut observed,
+            |event| matches!(event, Event::Stopped { reason } if reason == "prompt_complete"),
+        )
+        .await;
+        assert!(!observed.iter().any(|event| {
+            matches!(event, Event::AgentMessageChunk { text, .. } if text == "stale after explicit reset")
+        }));
+        assert!(
+            observed[initial_end..]
+                .iter()
+                .filter_map(|event| match event {
+                    Event::SessionCleared => Some(0),
+                    Event::SessionContextReset { .. } => Some(1),
+                    Event::AcpSessionAssigned { .. } => Some(2),
+                    Event::Stopped { reason } if reason == "session_reset" => Some(3),
+                    _ => None,
+                })
+                .eq([0, 1, 2, 3]),
+            "{kind}: {observed:?}"
+        );
+        assert!(observed[initial_end..].iter().any(|event| {
+            matches!(event, Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. } if acp_session_id == "s-pending-reset-reset-1")
+        }));
+        assert_eq!(
+            observed[initial_end..]
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. }
+                    )
+                })
+                .count(),
+            1
+        );
+        {
+            let received = fake.received.lock().await;
+            assert_eq!(
+                received
+                    .iter()
+                    .filter(|frame| frame["method"] == "session/new")
+                    .count(),
+                2
+            );
+            assert!(received
+                .iter()
+                .filter(|frame| frame["method"] == "session/prompt")
+                .map(|frame| frame["params"]["sessionId"].as_str().unwrap())
+                .eq(["s-pending-reset", "s-pending-reset-reset-1"]));
+        }
+        fake.connection.abort();
+        let _ = fake.connection.await;
+        fake.agent.abort();
+        let _ = fake.agent.await;
     }
 }
 
@@ -1763,7 +1960,7 @@ async fn transport_eof_cancels_unanswered_callbacks_after_intervening_progress()
             .send(ClientCmd::Prompt(Vec::new()))
             .await
             .unwrap();
-        let nonce = registered_interaction(&mut fake).await;
+        let nonce = registered_interaction(&mut fake, &mut Vec::new()).await;
         write_line(&fake.agent_write, &serde_json::json!({
             "jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":"s-pending-eof","update":{
@@ -1809,4 +2006,451 @@ async fn transport_eof_cancels_unanswered_callbacks_after_intervening_progress()
         fake.agent.abort();
         let _ = fake.agent.await;
     }
+}
+
+/// A child cancel reaches the agent addressed to the child and only when the
+/// child announced `cancel`; the root turn's cancel stays a separate command.
+#[tokio::test]
+async fn child_cancel_targets_the_child_and_requires_the_capability() {
+    let (daemon_write, agent_read) = tokio::io::duplex(1024 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(1024 * 1024);
+    let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+    let cancels = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+    let agent = tokio::spawn({
+        let (agent_write, cancels) = (agent_write.clone(), cancels.clone());
+        async move {
+            let mut reader = BufReader::new(agent_read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let id = &msg["id"];
+                match msg.get("method").and_then(|m| m.as_str()) {
+                    Some("initialize") => {
+                        write_line(&agent_write, &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                        )).await;
+                    }
+                    Some("session/new") => {
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"root"}}}}"#
+                            ),
+                        )
+                        .await;
+                        for (child, caps) in
+                            [("c-yes", r#","capabilities":{"cancel":{}}"#), ("c-no", "")]
+                        {
+                            write_line(&agent_write, &format!(
+                                r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"root","update":{{"sessionUpdate":"subagent_update","sessionId":"{child}","state":{{"state":"running"}}{caps}}}}}}}"#
+                            )).await;
+                        }
+                    }
+                    Some("session/cancel") => cancels
+                        .lock()
+                        .unwrap()
+                        .push(msg["params"]["sessionId"].as_str().unwrap().to_string()),
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        connection_state: Arc::default(),
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "root".to_string(),
+            sandbox: None,
+        },
+        mode: ConnectMode::Fresh {
+            stored_acp_session_id: None,
+            seed_history_replay: false,
+            prior_conversation: false,
+            fork_from: None,
+        },
+        ready_tx,
+        profile: &crate::acp::agent_profiles::CLAUDE,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model_config: Default::default(),
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    ready_rx.await.unwrap().expect("handshake ok");
+
+    // Both announcements are observed before any cancel is sent.
+    let mut announced = 0;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while announced < 2 {
+            if let Some(Event::SubagentUpdated { .. }) = event_rx.recv().await {
+                announced += 1;
+            }
+        }
+    })
+    .await
+    .expect("both subagents announced");
+
+    let mut sent = Vec::new();
+    for child in ["c-yes", "c-no", "unknown"] {
+        let (respond_to, answer) = oneshot::channel();
+        cmd_tx
+            .send(ClientCmd::CancelChild {
+                session_id: child.to_string(),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        sent.push(answer.await.unwrap());
+    }
+    assert_eq!(sent, [true, false, false]);
+
+    // The root cancel is a sentinel: the agent reads in order, so everything
+    // sent before it has been recorded once it shows up.
+    cmd_tx.send(ClientCmd::Cancel).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !cancels.lock().unwrap().contains(&"root".to_string()) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("root cancel reaches the agent");
+    assert_eq!(*cancels.lock().unwrap(), ["c-yes", "root"]);
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
+
+/// A reset is refused while a child runs, since it would orphan the child's
+/// routes, and goes through once the child reports idle.
+#[tokio::test]
+async fn reset_waits_for_a_running_subagent() {
+    let (daemon_write, agent_read) = tokio::io::duplex(1024 * 1024);
+    let (agent_write, daemon_read) = tokio::io::duplex(1024 * 1024);
+    let agent_write: SharedWrite = Arc::new(Mutex::new(agent_write));
+    let new_sessions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let agent = tokio::spawn({
+        let (agent_write, new_sessions) = (agent_write.clone(), new_sessions.clone());
+        async move {
+            let mut reader = BufReader::new(agent_read);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let id = &msg["id"];
+                match msg.get("method").and_then(|m| m.as_str()) {
+                    Some("initialize") => {
+                        write_line(&agent_write, &format!(
+                            r#"{{"jsonrpc":"2.0","id":{id},"result":{{"protocolVersion":1,"agentCapabilities":{{}}}}}}"#
+                        )).await;
+                    }
+                    Some("session/new") => {
+                        let n = new_sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"root-{n}"}}}}"#
+                            ),
+                        )
+                        .await;
+                        if n == 1 {
+                            write_line(&agent_write, r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"root-1","update":{"sessionUpdate":"subagent_update","sessionId":"child","state":{"state":"running"}}}}"#).await;
+                        }
+                    }
+                    Some("session/prompt") => {
+                        write_line(&agent_write, r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"root-1","update":{"sessionUpdate":"subagent_update","sessionId":"child","state":{"state":"idle","stopReason":"end_turn"}}}}"#).await;
+                        write_line(
+                            &agent_write,
+                            &format!(
+                                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"stopReason":"end_turn"}}}}"#
+                            ),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().to_path_buf();
+    let params = ConnectionParams {
+        connection_state: Arc::default(),
+        claude_home: None,
+        shutdown: tokio_util::sync::CancellationToken::new(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+        event_tx,
+        cmd_rx,
+        child: None,
+        pending_responders: Arc::new(Mutex::new(HashMap::new())),
+        resources: SessionResources {
+            fs_policy: Arc::new(FsPolicy::new(vec![cwd.clone()])),
+            terminals: TerminalManager::new(),
+            cwd,
+            label: "root".to_string(),
+            sandbox: None,
+        },
+        mode: ConnectMode::Fresh {
+            stored_acp_session_id: None,
+            seed_history_replay: false,
+            prior_conversation: false,
+            fork_from: None,
+        },
+        ready_tx,
+        profile: &crate::acp::agent_profiles::CLAUDE,
+        expected_agent: ExpectedAgent::Gemini,
+        source_profile: None,
+        default_effort: None,
+        default_mode: None,
+        default_model_config: Default::default(),
+        default_model: None,
+        mcp_servers: Vec::new(),
+        runner: None,
+    };
+    let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+    let connection = tokio::spawn(run_connection_task(transport, params));
+    ready_rx.await.unwrap().expect("handshake ok");
+    next_child_event(&mut event_rx, "child").await;
+
+    let reset = |cmd_tx: mpsc::Sender<ClientCmd>| async move {
+        let (respond_to, answer) = oneshot::channel();
+        cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/clear".into(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+                respond_to,
+            })
+            .await
+            .unwrap();
+        answer.await.unwrap()
+    };
+
+    match reset(cmd_tx.clone()).await {
+        ResetSessionOutcome::Failed { message } => {
+            assert!(message.contains("subagent is still running"), "{message}");
+        }
+        other => panic!("reset must be refused: {other:?}"),
+    }
+    assert_eq!(new_sessions.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The agent reports the child idle before it ends the turn.
+    cmd_tx
+        .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+            TextContent::new("go"),
+        )]))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (mut idle, mut stopped) = (false, false);
+        while !(idle && stopped) {
+            match event_rx.recv().await.expect("connection remains open") {
+                Event::SubagentUpdated { subagent, .. } => {
+                    idle |= subagent.state == SubagentState::Idle
+                }
+                Event::Stopped { .. } => stopped = true,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("child idle and turn stopped");
+
+    assert!(matches!(
+        reset(cmd_tx.clone()).await,
+        ResetSessionOutcome::Reset { .. }
+    ));
+    assert_eq!(new_sessions.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
+
+async fn next_child_event(event_rx: &mut mpsc::Receiver<Event>, child: &str) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Event::SubagentUpdated { subagent, .. } =
+                event_rx.recv().await.expect("connection remains open")
+            {
+                if subagent.session_id == child {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{child} announced"));
+}
+
+/// A child's approval waits on the human without holding the dispatch fence:
+/// a sibling's announcement is handled first, and the child's answer then
+/// reaches the adapter on the child's own request id.
+#[tokio::test]
+async fn child_approval_wait_does_not_stall_other_sessions() {
+    let FakeConnection {
+        mut event_rx,
+        agent_write,
+        cmd_tx: _cmd_tx,
+        pending_responders,
+        mut responses,
+        connection,
+        agent,
+        ..
+    } = spawn_fake_connection("root", None, false, |_| Vec::new()).await;
+    let announce = |child: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"root","update":{{"sessionUpdate":"subagent_update","sessionId":"{child}","state":{{"state":"running"}}}}}}}}"#
+        )
+    };
+    write_line(&agent_write, &announce("c1")).await;
+    next_child_event(&mut event_rx, "c1").await;
+    write_line(
+        &agent_write,
+        r#"{"jsonrpc":"2.0","id":900,"method":"session/request_permission","params":{"sessionId":"c1","toolCall":{"toolCallId":"t1"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}"#,
+    )
+    .await;
+    let nonce = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Event::ApprovalRequested { approval } =
+                event_rx.recv().await.expect("connection remains open")
+            {
+                break approval.nonce;
+            }
+        }
+    })
+    .await
+    .expect("approval requested");
+
+    // The approval is still unanswered, yet a sibling announcement is handled.
+    write_line(&agent_write, &announce("c2")).await;
+    next_child_event(&mut event_rx, "c2").await;
+
+    let PendingResponder { resolver } = pending_responders
+        .lock()
+        .await
+        .remove(&nonce)
+        .expect("approval parked");
+    let PendingResolver::Approval(tx) = resolver else {
+        panic!("approval resolver expected");
+    };
+    tx.send(ApprovalResolutionMessage::Decision {
+        decision: ApprovalDecision::Allow,
+        option_id: None,
+    })
+    .map_err(|_| "resolver gone")
+    .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(30), responses.recv())
+        .await
+        .expect("response reaches the adapter")
+        .expect("agent still reading");
+    assert_eq!(response["id"], 900);
+    assert_eq!(response["result"]["outcome"]["outcome"], "selected");
+    assert_eq!(response["result"]["outcome"]["optionId"], "allow");
+
+    agent.abort();
+    connection.abort();
+    let _ = tokio::join!(agent, connection);
+}
+
+const GOOD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":1,"primitive_schema_version":1}}}"#;
+const BAD_HELLO: &str = r#","_meta":{"aoe":{"proxy":{"plugin_id":"p","protocol_version":9,"primitive_schema_version":1}}}"#;
+
+fn tool_call_frame(id: &str, aoe: &str) -> String {
+    let meta = if aoe.is_empty() {
+        String::new()
+    } else {
+        format!(r#","_meta":{{"aoe":{aoe}}}"#)
+    };
+    format!(
+        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s-h","update":{{"sessionUpdate":"tool_call","toolCallId":"{id}","title":"T"{meta}}}}}}}"#
+    )
+}
+
+/// A hello core cannot accept refuses the session; a valid one makes the
+/// agent's `_meta.aoe` frames dedup, drop and reorder before the reducer, and a
+/// broken frame ends the integration.
+#[tokio::test]
+async fn proxy_hello_and_primitives_shape_the_event_stream() {
+    let (ready, fake) =
+        spawn_fake_connection_raw("s-h", None, false, BAD_HELLO, None, None, |_| vec![]).await;
+    assert!(
+        matches!(&ready, Err(AcpError::IncompatibleAgent(e))
+            if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
+        "{ready:?}"
+    );
+    fake.agent.abort();
+    fake.connection.abort();
+
+    let (ready, mut fake) =
+        spawn_fake_connection_raw("s-h", None, false, GOOD_HELLO, None, None, |_| vec![]).await;
+    ready.expect("valid hello accepted");
+    let frames = [
+        tool_call_frame("t1", ""),
+        // Tailer-emitted: waits for adapter frame 3.
+        tool_call_frame("t2", r#"{"v":1,"key":"k2","after_adapter_sequence":3}"#),
+        tool_call_frame("t3", r#"{"v":1,"key":"k3","ephemeral":true}"#),
+        tool_call_frame("t4", r#"{"v":1,"key":"k4"}"#),
+        tool_call_frame("t4-again", r#"{"v":1,"key":"k4"}"#),
+        tool_call_frame("t5", ""),
+        tool_call_frame("t6", r#"{"v":1}"#),
+    ];
+    for frame in &frames {
+        write_line(&fake.agent_write, frame).await;
+    }
+    let (mut started, mut lost) = (Vec::new(), None);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while lost.is_none() {
+            match fake.event_rx.recv().await.expect("connection remains open") {
+                Event::ToolCallStarted { tool_call } => started.push(tool_call.id),
+                Event::IntegrationLost { reason } => lost = Some(reason),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("integration loss is reported");
+    assert_eq!(started, ["t1", "t4", "t2", "t5"]);
+    assert!(matches!(
+        lost,
+        Some(IntegrationLostReason::ContractViolation { .. })
+    ));
+    fake.agent.abort();
+    fake.connection.abort();
 }

@@ -28,6 +28,7 @@ import {
   emptyAcpState,
   type ActivityRow,
   type BackgroundAgent,
+  type SubagentRecord,
   type ToolCall,
   type ToolOutputBlock,
 } from "../../lib/acpTypes";
@@ -795,6 +796,56 @@ describe("SubagentCard", () => {
     expect(container.textContent).toContain("x.ts");
   });
 
+  it("shows the roster title and state badge for the matching tool call", () => {
+    const tool = makeToolCall({ id: "task-1", name: "Task", args_preview: args({ description: "investigate bug" }) });
+    const subagents: SubagentRecord[] = [
+      {
+        session_id: "child-1",
+        parent_session_id: "s",
+        parent_tool_call_id: "task-1",
+        title: "Auth audit",
+        state: "idle",
+        stop_reason: "end_turn",
+        cancel_capable: false,
+      },
+    ];
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], subagents }}>
+        <SubagentCard tool={tool} result={makeCompletion()} children={[]} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Auth audit");
+    expect(container.textContent).not.toContain("investigate bug");
+    expect(container.textContent).toContain("idle · end_turn");
+  });
+
+  it.each([
+    ["running", undefined, "running"],
+    ["requires_action", undefined, "waiting on you"],
+    ["idle", "end_turn", "idle · end_turn"],
+    ["idle", undefined, "idle"],
+    ["unknown", undefined, "unknown"],
+    ["from_a_newer_server", undefined, "unknown"],
+  ])("badges the %s state (stop reason %s) as %j", (state, stop_reason, badge) => {
+    const tool = makeToolCall({ id: "task-1", name: "Task", args_preview: args({ description: "d" }) });
+    const subagents = [
+      {
+        session_id: "child-1",
+        parent_session_id: "s",
+        parent_tool_call_id: "task-1",
+        state,
+        stop_reason,
+        cancel_capable: false,
+      },
+    ] as SubagentRecord[];
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [], subagents }}>
+        <SubagentCard tool={tool} result={makeCompletion()} children={[]} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain(`subagentd${badge}`);
+  });
+
   it("renders an off-protocol launch with its prompt and unwrapped report", () => {
     const tool = makeToolCall({
       kind: "think",
@@ -820,6 +871,81 @@ describe("SubagentCard", () => {
     ["<task><task_result>use Vec<String> and a < b</task_result></task>", "use Vec<String> and a < b"],
   ])("extractTaskResult(%j)", (input, expected) => {
     expect(extractTaskResult(input)).toBe(expected);
+  });
+});
+
+describe("delegation card from the session identity", () => {
+  // The adapter hides the Agent call: the card is the delegation message id and
+  // no background-agent record exists.
+  const card = makeToolCall({
+    id: "msg-1",
+    name: "Explore repo",
+    kind: "think",
+    args_preview: args({ description: "Explore repo", prompt: "find the bug" }),
+  });
+  const child: SubagentRecord = {
+    session_id: "child-1",
+    parent_session_id: "root",
+    parent_tool_call_id: "msg-1",
+    title: "Explore repo",
+    state: "running",
+    cancel_capable: true,
+  };
+  const view = (
+    record: SubagentRecord,
+    result?: ActivityRow,
+    cancelSubagent = vi.fn().mockResolvedValue(undefined),
+  ) => (
+    <BackgroundAgentsContext.Provider value={{ agents: [], subagents: [record], cancelSubagent }}>
+      {wrap(<ToolCard tool={card} result={result} />)}
+    </BackgroundAgentsContext.Provider>
+  );
+
+  it("shows the badge and a Stop that cancels the child by session id", () => {
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const { container, getByRole } = render(view(child, undefined, cancelSubagent));
+    expect(container.textContent).toContain("subagent");
+    expect(container.textContent).toContain("Explore repo");
+    expect(container.textContent).toContain("running");
+    fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+  });
+
+  it("offers no Stop when the child cannot be cancelled", () => {
+    const { queryByRole } = render(view({ ...child, cancel_capable: false }));
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+  });
+
+  it.each(["end_turn", "error"])("stops looking active once the child is idle with no reply (%s)", (stop_reason) => {
+    const { container, queryByRole } = render(view({ ...child, state: "idle", stop_reason }));
+    expect(container.textContent).toContain(`idle · ${stop_reason}`);
+    expect(container.textContent).not.toMatch(/running/);
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+  });
+
+  it("stays active when the turn end stopped the launch call but the child runs", () => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container } = render(view(child, stopped));
+    expect(container.textContent).toContain("running");
+    expect(container.textContent).not.toMatch(/done|stopped/);
+    expect(container.querySelector(".animate-pulse")).not.toBeNull();
+  });
+
+  it("settles from the record, with no duration, when the child went idle after a stop", () => {
+    const stopped = makeStopped({ toolCallId: "msg-1" });
+    const { container } = render(view({ ...child, state: "idle", stop_reason: "end_turn" }, stopped));
+    expect(container.textContent).toContain("idle · end_turn");
+    expect(container.textContent).toContain("done");
+    expect(container.textContent).not.toMatch(/stopped|\d+(ms|s)\b/);
+  });
+
+  it("keeps the reply as the card's report", () => {
+    const { container, getByRole } = render(
+      view({ ...child, state: "idle" }, makeCompletion({ toolCallId: "msg-1", text: "the answer" })),
+    );
+    fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+    expect(container.textContent).toContain("find the bug");
+    expect(container.textContent).toContain("the answer");
   });
 });
 
@@ -861,6 +987,88 @@ describe("AsyncSubagentCard", () => {
     );
     expect(container.textContent).toContain("3 tools · Read");
     expect(container.textContent).not.toContain("agentId");
+  });
+
+  it("shows Stop only for a cancel-capable active subagent, without opening the pane", () => {
+    const openPane = vi.fn();
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const agent: BackgroundAgent = {
+      agentId: "a1",
+      toolCallId: "task-async",
+      description: "d",
+      prompt: "",
+      model: "",
+      status: "running",
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    const record: SubagentRecord = {
+      session_id: "child-1",
+      parent_session_id: "s",
+      parent_tool_call_id: "task-async",
+      state: "running",
+      cancel_capable: true,
+    };
+    const view = (a: BackgroundAgent, r: SubagentRecord) => (
+      <BackgroundAgentsContext.Provider value={{ agents: [a], subagents: [r], cancelSubagent, openPane }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>
+    );
+    const { getByRole, queryByRole, rerender } = render(view(agent, record));
+    fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+    expect(openPane).not.toHaveBeenCalled();
+    rerender(view(agent, { ...record, cancel_capable: false }));
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+    rerender(view({ ...agent, status: "completed", endedAt: agent.startedAt }, record));
+    expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+  });
+
+  it("stops from the keyboard with Enter or Space and ignores other keys", () => {
+    const openPane = vi.fn();
+    const cancelSubagent = vi.fn().mockResolvedValue(undefined);
+    const agent = { agentId: "a1", toolCallId: "task-async", status: "running", endedAt: null } as BackgroundAgent;
+    const record: SubagentRecord = {
+      session_id: "child-1",
+      parent_session_id: "s",
+      parent_tool_call_id: "task-async",
+      state: "running",
+      cancel_capable: true,
+    };
+    const { getByRole } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [agent], subagents: [record], cancelSubagent, openPane }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    const stop = getByRole("button", { name: "Stop sub-agent" });
+    fireEvent.keyDown(stop, { key: "a" });
+    expect(cancelSubagent).not.toHaveBeenCalled();
+    fireEvent.keyDown(stop, { key: "Enter" });
+    fireEvent.keyDown(stop, { key: " " });
+    expect(cancelSubagent).toHaveBeenCalledTimes(2);
+    expect(cancelSubagent).toHaveBeenCalledWith("child-1");
+    expect(openPane).not.toHaveBeenCalled();
+  });
+
+  it("labels a requires_action agent as waiting on the user", () => {
+    const agent = {
+      agentId: "a1",
+      toolCallId: "task-async",
+      status: "requires_action",
+      endedAt: null,
+    } as BackgroundAgent;
+    const { container } = render(
+      <BackgroundAgentsContext.Provider value={{ agents: [agent] }}>
+        <AsyncSubagentCard tool={tool} />
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(container.textContent).toContain("Waiting on you");
   });
 
   it("opens the Sub agents pane on click", () => {

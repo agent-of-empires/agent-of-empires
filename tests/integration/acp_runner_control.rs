@@ -1,4 +1,4 @@
-//! Integration tests for the runner's control-only v4 transport.
+//! Integration tests for the runner's control-only transport.
 //!
 //! The scenarios spawn real `aoe __acp-runner` processes with deterministic
 //! stand-in agents and exercise framed handshake, forward-lane, reverse-lane,
@@ -143,7 +143,7 @@ fn read_frame(stream: &mut UnixStream) -> serde_json::Value {
     serde_json::from_slice(&body).expect("parse frame json")
 }
 
-/// The current control loop over real sockets and framing: an
+/// The core loop over real sockets and framing: an
 /// agent-issued request reaches the daemon as a `ServerCall`, and the
 /// daemon's `ServerResult` reaches the agent as a JSON-RPC response echoing
 /// the agent's own id.
@@ -878,7 +878,7 @@ for line in sys.stdin:
     drop(replacement);
 }
 
-/// The runner owns the ACP handshake. Drive it as a current
+/// The runner owns the ACP handshake. Drive it as a current-version
 /// daemon over the control channel across two attaches and assert the
 /// agent is handshaken (initialize + session/new) exactly once, that the
 /// second attach replays the cache without touching the agent, and that a

@@ -649,6 +649,12 @@ impl DaemonControlClient {
     pub(super) async fn cancel(&self) {
         let _ = self.send(ControlBody::Cancel).await;
     }
+
+    pub(super) async fn cancel_session(&self, session_id: String) -> bool {
+        self.send(ControlBody::CancelSession { session_id })
+            .await
+            .is_ok()
+    }
 }
 
 /// A newborn must publish its own declaration; never retrofit a retained record.
@@ -2234,6 +2240,50 @@ mod tests {
             Ok(0) => {}
             other => panic!("an unavailable SDK route must send no native controls: {other:?}"),
         }
+    }
+
+    /// A runner from the other side of a protocol bump fails the attach with a
+    /// readable mismatch error, not a decode failure.
+    #[tokio::test]
+    async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (control, listener) = bind(&tmp);
+        let fake = tokio::spawn(async move {
+            accept_hello(
+                &listener,
+                "old",
+                control_protocol::CONTROL_PROTOCOL_VERSION - 1,
+            )
+            .await
+        });
+        let error = connect(&control, "old", Arc::new(TerminalClaim::new()), false)
+            .await
+            .err()
+            .expect("a version mismatch must fail the attach");
+        assert!(
+            error
+                .to_string()
+                .contains("control protocol is incompatible"),
+            "{error}"
+        );
+        match error {
+            AcpError::RetainedRuntimeUnavailable(refusal) => {
+                assert_eq!(
+                    refusal.reason,
+                    crate::process::worker_registry::ControlRefusalReason::ProtocolIncompatible
+                );
+                assert_eq!(
+                    refusal.declared_protocol,
+                    Some(control_protocol::CONTROL_PROTOCOL_VERSION)
+                );
+                assert_eq!(
+                    refusal.observed_protocol,
+                    Some(control_protocol::CONTROL_PROTOCOL_VERSION - 1)
+                );
+            }
+            other => panic!("expected typed protocol incompatibility, got {other}"),
+        }
+        let _ = fake.await;
     }
 
     /// An oversized reverse response becomes a bounded error and the

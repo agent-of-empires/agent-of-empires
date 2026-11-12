@@ -37,6 +37,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
             description: "test shim".into(),
             env_allowlist: None,
         },
+        config_path: cwd.clone(),
         cwd,
         additional_dirs: vec![],
         provider_env: vec![(

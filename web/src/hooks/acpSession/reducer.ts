@@ -30,9 +30,19 @@ import type { ServerQueuedPrompt } from "../../lib/api";
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
-  | { kind: "reduced_state"; state: ReducedState; unchanged: string[]; seq?: number }
+  | {
+      kind: "reduced_state";
+      state: ReducedState;
+      unchanged: string[];
+      seq?: number;
+    }
   | { kind: "native_authority_pending" }
-  | { kind: "frames"; frames: AcpFrame[]; rows?: ActivityRow[]; oldestSeq?: number }
+  | {
+      kind: "frames";
+      frames: AcpFrame[];
+      rows?: ActivityRow[];
+      oldestSeq?: number;
+    }
   | { kind: "prepend"; rows: ActivityRow[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "transcript_snapshot"; rows: ActivityRow[] }
@@ -40,14 +50,23 @@ export type Action =
   | { kind: "transcript_patch"; row: ActivityRow }
   | { kind: "transcript_remove"; id: string }
   | { kind: "lagged"; skipped: number }
-  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
+  | {
+      kind: "user_prompt";
+      text: string;
+      attachments?: AcpAttachment[];
+      id?: string;
+    }
   | { kind: "prompt_send_rejected"; id: string }
   | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string; target?: NonNullable<AcpState["interactionError"]>["target"] }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
-  | { kind: "elicitation_resolved_locally"; nonce: string; resolution: ElicitationResolution }
+  | {
+      kind: "elicitation_resolved_locally";
+      nonce: string;
+      resolution: ElicitationResolution;
+    }
   | { kind: "lagged_resolved" }
   | { kind: "reset" }
   | { kind: "hydrate"; state: AcpState }
@@ -65,7 +84,12 @@ export type Action =
   | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   | { kind: "restart_started"; epoch: number; stoppedSent: boolean }
-  | { kind: "restart_failed"; epoch: number; message: string; stoppedSent: boolean }
+  | {
+      kind: "restart_failed";
+      epoch: number;
+      message: string;
+      stoppedSent: boolean;
+    }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
@@ -73,7 +97,11 @@ export type Action =
   | { kind: "set_pending_config_option"; configId: string; value: string }
   | { kind: "clear_pending_config_option" }
   // Only clears when still matching, so a stale failed request can't wipe a newer click.
-  | { kind: "clear_pending_config_option_if_match"; configId: string; value: string }
+  | {
+      kind: "clear_pending_config_option_if_match";
+      configId: string;
+      value: string;
+    }
   | { kind: "dismiss_config_option_switch_failed" };
 
 export type ApprovalResolveOutcome = { kind: "resolved" } | { kind: "error"; message: string };
@@ -91,7 +119,10 @@ export function classifyResolveResponse(
     return { kind: "resolved" };
   }
   const noun = target === "approval" ? "approval" : "question";
-  return { kind: "error", message: `Could not resolve ${noun} (${status}). ${detail}`.trim() };
+  return {
+    kind: "error",
+    message: `Could not resolve ${noun} (${status}). ${detail}`.trim(),
+  };
 }
 
 export function toActivityRows(rows: readonly TranscriptRow[], sessionId: string): ActivityRow[] {
@@ -104,7 +135,10 @@ function settleInflightPrompt(state: AcpState, id: string): AcpState {
   return {
     ...state,
     inflightPromptIds,
-    turnActive: deriveTurnActive({ serverTurnActive: state.serverTurnActive, inflightPromptIds }),
+    turnActive: deriveTurnActive({
+      serverTurnActive: state.serverTurnActive,
+      inflightPromptIds,
+    }),
   };
 }
 
@@ -132,7 +166,10 @@ function withServerRows(state: AcpState, activity: ActivityRow[]): AcpState {
 }
 
 function mapQueued(state: AcpState, id: string, update: (q: QueuedPrompt) => QueuedPrompt): AcpState {
-  return { ...state, queuedPrompts: state.queuedPrompts.map((q) => (q.id === id ? update(q) : q)) };
+  return {
+    ...state,
+    queuedPrompts: state.queuedPrompts.map((q) => (q.id === id ? update(q) : q)),
+  };
 }
 
 // The prompt now lives only in the queue; a leftover overlay row would duplicate its resend.
@@ -163,7 +200,12 @@ function hydrateServerQueue(state: AcpState, serverRows: ServerQueuedPrompt[]): 
     const attachments: PromptAttachmentInput[] | undefined = local?.attachments?.length
       ? local.attachments
       : r.attachments && r.attachments.length > 0
-        ? r.attachments.map((a) => ({ kind: a.kind, mimeType: a.mime_type, name: a.name ?? undefined, dataB64: "" }))
+        ? r.attachments.map((a) => ({
+            kind: a.kind,
+            mimeType: a.mime_type,
+            name: a.name ?? undefined,
+            dataB64: "",
+          }))
         : undefined;
     return {
       id: r.id,
@@ -234,7 +276,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "clear_error":
       return state.interactionError
         ? { ...state, interactionError: null }
-        : { ...state, lastError: null, lastErrorEvidence: null, startupError: null };
+        : { ...state, lastError: null, lastErrorEvidence: null, startupError: null, integrationLost: null };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).
       const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);
@@ -322,7 +364,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "dequeue_prompt":
       // Even an already-removed row gets a new queue snapshot: the final
       // acknowledgement must fence reads begun during optimistic delivery.
-      return { ...state, queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id) };
+      return {
+        ...state,
+        queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id),
+      };
     case "edit_queued_prompt":
       return mapQueued(state, action.id, (q) => ({ ...q, text: action.text }));
     case "clear_queue":
@@ -338,7 +383,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "restart_started":
       // The restart already ended when `epoch` moved on; its replacement's stops are real, but its stop still stopped the sent prompt.
       if (action.epoch !== state.restartEpoch)
-        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+        return {
+          ...state,
+          restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        };
       // The stop this restart caused may already be applied; it isn't the Worker stopping.
       return {
         ...state,
@@ -350,7 +398,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
       };
     case "restart_failed":
       if (action.epoch !== state.restartEpoch)
-        return { ...state, restartStoppedSent: state.restartStoppedSent || action.stoppedSent };
+        return {
+          ...state,
+          restartStoppedSent: state.restartStoppedSent || action.stoppedSent,
+        };
       return {
         ...state,
         restartFailure: action.message,
@@ -359,7 +410,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "dismiss_compaction_reminder":
       return { ...state, compactionReminderDismissed: state.sessionUsage };
     case "dismiss_rejected_prompt":
-      return { ...state, rejectedPrompts: state.rejectedPrompts.filter((r) => r.id !== action.id) };
+      return {
+        ...state,
+        rejectedPrompts: state.rejectedPrompts.filter((r) => r.id !== action.id),
+      };
     case "dismiss_mode_switch_failed":
       return { ...state, modeSwitchFailed: null };
     case "dismiss_session_notice":
@@ -367,9 +421,15 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // snapshot would otherwise bring the notice back.
       return state.dismissedNoticeIds.includes(action.id)
         ? state
-        : { ...state, dismissedNoticeIds: [...state.dismissedNoticeIds, action.id] };
+        : {
+            ...state,
+            dismissedNoticeIds: [...state.dismissedNoticeIds, action.id],
+          };
     case "set_pending_config_option":
-      return { ...state, pendingConfigOption: { configId: action.configId, value: action.value } };
+      return {
+        ...state,
+        pendingConfigOption: { configId: action.configId, value: action.value },
+      };
     case "clear_pending_config_option":
       return { ...state, pendingConfigOption: null };
     case "clear_pending_config_option_if_match": {
@@ -387,11 +447,17 @@ export function reducer(state: AcpState, action: Action): AcpState {
 export function transcriptDeltaAction(delta: TranscriptDelta, sessionId: string): Action | null {
   if ("Append" in delta) {
     if (!webRendersServerRow(delta.Append)) return null;
-    return { kind: "transcript_append", row: transcriptRowToActivity(delta.Append, sessionId) };
+    return {
+      kind: "transcript_append",
+      row: transcriptRowToActivity(delta.Append, sessionId),
+    };
   }
   if ("Patch" in delta) {
     if (!webRendersServerRow(delta.Patch.row)) return null;
-    return { kind: "transcript_patch", row: transcriptRowToActivity(delta.Patch.row, sessionId) };
+    return {
+      kind: "transcript_patch",
+      row: transcriptRowToActivity(delta.Patch.row, sessionId),
+    };
   }
   if ("Remove" in delta) return { kind: "transcript_remove", id: delta.Remove };
   return null;

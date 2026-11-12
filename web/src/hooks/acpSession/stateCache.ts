@@ -8,6 +8,8 @@ import {
   revokeNativeAuthority,
   type AcpState,
   type BackgroundAgent,
+  type BackgroundShell,
+  type SubagentRecord,
   type WorkflowRun,
 } from "../../lib/acpTypes";
 import {
@@ -22,6 +24,33 @@ import { safeSetItem } from "../../lib/safeStorage";
 const STATE_CACHE_CAP = 32;
 const stateCache = new Map<string, AcpState>();
 const stateListeners = new Map<string, Set<() => void>>();
+
+export const NATIVE_INPUT_UNCONFIRMED =
+  "Native input is not currently confirmed. The retained conversation has not been replaced.";
+
+export interface LiveAcpActions {
+  cancelPrompt: () => Promise<string | null>;
+  cancelSubagent: (childId: string) => Promise<string | null>;
+}
+
+const liveActions = new Map<string, { owner: symbol; actions: LiveAcpActions }>();
+
+/** Live callbacks have their own lifetime, never the cached state's lifetime. */
+export function registerLiveAcpActions(sessionId: string, owner: symbol, actions: LiveAcpActions): () => void {
+  const entry = { owner, actions };
+  liveActions.set(sessionId, entry);
+  return () => {
+    if (liveActions.get(sessionId) === entry) liveActions.delete(sessionId);
+  };
+}
+
+export function getLiveAcpActions(sessionId: string): LiveAcpActions | undefined {
+  return liveActions.get(sessionId)?.actions;
+}
+
+export function ownsLiveAcpActions(sessionId: string, owner: symbol): boolean {
+  return liveActions.get(sessionId)?.owner === owner;
+}
 
 function storageKey(sessionId: string): string {
   return STORAGE_KEY_PREFIX + sessionId;
@@ -207,6 +236,8 @@ function subscribeAcpState(sessionId: string, cb: () => void): () => void {
 
 const EMPTY_BACKGROUND_AGENTS: BackgroundAgent[] = [];
 const EMPTY_BACKGROUND_TASKS: string[] = [];
+const EMPTY_SUBAGENTS: SubagentRecord[] = [];
+const EMPTY_BACKGROUND_SHELLS: BackgroundShell[] = [];
 const EMPTY_WORKFLOW_RUNS: Record<string, WorkflowRun> = {};
 
 /** One field of a session's cached state, so sibling panels need no second WebSocket. */
@@ -223,15 +254,25 @@ function useCachedField<T>(sessionId: string | null, pick: (state: AcpState) => 
 }
 
 const pickBackgroundAgents = (s: AcpState) => s.backgroundAgents;
+const pickSubagents = (s: AcpState) => s.subagents;
 const pickBackgroundTasks = (s: AcpState) => s.backgroundTasks;
+const pickBackgroundShells = (s: AcpState) => s.backgroundShells;
 const pickWorkflowRuns = (s: AcpState) => s.workflowRuns;
 
 export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[] {
   return useCachedField(sessionId, pickBackgroundAgents, EMPTY_BACKGROUND_AGENTS);
 }
 
+export function useSubagents(sessionId: string | null): SubagentRecord[] {
+  return useCachedField(sessionId, pickSubagents, EMPTY_SUBAGENTS);
+}
+
 export function useBackgroundTasks(sessionId: string | null): string[] {
   return useCachedField(sessionId, pickBackgroundTasks, EMPTY_BACKGROUND_TASKS);
+}
+
+export function useBackgroundShells(sessionId: string | null): BackgroundShell[] {
+  return useCachedField(sessionId, pickBackgroundShells, EMPTY_BACKGROUND_SHELLS);
 }
 
 export function useWorkflowRuns(sessionId: string | null): Record<string, WorkflowRun> {

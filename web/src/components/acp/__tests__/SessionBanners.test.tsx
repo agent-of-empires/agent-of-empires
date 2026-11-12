@@ -4,13 +4,19 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 
 import { useReducer } from "react";
 
-import { applyEvent, emptyAcpState, type AcpEvent, nativeInputAvailable } from "../../../lib/acpTypes";
+import {
+  applyEvent,
+  applyReducedState,
+  emptyAcpState,
+  type AcpEvent,
+  nativeInputAvailable,
+} from "../../../lib/acpTypes";
 
 import { reducer, type Action } from "../../../hooks/acpSession/reducer";
 
 import { isNewSessionStarting } from "../startupWait";
 
-import type { AcpState, Approval, Elicitation, ReducedState } from "../../../lib/acpTypes";
+import type { AcpState, Approval, Elicitation, IntegrationLostReason, ReducedState } from "../../../lib/acpTypes";
 
 import { setServerDown } from "../../../lib/connectionState";
 
@@ -684,5 +690,175 @@ describe("SessionBanners startup line", () => {
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe("0:31");
     expect(screen.queryByTestId("startup-wait-restart") !== null).toBe(canRestart);
     expect(screen.queryByTestId("startup-wait-restart-cost") !== null).toBe(canRestart);
+  });
+});
+
+describe("accepted integration-loss snapshot diagnostics", () => {
+  const message = "Agent integration lost: hold overflow";
+  const banners = (state: AcpState) => (
+    <SessionBanners
+      sessionId="snapshot-diagnostic"
+      state={state}
+      startingAgent={null}
+      canRestart={false}
+      acpWorkerState="running"
+      trashedAt={null}
+      archivedAt={null}
+      snoozedUntil={null}
+      dismissError={vi.fn()}
+    />
+  );
+  const snapshot = (
+    state: AcpState,
+    reason: IntegrationLostReason | null,
+    seq: number,
+    receipt: Parameters<typeof currentControlSnapshot>[1] = { ready: false },
+  ) => {
+    const header = currentControlSnapshot(state, receipt, seq);
+    const wire = { ...header.state, integration_lost: reason };
+    return applyReducedState(state, wire, header.unchanged, header.seq);
+  };
+
+  beforeEach(() => setServerDown(false));
+
+  it.each<[IntegrationLostReason, string]>([
+    [{ kind: "contract_violation", detail: "invalid primitive epoch" }, "invalid primitive epoch"],
+    [{ kind: "hold_overflow" }, "hold overflow"],
+    [{ kind: "lease_overflow" }, "lease overflow"],
+  ])("renders snapshot-only reason %j without a raw frame or native authority (%s)", (reason, detail) => {
+    const state = snapshot(emptyAcpState(), reason, 20);
+    render(banners(state));
+    expect(screen.getByText(`Agent integration lost: ${detail}`)).toBeTruthy();
+    expect(screen.queryByTestId("startup-error-banner")).toBeNull();
+    expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
+    expect(state).toMatchObject({
+      connectionReady: false,
+      connectionUnavailable: null,
+      promptWakeEligible: false,
+      nativeSnapshotSeq: 20,
+    });
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it.each<[string, Parameters<typeof currentControlSnapshot>[1]]>([
+    ["Available", { ready: true }],
+    ["governed wake", { ready: false, wakeEligible: true }],
+    [
+      "qualified native loss",
+      {
+        ready: false,
+        unavailable: { source: "native", cause: "stdout_eof", phase: "established" },
+      },
+    ],
+  ])("keeps integration diagnostics separate from the %s native receipt", (_label, receipt) => {
+    const header = currentControlSnapshot(emptyAcpState(), receipt, 20);
+    const baseline = applyReducedState(emptyAcpState(), header.state, [], header.seq);
+    const state = snapshot(baseline, { kind: "hold_overflow" }, 20, receipt);
+    render(banners(state));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect({
+      ready: state.connectionReady,
+      unavailable: state.connectionUnavailable,
+      wake: state.promptWakeEligible,
+    }).toEqual({
+      ready: baseline.connectionReady,
+      unavailable: baseline.connectionUnavailable,
+      wake: baseline.promptWakeEligible,
+    });
+    expect(nativeInputAvailable(state)).toBe(nativeInputAvailable(baseline));
+  });
+
+  it.each<["current reason" | "current clear", IntegrationLostReason | null]>([
+    ["current reason", { kind: "hold_overflow" }],
+    ["current clear", null],
+  ])("protects the %s from covered raw loss/reset history and an older snapshot", (_label, reason) => {
+    let state = snapshot(emptyAcpState(), reason, 20);
+    const view = render(banners(state));
+    const expectDiagnostic = () => {
+      if (reason) expect(screen.getByText(message)).toBeTruthy();
+      else expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+      expect(nativeInputAvailable(state)).toBe(false);
+    };
+    expectDiagnostic();
+    state = applyEvent(state, {
+      session_id: "snapshot-diagnostic",
+      seq: 5,
+      event: { IntegrationLost: { reason: { kind: "contract_violation", detail: "older raw loss" } } },
+    });
+    view.rerender(banners(state));
+    expectDiagnostic();
+    state = applyEvent(state, {
+      session_id: "snapshot-diagnostic",
+      seq: 6,
+      event: { UserPromptSent: { text: "older raw prompt" } },
+    });
+    view.rerender(banners(state));
+    expectDiagnostic();
+    expect(snapshot(state, { kind: "lease_overflow" }, 19)).toEqual(state);
+    for (const [index, connectionReady] of [undefined, false, true].entries()) {
+      state = applyEvent(state, {
+        session_id: "snapshot-diagnostic",
+        seq: 21 + index,
+        event: {
+          AcpSessionAssigned: {
+            acp_session_id: "new-current-native",
+            ...(connectionReady === undefined ? {} : { connection_ready: connectionReady }),
+            native_subject: null,
+          },
+        },
+      });
+      view.rerender(banners(state));
+      expectDiagnostic();
+      expect(state.integrationLost).toEqual(reason);
+    }
+    state = snapshot(state, null, 24);
+    view.rerender(banners(state));
+    expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(state.integrationLost).toBeNull();
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it("keeps raw integration diagnostics when a legacy snapshot omits the optional field", () => {
+    const initial = applyEvent(emptyAcpState(), {
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
+    });
+    const header = currentControlSnapshot(initial, { ready: false }, 20);
+    delete header.state.integration_lost;
+    const state = applyReducedState(initial, header.state, [], header.seq);
+    render(banners(state));
+    expect(screen.getByText(message)).toBeTruthy();
+    expect(nativeInputAvailable(state)).toBe(false);
+  });
+
+  it("clears only the current integration diagnostic while preserving unrelated errors", () => {
+    let initial = applyEvent(emptyAcpState(), {
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { AgentStartupError: { message: "Unrelated startup diagnostic" } },
+    });
+    initial = applyEvent(initial, {
+      session_id: "snapshot-diagnostic",
+      seq: 2,
+      event: { PromptRuntimeError: { message: "Retained operation diagnostic" } },
+    });
+    initial = reducer(initial, { kind: "error", message: "Retained callback failure" });
+    const lost = snapshot(initial, { kind: "hold_overflow" }, 20);
+    const view = render(banners(lost));
+    expect(screen.getByText(message)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("startup-error-banner-details"));
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
+    expect(screen.getByText(message)).toBeTruthy();
+    const cleared = snapshot(lost, null, 21);
+    view.rerender(banners(cleared));
+    expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(cleared.startupError).toBe("Unrelated startup diagnostic");
+    expect(cleared.lastError).toBe("Retained operation diagnostic");
+    expect(cleared.interactionError).toEqual(initial.interactionError);
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
+    expect(nativeInputAvailable(cleared)).toBe(false);
   });
 });
