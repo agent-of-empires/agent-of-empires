@@ -78,14 +78,14 @@ fn declared_args_need_direct_launch(command: &str) -> bool {
     aoe_plugin_api::agent_integration::direct_launch_words(command).is_none()
 }
 
-/// Refuse an agent-supplied argument the shell would consume before the agent
-/// sees it.
-fn ensure_declared_argument_reaches_the_agent(command: &str, tool: &str) -> Result<()> {
+/// Refuse an argument AoE appends for the agent when the command is not a plain
+/// invocation, because the shell would consume it before the agent sees it.
+fn refuse_shell_consumed_argument(command: &str, argument: &str) -> Result<()> {
     anyhow::ensure!(
         !declared_args_need_direct_launch(command),
-        "agent {} launches `{}`, which is not a plain invocation, so its declared arguments would reach the shell instead of the agent; declare the bare agent invocation",
-        tool,
-        command
+        "`{}` is not a plain invocation, so the agent's {} would reach the shell instead of the agent; declare the bare agent invocation",
+        command,
+        argument
     );
     Ok(())
 }
@@ -136,9 +136,14 @@ fn wrap_prime_launch(
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
-fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxed: bool) {
+fn apply_yolo_mode(
+    cmd: &mut String,
+    yolo: &crate::agents::YoloMode,
+    is_sandboxed: bool,
+) -> Result<()> {
     match yolo {
         crate::agents::YoloMode::CliFlag(flag) => {
+            refuse_shell_consumed_argument(cmd, "mode flag")?;
             *cmd = format!("{} {}", cmd, flag);
         }
         crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
@@ -148,6 +153,7 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
         | crate::agents::YoloMode::AlwaysYolo
         | crate::agents::YoloMode::EitherGeneration { .. } => {}
     }
+    Ok(())
 }
 
 /// Format an environment variable assignment as a shell-safe command prefix.
@@ -1374,7 +1380,7 @@ impl Instance {
             let mut tool_cmd = if self.is_yolo_mode() {
                 match yolo {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
-                        ensure_declared_argument_reaches_the_agent(&base_cmd, &self.tool)?;
+                        refuse_shell_consumed_argument(&base_cmd, "mode flag")?;
                         format!("{} {}", base_cmd, flag)
                     }
                     Some(crate::agents::YoloMode::EnvVar(..))
@@ -1392,7 +1398,7 @@ impl Instance {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(flag_template) = agent.and_then(|a| a.instruction_flag) {
-                    ensure_declared_argument_reaches_the_agent(&tool_cmd, &self.tool)?;
+                    refuse_shell_consumed_argument(&tool_cmd, "instruction flag")?;
                     let escaped = shell_escape(instruction);
                     let flag = flag_template.replace("{}", &escaped);
                     tool_cmd = format!("{} {}", tool_cmd, flag);
@@ -1649,7 +1655,7 @@ impl Instance {
                     }
                     if host_command.is_none() {
                         if let Some(yolo) = yolo {
-                            apply_yolo_mode(&mut cmd, yolo, false);
+                            apply_yolo_mode(&mut cmd, yolo, false)?;
                         }
                     }
                     let is_existing = self.apply_session_flags_in(
@@ -1672,7 +1678,7 @@ impl Instance {
                             if let Some(yolo) =
                                 agent.and_then(|agent| resolved_yolo(agent, launch_context))
                             {
-                                apply_yolo_mode(&mut cmd, yolo, false);
+                                apply_yolo_mode(&mut cmd, yolo, false)?;
                             }
                         }
                     }
@@ -1748,7 +1754,7 @@ impl Instance {
             }
             if host_command.is_none() {
                 if let Some(yolo) = yolo {
-                    apply_yolo_mode(&mut cmd, yolo, false);
+                    apply_yolo_mode(&mut cmd, yolo, false)?;
                 }
             }
             let is_existing = self.apply_session_flags_in(
@@ -1770,7 +1776,7 @@ impl Instance {
                 if !defer_yolo && self.is_yolo_mode() {
                     if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
                     {
-                        apply_yolo_mode(&mut cmd, yolo, false);
+                        apply_yolo_mode(&mut cmd, yolo, false)?;
                     }
                 }
             }
@@ -1856,6 +1862,34 @@ tool = "zzgamma"
 command = "prime-agent"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzdelta"
+command = "prime-agent | tee log"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--yolo"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+
+[[agent_integrations]]
+tool = "zzepsilon"
+command = "prime-agent"
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--yolo"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--resume"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
 "#;
         let dir = crate::plugin::plugins_dir()
             .unwrap()
@@ -1952,6 +1986,83 @@ instruction_flag = "--prompt={}"
         assert!(
             prepared.command.unwrap().contains("--prompt="),
             "the direct command must receive the instruction"
+        );
+    }
+
+    /// The host launch appends the same declaration-derived arguments as the
+    /// packaged one, and they are argv for the agent. A pipeline in the declared
+    /// command would hand the mode flag to the shell, so the guard holds on the
+    /// host path too while a bare command still takes it. Resume flags need no
+    /// guard here: a command that hides the agent behind a launcher already
+    /// starts fresh instead of injecting a selector.
+    #[test]
+    #[serial_test::serial]
+    fn declared_host_launch_refuses_arguments_the_shell_would_consume() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_shell_syntax_declarations();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let declared = |tool: &str| {
+            let command = crate::plugin::agent_integration::declared_agent(
+                crate::plugin::registry(),
+                tool,
+                std::iter::empty(),
+            )
+            .expect("the declaration is installed")
+            .contribution()
+            .command
+            .clone()
+            .expect("the declaration names its command");
+            let mut inst = Instance::new(tool, project.to_str().unwrap());
+            inst.tool = tool.into();
+            inst.command = command.clone();
+            inst.source_profile = "declared-shell".into();
+            (inst, command)
+        };
+
+        let (mut piped, command) = declared("zzdelta");
+        piped.yolo_mode = true;
+        let error = match piped.prepare_launch_command(piped.conversation_state()) {
+            Err(error) => error,
+            Ok(prepared) => panic!(
+                "a host pipeline must not receive the mode flag: {:?}",
+                prepared.command
+            ),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("mode flag would reach the shell"),
+            "{command}: {error}"
+        );
+
+        let (mut piped, command) = declared("zzdelta");
+        piped.set_agent_conversation(Some("4f6f3a52".into()), None, None);
+        let prepared = piped
+            .prepare_launch_command(piped.conversation_state())
+            .expect("a launcher-hidden command launches without a resume selector");
+        assert!(
+            !prepared.command.unwrap().contains("--resume"),
+            "{command} must not receive a resume flag the shell would consume"
+        );
+
+        let (mut direct, _) = declared("zzepsilon");
+        direct.yolo_mode = true;
+        let prepared = direct
+            .prepare_launch_command(direct.conversation_state())
+            .expect("a bare declared command must launch");
+        assert!(
+            prepared.command.unwrap().contains("--yolo"),
+            "the direct command must receive the mode flag"
         );
     }
 
