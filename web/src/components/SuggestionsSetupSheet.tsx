@@ -251,6 +251,7 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
   const [polling, setPolling] = useState(true);
   const [rechecking, setRechecking] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
+  const [recheckError, setRecheckError] = useState<string | null>(null);
 
   // Polls until the first suggestions land or a check fails; Check again restarts it.
   useEffect(() => {
@@ -282,8 +283,10 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
 
   const recheck = async () => {
     setRechecking(true);
-    await runSuggestionChecks();
-    if (snapshot?.providers.some((p) => p.status === "error")) await refreshSuggestions();
+    setRecheckError(null);
+    let result = await runSuggestionChecks();
+    if (result.ok && snapshot?.providers.some((p) => p.status === "error")) result = await refreshSuggestions();
+    if (!result.ok) setRecheckError(result.error);
     setRechecking(false);
     setPolling(true);
   };
@@ -313,6 +316,15 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
             </li>
           );
         })}
+        {recheckError && (
+          <li
+            className="px-4 py-3 text-sm text-status-error-text"
+            role="alert"
+            data-testid="suggestions-setup-recheck-error"
+          >
+            Check again failed: {recheckError}
+          </li>
+        )}
         {loadFailed && (
           <li
             className="px-4 py-3 text-sm text-status-error-text"
