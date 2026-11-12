@@ -189,13 +189,13 @@ fn startup_case(test: &str, remote: bool, unwind: bool) {
         process: command.spawn().unwrap(),
         stderr: None,
     };
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut stderr = child.process.stderr.take().unwrap();
     child.stderr = Some(std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let error = stderr.read_to_end(&mut bytes).err();
         (bytes, error)
     }));
-    let deadline = Instant::now() + Duration::from_secs(5);
     let mut emitted = Vec::new();
     let mut custody = None;
     let mut restored = [0; RESTORED.len()];
