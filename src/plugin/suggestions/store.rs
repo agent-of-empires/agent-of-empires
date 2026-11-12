@@ -209,8 +209,9 @@ pub(crate) fn find_item(
     Ok(effective_enabled(&provider.spec, &overrides, &item.criterion).then_some(item))
 }
 
-/// Whether `origin` names an active provider's live item in the profile's
-/// store: what a session may be recorded as started from.
+/// Whether `origin` names an active provider's live, non-stale item in the
+/// profile's store: what a session may be recorded as started from, the same
+/// bar `prepare` applies.
 pub(crate) fn is_published(
     conn: &Connection,
     profile: &str,
@@ -220,7 +221,7 @@ pub(crate) fn is_published(
     let Some(provider) = providers.iter().find(|p| p.id == origin.provider_id) else {
         return Ok(false);
     };
-    Ok(find_item(conn, profile, provider, &origin.id)?.is_some())
+    Ok(find_item(conn, profile, provider, &origin.id)?.is_some_and(|item| !item.stale))
 }
 
 /// `false` when the provider has no such live item, so a stale client cannot
@@ -859,6 +860,27 @@ mod tests {
         delete_template(&conn, "p", "acme.github", "assigned").unwrap();
         assert_eq!(get("p", "assigned"), None);
         assert_eq!(get("p", "quiet").as_deref(), Some("q"));
+    }
+
+    #[test]
+    fn a_stale_item_is_not_a_session_origin() {
+        let conn = store();
+        let mut stale = item("old", "assigned");
+        stale.stale = true;
+        publish(&conn, "p", &[item("live", "assigned"), stale]);
+        let origin = |id: &str| crate::session::SuggestionOrigin {
+            provider_id: "acme.github".into(),
+            id: id.into(),
+            profile: None,
+        };
+        let providers = [provider()];
+        let published = |id: &str| is_published(&conn, "p", &providers, &origin(id)).unwrap();
+        assert!(published("live"));
+        assert!(
+            !published("old"),
+            "prepare refuses it, so a session may not link it"
+        );
+        assert!(!published("never"));
     }
 
     #[test]
