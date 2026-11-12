@@ -349,7 +349,7 @@ impl Shared {
                     .note_subagent_activity(accepted, local_prompt_signals, epoch)
                     .await;
             }
-            SessionUpdate::SessionMessageChunk(_) => return,
+            SessionUpdate::SessionMessageChunk(_) if !from_child => return,
             update if from_child => {
                 self.handle_child_notification(notification.session_id, update)
                     .await;
