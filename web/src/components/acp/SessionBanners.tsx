@@ -46,16 +46,22 @@ export function SessionBanners({
     ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
     : null;
   const startupError = state.startupError;
-  const variant = reason ? "none" : pickWorkerStoppedVariant({
-    workerStopped: state.workerStopped,
-    startupError,
-    trashedAt,
-    archivedAt,
-    snoozedUntil,
-    workerStopping: acpWorkerState === "stopping",
-  });
+  const variant = reason
+    ? "none"
+    : pickWorkerStoppedVariant({
+        workerStopped: state.workerStopped,
+        startupError,
+        trashedAt,
+        archivedAt,
+        snoozedUntil,
+        workerStopping: acpWorkerState === "stopping",
+      });
   const healthy =
-    !reason && !state.workerStopped && !state.workerRestarting && !state.connectionUnavailable && (!startupError || nativeReady);
+    !reason &&
+    !state.workerStopped &&
+    !state.workerRestarting &&
+    !state.connectionUnavailable &&
+    (!startupError || nativeReady);
   const idle = healthy && !state.turnActive;
   const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
