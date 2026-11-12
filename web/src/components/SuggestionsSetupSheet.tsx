@@ -250,6 +250,7 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
   const [snapshot, setSnapshot] = useState<SuggestionsSnapshot | null>(null);
   const [polling, setPolling] = useState(true);
   const [rechecking, setRechecking] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
 
   // Polls until the first suggestions land or a check fails; Check again restarts it.
   useEffect(() => {
@@ -258,9 +259,14 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
     const tick = async () => {
       const next = await fetchSuggestions();
       if (!alive) return;
-      if (next) setSnapshot(next);
-      if (next && isReady(next)) onDone();
-      else if (next && checkRows(next).some((c) => c.status === "fail")) setPolling(false);
+      if (!next) {
+        setLoadFailed(true);
+        setPolling(false);
+        return;
+      }
+      setSnapshot(next);
+      if (isReady(next)) onDone();
+      else if (checkRows(next).some((c) => c.status === "fail")) setPolling(false);
       else timer = setTimeout(() => void tick(), POLL_MS);
     };
     let timer = setTimeout(() => void tick(), 0);
@@ -307,7 +313,16 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
             </li>
           );
         })}
-        {!failed && (
+        {loadFailed && (
+          <li
+            className="px-4 py-3 text-sm text-status-error-text"
+            role="alert"
+            data-testid="suggestions-setup-load-error"
+          >
+            Could not load suggestions.
+          </li>
+        )}
+        {!failed && !loadFailed && (
           <li className="flex gap-3 px-4 py-3" data-testid="suggestions-setup-waiting">
             <span aria-hidden="true" className="w-[18px] shrink-0 text-center font-mono text-brand-500">
               ⠙
@@ -325,6 +340,19 @@ function ChecksStep({ onDone, onFinishLater }: { onDone: () => void; onFinishLat
         <button type="button" className={GHOST} onClick={onFinishLater} data-testid="suggestions-setup-later">
           Finish later
         </button>
+        {loadFailed && (
+          <button
+            type="button"
+            className={PRIMARY}
+            onClick={() => {
+              setLoadFailed(false);
+              setPolling(true);
+            }}
+            data-testid="suggestions-setup-retry"
+          >
+            Retry
+          </button>
+        )}
         {failed && (
           <button
             type="button"
