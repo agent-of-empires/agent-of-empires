@@ -542,6 +542,7 @@ export function SettingsView({
       activeTab !== "structured-view" &&
       activeTab !== "mcp" &&
       activeTab !== "skills" &&
+      activeTab !== "suggestions" &&
       activeTab !== "plugins" &&
       activeTab !== "telemetry" &&
       activeTab !== "cityhall" &&
