@@ -189,6 +189,18 @@ pending and named queued intent. After publication, the admitted request
 supersedes the pending initial turn even when its forward is refused; the named
 queue row remains parked, and no native input is replayed.
 
+Web background Stop actions for the root or a child use the live session's
+cancellation path and recheck the current connection and native-input admission
+at the gesture. A cached card, Unknown receipt or callback from a replaced
+session cannot authorize a POST.
+
+Current Web snapshots carry integration loss separately from startup and
+operation errors. Its reason stays visible without native-input readiness,
+does not grant that readiness and does not replace unrelated diagnostics or
+offer startup repair by itself. An accepted current snapshot's explicit
+`integration_lost: null` clears the diagnostic; older snapshots, legacy omission
+and raw session assignment do not.
+
 Publication samples supervisor worker state before taking publication or instance
 exclusion. Producers and native-control admission try the native flock/cache
 without blocking under workers/lifecycle guards. On contention, they release both

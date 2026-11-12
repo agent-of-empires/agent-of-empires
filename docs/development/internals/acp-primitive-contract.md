@@ -18,6 +18,11 @@ A frame or hello naming a version core does not speak is rejected.
 
 A proxy adds `_meta.aoe.proxy = {plugin_id, protocol_version, primitive_schema_version}` to the `initialize` response, next to the adapter's own unchanged `agent_info`. No hello means a plain ACP agent: it is not held to this contract and a malformed `_meta.aoe` from it is ignored. An invalid hello refuses the session with `StartupErrorDetail::InvalidProxyHello`.
 
+Core validates the hello and initializes its per-connection primitive state
+before reporting initialized ownership. Ownership still returns before bootstrap
+replay or session establishment can fill the public event queue; it is not
+session readiness.
+
 ## Envelope
 
 `_meta.aoe` on a `session/update` or tool call:
