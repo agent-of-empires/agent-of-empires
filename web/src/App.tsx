@@ -2326,7 +2326,7 @@ function AppContent({
             </button>
           </div>
           <SuggestionsView
-            readOnly={serverAbout?.read_only ?? false}
+            readOnly={caps.readOnly}
             onOpenMarketplace={
               caps.canManageProjects ? () => requestNavigate("/settings/plugins?marketplace=suggestions") : undefined
             }

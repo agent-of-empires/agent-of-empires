@@ -338,3 +338,16 @@ test("a dismiss on the full view shows Undo, and Undo restores the row", async (
   expect((await undismiss).postDataJSON()).toEqual({ provider_id: "github", id: "issue-1" });
   await expect(page.getByText(item.title, { exact: true })).toBeVisible();
 });
+
+test("the suggestions page stays read-only while /api/about is unavailable", async ({ page }) => {
+  await mockTerminalApis(page);
+  await page.route("**/api/sessions", (route) =>
+    route.fulfill({ headers: CURSOR, json: { sessions: [], workspace_ordering: [] } }),
+  );
+  await page.route("**/api/suggestions", (route) =>
+    route.fulfill({ json: { providers: [provider], items: [item], prefs } }),
+  );
+  await page.route("**/api/about", (route) => route.fulfill({ status: 503, json: { message: "down" } }));
+  await page.goto("/suggestions");
+  await expect(page.getByRole("button", { name: "Start", exact: true })).toBeDisabled();
+});
