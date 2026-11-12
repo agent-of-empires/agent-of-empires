@@ -6,7 +6,7 @@ use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionMessage, SessionUpdate, StateUpdate, SubagentUpdate,
 };
 
-use super::notifications::Shared;
+use super::notifications::{now_ms, Shared};
 use crate::acp::acp_client::config_options::map_acp_config_option;
 use crate::acp::acp_client::lifecycle::ASYNC_AGENT_LAUNCHED;
 use crate::acp::acp_client::tool_context::update_tool_context_cache;
@@ -16,7 +16,6 @@ use crate::acp::acp_client::watchdog::OFF_PROTOCOL_WORK_GRACE_FLOOR;
 use crate::acp::state::{
     ConfigOptionCategory, Event, SubagentRecord, SubagentState, ToolCall, ToolOutputBlock,
 };
-use std::sync::atomic::Ordering;
 
 /// A background child's card, open until the child goes idle, and the text
 /// of its latest message: its answer once it ends.
@@ -68,11 +67,31 @@ fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) 
 
 impl Shared {
     /// A child still holds its parent's turn open. One silent past the
-    /// off-protocol floor lost its idle update, so it stops counting.
+    /// off-protocol floor lost its idle update, so it stops counting, whatever
+    /// its siblings send.
     pub(super) fn subagent_working(&self, now_ms: i64) -> bool {
         let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
-        now_ms - self.subagent_activity_at.load(Ordering::Relaxed) < floor
-            && self.has_active_subagent()
+        let seen = self
+            .subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned");
+        self.subagents
+            .lock()
+            .expect("subagents mutex poisoned")
+            .iter()
+            .any(|(id, record)| {
+                matches!(
+                    record.state,
+                    SubagentState::Running | SubagentState::RequiresAction
+                ) && seen.get(id).is_some_and(|at| now_ms - at < floor)
+            })
+    }
+
+    fn mark_child_seen(&self, child: &SessionId) {
+        self.subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned")
+            .insert(child.0.to_string(), now_ms());
     }
 
     /// A running child would lose its routes if the conversation reset.
@@ -151,6 +170,7 @@ impl Shared {
             apply_state(record, update.state);
         })
         .await;
+        self.mark_child_seen(&child);
         self.finish_background_report(&child).await;
         true
     }
@@ -215,9 +235,11 @@ impl Shared {
             _ => String::new(),
         };
         if *sender == session && child_of_session(recipient) {
+            self.mark_child_seen(recipient);
             self.start_delegation_card(&session, recipient, message.message_id.0.to_string(), text)
                 .await;
         } else if *recipient == session && child_of_session(sender) {
+            self.mark_child_seen(sender);
             self.complete_delegation_card(sender, &message.message_id.0, text)
                 .await;
         } else {
@@ -328,6 +350,7 @@ impl Shared {
     /// lifecycle must never read as the root session's. A background child's
     /// latest message is kept as its answer.
     pub(super) async fn handle_child_notification(&self, child: SessionId, update: SessionUpdate) {
+        self.mark_child_seen(&child);
         match update {
             SessionUpdate::SubagentUpdate(nested) => {
                 self.handle_subagent_update(child, nested).await;
@@ -416,10 +439,9 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::connection::notifications::now_ms;
     use crate::acp::acp_client::lifecycle::LifecycleSignal;
-    use crate::acp::acp_client::SessionState;
     use crate::acp::acp_client::session_identity::SessionIngress;
+    use crate::acp::acp_client::SessionState;
     use crate::acp::agent_profiles::CLAUDE;
     use agent_client_protocol::v1::schema::SessionNotification;
     use std::sync::atomic::AtomicBool;
@@ -797,6 +819,46 @@ mod tests {
             flags.push(subagent.cancel_capable);
         }
         assert_eq!(flags, [false, true]);
+    }
+
+    /// A child silent past the floor stops holding the turn even while a
+    /// sibling keeps sending traffic.
+    #[tokio::test]
+    async fn a_silent_child_stops_holding_the_turn_whatever_its_siblings_send() {
+        let (_ingress, shared, _events) = harness();
+        let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        let now = now_ms();
+        let child = |id: &str, state| SubagentRecord {
+            session_id: id.into(),
+            parent_session_id: "root".into(),
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state,
+            stop_reason: None,
+            error: None,
+            cancel_capable: true,
+            model: None,
+            background: false,
+        };
+        for (id, state, seen) in [
+            ("stale", SubagentState::Running, now - floor - 1),
+            ("sibling", SubagentState::Idle, now),
+        ] {
+            shared
+                .subagents
+                .lock()
+                .unwrap()
+                .insert(id.into(), child(id, state));
+            shared.subagent_seen.lock().unwrap().insert(id.into(), seen);
+        }
+        assert!(!shared.subagent_working(now));
+        shared
+            .subagent_seen
+            .lock()
+            .unwrap()
+            .insert("stale".into(), now);
+        assert!(shared.subagent_working(now));
     }
 
     /// A child's tool calls nest under the Agent card that spawned it, while

@@ -96,6 +96,8 @@ pub(super) struct Shared {
     pub(super) background_reports: std::sync::Mutex<HashMap<String, BackgroundReport>>,
     /// Epoch-ms of the last validated child traffic.
     pub(super) subagent_activity_at: AtomicI64,
+    /// Epoch-ms of each child's own last validated traffic.
+    pub(super) subagent_seen: std::sync::Mutex<HashMap<String, i64>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
@@ -152,6 +154,7 @@ impl Shared {
             subagents: Default::default(),
             background_reports: Default::default(),
             subagent_activity_at: AtomicI64::new(0),
+            subagent_seen: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
