@@ -3435,7 +3435,9 @@ fn retained_serve_takeover_owns_keyboard_and_mouse_without_consuming_other_draft
         find(&form, "retained-serve-form");
         env.view.diff_view = retained_diff;
         env.view.pending_paste = Some("retained-serve-paste".into());
-        env.view.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        env.view.serve_view = Some(crate::tui::dialogs::ServeView::new(
+            &mut env.view.serve_jobs,
+        ));
         let foreground = draw(120, 42, |frame, theme| {
             env.view
                 .render(frame, frame.area(), theme, None, None, None)

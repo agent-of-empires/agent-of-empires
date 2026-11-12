@@ -25,7 +25,7 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
     assert!(!env.view.wants_text_selection());
 
     use crate::tui::dialogs::ServeView;
-    env.view.serve_view = Some(ServeView::new());
+    env.view.serve_view = Some(ServeView::new(&mut env.view.serve_jobs));
     assert!(env.view.wants_text_selection());
     env.view.serve_view = None;
     assert!(!env.view.wants_text_selection());
