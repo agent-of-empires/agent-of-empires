@@ -167,7 +167,7 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
         title: None,
         args_preview: Some(args.into()),
         prompt: prompt.map(str::to_owned),
-        started_at: None,
+        started_at: Some(at()),
         diffs: None,
     };
     let events = vec![
