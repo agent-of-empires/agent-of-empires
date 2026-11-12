@@ -46,6 +46,10 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_with(Vec::new(), false)
+}
+
+fn fixture_with(prior: Vec<crate::session::Instance>, cityhall: bool) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
     let env = crate::session::test_support::EnvGuard::set(&[
         ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
@@ -90,13 +94,16 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let state = crate::server::test_support::build_test_app_state_with_policy_configured(
-        Vec::new(),
+        prior,
         vec!["localhost".into()],
         Vec::new(),
         None,
         {
             let host = host.clone();
-            move |state| state.plugin_host = Some(host)
+            move |state| {
+                state.plugin_host = Some(host);
+                state.cityhall_mode = cityhall;
+            }
         },
     );
     Fixture {
@@ -190,6 +197,28 @@ async fn snapshot_and_refresh() {
         let (status, _, body) = f.call(Method::POST, uri, json!({})).await;
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert_eq!(body, json!({ "ok": true, "notified": 0 }), "{uri}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cityhall_hides_terminal_sessions_from_started_session() {
+    let mut linked = crate::session::Instance::new("terminal", "/tmp/x");
+    linked.source_profile = "default".into();
+    linked.suggestion = Some(crate::session::SuggestionOrigin {
+        provider_id: PROVIDER.into(),
+        id: "a".into(),
+    });
+    for (cityhall, shown) in [(false, true), (true, false)] {
+        let f = fixture_with(vec![linked.clone()], cityhall);
+        f.seed_item("a", None, "42");
+        let (status, _, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["items"][0].get("started_session").is_some(),
+            shown,
+            "cityhall={cityhall}"
+        );
     }
 }
 

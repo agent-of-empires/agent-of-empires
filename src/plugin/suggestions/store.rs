@@ -342,8 +342,8 @@ pub(crate) fn snapshot(
 /// The oldest live Session of `profile` started from each item, as snapshot
 /// JSON keyed by `(provider_id, id)`. Trashed Sessions do not count; a tie
 /// on `created_at` goes to the smaller id.
-pub(crate) fn started_sessions(
-    instances: &[Instance],
+pub(crate) fn started_sessions<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
     profile: &str,
 ) -> HashMap<(String, String), Value> {
     let mut oldest: HashMap<(&str, &str), &Instance> = HashMap::new();
