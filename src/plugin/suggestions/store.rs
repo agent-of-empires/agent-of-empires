@@ -170,7 +170,7 @@ fn load_items(
     let rows: Vec<String> = conn
         .prepare(
             "SELECT item_json FROM suggestion_items
-             WHERE profile = ?1 AND provider_id = ?2 ORDER BY item_id",
+             WHERE profile = ?1 AND provider_id = ?2 ORDER BY position",
         )?
         .query_map(params![profile, provider.id], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
@@ -548,6 +548,27 @@ mod tests {
         assert_eq!(snap(&conn, "other")["items"], json!([]));
         assert!(set_dismissed(&conn, "p", &p, "a", false).unwrap());
         assert_eq!(snap(&conn, "p")["items"][0]["dismissed"], false);
+    }
+
+    #[test]
+    fn items_keep_the_published_order_and_a_reorder_keeps_dismissals() {
+        let conn = store();
+        let p = provider();
+        publish(
+            &conn,
+            "p",
+            &[item("urgent-42", "assigned"), item("backlog-1", "assigned")],
+        );
+        assert_eq!(ids(&snap(&conn, "p")), ["urgent-42", "backlog-1"]);
+        assert!(set_dismissed(&conn, "p", &p, "urgent-42", true).unwrap());
+        publish(
+            &conn,
+            "p",
+            &[item("backlog-1", "assigned"), item("urgent-42", "assigned")],
+        );
+        let snapshot = snap(&conn, "p");
+        assert_eq!(ids(&snapshot), ["backlog-1", "urgent-42"]);
+        assert_eq!(snapshot["items"][1]["dismissed"], true);
     }
 
     #[test]
