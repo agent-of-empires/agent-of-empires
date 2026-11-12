@@ -375,6 +375,15 @@ async fn home_visible_mouse_discard_restores_the_actual_theme_preview() {
         "the real theme edit must apply its live preview"
     );
     assert!(app.home.settings_view.as_ref().unwrap().has_changes);
+    // Esc leaves field focus first; only Esc from categories requests dirty-settings consent.
+    app.handle_key(key(KeyCode::Esc), &mut terminal)
+        .await
+        .unwrap();
+    assert_eq!(
+        app.home.settings_view.as_ref().unwrap().focus,
+        SettingsFocus::Categories
+    );
+    assert!(app.home.settings_view.as_ref().unwrap().has_changes);
     app.handle_key(key(KeyCode::Esc), &mut terminal)
         .await
         .unwrap();
