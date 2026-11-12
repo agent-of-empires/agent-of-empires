@@ -3464,8 +3464,9 @@ export interface SetupStatus {
 }
 
 export type SetupPatch = Partial<{
-  skipped_steps: SetupStepKey[];
-  confirmed_steps: SetupStepKey[];
+  skip_step: SetupStepKey;
+  confirm_step: SetupStepKey;
+  unskip_step: SetupStepKey;
   finished: boolean;
   deferred: boolean;
   banner_dismissed: boolean;

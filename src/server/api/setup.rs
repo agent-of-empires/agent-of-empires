@@ -139,19 +139,13 @@ fn known_steps(stored: &[String]) -> Vec<&'static str> {
         .collect()
 }
 
-/// Validate a client-sent set of optional steps and return it in catalog order.
-fn canonical_optional_steps(requested: &[String]) -> Result<Vec<String>, String> {
-    for key in requested {
-        match STEPS.iter().find(|(step, _)| step == key) {
-            None => return Err(format!("unknown setup step '{key}'")),
-            Some((_, true)) => return Err(format!("setup step '{key}' is required")),
-            Some(_) => {}
-        }
+/// Validate a client-sent optional step key.
+fn optional_step(key: &str) -> Result<String, String> {
+    match STEPS.iter().find(|(step, _)| *step == key) {
+        None => Err(format!("unknown setup step '{key}'")),
+        Some((_, true)) => Err(format!("setup step '{key}' is required")),
+        Some(_) => Ok(key.to_string()),
     }
-    Ok(known_steps(requested)
-        .into_iter()
-        .map(str::to_string)
-        .collect())
 }
 
 /// The first required step that isn't set up, which blocks finishing.
@@ -241,8 +235,9 @@ pub async fn get_setup(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 #[derive(Deserialize)]
 pub struct SetupPatch {
-    skipped_steps: Option<Vec<String>>,
-    confirmed_steps: Option<Vec<String>>,
+    skip_step: Option<String>,
+    confirm_step: Option<String>,
+    unskip_step: Option<String>,
     finished: Option<bool>,
     deferred: Option<bool>,
     banner_dismissed: Option<bool>,
@@ -264,14 +259,15 @@ pub async fn patch_setup(
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", e.body_text());
         }
     };
-    let canonical =
-        |steps: &Option<Vec<String>>| steps.as_deref().map(canonical_optional_steps).transpose();
-    let (skipped, confirmed) = match (
-        canonical(&patch.skipped_steps),
-        canonical(&patch.confirmed_steps),
+    // Per-step deltas, so concurrent writers compose inside `update_app_state`.
+    let validate = |key: &Option<String>| key.as_deref().map(optional_step).transpose();
+    let (skip, confirm, unskip) = match (
+        validate(&patch.skip_step),
+        validate(&patch.confirm_step),
+        validate(&patch.unskip_step),
     ) {
-        (Ok(skipped), Ok(confirmed)) => (skipped, confirmed),
-        (Err(message), _) | (_, Err(message)) => {
+        (Ok(skip), Ok(confirm), Ok(unskip)) => (skip, confirm, unskip),
+        (Err(message), _, _) | (_, Err(message), _) | (_, _, Err(message)) => {
             return api_error(StatusCode::BAD_REQUEST, "validation_failed", message)
         }
     };
@@ -284,15 +280,20 @@ pub async fn patch_setup(
             }
         }
         crate::session::update_app_state(|app| {
-            if let Some(skipped) = skipped {
-                // A skipped step is no longer a confirmed one.
-                app.setup_confirmed_steps.retain(|k| !skipped.contains(k));
-                app.setup_skipped_steps = skipped;
+            if let Some(key) = unskip {
+                app.setup_skipped_steps.retain(|k| *k != key);
             }
-            if let Some(confirmed) = confirmed {
-                // A confirmed step is no longer a skipped one.
-                app.setup_skipped_steps.retain(|k| !confirmed.contains(k));
-                app.setup_confirmed_steps = confirmed;
+            if let Some(key) = skip {
+                app.setup_confirmed_steps.retain(|k| *k != key);
+                if !app.setup_skipped_steps.contains(&key) {
+                    app.setup_skipped_steps.push(key);
+                }
+            }
+            if let Some(key) = confirm {
+                app.setup_skipped_steps.retain(|k| *k != key);
+                if !app.setup_confirmed_steps.contains(&key) {
+                    app.setup_confirmed_steps.push(key);
+                }
             }
             // Finishing is one-way; revisiting /setup doesn't reopen the redirect.
             app.setup_finished |= patch.finished.unwrap_or(false);
@@ -430,14 +431,10 @@ mod tests {
     }
 
     #[test]
-    fn skips_are_validated_and_canonical() {
-        let strings = |keys: &[&str]| keys.iter().map(|k| k.to_string()).collect::<Vec<_>>();
-        assert_eq!(
-            canonical_optional_steps(&strings(&["sandbox", "project", "sandbox"])),
-            Ok(strings(&["project", "sandbox"]))
-        );
+    fn step_keys_are_validated() {
+        assert_eq!(optional_step("sandbox"), Ok("sandbox".to_string()));
         for bad in ["agents", "Sandbox", "", "bogus"] {
-            assert!(canonical_optional_steps(&strings(&[bad])).is_err(), "{bad}");
+            assert!(optional_step(bad).is_err(), "{bad}");
         }
     }
 
@@ -473,7 +470,7 @@ mod tests {
             }
         };
         let status = send(serde_json::json!({
-            "skipped_steps": ["sandbox"],
+            "skip_step": "sandbox",
             "deferred": true,
             "banner_dismissed": true,
         }))
@@ -491,12 +488,12 @@ mod tests {
         assert!(AppStateConfig::load().unwrap().setup_finished);
 
         assert_eq!(
-            send(serde_json::json!({ "skipped_steps": ["agents"] })).await,
+            send(serde_json::json!({ "skip_step": "agents" })).await,
             StatusCode::BAD_REQUEST
         );
 
         assert_eq!(
-            send(serde_json::json!({ "confirmed_steps": ["sandbox"] })).await,
+            send(serde_json::json!({ "confirm_step": "sandbox" })).await,
             StatusCode::NO_CONTENT
         );
         let app = AppStateConfig::load().unwrap();
@@ -504,12 +501,24 @@ mod tests {
         assert!(app.setup_skipped_steps.is_empty());
 
         assert_eq!(
-            send(serde_json::json!({ "skipped_steps": ["sandbox"] })).await,
+            send(serde_json::json!({ "skip_step": "sandbox" })).await,
             StatusCode::NO_CONTENT
         );
         let app = AppStateConfig::load().unwrap();
         assert_eq!(app.setup_skipped_steps, ["sandbox"]);
         assert!(app.setup_confirmed_steps.is_empty());
+
+        // Deltas compose: skipping another step keeps the first skip.
+        for body in [
+            serde_json::json!({ "skip_step": "worktrees" }),
+            serde_json::json!({ "unskip_step": "sandbox" }),
+        ] {
+            assert_eq!(send(body).await, StatusCode::NO_CONTENT);
+        }
+        assert_eq!(
+            AppStateConfig::load().unwrap().setup_skipped_steps,
+            ["worktrees"]
+        );
     }
 
     #[test]

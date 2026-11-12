@@ -130,9 +130,9 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const markConfigured = useCallback(
     async (key: SetupStepKey) => {
       const next = await refresh();
-      const stillSkipped = next?.steps.filter((s) => s.skipped).map((s) => s.key) ?? [];
-      if (next?.steps.find((s) => s.key === key)?.configured && stillSkipped.includes(key)) {
-        await updateSetup({ skipped_steps: stillSkipped.filter((k) => k !== key) });
+      const current = next?.steps.find((s) => s.key === key);
+      if (current?.configured && current.skipped) {
+        await updateSetup({ unskip_step: key });
         await refresh();
       }
     },
@@ -142,8 +142,6 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const step = steps[index];
   if (!step) return null;
   const last = index === steps.length - 1;
-  const skippedKeys = steps.filter((s) => s.skipped).map((s) => s.key);
-  const confirmedKeys = steps.filter((s) => s.confirmed).map((s) => s.key);
 
   const saveField = async (section: string, field: string, value: unknown): Promise<boolean> => {
     const ok = await save({ [section]: { [field]: value } });
@@ -211,7 +209,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
         step.key !== "theme_telemetry" &&
         !current.steps.find((s) => s.key === step.key)?.configured
       ) {
-        const result = await updateSetup({ confirmed_steps: [...confirmedKeys, step.key] });
+        const result = await updateSetup({ confirm_step: step.key });
         if (!result.ok) {
           setError(result.message ?? "Couldn't save this step.");
           return;
@@ -224,7 +222,7 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
 
   const skip = () =>
     run(async () => {
-      const result = await updateSetup({ skipped_steps: [...skippedKeys, step.key] });
+      const result = await updateSetup({ skip_step: step.key });
       if (!result.ok) {
         setError(result.message ?? "Couldn't skip this step.");
         return;

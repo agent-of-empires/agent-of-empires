@@ -93,7 +93,7 @@ it("opens on the first open step and never offers Skip on the required Agents st
 it("Skip records the step and moves on", async () => {
   renderPage(status(["agents"]), "/setup?step=sandbox");
   fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
-  await waitFor(() => expect(patches).toEqual([{ skipped_steps: ["sandbox"] }]));
+  await waitFor(() => expect(patches).toEqual([{ skip_step: "sandbox" }]));
   expect(await screen.findByRole("heading", { name: "Notifications and access" })).toBeTruthy();
 });
 
@@ -110,7 +110,7 @@ it("Finish keeps the last step's defaults and marks setup finished once Agents i
   const { onLeave } = renderPage(status(["agents"]), "/setup?step=notifications");
   fireEvent.click(await enabled("Finish setup"));
   await waitFor(() => expect(onLeave).toHaveBeenCalled());
-  expect(patches).toEqual([{ confirmed_steps: ["notifications"] }, { finished: true }]);
+  expect(patches).toEqual([{ confirm_step: "notifications" }, { finished: true }]);
 });
 
 it("Go to dashboard defers setup so / stops redirecting", async () => {
@@ -120,31 +120,45 @@ it("Go to dashboard defers setup so / stops redirecting", async () => {
   expect(patches).toEqual([{ deferred: true }]);
 });
 
-it("keeps earlier skips and confirmations as later steps are saved", async () => {
-  let serverStatus = status(["agents"]);
+type StepDelta = { skip_step?: string; confirm_step?: string; unskip_step?: string };
+
+/** A mock `/api/setup` that applies step deltas like the Daemon; `hold` delays one PATCH before it applies. */
+function deltaServer(initial: SetupStatus) {
+  const state = { status: initial, saved: false, hold: undefined as ((body: StepDelta) => boolean) | undefined };
+  const release = { held: undefined as (() => void) | undefined };
   server.use(
     http.patch("*/api/setup", async ({ request }) => {
-      const body = (await request.json()) as { skipped_steps?: string[]; confirmed_steps?: string[] };
+      const body = (await request.json()) as StepDelta;
       patches.push(body);
-      serverStatus = {
-        ...serverStatus,
-        steps: serverStatus.steps.map((s) => {
-          const confirmed = body.confirmed_steps ? body.confirmed_steps.includes(s.key) : s.confirmed;
-          const skipped = body.skipped_steps ? body.skipped_steps.includes(s.key) : s.skipped && !confirmed;
-          return { ...s, confirmed, skipped, configured: s.key === "agents" || confirmed };
+      if (state.hold?.(body)) {
+        state.hold = undefined;
+        await new Promise<void>((resolve) => (release.held = resolve));
+      }
+      state.status = {
+        ...state.status,
+        steps: state.status.steps.map((s) => {
+          const confirmed = s.key === body.confirm_step || (s.confirmed && s.key !== body.skip_step);
+          const skipped =
+            s.key === body.skip_step || (s.skipped && s.key !== body.confirm_step && s.key !== body.unskip_step);
+          return { ...s, confirmed, skipped, configured: s.configured || confirmed };
         }),
       };
       return new HttpResponse(null, { status: 204 });
     }),
   );
   function Harness() {
-    const [current, setCurrent] = useState(serverStatus);
+    const [current, setCurrent] = useState(state.status);
     const refresh = async () => {
-      setCurrent(serverStatus);
-      return serverStatus;
+      setCurrent(state.status);
+      return state.status;
     };
     return <SetupWizardPage status={current} about={null} profile="" refresh={refresh} onLeave={() => {}} />;
   }
+  return { state, release, Harness };
+}
+
+it("keeps earlier skips and confirmations as later steps are saved", async () => {
+  const { state, Harness } = deltaServer(status(["agents"]));
   render(
     <MemoryRouter initialEntries={["/setup?step=project"]}>
       <Harness />
@@ -156,11 +170,45 @@ it("keeps earlier skips and confirmations as later steps are saved", async () =>
   await screen.findByRole("heading", { name: "Sandbox" });
   fireEvent.click(await enabled("Next"));
   await screen.findByRole("heading", { name: "Notifications and access" });
-  expect(patches).toEqual([
-    { confirmed_steps: ["project"] },
-    { skipped_steps: ["worktrees"] },
-    { confirmed_steps: ["project", "sandbox"] },
-  ]);
+  expect(patches).toEqual([{ confirm_step: "project" }, { skip_step: "worktrees" }, { confirm_step: "sandbox" }]);
+  const flags = (key: SetupStepKey) => state.status.steps.find((s) => s.key === key);
+  expect(flags("project")?.confirmed && flags("sandbox")?.confirmed && flags("worktrees")?.skipped).toBe(true);
+});
+
+it("a late un-skip from a save doesn't erase a skip made on another step meanwhile", async () => {
+  const initial = status(["agents"]);
+  initial.steps = initial.steps.map((s) => (s.key === "worktrees" ? { ...s, skipped: true } : s));
+  const { state, release, Harness } = deltaServer(initial);
+  server.use(
+    http.get("*/api/settings/schema", () => HttpResponse.json([FIELD])),
+    http.patch("*/api/settings", () => {
+      state.status = {
+        ...state.status,
+        steps: state.status.steps.map((s) => (s.key === "worktrees" ? { ...s, configured: true } : s)),
+      };
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  state.hold = (body) => Object.keys(body).length > 0 && body.skip_step === undefined;
+  render(
+    <MemoryRouter initialEntries={["/setup?step=worktrees"]}>
+      <Harness />
+    </MemoryRouter>,
+  );
+  fireEvent.click(await screen.findByRole("switch"));
+  await waitFor(() => expect(release.held).toBeDefined());
+
+  fireEvent.click(screen.getAllByRole("button", { name: /Sandbox/ })[0]!);
+  await screen.findByRole("heading", { name: "Sandbox" });
+  fireEvent.click(screen.getByRole("button", { name: "Skip for now" }));
+  await screen.findByRole("heading", { name: "Notifications and access" });
+  await act(async () => release.held!());
+
+  await waitFor(() => expect(patches).toHaveLength(2));
+  await waitFor(() => {
+    const skipped = state.status.steps.filter((s) => s.skipped).map((s) => s.key);
+    expect(skipped).toEqual(["sandbox"]);
+  });
 });
 
 it("stays on the step and reports it when keeping the defaults fails to save", async () => {
