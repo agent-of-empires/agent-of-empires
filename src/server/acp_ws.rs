@@ -812,6 +812,7 @@ mod tests {
                 stop_reason: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             },
             at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };

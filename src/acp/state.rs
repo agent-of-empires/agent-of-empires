@@ -513,6 +513,9 @@ pub struct SubagentRecord {
     /// Read-only: the child's own model selector, never set by aoe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Launched in the background: its card stays open until it goes idle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
 }
 
 /// One tool call a background sub-agent made, parsed from its transcript.
@@ -2509,6 +2512,7 @@ mod tests {
                 stop_reason: stop_reason.map(str::to_owned),
                 cancel_capable: true,
                 model: None,
+                background: false,
             },
             at: Utc::now(),
         }

@@ -1,6 +1,7 @@
 //! Turn state shared between the notification handler and the command loop,
 //! and the `session/update` handler itself.
 
+use super::subagents::BackgroundReport;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
 use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
@@ -90,6 +91,9 @@ pub(super) struct Shared {
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
+    /// Background children whose card waits for their final answer; see
+    /// `subagents.rs`.
+    pub(super) background_reports: std::sync::Mutex<HashMap<String, BackgroundReport>>,
     /// Epoch-ms of the last validated child traffic.
     pub(super) subagent_activity_at: AtomicI64,
     bg_transcript_source: TranscriptSource,
@@ -146,6 +150,7 @@ impl Shared {
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
+            background_reports: Default::default(),
             subagent_activity_at: AtomicI64::new(0),
             bg_transcript_source,
             bg_tasks: Arc::default(),

@@ -8,6 +8,7 @@ use agent_client_protocol::v1::schema::{
 
 use super::notifications::Shared;
 use crate::acp::acp_client::config_options::map_acp_config_option;
+use crate::acp::acp_client::lifecycle::ASYNC_AGENT_LAUNCHED;
 use crate::acp::acp_client::tool_context::update_tool_context_cache;
 use crate::acp::acp_client::tool_output::preview_args;
 use crate::acp::acp_client::update_events::map_update_to_events;
@@ -16,6 +17,15 @@ use crate::acp::state::{
     ConfigOptionCategory, Event, SubagentRecord, SubagentState, ToolCall, ToolOutputBlock,
 };
 use std::sync::atomic::Ordering;
+
+/// A background child's card, open until the child goes idle, and the text
+/// of its latest message: its answer once it ends.
+#[derive(Debug)]
+pub(super) struct BackgroundReport {
+    tool_call_id: String,
+    message_id: Option<String>,
+    text: String,
+}
 
 fn patch<T>(slot: &mut Option<T>, incoming: MaybeUndefined<T>) {
     match incoming {
@@ -91,6 +101,7 @@ impl Shared {
                     stop_reason: None,
                     cancel_capable: false,
                     model: None,
+                    background: false,
                 });
             record.cancel_capable = self
                 .ingress
@@ -130,7 +141,35 @@ impl Shared {
             apply_state(record, update.state);
         })
         .await;
+        self.finish_background_report(&child).await;
         true
+    }
+
+    /// An idle background child's answer completes its card. A cancelled or
+    /// orphaned one leaves it open for the turn's end to mark stopped.
+    async fn finish_background_report(&self, child: &SessionId) {
+        let stop_reason = {
+            let subagents = self.subagents.lock().expect("subagents mutex poisoned");
+            match subagents.get(child.0.as_ref()) {
+                Some(record) if record.state == SubagentState::Idle => record.stop_reason.clone(),
+                _ => return,
+            }
+        };
+        let Some(report) = self
+            .background_reports
+            .lock()
+            .expect("background reports mutex poisoned")
+            .remove(child.0.as_ref())
+        else {
+            return;
+        };
+        let is_error = match stop_reason.as_deref() {
+            Some("end_turn") => false,
+            Some("error") => true,
+            _ => return,
+        };
+        self.emit_card_completion(report.tool_call_id, report.text, is_error)
+            .await;
     }
 
     /// `session` is the session the message arrived on. The adapter hides the
@@ -167,7 +206,8 @@ impl Shared {
             self.start_delegation_card(&session, recipient, message.message_id.0.to_string(), text)
                 .await;
         } else if *recipient == session && child_of_session(sender) {
-            self.complete_delegation_card(sender, text).await;
+            self.complete_delegation_card(sender, &message.message_id.0, text)
+                .await;
         } else {
             return false;
         }
@@ -221,7 +261,7 @@ impl Shared {
         .await;
     }
 
-    async fn complete_delegation_card(&self, child: &SessionId, reply: String) {
+    async fn complete_delegation_card(&self, child: &SessionId, message_id: &str, reply: String) {
         let Some(tool_call_id) = self
             .subagents
             .lock()
@@ -231,9 +271,37 @@ impl Shared {
         else {
             return;
         };
+        // The adapter sends an async launch's acknowledgement as its reply
+        // when the Agent call lacks `run_in_background`.
+        let launch_notice = message_id == format!("{tool_call_id}:reply")
+            && reply
+                .lines()
+                .any(|line| line.trim_start().starts_with(ASYNC_AGENT_LAUNCHED));
+        if !launch_notice {
+            return self.emit_card_completion(tool_call_id, reply, false).await;
+        }
+        self.background_reports
+            .lock()
+            .expect("background reports mutex poisoned")
+            .insert(
+                child.0.to_string(),
+                BackgroundReport {
+                    tool_call_id,
+                    message_id: None,
+                    text: String::new(),
+                },
+            );
+        let parent = self.ingress.child_route(child).map(|route| route.parent);
+        if let Some(parent) = parent {
+            self.publish_subagent(&parent, child, |record| record.background = true)
+                .await;
+        }
+    }
+
+    async fn emit_card_completion(&self, tool_call_id: String, reply: String, is_error: bool) {
         self.emit(Event::ToolCallCompleted {
             tool_call_id,
-            is_error: false,
+            is_error,
             output: vec![ToolOutputBlock::Text {
                 text: reply.clone(),
             }],
@@ -251,7 +319,35 @@ impl Shared {
             SessionUpdate::SubagentUpdate(nested) => {
                 self.handle_subagent_update(child, nested).await;
             }
+            SessionUpdate::AgentMessageChunk(chunk) => {
+                let ContentBlock::Text(text) = chunk.content else {
+                    return;
+                };
+                let id = chunk.message_id.map(|id| id.0.to_string());
+                let mut reports = self
+                    .background_reports
+                    .lock()
+                    .expect("background reports mutex poisoned");
+                if let Some(report) = reports.get_mut(child.0.as_ref()) {
+                    if id.is_some() && id != report.message_id {
+                        report.message_id = id;
+                        report.text.clear();
+                    }
+                    report.text.push_str(&text.text);
+                }
+            }
             tool @ (SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_)) => {
+                // Prose before a tool call is not the child's answer.
+                if matches!(tool, SessionUpdate::ToolCall(_)) {
+                    if let Some(report) = self
+                        .background_reports
+                        .lock()
+                        .expect("background reports mutex poisoned")
+                        .get_mut(child.0.as_ref())
+                    {
+                        report.text.clear();
+                    }
+                }
                 let link = self
                     .subagents
                     .lock()
@@ -439,6 +535,90 @@ mod tests {
         assert_eq!(linked.title.as_deref(), Some("Explore"));
         assert!(linked.cancel_capable);
         assert_eq!(linked.state, SubagentState::Running);
+    }
+
+    /// A background launch's acknowledgement is not the child's answer: the
+    /// card stays open, marked background, and completes with the child's
+    /// last message once it ends. A cancelled child leaves it open (#5612).
+    #[tokio::test]
+    async fn background_launch_completes_with_the_childs_answer() {
+        let notice = "Async agent launched successfully. (internal metadata) agentId: a1";
+        let chunk = |id: &str, text: &str| {
+            serde_json::json!({
+                "sessionId": "child",
+                "update": { "sessionUpdate": "agent_message_chunk", "messageId": id,
+                            "content": { "type": "text", "text": text } },
+            })
+        };
+        for (stop, want) in [
+            ("end_turn", Some(false)),
+            ("error", Some(true)),
+            ("cancelled", None),
+        ] {
+            let (ingress, shared, events) = harness();
+            for frame in [
+                serde_json::to_value(announce("root", "running")).unwrap(),
+                delegation("tool-1", "child", "dig"),
+                to_parent("tool-1:reply", "child", notice),
+                chunk("m1", "Let me look."),
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                                "title": "Read", "kind": "read", "status": "pending" },
+                }),
+                chunk("m2", "The answer"),
+                chunk("m2", " is 42."),
+                serde_json::json!({
+                    "sessionId": "root",
+                    "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
+                                "state": { "state": "idle", "stopReason": stop } },
+                }),
+            ] {
+                feed(&ingress, &shared, frame).await;
+            }
+            let events = drain(shared, events).await;
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    Event::SubagentUpdated { subagent, .. } if subagent.background
+                )),
+                "{stop}: no background snapshot in {events:?}"
+            );
+            let completions: Vec<_> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ToolCallCompleted {
+                        tool_call_id,
+                        content,
+                        is_error,
+                        ..
+                    } if tool_call_id == "tool-1" => Some((content.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            match want {
+                Some(is_error) => {
+                    assert_eq!(completions, [("The answer is 42.", is_error)], "{stop}")
+                }
+                None => assert!(completions.is_empty(), "{stop}: {completions:?}"),
+            }
+        }
+
+        // Only the launch's own reply is an acknowledgement.
+        let (ingress, shared, events) = harness();
+        feed(
+            &ingress,
+            &shared,
+            serde_json::to_value(announce("root", "running")).unwrap(),
+        )
+        .await;
+        feed(&ingress, &shared, delegation("tool-1", "child", "dig")).await;
+        feed(&ingress, &shared, to_parent("handback-1", "child", notice)).await;
+        let events = drain(shared, events).await;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ToolCallCompleted { content, .. } if content == notice
+        )));
     }
 
     /// A foreground reply and a hand-back report both complete the card with

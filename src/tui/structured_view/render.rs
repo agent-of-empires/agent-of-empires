@@ -3150,6 +3150,7 @@ mod tests {
                 stop_reason: stop_reason.map(Into::into),
                 cancel_capable: true,
                 model: None,
+                background: false,
             }];
             let mut want: Vec<String> = head.into_iter().map(Into::into).collect();
             want.push("  tool ▶ · Read".into());
@@ -3188,6 +3189,7 @@ mod tests {
                 stop_reason: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             }];
             let lines = tool_lines(&t);
             assert_eq!(lines[0], head);

@@ -231,6 +231,9 @@ pub(super) async fn forward_lifecycle_signals(
     }
 }
 
+/// The SDK's acknowledgement of a background `Agent` launch.
+pub(super) const ASYNC_AGENT_LAUNCHED: &str = "Async agent launched successfully";
+
 /// Matches SDK markers only at line starts so echoed output does not extend
 /// watchdog grace.
 pub(super) fn detect_off_protocol_work_completed(
@@ -248,7 +251,7 @@ pub(super) fn detect_off_protocol_work_completed(
         .flat_map(str::lines)
         .find_map(|line| {
             let line = line.trim_start();
-            if line.starts_with("Async agent launched successfully") {
+            if line.starts_with(ASYNC_AGENT_LAUNCHED) {
                 Some(OffProtocolWorkKind::AsyncAgent)
             } else if line.starts_with("Command running in background with ID: ") {
                 Some(OffProtocolWorkKind::BackgroundCommand)
