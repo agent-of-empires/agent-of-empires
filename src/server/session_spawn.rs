@@ -114,6 +114,20 @@ pub(crate) struct ImageUpdateFailed {
     pub detail: String,
 }
 
+/// A CLI Terminal create with no `on_create` to run needs only an installed runtime; a pull needs it running.
+fn sandbox_readiness(
+    cli: bool,
+    view: crate::session::View,
+    on_create_runs: bool,
+    pull_latest_image: bool,
+) -> crate::session::builder::SandboxReadiness {
+    if cli && view == crate::session::View::Terminal && !on_create_runs && !pull_latest_image {
+        crate::session::builder::SandboxReadiness::InstalledOnly
+    } else {
+        crate::session::builder::SandboxReadiness::RequireRunning
+    }
+}
+
 /// Force-pulls `image` for a create that asked for the latest one; a cancel kills the pull.
 fn pull_latest(
     image: &str,
@@ -246,14 +260,12 @@ pub(crate) async fn spawn_structured_session(
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
 
-        let sandbox_readiness = if cli.is_some()
-            && view == crate::session::View::Terminal
-            && hook_plan.on_create().is_empty()
-        {
-            builder::SandboxReadiness::InstalledOnly
-        } else {
-            builder::SandboxReadiness::RequireRunning
-        };
+        let sandbox_readiness = sandbox_readiness(
+            cli.is_some(),
+            view,
+            !hook_plan.on_create().is_empty(),
+            pull_latest_image,
+        );
         let params = InstanceParams {
             title,
             title_typed,
@@ -1142,6 +1154,29 @@ pub(crate) async fn finish_structured_launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_cli_terminal_create_with_nothing_to_run_or_pull_skips_a_running_runtime() {
+        use crate::session::View::{Structured, Terminal};
+        // (cli, view, on_create runs, pull, installed only)
+        for case in [
+            (true, Terminal, false, false, true),
+            (true, Terminal, false, true, false),
+            (true, Terminal, true, false, false),
+            (true, Structured, false, false, false),
+            (false, Terminal, false, false, false),
+        ] {
+            let (cli, view, on_create_runs, pull, installed_only) = case;
+            assert_eq!(
+                matches!(
+                    sandbox_readiness(cli, view, on_create_runs, pull),
+                    crate::session::builder::SandboxReadiness::InstalledOnly
+                ),
+                installed_only,
+                "{case:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn spawn_guard_wait_yields_to_lease_cancellation() {
