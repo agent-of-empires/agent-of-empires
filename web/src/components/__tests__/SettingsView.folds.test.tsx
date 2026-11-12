@@ -45,6 +45,7 @@ const ROWS: Row[] = [
   ["systemd", "survive_daemon_restart", "Sessions survive daemon restart", { kind: "toggle" }, false],
   ["systemd", "memory_max", "Session memory limit", { kind: "optional_text" }, true, false, "memory_limit"],
   ["systemd", "tasks_max", "Session task limit", { kind: "number", min: 0 }, true],
+  ["serve", "port", "Daemon port", { kind: "number", min: 1, max: 65535 }, false],
   ["acp", "show_tool_durations", "Show tool-call durations", { kind: "toggle" }, false],
   ["acp", "rate_limit_auto_resume", "Auto-resume after rate limit", { kind: "toggle" }, false],
   ["acp", "replay_events", "History cap (events)", { kind: "number", min: 0 }, false],
@@ -148,6 +149,17 @@ function selectProfile(container: HTMLElement, name: string) {
 import { resetSettingsStore } from "../../lib/settingsStore";
 
 beforeEach(resetSettingsStore);
+
+describe("Settings daemon port", () => {
+  it("saves the serve port from the Updates tab", async () => {
+    const { container } = renderView("updates");
+    await screen.findByText("Daemon port");
+
+    commit(fieldInputByLabel(container, "Daemon port", "number"), "8090");
+
+    await waitFor(() => expect(vi.mocked(api.updateSettings)).toHaveBeenCalledWith({ serve: { port: 8090 } }, "main"));
+  });
+});
 
 describe("Settings Advanced fold", () => {
   beforeEach(() => {

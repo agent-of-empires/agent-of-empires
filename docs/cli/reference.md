@@ -1775,7 +1775,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 ###### **Options:**
 
 * `--core-only` — Serve the private local API without opening TCP or a dashboard
-* `--port <PORT>` — Port to listen on (default: 8080; debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
+* `--port <PORT>` — Port to listen on. Falls back to the `AOE_SERVE_PORT` environment variable, then `[serve] port` in config.toml, then 8080 (debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`

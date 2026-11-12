@@ -71,6 +71,9 @@ pub struct Config {
     pub web: WebConfig,
 
     #[serde(default)]
+    pub serve: ServeConfig,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -2655,6 +2658,41 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             persist_sessions: true,
+        }
+    }
+}
+
+/// Debug builds use 8081 so a `cargo run` daemon does not collide with an
+/// installed release `aoe` on 8080.
+pub(crate) const DEFAULT_SERVE_PORT: u16 = if cfg!(debug_assertions) { 8081 } else { 8080 };
+
+const fn default_serve_port() -> u16 {
+    DEFAULT_SERVE_PORT
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "serve", category = "Web")]
+pub struct ServeConfig {
+    /// TCP port for a newly started `aoe serve` daemon. `--port` and the
+    /// `AOE_SERVE_PORT` environment variable take precedence. A running daemon
+    /// keeps its recorded port across `--restart`.
+    #[serde(default = "default_serve_port")]
+    #[setting(
+        label = "Daemon port",
+        widget = "number",
+        min = 1,
+        max = 65535,
+        validate = "range:1:65535",
+        global_only,
+        summary = "Port for a newly started Daemon. A restart keeps the running Daemon's port."
+    )]
+    pub port: u16,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_SERVE_PORT,
         }
     }
 }
