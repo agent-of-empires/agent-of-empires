@@ -62,6 +62,7 @@ import { agentsView, initialData, reducer, type WizardData } from "./wizardReduc
 import { buildCreateRequest, launchEligible } from "./createRequest";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 import { profileDefaults, type ProfileDefaults } from "./profileDefaults";
+import { useSandboxImageRowStatus } from "./useSandboxImageRowStatus";
 
 // Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
@@ -164,6 +165,16 @@ function waitUntilVisible(): Promise<void> {
     };
     document.addEventListener("visibilitychange", onChange);
   });
+}
+
+/** The status stays whole and only the image truncates, so a narrow row still says whether to update. */
+function SandboxImageSummary({ status, image }: { status: string | null; image: string }) {
+  return (
+    <span className="flex min-w-0">
+      {status && <span className="shrink-0 whitespace-pre">{status} · </span>}
+      <span className="min-w-0 truncate">{image || "default image"}</span>
+    </span>
+  );
 }
 
 /** Worktree row summary: branch name, attach mode and base. */
@@ -878,6 +889,7 @@ export function SessionWizard({
     : !state.dockerAvailable
       ? `${state.dockerRuntimeName ?? "Container runtime"} is not running`
       : null;
+  const imageStatus = useSandboxImageRowStatus(d.sandboxImage, defaultsReady && d.sandboxEnabled && !sandboxBlocked);
   // Locked on without touching the stored value, so another agent gets it back.
   const alwaysYolo = (structuredOn ? selectedAgent?.acp_always_yolo : selectedAgent?.always_yolo) === true;
   const agentCustomized = !!(d.extraArgs || d.commandOverride || d.customInstruction);
@@ -1079,7 +1091,12 @@ export function SessionWizard({
           summary={
             <>
               {failed?.row === "sandbox" && <span className="text-status-error">{failed.cue} · </span>}
-              {sandboxBlocked ?? (d.sandboxEnabled ? d.sandboxImage || "default image" : "run on the host")}
+              {sandboxBlocked ??
+                (d.sandboxEnabled ? (
+                  <SandboxImageSummary status={imageStatus} image={d.sandboxImage} />
+                ) : (
+                  "run on the host"
+                ))}
             </>
           }
           onConfigure={!sandboxBlocked && d.sandboxEnabled ? openPanel("sandbox") : undefined}

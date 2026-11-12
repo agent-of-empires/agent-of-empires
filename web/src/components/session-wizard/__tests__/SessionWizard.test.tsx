@@ -15,6 +15,7 @@ import {
   fetchProfiles,
   fetchProjects,
   fetchRecentProjects,
+  fetchSandboxImageStatus,
   fetchSettings,
   fetchVolumeIgnoresPreview,
   type SettingsResponse,
@@ -44,6 +45,7 @@ vi.mock("../../../lib/api", () => ({
   fetchBranches: vi.fn().mockResolvedValue([]),
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" }),
+  fetchSandboxImageStatus: vi.fn().mockResolvedValue(null),
   fetchProfiles: vi.fn().mockResolvedValue([]),
   fetchVolumeIgnoresPreview: vi.fn().mockResolvedValue([]),
   markVolumeIgnoresGlobsAcknowledged: vi.fn().mockResolvedValue(undefined),
@@ -1529,6 +1531,34 @@ describe("SessionWizard Container runtime", () => {
     await launch();
     expect(await screen.findByText(`Sandbox unavailable: ${message}. Turn it off to launch.`)).toBeTruthy();
     expect(createSession).not.toHaveBeenCalled();
+  });
+});
+
+describe("SessionWizard Sandbox image status", () => {
+  afterEach(() => {
+    vi.mocked(fetchDockerStatus)
+      .mockReset()
+      .mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
+  });
+
+  it("leads the row with the status of the Profile's image, checked fresh on open", async () => {
+    vi.mocked(fetchDockerStatus).mockResolvedValue({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchSettings).mockResolvedValueOnce({
+      sandbox: { enabled_by_default: true, default_image: "ghcr.io/x/sb:1" },
+    } as never);
+    vi.mocked(fetchSandboxImageStatus).mockResolvedValueOnce({
+      image: "ghcr.io/x/sb:1",
+      state: "available",
+      remote_digest: "sha256:b",
+    } as never);
+    renderWizard();
+    const row = screen.getByTestId("wizard-sandbox-row");
+    await waitFor(() => expect(row.textContent).toContain("Update available · ghcr.io/x/sb:1"));
+    expect(vi.mocked(fetchSandboxImageStatus).mock.calls).toEqual([["ghcr.io/x/sb:1", { fresh: true }]]);
+
+    fireEvent.click(screen.getByRole("switch", { name: "Run in a safe container" }));
+    expect(row.textContent).toContain("run on the host");
+    expect(row.textContent).not.toContain("Update available");
   });
 });
 

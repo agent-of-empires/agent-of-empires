@@ -677,6 +677,37 @@ test.describe("View row", () => {
   });
 });
 
+test.describe("Sandbox row", () => {
+  test.describe("at 375px", () => {
+    test.use({ viewport: { width: 375, height: 812 } });
+
+    test("leads with the image's status, kept whole while only the image truncates", async ({ page }) => {
+      const image = "ghcr.io/example-org/a-long-sandbox-image-name-for-narrow-screens:2026.11.12";
+      const asked: string[] = [];
+      await page.route("**/api/sandbox/image-status**", (r) => {
+        asked.push(new URL(r.request().url()).search);
+        return r.fulfill({ json: { image, state: "available", remote_digest: "sha256:b" } });
+      });
+      await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true, default_image: image } },
+      });
+      await page.setViewportSize({ width: 375, height: 812 });
+      const row = wizard(page).getByTestId("wizard-sandbox-row");
+      const status = row.getByText("Update available ·");
+      await expect(status).toBeVisible();
+      // The banner polls the default image too; the wizard asks for its own, fresh.
+      expect(asked).toContain(`?${new URLSearchParams({ image, fresh: "true" })}`);
+      expect(await status.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      expect(await row.getByText(image).evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+      const overflow = await page.evaluate(
+        () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+      );
+      expect(overflow).toBeLessThanOrEqual(0);
+    });
+  });
+});
+
 test.describe("create failure", () => {
   for (const width of [1280, 375]) {
     test(`a refused create shows its step, reference and a relaunch without Sandbox at ${width}px`, async ({

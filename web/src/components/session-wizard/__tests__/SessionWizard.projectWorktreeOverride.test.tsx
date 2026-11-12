@@ -39,6 +39,7 @@ vi.mock("../../../lib/api", () => ({
   fetchProjects: (...args: unknown[]) => fetchProjects(...args),
   createSession: (...args: unknown[]) => createSession(...args),
   fetchDockerStatus: (...args: unknown[]) => fetchDockerStatus(...args),
+  fetchSandboxImageStatus: vi.fn().mockResolvedValue(null),
   fetchRecentProjects: (...args: unknown[]) => fetchRecentProjects(...args),
 }));
 
