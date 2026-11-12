@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { applyEvent, applyReducedState, emptyAcpState, nativeInputAvailable } from "../../../lib/acpTypes";
-import type { AcpState, Approval, Elicitation, IntegrationLostReason, ReducedState } from "../../../lib/acpTypes";
+import type { AcpEvent, AcpState, Approval, Elicitation, IntegrationLostReason, ReducedState } from "../../../lib/acpTypes";
 import { setServerDown } from "../../../lib/connectionState";
 import { clearAcpCache, useAcpSession } from "../../../hooks/useAcpSession";
 import {
@@ -16,10 +16,8 @@ import {
 } from "../../../hooks/__tests__/acpHarness";
 import { ApprovalCard } from "../ApprovalCard";
 import { AskUserQuestionCard } from "../AskUserQuestionCard";
-import { reducer } from "../../../hooks/acpSession/reducer";
-import { useReducer } from "react";
-import { applyEvent, emptyAcpState, type AcpEvent, nativeInputAvailable } from "../../../lib/acpTypes";
 import { reducer, type Action } from "../../../hooks/acpSession/reducer";
+import { useReducer } from "react";
 import { isNewSessionStarting } from "../startupWait";
 
 import {
