@@ -103,5 +103,14 @@ describe("SettingsView schema load", () => {
       expect(await screen.findByText("Show in sidebar")).toBeTruthy();
       expect(screen.queryByText("Loading settings...")).toBeNull();
     });
+
+    it("shows the schema failure and Retry beside the provider source settings", async () => {
+      vi.mocked(api.fetchSettings).mockResolvedValue({ worktree: {} });
+      vi.mocked(api.getSettingsSchema).mockResolvedValue(null);
+      renderView("suggestions");
+      expect(await screen.findByText("Show in sidebar")).toBeTruthy();
+      await waitFor(() => expect(screen.getByText("Failed to load settings schema.")).toBeTruthy());
+      expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    });
   });
 });
