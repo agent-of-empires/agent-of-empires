@@ -167,16 +167,26 @@ function waitUntilVisible(): Promise<void> {
   });
 }
 
-/** The status stays whole and only the image truncates, so a narrow row still says whether to update.
- *  Under 14rem of summary width (a phone, not the md+ modal) the status takes its own line. */
-function SandboxImageSummary({ status, image }: { status: string | null; image: string }) {
+/** Below these summary widths the lead (cue and status) leaves the image no room, so it takes its own line.
+ *  The longest lead is 159px without a cue and 260px with one, plus about 64px for the image. */
+const STACK_UNDER = {
+  status: { row: "@max-[14rem]:flex-col", lead: "@max-[14rem]:whitespace-normal", sep: "@max-[14rem]:hidden" },
+  cue: { row: "@max-[21rem]:flex-col", lead: "@max-[21rem]:whitespace-normal", sep: "@max-[21rem]:hidden" },
+};
+
+/** The failure cue and status stay whole and only the image truncates, so a narrow row still says what
+ *  went wrong and whether to update. Sized by the summary's width, not the viewport. */
+function SandboxImageSummary({ cue, status, image }: { cue: string | null; status: string | null; image: string }) {
+  const stack = cue ? STACK_UNDER.cue : STACK_UNDER.status;
   return (
     <span className="@container block min-w-0">
-      <span className="flex min-w-0 @max-[14rem]:flex-col">
-        {status && (
-          <span data-testid="sandbox-image-status" className="shrink-0 whitespace-pre @max-[14rem]:whitespace-normal">
+      <span className={`flex min-w-0 ${stack.row}`}>
+        {(cue || status) && (
+          <span data-testid="sandbox-image-status" className={`shrink-0 whitespace-pre ${stack.lead}`}>
+            {cue && <span className="text-status-error">{cue}</span>}
+            {cue && status && " · "}
             {status}
-            <span className="@max-[14rem]:hidden"> · </span>
+            <span className={stack.sep}> · </span>
           </span>
         )}
         <span className="min-w-0 truncate">{image || "default image"}</span>
@@ -892,6 +902,7 @@ export function SessionWizard({
       : isHostOnly
         ? hostOnlyReason
         : null;
+  const sandboxCue = failed?.row === "sandbox" ? failed.cue : null;
   const sandboxBlocked = isHostOnly
     ? hostOnlyReason
     : !state.dockerAvailable
@@ -1097,15 +1108,14 @@ export function SessionWizard({
           disabled={!!sandboxBlocked && !d.sandboxEnabled}
           highlight={failed?.row === "sandbox" ? "error" : undefined}
           summary={
-            <>
-              {failed?.row === "sandbox" && <span className="text-status-error">{failed.cue} · </span>}
-              {sandboxBlocked ??
-                (d.sandboxEnabled ? (
-                  <SandboxImageSummary status={imageStatus} image={d.sandboxImage} />
-                ) : (
-                  "run on the host"
-                ))}
-            </>
+            sandboxBlocked == null && d.sandboxEnabled ? (
+              <SandboxImageSummary cue={sandboxCue} status={imageStatus} image={d.sandboxImage} />
+            ) : (
+              <>
+                {sandboxCue && <span className="text-status-error">{sandboxCue} · </span>}
+                {sandboxBlocked ?? "run on the host"}
+              </>
+            )
           }
           onConfigure={!sandboxBlocked && d.sandboxEnabled ? openPanel("sandbox") : undefined}
         />

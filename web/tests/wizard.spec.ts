@@ -725,6 +725,52 @@ test.describe("Sandbox row", () => {
       });
     }
   });
+
+  // The longest cue and status together are wider than the md+ modal's 256px summary.
+  for (const width of [1280, 375]) {
+    test(`a pull failure's cue shares the status's line, with the image still shown, at ${width}px`, async ({
+      page,
+    }) => {
+      const image = "ghcr.io/example-org/a-long-sandbox-image-name-for-narrow-screens:2026.11.12";
+      await page.route("**/api/sandbox/image-status**", (r) =>
+        r.fulfill({ json: { image, state: "check_failed", error: "registry unreachable" } }),
+      );
+      await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+        r.fulfill({ json: { acknowledged: true, globs: [] } }),
+      );
+      await startWizard(page, {
+        docker: true,
+        settings: { sandbox: { enabled_by_default: true, default_image: image } },
+        onCreate: (_body, route) =>
+          route
+            .fulfill({
+              status: 400,
+              json: { error: "sandbox_image_pull_failed", message: "Pull refused.", stage: "pulling_image" },
+            })
+            .then(() => true),
+      });
+      await page.setViewportSize({ width, height: width < 768 ? 812 : 900 });
+      await launch(page);
+      const row = wizard(page).getByTestId("wizard-sandbox-row");
+      const cue = row.getByText("image pull failed");
+      await expect(cue).toBeVisible();
+      const status = row.getByTestId("sandbox-image-status");
+      await expect(status).toContainText("Couldn't check for updates");
+      expect((await cue.boundingBox())!.y).toBe((await status.boundingBox())!.y);
+      const fit = await status.evaluate((el) => {
+        let clip = el.parentElement;
+        while (clip && getComputedStyle(clip).overflowX === "visible") clip = clip.parentElement;
+        const c = clip!.getBoundingClientRect();
+        const inside = (r: DOMRect) =>
+          r.width > 0 && r.left >= c.left - 0.5 && r.right <= c.right + 0.5 && r.bottom <= c.bottom + 0.5;
+        return {
+          status: inside(el.getBoundingClientRect()),
+          image: inside(el.nextElementSibling!.getBoundingClientRect()),
+        };
+      });
+      expect(fit).toEqual({ status: true, image: true });
+    });
+  }
 });
 
 test.describe("create failure", () => {
