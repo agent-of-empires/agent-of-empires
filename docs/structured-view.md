@@ -204,9 +204,13 @@ The TUI command palette exposes Restore and Retry Trash using
 the same lifecycle-gated actions as the context menu. Opening Trash confirmation
 captures its runtime epoch; a daemon replacement invalidates the confirmation.
 Trash remains read-only without discarding untargeted pending composer paste.
-Web recovery lists unfinished members of mixed live/Trash workspaces separately.
-It never retries or restores a live sibling. Restore receipts keep their native
-revision so a late older Retry cannot replace the restored row.
+Web recovery is workspace-scoped. While any workspace member has unfinished
+Trash, Restore and Delete are hidden for the whole workspace, including settled
+Trash siblings; they return only when all pending members settle. Retry targets
+unfinished Trash members, never live siblings. This management-menu restriction
+is separate from passive web transcript opening.
+Restore receipts keep their native revision so a late older Retry cannot replace
+the restored row.
 
 If Retry cannot verify the checkout, keep the record in Trash and inspect its
 retained history read-only. There is no record-only removal action. A fresh
