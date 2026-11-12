@@ -2168,7 +2168,9 @@ mod tests {
             .err()
             .expect("a version mismatch must fail the attach");
         assert!(
-            error.to_string().contains("control protocol is incompatible"),
+            error
+                .to_string()
+                .contains("control protocol is incompatible"),
             "{error}"
         );
         match error {

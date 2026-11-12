@@ -11,8 +11,8 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
-use agent_of_empires::acp::control_protocol::CONTROL_PROTOCOL_VERSION;
 use agent_of_empires::acp::control_protocol;
+use agent_of_empires::acp::control_protocol::CONTROL_PROTOCOL_VERSION;
 use agent_of_empires::acp::state::AcpSessionId;
 
 /// App data dir for the debug binary under this test's env, mirroring the

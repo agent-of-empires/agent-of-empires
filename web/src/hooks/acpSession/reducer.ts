@@ -33,7 +33,9 @@ export type Action =
   | {
       kind: "reduced_state";
       state: ReducedState;
-      unchanged: string[]; seq?: number; }
+      unchanged: string[];
+      seq?: number;
+    }
   | { kind: "native_authority_pending" }
   | {
       kind: "frames";
@@ -74,7 +76,7 @@ export type Action =
       text: string;
       attachments?: PromptAttachmentInput[];
       preserveExisting?: boolean;
-  }
+    }
   | { kind: "dequeue_prompt"; id: string }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }

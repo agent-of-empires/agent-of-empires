@@ -1205,10 +1205,13 @@ mod tests {
             assert!(!admitted(&ingress, n).await);
         }
         let replay = ingress.finish(Some(root.clone())).unwrap();
-        let ids: Vec<_> = replay.iter().map(|entry| match entry {
-            PendingIngress::Update(notification) => notification.session_id.0.to_string(),
-            _ => panic!("child replay contains only session updates"),
-        }).collect();
+        let ids: Vec<_> = replay
+            .iter()
+            .map(|entry| match entry {
+                PendingIngress::Update(notification) => notification.session_id.0.to_string(),
+                _ => panic!("child replay contains only session updates"),
+            })
+            .collect();
         assert_eq!(ids, ["root", "c2", "c1"]);
         assert!(admitted(&ingress, notif("c1")).await);
         assert!(admitted(&ingress, notif("c2")).await);

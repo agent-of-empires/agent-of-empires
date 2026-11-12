@@ -1853,7 +1853,11 @@ export function applyReducedState(
     backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     workflowSnapshotKeys: reduced.workflow_runs?.map((run) => run.tool_call_id) ?? [],
-    subagents: mergeSubagents(state.subagents, reduced.subagents ?? [], snapshotSeq === undefined || snapshotSeq >= state.lastSeq),
+    subagents: mergeSubagents(
+      state.subagents,
+      reduced.subagents ?? [],
+      snapshotSeq === undefined || snapshotSeq >= state.lastSeq,
+    ),
     locallyResolved,
   };
   if (connectionReady) {

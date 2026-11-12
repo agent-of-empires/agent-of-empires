@@ -1017,7 +1017,7 @@ pub struct AcpState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integration_lost: Option<IntegrationLostReason>,
     /// Full snapshot of the adapter's per-session selectors.
-#[serde(default)]
+    #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
     /// Notice for the most recent rejected `session/set_config_option`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1331,11 +1331,11 @@ mod tests {
     }
 
     async fn durable_stop_state(row: crate::session::Instance) -> Arc<AppState> {
-    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-    let state = crate::server::test_support::build_test_app_state(vec![row]);
-    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
-    state
-}
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![row]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        state
+    }
 
     #[cfg(unix)]
     #[tokio::test]

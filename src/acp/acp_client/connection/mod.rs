@@ -47,7 +47,8 @@ use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
 use super::rate_limit::captured_rate_limit_resets_at;
 use super::session_identity::{
-    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress, SessionIngressNotification,
+    spawn_native_callback, PendingIngress, RequestPolicy, SessionIngress,
+    SessionIngressNotification,
 };
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
@@ -501,41 +502,41 @@ pub(super) async fn run_connection_task<W, R>(
                     async move {
                         let state = shared.connection_state.clone();
                         spawn_native_callback(&conn, &state, async move {
-                        let guard = match shared
-                            .ingress
-                            .request(&request.session_id, RequestPolicy::ParentOrChild)
-                            .await
-                        {
-                            Ok(guard) => guard,
-                            Err(error) => return reply(responder, Err(error)),
-                        };
-                        let _parked = shared.ingress.park();
-                        let session_id = request.session_id.clone();
-                        let outcome = handle_permission_request(
-                            request,
-                            shared.event_tx.clone(),
-                            pending,
-                            profile,
-                            shared.tool_context_cache.clone(),
-                            Some(guard),
-                        )
-                        .await;
-                        // The fence was released across the wait, so a reset
-                        // in between must not turn into an approval.
-                        let outcome = if shared
-                            .ingress
-                            .still_admitted(&session_id, RequestPolicy::ParentOrChild)
-                        {
-                            outcome
-                        } else {
-                            outcome.map(|_| {
-                                RequestPermissionResponse::new(
-                                    RequestPermissionOutcome::Cancelled,
-                                )
-                            })
-                        };
-                        reply(responder, outcome)
-                    })?;
+                            let guard = match shared
+                                .ingress
+                                .request(&request.session_id, RequestPolicy::ParentOrChild)
+                                .await
+                            {
+                                Ok(guard) => guard,
+                                Err(error) => return reply(responder, Err(error)),
+                            };
+                            let _parked = shared.ingress.park();
+                            let session_id = request.session_id.clone();
+                            let outcome = handle_permission_request(
+                                request,
+                                shared.event_tx.clone(),
+                                pending,
+                                profile,
+                                shared.tool_context_cache.clone(),
+                                Some(guard),
+                            )
+                            .await;
+                            // The fence was released across the wait, so a reset
+                            // in between must not turn into an approval.
+                            let outcome = if shared
+                                .ingress
+                                .still_admitted(&session_id, RequestPolicy::ParentOrChild)
+                            {
+                                outcome
+                            } else {
+                                outcome.map(|_| {
+                                    RequestPermissionResponse::new(
+                                        RequestPermissionOutcome::Cancelled,
+                                    )
+                                })
+                            };
+                            reply(responder, outcome)
+                        })?;
                         Ok(())
                     }
                 }
@@ -553,41 +554,43 @@ pub(super) async fn run_connection_task<W, R>(
                     async move {
                         let state = shared.connection_state.clone();
                         spawn_native_callback(&conn, &state, async move {
-                        // Only a session-scoped elicitation carries an identity
-                        // to fence on.
-                        let (session_id, guard) =
-                            if let ElicitationScope::Session(scope) = request.scope() {
-                                match shared
-                                    .ingress
-                                    .request(&scope.session_id, RequestPolicy::ParentOrChild)
-                                    .await
+                            // Only a session-scoped elicitation carries an identity
+                            // to fence on.
+                            let (session_id, guard) =
+                                if let ElicitationScope::Session(scope) = request.scope() {
+                                    match shared
+                                        .ingress
+                                        .request(&scope.session_id, RequestPolicy::ParentOrChild)
+                                        .await
+                                    {
+                                        Ok(guard) => (Some(scope.session_id.clone()), Some(guard)),
+                                        Err(error) => return reply(responder, Err(error)),
+                                    }
+                                } else {
+                                    (None, None)
+                                };
+                            let _parked = guard.as_ref().map(|_| shared.ingress.park());
+                            let outcome = handle_elicitation_request(
+                                request,
+                                shared.event_tx.clone(),
+                                pending,
+                                guard,
+                            )
+                            .await;
+                            let outcome = match session_id {
+                                Some(id)
+                                    if !shared
+                                        .ingress
+                                        .still_admitted(&id, RequestPolicy::ParentOrChild) =>
                                 {
-                                    Ok(guard) => (Some(scope.session_id.clone()), Some(guard)),
-                                    Err(error) => return reply(responder, Err(error)),
+                                    outcome.map(|_| {
+                                        CreateElicitationResponse::new(ElicitationAction::Cancel)
+                                    })
                                 }
-                            } else {
-                                (None, None)
+                                _ => outcome,
                             };
-                        let _parked = guard.as_ref().map(|_| shared.ingress.park());
-                        let outcome = handle_elicitation_request(
-                            request,
-                            shared.event_tx.clone(),
-                            pending,
-                            guard,
-                        ).await;
-                        let outcome = match session_id {
-                            Some(id)
-                                if !shared.ingress
-                                    .still_admitted(&id, RequestPolicy::ParentOrChild) =>
-                            {
-                                outcome.map(|_| {
-                                    CreateElicitationResponse::new(ElicitationAction::Cancel)
-                                })
-                            }
-                            _ => outcome,
-                        };
-                        reply(responder, outcome)
-                    })?;
+                            reply(responder, outcome)
+                        })?;
                         Ok(())
                     }
                 }

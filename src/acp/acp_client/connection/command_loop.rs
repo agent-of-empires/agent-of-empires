@@ -333,7 +333,6 @@ impl Session {
             .unwrap_or(false)
     }
 
-    
     async fn between_prompt_idle_tick(&self) {
         let shared = &self.shared;
         if shared.connection_state.loss().is_some() {

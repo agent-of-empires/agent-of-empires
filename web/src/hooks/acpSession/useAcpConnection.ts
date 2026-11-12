@@ -41,7 +41,8 @@ type ServerMessage =
   | { kind: "lagged"; skipped?: number }
   | { kind: "heartbeat" }
   | {
-      kind: "reduced_state"; seq?: number;
+      kind: "reduced_state";
+      seq?: number;
       state?: ReducedState;
       unchanged?: string[];
     }
@@ -295,15 +296,15 @@ export function useAcpConnection(
             state: reduced,
             unchanged,
             seq,
-          } = data as { seq?: number; state?: ReducedState;
-            unchanged?: string[];
-          };
+          } = data as { seq?: number; state?: ReducedState; unchanged?: string[] };
           if (!reduced) return;
           lastActivityRef.current = Date.now();
           dispatch({
             kind: "reduced_state",
             state: reduced,
-            unchanged: unchanged ?? [], seq, });
+            unchanged: unchanged ?? [],
+            seq,
+          });
           return;
         }
         case "transcript_snapshot": {
