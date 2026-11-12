@@ -53,6 +53,17 @@ describe("ToastProvider", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
+  it("keeps an action toast usable when its action returns false", () => {
+    renderProvider();
+    const reopen = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    act(() => toastBus.handler?.action("Session was not created", "Reopen", reopen));
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(screen.getByRole("alert").textContent).toContain("Session was not created");
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    expect(reopen).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("keeps an action toast past a plain toast's lifetime until it is dismissed", () => {
     renderProvider();
     act(() => {
