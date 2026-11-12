@@ -5557,6 +5557,17 @@ fn public_create_session_error_forwards_typed_causes_as_fixed_templates() {
             ),
         ),
         (
+            "latest image pull",
+            anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
+                image: "ghcr.io/acme/sandbox:1".into(),
+                detail: format!("denied: token {SECRET} at /root/.docker/config.json"),
+            }),
+            (
+                "sandbox_image_update_failed",
+                "Couldn't pull the latest Sandbox image ghcr.io/acme/sandbox:1.".into(),
+            ),
+        ),
+        (
             "working dir missing",
             BuildRefusal::WorkingDirMissing("/home/alice/secret-project".into()).into(),
             (
@@ -9849,6 +9860,111 @@ async fn post_create_raw(
         .unwrap();
     (status, code, serde_json::from_slice(&bytes).unwrap())
 }
+#[test]
+fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
+    let error = anyhow::Error::new(crate::server::session_spawn::ImageUpdateFailed {
+        image: "img:1".into(),
+        detail: "manifest unknown".into(),
+    });
+    let stage = crate::server::create_progress::CreateStage::PullingImage;
+    let public = create_failure(&error, stage, "ref").unwrap();
+    assert_eq!(
+        public.message,
+        "Couldn't pull the latest Sandbox image img:1."
+    );
+    for (local_owner, message) in [
+        (false, "Couldn't pull the latest Sandbox image img:1."),
+        (
+            true,
+            "Couldn't pull the latest Sandbox image img:1. manifest unknown",
+        ),
+    ] {
+        let shown = with_local_pull_detail(public.clone(), &error, local_owner);
+        assert_eq!(shown.message, message, "local_owner={local_owner}");
+        assert_eq!(
+            (shown.code, shown.stage),
+            ("sandbox_image_update_failed", stage)
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
+    use axum::http::StatusCode;
+    // None: the create gets past validation. CityHall strips the operator-owned Sandbox
+    // fields, the pull included.
+    for (label, sandbox, cityhall, allow_image_pull, expected) in [
+        (
+            "unsandboxed",
+            false,
+            false,
+            true,
+            Some((StatusCode::BAD_REQUEST, "validation_failed")),
+        ),
+        (
+            "pull gate off",
+            true,
+            false,
+            false,
+            Some((StatusCode::FORBIDDEN, "pull_disabled")),
+        ),
+        ("allowed", true, false, true, None),
+        ("cityhall", true, true, true, None),
+    ] {
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_config(|config| {
+            config.sandbox.allow_image_pull = allow_image_pull;
+        })
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        if cityhall {
+            crate::session::projects::add(
+                "default",
+                crate::session::ProjectScope::Global,
+                crate::session::Project::new(
+                    "cityhall",
+                    project.path().to_string_lossy(),
+                    crate::session::ProjectScope::Global,
+                ),
+                false,
+            )
+            .unwrap();
+        }
+        let state = crate::server::test_support::build_test_app_state_impl(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            cityhall,
+            |_| {},
+            |supervisor| supervisor,
+        );
+        let (got, body) = post_create(
+            &state,
+            serde_json::json!({
+                "title": "pull", "path": "", "tool": "claude", "scratch": true,
+                "view": "terminal", "sandbox": sandbox, "pull_latest_image": true,
+            }),
+        )
+        .await;
+        match expected {
+            Some((status, code)) => {
+                assert_eq!(
+                    (got, body["error"].as_str()),
+                    (status, Some(code)),
+                    "{label}: {body}"
+                );
+                assert!(state.instances.read().await.is_empty(), "{label}");
+            }
+            // Past validation: only a failure inside the spawn carries a stage.
+            None => assert!(
+                body.get("error").is_none() || body["stage"].is_string(),
+                "{label}: {got} {body}"
+            ),
+        }
+    }
+}
+
 #[tokio::test]
 async fn create_rejects_hook_env_without_sandbox() {
     let _home = crate::session::test_support::isolate_app_dir();

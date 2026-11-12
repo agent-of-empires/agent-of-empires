@@ -284,7 +284,7 @@ impl RuntimeBase {
         self.pull_until_cancelled(image, &CancellationToken::new())
     }
 
-    fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
+    pub fn pull_until_cancelled(&self, image: &str, cancel: &CancellationToken) -> Result<()> {
         let mut cmd = self.command();
         cmd.args(self.pull_prefix);
         cmd.arg(image);

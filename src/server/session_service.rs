@@ -549,6 +549,7 @@ impl SessionService {
                 cancelled: false,
             },
             published_at: std::time::Instant::now(),
+            cancel: tokio_util::sync::CancellationToken::new(),
         }));
         {
             let mut active = self
@@ -570,7 +571,8 @@ impl SessionService {
     }
 
     /// Refuse a cancellation the creation can no longer honor. Accepted
-    /// requests only mark the in-flight phase; the rollback still owns cleanup.
+    /// requests mark the in-flight phase and stop an image pull; the rollback
+    /// still owns cleanup.
     pub(crate) fn cancel_creation(&self, id: &str) -> bool {
         let entry = {
             let active = self
@@ -589,6 +591,7 @@ impl SessionService {
                 CreationLifecycle::Running | CreationLifecycle::Cancelled => {
                     entry.lifecycle = CreationLifecycle::Cancelled;
                     entry.progress.cancelled = true;
+                    entry.cancel.cancel();
                 }
             }
         }
@@ -2407,6 +2410,8 @@ struct CreationEntry {
     lifecycle: CreationLifecycle,
     progress: CreationProgress,
     published_at: std::time::Instant,
+    /// Fired by a cancel, for work that can stop early, such as an image pull.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2420,6 +2425,15 @@ pub(super) struct CreationGuard {
 }
 
 impl CreationGuard {
+    /// Fires when the creation is cancelled.
+    pub(super) fn cancellation(&self) -> tokio_util::sync::CancellationToken {
+        self.entry
+            .lock()
+            .expect("creation entry poisoned")
+            .cancel
+            .clone()
+    }
+
     pub(super) fn check(&self) -> Result<(), CreationCancelled> {
         if matches!(
             self.entry
@@ -2721,6 +2735,7 @@ mod tests {
             base_branch: None,
             sandbox: false,
             sandbox_image: None,
+            pull_latest_image: false,
             yolo_mode: false,
             extra_env: Vec::new(),
             before_start_hook_env: Vec::new(),

@@ -562,6 +562,7 @@ fn wizard_create_body(
         sandbox: data.sandbox,
         extra_args: data.extra_args.clone(),
         sandbox_image: (!data.sandbox_image.is_empty()).then(|| data.sandbox_image.clone()),
+        pull_latest_image: false,
         extra_env: data.extra_env.clone(),
         hook_env: data.hook_env.clone(),
         extra_repo_paths: data.extra_repo_paths.clone(),

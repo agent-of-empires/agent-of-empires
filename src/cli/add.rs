@@ -351,6 +351,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         base_branch: args.base_branch,
         sandbox,
         sandbox_image: args.sandbox_image,
+        pull_latest_image: false,
         extra_args: args.extra_args.unwrap_or_default(),
         extra_env: Vec::new(),
         hook_env: explicit_hook_env(&args.hook_env),

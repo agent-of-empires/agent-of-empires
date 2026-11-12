@@ -22,6 +22,8 @@ pub(crate) struct StructuredSessionSpec {
     pub base_branch: Option<String>,
     pub sandbox: bool,
     pub sandbox_image: Option<String>,
+    /// Force-pull the Sandbox image before the create hooks.
+    pub pull_latest_image: bool,
     pub yolo_mode: bool,
     pub extra_env: Vec<String>,
     /// Host-only env for `host_hooks.before_start`; never enters the container.
@@ -103,6 +105,41 @@ impl std::fmt::Display for SessionBuildPanicked {
 
 impl std::error::Error for SessionBuildPanicked {}
 
+/// A create's requested pull of the latest Sandbox image failed; `detail` is the
+/// runtime's sanitized stderr.
+#[derive(Debug, thiserror::Error)]
+#[error("Couldn't pull the latest Sandbox image {image}: {detail}")]
+pub(crate) struct ImageUpdateFailed {
+    pub image: String,
+    pub detail: String,
+}
+
+/// Force-pulls `image` for a create that asked for the latest one; a cancel kills the pull.
+fn pull_latest(
+    image: &str,
+    progress: Option<&crate::server::create_progress::CreateProgress>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    use crate::containers::error::DockerError;
+    if let Some(progress) = progress {
+        progress.set_stage(crate::server::create_progress::CreateStage::PullingImage);
+    }
+    let runtime = crate::containers::get_container_runtime();
+    match runtime.pull_image_until_cancelled(image, cancel) {
+        Ok(()) => {
+            crate::server::api::invalidate_sandbox_image_status(&runtime, image);
+            Ok(())
+        }
+        Err(DockerError::Cancelled(_)) => {
+            Err(crate::server::session_service::CreationCancelled.into())
+        }
+        Err(DockerError::ImagePullFailed { image, detail, .. }) => {
+            Err(ImageUpdateFailed { image, detail }.into())
+        }
+        Err(other) => Err(other.into()),
+    }
+}
+
 /// Build, persist, and register a session, spawning its ACP worker when the
 /// resolved view is structured. Returns the created instance and any build
 /// warnings; a build-time panic is surfaced as a [`SessionBuildPanicked`] error
@@ -140,6 +177,7 @@ pub(crate) async fn spawn_structured_session(
             base_branch,
             sandbox,
             sandbox_image,
+            pull_latest_image,
             yolo_mode,
             extra_env,
             before_start_hook_env,
@@ -626,6 +664,9 @@ pub(crate) async fn spawn_structured_session(
                 .map_err(anyhow::Error::from)
                 .and_then(|()| {
                     creation_guard.phase(CreationPhase::CreateHooks);
+                    if let Some(sandbox) = instance.sandbox_info.as_ref().filter(|_| pull_latest_image) {
+                        pull_latest(&sandbox.image, progress.as_deref(), &creation_guard.cancellation())?;
+                    }
                     if instance.sandbox_info.is_some() {
                         if let Some(progress) = progress.as_deref() {
                             progress.set_stage(
@@ -1171,6 +1212,7 @@ mod tests {
             base_branch: None,
             sandbox: false,
             sandbox_image: None,
+            pull_latest_image: false,
             yolo_mode: false,
             extra_env: Vec::new(),
             before_start_hook_env: Vec::new(),
@@ -1232,13 +1274,24 @@ mod tests {
     async fn sandboxed_cli_create_runs_on_create_and_rolls_back_only_itself() {
         use crate::session::{LifecycleOperation, LifecycleReservationError, Storage};
         use std::os::unix::fs::PermissionsExt;
-        for (label, hook, skip) in [
-            ("no hook", None, false),
-            ("hook", Some("echo created"), false),
-            ("slow hook", Some("echo slow"), false),
-            ("failing hook", Some("exit 7"), false),
-            ("failing hook created without setup", Some("exit 7"), true),
-            ("no hook created without setup", None, true),
+        // The fake runtime's answer to `pull`: None when the create asks for none.
+        for (label, hook, skip, pull) in [
+            ("no hook", None, false, None),
+            ("hook", Some("echo created"), false, None),
+            ("slow hook", Some("echo slow"), false, None),
+            ("failing hook", Some("exit 7"), false, None),
+            ("failing hook created without setup", Some("exit 7"), true, None),
+            ("no hook created without setup", None, true, None),
+            ("pull, then hook", Some("echo created"), false, Some("exit 0")),
+            ("pull, created without setup", Some("echo created"), true, Some("exit 0")),
+            ("pull without hooks", None, false, Some("exit 0")),
+            (
+                "failed pull",
+                Some("echo created"),
+                false,
+                Some("echo 'manifest unknown' >&2; exit 1"),
+            ),
+            ("cancelled pull", Some("echo created"), false, Some("block")),
         ] {
             let root = tempfile::tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
@@ -1262,9 +1315,19 @@ mod tests {
             let calls = root.path().join("calls");
             let started = root.path().join("hook-started");
             let release = root.path().join("hook-release");
+            let pulling = root.path().join("pull-pid");
+            let pull_answer = match pull {
+                Some("block") => format!(
+                    "echo $$ > '{}'; i=0; until [ $i -ge 1200 ]; do sleep 0.05; i=$((i+1)); done",
+                    pulling.display()
+                ),
+                Some(answer) => answer.to_string(),
+                None => "exit 0".to_string(),
+            };
             let script = format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
                  'image inspect'*) exit 0;;\n\
+                 pull\\ *) {pull_answer};;\n\
                  *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;;\n\
                  run\\ *|create\\ *) echo fake-id;;\n\
                  exec*'echo slow'*) touch '{started}'; i=0; \
@@ -1275,6 +1338,12 @@ mod tests {
                 started = started.display(),
                 release = release.display(),
             );
+            let runtime = crate::containers::get_container_runtime();
+            let invalidated = || {
+                crate::server::api::sandbox_image_status_generation_for_test(&runtime, "test-image")
+            };
+            let generation = invalidated();
+            let progress = Arc::new(crate::server::create_progress::CreateProgress::default());
             for runtime in ["docker", "podman", "container"] {
                 let path = bin.join(runtime);
                 std::fs::write(&path, &script).unwrap();
@@ -1330,6 +1399,7 @@ mod tests {
                 base_branch: None,
                 sandbox: true,
                 sandbox_image: Some("test-image".into()),
+                pull_latest_image: pull.is_some(),
                 yolo_mode: false,
                 extra_env: Vec::new(),
                 before_start_hook_env: Vec::new(),
@@ -1358,7 +1428,7 @@ mod tests {
                 import_acp_session_id: None,
                 import_binding: None,
                 fork_seed: None,
-                progress: None,
+                progress: Some(Arc::clone(&progress)),
                 cli: Some(crate::daemon::CliCreationOptions {
                     parent: None,
                     projects: Vec::new(),
@@ -1401,7 +1471,40 @@ mod tests {
                 );
                 std::fs::write(&release, "").unwrap();
             }
-            let result = create.await.unwrap();
+            let mut pull_pid = None;
+            if label == "cancelled pull" {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !pulling.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the pull never started"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                assert_eq!(
+                    progress.stage(),
+                    crate::server::create_progress::CreateStage::PullingImage
+                );
+                let id = Storage::open_unwatched(profile)
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.title == "hooked")
+                    .expect("the creation published its row before the pull")
+                    .id;
+                assert!(state.session_service.cancel_creation(&id));
+                pull_pid = Some(
+                    std::fs::read_to_string(&pulling)
+                        .unwrap()
+                        .trim()
+                        .to_string(),
+                );
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(30), create)
+                .await
+                .expect("a cancel stops the pull well before its own 60 s loop ends")
+                .unwrap();
             let log = std::fs::read_to_string(&calls).unwrap_or_default();
             let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
             for peer in &peers {
@@ -1420,12 +1523,58 @@ mod tests {
                 );
             }
             let branch = repo.find_branch("feature", git2::BranchType::Local);
-            if label == "failing hook" {
-                let error = format!("{:#}", result.expect_err("the hook failed"));
-                assert!(error.contains("on_create"), "{error}");
+            let pulled_at = log.lines().position(|line| line == "pull test-image");
+            let hooked_at = log.lines().position(|line| line.contains("bash -c echo"));
+            assert_eq!(pulled_at.is_some(), pull.is_some(), "{label}: {log}");
+            assert_eq!(
+                invalidated() - generation,
+                u64::from(pull == Some("exit 0")),
+                "{label}: only a successful pull invalidates the image status"
+            );
+            if matches!(label, "failing hook" | "failed pull" | "cancelled pull") {
+                let error = result.expect_err("the create failed");
+                match label {
+                    "failing hook" => {
+                        assert!(format!("{error:#}").contains("on_create"), "{error:#}")
+                    }
+                    "failed pull" => {
+                        let failed = error
+                            .downcast_ref::<ImageUpdateFailed>()
+                            .expect("typed pull failure");
+                        assert_eq!(
+                            (failed.image.as_str(), failed.detail.as_str()),
+                            ("test-image", "manifest unknown")
+                        );
+                    }
+                    _ => {
+                        assert!(
+                            error.is::<crate::server::session_service::CreationCancelled>(),
+                            "{error:#}"
+                        );
+                        let alive = std::process::Command::new("kill")
+                            .args(["-0", pull_pid.as_deref().unwrap()])
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .unwrap()
+                            .success();
+                        assert!(!alive, "the cancelled pull is still running");
+                    }
+                }
+                if label != "failing hook" {
+                    assert_eq!(
+                        hooked_at, None,
+                        "{label}: a hook ran after the pull failed: {log}"
+                    );
+                }
                 assert!(!rows.iter().any(|row| row.title == "hooked"), "{label}");
                 assert!(branch.is_err(), "{label}: the created branch was kept");
             } else {
+                if let (Some(pulled_at), Some(hooked_at)) = (pulled_at, hooked_at) {
+                    assert!(
+                        pulled_at < hooked_at,
+                        "{label}: the pull ran after the hook: {log}"
+                    );
+                }
                 result.unwrap_or_else(|error| panic!("{label}: {error:#}\n{log}"));
                 let created = rows.iter().find(|row| row.title == "hooked").expect(label);
                 assert_eq!(created.status, crate::session::Status::Stopped, "{label}");

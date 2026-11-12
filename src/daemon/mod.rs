@@ -296,6 +296,7 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "hook_failed"
             | "sandbox_unavailable"
             | "sandbox_image_pull_failed"
+            | "sandbox_image_update_failed"
             | "working_dir_missing"
             | "create_outcome_unknown"
             | "creation_cancelled"
