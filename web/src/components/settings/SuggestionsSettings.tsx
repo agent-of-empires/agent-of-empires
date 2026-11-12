@@ -210,10 +210,20 @@ export function SuggestionsSettings({
   };
   const patch = (p: SuggestionPrefsPatch) => act(() => updateSuggestionPrefs(p));
 
+  const retry = (
+    <button
+      type="button"
+      onClick={() => void reload()}
+      className="rounded-md border border-surface-700 px-2 py-0.5 text-xs text-text-secondary hover:bg-surface-800"
+    >
+      Retry
+    </button>
+  );
   if (!snapshot) {
     return (
-      <p role="status" className="py-10 text-center text-sm text-text-dim">
+      <p role="status" className="flex items-center justify-center gap-3 py-10 text-sm text-text-dim">
         {failed ? "Could not load suggestions." : "Loading suggestions…"}
+        {failed && retry}
       </p>
     );
   }
@@ -249,6 +259,15 @@ export function SuggestionsSettings({
 
   return (
     <div className="space-y-6" title={offline ? OFFLINE_TITLE : undefined}>
+      {failed && (
+        <div
+          role="alert"
+          className="flex items-center gap-3 rounded-md border border-status-error/40 bg-status-error/10 p-3 text-sm text-status-error"
+        >
+          Could not reload suggestions. The values below may be out of date.
+          {retry}
+        </div>
+      )}
       {notice && (
         <div
           role="alert"
