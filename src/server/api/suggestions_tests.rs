@@ -224,6 +224,21 @@ async fn cityhall_hides_terminal_sessions_from_started_session() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn an_unreadable_project_registry_is_reported_not_hidden() {
+    let f = fixture();
+    f.seed_item("a", None, "42");
+    std::fs::write(
+        crate::session::get_app_dir().unwrap().join("projects.json"),
+        "not json",
+    )
+    .unwrap();
+    let (status, code, body) = f.call(Method::GET, "/api/suggestions", Value::Null).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(code, "internal");
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn dismiss_and_undismiss() {
     let f = fixture();
     f.seed_item("a", None, "42");
