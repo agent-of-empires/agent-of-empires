@@ -188,7 +188,10 @@ describe("SuggestionsSettings", () => {
 
     fireEvent.change(field, { target: { value: "/aoe-review #" } });
     field.setSelectionRange(13, 13);
-    fireEvent.click(screen.getByRole("button", { name: "{pr-number}" }));
+    const variable = screen.getByRole("button", { name: "{pr-number}" });
+    // Without the mouse-down guard the textarea would blur and save before the variable is inserted.
+    expect(fireEvent.mouseDown(variable)).toBe(false);
+    fireEvent.click(variable);
     expect(field.value).toBe("/aoe-review #{pr-number}");
     expect(screen.getByText("Preview: /aoe-review #4562")).toBeTruthy();
 
