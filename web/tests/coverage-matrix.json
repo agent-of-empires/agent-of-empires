@@ -3726,6 +3726,20 @@
       ]
     },
     {
+      "id": "acp.custom-agent-reset-alias",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-session-history.spec.ts"],
+      "components": [
+        "src/acp/agent_profiles.rs",
+        "src/acp/supervisor/",
+        "src/server/api/sessions/list.rs",
+        "src/server/session_service.rs",
+        "src/session/config/mod.rs"
+      ],
+      "notes": "A custom ACP agent's `session.agent_clear_alias` drives the same fresh `session/new` as the Claude `/clear` and Codex `/new` stories, which this reuses. Rust tests cover what is specific to a custom agent: the queue drain keeps the reset as its own turn and leaves later rows queued (`the_queue_drain_keeps_a_custom_reset_as_its_own_turn`); the solo hold, drain, publication and session list use the agent the worker runs, else the one its next spawn picks (`a_custom_reset_is_classified_by_the_agent_the_session_runs`, `list_sessions_advertises_the_running_agents_reset_command`); publication keeps the classification the drain cut with (`a_carried_classification_decides_the_published_turn`); a built-in agent, including a registry agent without a profile, ignores its entry."
+    },
+    {
       "id": "acp.idle-dormant-wake",
       "kind": "vitest",
       "risk": "high",

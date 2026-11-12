@@ -4463,6 +4463,76 @@ async fn list_sessions_judges_custom_agent_capability_by_the_agent_name() {
     assert_eq!(capable, [("named-agent", true), ("tool-only", false)]);
 }
 
+/// The list advertises the solo commands of the agent that classifies the session's prompts:
+/// its worker's agent, else the one its next spawn picks.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_advertises_the_running_agents_reset_command() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("bridge".into(), "bridge acp".into());
+        c.session
+            .agent_clear_alias
+            .insert("bridge".into(), "/new".into());
+        c.session
+            .agent_acp_cmd
+            .insert("cursor".into(), "cursor-bridge acp".into());
+        c.session
+            .agent_clear_alias
+            .insert("cursor".into(), "/clear".into());
+    })
+    .unwrap();
+    let mk = |id: &str, tool: &str, structured: bool| {
+        let mut inst = Instance::new(id, &format!("/tmp/{id}"));
+        inst.id = id.to_string();
+        inst.tool = tool.to_string();
+        if structured {
+            inst.view = crate::session::View::Structured;
+        }
+        inst
+    };
+    let state = crate::server::test_support::build_test_app_state(vec![
+        mk("next-bridge", "bridge", true),
+        mk("runs-bridge", "claude", true),
+        mk("dead-bridge", "claude", true),
+        mk("claude", "claude", true),
+        mk("cursor", "cursor", true),
+        mk("terminal-bridge", "bridge", false),
+    ]);
+    let _live =
+        crate::acp::supervisor::test_support::save_agent_record("runs-bridge", "bridge", true);
+    crate::acp::supervisor::test_support::save_agent_record("dead-bridge", "bridge", false);
+
+    let advertised: Vec<_> = project_sessions(&state)
+        .await
+        .into_iter()
+        .map(|s| (s.id, s.clear_aliases, s.compact_aliases))
+        .collect();
+    let row = |id: &str, clear: &[&str], compact: &[&str]| {
+        (
+            id.to_string(),
+            clear.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            compact.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        advertised,
+        [
+            row("next-bridge", &["/new"], &[]),
+            row("runs-bridge", &["/new"], &[]),
+            row("dead-bridge", &["/clear"], &["/compact"]),
+            row("claude", &["/clear"], &["/compact"]),
+            row("cursor", &[], &[]),
+            row("terminal-bridge", &[], &[]),
+        ]
+    );
+    for id in ["runs-bridge", "dead-bridge"] {
+        crate::process::worker_registry::delete(id).ok();
+    }
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_state_filter() {
@@ -8157,6 +8227,21 @@ fn plan_summary_counts_done_and_picks_the_first_non_done_step() {
 #[serial_test::serial]
 async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> anyhow::Result<()> {
     let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|c| {
+        c.session
+            .agent_acp_cmd
+            .insert("bridge".into(), "bridge acp".into());
+    })?;
+    for (profile, alias) in [("rename-source", "/clear"), ("rename-target", "/new")] {
+        let dir = crate::session::get_app_dir()?
+            .join("profiles")
+            .join(profile);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[session.agent_clear_alias]\nbridge = \"{alias}\"\n"),
+        )?;
+    }
     let cases = [
         ("profile-move", Some("rename-target"), false),
         ("title-only", None, true),
@@ -8164,6 +8249,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
     for (id, profile, worker_survives) in cases {
         let mut inst = Instance::new("Before", &format!("/tmp/{id}"));
         inst.id = id.into();
+        inst.tool = "bridge".into();
         inst.source_profile = "rename-source".into();
         inst.status = Status::Idle;
         inst.view = crate::session::View::Structured;
@@ -8177,6 +8263,7 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
         state.acp_supervisor.test_insert_worker(id).await;
 
+        assert_eq!(project_sessions(&state).await[0].clear_aliases, ["/clear"]);
         let response = rename_session(
             State(state.clone()),
             Path(id.to_string()),
@@ -8195,6 +8282,35 @@ async fn rename_session_quiesces_structured_worker_only_on_profile_move() -> any
             worker_survives,
             "{id}"
         );
+        if profile.is_some() {
+            let commands = state
+                .acp_supervisor
+                .test_insert_worker_cmd_recording(id)
+                .await;
+            let _live = crate::acp::supervisor::test_support::save_agent_record(id, "bridge", true);
+            assert_eq!(project_sessions(&state).await[0].clear_aliases, ["/new"]);
+            state
+                .session_service
+                .send_turn(
+                    &crate::server::session_service::SessionCaller::User,
+                    id,
+                    crate::server::session_service::SendTurnRequest {
+                        resume_authority:
+                            crate::process::worker_registry::ResumeAuthority::Automatic,
+                        text: "/new",
+                        attachments: &[],
+                        woke_idle_dormant: false,
+                        prompt_ids: Vec::new(),
+                        synthesized: false,
+                        no_revive: false,
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            state.acp_supervisor.test_flush_worker_commands(id).await;
+            assert_eq!(*commands.lock().unwrap(), ["reset_session"]);
+            crate::process::worker_registry::delete(id)?;
+        }
     }
     Ok(())
 }

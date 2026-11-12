@@ -544,6 +544,7 @@ mod tests {
                     Vec::new(),
                     false,
                     None,
+                    None,
                 ));
                 published.seq == Some(1)
             }),

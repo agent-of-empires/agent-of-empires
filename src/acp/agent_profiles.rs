@@ -203,6 +203,51 @@ pub const AOE_AGENT: AgentProfile = AgentProfile {
     ..DEFAULT
 };
 
+/// True when `text` could be a declared reset command (`/clear` or `/new`). A prompt that is
+/// neither never needs the session configuration to be read to classify it.
+pub fn could_be_declared_alias(text: &str) -> bool {
+    matches_alias(&["/clear", "/new"], text)
+}
+
+/// True when `key` names a built-in agent: one in the agent registry or with its own profile.
+/// A built-in agent keeps its own reset command and ignores `session.agent_clear_alias`.
+pub fn is_builtin(key: &str) -> bool {
+    crate::agents::get_agent(key).is_some() || resolve(key).key != DEFAULT.key
+}
+
+/// A custom agent that resets with `/clear`, declared by `session.agent_clear_alias`.
+pub const CUSTOM_CLEAR: AgentProfile = AgentProfile {
+    key: "custom-clear",
+    clear_aliases: &["/clear"],
+    clear_requires_driven_reset: true,
+    ..DEFAULT
+};
+
+/// A custom agent that resets with `/new`, declared by `session.agent_clear_alias`.
+pub const CUSTOM_NEW: AgentProfile = AgentProfile {
+    key: "custom-new",
+    clear_aliases: &["/new"],
+    clear_requires_driven_reset: true,
+    ..DEFAULT
+};
+
+/// The profile a declared reset alias selects, or `None` for anything but `/clear` or `/new`.
+pub fn alias_profile(alias: &str) -> Option<&'static AgentProfile> {
+    match alias.trim() {
+        "/clear" => Some(&CUSTOM_CLEAR),
+        "/new" => Some(&CUSTOM_NEW),
+        _ => None,
+    }
+}
+
+/// [`resolve`], except that a custom agent takes the reset alias `session` declares for it.
+pub fn resolve_with_config(
+    key: &str,
+    session: &crate::session::config::SessionConfig,
+) -> &'static AgentProfile {
+    session.clear_alias_profile(key).unwrap_or(resolve(key))
+}
+
 /// Resolve a static profile by registry key.
 pub fn resolve(key: &str) -> &'static AgentProfile {
     match key {
@@ -258,6 +303,61 @@ mod tests {
                 "{} {text:?}",
                 profile.key
             );
+        }
+    }
+
+    #[test]
+    fn a_declared_alias_gives_a_custom_agent_a_reset_but_never_a_built_in() {
+        let mut session = crate::session::config::SessionConfig::default();
+        // `cursor` is a registry agent with no ACP profile of its own.
+        for (agent, alias) in [
+            ("my-claude", "/clear"),
+            ("my-codex", " /new "),
+            ("odd", "/compact"),
+            ("claude", "/new"),
+            ("cursor", "/clear"),
+        ] {
+            session.agent_clear_alias.insert(agent.into(), alias.into());
+            session
+                .agent_acp_cmd
+                .insert(agent.into(), format!("{agent}-bridge acp"));
+        }
+        // (agent, text, resets)
+        let cases = [
+            ("my-claude", "/clear", true),
+            ("my-claude", "/new", false),
+            ("my-codex", "/new", true),
+            ("my-codex", "/clear", false),
+            ("odd", "/compact", false),
+            ("unlisted", "/clear", false),
+            ("claude", "/clear", true),
+            ("claude", "/new", false),
+            ("cursor", "/clear", false),
+        ];
+        for (agent, text, resets) in cases {
+            let profile = resolve_with_config(agent, &session);
+            assert_eq!(
+                profile.is_clear_command(text) && profile.clear_requires_driven_reset,
+                resets,
+                "{agent} {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_clear_or_new_command_can_match_a_declared_alias() {
+        // (text, could match)
+        let cases = [
+            ("/clear", true),
+            ("  /new  ", true),
+            ("/clear --hard", true),
+            ("/compact", false),
+            ("clear the cache", false),
+            ("please /clear", false),
+            ("", false),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(could_be_declared_alias(text), expected, "{text:?}");
         }
     }
 

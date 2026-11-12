@@ -758,6 +758,7 @@ async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
         .acp_supervisor
         .test_insert_worker_cmd_recording(id)
         .await;
+    let _live = crate::acp::supervisor::test_support::save_agent_record(id, "claude", true);
     for (row, text) in [("q1", "first"), ("q2", "second")] {
         state
             .session_service
@@ -810,6 +811,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
             &[],
             Vec::new(),
             false,
+            None,
             None,
         )
         .await;
@@ -1429,6 +1431,7 @@ async fn send_now_behind_a_busy_agent_keeps_the_one_queued_row() {
             &[],
             Vec::new(),
             false,
+            None,
             None,
         )
         .await;

@@ -1492,6 +1492,21 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
+    /// Conversation-reset slash command for a custom ACP agent, `"/clear"` or
+    /// `"/new"` (e.g. "my-claude" = "/clear"). A custom agent has no built-in
+    /// profile, so without an entry its reset command reaches the model as an
+    /// ordinary prompt. With one, aoe drives a fresh `session/new` for it as it
+    /// does for a built-in agent. Applies only to an agent with its own `agent_acp_cmd`.
+    /// Repo-denied like `agent_acp_cmd`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Clear Alias",
+        widget = "list",
+        web = "local_only:declares which slash command resets a custom agent's conversation",
+        category = "Agents"
+    )]
+    pub agent_clear_alias: HashMap<String, String>,
+
     /// Config directory read by the session's agent instead of its built-in
     /// default. Host sessions use the directory directly. Sandboxed sessions
     /// use a per-session `sandbox-v2/<instance id>` child of it, which AoE
@@ -2250,6 +2265,7 @@ impl Default for SessionConfig {
             agent_detect_as: HashMap::new(),
             agent_execution_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
+            agent_clear_alias: HashMap::new(),
             agent_config_dir: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
@@ -2413,6 +2429,21 @@ impl SessionConfig {
         }
     }
 
+    /// The reset profile `agent_clear_alias` declares for `agent`. Only a custom agent launched
+    /// through its own valid `agent_acp_cmd` takes one; an agent inheriting a built-in adapter
+    /// through `agent_detect_as` runs as that built-in.
+    pub fn clear_alias_profile(
+        &self,
+        agent: &str,
+    ) -> Option<&'static crate::acp::agent_profiles::AgentProfile> {
+        if crate::acp::agent_profiles::is_builtin(agent) {
+            return None;
+        }
+        let cmd = self.agent_acp_cmd.get(agent)?;
+        crate::acp::AgentSpec::from_acp_cmd(agent, cmd).ok()?;
+        crate::acp::agent_profiles::alias_profile(self.agent_clear_alias.get(agent)?)
+    }
+
     /// Log warnings for misconfigured custom agent entries.
     /// Called after config load to surface TOML editing mistakes.
     pub fn warn_custom_agent_issues(&self) {
@@ -2448,6 +2479,24 @@ impl SessionConfig {
                     name,
                     target,
                     crate::agents::agent_names().join(", ")
+                );
+            }
+        }
+        for (name, alias) in &self.agent_clear_alias {
+            if name.is_empty() || crate::acp::agent_profiles::alias_profile(alias).is_none() {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' = '{}' is ignored; use an agent name and \"/clear\" or \"/new\"",
+                    name, alias
+                );
+            } else if crate::acp::agent_profiles::is_builtin(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' is a built-in agent with its own reset command; the entry is ignored",
+                    name
+                );
+            } else if !self.agent_acp_cmd.contains_key(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_clear_alias: '{}' has no agent_acp_cmd entry, so it runs as another agent; the entry is ignored",
+                    name
                 );
             }
         }
@@ -4395,6 +4444,39 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clear_alias_applies_only_to_a_custom_agent_with_its_own_acp_command() {
+        let mut config = SessionConfig::default();
+        // (agent, acp command)
+        let agents = [
+            ("own", Some("own-bridge acp")),
+            // Launched as its agent_detect_as base.
+            ("inherits", None),
+            ("empty", Some("")),
+            ("malformed", Some("bridge \"unterminated")),
+            // Built-in, in the registry without an ACP profile.
+            ("cursor", Some("cursor-bridge acp")),
+        ];
+        for (agent, cmd) in agents {
+            config
+                .agent_clear_alias
+                .insert(agent.into(), "/clear".into());
+            if let Some(cmd) = cmd {
+                config.agent_acp_cmd.insert(agent.into(), cmd.into());
+            }
+        }
+        config
+            .agent_detect_as
+            .insert("inherits".into(), "claude".into());
+        for (agent, _) in agents {
+            assert_eq!(
+                config.clear_alias_profile(agent).map(|p| p.key),
+                (agent == "own").then_some(crate::acp::agent_profiles::CUSTOM_CLEAR.key),
+                "{agent}"
+            );
+        }
+    }
 
     #[test]
     fn notice_policy_hides_by_display_severity_and_age() {

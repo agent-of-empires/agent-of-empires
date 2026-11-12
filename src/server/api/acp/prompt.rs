@@ -134,9 +134,9 @@ pub async fn acp_prompt(
         Err(PromptSubmitError::Turn(e)) => match e {
             SendTurnError::SessionNotFound => session_not_found(),
             SendTurnError::ResumeFailed(e) => resume_failed_response(&e),
-            SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
-                worker_not_ready()
-            }
+            SendTurnError::WorkerNotReady
+            | SendTurnError::AgentChanged
+            | SendTurnError::WorkerLostAfterPublish => worker_not_ready(),
             SendTurnError::RevivalRefused => no_revive_refused(),
             // Unreachable for a User caller.
             SendTurnError::NotOwner => {
