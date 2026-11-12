@@ -2948,7 +2948,11 @@ mod tests {
         let model_config = ConfigOptionCategory::Other("model_config".into());
         let mut acp = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         acp.config_options = vec![config_option(
-            "ultracode", "Ultracode", model_config, "off", &["on", "off"],
+            "ultracode",
+            "Ultracode",
+            model_config,
+            "off",
+            &["on", "off"],
         )];
         let frame = |acp: &AcpState, seq| {
             Ok(WsMessage::ReducedState {

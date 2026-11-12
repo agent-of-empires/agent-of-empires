@@ -649,7 +649,11 @@ mod tests {
                 "config_options".to_string(),
             ],
         );
-        assert_eq!(transcript.config_options.len(), 1, "config options survived");
+        assert_eq!(
+            transcript.config_options.len(),
+            1,
+            "config options survived"
+        );
         assert_eq!(transcript.available_commands.len(), 1, "commands survived");
         assert_eq!(transcript.available_modes.len(), 1, "modes survived");
 

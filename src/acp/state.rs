@@ -4658,7 +4658,12 @@ mod tests {
         assert_eq!(s.background_shells[0].command, "cmd a");
         assert!(!s.background_shells[0].finished);
 
-        s.apply_scoped_event(s.last_seq + 1, &finished("a"), &crate::acp::event_sender::EventMetadata::history()).unwrap();
+        s.apply_scoped_event(
+            s.last_seq + 1,
+            &finished("a"),
+            &crate::acp::event_sender::EventMetadata::history(),
+        )
+        .unwrap();
         assert!(s.background_tasks.iter().all(|task| task.task_id != "a"));
         assert!(
             s.background_shells[0].finished,
@@ -4667,8 +4672,18 @@ mod tests {
 
         for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 3 {
             let id = format!("t{i}");
-            s.apply_scoped_event(s.last_seq + 1, &started(&id, None), &crate::acp::event_sender::EventMetadata::history()).unwrap();
-            s.apply_scoped_event(s.last_seq + 1, &finished(&id), &crate::acp::event_sender::EventMetadata::history()).unwrap();
+            s.apply_scoped_event(
+                s.last_seq + 1,
+                &started(&id, None),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
+            s.apply_scoped_event(
+                s.last_seq + 1,
+                &finished(&id),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         }
         assert_eq!(s.background_shells.len(), MAX_FINISHED_BACKGROUND_SHELLS);
         assert_eq!(
@@ -5040,7 +5055,9 @@ mod tests {
             native_subject: None,
         };
         for (seq, event) in [lost, stopped].into_iter().enumerate() {
-            state.apply_scoped_event(seq as u64 + 1, &event, &current_session_metadata()).unwrap();
+            state
+                .apply_scoped_event(seq as u64 + 1, &event, &current_session_metadata())
+                .unwrap();
         }
         assert_eq!(state.sidebar_phase, SidebarPhase::Error);
         assert_eq!(
@@ -5049,10 +5066,18 @@ mod tests {
                 .get("integration_lost"),
             Some(&serde_json::json!({"kind": "hold_overflow"}))
         );
-        state.apply_scoped_event(3, &unqualified, &current_session_metadata()).unwrap();
+        state
+            .apply_scoped_event(3, &unqualified, &current_session_metadata())
+            .unwrap();
         assert!(state.integration_lost.is_some());
         assert_eq!(state.sidebar_phase, SidebarPhase::Error);
-        state.apply_scoped_event(4, &observed_channel_ready("s2"), &current_session_metadata()).unwrap();
+        state
+            .apply_scoped_event(
+                4,
+                &observed_channel_ready("s2"),
+                &current_session_metadata(),
+            )
+            .unwrap();
         assert!(state.integration_lost.is_none());
         assert_ne!(state.sidebar_phase, SidebarPhase::Error);
         assert_eq!(

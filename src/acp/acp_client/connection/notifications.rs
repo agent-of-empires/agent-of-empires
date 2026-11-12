@@ -1146,7 +1146,9 @@ mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{ContentChunk, TextContent};
 
-    fn echo_shared(prompt_in_flight: bool) -> (Shared, mpsc::Receiver<crate::acp::event_sender::SdkEvent>) {
+    fn echo_shared(
+        prompt_in_flight: bool,
+    ) -> (Shared, mpsc::Receiver<crate::acp::event_sender::SdkEvent>) {
         let (event_tx, event_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let shared = Shared::new(

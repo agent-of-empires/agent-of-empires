@@ -391,7 +391,11 @@ mod tests {
         })
     }
 
-    fn harness() -> (Arc<SessionIngress>, Shared, mpsc::Receiver<crate::acp::event_sender::SdkEvent>) {
+    fn harness() -> (
+        Arc<SessionIngress>,
+        Shared,
+        mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
+    ) {
         let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
         let (event_tx, events) = mpsc::channel(16);
         let (lifecycle_tx, _lifecycle) = mpsc::channel(16);
@@ -412,7 +416,10 @@ mod tests {
         (ingress, shared, events)
     }
 
-    async fn drain(shared: Shared, mut events: mpsc::Receiver<crate::acp::event_sender::SdkEvent>) -> Vec<Event> {
+    async fn drain(
+        shared: Shared,
+        mut events: mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
+    ) -> Vec<Event> {
         drop(shared);
         let mut all = Vec::new();
         while let Some(event) = events.recv().await {
@@ -573,12 +580,13 @@ mod tests {
     }
 
     async fn feed(ingress: &SessionIngress, shared: &Shared, value: serde_json::Value) {
-        let (update, wire_bytes) = crate::acp::acp_client::session_identity::SessionIngressNotification::decode_update(value, false).unwrap();
-        let update = ingress.capture_notification(update, false);
-        let admitted = ingress
-            .notification(update, wire_bytes)
-            .await
+        let (update, wire_bytes) =
+            crate::acp::acp_client::session_identity::SessionIngressNotification::decode_update(
+                value, false,
+            )
             .unwrap();
+        let update = ingress.capture_notification(update, false);
+        let admitted = ingress.notification(update, wire_bytes).await.unwrap();
         if let Some((notification, _guard)) = admitted {
             shared.handle_notification(notification, true).await;
         }

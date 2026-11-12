@@ -1848,7 +1848,11 @@ mod tests {
             synthesized: false,
             origin_plugin: None,
         };
-        let deltas = m.apply_scoped_event(9, &retry, &crate::acp::event_sender::EventMetadata::history());
+        let deltas = m.apply_scoped_event(
+            9,
+            &retry,
+            &crate::acp::event_sender::EventMetadata::history(),
+        );
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
         assert_eq!(m.rows().len(), 1);
 

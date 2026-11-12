@@ -1862,7 +1862,9 @@ mod tests {
 
         let mut state = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
         for stored in store.replay_from("s-1", 0).unwrap() {
-            state.apply_scoped_event(stored.seq, &stored.event, &stored.metadata).unwrap();
+            state
+                .apply_scoped_event(stored.seq, &stored.event, &stored.metadata)
+                .unwrap();
         }
         assert_eq!(state.background_shells.len(), 1);
         assert_eq!(state.background_shells[0].command, "make build");

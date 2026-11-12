@@ -276,7 +276,9 @@ pub(super) struct VecSink {
     pub(super) durable: ChannelSink,
     pub(super) completed: std::sync::Mutex<broadcast::Receiver<crate::server::AcpBroadcastFrame>>,
     pub(super) before_orphan_query: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    pub(super) wrap_worker: std::sync::Mutex<Option<Box<dyn FnOnce(super::WorkerPublication) -> super::WorkerPublication + Send>>>,
+    pub(super) wrap_worker: std::sync::Mutex<
+        Option<Box<dyn FnOnce(super::WorkerPublication) -> super::WorkerPublication + Send>>,
+    >,
     pub(super) worker_queued: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(super) before_replay: std::sync::Mutex<Option<Arc<dyn Fn(&Event) + Send + Sync>>>,
 }

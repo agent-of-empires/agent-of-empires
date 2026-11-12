@@ -2575,7 +2575,10 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
             if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
                 "{ready:?}"
             );
-            fake.event_rx.shutdown().await.expect("retire the exact incompatible Native fixture");
+            fake.event_rx
+                .shutdown()
+                .await
+                .expect("retire the exact incompatible Native fixture");
             fake.agent.abort();
 
             let (ready, mut fake) = spawn_fake_connection_raw(
@@ -2620,7 +2623,10 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
                 lost,
                 Some(IntegrationLostReason::ContractViolation { .. })
             ));
-            fake.event_rx.shutdown().await.expect("retire the exact primitive fixture");
+            fake.event_rx
+                .shutdown()
+                .await
+                .expect("retire the exact primitive fixture");
             fake.agent.abort();
         })
     })
