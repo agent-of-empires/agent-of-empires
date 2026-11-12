@@ -310,6 +310,21 @@ describe("SuggestionsSettings", () => {
     await waitFor(() => expect(select.disabled).toBe(false));
   });
 
+  it("keeps the mapping controls locked after a failed reload until Retry succeeds", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const select = (await screen.findByLabelText("Map github.com/o/r")) as HTMLSelectElement;
+    await waitFor(() => expect(select.disabled).toBe(false));
+    api.fetchSuggestionMappings.mockResolvedValueOnce(null);
+    fireEvent.change(select, { target: { value: "/p/aoe" } });
+    await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledTimes(1));
+    await screen.findByText(/Could not reload mappings/);
+    expect(select.disabled).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(select.disabled).toBe(false));
+    expect(screen.queryByText(/Could not reload mappings/)).toBeNull();
+  });
+
   it("opens straight on a focused template and returns to the suggestions view", async () => {
     const openFull = open({
       templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },

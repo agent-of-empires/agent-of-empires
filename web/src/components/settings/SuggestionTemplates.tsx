@@ -254,6 +254,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
   const [error, setError] = useState<string | null>(null);
   const [wizard, setWizard] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [mappingsStale, setMappingsStale] = useState(false);
   const mounted = useRef(true);
 
   const load = useCallback(async () => {
@@ -261,6 +262,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
     if (!mounted.current) return;
     if (t) setTemplates(t);
     if (m) setMappings(m);
+    setMappingsStale(!m);
     if (p) setProjects(p);
     const failed = [!t && "templates", !m && "mappings", !p && "Projects"].filter(Boolean);
     if (failed.length > 0) setError(`Could not load ${failed.join(", ")}.`);
@@ -276,7 +278,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
     };
   }, [load]);
 
-  // Mapping controls stay off until the reload lands: each edit is built from the rendered row.
+  // Mapping controls stay off until the reload lands, and while it has failed: each edit is built from the rendered row.
   const mutate = async (request: Promise<SuggestionResult<unknown>>) => {
     setError(null);
     setSaving(true);
@@ -338,9 +340,17 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
           items={snapshot.items}
           mappings={mappings}
           projects={projects}
-          disabled={disabled || saving}
+          disabled={disabled || saving || mappingsStale}
           onChange={mutate}
         />
+        {mappingsStale && (
+          <p className="mt-2 flex items-center gap-3 text-xs text-status-error">
+            Could not reload mappings.
+            <button type="button" className={GHOST} onClick={() => void load()}>
+              Retry
+            </button>
+          </p>
+        )}
       </section>
       {wizard && (
         <SuggestionMappingWizard
