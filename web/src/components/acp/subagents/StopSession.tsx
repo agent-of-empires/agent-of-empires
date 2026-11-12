@@ -3,6 +3,7 @@
 import { Square } from "lucide-react";
 import { useState } from "react";
 
+import { getLiveAcpActions, NATIVE_INPUT_UNCONFIRMED } from "../../../hooks/acpSession/stateCache";
 import { reportError } from "../../../lib/toastBus";
 
 export function StopSession({ sessionId, running }: { sessionId: string; running: number }) {
@@ -13,8 +14,9 @@ export function StopSession({ sessionId, running }: { sessionId: string; running
   const stop = async () => {
     setBusy(true);
     try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
-      if (!res.ok) reportError("Could not interrupt the session. Try again.");
+      const actions = getLiveAcpActions(sessionId);
+      const message = actions ? await actions.cancelPrompt() : NATIVE_INPUT_UNCONFIRMED;
+      if (message) reportError(message);
     } catch {
       reportError("Could not interrupt the session. Try again.");
     } finally {

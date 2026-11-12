@@ -471,6 +471,13 @@ describe("BackgroundAgentsPanel", () => {
   });
 
   it("disables both dialog buttons while the interrupt request is in flight", async () => {
+    const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
+    installAcpFakes();
+    const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(runtime.result.current.state, { ready: true }));
+    await flushAsync();
     let finish: (res: Response) => void = () => {};
     const fetchMock = vi.fn(() => new Promise<Response>((resolve) => (finish = resolve)));
     vi.stubGlobal("fetch", fetchMock);
@@ -483,6 +490,7 @@ describe("BackgroundAgentsPanel", () => {
     expect((getByRole("button", { name: "Interrupt session" }) as HTMLButtonElement).disabled).toBe(true);
     finish({ ok: true } as Response);
     await waitFor(() => expect(queryByRole("alertdialog")).toBeNull());
+    runtime.unmount();
     vi.unstubAllGlobals();
   });
 

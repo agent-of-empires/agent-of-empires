@@ -1303,6 +1303,44 @@ describe("live panel cancellation authority", () => {
     });
   };
 
+  it.each(["native revocation", "runtime unmount"] as const)(
+    "rechecks whole-session authority when confirmation opens before %s",
+    async (transition) => {
+      const id = "sess-panel-confirmation";
+      const hook = await openSession(id);
+      seedChild(lastSocket(), id);
+      await flushAsync();
+      const view = renderView(panelElements(id), { wrapper: profileWrapper });
+      const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
+      expect(regions).toHaveLength(2);
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+        expect(within(region).getByRole("alertdialog")).toBeTruthy();
+      }
+      expect(posts("/cancel")).toEqual([]);
+
+      if (transition === "native revocation") {
+        await act(async () => {
+          lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+        });
+        expect(nativeInputAvailable(hook.result.current.state)).toBe(false);
+      } else {
+        hook.unmount();
+      }
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
+      }
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([]);
+      for (const region of regions) {
+        expect(within(region).queryByRole("alertdialog")).toBeNull();
+      }
+      expect(sockets).toHaveLength(1);
+      view.unmount();
+      if (transition === "native revocation") hook.unmount();
+    },
+  );
+
   it.each(["unknown", "disconnected"] as const)(
     "refuses child and whole-turn gestures from both cached panels while %s",
     async (phase) => {
