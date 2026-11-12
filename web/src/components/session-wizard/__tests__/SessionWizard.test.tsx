@@ -1767,7 +1767,12 @@ describe("SessionWizard create failures", () => {
 
   /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard.
    *  `whileSending` runs after Launch, before the progress view replaces the form. */
-  const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude", whileSending?: () => void) => {
+  const backgroundFailure = async (
+    sent: ReturnType<typeof failure>,
+    tool = "claude",
+    whileSending?: () => void,
+    extra: Partial<WizardPrefill> = {},
+  ) => {
     const toastAction = vi.fn();
     toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
     let finish!: (r: unknown) => void;
@@ -1780,7 +1785,7 @@ describe("SessionWizard create failures", () => {
         onCreated={vi.fn()}
         onCreatedInBackground={vi.fn()}
         onReopenFailure={onReopenFailure}
-        prefill={{ path: "/tmp/proj", tool }}
+        prefill={{ path: "/tmp/proj", tool, ...extra }}
       />,
     );
     await launch();
@@ -1814,6 +1819,22 @@ describe("SessionWizard create failures", () => {
     expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
     fireEvent.click(screen.getByTestId("create-failure-choose_project"));
     expect(screen.getByText("Back")).toBeTruthy();
+  });
+
+  it("Reopen keeps the suggestion link of a create that failed in the background", async () => {
+    const suggestion = { provider_id: "github", id: "issue-1" };
+    const { restore } = await backgroundFailure(
+      failure("validation_failed", null, "Title is too long."),
+      "claude",
+      undefined,
+      { suggestion },
+    );
+    expect(restore.suggestion).toEqual(suggestion);
+    createSession.mockClear();
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    fireEvent.click(await screen.findByTestId("create-failure-try_again"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ suggestion });
   });
 
   it("Reopen restores the form as sent, not an edit made while the create ran", async () => {

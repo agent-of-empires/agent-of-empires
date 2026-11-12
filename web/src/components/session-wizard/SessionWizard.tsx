@@ -219,6 +219,7 @@ export interface WizardRestore {
   failure: CreateFailure;
   /** The create's last progress snapshot, for a failed hook's output tail. */
   progress?: CreateProgress | null;
+  suggestion?: WizardPrefill["suggestion"];
 }
 
 interface Props {
@@ -752,7 +753,12 @@ export function SessionWizard({
       } else if (background) {
         const failure = result.failure;
         if (failure && onReopenFailure && sent) {
-          const restored = { data: sent, failure, progress: lastProgressRef.current };
+          const restored = {
+            data: sent,
+            failure,
+            progress: lastProgressRef.current,
+            suggestion: prefill?.suggestion,
+          };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
           toastBus.handler?.action(`Session was not created: ${title}.${reference}`, "Reopen", () =>
@@ -818,7 +824,7 @@ export function SessionWizard({
         ),
         { skipOnCreate },
       ),
-      suggestion: prefill?.suggestion,
+      suggestion: prefill?.suggestion ?? restore?.suggestion,
       idempotency_key: newIdempotencyKey(),
     };
     // A failed preview counts as nothing to confirm, so it never blocks creation.
