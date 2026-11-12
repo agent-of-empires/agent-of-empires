@@ -179,11 +179,14 @@ export function useSuggestions(
           return;
         }
         if (!mounted.current) return;
-        if (created.network || created.outcomeUnknown || !(created.hooksNeedTrust || created.trustChanged)) {
+        if (created.network || created.outcomeUnknown) {
           setNotice(created.error ?? "Could not start the session.");
           setBusy(null);
           return;
         }
+        // A definitive refusal opens the prefilled wizard, so the draft can be corrected instead of resent as is.
+        if (!(created.hooksNeedTrust || created.trustChanged))
+          setNotice(created.error ?? "Could not start the session.");
       }
       setBusy(null);
       onPrepare(prefill);

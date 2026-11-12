@@ -86,7 +86,7 @@ Change any proposal with its select, then **Save** stores every checked row as a
 
 ### Start without review
 
-When on, **Start** creates the session straight from the template and mapping, skipping the wizard. This is web dashboard only, and only for an item whose template is non-empty and that resolves to a Project; anything else opens the wizard. **Start another Session…** always opens the wizard.
+When on, **Start** creates the session straight from the template and mapping, skipping the wizard. This is web dashboard only, and only for an item whose template is non-empty and that resolves to a Project; anything else opens the wizard, as does a create the server refuses, with the reason shown. **Start another Session…** always opens the wizard.
 
 ## TUI
 
