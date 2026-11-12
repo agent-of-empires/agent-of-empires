@@ -3,6 +3,18 @@
 
 use super::*;
 
+/// The rule [`Instance::detect_pane_now`] reports when the pane could not be captured.
+pub(crate) const CAPTURE_FAILED_RULE: &str = "capture_failed";
+
+/// The pane text to detect on: the fresh capture, else the caller's. `None` when neither
+/// exists, so a failed capture decides nothing rather than reading as an empty screen.
+fn detection_content<'a>(
+    fresh: Option<&'a str>,
+    reuse: Option<(&'a str, usize)>,
+) -> Option<&'a str> {
+    fresh.or(reuse.map(|(reused, _)| reused))
+}
+
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 fn skip_capture(
     activity: Option<i64>,
@@ -431,6 +443,44 @@ impl Instance {
             .unwrap_or_else(|| session.is_pane_running_shell())
     }
 
+    /// A status read of this session's pane taken now, through its detection manifest, for
+    /// callers outside the poller (`aoe session show`, MCP). `None` when the agent has no
+    /// manifest. `reuse` is a capture the caller already took and how many lines it holds; it is
+    /// used when it covers the manifest's scope. Returns the detected status (`None` for an
+    /// agent-owned viewer, or for a failed capture with nothing to reuse) and the rule that
+    /// decided it.
+    pub(crate) fn detect_pane_now(
+        &self,
+        profile: &str,
+        session: &tmux::Session,
+        reuse: Option<(&str, usize)>,
+    ) -> Option<(Option<Status>, &'static str)> {
+        let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
+        let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
+        let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
+        let plan = tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)?;
+        let policy = plan.capture_policy();
+        let fresh = match reuse {
+            Some((_, lines)) if policy.scope.can_reuse(lines) => None,
+            _ => session.try_capture_pane(policy.scope.lines()).ok(),
+        };
+        let Some(content) = detection_content(fresh.as_deref(), reuse) else {
+            return Some((None, CAPTURE_FAILED_RULE));
+        };
+        let hook =
+            crate::hooks::read_hook_status(&self.id).map(|status| tmux::detect::HookObservation {
+                status,
+                age: crate::hooks::read_hook_status_age(&self.id),
+            });
+        let title = tmux::utils::pane_title(session.name()).unwrap_or_default();
+        let owned = !policy.observe_ownership
+            || self.live_pane_owned(session, None, session.is_pane_dead());
+        let observation = tmux::Observation::new(&title, hook, owned);
+        let clean = tmux::utils::strip_ansi(content);
+        let detection = plan.detect(&clean, &observation);
+        Some((detection.status, detection.rule))
+    }
+
     pub(crate) fn live_pane_owned(
         &self,
         session: &tmux::Session,
@@ -594,6 +644,19 @@ mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_failed_capture_falls_back_to_the_callers_or_to_nothing() {
+        let cases = [
+            (Some("fresh"), None, Some("fresh")),
+            (Some("fresh"), Some(("reused", 40)), Some("fresh")),
+            (None, Some(("reused", 40)), Some("reused")),
+            (None, None, None),
+        ];
+        for (fresh, reuse, want) in cases {
+            assert_eq!(detection_content(fresh, reuse), want, "{fresh:?} {reuse:?}");
+        }
+    }
 
     #[test]
     fn skip_capture_requires_an_unchanged_pane_captured_past_its_activity_second() {

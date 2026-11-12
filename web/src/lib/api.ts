@@ -2974,11 +2974,71 @@ export async function trashSession(id: string, killPane = true): Promise<Session
   }
 }
 
+export interface TrashRetryConsent {
+  expected_profile: string;
+  expected_generation: number;
+}
+
+export async function retryTrashSession(
+  id: string,
+  consent: TrashRetryConsent,
+  expectedEpoch: string,
+): Promise<SessionSettingOutcome & { message?: string }> {
+  try {
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(id)}/trash`,
+      jsonInit(
+        "POST",
+        {
+          kill_pane: true,
+          expected_profile: consent.expected_profile,
+          expected_generation: consent.expected_generation,
+        },
+        { "aoe-runtime-epoch": expectedEpoch },
+      ),
+    );
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as Payload | null;
+      return {
+        outcome: response.status >= 500 ? "uncertain" : "rejected",
+        message: stringField(payload, "message") ?? `Trash retry failed (HTTP ${response.status})`,
+      };
+    }
+    const result = await sessionSettingOutcome(response, id, expectedEpoch);
+    if (result.outcome !== "committed") {
+      return { ...result, message: "Trash retry was not confirmed. Refresh before retrying." };
+    }
+    const session = result.mutation.session;
+    let message: string | undefined;
+    if (
+      "outcome" in session &&
+      session.outcome &&
+      typeof session.outcome === "object" &&
+      "relocation" in session.outcome
+    ) {
+      const relocation = session.outcome.relocation;
+      if (relocation && typeof relocation === "object") {
+        if ("reason" in relocation && typeof relocation.reason === "string") message = relocation.reason;
+        else if ("warning" in relocation && typeof relocation.warning === "string") message = relocation.warning;
+      }
+    }
+    return { ...result, message };
+  } catch (error) {
+    return { outcome: "uncertain", message: networkError(error) };
+  }
+}
+
 /** Restore a trashed session (#2489): clears `trashed_at`, returning it to
  *  its prior bucket with its transcript and metadata intact. */
-export async function restoreSession(id: string): Promise<SessionResponse | null> {
+export async function restoreSession(id: string): Promise<SessionMutation | null> {
   try {
-    return withMoveWarning(await sessionUpdate(id, "restore", jsonInit("POST")), (o) => stringField(o, "warning"));
+    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/restore`, jsonInit("POST"));
+    const mutation = await sessionMutation(response);
+    if (!mutation) return null;
+    return {
+      ...mutation,
+      session: withMoveWarning(mutation.session, (outcome) => stringField(outcome, "warning"))!,
+    };
   } catch {
     return null;
   }

@@ -160,6 +160,7 @@ mod tests {
             approval: crate::acp::approvals::Approval {
                 nonce: crate::acp::approvals::Nonce("n-1".into()),
                 tool_call: crate::acp::state::ToolCall {
+                    prompt: None,
                     id: "tc-1".into(),
                     name: "Edit".into(),
                     kind: "edit".into(),

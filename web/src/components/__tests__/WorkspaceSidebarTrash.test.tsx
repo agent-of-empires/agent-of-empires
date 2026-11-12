@@ -60,6 +60,7 @@ function renderSidebar(workspaces: Workspace[], over: Partial<Props> = {}) {
     onRestoreSession: vi.fn(),
     onDeleteSession: vi.fn(),
     onEmptyTrash: vi.fn(),
+    onRetryTrash: vi.fn(async () => {}),
     sortMode: "lastActivity",
     onSortModeChange: noop,
     pluginSortRef: null,
@@ -234,6 +235,8 @@ describe("WorkspaceSidebar Trash control", () => {
         trashedCount={workspaces.length}
         loaded
         onLoad={noop}
+        runtimeEpoch="boot"
+        onRetryTrash={async () => {}}
         onOpen={noop}
         onRestore={noop}
         onDelete={noop}
@@ -283,6 +286,42 @@ describe("WorkspaceSidebar Trash control", () => {
     expect(follows(screen.getByTestId("sidebar-sunk-section"), screen.getByTestId("sidebar-projects-section"))).toBe(
       true,
     );
+  });
+
+  it("offers only Retry for unfinished Trash without permanent deletion", async () => {
+    const onRetry = vi.fn(async () => {});
+    const pending: Partial<SessionResponse> = {
+      id: "pending",
+      title: "unfinished",
+      profile: "test",
+      trashed_at: TRASHED,
+      trash_lifecycle_id: "00000000-0000-4000-8000-000000000004",
+      lifecycle_generation: 4,
+      lifecycle_reservation: { op: "trash", generation: 4, at: TRASHED },
+    };
+    const menu = (session: Partial<SessionResponse>) => (
+      <TrashMenu
+        trashedWorkspaces={[workspace("pending", [session])]}
+        trashedCount={1}
+        loaded
+        onLoad={noop}
+        runtimeEpoch="boot"
+        onRetryTrash={onRetry}
+        onOpen={noop}
+        onRestore={noop}
+        onDelete={noop}
+        onEmptyTrash={noop}
+      />
+    );
+    render(menu(pending));
+    click("sidebar-trash-toggle");
+    expect(query("sidebar-trash-forget")).toBeNull();
+    expect(query("sidebar-trash-purge")).toBeNull();
+    expect((screen.getByTestId("sidebar-trash-retry") as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => {
+      click("sidebar-trash-retry");
+    });
+    expect(onRetry).toHaveBeenCalledOnce();
   });
 });
 

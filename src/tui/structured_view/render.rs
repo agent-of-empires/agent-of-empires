@@ -3069,6 +3069,7 @@ mod tests {
                 name: name.into(),
                 kind: "other".into(),
                 args_preview: String::new(),
+                prompt: None,
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id: parent.map(Into::into),
                 memory_recall: None,

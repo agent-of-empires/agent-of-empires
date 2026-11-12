@@ -462,6 +462,7 @@ mod tests {
 
     fn tool_call(id: &str, name: &str, kind: &str, args: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.to_string(),
             name: name.to_string(),
             kind: kind.to_string(),
@@ -676,6 +677,7 @@ mod tests {
     #[test]
     fn tool_lines_merge_lifecycle_and_describe_arguments_without_bulk() {
         let updated = Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "t1".into(),
             title: Some("Edit".into()),
             args_preview: Some(

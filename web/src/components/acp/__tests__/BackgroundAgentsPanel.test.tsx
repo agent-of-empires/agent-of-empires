@@ -325,6 +325,25 @@ describe("BackgroundAgentsPanel", () => {
     runsMock.mockReturnValue({});
   });
 
+  it("offers Stop on a running agent only when the session is writable", () => {
+    agentsMock.mockReturnValue([agent()]);
+    const stopButtons = (c: HTMLElement) => [...c.querySelectorAll("button")].filter((b) => b.textContent === "Stop");
+    const open = (c: HTMLElement) =>
+      fireEvent.click([...c.querySelectorAll("button")].find((b) => b.textContent?.includes("Map backend lifecycle"))!);
+    // Writable: Stop shows in the pane header and in the agent's detail view.
+    const writable = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(stopButtons(writable.container)).toHaveLength(1);
+    open(writable.container);
+    expect(stopButtons(writable.container)).toHaveLength(1);
+    writable.unmount();
+    // Read-only (server read-only, trashed or archived): neither shows it.
+    const locked = render(<BackgroundAgentsPanel sessionId="s-1" readOnly />);
+    expect(stopButtons(locked.container)).toHaveLength(0);
+    open(locked.container);
+    expect(locked.container.textContent).toContain("do the thing");
+    expect(stopButtons(locked.container)).toHaveLength(0);
+  });
+
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
@@ -352,14 +371,15 @@ describe("BackgroundAgentsPanel", () => {
         ],
       }),
     ]);
-    const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     expect(container.textContent).toContain("done");
-    fireEvent.click(getAllByRole("button")[0]!);
+    fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+    fireEvent.click(getByRole("button", { name: "Activity" }));
     for (const text of [
       "do the thing",
       "claude-opus-4-8",
       "found 12 files",
-      "tools · 3",
+      "3 calls",
       "ls -la",
       "src/main.rs",
       "Grep",
@@ -388,7 +408,40 @@ describe("BackgroundAgentsPanel", () => {
     const { getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const stop = getByRole("button", { name: /stop/i });
     fireEvent.click(stop);
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" });
+    // ACP stops the whole session, so Stop asks first.
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(getByRole("alertdialog").textContent).toContain("interrupts the main agent and all 1 running sub-agent");
+    fireEvent.click(getByRole("button", { name: "Interrupt session" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" }));
+    vi.unstubAllGlobals();
+  });
+
+  it("disables both dialog buttons while the interrupt request is in flight", async () => {
+    let finish: (res: Response) => void = () => {};
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => (finish = resolve)));
+    vi.stubGlobal("fetch", fetchMock);
+    agentsMock.mockReturnValue([agent({ status: "running" })]);
+    const { getByRole, queryByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByRole("button", { name: /stop/i }));
+    fireEvent.click(getByRole("button", { name: "Interrupt session" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect((getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((getByRole("button", { name: "Interrupt session" }) as HTMLButtonElement).disabled).toBe(true);
+    finish({ ok: true } as Response);
+    await waitFor(() => expect(queryByRole("alertdialog")).toBeNull());
+    vi.unstubAllGlobals();
+  });
+
+  it("closes an open Stop confirmation when the panel switches to another session", () => {
+    const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
+    vi.stubGlobal("fetch", fetchMock);
+    agentsMock.mockReturnValue([agent({ status: "running" })]);
+    const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(view.getByRole("button", { name: /stop/i }));
+    expect(view.getByRole("alertdialog")).toBeTruthy();
+    view.rerender(<BackgroundAgentsPanel sessionId="s-2" />);
+    expect(view.queryByRole("alertdialog")).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
     vi.unstubAllGlobals();
   });
 
@@ -491,25 +544,31 @@ describe("BackgroundAgentsPanel", () => {
     });
   });
 
-  it("opens a details modal showing the full prompt, result, and tools", () => {
+  it("opens the shared detail view with the full prompt and result, and steps between agents", () => {
     agentsMock.mockReturnValue([
       agent({
+        agentId: "a1",
+        toolCallId: "t1",
         status: "completed",
         endedAt: new Date().toISOString(),
         prompt: "a very long prompt that the narrow panel would clamp",
         result: "the complete final result text",
-        tools: [{ name: "Bash", title: "ls -la", ok: true }],
+        tools: [{ name: "Bash", title: "ls", ok: true }],
       }),
+      agent({ agentId: "a2", toolCallId: "t2", description: "Second one", status: "completed", endedAt: "2020-01-01" }),
     ]);
-    const { getByRole, getByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    fireEvent.click(getByRole("button", { name: /open full details/i }));
-    const dialog = getByRole("dialog");
-    expect(dialog.textContent).toContain("a very long prompt that the narrow panel would clamp");
-    expect(dialog.textContent).toContain("the complete final result text");
-    expect(dialog.textContent).toContain("ls -la");
-    // Closes on the X button.
-    fireEvent.click(getByRole("button", { name: /close/i }));
-    expect(() => getByText("the complete final result text")).toThrow();
+    const { getByRole, container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+    // The same Input, Activity and Output sections the inline card shows.
+    const text = container.textContent!;
+    for (const part of ["Input", "Activity", "Output", "a very long prompt", "the complete final result text"]) {
+      expect(text).toContain(part);
+    }
+    expect(text).toContain("Subagent 1 of 2");
+    fireEvent.click(getByRole("button", { name: "Next subagent" }));
+    expect(container.textContent).toContain("Subagent 2 of 2");
+    fireEvent.click(getByRole("button", { name: /All agents/ }));
+    expect(container.textContent).toContain("Background agents · 2");
   });
 });
 
@@ -523,7 +582,7 @@ describe("BackgroundAgentsPanel copy", () => {
     fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
     fireEvent.click(getByRole("button", { name: "Copy prompt" }));
     expect(writeClipboard).toHaveBeenLastCalledWith(prompt);
-    fireEvent.click(getByRole("button", { name: "Copy result" }));
+    fireEvent.click(getByRole("button", { name: "Copy report" }));
     expect(writeClipboard).toHaveBeenLastCalledWith("done");
   });
 });

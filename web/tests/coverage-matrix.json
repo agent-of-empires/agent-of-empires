@@ -29,6 +29,34 @@
       "notes": "Marketplace install and installed-plugin update previews display agent declarations and escape hostile text before approval."
     },
     {
+      "id": "trash.unfinished-recovery",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/trash-recovery.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/TrashMenu.tsx"
+      ],
+      "notes": "Real-daemon Retry preserves unverified files and captured generations. Fresh owners refuse Retry without changing custody. Retry and read-only inspection remain available; unfinished Trash never grants purge authority."
+    },
+    {
+      "id": "trash.mixed-workspace-recovery",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/sidebar/TrashMenu.tsx"],
+      "notes": "An unfinished Trash member remains reachable beside a live workspace sibling. Retry targets only the pending member and preserves the active live session route."
+    },
+    {
+      "id": "trash.restore-receipt-ordering",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useSessions.test.ts", "src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": ["web/src/App.tsx"],
+      "notes": "Restore consumes its native receipt and wins over a late older Retry without fencing unrelated rows. Mixed-workspace restore excludes live members."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -3220,9 +3248,16 @@
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
-        "src/components/acp/ToolCards.render.test.tsx"
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/subagents/activityFold.test.ts",
+        "src/components/acp/subagents/longText.test.ts",
+        "tests/acp-subagent-view-mobile.spec.ts"
       ],
       "components": [
+        "web/src/components/acp/subagents/ActivitySection.tsx",
+        "web/src/components/acp/subagents/LongMarkdown.tsx",
+        "web/src/components/acp/subagents/StopSession.tsx",
+        "web/src/components/acp/subagents/SubagentDetail.tsx",
         "web/src/components/acp/BackgroundAgentsPanel.tsx",
         "web/src/components/acp/BackgroundShells.tsx",
         "web/src/components/acp/backgroundAgentsContext.ts",

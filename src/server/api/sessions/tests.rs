@@ -1,5 +1,23 @@
 use super::*;
 
+async fn assert_response_status(
+    response: axum::response::Response,
+    expected: StatusCode,
+    context: &str,
+) -> axum::response::Response {
+    if response.status() != expected {
+        let actual = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        panic!(
+            "{context}: expected {expected}, got {actual}; sanitized response body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    response
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn structured_purge_waits_for_a_pending_runner_retirement() -> anyhow::Result<()> {
@@ -1278,17 +1296,22 @@ async fn metadata_commit_rejects_partial_rows_without_rewriting_them() -> anyhow
 
 #[tokio::test]
 #[serial_test::serial]
-async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::Result<()> {
+async fn trash_preserves_idempotency_and_rejects_stale_generations_or_profiles(
+) -> anyhow::Result<()> {
     use crate::session::LifecycleOperation;
-    for (already_trashed, precondition, omit_body, peer) in [
-        (false, true, false, None),
-        (true, true, false, None),
-        (true, false, false, None),
-        (true, false, true, None),
-        (true, false, false, Some(LifecycleOperation::Purge)),
-        (true, false, false, Some(LifecycleOperation::Trash)),
+    for (already_trashed, precondition, omit_body, peer, wrong_profile) in [
+        (false, true, false, None, false),
+        (true, true, false, None, false),
+        (true, false, false, None, false),
+        (true, false, true, None, false),
+        (true, false, false, Some(LifecycleOperation::Purge), false),
+        (true, false, false, Some(LifecycleOperation::Trash), false),
+        (false, false, false, None, true),
+        (true, false, false, None, true),
     ] {
         let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
         let mut row = Instance::new("stale trash", "/tmp/stale-trash");
         row.source_profile = "receipt".into();
         let expected_generation = row.lifecycle_generation;
@@ -1319,19 +1342,22 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             (!omit_body).then_some(Json(TrashSessionBody {
                 kill_pane: true,
                 expected_generation: precondition.then_some(expected_generation),
+                expected_profile: wrong_profile.then(|| "different-profile".into()),
             })),
         )
         .await
         .into_response();
-        assert_eq!(
-            response.status(),
-            if precondition || peer.is_some() {
+        let response = assert_response_status(
+            response,
+            if precondition || peer.is_some() || wrong_profile {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::OK
-            }
-        );
-        if precondition {
+            },
+            "Trash generation/idempotency",
+        )
+        .await;
+        if precondition || wrong_profile {
             assert_eq!(
                 response.headers()[crate::daemon::ERROR_CODE_HEADER],
                 crate::daemon::ApiErrorCode::LifecycleSuperseded.as_str()
@@ -1344,7 +1370,7 @@ async fn trash_preserves_idempotency_and_rejects_stale_generations() -> anyhow::
             );
         }
         assert_eq!(std::fs::read(storage.sessions_path())?, before);
-        if precondition || peer.is_some() {
+        if precondition || peer.is_some() || wrong_profile {
             assert!(!response
                 .headers()
                 .contains_key(crate::daemon::RUNTIME_REVISION_HEADER));
@@ -1790,6 +1816,7 @@ async fn trash_retry_finishes_expired_transition_after_startup() -> anyhow::Resu
             Some(Json(TrashSessionBody {
                 kill_pane: true,
                 expected_generation: Some(generation),
+                expected_profile: None,
             })),
         )
         .await
@@ -7161,6 +7188,7 @@ mod open_file {
         std::fs::write(&page, "<script>alert(1)</script>").unwrap();
         let state = state_for(single_repo(dir.path()), false);
         let tool_call = crate::acp::state::ToolCall {
+            prompt: None,
             id: "t1".to_string(),
             name: "Write".to_string(),
             kind: "edit".to_string(),
@@ -9041,6 +9069,7 @@ async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
     let state = crate::server::test_support::build_test_app_state(vec![inst]);
     let approval = build_approval(
         ToolCall {
+            prompt: None,
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             kind: "execute".to_string(),
