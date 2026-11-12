@@ -179,8 +179,8 @@ describe("SuggestionsView", () => {
 
     it("shows Open and the Session state instead of Start", async () => {
       const onPrepare = await openStarted();
-      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
       const row = (await screen.findByText("Fix lifecycle")).closest("li") as HTMLElement;
+      expect(screen.queryByRole("button", { name: "Start" })).toBeNull();
       expect(row.querySelector("p:nth-of-type(3)")?.textContent).toBe(
         "GitHub · ⠋ Session running · Review RFC 4562 · started 3 min ago · aoe",
       );
@@ -302,6 +302,27 @@ describe("SuggestionsView", () => {
     expect(createSession).not.toHaveBeenCalled();
     expect(pending.register).not.toHaveBeenCalled();
     expect(onPrepare).not.toHaveBeenCalled();
+  });
+
+  it("Start without review refuses a second view's Start while the first create is in flight", async () => {
+    let finish: (v: object) => void = () => {};
+    createSession.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    prepareSuggestion.mockResolvedValue({ ok: true, data: prepared });
+    const snap = snapshot();
+    fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
+    render(
+      <>
+        <SuggestionsView onPrepare={vi.fn()} onStarted={vi.fn()} />
+        <SuggestionsView onPrepare={vi.fn()} onStarted={vi.fn()} />
+      </>,
+    );
+    const starts = await screen.findAllByRole("button", { name: "Start" });
+    fireEvent.click(starts[0]!);
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    fireEvent.click(starts[1]!);
+    expect((await screen.findByRole("alert")).textContent).toContain("still being created");
+    expect(createSession).toHaveBeenCalledTimes(1);
+    await act(async () => finish({ ok: true, session: { id: "s1" } }));
   });
 
   it("Start without review refuses a re-click while an earlier create is unresolved", async () => {

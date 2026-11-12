@@ -38,6 +38,8 @@ export const suggestionKey = (item: SuggestionItem) => `${item.provider_id}:${it
  * With "Start without review" on and a resolved, templated draft, `start` creates the session and
  * calls `onStarted`; anything unresolved or needing hook trust opens the wizard through `onPrepare`.
  */
+let directStartInFlight = false;
+
 export function useSuggestions(
   onPrepare: (prefill: WizardPrefill) => void,
   onStarted?: (session: SessionResponse) => void,
@@ -157,36 +159,49 @@ export function useSuggestions(
           suggestion: link,
           idempotency_key: newIdempotencyKey(),
         };
-        const origin = await fetchCreateBootId();
-        // Checked after the await and just before registering, so no other start slips in between.
-        if (peekPendingCreate()) {
+        // Claimed creates are invisible to peekPendingCreate, so starts in flight are tracked across hook instances here.
+        if (directStartInFlight) {
           if (mounted.current) {
             setNotice(PENDING_NOTICE);
             setBusy(null);
           }
           return;
         }
-        registerPendingCreate({ body, tool: draft.tool, since: Date.now(), origin }, { claimed: true });
-        const created = await createSession(body);
-        // No definite answer: the app-level owner keeps reconciling under this key, and a
-        // re-click is refused until it does.
-        if (created.network || created.outcomeUnknown) releasePendingCreate(body.idempotency_key);
-        else resolvePendingCreate(body.idempotency_key);
-        if (created.ok && created.session) {
-          // Both views navigate away, so the snapshot is not reloaded.
-          onStarted(created.session);
-          if (mounted.current) setBusy(null);
-          return;
+        directStartInFlight = true;
+        try {
+          const origin = await fetchCreateBootId();
+          // Checked after the await and just before registering, so no other start slips in between.
+          if (peekPendingCreate()) {
+            if (mounted.current) {
+              setNotice(PENDING_NOTICE);
+              setBusy(null);
+            }
+            return;
+          }
+          registerPendingCreate({ body, tool: draft.tool, since: Date.now(), origin }, { claimed: true });
+          const created = await createSession(body);
+          // No definite answer: the app-level owner keeps reconciling under this key, and a
+          // re-click is refused until it does.
+          if (created.network || created.outcomeUnknown) releasePendingCreate(body.idempotency_key);
+          else resolvePendingCreate(body.idempotency_key);
+          if (created.ok && created.session) {
+            // Both views navigate away, so the snapshot is not reloaded.
+            onStarted(created.session);
+            if (mounted.current) setBusy(null);
+            return;
+          }
+          if (!mounted.current) return;
+          if (created.network || created.outcomeUnknown) {
+            setNotice(created.error ?? "Could not start the session.");
+            setBusy(null);
+            return;
+          }
+          // A definitive refusal opens the prefilled wizard, so the draft can be corrected instead of resent as is.
+          if (!(created.hooksNeedTrust || created.trustChanged))
+            setNotice(created.error ?? "Could not start the session.");
+        } finally {
+          directStartInFlight = false;
         }
-        if (!mounted.current) return;
-        if (created.network || created.outcomeUnknown) {
-          setNotice(created.error ?? "Could not start the session.");
-          setBusy(null);
-          return;
-        }
-        // A definitive refusal opens the prefilled wizard, so the draft can be corrected instead of resent as is.
-        if (!(created.hooksNeedTrust || created.trustChanged))
-          setNotice(created.error ?? "Could not start the session.");
       }
       setBusy(null);
       onPrepare(prefill);
