@@ -265,6 +265,7 @@ mod tests {
 
     fn tool_call(args_preview: &str, diffs: Vec<&str>, recall: Vec<&str>) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: "t1".into(),
             name: "Write".into(),
             kind: "edit".into(),
@@ -314,6 +315,7 @@ mod tests {
             (
                 3,
                 Event::ToolCallUpdated {
+                    prompt: None,
                     tool_call_id: "t3".into(),
                     title: None,
                     args_preview: Some(r#"{"path":"/tmp/late.txt"}"#.into()),

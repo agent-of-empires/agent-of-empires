@@ -622,6 +622,7 @@ pub(super) mod test_support {
 
     pub(in crate::acp::event_store) fn tool_call(id: &str) -> crate::acp::state::ToolCall {
         crate::acp::state::ToolCall {
+            prompt: None,
             id: id.into(),
             name: "Bash".into(),
             kind: "execute".into(),

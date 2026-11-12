@@ -420,6 +420,8 @@ pub struct SpawnRequest {
     /// The session's logical tool (`Instance.tool`); host hooks see this as `AOE_TOOL`.
     pub tool: String,
     pub cwd: PathBuf,
+    /// Where repo config is read; a workspace's `cwd` holds none (`Instance::repo_config_path`).
+    pub config_path: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     /// LLM backend pinned on the session row, one of

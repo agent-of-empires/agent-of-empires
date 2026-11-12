@@ -7,7 +7,9 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock};
+use super::state::{
+    notice_id, DiffComment, DiffPreview, Event, ToolCall, ToolOutputBlock, ARGS_CUT_MARKER,
+};
 use crate::daemon::PromptAttachmentRef;
 
 /// Reasons with this prefix are hidden before the first prompt, since a never-prompted
@@ -439,7 +441,7 @@ impl TranscriptModel {
                 ) {
                     Vec::new()
                 } else {
-                    self.ensure_tool_start(tool_call_id, None, None, *completed_at, None)
+                    self.ensure_tool_start(tool_call_id, None, None, None, *completed_at, None)
                 };
                 self.turn_has_output = true;
                 let mut row = self.completion_row(seq, tool_call_id, *is_error, content);
@@ -461,12 +463,14 @@ impl TranscriptModel {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => self.on_tool_updated(
                 tool_call_id,
                 title.as_deref(),
                 args_preview.as_deref(),
+                prompt.as_deref(),
                 *started_at,
                 diffs.as_deref(),
             ),
@@ -719,6 +723,7 @@ impl TranscriptModel {
         tool_call_id: &str,
         title: Option<&str>,
         args_preview: Option<&str>,
+        prompt: Option<&str>,
         started_at: Option<DateTime<Utc>>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
@@ -736,6 +741,7 @@ impl TranscriptModel {
             tool_call_id,
             title,
             args_preview,
+            prompt,
             started_at.unwrap_or_else(Utc::now),
             diffs,
         );
@@ -754,6 +760,9 @@ impl TranscriptModel {
                 tool.name = title.to_string();
             }
             if let Some(args_preview) = args_preview {
+                if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
+                    tool.prompt = prompt.map(str::to_string);
+                }
                 tool.args_preview = args_preview.to_string();
             }
             if let Some(started_at) = started_at {
@@ -772,6 +781,7 @@ impl TranscriptModel {
         tool_call_id: &str,
         name: Option<&str>,
         args_preview: Option<&str>,
+        prompt: Option<&str>,
         started_at: DateTime<Utc>,
         diffs: Option<&[DiffPreview]>,
     ) -> Vec<TranscriptDelta> {
@@ -781,6 +791,7 @@ impl TranscriptModel {
         self.track_tool_start(tool_call_id, false);
         self.turn_has_output = true;
         let tool = ToolCall {
+            prompt: prompt.map(str::to_string),
             id: tool_call_id.to_string(),
             name: name
                 .filter(|n| !n.is_empty())
@@ -990,6 +1001,12 @@ pub(crate) fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall
             &incoming.args_preview,
             &prev.args_preview,
         ),
+        // A repeat that carries no `prompt` of its own (sparse, or bookkeeping-only
+        // args) keeps the earlier one; a repeat with its own prompt replaces it.
+        prompt: incoming.prompt.clone().or_else(|| {
+            let restates = incoming.args_preview.contains(r#""prompt""#);
+            prev.prompt.clone().filter(|_| !restates)
+        }),
         started_at: incoming.started_at.max(prev.started_at),
         parent_tool_call_id: incoming
             .parent_tool_call_id
@@ -1052,6 +1069,7 @@ mod tests {
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: name.into(),
             kind: "execute".into(),
@@ -1061,6 +1079,54 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_repeated_start_keeps_the_full_prompt_unless_it_restates_a_prompt() {
+        let mut prev = tool("t", "Task");
+        prev.args_preview = r#"{"prompt":"cut"#.into();
+        prev.prompt = Some("full prompt".into());
+        let mut sparse = tool("t", "Task");
+        sparse.args_preview = String::new();
+        assert_eq!(
+            merge_tool_start(&prev, &sparse).prompt.as_deref(),
+            Some("full prompt")
+        );
+        let mut changed = tool("t", "Task");
+        changed.args_preview = r#"{"prompt":"other"}"#.into();
+        assert_eq!(merge_tool_start(&prev, &changed).prompt, None);
+        let mut bookkeeping = tool("t", "Task");
+        bookkeeping.args_preview = r#"{"_aoe_title":"external_directory"}"#.into();
+        assert_eq!(
+            merge_tool_start(&prev, &bookkeeping).prompt.as_deref(),
+            Some("full prompt")
+        );
+    }
+
+    #[test]
+    fn an_update_keeps_the_stored_prompt_only_while_the_preview_stays_cut() {
+        let mut start = tool("t", "Task");
+        start.args_preview = "{\"prompt\":\"cut\u{2026}[truncated]".into();
+        start.prompt = Some("full prompt".into());
+        let m = fold([
+            started(start.clone()),
+            updated("t", None, Some(&start.args_preview), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt.as_deref(),
+            Some("full prompt"),
+            "a deduplicated repeat of the cut call"
+        );
+
+        let m = fold([
+            started(start),
+            updated("t", None, Some(r#"{"prompt":"B"}"#), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt,
+            None,
+            "an explicit short replacement drops the old prompt"
+        );
     }
 
     fn started(tool_call: ToolCall) -> Event {
@@ -1085,6 +1151,7 @@ mod tests {
         diffs: Option<Vec<DiffPreview>>,
     ) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: id.into(),
             title: title.map(Into::into),
             args_preview: args.map(Into::into),

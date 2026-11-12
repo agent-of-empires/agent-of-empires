@@ -183,6 +183,7 @@ impl Shared {
                 name,
                 kind: "think".into(),
                 args_preview: preview_args(&args),
+                prompt: None,
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id: outer,
                 memory_recall: None,
@@ -247,7 +248,7 @@ impl Shared {
                         | Event::DiffEmitted { .. } => {}
                         _ => continue,
                     }
-                    update_tool_context_cache(&self.tool_context_cache, &event, &source);
+                    update_tool_context_cache(&self.tool_context_cache, &mut event, &source);
                     if self.event_tx.send(event).await.is_err() {
                         break;
                     }

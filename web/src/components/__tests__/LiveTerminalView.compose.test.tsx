@@ -81,10 +81,11 @@ describe("LiveTerminalView compose", () => {
     expect(input.value).toBe(HIDDEN_INPUT_SENTINEL);
   });
 
-  it("toasts an undelivered paste and keeps the sheet and draft", async () => {
+  it("holds a not-sent strip for an undelivered paste and keeps the sheet and draft", async () => {
     live.state.isOwner = false;
     const { error, text } = await openCompose("compose-refused", false);
-    expect(error).toHaveBeenCalledWith(expect.stringContaining("another device"));
+    expect(screen.getByRole("status").textContent).toBe("Not sent. Take control to type.");
+    expect(error).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog", { name: "Compose" })).toBeTruthy();
     expect(text.value).toBe("ship it");
   });
