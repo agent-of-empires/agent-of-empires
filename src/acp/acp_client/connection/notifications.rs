@@ -163,12 +163,20 @@ impl Shared {
     }
 
     /// Validated child traffic keeps whichever watchdog owns the turn from
-    /// reading a parent that waits on its subagents as silent.
-    async fn note_subagent_activity(&self, accepted: bool, local_prompt_signals: bool, epoch: u64) {
-        if !accepted {
-            return;
-        }
-        self.subagent_activity_at.store(now_ms(), Ordering::Relaxed);
+    /// reading a parent that waits on its subagents as silent. Call it before
+    /// publishing events so a full event channel cannot delay the signal.
+    pub(super) async fn note_child_activity(
+        &self,
+        child: &SessionId,
+        local_prompt_signals: bool,
+        epoch: u64,
+    ) {
+        let now = now_ms();
+        self.subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned")
+            .insert(child.0.to_string(), now);
+        self.subagent_activity_at.store(now, Ordering::Relaxed);
         if self.prompt_in_flight.load(Ordering::Relaxed) {
             forward_lifecycle_signals(
                 local_prompt_signals && epoch != 0,
@@ -334,27 +342,34 @@ impl Shared {
         let from_child = self.ingress.child_route(&notification.session_id).is_some();
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
-                let accepted = self
-                    .handle_subagent_update(notification.session_id, update)
-                    .await;
                 return self
-                    .note_subagent_activity(accepted, local_prompt_signals, epoch)
+                    .handle_subagent_update(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             SessionUpdate::SessionMessage(message) => {
-                let accepted = self
-                    .handle_session_message(notification.session_id, message)
-                    .await;
                 return self
-                    .note_subagent_activity(accepted, local_prompt_signals, epoch)
+                    .handle_session_message(
+                        notification.session_id,
+                        message,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             SessionUpdate::SessionMessageChunk(_) if !from_child => return,
             update if from_child => {
-                self.handle_child_notification(notification.session_id, update)
-                    .await;
                 return self
-                    .note_subagent_activity(true, local_prompt_signals, epoch)
+                    .handle_child_notification(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             update => notification.update = update,
