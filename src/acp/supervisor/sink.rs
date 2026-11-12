@@ -891,10 +891,8 @@ mod tests {
                 "the owned drain publication queues while the writer is stalled"
             );
             assert_eq!(
-                counter
-                    .try_lock()
-                    .expect("queued completion owns no seq guard")
-                    .seq,
+                super::super::try_activity_seq(&sup.next_seqs, "stalled")
+                    .expect("queued completion owns no seq guard"),
                 0
             );
             assert!(
