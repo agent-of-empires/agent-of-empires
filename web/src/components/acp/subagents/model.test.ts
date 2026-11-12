@@ -35,6 +35,12 @@ describe("fromBackground", () => {
     expect(t!.detail).toBe("cd repo\ncargo test");
   });
 
+  it("shows a failed child's own error over the generic fallback", () => {
+    const failed = agent({ status: "error", error: "Authentication required" });
+    expect(fromBackground(failed).error).toBe("Authentication required");
+    expect(fromBackground(agent({ status: "error" })).error).toBe("background agent error");
+  });
+
   it("keeps the total and newest call when the list is capped", () => {
     const record = fromBackground(agent({ toolCount: 300, lastTool: "Bash" }));
     expect(record.toolCount).toBe(300);

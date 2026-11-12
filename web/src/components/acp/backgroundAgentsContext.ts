@@ -101,7 +101,8 @@ export function paneAgents(
         lastTool: record?.lastTool ?? null,
         lastText: null,
         result: record?.report || null,
-        warning: s.error ?? null,
+        warning: null,
+        error: s.error ?? null,
         record,
       };
     });

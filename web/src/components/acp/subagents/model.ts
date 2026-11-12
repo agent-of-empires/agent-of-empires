@@ -232,6 +232,6 @@ export function fromBackground(agent: BackgroundAgent): SubagentRecord {
     report: agent.result ?? "",
     latestNote: status === "running" ? agent.lastText : null,
     warning: status === "failed" ? null : agent.warning,
-    error: status === "failed" ? (agent.warning ?? "background agent error") : null,
+    error: status === "failed" ? (agent.error ?? agent.warning ?? "background agent error") : null,
   };
 }

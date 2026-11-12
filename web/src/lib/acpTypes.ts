@@ -806,6 +806,8 @@ export interface BackgroundAgent {
   lastText: string | null;
   result: string | null;
   warning: string | null;
+  /** The error message its RFD child stopped with; never a completion warning. */
+  error?: string | null;
 }
 
 export interface RejectedPrompt {
@@ -1547,7 +1549,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
 /** Folds a child's RFD snapshot into its agent; `at` stamps a newly ended one. */
 function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): BackgroundAgent {
   const status = subagentStatus(child);
-  return child.state === "idle" ? { ...a, status, endedAt: a.endedAt ?? at } : { ...a, status, endedAt: null };
+  const error = child.error ?? null;
+  return child.state === "idle"
+    ? { ...a, status, error, endedAt: a.endedAt ?? at }
+    : { ...a, status, error, endedAt: null };
 }
 
 /** The agent status a child's session state stands for. */

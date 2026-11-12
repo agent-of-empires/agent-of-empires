@@ -361,9 +361,11 @@ describe("applyEvent / subagent roster", () => {
       status: "completed",
       endedAt: "t1",
     });
-    expect(agentAfter(update("idle", "t1", { stop_reason: "error" }))).toMatchObject({
+    expect(agentAfter(update("idle", "t1", { stop_reason: "error", error: "Authentication required" }))).toMatchObject({
       status: "error",
       endedAt: "t1",
+      error: "Authentication required",
+      warning: null,
     });
     // A later idle keeps the first end time; running again reopens the agent.
     const twice = agentAfter(update("idle", "t1"), update("idle", "t2"));
