@@ -449,7 +449,7 @@ mod tests {
     use crate::acp::acp_client::SessionState;
     use crate::acp::agent_profiles::CLAUDE;
     use agent_client_protocol::v1::schema::SessionNotification;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
