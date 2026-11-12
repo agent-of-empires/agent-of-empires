@@ -28,7 +28,8 @@ mod worker;
 
 pub use app::*;
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod standalone_startup_tests;
 
 /// Re-enter one libtest case in a private, killable process. Output stays off
