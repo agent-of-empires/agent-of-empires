@@ -49,6 +49,7 @@ describe("failureView", () => {
         primary: "launch_with_current_image",
         secondary: null,
         row: "sandbox",
+        cue: "image pull failed",
       },
     ],
     [
