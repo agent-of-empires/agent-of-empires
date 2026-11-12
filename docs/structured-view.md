@@ -101,7 +101,7 @@ Features depend on the ACP adapter and its profile:
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
 | Subagent indentation | ✓ | — | unverified | — | — |
 | Per-subagent state and Stop | ✓ | — | — | — | — |
-| Workflow agents in the Sub agents pane | ✓ | — | — | — | — |
+| Workflow agents in the Background pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
 In a sandboxed session a Claude `Workflow` run is not tracked, like a backgrounded command: the session can show idle while its agents still work.
