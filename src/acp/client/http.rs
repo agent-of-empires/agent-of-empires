@@ -1386,7 +1386,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-
         server.abort();
         let _ = server.await;
     }

@@ -358,14 +358,7 @@ impl<B: Backend> Core<B> {
                 prompt,
                 started_at,
                 diffs,
-            } => self.on_tool_updated(
-                tool_call_id,
-                title,
-                args_preview,
-                prompt,
-                started_at,
-                diffs,
-            ),
+            } => self.on_tool_updated(tool_call_id, title, args_preview, prompt, started_at, diffs),
             View::ElicitationRequested { tool_call_id } => {
                 let Some(id) = tool_call_id else {
                     return Ok(self.backend.changes());

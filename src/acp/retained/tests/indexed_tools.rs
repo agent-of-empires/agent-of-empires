@@ -1,7 +1,14 @@
 use super::*;
 use crate::acp::transcript::{storage::DeltaOf, TranscriptModel, TranscriptRow};
 
-type ToolSignature = (String, String, String, String, Option<String>, DateTime<Utc>);
+type ToolSignature = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    DateTime<Utc>,
+);
 type RowSignature = (
     String,
     String,
@@ -215,9 +222,7 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
                 let row = memory
                     .rows
                     .iter()
-                    .find(|row| {
-                        row.tool_call_id.as_deref() == Some(id) && row.tool.is_some()
-                    })
+                    .find(|row| row.tool_call_id.as_deref() == Some(id) && row.tool.is_some())
                     .unwrap();
                 assert_eq!(
                     row.tool.as_ref().unwrap().prompt.as_deref(),

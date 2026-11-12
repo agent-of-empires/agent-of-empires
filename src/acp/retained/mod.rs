@@ -327,7 +327,10 @@ impl Backend for Disk {
                     "retained text disappeared",
                 ));
             }
-            if buffer[..count].windows(needle.len()).any(|window| window == needle_bytes) {
+            if buffer[..count]
+                .windows(needle.len())
+                .any(|window| window == needle_bytes)
+            {
                 return Ok(true);
             }
             // Only boundary-spanning candidates need another bounded spool comparison.
@@ -336,7 +339,11 @@ impl Backend for Disk {
                 let start = offset + (boundary + relative) as u64;
                 if start <= value.len - length
                     && byte == first
-                    && json::text_is(&self.0.spool, value.subrange(start..start + length)?, needle)?
+                    && json::text_is(
+                        &self.0.spool,
+                        value.subrange(start..start + length)?,
+                        needle,
+                    )?
                 {
                     return Ok(true);
                 }
