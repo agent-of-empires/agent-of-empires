@@ -64,9 +64,15 @@ impl HomeView {
             changed = true;
         }
         // A view prepare answered after the view closed has no one to start it.
-        if let Some((key, start, PrepareTarget::Home)) = polled.start {
-            // The prepare answered after the user moved on or opened another dialog.
-            if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
+        if let Some((key, mut start, target @ (PrepareTarget::Home | PrepareTarget::HomeAnother))) =
+            polled.start
+        {
+            if self.suggestions_view.is_some() {
+                // The full view opened meanwhile and owns suggestion starts now.
+            } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
+                if target == PrepareTarget::HomeAnother {
+                    start.suggestion = None;
+                }
                 self.start_suggestion(start);
             } else {
                 self.flash_status("Selection changed, suggestion not started");
@@ -119,7 +125,11 @@ impl HomeView {
             profiles,
         );
         // Path first: setting it re-resolves the defaults the rest builds on.
-        dialog.set_path(start.path);
+        let path_known = start.path.is_some();
+        match start.path {
+            Some(path) => dialog.set_path(path),
+            None => dialog.require_path(),
+        }
         dialog.set_tool(&start.tool);
         dialog.set_title(start.title);
         dialog.set_suggestion(
@@ -132,7 +142,9 @@ impl HomeView {
                 suggestion: start.suggestion,
             },
         );
-        dialog.focus_title();
+        if path_known {
+            dialog.focus_title();
+        }
         Ok(dialog)
     }
 }
