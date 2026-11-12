@@ -306,6 +306,8 @@ mod tests {
             PromptPending,
             /// Quiet for an hour, but an agent-initiated turn never got its `Stopped`.
             OpenAgentTurn,
+            /// Quiet for an hour after the root's terminal, but a child still runs.
+            RunningChild,
         }
         // (worker, reaped)
         let cases = [
@@ -325,6 +327,7 @@ mod tests {
             ),
             (Worker::PromptPending, false),
             (Worker::OpenAgentTurn, false),
+            (Worker::RunningChild, false),
         ];
         for (worker, reaped) in cases {
             let id = "resuming-session";
@@ -373,6 +376,37 @@ mod tests {
                             &Event::AgentMessageChunk {
                                 text: "woken".into(),
                                 message_id: None,
+                            },
+                            stale_ms,
+                        )
+                        .unwrap();
+                    sup.test_insert_worker(id).await;
+                    let lease = sup.running_lease(id).unwrap();
+                    lease.test_backdate_idle_baseline(Utc::now().timestamp_millis() - 3_600_000);
+                    (None, Running)
+                }
+                Worker::RunningChild => {
+                    let child = crate::acp::state::SubagentRecord {
+                        session_id: "child".into(),
+                        parent_session_id: "root".into(),
+                        parent_tool_call_id: Some("msg-1".into()),
+                        title: None,
+                        description: None,
+                        state: crate::acp::state::SubagentState::Running,
+                        stop_reason: None,
+                        error: None,
+                        cancel_capable: true,
+                        model: None,
+                        background: true,
+                    };
+                    state
+                        .acp_event_store
+                        .record_at(
+                            id,
+                            2,
+                            &Event::SubagentUpdated {
+                                subagent: child,
+                                at: Utc::now(),
                             },
                             stale_ms,
                         )

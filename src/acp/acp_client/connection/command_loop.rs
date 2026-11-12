@@ -332,6 +332,7 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
+        shared.expire_silent_subagents(now_ms()).await;
         let Some(cost_seen) = shared.between_prompt.take_idle_fire(
             now_ms(),
             shared.aoe.leases.working(now_ms()),

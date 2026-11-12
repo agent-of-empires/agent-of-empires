@@ -1713,6 +1713,26 @@ mod tests {
                 workflow: None,
             },
         );
+        sink.publish(
+            id,
+            2,
+            &Event::SubagentUpdated {
+                subagent: crate::acp::state::SubagentRecord {
+                    session_id: "child".into(),
+                    parent_session_id: "root".into(),
+                    parent_tool_call_id: Some("msg-1".into()),
+                    title: None,
+                    description: None,
+                    state: crate::acp::state::SubagentState::Running,
+                    stop_reason: None,
+                    error: None,
+                    cancel_capable: true,
+                    model: None,
+                    background: true,
+                },
+                at: chrono::Utc::now(),
+            },
+        );
         let sup = Supervisor::new(sink);
         sup.hydrate_seqs(store.all_session_seqs());
         let (client, _client_tx) =
@@ -1743,6 +1763,12 @@ mod tests {
             state.background_agents[0].status,
             BackgroundAgentStatus::Detached
         );
+        assert_eq!(
+            state.subagents[0].stop_reason.as_deref(),
+            Some("cancelled"),
+            "the dropped worker's subagent closes as cancelled"
+        );
+        assert!(store.open_subagents(id).is_empty());
         assert!(
             !state.has_active_background_agent(),
             "the sidebar dot must not stay lit behind a stopped worker"

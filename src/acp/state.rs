@@ -493,6 +493,13 @@ pub enum SubagentState {
     Unknown,
 }
 
+impl SubagentState {
+    /// Still working: it holds its parent busy until it idles.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::RequiresAction)
+    }
+}
+
 /// One subagent session announced by its parent. The event carries the whole
 /// merged snapshot, so replay is last-write-wins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1050,14 +1057,15 @@ impl AcpState {
         }
     }
 
-    /// Whether any background sub-agent or task is still in flight. Agents
-    /// are keyed on `ended_at`, not `status`: a terminal
+    /// Whether any background sub-agent, subagent session or task is still in
+    /// flight. Agents are keyed on `ended_at`, not `status`: a terminal
     /// `BackgroundAgentCompleted` can carry `status: Stalled` (the tailer's
     /// abort timeout gives up without a clean `end_turn`), and that record is
     /// done like any other (#4001).
     pub fn has_active_background_agent(&self) -> bool {
         !self.background_tasks.is_empty()
             || self.background_agents.iter().any(|a| a.ended_at.is_none())
+            || self.subagents.iter().any(|s| s.state.is_active())
     }
 
     /// Task ids can be reused, so only the run still open on `task_id` closes.
@@ -2615,6 +2623,32 @@ mod tests {
         }
         assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
         assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+    }
+
+    /// A child with no `BackgroundAgentLaunched` record keeps the row busy past
+    /// the root's terminal without reopening the main turn.
+    #[test]
+    fn a_working_child_holds_the_sidebar_past_the_root_terminal() {
+        for (state, reason, busy) in [
+            (SubagentState::Running, None, true),
+            (SubagentState::RequiresAction, None, true),
+            (SubagentState::Unknown, None, false),
+            (SubagentState::Idle, Some("end_turn"), false),
+        ] {
+            let mut s = applied([
+                prompt("go"),
+                subagent(SubagentState::Running, None),
+                stopped("end_turn"),
+            ]);
+            assert!(!s.turn_active);
+            assert_eq!(s.sidebar_status(), Status::Running);
+            s.apply_event(s.last_seq + 1, subagent(state, reason))
+                .unwrap();
+            assert!(!s.turn_active, "{state:?}");
+            assert_eq!(s.has_active_background_agent(), busy, "{state:?}");
+            let want = if busy { Status::Running } else { Status::Idle };
+            assert_eq!(s.sidebar_status(), want, "{state:?}");
+        }
     }
 
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {

@@ -1,6 +1,8 @@
 //! Subagent sessions: the ACP subagents RFD's child sessions, which share the
 //! parent's connection and arrive addressed to their own session id.
 
+use std::collections::HashMap;
+
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionMessage, SessionUpdate, StateUpdate, SubagentUpdate,
@@ -65,12 +67,16 @@ fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) 
     });
 }
 
+fn heard_within_floor(seen: &HashMap<String, i64>, child: &str, now_ms: i64) -> bool {
+    let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+    seen.get(child).is_some_and(|at| now_ms - at < floor)
+}
+
 impl Shared {
     /// A child still holds its parent's turn open. One silent past the
     /// off-protocol floor lost its idle update, so it stops counting, whatever
     /// its siblings send.
     pub(super) fn subagent_working(&self, now_ms: i64) -> bool {
-        let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
         let seen = self
             .subagent_seen
             .lock()
@@ -79,12 +85,34 @@ impl Shared {
             .lock()
             .expect("subagents mutex poisoned")
             .iter()
-            .any(|(id, record)| {
-                matches!(
-                    record.state,
-                    SubagentState::Running | SubagentState::RequiresAction
-                ) && seen.get(id).is_some_and(|at| now_ms - at < floor)
+            .any(|(id, record)| record.state.is_active() && heard_within_floor(&seen, id, now_ms))
+    }
+
+    /// Publish each child that fell silent past the floor as cancelled, so the
+    /// log stops counting it. Its idle state keeps it from publishing twice.
+    pub(super) async fn expire_silent_subagents(&self, now_ms: i64) {
+        let expired: Vec<(String, String)> = {
+            let seen = self
+                .subagent_seen
+                .lock()
+                .expect("subagent seen mutex poisoned");
+            self.subagents
+                .lock()
+                .expect("subagents mutex poisoned")
+                .iter()
+                .filter(|(id, record)| {
+                    record.state.is_active() && !heard_within_floor(&seen, id, now_ms)
+                })
+                .map(|(id, record)| (record.parent_session_id.clone(), id.clone()))
+                .collect()
+        };
+        for (parent, child) in expired {
+            self.publish_subagent(&parent.into(), &child.into(), |record| {
+                record.state = SubagentState::Idle;
+                record.stop_reason = Some("cancelled".into());
             })
+            .await;
+        }
     }
 
     /// A running child would lose its routes if the conversation reset.
@@ -93,12 +121,7 @@ impl Shared {
             .lock()
             .expect("subagents mutex poisoned")
             .values()
-            .any(|record| {
-                matches!(
-                    record.state,
-                    SubagentState::Running | SubagentState::RequiresAction
-                )
-            })
+            .any(|record| record.state.is_active())
     }
 
     /// Merge `edit` into the child's snapshot and publish the result.
@@ -837,10 +860,10 @@ mod tests {
     }
 
     /// A child silent past the floor stops holding the turn even while a
-    /// sibling keeps sending traffic.
+    /// sibling keeps sending traffic, and is published cancelled exactly once.
     #[tokio::test]
     async fn a_silent_child_stops_holding_the_turn_whatever_its_siblings_send() {
-        let (_ingress, shared, _events) = harness();
+        let (_ingress, shared, events) = harness();
         let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
         let now = now_ms();
         let child = |id: &str, state| SubagentRecord {
@@ -874,6 +897,30 @@ mod tests {
             .unwrap()
             .insert("stale".into(), now);
         assert!(shared.subagent_working(now));
+
+        shared.expire_silent_subagents(now).await;
+        assert!(shared.subagent_working(now), "a heard child is not expired");
+        let later = now + floor;
+        shared.expire_silent_subagents(later).await;
+        shared.expire_silent_subagents(later).await;
+        let published: Vec<_> = drain(shared, events)
+            .await
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::SubagentUpdated { subagent, .. } => {
+                    Some((subagent.session_id, subagent.state, subagent.stop_reason))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            [(
+                "stale".to_string(),
+                SubagentState::Idle,
+                Some("cancelled".to_string())
+            )]
+        );
     }
 
     /// A child's tool calls nest under the Agent card that spawned it, while
