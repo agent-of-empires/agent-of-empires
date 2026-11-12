@@ -239,6 +239,22 @@ const LIVE_DISMISSALS_SQL: &str = "SELECT i.provider_id, i.item_id FROM suggesti
          SELECT 1 FROM suggestion_dismissals d
          WHERE d.profile = i.profile AND d.provider_id = i.provider_id AND d.item_id = i.item_id)";
 
+/// Round-robin across providers in order, each keeping its own item order, so
+/// a client reading a prefix of the snapshot sees every provider.
+fn interleave(lists: Vec<Vec<Value>>) -> Vec<Value> {
+    let mut iters: Vec<_> = lists.into_iter().map(Vec::into_iter).collect();
+    let mut out = Vec::new();
+    loop {
+        let before = out.len();
+        for it in &mut iters {
+            out.extend(it.next());
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
 pub(crate) fn snapshot(
     conn: &Connection,
     profile: &str,
@@ -251,7 +267,7 @@ pub(crate) fn snapshot(
     let stored = provider_prefs(conn, profile)?;
     let order = ordered_indexes(providers, &stored);
     let mut out_providers = Vec::with_capacity(providers.len());
-    let mut out_items = Vec::new();
+    let mut per_provider: Vec<Vec<Value>> = Vec::new();
     for &index in &order {
         let provider = &providers[index];
         let enabled = stored.get(&provider.id).is_none_or(|p| p.0);
@@ -304,14 +320,17 @@ pub(crate) fn snapshot(
         if !enabled {
             continue;
         }
+        let mut items = Vec::new();
         for item in load_items(conn, profile, provider)? {
             let is_dismissed = dismissed.contains(&(provider.id.clone(), item.id.clone()));
             let mut value = serde_json::to_value(&item)?;
             value["provider_id"] = json!(provider.id);
             value["dismissed"] = json!(is_dismissed);
-            out_items.push(value);
+            items.push(value);
         }
+        per_provider.push(items);
     }
+    let out_items = interleave(per_provider);
     let order_ids: Vec<&str> = order.iter().map(|&i| providers[i].id.as_str()).collect();
     let prefs = prefs_json(load_prefs(conn, profile)?, &order_ids);
     Ok(json!({ "providers": out_providers, "items": out_items, "prefs": prefs }))
@@ -484,6 +503,37 @@ pub(crate) fn list_mappings(conn: &Connection, profile: &str) -> anyhow::Result<
 mod tests {
     use super::fixtures::*;
     use super::*;
+
+    #[test]
+    fn providers_interleave_in_saved_order_each_keeping_its_own_order() {
+        let conn = store();
+        let other = Provider {
+            id: "acme.other".into(),
+            ..provider()
+        };
+        let providers = [provider(), other];
+        let publish_for = |id: &str, ids: &[&str]| {
+            let items: Vec<_> = ids.iter().map(|i| item(i, "assigned")).collect();
+            set(&conn, "p", id, &spec(), &json!({ "items": items })).unwrap();
+        };
+        publish_for("acme.github", &["a1", "a2", "a3"]);
+        publish_for("acme.other", &["b1"]);
+        let read = |conn: &Connection| {
+            let snapshot = snapshot(conn, "p", &providers).unwrap();
+            ids(&snapshot)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(&conn), ["a1", "b1", "a2", "a3"]);
+
+        let patch =
+            serde_json::from_value(json!({ "provider_order": ["acme.other", "acme.github"] }))
+                .unwrap();
+        let known = ["acme.github".to_string(), "acme.other".to_string()];
+        apply_prefs(&conn, "p", &known, &patch).unwrap().unwrap();
+        assert_eq!(read(&conn), ["b1", "a1", "a2", "a3"]);
+    }
 
     #[test]
     fn dismissals_persist_across_publishes_and_need_a_live_item() {
