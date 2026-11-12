@@ -53,6 +53,31 @@ fn overlay_hover_rects(entries: &[(usize, Rect)], fields: &[(usize, Rect)]) -> V
 const PROMPT_TEXT_WIDTH: usize = 68;
 const PROMPT_MAX_ROWS: usize = 4;
 
+/// Splits `text` into rows of at most `PROMPT_TEXT_WIDTH` display cells, as
+/// `(index of the row's first char, row text)`. A row that fills the width is
+/// followed by an empty one, which is where the cursor goes.
+pub(super) fn wrap_prompt(text: &str) -> Vec<(usize, String)> {
+    let mut rows = vec![(0, String::new())];
+    let mut cells = 0;
+    let mut count = 0;
+    for (index, ch) in text.chars().enumerate() {
+        let width = ch.width().unwrap_or(0);
+        if cells + width > PROMPT_TEXT_WIDTH {
+            rows.push((index, String::new()));
+            cells = 0;
+        }
+        if let Some((_, row)) = rows.last_mut() {
+            row.push(ch);
+        }
+        cells += width;
+        count = index + 1;
+    }
+    if cells == PROMPT_TEXT_WIDTH {
+        rows.push((count, String::new()));
+    }
+    rows
+}
+
 /// Provider text is untrusted: one cell per char, with newlines shown as `⏎`
 /// and other control or bidi characters replaced, so nothing can move the
 /// terminal or reorder the line.
@@ -621,8 +646,9 @@ impl NewSessionDialog {
     /// Rows the wrapped prompt needs (cursor cell included) plus the
     /// provenance sub-line of a suggestion.
     fn prompt_height(&self) -> u16 {
-        let chars = self.prompt.value().chars().count() + 1;
-        chars.div_ceil(PROMPT_TEXT_WIDTH).clamp(1, PROMPT_MAX_ROWS) as u16
+        wrap_prompt(&prompt_display(self.prompt.value()))
+            .len()
+            .clamp(1, PROMPT_MAX_ROWS) as u16
             + u16::from(self.prompt_origin.is_some())
     }
 
@@ -635,11 +661,14 @@ impl NewSessionDialog {
             Style::default().fg(theme.text)
         };
         let value_style = Style::default().fg(if focused { theme.accent } else { theme.text });
-        let chars: Vec<char> = prompt_display(self.prompt.value()).chars().collect();
+        let wrapped = wrap_prompt(&prompt_display(self.prompt.value()));
         let sub_line = usize::from(self.prompt_origin.is_some());
         let rows = (area.height as usize).saturating_sub(sub_line);
         let cursor = self.prompt.cursor();
-        let cursor_row = cursor / PROMPT_TEXT_WIDTH;
+        let cursor_row = wrapped
+            .iter()
+            .rposition(|(first, _)| *first <= cursor)
+            .unwrap_or(0);
         let start = if focused {
             (cursor_row + 1).saturating_sub(rows)
         } else {
@@ -647,11 +676,10 @@ impl NewSessionDialog {
         };
         let mut lines: Vec<Line> = Vec::new();
         for row in start..start + rows {
-            let text: String = chars
-                .iter()
-                .skip(row * PROMPT_TEXT_WIDTH)
-                .take(PROMPT_TEXT_WIDTH)
-                .collect();
+            let text = wrapped
+                .get(row)
+                .map_or("", |(_, text)| text.as_str())
+                .to_owned();
             let prefix = if row == start {
                 Span::styled("Prompt:", label_style)
             } else {
@@ -674,7 +702,13 @@ impl NewSessionDialog {
         }
         frame.render_widget(Paragraph::new(lines), area);
         if focused {
-            let col = (cursor % PROMPT_TEXT_WIDTH) as u16;
+            let (first, text) = &wrapped[cursor_row];
+            let col: usize = text
+                .chars()
+                .take(cursor - first)
+                .map(|c| c.width().unwrap_or(0))
+                .sum();
+            let col = col as u16;
             let row = cursor_row.saturating_sub(start) as u16;
             frame.set_cursor_position(Position::new(
                 area.x + 8 + col.min(area.width.saturating_sub(9)),

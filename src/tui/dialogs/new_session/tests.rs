@@ -2474,3 +2474,43 @@ fn workspace_is_unavailable_when_attaching_an_existing_branch() {
     dialog.create_new_branch = true;
     assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
 }
+
+#[test]
+fn the_prompt_wraps_and_places_the_cursor_by_display_cells() {
+    use super::render::wrap_prompt;
+    // 40 double-width characters are 80 cells: 34 fit a 68-cell row.
+    let rows = wrap_prompt(&"\u{4e2d}".repeat(40));
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].0, rows[0].1.chars().count()), (0, 34));
+    assert_eq!((rows[1].0, rows[1].1.chars().count()), (34, 6));
+    // A row filled to the width leaves an empty one for the cursor.
+    let rows = wrap_prompt(&"\u{4e2d}".repeat(34));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1], (34, String::new()));
+    assert_eq!(wrap_prompt("").len(), 1);
+}
+
+#[test]
+fn an_unresolved_project_waits_for_a_path_before_submitting() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("Review PR 4562".to_string(), github_origin());
+    dialog.require_path();
+    assert_eq!(dialog.focused_field, dialog.field_indices().path);
+    assert!(matches!(
+        dialog.handle_key(key(KeyCode::Enter)),
+        DialogResult::Continue
+    ));
+    assert!(dialog
+        .error_message
+        .as_deref()
+        .is_some_and(|e| e.contains("Pick a project path")));
+    assert_eq!(
+        dialog.prompt.value(),
+        "Review PR 4562",
+        "the prompt is kept"
+    );
+
+    dialog.set_path(TEST_PATH.to_string());
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert_eq!(data.initial_prompt.as_deref(), Some("Review PR 4562"));
+}

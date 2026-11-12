@@ -307,6 +307,8 @@ pub struct NewSessionDialog {
     prompt_origin: Option<PromptOrigin>,
     /// Overlay with `prompt_origin.source_text`, opened by Ctrl+P on the Prompt row.
     pub(super) show_prompt_source: bool,
+    /// A suggestion left the path unresolved: submit waits for the user to pick one.
+    path_required: bool,
     /// `(focused_field_index, rect)` per main-form field, repopulated every
     /// frame and empty while an overlay is up, so a click during one cannot
     /// snap focus to the field that used to sit there.
@@ -690,6 +692,7 @@ impl NewSessionDialog {
             prompt: Input::default(),
             prompt_origin: None,
             show_prompt_source: false,
+            path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -709,6 +712,13 @@ impl NewSessionDialog {
             let config = self.resolve_config_for_path(self.selected_profile());
             self.refresh_path_agent_config(&config);
         }
+    }
+
+    /// Leaves the path empty and focused until the user picks a project.
+    pub fn require_path(&mut self) {
+        self.path = Input::new(String::new());
+        self.path_required = true;
+        self.focused_field = self.path_field();
     }
 
     pub fn set_group(&mut self, group: String) {
@@ -1316,6 +1326,7 @@ impl NewSessionDialog {
             prompt: Input::default(),
             prompt_origin: None,
             show_prompt_source: false,
+            path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1405,6 +1416,7 @@ impl NewSessionDialog {
             prompt: Input::default(),
             prompt_origin: None,
             show_prompt_source: false,
+            path_required: false,
             focusable_rects: Vec::new(),
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
@@ -1752,6 +1764,11 @@ impl NewSessionDialog {
                 self.error_message = None;
                 if self.focused_field == self.path_field() {
                     self.seed_defaults_for_path();
+                }
+                if self.path_required && !self.scratch && self.path.value().trim().is_empty() {
+                    self.error_message = Some("Pick a project path before starting.".into());
+                    self.focused_field = self.path_field();
+                    return DialogResult::Continue;
                 }
                 // The server provisions the scratch dir, so no path check.
                 if !self.scratch {
