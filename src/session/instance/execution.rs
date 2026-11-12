@@ -4313,8 +4313,9 @@ sandbox = "unsupported"
     #[serial_test::serial]
     fn declared_omp_recovery_binds_its_own_store_transcript() {
         let temp = tempfile::tempdir().unwrap();
-        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        // Declared first so it reloads after the app directory is restored.
         let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _env = crate::session::test_support::EnvGuard::set(&[
             ("HOME", temp.path().to_path_buf()),
             ("XDG_CONFIG_HOME", temp.path().join(".config")),
