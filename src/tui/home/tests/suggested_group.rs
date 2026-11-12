@@ -636,3 +636,17 @@ fn an_undelivered_first_prompt_is_announced_once_per_failure() {
     env.view.announce_prompt_failure(&row);
     assert!(env.view.info_dialog.is_some(), "a new failure is announced");
 }
+
+#[test]
+#[serial]
+fn open_on_an_unknown_session_says_so_and_keeps_the_full_view() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.open_suggestions_view();
+    assert!(!env.view.open_linked_session("gone"));
+    assert!(env
+        .view
+        .status_flash_text()
+        .unwrap()
+        .contains("no longer exists"));
+    assert!(env.view.suggestions_view.is_some());
+}

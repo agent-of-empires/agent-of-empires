@@ -93,7 +93,9 @@ impl HomeView {
                 .entry(&key)
                 .and_then(|e| e.started_session)
             {
-                Some(id) => self.jump_to_session_id(&id),
+                Some(id) => {
+                    self.open_linked_session(&id);
+                }
                 None if self.mutations_blocked() => {}
                 None => self.suggestions_feed.prepare(key),
             }
@@ -107,6 +109,41 @@ impl HomeView {
             return true;
         }
         false
+    }
+
+    /// Selects the Session a suggestion was started as, expanding the Archived
+    /// or Trash section or switching profile when that is where it sits. False,
+    /// with the reason flashed, when it cannot be shown.
+    pub(super) fn open_linked_session(&mut self, id: &str) -> bool {
+        let Some(row) = self.session_feed.applied_session(id) else {
+            self.flash_status("That session no longer exists");
+            return false;
+        };
+        let (profile, trashed, archived) = (
+            row.profile.clone(),
+            row.trashed_at.is_some(),
+            row.archived_at.is_some(),
+        );
+        if self.active_profile.as_deref().is_some_and(|p| p != profile) {
+            if let Err(error) = self.switch_profile(Some(profile)) {
+                self.flash_status(format!(
+                    "Could not switch to the session's profile: {error}"
+                ));
+                return false;
+            }
+        }
+        if trashed {
+            self.trashed_section_collapsed = false;
+        } else if archived {
+            self.archived_section_collapsed = false;
+        }
+        self.rebuild_flat_items();
+        self.jump_to_session_id(id);
+        let shown = self.selected_session.as_deref() == Some(id);
+        if !shown {
+            self.flash_status("That session could not be shown");
+        }
+        shown
     }
 
     /// Flashes why the daemon refuses mutations; true when it does.
