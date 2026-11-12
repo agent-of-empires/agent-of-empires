@@ -70,7 +70,11 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
     setError(`Could not save ${failures.join("; ")}`);
     await load();
   };
-  useConfirmKeys(onClose, () => void save(), busy);
+  // Escape and the backdrop would otherwise close the wizard under requests still in flight.
+  const dismiss = () => {
+    if (!busy) onClose();
+  };
+  useConfirmKeys(dismiss, () => void save(), busy);
 
   const multi = providers.length > 1;
   const providerName = (id: string) => providers.find((p) => p.id === id)?.name ?? id;
@@ -124,7 +128,7 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
       panelClassName="w-[640px]"
       bodyClassName="max-h-[60vh] overflow-y-auto px-5 py-4"
       describedBy="suggestion-mapping-wizard-intro"
-      onDismiss={onClose}
+      onDismiss={dismiss}
       footer={
         <>
           <CancelButton onClick={onClose} disabled={busy} />
