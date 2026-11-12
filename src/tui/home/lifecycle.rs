@@ -204,6 +204,7 @@ impl HomeView {
             pending_native_attachment: None,
             live_send: None,
             live_send_worker: None,
+            vt_yield: None,
             preview_capture_worker: None,
             preview_capture_target: None,
             preview_worker_pulse: None,
