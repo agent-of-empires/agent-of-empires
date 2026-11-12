@@ -546,6 +546,8 @@ pub struct TrashSessionBody {
     /// Reject a lifecycle change after the caller captured its target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_profile: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -580,9 +582,11 @@ impl Default for TrashSessionBody {
         Self {
             kill_pane: default_kill_pane(),
             expected_generation: None,
+            expected_profile: None,
         }
     }
 }
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DeleteSessionBody {
     #[serde(default)]

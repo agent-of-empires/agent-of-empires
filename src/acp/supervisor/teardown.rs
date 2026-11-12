@@ -79,6 +79,28 @@ impl RetirementResources {
         }));
     }
 
+    /// A reattach supersedes a lost connection, keeping any close it owed.
+    pub(super) fn replace_client(&self, lost: &Arc<AcpClient>, next: &Arc<AcpClient>) {
+        use std::sync::atomic::Ordering;
+        let mut clients = lock_recover(&self.clients);
+        let Some(slot) = clients.iter_mut().find(|slot| {
+            slot.as_ref()
+                .is_some_and(|entry| Arc::ptr_eq(&entry.client, lost))
+        }) else {
+            drop(clients);
+            return self.record_client(next, false);
+        };
+        let close = slot
+            .as_ref()
+            .is_some_and(|entry| entry.close_requested.load(Ordering::Acquire));
+        *slot = Some(Arc::new(RetiringClient {
+            client: Arc::clone(next),
+            close_requested: std::sync::atomic::AtomicBool::new(close),
+            close_done: std::sync::atomic::AtomicBool::new(false),
+            shutdown_done: std::sync::atomic::AtomicBool::new(false),
+        }));
+    }
+
     pub(super) fn record_worker(&self, handle: WorkerHandle) {
         if is_test_worker(&handle) {
             self.emit_events

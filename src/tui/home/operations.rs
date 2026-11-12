@@ -842,22 +842,18 @@ impl HomeView {
         });
         Ok(())
     }
-    /// Move a session to the trash and set `trashed_at`. Durable artifacts are
-    /// kept so it can be restored. The Trash section's collapse state is left
-    /// untouched: like single-row archive, the section header's count is the
-    /// feedback, so a user who collapsed it stays collapsed (#2489).
-    ///
-    /// The daemon commits the trash reservation, teardown and relocation; UI follows its receipt fence.
+    /// Preserve the shelf's collapsed state; teardown and relocation remain daemon-owned.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
         let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
             self.flash_status("Runtime unavailable; reopen Trash controls");
             return;
         };
-        self.trash_session_by_id_at_epoch(id, &epoch);
+        self.trash_session_by_id_at_epoch(id, epoch);
     }
 
-    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, epoch: &str) {
-        if self.session_feed.applied_epoch() != Some(epoch) {
+    
+    pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, expected_epoch: String) {
+        if self.session_feed.applied_epoch() != Some(expected_epoch.as_str()) {
             self.flash_status("Runtime changed; reopen Trash controls");
             return;
         }
@@ -868,17 +864,52 @@ impl HomeView {
             return;
         };
         let generation = instance.lifecycle_generation;
+        let profile = instance.source_profile.clone();
         if let Err(error) = self.session_feed.submit_request(
             id.to_owned(),
-            crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-                kill_pane: true,
-                expected_generation: Some(generation),
-            }),
+            crate::tui::session_feed::SessionRequest::Trash {
+                body: crate::daemon::TrashSessionBody {
+                    kill_pane: true,
+                    expected_generation: Some(generation),
+                    expected_profile: Some(profile),
+                },
+                expected_epoch,
+            },
         ) {
             self.info_dialog = Some(InfoDialog::new(
                 "Could Not Trash Session",
                 &error.to_string(),
             ));
+        }
+    }
+
+    pub(super) fn retry_selected_trash(&mut self) {
+        let Some(instance) = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|instance| instance.has_pending_trash())
+        else {
+            return;
+        };
+        let id = instance.id.clone();
+        let Some(expected_epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
+            self.flash_status("Runtime unavailable; reopen Trash controls");
+            return;
+        };
+        let body = crate::daemon::TrashSessionBody {
+            kill_pane: true,
+            expected_generation: Some(instance.lifecycle_generation),
+            expected_profile: Some(instance.source_profile.clone()),
+        };
+        if let Err(error) = self.session_feed.submit_request(
+            id,
+            crate::tui::session_feed::SessionRequest::Trash {
+                body,
+                expected_epoch,
+            },
+        ) {
+            self.info_dialog = Some(InfoDialog::new("Could Not Retry Trash", &error.to_string()));
         }
     }
 

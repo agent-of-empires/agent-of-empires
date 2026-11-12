@@ -60,7 +60,10 @@ const COMMAND_CAPACITY: usize = 32;
 
 pub(crate) enum SessionRequest {
     Mutation(SessionMutation),
-    Trash(crate::daemon::TrashSessionBody),
+    Trash {
+        body: crate::daemon::TrashSessionBody,
+        expected_epoch: String,
+    },
     Purge(crate::daemon::DeleteSessionBody),
     Restore,
     Rename(crate::daemon::RenameSessionBody),
@@ -240,7 +243,6 @@ pub(crate) struct CapturedRequest {
     pub request: SessionRequest,
     reply: tokio::sync::oneshot::Sender<Result<CommandReply, CommandFailure>>,
 }
-
 #[cfg(test)]
 impl CapturedRequest {
     pub fn finish(self, result: Result<SessionCommandOutcome, String>) {
@@ -533,8 +535,11 @@ async fn run_queued_command(
                             })
                         })
                 }
-                SessionRequest::Trash(body) => client
-                    .trash_session(&id, &body, epoch)
+                SessionRequest::Trash {
+                    body,
+                    expected_epoch,
+                } => client
+                    .trash_session(&id, &body, &expected_epoch)
                     .await
                     .map(CommandReply::Trash),
                 SessionRequest::Purge(body) => client

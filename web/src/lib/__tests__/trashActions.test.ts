@@ -50,38 +50,43 @@ describe("trash and restore loops (#2489)", () => {
   });
 
   it("restoreSessions applies snapshots and toasts the aggregate", async () => {
-    restoreMock.mockImplementation(async (id: string) => (id === "bad" ? null : snap(id)));
-    const applySession = vi.fn();
+    restoreMock.mockImplementation(async (id: string) =>
+      id === "bad" ? null : { session: snap(id), cursor: { epoch: "boot", revision: 12n } },
+    );
+    const applySessionMutation = vi.fn();
     const notify = notifier();
-    expect(await restoreSessions(["a", "b"], { applySession, notify })).toBe(true);
-    expect(applySession).toHaveBeenCalledTimes(2);
+    expect(await restoreSessions(["a", "b"], { applySessionMutation, notify })).toBe(true);
+    expect(applySessionMutation).toHaveBeenCalledTimes(2);
     expect(notify.info).toHaveBeenCalledWith("Session restored");
-    expect(await restoreSessions(["bad"], { applySession, notify })).toBe(false);
+    expect(await restoreSessions(["bad"], { applySessionMutation, notify })).toBe(false);
     expect(notify.error).toHaveBeenCalledWith("Failed to restore session");
   });
 
   it("surfaces the warnings of a landed trash or restore", async () => {
     const warned = { ...snap("a"), warnings: ["submodule x is not repointed"] } as SessionResponse;
     trashMock.mockResolvedValue(warned);
-    restoreMock.mockResolvedValue(warned);
+    restoreMock.mockResolvedValue({ session: warned, cursor: { epoch: "boot", revision: 12n } });
     const notify = notifier();
     await trashSessions(["a"], { applySession: vi.fn(), onError: vi.fn(), notify });
-    await restoreSessions(["a"], { applySession: vi.fn(), notify });
+    await restoreSessions(["a"], { applySessionMutation: vi.fn(), notify });
     expect(notify.info.mock.calls.filter(([m]) => m === "submodule x is not repointed")).toHaveLength(2);
   });
 
   it("tolerates a null notifier", async () => {
     trashMock.mockResolvedValue(snap("a"));
-    restoreMock.mockResolvedValue(snap("a"));
+    restoreMock.mockResolvedValue({ session: snap("a"), cursor: { epoch: "boot", revision: 12n } });
     await expect(trashSessions(["a"], { applySession: vi.fn(), onError: vi.fn(), notify: null })).resolves.toBe(true);
-    await expect(restoreSessions(["a"], { applySession: vi.fn(), notify: null })).resolves.toBe(true);
+    await expect(restoreSessions(["a"], { applySessionMutation: vi.fn(), notify: null })).resolves.toBe(true);
   });
 });
 
 describe("trashedWorkspaceRestoreIds (#2593)", () => {
-  it("returns every session id in the containing workspace, else just the session id", () => {
-    const workspaces = [ws("w1", ["a", "b"]), ws("w2", ["c"])];
-    expect(trashedWorkspaceRestoreIds(workspaces, "b")).toEqual(["a", "b"]);
+  it("restores trashed members without targeting a live sibling", () => {
+    const first = ws("w1", ["a", "b"]);
+    first.sessions[0]!.trashed_at = "2026-01-01T00:00:00Z";
+    const workspaces = [first, ws("w2", ["c"])];
+    expect(trashedWorkspaceRestoreIds(workspaces, "a")).toEqual(["a"]);
+    expect(trashedWorkspaceRestoreIds(workspaces, "c")).toEqual([]);
     expect(trashedWorkspaceRestoreIds(workspaces, "orphan")).toEqual(["orphan"]);
   });
 });

@@ -219,8 +219,25 @@ reload. See [retained history internals](development/internals/structured-view.m
 for storage, clipboard ownership, and terminal transport invariants.
 
 Dialogs close when their target session changes or disappears. Trash context
-menus reject actions if the original session, profile, lifecycle generation, or
-runtime epoch changes. Restore and deletion never target a replacement selection.
+menus reject actions if their original session, profile, lifecycle generation,
+or runtime epoch changes. Restore and permanent deletion never target a
+replacement selection.
+
+An unfinished Trash transition offers **Retry Trash** in the TUI context menu and
+web Trash controls. A fresh owner remains busy; an unverified retained checkout
+can still prevent completion. Retry is an explicit management action, never part
+of opening the transcript.
+The TUI command palette exposes Restore and Retry Trash using
+the same lifecycle-gated actions as the context menu. Opening Trash confirmation
+captures its runtime epoch; a daemon replacement invalidates the confirmation.
+Trash remains read-only without discarding untargeted pending composer paste.
+Web recovery lists unfinished members of mixed live/Trash workspaces separately.
+It never retries or restores a live sibling. Restore receipts keep their native
+revision so a late older Retry cannot replace the restored row.
+
+If Retry cannot verify the checkout, keep the record in Trash and inspect its
+retained history read-only. There is no record-only removal action. A fresh
+runtime, profile, or lifecycle generation requires fresh recovery consent.
 
 The reader shows retained ACP history, including events
 recorded before a switch to terminal view. Missing or unreadable event ranges

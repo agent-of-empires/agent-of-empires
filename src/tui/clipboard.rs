@@ -459,6 +459,97 @@ mod tests {
     use super::*;
     use base64::Engine;
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_clipboard_helper_that_never_reads_cannot_hold_its_input_writer() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        struct ReleaseGate(File);
+        impl Drop for ReleaseGate {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"release\n");
+            }
+        }
+
+        let _environment = crate::session::test_support::EnvGuard::read_lock();
+        let fixture = tempfile::tempdir().unwrap();
+        let entered = fixture.path().join("entered");
+        let path = fixture.path().join("gate");
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let mut export = tempfile::NamedTempFile::new_in(fixture.path()).unwrap();
+        export
+            .write_all(&vec![b'x'; OSC52_MAX_BYTES as usize])
+            .unwrap();
+        let marker = entered.clone();
+        let (finished, received) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let release = ReleaseGate(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(nix::libc::O_NONBLOCK)
+                    .open(&path)
+                    .unwrap(),
+            );
+            let worker = scope.spawn(move || {
+                let mut input = finalize_export(export).unwrap();
+                let result = run_subprocess(
+                    "sh",
+                    &[
+                        "-c",
+                        "printf '%s\\n' \"$$\" > \"$1\"; read -r line < \"$2\"",
+                        "sh",
+                        marker.to_str().unwrap(),
+                        path.to_str().unwrap(),
+                    ],
+                    &mut input,
+                    Duration::from_millis(500),
+                    &CancellationToken::new(),
+                );
+                assert!(finished.send(result).is_ok());
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let pid = loop {
+                if let Some(pid) = std::fs::read_to_string(&entered)
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<i32>().ok())
+                    .filter(|pid| *pid > 0)
+                {
+                    break nix::unistd::Pid::from_raw(pid);
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "clipboard fixture did not enter"
+                );
+                std::thread::yield_now();
+            };
+            let result = received.recv_timeout(Duration::from_secs(2));
+            let reaped_before_release =
+                nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+            if matches!(
+                reaped_before_release,
+                Ok(nix::sys::wait::WaitStatus::StillAlive)
+            ) {
+                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                let _ = nix::sys::wait::waitpid(pid, None);
+            }
+            drop(release);
+            worker.join().unwrap();
+            assert!(
+                matches!(reaped_before_release, Err(nix::errno::Errno::ECHILD)),
+                "helper must exit and be reaped before FIFO release: {reaped_before_release:?}"
+            );
+            assert!(result
+                .expect("stdin write outlived the helper deadline")
+                .is_err());
+        });
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     #[serial_test::serial]

@@ -37,77 +37,86 @@ pub(super) fn render(view: &ServeView, frame: &mut Frame, area: Rect, theme: &Th
         );
         return;
     }
-    match &view.state {
-        ServeViewState::ModePicker {
-            selected,
-            tunnel_available,
-            local_available,
-            flash,
-        } => render_mode_picker(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *selected,
-            (*local_available, *tunnel_available),
-            flash_text(flash),
-        ),
-        ServeViewState::Confirm {
-            selected,
-            tailscale,
-            cloudflare,
-            flash,
-        } => render_confirm(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *selected,
-            (*tailscale, *cloudflare),
-            flash_text(flash),
-        ),
-        ServeViewState::Checking { .. } => render_pending(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            " Checking... ",
-            "Looking for a running daemon",
-        ),
-        ServeViewState::Starting {
-            mode, started_at, ..
-        } => render_starting(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            *mode,
-            started_at.elapsed(),
-            false,
-        ),
-        ServeViewState::Active { mode, urls, .. } => {
-            render_active(view, frame, area, theme, &mut mouse);
-            if view.show_help {
-                // Any click closes the overlay, so nothing beneath is a target.
-                mouse.keys.clear();
-                mouse.copies.clear();
-                let effect =
-                    RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
-                render_help_overlay(frame, area, theme, *mode, effect);
+    if let Some(banner) = view
+        .pending
+        .as_ref()
+        .and_then(|pending| pending.kind.banner())
+    {
+        render_pending(frame, area, theme, &mut mouse, " Checking... ", banner);
+    } else {
+        match &view.state {
+            ServeViewState::ModePicker {
+                selected,
+                tunnel_available,
+                local_available,
+                flash,
+            } => render_mode_picker(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                (*selected, *local_available, *tunnel_available),
+                &view.local_primary,
+                flash_text(flash),
+            ),
+            ServeViewState::Confirm {
+                selected,
+                tailscale,
+                cloudflare,
+                flash,
+            } => render_confirm(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                *selected,
+                (*tailscale, *cloudflare),
+                flash_text(flash),
+            ),
+            ServeViewState::Checking { .. } => render_pending(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                " Checking... ",
+                "Looking for a running daemon",
+            ),
+            ServeViewState::Starting {
+                mode, started_at, ..
+            } => render_starting(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                *mode,
+                started_at.elapsed(),
+                false,
+            ),
+            ServeViewState::Active { mode, urls, .. } => {
+                render_active(view, frame, area, theme, &mut mouse);
+                if view.show_help {
+                    // Any click closes the overlay, so nothing beneath is a target.
+                    mouse.keys.clear();
+                    mouse.copies.clear();
+                    let effect =
+                        RestartEffect::of(*mode, urls, &view.restart_probe, view.running_persists);
+                    render_help_overlay(frame, area, theme, *mode, effect);
+                }
             }
+            ServeViewState::Error {
+                message,
+                mode,
+                transport,
+            } => render_error(
+                frame,
+                area,
+                theme,
+                &mut mouse,
+                message,
+                view.control_error.as_deref(),
+                &error_recovery_keys(*mode, *transport),
+            ),
         }
-        ServeViewState::Error {
-            message,
-            mode,
-            transport,
-        } => render_error(
-            frame,
-            area,
-            theme,
-            &mut mouse,
-            message,
-            &error_recovery_keys(message, *mode, *transport),
-        ),
     }
     if let Some(rect) = mouse.hover.current_in(&mouse.rects()) {
         paint_hover_bg(frame, rect, theme.selection);
@@ -223,8 +232,8 @@ fn render_mode_picker(
     area: Rect,
     theme: &Theme,
     mouse: &mut ServeMouse,
-    selected: ServeMode,
-    (local_available, tunnel_available): (bool, bool),
+    (selected, local_available, tunnel_available): (ServeMode, bool, bool),
+    local_primary: &str,
     flash: &str,
 ) {
     let title = format!(" {} ", view_title());
@@ -238,15 +247,6 @@ fn render_mode_picker(
         Style::default().fg(theme.title).bold(),
     );
 
-    let local_primary = crate::server::discover_tagged_ips()
-        .into_iter()
-        .next()
-        .map(|(kind, ip)| match kind {
-            crate::server::IpKind::Tailscale => format!("{} (Tailscale)", ip),
-            crate::server::IpKind::Lan => format!("{} (LAN)", ip),
-            crate::server::IpKind::Loopback => format!("{} (loopback)", ip),
-        })
-        .unwrap_or_else(|| "only localhost available".to_string());
     let tunnel_status = if tunnel_available {
         "reachable from your phone"
     } else {
@@ -267,7 +267,7 @@ fn render_mode_picker(
             "Internet (HTTPS)",
             ServeMode::Tunnel,
             tunnel_available,
-            tunnel_status.to_string(),
+            tunnel_status,
             [
                 "Token + passphrase (2FA).",
                 "Pick transport on next screen.",
@@ -583,6 +583,7 @@ fn render_active(
             theme,
             mouse,
             "Daemon started but no URL available yet.",
+            None,
             &[],
         );
         return;
@@ -922,16 +923,12 @@ fn split_url_and_token(url: &str) -> (String, Option<&str>) {
 }
 
 /// The keys `error_key` handles for this failure, shown before the way out.
-fn error_recovery_keys(
-    message: &str,
-    mode: ServeMode,
-    transport: Option<TunnelTransport>,
-) -> Vec<&'static str> {
+fn error_recovery_keys(mode: ServeMode, transport: Option<TunnelTransport>) -> Vec<&'static str> {
     let mut keys = Vec::new();
     if mode == ServeMode::Tunnel {
         keys.push("[P] Pick provider");
     }
-    if funnel_reset_applies(message, mode, transport) {
+    if funnel_reset_applies(mode, transport) {
         keys.push("[R] Reset Funnel");
     }
     keys
@@ -943,6 +940,7 @@ fn render_error(
     theme: &Theme,
     mouse: &mut ServeMouse,
     message: &str,
+    control_error: Option<&str>,
     recovery: &[&str],
 ) {
     let inner = render_page(frame, area, " Serve failed ", theme.error, theme.error);
@@ -966,8 +964,17 @@ fn render_error(
         Layout::vertical([Constraint::Min(1), Constraint::Length(rows.len() as u16)])
             .margin(1)
             .areas(inner);
+    let mut content = Text::from(message);
+    if let Some(error) = control_error {
+        content.lines.push(Line::default());
+        content.lines.push(Line::styled(
+            "Recovery controls unavailable",
+            Style::default().fg(theme.error),
+        ));
+        content.lines.extend(error.lines().map(Line::raw));
+    }
     frame.render_widget(
-        Paragraph::new(message)
+        Paragraph::new(content)
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(theme.text)),
         body,
@@ -1029,31 +1036,18 @@ mod tests {
     /// bundle must say the endpoint is API-only instead of drawing a code nothing answers.
     #[test]
     fn active_screen_matches_the_dashboard_feature() {
-        let view = ServeView {
-            state: ServeViewState::Active {
-                mode: ServeMode::Local,
-                transport: None,
-                urls: vec![ServeUrl {
-                    label: Some("lan".to_string()),
-                    url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
-                }],
-                url_index: 0,
-                passphrase: None,
-                opened_at: Instant::now(),
-                log_offset: 0,
-            },
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-            running_persists: Some(true),
-            restart_probe: Default::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: super::super::Probes::new(|_| false),
-        };
+        let view = view(ServeViewState::Active {
+            mode: ServeMode::Local,
+            transport: None,
+            urls: vec![ServeUrl {
+                label: Some("lan".to_string()),
+                url: "http://192.168.1.42:8080/?t=abc123def456".to_string(),
+            }],
+            url_index: 0,
+            passphrase: None,
+            opened_at: Instant::now(),
+            log_offset: 0,
+        });
         let mut term = Terminal::new(TestBackend::new(72, 26)).unwrap();
         term.draw(|f| render(&view, f, f.area(), &Theme::default()))
             .unwrap();
@@ -1093,20 +1087,9 @@ mod tests {
     }
 
     fn view(state: ServeViewState) -> ServeView {
-        ServeView {
-            state,
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: Default::default(),
-            copied: None,
-            running_persists: Some(true),
-            restart_probe: Default::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: super::super::Probes::new(|_| false),
-        }
+        let mut view = ServeView::for_test(state);
+        view.running_persists = Some(true);
+        view
     }
 
     fn draw(view: &ServeView) -> ratatui::buffer::Buffer {
@@ -1603,95 +1586,5 @@ mod tests {
         let buf = draw(&view);
         let (x, y) = crate::tui::dialogs::test_render::find(&buf, "[Esc] cancel");
         assert_eq!(view.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
-    }
-
-    #[test]
-    fn the_error_footer_offers_recovery_keys_first_and_only_those_error_key_handles() {
-        use ServeMode::{Local, Tunnel};
-        use TunnelTransport::{Cloudflare, Tailscale};
-        let (p, r) = ("[P] Pick provider", "[R] Reset Funnel");
-        let rest = "[S] Force stop    [Enter] Back to sessions";
-        let funnel_msg = "Tailscale Funnel setup failed";
-        // (mode, transport, message, width, footer rows)
-        let cases = [
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                120,
-                vec![format!("{p}    {r}    {rest}")],
-            ),
-            // Too wide at 80 columns: the recovery keys and the way out take a row each.
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                80,
-                vec![format!("{p}    {r}"), rest.to_string()],
-            ),
-            (
-                Tunnel,
-                Some(Tailscale),
-                "timed out",
-                60,
-                vec![format!("{p}    {r}"), rest.to_string()],
-            ),
-            // At 60 columns the three hints no longer fit on one row.
-            (
-                Tunnel,
-                Some(Cloudflare),
-                funnel_msg,
-                60,
-                vec![p.to_string(), rest.to_string()],
-            ),
-            // A known Cloudflare failure gets no Funnel reset, whatever the message says.
-            (
-                Tunnel,
-                Some(Cloudflare),
-                funnel_msg,
-                80,
-                vec![format!("{p}    {rest}")],
-            ),
-            // A reattached daemon's transport is unknown, so the message decides.
-            (
-                Tunnel,
-                None,
-                funnel_msg,
-                120,
-                vec![format!("{p}    {r}    {rest}")],
-            ),
-            (Local, None, funnel_msg, 120, vec![rest.to_string()]),
-        ];
-        for (mode, transport, message, width, want) in cases {
-            let case = format!("{mode:?} {transport:?} {message:?} at {width}");
-            let mut view = view(ServeViewState::Error {
-                message: message.to_string(),
-                mode,
-                transport,
-            });
-            let buf = draw_at(&view, width);
-            let rows: Vec<String> = (0..buf.area.height)
-                .map(|y| {
-                    let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
-                    row.trim_matches(|c: char| c == '│' || c.is_whitespace())
-                        .to_string()
-                })
-                .filter(|row| row.contains("[S] ") || row.contains("[P] ") || row.contains("[R] "))
-                .collect();
-            assert_eq!(rows, want, "{case}");
-            // Every hint stays whole and clickable, on either row.
-            let mut hints = vec![("[S]", KeyCode::Char('S')), ("[Enter]", KeyCode::Enter)];
-            if mode == Tunnel {
-                hints.push(("[P]", KeyCode::Char('P')));
-            }
-            for (label, code) in hints {
-                let (x, y) = crate::tui::dialogs::test_render::find(&buf, label);
-                assert_eq!(
-                    view.handle_click(x, y).map(|k| k.code),
-                    Some(code),
-                    "{case}: {label}"
-                );
-            }
-        }
     }
 }

@@ -4,6 +4,7 @@ pub(super) use super::AppState;
 
 use axum::{http::StatusCode, response::Response};
 mod acp;
+pub(crate) use acp::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 mod client_log;
 mod file_provenance;
 mod git;
@@ -229,6 +230,9 @@ pub(super) fn session_not_found() -> axum::response::Response {
     )
 }
 
+/// Why `aoe serve --read-only` refused a change.
+pub(crate) const READ_ONLY_MESSAGE: &str = "Server is in read-only mode";
+
 /// Canonical 403 body for `aoe serve --read-only`.
 pub(super) fn read_only_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -237,7 +241,7 @@ pub(super) fn read_only_response() -> axum::response::Response {
         crate::daemon::ApiErrorCode::ReadOnly.header(),
         axum::Json(serde_json::json!({
             "error": "read_only",
-            "message": "Server is in read-only mode"
+            "message": READ_ONLY_MESSAGE
         })),
     )
         .into_response()
