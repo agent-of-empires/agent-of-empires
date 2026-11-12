@@ -1262,13 +1262,18 @@ describe("current native admission", () => {
 describe("live panel cancellation authority", () => {
   const childId = "panel-child";
   const startedAt = "2026-01-01T00:00:00Z";
-  const panelElements = (sessionId: string) => createElement("div", null,
-    ...["desktop background work", "mobile background work"].map((name) =>
-      createElement("section", { key: name, "aria-label": name },
-        createElement(BackgroundAgentsPanel, { sessionId }),
+  const panelElements = (sessionId: string) =>
+    createElement(
+      "div",
+      null,
+      ...["desktop background work", "mobile background work"].map((name) =>
+        createElement(
+          "section",
+          { key: name, "aria-label": name },
+          createElement(BackgroundAgentsPanel, { sessionId }),
+        ),
       ),
-    ),
-  );
+    );
   const seedChild = (socket: FakeWebSocket, sessionId: string, seq = 0) => {
     const child: SubagentRecord = {
       session_id: childId,
@@ -1278,13 +1283,23 @@ describe("live panel cancellation authority", () => {
       cancel_capable: true,
     };
     socket.message({
-      session_id: sessionId, seq: seq + 1, event: { BackgroundAgentLaunched: {
-        agent_id: "panel-agent", tool_call_id: "panel-tool", description: "Linked panel child",
-        prompt: "Retained child instructions", model: "test-model", started_at: startedAt,
-      } },
+      session_id: sessionId,
+      seq: seq + 1,
+      event: {
+        BackgroundAgentLaunched: {
+          agent_id: "panel-agent",
+          tool_call_id: "panel-tool",
+          description: "Linked panel child",
+          prompt: "Retained child instructions",
+          model: "test-model",
+          started_at: startedAt,
+        },
+      },
     });
     socket.message({
-      session_id: sessionId, seq: seq + 2, event: { SubagentUpdated: { subagent: child, at: startedAt } },
+      session_id: sessionId,
+      seq: seq + 2,
+      event: { SubagentUpdated: { subagent: child, at: startedAt } },
     });
   };
 
@@ -1318,16 +1333,19 @@ describe("live panel cancellation authority", () => {
   it("checks the committed runtime before cached panel publication and permits a fresh Available gesture", async () => {
     const id = "sess-panel-layout";
     let clickAtCommit: (() => void) | undefined;
-    const hook = renderHook(() => {
-      const session = useAcpSession(id);
-      useLayoutEffect(() => {
-        if (!clickAtCommit || nativeInputAvailable(session.state)) return;
-        const click = clickAtCommit;
-        clickAtCommit = undefined;
-        click();
-      }, [session.state, session.status]);
-      return session;
-    }, { wrapper: profileWrapper });
+    const hook = renderHook(
+      () => {
+        const session = useAcpSession(id);
+        useLayoutEffect(() => {
+          if (!clickAtCommit || nativeInputAvailable(session.state)) return;
+          const click = clickAtCommit;
+          clickAtCommit = undefined;
+          click();
+        }, [session.state, session.status]);
+        return session;
+      },
+      { wrapper: profileWrapper },
+    );
     await flushAsync();
     lastSocket().open();
     lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
@@ -1389,7 +1407,8 @@ describe("live panel cancellation authority", () => {
   it("keeps a refused current child cancellation visible in each sibling panel", async () => {
     calls = installAcpFakes(({ method, url }) =>
       method === "POST" && url.endsWith(`/subagents/${childId}/cancel`)
-        ? new Response("subagent cannot be cancelled", { status: 409 }) : undefined,
+        ? new Response("subagent cannot be cancelled", { status: 409 })
+        : undefined,
     );
     const id = "sess-panel-error";
     const hook = await openSession(id);
@@ -1411,7 +1430,8 @@ describe("live panel cancellation authority", () => {
       const oldId = "sess-panel-old";
       const nextId = transition === "target replacement" ? "sess-panel-new" : oldId;
       const previous = renderHook(({ id }) => useAcpSession(id), {
-        initialProps: { id: oldId }, wrapper: profileWrapper,
+        initialProps: { id: oldId },
+        wrapper: profileWrapper,
       });
       await flushAsync();
       lastSocket().open();
@@ -1427,7 +1447,8 @@ describe("live panel cancellation authority", () => {
       } else {
         previous.unmount();
         current = renderHook(({ id }) => useAcpSession(id), {
-          initialProps: { id: nextId }, wrapper: profileWrapper,
+          initialProps: { id: nextId },
+          wrapper: profileWrapper,
         });
       }
       await flushAsync();

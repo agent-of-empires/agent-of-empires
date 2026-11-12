@@ -481,9 +481,7 @@ describe("BackgroundAgentsPanel", () => {
     });
 
     it("POSTs the child cancel route and surfaces a failure", async () => {
-      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>(
-        "../../../hooks/useAcpSession",
-      );
+      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
       installAcpFakes();
       const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
       await flushAsync();
@@ -506,9 +504,7 @@ describe("BackgroundAgentsPanel", () => {
     });
 
     it("lists and stops a child that has no legacy background-agent record", async () => {
-      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>(
-        "../../../hooks/useAcpSession",
-      );
+      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>("../../../hooks/useAcpSession");
       installAcpFakes();
       const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
       await flushAsync();
@@ -601,18 +597,27 @@ describe("BackgroundAgentsPanel", () => {
           const linked = agent({ startedAt, endedAt, status: endedAt === null ? "running" : "completed" });
           const local = agent({ agentId: "local-card", toolCallId: "local-tool", description: "Local-only card" });
           const localChild = record({
-            session_id: "local-child", parent_tool_call_id: null, title: "Local-only child", cancel_capable: false,
+            session_id: "local-child",
+            parent_tool_call_id: null,
+            title: "Local-only child",
+            cancel_capable: false,
           });
           const held = {
-            ...emptyAcpState(), lastSeq: 7, backgroundAgents: [linked, local], subagents: [record(), localChild],
+            ...emptyAcpState(),
+            lastSeq: 7,
+            backgroundAgents: [linked, local],
+            subagents: [record(), localChild],
           };
           const header = currentControlSnapshot(held, { ready: true }, 8);
           const wire = {
-            ...header.state, subagents: [record({ state, stop_reason: stopReason })],
+            ...header.state,
+            subagents: [record({ state, stop_reason: stopReason })],
           };
           const restored = applyReducedState(held, wire, header.unchanged, header.seq);
           expect(restored.backgroundAgents.find((item) => item.agentId === linked.agentId)).toMatchObject({
-            status, startedAt, endedAt,
+            status,
+            startedAt,
+            endedAt,
           });
           expect(restored.backgroundAgents.find((item) => item.agentId === local.agentId)).toEqual(local);
           expect(restored.subagents).toContainEqual(localChild);
@@ -626,9 +631,15 @@ describe("BackgroundAgentsPanel", () => {
           expect(view.getByText("Local-only card")).toBeTruthy();
           expect(view.getByText("Local-only child")).toBeTruthy();
 
-          const older = applyReducedState(restored, {
-            ...wire, subagents: [record({ state: "running", stop_reason: null })],
-          }, [], 7);
+          const older = applyReducedState(
+            restored,
+            {
+              ...wire,
+              subagents: [record({ state: "running", stop_reason: null })],
+            },
+            [],
+            7,
+          );
           expect(older.backgroundAgents).toEqual(restored.backgroundAgents);
           expect(older.subagents).toEqual(restored.subagents);
           agentsMock.mockReturnValue(older.backgroundAgents);

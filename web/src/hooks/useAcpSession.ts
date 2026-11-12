@@ -26,7 +26,12 @@ import {
 import { classifyResolveResponse, reducer } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
 import {
-  cacheGet, cacheSet, sweepExpiredStorage, registerLiveAcpActions, ownsLiveAcpActions, NATIVE_INPUT_UNCONFIRMED,
+  cacheGet,
+  cacheSet,
+  sweepExpiredStorage,
+  registerLiveAcpActions,
+  ownsLiveAcpActions,
+  NATIVE_INPUT_UNCONFIRMED,
 } from "./acpSession/stateCache";
 import { useLatestRef } from "./useLatestRef";
 
@@ -111,7 +116,6 @@ function optimisticPromptId(): string {
   }
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
-
 
 export function useAcpSession(
   sessionId: string | null,
@@ -445,24 +449,28 @@ export function useAcpSession(
   const performCancelPrompt = useCallback(async (): Promise<string | null> => {
     if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
     if (!requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
-    const message = await postErrorMessage(
-      acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"],
-    );
+    const message = await postErrorMessage(acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
     if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
     return message;
   }, [sessionId, actionOwner, requireNativeInput]);
   const cancelPrompt = useCallback(async () => (await performCancelPrompt()) === null, [performCancelPrompt]);
 
-  const performCancelSubagent = useCallback(async (childId: string): Promise<string | null> => {
-    if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
-    if (!requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
-    const message = await cancelSubagent(sessionId, childId);
-    if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
-    return message;
-  }, [sessionId, actionOwner, requireNativeInput]);
-  const cancelSubagentById = useCallback(async (childId: string) => {
-    await performCancelSubagent(childId);
-  }, [performCancelSubagent]);
+  const performCancelSubagent = useCallback(
+    async (childId: string): Promise<string | null> => {
+      if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
+      if (!requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
+      const message = await cancelSubagent(sessionId, childId);
+      if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
+      return message;
+    },
+    [sessionId, actionOwner, requireNativeInput],
+  );
+  const cancelSubagentById = useCallback(
+    async (childId: string) => {
+      await performCancelSubagent(childId);
+    },
+    [performCancelSubagent],
+  );
 
   useLayoutEffect(() => {
     if (!sessionId) return;

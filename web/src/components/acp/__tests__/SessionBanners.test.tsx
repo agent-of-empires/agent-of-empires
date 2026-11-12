@@ -4,7 +4,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 
 import { useReducer } from "react";
 
-import { applyEvent, applyReducedState, emptyAcpState, type AcpEvent, nativeInputAvailable } from "../../../lib/acpTypes";
+import {
+  applyEvent,
+  applyReducedState,
+  emptyAcpState,
+  type AcpEvent,
+  nativeInputAvailable,
+} from "../../../lib/acpTypes";
 
 import { reducer, type Action } from "../../../hooks/acpSession/reducer";
 
@@ -724,7 +730,10 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     render(banners(state));
     expect(screen.getByText(`Agent integration lost: ${detail}`)).toBeTruthy();
     expect(state).toMatchObject({
-      connectionReady: false, connectionUnavailable: null, promptWakeEligible: false, nativeSnapshotSeq: 20,
+      connectionReady: false,
+      connectionUnavailable: null,
+      promptWakeEligible: false,
+      nativeSnapshotSeq: 20,
     });
     expect(nativeInputAvailable(state)).toBe(false);
   });
@@ -732,9 +741,13 @@ describe("accepted integration-loss snapshot diagnostics", () => {
   it.each<[string, Parameters<typeof currentControlSnapshot>[1]]>([
     ["Available", { ready: true }],
     ["governed wake", { ready: false, wakeEligible: true }],
-    ["qualified native loss", {
-      ready: false, unavailable: { source: "native", cause: "stdout_eof", phase: "established" },
-    }],
+    [
+      "qualified native loss",
+      {
+        ready: false,
+        unavailable: { source: "native", cause: "stdout_eof", phase: "established" },
+      },
+    ],
   ])("keeps integration diagnostics separate from the %s native receipt", (_label, receipt) => {
     const header = currentControlSnapshot(emptyAcpState(), receipt, 20);
     const baseline = applyReducedState(emptyAcpState(), header.state, [], header.seq);
@@ -742,9 +755,13 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     render(banners(state));
     expect(screen.getByText(message)).toBeTruthy();
     expect({
-      ready: state.connectionReady, unavailable: state.connectionUnavailable, wake: state.promptWakeEligible,
+      ready: state.connectionReady,
+      unavailable: state.connectionUnavailable,
+      wake: state.promptWakeEligible,
     }).toEqual({
-      ready: baseline.connectionReady, unavailable: baseline.connectionUnavailable, wake: baseline.promptWakeEligible,
+      ready: baseline.connectionReady,
+      unavailable: baseline.connectionUnavailable,
+      wake: baseline.promptWakeEligible,
     });
     expect(nativeInputAvailable(state)).toBe(nativeInputAvailable(baseline));
   });
@@ -762,19 +779,23 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     };
     expectDiagnostic();
     state = applyEvent(state, {
-      session_id: "snapshot-diagnostic", seq: 5,
+      session_id: "snapshot-diagnostic",
+      seq: 5,
       event: { IntegrationLost: { reason: { kind: "contract_violation", detail: "older raw loss" } } },
     });
     view.rerender(banners(state));
     expectDiagnostic();
     state = applyEvent(state, {
-      session_id: "snapshot-diagnostic", seq: 6, event: { UserPromptSent: { text: "older raw prompt" } },
+      session_id: "snapshot-diagnostic",
+      seq: 6,
+      event: { UserPromptSent: { text: "older raw prompt" } },
     });
     view.rerender(banners(state));
     expectDiagnostic();
     expect(snapshot(state, { kind: "lease_overflow" }, 19)).toEqual(state);
     state = applyEvent(state, {
-      session_id: "snapshot-diagnostic", seq: 21,
+      session_id: "snapshot-diagnostic",
+      seq: 21,
       event: { AcpSessionAssigned: { acp_session_id: "new-current-native" } },
     });
     view.rerender(banners(state));
@@ -784,7 +805,9 @@ describe("accepted integration-loss snapshot diagnostics", () => {
 
   it("keeps raw integration diagnostics when a legacy snapshot omits the optional field", () => {
     const initial = applyEvent(emptyAcpState(), {
-      session_id: "snapshot-diagnostic", seq: 1, event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
+      session_id: "snapshot-diagnostic",
+      seq: 1,
+      event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
     });
     const header = currentControlSnapshot(initial, { ready: false }, 20);
     delete header.state.integration_lost;
@@ -796,11 +819,13 @@ describe("accepted integration-loss snapshot diagnostics", () => {
 
   it("clears only the current integration diagnostic while preserving unrelated errors", () => {
     let initial = applyEvent(emptyAcpState(), {
-      session_id: "snapshot-diagnostic", seq: 1,
+      session_id: "snapshot-diagnostic",
+      seq: 1,
       event: { AgentStartupError: { message: "Unrelated startup diagnostic" } },
     });
     initial = applyEvent(initial, {
-      session_id: "snapshot-diagnostic", seq: 2,
+      session_id: "snapshot-diagnostic",
+      seq: 2,
       event: { PromptRuntimeError: { message: "Retained operation diagnostic" } },
     });
     initial = reducer(initial, { kind: "error", message: "Retained callback failure" });

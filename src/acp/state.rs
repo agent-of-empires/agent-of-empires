@@ -3908,7 +3908,9 @@ mod tests {
         }
         assert_eq!(state.sidebar_phase, SidebarPhase::Error);
         assert_eq!(
-            serde_json::to_value(&state).unwrap().get("integration_lost"),
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("integration_lost"),
             Some(&serde_json::json!({"kind": "hold_overflow"}))
         );
         state.apply_event(3, unqualified).unwrap();
@@ -3918,7 +3920,9 @@ mod tests {
         assert!(state.integration_lost.is_none());
         assert_ne!(state.sidebar_phase, SidebarPhase::Error);
         assert_eq!(
-            serde_json::to_value(&state).unwrap().get("integration_lost"),
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("integration_lost"),
             Some(&serde_json::Value::Null)
         );
     }

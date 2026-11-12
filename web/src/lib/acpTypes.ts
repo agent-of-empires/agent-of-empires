@@ -1882,8 +1882,11 @@ export function applyReducedState(
     ),
     locallyResolved,
   };
-  if (authoritative && reduced.integration_lost !== undefined &&
-      (state.integrationLostSnapshotSeq == null || snapshotSeq >= state.integrationLostSnapshotSeq)) {
+  if (
+    authoritative &&
+    reduced.integration_lost !== undefined &&
+    (state.integrationLostSnapshotSeq == null || snapshotSeq >= state.integrationLostSnapshotSeq)
+  ) {
     next.integrationLost = reduced.integration_lost;
     next.integrationLostSnapshotSeq = snapshotSeq;
   }
@@ -2142,9 +2145,12 @@ export function normaliseTurnState(
     ...state,
     oldestSeq,
     integrationLost: state.integrationLost ?? null,
-    integrationLostSnapshotSeq: typeof state.integrationLostSnapshotSeq === "number" &&
-      Number.isFinite(state.integrationLostSnapshotSeq) && state.integrationLostSnapshotSeq >= 0
-      ? state.integrationLostSnapshotSeq : null,
+    integrationLostSnapshotSeq:
+      typeof state.integrationLostSnapshotSeq === "number" &&
+      Number.isFinite(state.integrationLostSnapshotSeq) &&
+      state.integrationLostSnapshotSeq >= 0
+        ? state.integrationLostSnapshotSeq
+        : null,
     connectionUnavailable: state.connectionUnavailable ?? null,
     connectionUnavailableNotice: state.connectionUnavailableNotice ?? state.connectionUnavailable ?? null,
     connectionReady: state.connectionReady === true,

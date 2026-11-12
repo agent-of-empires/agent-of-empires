@@ -54,10 +54,7 @@ export function SessionBanners({
     workerStopping: acpWorkerState === "stopping",
   });
   const healthy =
-    !state.workerStopped &&
-    !state.workerRestarting &&
-    !state.connectionUnavailable &&
-    (!startupError || nativeReady);
+    !state.workerStopped && !state.workerRestarting && !state.connectionUnavailable && (!startupError || nativeReady);
   const idle = healthy && !state.turnActive;
   const errorMessage = state.interactionError?.message ?? state.lastError;
   return (

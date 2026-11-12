@@ -160,30 +160,34 @@ function StopButton({ sessionId }: { sessionId: string }) {
   const [stopError, setStopError] = useState<string | null>(null);
   return (
     <div className="flex flex-col items-end">
-    <button
-      type="button"
-      disabled={busy}
-      title="Stop the whole turn, including every running sub-agent"
-      onClick={async () => {
-        setBusy(true);
-        try {
-          const actions = getLiveAcpActions(sessionId);
-          setStopError(actions ? await actions.cancelPrompt() : NATIVE_INPUT_UNCONFIRMED);
-        } finally {
-          setBusy(false);
-        }
-      }}
-      className={[
-        "inline-flex items-center gap-1 rounded-md border border-surface-600 bg-surface-800 px-2 py-0.5",
-        "text-[11px] text-text-secondary transition-colors",
-        "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300",
-        busy ? "opacity-50" : "",
-      ].join(" ")}
-    >
-      <Square className="h-3 w-3 fill-current" strokeWidth={0} />
-      Stop
-    </button>
-      {stopError && <p role="alert" className="max-w-xs text-xs text-status-error">{stopError}</p>}
+      <button
+        type="button"
+        disabled={busy}
+        title="Stop the whole turn, including every running sub-agent"
+        onClick={async () => {
+          setBusy(true);
+          try {
+            const actions = getLiveAcpActions(sessionId);
+            setStopError(actions ? await actions.cancelPrompt() : NATIVE_INPUT_UNCONFIRMED);
+          } finally {
+            setBusy(false);
+          }
+        }}
+        className={[
+          "inline-flex items-center gap-1 rounded-md border border-surface-600 bg-surface-800 px-2 py-0.5",
+          "text-[11px] text-text-secondary transition-colors",
+          "hover:border-rose-700/60 hover:bg-rose-950/30 hover:text-rose-300",
+          busy ? "opacity-50" : "",
+        ].join(" ")}
+      >
+        <Square className="h-3 w-3 fill-current" strokeWidth={0} />
+        Stop
+      </button>
+      {stopError && (
+        <p role="alert" className="max-w-xs text-xs text-status-error">
+          {stopError}
+        </p>
+      )}
     </div>
   );
 }
