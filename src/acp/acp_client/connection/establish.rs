@@ -166,26 +166,6 @@ pub(super) async fn establish(
         return Ok(None);
     }
 
-    // Return initialized ownership before any bootstrap replay can fill the
-    // public queue. Session establishment still owns its own readiness gate.
-    if let Some(tx) = ctx.ready_tx.lock().await.take() {
-        let _admission = shared
-            .connection_state
-            .admission
-            .lock()
-            .expect("connection admission lock");
-        let readiness = match shared.connection_state.loss() {
-            Some(observation) => Err(AcpError::ConnectionUnavailable(observation)),
-            None => Ok(()),
-        };
-        let _ = tx.send(readiness);
-    }
-    if matches!(&ctx.mode, ConnectMode::Fresh { .. }) {
-        let _guard = shared.ingress.fence.write().await;
-        let replay = shared.ingress.finish(None)?;
-        shared.apply_replay(replay).await;
-    }
-
     // A proxy announces itself on the initialize response; any other agent
     // has no hello and is not held to the `_meta.aoe` contract.
     let proxied = match init
@@ -215,6 +195,26 @@ pub(super) async fn establish(
         }
     };
     shared.aoe.begin_connection(proxied);
+
+    // Return initialized ownership before any bootstrap replay can fill the
+    // public queue. Session establishment still owns its own readiness gate.
+    if let Some(tx) = ctx.ready_tx.lock().await.take() {
+        let _admission = shared
+            .connection_state
+            .admission
+            .lock()
+            .expect("connection admission lock");
+        let readiness = match shared.connection_state.loss() {
+            Some(observation) => Err(AcpError::ConnectionUnavailable(observation)),
+            None => Ok(()),
+        };
+        let _ = tx.send(readiness);
+    }
+    if matches!(&ctx.mode, ConnectMode::Fresh { .. }) {
+        let _guard = shared.ingress.fence.write().await;
+        let replay = shared.ingress.finish(None)?;
+        shared.apply_replay(replay).await;
+    }
 
     let load_session_capable = init.agent_capabilities.load_session;
     // Re-derived on every connect (a respawn may land on another adapter
