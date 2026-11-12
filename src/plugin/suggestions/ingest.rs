@@ -93,12 +93,12 @@ fn set_at(
         params![profile, provider_id],
     )
     .map_err(db_error)?;
-    for item in &kept {
+    for (position, item) in kept.iter().enumerate() {
         let json = serde_json::to_string(item)
             .map_err(|e| DispatchError::internal(format!("encode suggestion: {e}")))?;
         tx.execute(
-            "INSERT INTO suggestion_items (profile, provider_id, item_id, item_json) VALUES (?1, ?2, ?3, ?4)",
-            params![profile, provider_id, item.id, json],
+            "INSERT INTO suggestion_items (profile, provider_id, item_id, item_json, position) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![profile, provider_id, item.id, json, position as i64],
         )
         .map_err(db_error)?;
     }

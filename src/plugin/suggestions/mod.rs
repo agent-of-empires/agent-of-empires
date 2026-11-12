@@ -60,7 +60,7 @@ pub(crate) fn providers() -> Vec<Provider> {
         .collect()
 }
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Every suggestion table, including the legacy `suggestion_policy`, dropped
 /// when the recorded schema version differs.
@@ -115,6 +115,7 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              provider_id TEXT NOT NULL,
              item_id     TEXT NOT NULL,
              item_json   TEXT NOT NULL,
+             position    INTEGER NOT NULL DEFAULT 0,
              PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_sources (
