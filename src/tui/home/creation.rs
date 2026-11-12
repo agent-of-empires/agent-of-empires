@@ -467,9 +467,11 @@ impl HomeView {
             self.prompt_failures_announced.remove(&row.id);
             return;
         };
-        if !self.prompt_failures_announced.insert(row.id.clone()) {
+        // Another dialog is open: the next snapshot tries again.
+        if self.prompt_failures_announced.contains(&row.id) || self.info_dialog.is_some() {
             return;
         }
+        self.prompt_failures_announced.insert(row.id.clone());
         let prompt = self
             .get_instance(&row.id)
             .and_then(|i| i.pending_initial_turn.as_ref())
@@ -478,10 +480,6 @@ impl HomeView {
             "{} was created, but its first prompt was not delivered: {error}",
             row.title
         );
-        if self.info_dialog.is_some() {
-            self.flash_status("A session's first prompt was not delivered");
-            return;
-        }
         match prompt {
             Some(text) => {
                 crate::tui::clipboard::copy_to_clipboard(&text);
