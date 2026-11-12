@@ -632,6 +632,11 @@ pub struct UiContribution {
     pub deep_link: bool,
 }
 
+/// Longest Enter delay a declaration may ask for. A pause longer than this is a
+/// slow send rather than a paste-burst guard, and the host holds the session's
+/// input lock while it waits.
+pub const MAX_SEND_KEYS_ENTER_DELAY_MS: u64 = 2_000;
+
 /// An opaque page deep-link value: 1 to 128 URL-safe characters, so it never needs escaping.
 pub fn deep_link_value_ok(value: &str) -> bool {
     (1..=128).contains(&value.len())
@@ -1247,6 +1252,18 @@ impl PluginManifest {
                 format!("agent_integrations[{i}] declarations require api_version >= 21"),
             );
             check(
+                self.api_version >= 22 || integration.send_keys_enter_delay_ms == 0,
+                format!(
+                    "agent_integrations[{i}].send_keys_enter_delay_ms requires api_version >= 22"
+                ),
+            );
+            check(
+                integration.send_keys_enter_delay_ms <= MAX_SEND_KEYS_ENTER_DELAY_MS,
+                format!(
+                    "agent_integrations[{i}].send_keys_enter_delay_ms must be at most {MAX_SEND_KEYS_ENTER_DELAY_MS} ms"
+                ),
+            );
+            check(
                 if status_integration {
                     !integration.provider_versions.is_empty()
                         && integration.provider_versions.iter().all(|range| {
@@ -1814,6 +1831,40 @@ mod tests {
         ] {
             assert!(!deep_link_value_ok(bad), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn send_keys_enter_delay_needs_api_22_and_a_sane_pause() {
+        let manifest = |api_version: u32, delay: u64| {
+            format!(
+                "id = \"acme.delay\"\nname = \"Delay\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\n\
+                 [[agent_integrations]]\ntool = \"fake-agent\"\ncommand = \"fake-agent\"\nsend_keys_enter_delay_ms = {delay}\n"
+            )
+        };
+        let m =
+            PluginManifest::from_toml_str(&manifest(22, 150)).expect("api 22 carries the pause");
+        assert_eq!(m.agent_integrations[0].send_keys_enter_delay_ms, 150);
+
+        // The pause is part of the declaration, so a host that predates it must
+        // refuse the manifest rather than send without it and lose the message.
+        rejects(&[
+            (
+                "pause below api_version 22",
+                manifest(21, 150),
+                "send_keys_enter_delay_ms requires api_version >= 22",
+            ),
+            (
+                "pause past the cap",
+                manifest(22, MAX_SEND_KEYS_ENTER_DELAY_MS + 1),
+                "at most",
+            ),
+        ]);
+
+        // Omitting it keeps the field at its default, so declarations that say
+        // nothing about pacing stay valid on every API version.
+        let omitted = manifest(22, 0).replace("send_keys_enter_delay_ms = 0\n", "");
+        let m = PluginManifest::from_toml_str(&omitted).expect("parses without the field");
+        assert_eq!(m.agent_integrations[0].send_keys_enter_delay_ms, 0);
     }
 
     #[test]
