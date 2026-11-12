@@ -1937,22 +1937,18 @@ instruction_flag = "--prompt={}"
             );
         }
 
-        // YOLO off and a bare command: the instruction is appended as argv.
+        // YOLO off and a bare command: the instruction is appended as argv. The
+        // transport is fixtures so the launch does not depend on a host runtime.
         let mut direct = declared("zzgamma", "helper");
-        match direct.prepare_launch_command(direct.conversation_state()) {
-            Ok(prepared) => assert!(
-                prepared.command.unwrap().contains("--prompt="),
-                "the direct command must receive the instruction"
-            ),
-            // Without a container runtime the sandbox launch cannot complete;
-            // the refusal asserted above is the behaviour under test.
-            Err(error) => assert!(
-                !error
-                    .to_string()
-                    .contains("reach the shell instead of the agent"),
-                "a bare command must not be refused: {error}"
-            ),
-        }
+        let config = direct.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+        let prepared = direct
+            .prepare_launch_command(direct.conversation_state())
+            .expect("a bare declared command must launch");
+        assert!(
+            prepared.command.unwrap().contains("--prompt="),
+            "the direct command must receive the instruction"
+        );
     }
 
     #[test]
