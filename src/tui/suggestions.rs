@@ -308,6 +308,7 @@ fn start_for(snapshot: Option<&Snapshot>, key: &ItemKey, prepared: Prepared) -> 
         suggestion: Some(crate::session::SuggestionOrigin {
             provider_id: key.0.clone(),
             id: key.1.clone(),
+            profile: None,
         }),
     }
 }
