@@ -509,6 +509,24 @@ describe("SuggestionsView", () => {
       expect(screen.getByText("Linear api")).toBeTruthy();
     });
 
+    it("drops a source chip when the provider tab changes, so the other list is not left empty", async () => {
+      const base = two();
+      await open({
+        ...base,
+        items: [
+          { ...base.items[0]!, title: "GitHub item", mapping_key: "acme/web" },
+          { ...base.items[2]!, title: "Linear item", mapping_key: "team/api" },
+        ],
+      });
+      await screen.findByText("GitHub item");
+      fireEvent.click(
+        within(screen.getByRole("group", { name: "Filter by source" })).getByRole("button", { name: "acme/ 1" }),
+      );
+      expect(screen.queryByText("Linear item")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Linear 1" }));
+      expect(screen.getByText("Linear item")).toBeTruthy();
+    });
+
     it("shows each provider's update age, error, emptiness and refresh state", async () => {
       const base = two();
       await open({

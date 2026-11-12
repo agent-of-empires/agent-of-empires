@@ -79,6 +79,12 @@ export function SuggestionsView({
   const [keyChips, setKeyChips] = useState<KeyChip[]>([]);
   const [mapping, setMapping] = useState(false);
 
+  // A source chip belongs to the list it was picked in, so it does not outlive a tab change.
+  const changeFilter = (next: Filter) => {
+    setFilter(next);
+    setKeyChips([]);
+  };
+
   const disabled = readOnly || offline;
   const unavailableTitle = readOnly ? "Read-only dashboard" : offline ? OFFLINE_TITLE : undefined;
 
@@ -188,7 +194,7 @@ export function SuggestionsView({
               <button
                 type="button"
                 aria-pressed={filter === "all"}
-                onClick={() => setFilter("all")}
+                onClick={() => changeFilter("all")}
                 className={chip(filter === "all")}
               >
                 All <span className="text-text-dim">{active.length}</span>
@@ -200,7 +206,7 @@ export function SuggestionsView({
                     key={p.id}
                     type="button"
                     aria-pressed={selected}
-                    onClick={() => setFilter({ provider: p.id })}
+                    onClick={() => changeFilter({ provider: p.id })}
                     className={chip(selected)}
                   >
                     {p.name}{" "}
@@ -212,7 +218,7 @@ export function SuggestionsView({
                 <button
                   type="button"
                   aria-pressed={showDismissed}
-                  onClick={() => setFilter("dismissed")}
+                  onClick={() => changeFilter("dismissed")}
                   className={chip(showDismissed)}
                 >
                   Dismissed <span className="text-text-dim">{dismissedCount}</span>
