@@ -608,6 +608,7 @@ async fn run_queued_command(
                                     code:
                                         crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
                                         | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                                        | crate::daemon::ApiErrorCode::LaunchIndeterminate
                                         | crate::daemon::ApiErrorCode::SandboxMigrationFailed,
                                     ..
                                 } => CommandFailure::Rejected(error.to_string()),
@@ -644,6 +645,7 @@ async fn run_queued_command(
                     crate::daemon::ApiErrorCode::PurgeFailed
                         | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
                         | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                        | crate::daemon::ApiErrorCode::LaunchIndeterminate
                         | crate::daemon::ApiErrorCode::SandboxMigrationFailed
                 ) {
                     CommandFailure::Rejected(message)
@@ -2399,6 +2401,11 @@ mod tests {
         for (request, code, known) in [
             (
                 SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "launch_indeterminate",
+                true,
+            ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
                 "start_failed",
                 false,
             ),
@@ -3913,6 +3920,12 @@ mod tests {
     async fn committed_start_remains_fenced_when_pane_preparation_fails() {
         use axum::response::IntoResponse;
         for (start_refused, ensure_status, committed_revision, code) in [
+            (
+                false,
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "launch_indeterminate",
+            ),
             (
                 false,
                 axum::http::StatusCode::FORBIDDEN,

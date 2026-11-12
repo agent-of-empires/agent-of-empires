@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StateMutex;
-use tokio::sync::{oneshot, Mutex, MutexGuard, Notify};
+use tokio::sync::{oneshot, Notify, RwLock, RwLockReadGuard};
 
 use super::errors::acp_internal_error;
 use crate::acp::control_protocol::{
@@ -48,7 +48,7 @@ pub(super) enum SessionIngressNotification {
     Update(serde_json::Value),
     /// Runner-minted barrier marking the end of a session/load replay (#4016).
     Replayed(SessionReplayed),
-    /// Daemon-minted barrier releasing a local prompt's outcome.
+    /// Daemon-minted barrier committing a local or adopted prompt outcome.
     PromptCompleted(PromptCompletedMarker),
     /// `_auth/status_update`: the agent's own identity. Connection-scoped, so
     /// it carries no session id and never passes the ingress fence (#4241).
@@ -149,7 +149,7 @@ impl SessionIngressNotification {
 #[derive(Default)]
 pub(super) struct SessionIngress {
     state: StateMutex<IdentityState>,
-    pub(super) fence: Mutex<()>,
+    pub(super) fence: RwLock<()>,
     /// Requests awaiting the human with the fence released.
     parked: AtomicUsize,
     changed: Notify,
@@ -356,16 +356,16 @@ impl SessionIngress {
         Ok(updates)
     }
 
-    /// Hold the admission fence through effects, retaining bytes across both checks.
+    /// Share admission through effects; identity transitions require exclusive access.
     pub(super) async fn notification(
         &self,
         notification: SessionNotification,
         wire_bytes: Option<usize>,
-    ) -> agent_client_protocol::Result<Option<(SessionNotification, MutexGuard<'_, ()>)>> {
+    ) -> agent_client_protocol::Result<Option<(SessionNotification, RwLockReadGuard<'_, ()>)>> {
         let Some(notification) = self.route(notification, wire_bytes)? else {
             return Ok(None);
         };
-        let guard = self.fence.lock().await;
+        let guard = self.fence.read().await;
         Ok(self
             .route(notification, wire_bytes)?
             .map(|notification| (notification, guard)))
@@ -481,7 +481,7 @@ impl SessionIngress {
         &self,
         id: &SessionId,
         policy: RequestPolicy,
-    ) -> agent_client_protocol::Result<MutexGuard<'_, ()>> {
+    ) -> agent_client_protocol::Result<RwLockReadGuard<'_, ()>> {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -499,7 +499,7 @@ impl SessionIngress {
                 }
                 RequestAdmission::AwaitCommit => changed.await,
                 RequestAdmission::Active => {
-                    let guard = self.fence.lock().await;
+                    let guard = self.fence.read().await;
                     if self.request_admission(id, policy) == RequestAdmission::Active {
                         return Ok(guard);
                     }
@@ -734,7 +734,7 @@ mod tests {
     #[tokio::test]
     async fn pending_replay_and_wire_budget_are_bounded() {
         let ingress = SessionIngress::new(Some(SessionId::from("s")));
-        let guard = ingress.fence.lock().await;
+        let guard = ingress.fence.write().await;
         let mut admission =
             std::pin::pin!(ingress.notification(notif("s"), Some(MAX_PENDING_BYTES / 2)));
         assert!(futures_util::poll!(admission.as_mut()).is_pending());
@@ -786,6 +786,71 @@ mod tests {
                 assert!(ingress.route(notif("s"), None).is_err());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn admitted_callbacks_share_progress_but_exclude_identity_writes() {
+        use futures_util::FutureExt as _;
+        let ingress = SessionIngress::new(Some(SessionId::from("old")));
+        let old = SessionId::from("old");
+        let request = ingress
+            .request(&old, RequestPolicy::ParentOnly)
+            .await
+            .unwrap();
+        let notification = ingress
+            .notification(notif("old"), None)
+            .now_or_never()
+            .expect("progress cannot wait for a human response")
+            .unwrap()
+            .unwrap();
+        drop(notification);
+        let second = ingress
+            .request(&old, RequestPolicy::ParentOnly)
+            .now_or_never()
+            .expect("another admitted callback shares the session")
+            .unwrap();
+        drop(second);
+        let mut transition = std::pin::pin!(ingress.fence.write());
+        assert!(futures_util::poll!(transition.as_mut()).is_pending());
+        let mut stale = std::pin::pin!(ingress.request(&old, RequestPolicy::ParentOnly));
+        assert!(
+            futures_util::poll!(stale.as_mut()).is_pending(),
+            "queued writer excludes later readers"
+        );
+        drop(request);
+        let transition = transition.await;
+        ingress.begin();
+        ingress.finish(Some(SessionId::from("new"))).unwrap();
+        drop(transition);
+        assert!(
+            stale.await.is_err(),
+            "old admission must be rechecked after the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_callback_waits_without_blocking_commit_write() {
+        let ingress = SessionIngress::default();
+        let generation = {
+            let _guard = ingress.fence.write().await;
+            ingress.begin()
+        };
+        let id = SessionId::from("new");
+        ingress.resolve(Some(generation), id.clone());
+        let mut request = std::pin::pin!(ingress.request(&id, RequestPolicy::ParentOnly));
+        assert!(futures_util::poll!(request.as_mut()).is_pending());
+        let commit = ingress
+            .fence
+            .try_write()
+            .expect("AwaitCommit holds no read guard");
+        ingress.finish(Some(id.clone())).unwrap();
+        assert!(
+            futures_util::poll!(request.as_mut()).is_pending(),
+            "callback cannot overtake commit replay"
+        );
+        drop(commit);
+        let admitted = request.await.unwrap();
+        drop(admitted);
     }
 
     fn announce(parent: &str, child: &str) -> SessionNotification {

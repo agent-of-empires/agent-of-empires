@@ -1136,7 +1136,7 @@ impl<S: SessionStore + 'static> Drop for PurgeTransaction<S> {
         if let (Some(store), Some(request)) = (self.store.take(), self.request.take()) {
             store.defer_lifecycle_release(
                 request.session_id,
-                LifecycleOperation::Purge,
+                super::LifecycleRelease::Reservation(LifecycleOperation::Purge),
                 self.generation,
                 self.lifecycle_lock.take(),
             );

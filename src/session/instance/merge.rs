@@ -8,6 +8,12 @@ impl Instance {
         if preserve_errors {
             self.last_error = prior.last_error.take();
             self.last_error_check = prior.last_error_check;
+            self.last_error_evidence = prior.last_error_evidence.filter(|evidence| {
+                evidence.generation
+                    == Some(ErrorEvidenceGeneration::TerminalLifecycle(
+                        self.lifecycle_generation,
+                    ))
+            });
         }
         self.live_status_baseline = prior.live_status_baseline;
         self.ever_confirmed_present = prior.ever_confirmed_present;
@@ -16,14 +22,40 @@ impl Instance {
         self.pane_dead_observed = prior.pane_dead_observed;
         self.agent_pane = std::mem::take(&mut prior.agent_pane);
         self.auxiliary = std::mem::take(&mut prior.auxiliary);
-        self.inherit_process_runtime(prior);
+        self.capture_poller.adopt_reload(
+            &prior.capture_poller,
+            prior.held(),
+            Held::new(&self.tool, self.active_execution.as_ref()),
+            Unserved::Stop,
+        );
+        self.inherit_process_fields(prior);
+    }
+
+    /// A tmux status refresh is not a new launch: keep compatible repair pacing.
+    pub(crate) fn inherit_process_runtime_from_reload(&mut self, prior: Self) {
+        self.capture_poller.adopt_reload(
+            &prior.capture_poller,
+            prior.held(),
+            Held::new(&self.tool, self.active_execution.as_ref()),
+            Unserved::Stop,
+        );
+        self.inherit_process_fields(prior);
     }
 
     /// Keep launch-owned process state without replacing a fresh status observation.
     pub(crate) fn inherit_process_runtime(&mut self, prior: Self) {
+        self.capture_poller.adopt_relaunch(
+            &prior.capture_poller,
+            prior.held(),
+            prior.last_start_time != self.last_start_time,
+            Held::new(&self.tool, self.active_execution.as_ref()),
+        );
+        self.inherit_process_fields(prior);
+    }
+
+    fn inherit_process_fields(&mut self, prior: Self) {
         self.inherit_acp_load_capability(&prior);
         self.last_start_time = prior.last_start_time;
-        self.capture_poller = prior.capture_poller;
         self.retroactive_capture_excludes = prior.retroactive_capture_excludes;
         self.force_fresh_next_launch = prior.force_fresh_next_launch;
         self.pending_host_env = prior.pending_host_env;
@@ -61,6 +93,7 @@ impl Instance {
             self.last_accessed_at = src.last_accessed_at;
             self.last_error = src.last_error.clone();
             self.last_error_check = src.last_error_check;
+            self.last_error_evidence = src.last_error_evidence;
         }
         self.lifecycle_generation = src.lifecycle_generation;
         self.status = src.status;
@@ -148,6 +181,12 @@ impl Instance {
         self.detection = previous.detection;
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
+        self.last_error_evidence = previous.last_error_evidence.filter(|evidence| {
+            evidence.generation
+                == Some(ErrorEvidenceGeneration::TerminalLifecycle(
+                    self.lifecycle_generation,
+                ))
+        });
         self.last_start_time = previous.last_start_time;
         self.plugin_revival_pending = previous.plugin_revival_pending;
         self.capture_poller.adopt_reload(
@@ -605,6 +644,63 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .stop();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_launch_adoption_preserves_canonical_poller_and_next_observation() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut canonical = Instance::new("canonical-poller", "/tmp/test");
+        canonical.tool = "claude".into();
+        canonical.source_profile = "compatible-canonical-poller".into();
+        let storage = crate::session::Storage::new_unwatched(&canonical.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(canonical.clone());
+                Ok(())
+            })
+            .unwrap();
+        let launched = canonical.clone();
+        let poller = running_poller(
+            &canonical.id,
+            &canonical.tool,
+            canonical.active_execution.clone(),
+        );
+        canonical.capture_poller.set_handle(Some(poller.clone()));
+        canonical.inherit_process_runtime(launched);
+        assert!(
+            canonical
+                .capture_poller
+                .handle()
+                .is_some_and(|held| Arc::ptr_eq(held, &poller)),
+            "an empty launch slot must not discard a compatible canonical watcher"
+        );
+        let sid = "11111111-2222-4333-8444-555555555555";
+        poller
+            .lock()
+            .unwrap()
+            .inject_test_update(&canonical.id, sid);
+        let observed = canonical
+            .capture_poller
+            .handle()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .latest_observation()
+            .unwrap();
+        assert_eq!(observed.1.sid, sid);
+        crate::session::sync::capture_launched_session_id_blocking(
+            &mut canonical,
+            &crate::file_watch::FileWatchService::noop(),
+            std::time::Duration::ZERO,
+            false,
+        );
+        assert_eq!(canonical.agent_session_id.as_deref(), Some(sid));
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(sid),
+            "the retained canonical watcher must persist its next observation",
+        );
     }
 
     #[test]
@@ -1764,6 +1860,31 @@ mod tests {
         assert!(
             !live.runs(&relaunched.tool, relaunched.active_execution.as_ref()),
             "and the row does not end up on the runtime the relaunch described"
+        );
+    }
+    #[test]
+    fn terminal_error_metadata_is_transient_and_does_not_cross_generations() {
+        let mut observed = Instance::new("error-evidence", "/tmp");
+        observed.lifecycle_generation = 3;
+        observed.last_error = Some("provider request failed".into());
+        let mut evidence = OperationErrorEvidence::new(
+            ErrorEvidenceSource::TerminalText,
+            ErrorOperation::TerminalObservation,
+        );
+        evidence.runtime = RuntimeEvidence::PaneAlive;
+        evidence.generation = Some(ErrorEvidenceGeneration::TerminalLifecycle(3));
+        observed.last_error_evidence = Some(evidence);
+        let serialized = serde_json::to_string(&observed).unwrap();
+        assert!(!serialized.contains("last_error"));
+        let mut reloaded: Instance = serde_json::from_str(&serialized).unwrap();
+        assert!(reloaded.last_error.is_none() && reloaded.last_error_evidence.is_none());
+        reloaded.merge_runtime_from_reload(&observed);
+        assert_eq!(reloaded.last_error_evidence, Some(evidence));
+        reloaded.lifecycle_generation = 4;
+        reloaded.merge_runtime_from_reload(&observed);
+        assert_eq!(
+            reloaded.last_error_evidence, None,
+            "a newer launch cannot inherit stale evidence"
         );
     }
 }

@@ -305,6 +305,18 @@ export type IntegrationLostReason =
   | { kind: "hold_overflow" }
   | { kind: "lease_overflow" };
 
+export interface OperationErrorEvidence {
+  source: "terminal_text" | "tmux_observation" | "local_prompt_result" | "runner_completion" | "transcript_recovery";
+  operation: "prompt" | "context_reset" | "terminal_observation";
+  runtime: "unknown" | "pane_alive" | { pane_exited: { exit_code: number | null } } | "acp_transport_closed";
+  origin?: "tmux_observation" | "acp_transport" | null;
+  blocking_scope?: "operation" | "runtime" | null;
+  retryable?: boolean | null;
+  reported_code?: number | null;
+  observed_at_ms: number;
+  generation?: { terminal_lifecycle: number } | { acp_worker: number } | null;
+}
+
 // One variant per Event::* in src/acp/state.rs, externally tagged.
 export type AcpEvent =
   | { PlanUpdated: { plan: Plan } }
@@ -431,7 +443,7 @@ export type AcpEvent =
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
-  | { PromptRuntimeError: { message: string } }
+  | { PromptRuntimeError: { message: string; evidence?: OperationErrorEvidence | null } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | { IntegrationLost: { reason: IntegrationLostReason } }
   | {
@@ -564,6 +576,7 @@ export interface ReducedState {
   session_notices?: SessionNotice[];
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
+  operation_error?: OperationErrorEvidence | null;
   /** Background shells, running and recently finished; omitted when there are none. */
   background_shells?: {
     task_id: string;
@@ -583,6 +596,11 @@ export interface ReducedState {
     finished?: boolean;
     ended_at?: string | null;
   }[];
+}
+
+export interface InteractionError {
+  message: string;
+  target?: { kind: "approval" | "elicitation"; nonce: string };
 }
 
 export interface AcpState {
@@ -626,6 +644,8 @@ export interface AcpState {
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
+  lastErrorEvidence: OperationErrorEvidence | null;
+  interactionError: InteractionError | null;
   /** Derived from `serverTurnActive || inflightPromptIds.length > 0`; never written directly. */
   turnActive: boolean;
   /** The daemon's `turn_active`; only it knows whether a mid-turn prompt was steered into the running turn. */
@@ -1027,6 +1047,8 @@ export function emptyAcpState(): AcpState {
     startupError: null,
     incompatibleAgent: null,
     lastError: null,
+    lastErrorEvidence: null,
+    interactionError: null,
     turnActive: false,
     serverTurnActive: false,
     inflightPromptIds: [],
@@ -1074,6 +1096,8 @@ function isSteeredContinuation(state: AcpState): boolean {
 function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
   next.lastError = null;
+  next.lastErrorEvidence = null;
+  next.interactionError = null;
   // The cancel phase is server-owned; only the escalation deadline is ours.
   next.cancelEscalatesAt = null;
   next.workerStopped = false;
@@ -1121,6 +1145,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       const priorBaseline = state.usageBaseline?.cost ?? 0;
       next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
+    }
+    if (event === "SessionCleared") {
+      next.lastError = null;
+      next.lastErrorEvidence = null;
+      next.interactionError = null;
     }
     return next;
   }
@@ -1296,7 +1325,16 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("PromptRuntimeError" in event) {
     next.lastError = event.PromptRuntimeError.message;
+    next.lastErrorEvidence = event.PromptRuntimeError.evidence ?? null;
     closeTurn(next);
+    return next;
+  }
+  if ("ApprovalResolved" in event || "ElicitationResolved" in event) {
+    const kind = "ApprovalResolved" in event ? "approval" : "elicitation";
+    const nonce = "ApprovalResolved" in event ? event.ApprovalResolved.nonce : event.ElicitationResolved.nonce;
+    if (next.interactionError?.target?.kind === kind && next.interactionError.target.nonce === nonce) {
+      next.interactionError = null;
+    }
     return next;
   }
   if ("PromptCapabilities" in event) {
@@ -1344,7 +1382,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionAssigned = true;
     endRestart(next);
     next.startupError = null;
-    next.lastError = null;
     next.incompatibleAgent = null;
     next.workerStopped = false;
     next.workerRestarting = false;
@@ -1398,6 +1435,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.sessionUsage = null;
     next.usageBaseline = null;
     next.startupError = null;
+    next.lastError = null;
+    next.lastErrorEvidence = null;
+    next.interactionError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch emits Stopped { user_stopped } first; keep its banner hidden through the handshake.
     next.workerStopped = false;
@@ -1615,6 +1655,7 @@ export function applyReducedState(
     pendingElicitations: reduced.pending_elicitations.filter((e) => !resolved.has(e.nonce)),
     thinking: reduced.thinking != null,
     rateLimit: reduced.rate_limit,
+    lastErrorEvidence: reduced.operation_error ?? null,
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,

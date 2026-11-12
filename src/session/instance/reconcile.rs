@@ -42,9 +42,7 @@ impl Instance {
         // files this row no longer owns, and a window armed for it paces an
         // attempt this row never made.
         let prior = std::mem::replace(self, disk);
-        let handoff = Handoff::decide(&prior.capture_poller, prior.held(), self.held());
         self.inherit_runtime(prior, preserve_errors);
-        handoff.settle(&mut self.capture_poller);
         Ok(())
     }
 

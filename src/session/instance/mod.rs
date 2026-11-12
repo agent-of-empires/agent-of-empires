@@ -38,7 +38,7 @@ mod accessors;
 mod capture_slot;
 mod container;
 mod execution;
-pub(crate) use capture_slot::{Handoff, Held, Unserved};
+pub(crate) use capture_slot::{Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
@@ -85,16 +85,21 @@ pub use lifecycle::{LifecycleOperation, LifecycleReservation, LifecycleReservati
 pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
-pub use resume::ManagedResumeCause;
 pub(crate) use resume::{
-    LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy, ResumeLaunchOptions,
+    LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
+    ResumeLaunchOptions,
 };
+pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use sid_persist::{
     persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
 };
 pub use start::{LaunchSidOutcome, StartOutcome};
 pub(crate) use status::PassiveStatusPatch;
-pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR};
+pub use status::{
+    ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,
+    OperationErrorEvidence, RuntimeEvidence, Status, TMUX_SERVER_UNREACHABLE_ERROR,
+    TMUX_SESSION_GONE_ERROR,
+};
 pub(crate) use terminal::ToolLaunchUnavailable;
 #[cfg(test)]
 pub(crate) use test_helpers::install_aliases;
@@ -239,6 +244,10 @@ pub(crate) struct TerminalHandoffLaunch {
     pub(crate) capture_started_at: Option<SystemTime>,
     pub(crate) omp_capture_metadata: Option<OmpCaptureMetadata>,
     pub(crate) confirm_desired_conversation: bool,
+    pub(crate) receipt: Option<std::sync::Arc<LegacyToolObservation>>,
+    /// Negative evidence only; never substitutes for the launch's birth receipt.
+    #[serde(default)]
+    pub(crate) birth_inventory: Option<crate::tmux::utils::PaneBirthInventory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -956,6 +965,8 @@ pub struct Instance {
 
     #[serde(skip)]
     pub last_error: Option<String>,
+    #[serde(skip)]
+    pub last_error_evidence: Option<OperationErrorEvidence>,
     #[serde(skip)]
     pub(crate) capture_poller: capture_slot::CapturePollerSlot,
     /// Session IDs invalidated at a fresh-generation boundary. Persisting this

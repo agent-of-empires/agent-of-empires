@@ -687,7 +687,7 @@ pub(crate) async fn spawn_structured_session(
             let submission =
                 runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let guard = lock.blocking_lock();
-            let reservation = (|| -> anyhow::Result<()> {
+            let reservation = (|| -> anyhow::Result<_> {
                 native.check_available()?;
                 let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
                 let lifecycle_lock =
@@ -697,21 +697,24 @@ pub(crate) async fn spawn_structured_session(
                     false,
                     crate::session::LaunchReservation {
                         generation,
+                        revival: None,
                         title_lock,
                         lifecycle_lock,
                     },
-                )?;
-                Ok(())
+                )
             })();
             drop(guard);
             drop(submission);
             drop(namespace);
             reservation
         };
-        if let Err(error) = launch_reservation {
-            rollback(native, instance, false);
-            return Err(error);
-        }
+        let launch_reservation = match launch_reservation {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                rollback(native, instance, false);
+                return Err(error);
+            }
+        };
 
         creation_guard.phase(CreationPhase::LaunchHooks);
         let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation));
@@ -761,14 +764,23 @@ pub(crate) async fn spawn_structured_session(
                         restart: false,
                         conversation_carry: None,
                     },
-                    generation,
+                    launch_reservation,
                     Ok(()),
                 );
                 let _title = crate::session::acquire_session_title_lock(&instance.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
-                native.adopt_runtime_fields(&instance)?;
-                native.refresh_pane_observations(&instance)?;
-                outcome?;
+                let adoption = native
+                    .adopt_runtime_fields(&instance)
+                    .and_then(|()| native.refresh_pane_observations(&instance));
+                if let Err(error) = outcome {
+                    if let Err(adoption_error) = adoption {
+                        tracing::warn!(target: "session.store", session = %instance.id,
+                            error = %adoption_error,
+                            "canonical adoption also failed after refused launch finalization");
+                    }
+                    return Err(error);
+                }
+                adoption?;
             }
             Ok(())
         })();
@@ -777,6 +789,15 @@ pub(crate) async fn spawn_structured_session(
         drop(submission);
         drop(namespace);
         if let Err(error) = post_hooks {
+            if let Some(pending) = error.downcast_ref::<crate::session::LaunchFinalizationPending>() {
+                native.defer_lifecycle_release(
+                    instance.id.clone(),
+                    crate::session::LifecycleRelease::IndeterminateLaunch,
+                    pending.generation,
+                    None,
+                );
+                return Err(error);
+            }
             // Archiving during hooks preserves the row but refuses ACP admission.
             if !error.is::<crate::session::StartBlocked>() {
                 rollback(native, instance, false);
@@ -1577,6 +1598,344 @@ mod tests {
         })
         .await
         .expect("the session must be released for later operations");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_terminal_creation_is_finalized_and_idempotent() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let creations = root.path().join("creations");
+        let sends = root.path().join("sends");
+        let quote = crate::session::environment::shell_escape_script_word;
+        // Run the real server, but lose only its birth receipt. The pane remains alive.
+        let shim = bin.join("tmux");
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\ncase \"$arg\" in\nnew-session) printf 'birth\\n' >> {}; {} \"$@\" >/dev/null; exit $?;;\nsend-keys|paste-buffer) printf 'input\\n' >> {};;\nesac\ndone\nexec {} \"$@\"\n",
+            quote(&creations.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            quote(&sends.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let input = root.path().join("native-input");
+        let body = serde_json::json!({
+            "title": "indeterminate-created", "path": "", "tool": "claude",
+            "scratch": true, "view": "terminal", "profile": "test",
+            "idempotency_key": "indeterminate-creation",
+            "command_override": format!("exec cat > {}", quote(&input.to_string_lossy())),
+        });
+        let first = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body.clone()).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), axum::http::StatusCode::CREATED);
+        let rows = crate::server::test_support::load_instances_from_disk_for_test("test");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::Session::from_name(&name).exists_live());
+        assert!(row.lifecycle_reservation.is_none());
+        let second = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        assert!(
+            !sends.exists(),
+            "unknown readiness grants no input authority"
+        );
+        assert_eq!(
+            crate::server::test_support::load_instances_from_disk_for_test("test")[0].id,
+            row.id,
+        );
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+        assert_eq!(row.status, crate::session::Status::Starting);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_creation_write_failure_cannot_be_hidden_by_a_healthy_reload() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _environment = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", root.path().join(".config")),
+            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
+        ]);
+        let _native_helper = crate::session::frozen_test_helper(
+            root.path(),
+            concat!(
+                module_path!(),
+                "::indeterminate_creation_write_failure_cannot_be_hidden_by_a_healthy_reload"
+            ),
+        );
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+        );
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+
+        // The canonical native fork API pre-pins its child. Plain Fresh/opaque
+        // creation has no prior SID and never enters the owned-pane SID probe.
+        let mut parent =
+            crate::session::Instance::new("attested-fork-source", root.path().to_str().unwrap());
+        parent.source_profile = "test".into();
+        parent.tool = "claude".into();
+        parent.command = "claude".into();
+        let parent_sid = crate::session::capture::generate_session_uuid();
+        crate::session::seed_claude_transcript(&mut parent, &parent_sid);
+        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![parent.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![parent.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        struct OwnCreationCleanup;
+        impl Drop for OwnCreationCleanup {
+            fn drop(&mut self) {
+                if let Ok(rows) = crate::session::Storage::open_unwatched("test")
+                    .and_then(|storage| storage.load())
+                {
+                    for row in rows.into_iter().filter(|row| {
+                        row.title == "failed-indeterminate-finalization"
+                            && row.idempotency_key.as_deref()
+                                == Some("failed-indeterminate-finalization")
+                    }) {
+                        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+                        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+                    }
+                }
+            }
+        }
+        let _cleanup = OwnCreationCleanup;
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let creations = root.path().join("real-births");
+        let sends = root.path().join("real-input");
+        let probe = root.path().join("post-finalization-owned-probe");
+        let release = root.path().join("write-failure-armed");
+        let quote = crate::session::environment::shell_escape_script_word;
+        let shim = bin.join("tmux");
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nOWNED=; for arg do\ncase \"$arg\" in\nnew-session) printf 'birth\\n' >> {};;\nsend-keys|paste-buffer) printf 'input\\n' >> {};;\n*'#{{window_linked}}'*) OWNED=1;;\nesac\ndone\nif [ -n \"$OWNED\" ] && [ ! -e {} ]; then\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\nprintf '%s\\n' 'owned pane observation temporarily inaccessible' >&2; exit 1\nfi\nexec {} \"$@\"\n",
+            quote(&creations.to_string_lossy()), quote(&sends.to_string_lossy()),
+            quote(&probe.to_string_lossy()), quote(&probe.to_string_lossy()),
+            quote(&release.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let body = serde_json::json!({
+            "title": "failed-indeterminate-finalization", "path": root.path(), "tool": "claude",
+            "view": "terminal", "profile": "test",
+            "fork_session_id": parent.id,
+            "idempotency_key": "failed-indeterminate-finalization",
+        });
+        let create_state = state.clone();
+        let create_body = body.clone();
+        let mut create = tokio::spawn(async move {
+            crate::server::api::sessions::create_session(
+                State(create_state),
+                Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                None,
+                None,
+                Ok(Json(serde_json::from_value(create_body).unwrap())),
+            )
+            .await
+            .into_response()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !probe.exists() {
+                if create.is_finished() {
+                    let response = (&mut create).await.unwrap();
+                    panic!(
+                        "canonical native fork finished before its ownership probe: HTTP {}",
+                        response.status()
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real forked birth must reach its post-finalization ownership probe");
+        let storage = crate::session::Storage::open_unwatched("test").unwrap();
+        let before = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.idempotency_key.as_deref() == Some("failed-indeterminate-finalization"))
+            .expect("the real API-created child is durable");
+        assert_eq!(before.status, crate::session::Status::Creating);
+        let child_sid = before
+            .agent_session_id
+            .as_deref()
+            .expect("the production fork pre-pins its child");
+        assert_ne!(child_sid, parent_sid);
+        let generation = before.lifecycle_generation;
+        assert!(before.lifecycle_reservation_is_owned(
+            crate::session::LifecycleOperation::Launch,
+            generation
+        ));
+        let name = crate::tmux::Session::generate_name(&before.id, &before.title);
+        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+        let pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
+            .parse::<u32>()
+            .unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .expect("actual born process");
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        let write_failure = storage.fail_writes_for_test();
+        let heal_state = state.clone();
+        let healed = Arc::new(AtomicBool::new(false));
+        let heal_observed = healed.clone();
+        let heal_id = before.id.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let _failure =
+            crate::server::session_store::FailedCommitObserver::install(&storage, move || {
+                assert!(matches!(
+                    *heal_state.canonical_health.blocking_read(),
+                    crate::daemon::RuntimeHealth::Degraded { .. }
+                ));
+                drop(write_failure);
+                runtime.block_on(async {
+                    let fresh =
+                        crate::server::test_support::load_instances_from_disk_for_test("test");
+                    let row = fresh.iter().find(|row| row.id == heal_id).unwrap();
+                    assert_eq!(row.status, crate::session::Status::Creating);
+                    assert!(row.lifecycle_reservation_is_owned(
+                        crate::session::LifecycleOperation::Launch,
+                        generation
+                    ));
+                    crate::server::test_support::reload_disk_only_for_test(
+                        &heal_state,
+                        fresh,
+                        Vec::new(),
+                    )
+                    .await;
+                    assert_eq!(
+                        *heal_state.canonical_health.read().await,
+                        crate::daemon::RuntimeHealth::Healthy
+                    );
+                });
+                heal_observed.store(true, Ordering::SeqCst);
+            });
+        std::fs::write(
+            &release,
+            b"fail only the real finalization transaction, then reload",
+        )
+        .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), create)
+            .await
+            .expect("creation must not deadlock on the reloading store")
+            .unwrap();
+        assert!(
+            healed.load(Ordering::SeqCst),
+            "the actual failed transaction and healthy reload must both occur"
+        );
+        assert!(
+            crate::process::process_birth_is_live(pid, &birth).unwrap(),
+            "an unresolved finalization must not roll back its born process"
+        );
+        let current = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .unwrap();
+        if first.status() == axum::http::StatusCode::CREATED {
+            assert_eq!(current.status, crate::session::Status::Starting,
+                "healthy canonical adoption cannot turn a failed durable finalization into 201 Creating");
+            assert!(current.lifecycle_reservation.is_none());
+        } else {
+            assert_eq!(first.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        state.runtime.work.drain().await;
+        let finalized = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .unwrap();
+        assert_eq!(finalized.status, crate::session::Status::Starting);
+        assert!(finalized.lifecycle_reservation.is_none());
+        let second = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        assert!(!sends.exists(), "finalization is not input permission");
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+        assert_eq!(
+            crate::process::process_birth_identity(pid).unwrap(),
+            Some(birth)
+        );
     }
 
     /// A create that answered has registered every resource the launch owns,

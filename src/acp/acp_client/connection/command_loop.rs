@@ -185,14 +185,13 @@ impl Session {
                             "session/cancel (no prompt in flight) notification failed; still emitting Stopped"
                         );
                     }
-                    // The UI thinks a turn is running but none is owned here;
-                    // a spurious Stopped while idle is a reducer no-op (#2237).
-                    self.stand_down_idle_completion();
-                    self.shared
-                        .emit(Event::Stopped {
-                            reason: "cancelled".into(),
-                        })
-                        .await;
+                    if self.stand_down_idle_completion() {
+                        self.shared
+                            .emit(Event::Stopped {
+                                reason: "cancelled".into(),
+                            })
+                            .await;
+                    }
                 }
                 Some(ClientCmd::ForceStop) => {
                     // The supervisor publishes the terminal here (#1100).
@@ -246,14 +245,14 @@ impl Session {
         Ok(())
     }
 
-    /// This path owns the turn's terminal, so the other idle-completion
-    /// paths must not add a duplicate (#2899).
-    fn stand_down_idle_completion(&self) {
-        self.shared.terminal_claim.claim();
+    /// Claim an idle terminal without overriding an already-completed turn.
+    fn stand_down_idle_completion(&self) -> bool {
+        let claimed = self.shared.terminal_claim.claim();
         self.shared
             .adopted_turn_active
             .store(false, Ordering::Relaxed);
         self.shared.between_prompt.deactivate();
+        claimed
     }
 
     /// Returns true when the turn ended on a rate limit: the connection must
@@ -320,7 +319,7 @@ impl Session {
         let label = self.shared.session_label.clone();
         let ingress = self.shared.ingress.clone();
         // No identity transition while an agent callback holds the fence.
-        let Ok(transition_guard) = tokio::time::timeout_at(deadline, ingress.fence.lock()).await
+        let Ok(transition_guard) = tokio::time::timeout_at(deadline, ingress.fence.write()).await
         else {
             let _ = respond_to.send(ResetSessionOutcome::Failed {
                 message: "reset deadline expired while agent callbacks were in flight".into(),
@@ -391,7 +390,7 @@ impl Session {
         .await;
         // A failed reset keeps the old session, so its buffered updates are
         // replayed onto it rather than dropped.
-        let commit_guard = ingress.fence.lock().await;
+        let commit_guard = ingress.fence.write().await;
         let retained_id = result
             .as_ref()
             .map(|resp| resp.session_id.clone())
@@ -418,6 +417,7 @@ impl Session {
                     new_id = %new_id.0,
                     "conversation reset: session/new succeeded, swapped acp_session_id"
                 );
+                self.shared.terminal_claim.clear_failed_outcome();
                 self.shared.emit(Event::SessionCleared).await;
                 self.shared
                     .emit(Event::SessionContextReset {
@@ -454,7 +454,13 @@ impl Session {
                  instead of creating a fresh one; restart the \
                  structured view worker to clear context"
                 .to_string(),
-            Err(ResetRequestError::Acp(e)) => format!("session/new failed: {e}"),
+            Err(ResetRequestError::Acp(e)) => {
+                warn!(target: "acp.protocol", error = ?e, "session/new request failed");
+                format!(
+                    "session/new failed: {}",
+                    super::super::errors::public_error_message(&e)
+                )
+            }
             Err(ResetRequestError::TimedOut) => {
                 "agent did not answer session/new before the reset deadline".to_string()
             }
@@ -463,6 +469,10 @@ impl Session {
         self.shared
             .emit(Event::PromptRuntimeError {
                 message: message.clone(),
+                evidence: Some(crate::session::OperationErrorEvidence::new(
+                    crate::session::ErrorEvidenceSource::LocalPromptResult,
+                    crate::session::ErrorOperation::ContextReset,
+                )),
             })
             .await;
         self.shared
@@ -596,6 +606,186 @@ impl Session {
                 );
                 None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::acp_client::lifecycle::TerminalClaim;
+    use crate::acp::acp_client::session_identity::{RequestPolicy, SessionIngress};
+    use agent_client_protocol::{ByteStreams, Client};
+    use futures_util::FutureExt as _;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::Mutex;
+    use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+
+    #[tokio::test]
+    async fn reset_write_fence_releases_or_expires_with_an_actual_read_admission() {
+        for expire in [false, true] {
+            let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
+            let (mut agent_write, daemon_read) = tokio::io::duplex(64 * 1024);
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let received_frames = received.clone();
+            let agent = tokio::spawn(async move {
+                let mut lines = BufReader::new(agent_read).lines();
+                let mut new_sessions = 0;
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    received_frames.lock().await.push(message.clone());
+                    assert_eq!(message["method"], "session/new");
+                    let session_id = if new_sessions == 0 {
+                        "s-fence-reset".to_string()
+                    } else {
+                        format!("s-fence-reset-reset-{new_sessions}")
+                    };
+                    new_sessions += 1;
+                    let response = serde_json::json!({
+                        "jsonrpc":"2.0","id":message["id"],"result":{"sessionId":session_id}
+                    })
+                    .to_string();
+                    agent_write.write_all(response.as_bytes()).await.unwrap();
+                    agent_write.write_all(b"\n").await.unwrap();
+                    agent_write.flush().await.unwrap();
+                }
+            });
+            let transport = ByteStreams::new(daemon_write.compat_write(), daemon_read.compat());
+            tokio::time::timeout(Duration::from_secs(10), Client.v1().name("reset-fence-test").connect_with(
+                transport,
+                move |connection: ConnectionTo<Agent>| async move {
+                    let cwd = tempfile::tempdir().unwrap();
+                    let (event_tx, mut event_rx) = mpsc::channel(64);
+                    let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
+                    let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+                    let ingress = Arc::new(SessionIngress::default());
+                    let shared = Arc::new(Shared::new(
+                        event_tx,
+                        "reset-fence-test".into(),
+                        &crate::acp::agent_profiles::GEMINI,
+                        lifecycle_tx,
+                        Arc::new(TerminalClaim::new()),
+                        Arc::new(AtomicBool::new(false)),
+                        None,
+                        ingress.clone(),
+                        None,
+                    ));
+                    let initial = connection.send_request(NewSessionRequest::new(cwd.path().to_path_buf()))
+                        .block_task().await?;
+                    let old = initial.session_id;
+                    assert_eq!(old.0.as_ref(), "s-fence-reset");
+                    shared.commit_session(old.clone()).await?;
+                    assert!(matches!(event_rx.recv().await,
+                        Some(Event::AcpSessionAssigned { acp_session_id }) if acp_session_id == "s-fence-reset"));
+                    let mut session = Session {
+                        connection,
+                        shared,
+                        control: None,
+                        acp_session_id: old.clone(),
+                        session_from_storage: false,
+                        channels: SessionChannels::default(),
+                        steering_capable: false,
+                        close_capable: false,
+                        source_profile: None,
+                        default_effort: None,
+                        default_model_config: Default::default(),
+                        default_mode: None,
+                        default_model: None,
+                        agent_cwd: cwd.path().to_path_buf(),
+                        mcp_servers: Vec::new(),
+                        cmd_rx,
+                        lifecycle_rx,
+                        pending_prompts: VecDeque::new(),
+                    };
+                    let notification = || serde_json::from_value(serde_json::json!({
+                        "sessionId":"s-fence-reset","update":{
+                            "sessionUpdate":"agent_message_chunk",
+                            "content":{"type":"text","text":"non-parked progress"}
+                        }
+                    })).unwrap();
+                    let mut held = Some(ingress.request(&old, RequestPolicy::ParentOnly).await?);
+                    assert!(!ingress.has_parked());
+                    drop(ingress.request(&old, RequestPolicy::ParentOnly)
+                        .now_or_never().expect("admitted callbacks share progress")?);
+                    drop(ingress.notification(notification(), None)
+                        .now_or_never().expect("old-session progress shares admission")?
+                        .expect("old-session notification admitted"));
+                    if expire {
+                        tokio::time::pause();
+                    }
+                    let bound = if expire { Duration::from_millis(100) } else { Duration::from_secs(10) };
+                    let (respond_to, response) = oneshot::channel();
+                    {
+                        let reset = session.reset_session(
+                            "/clear".into(), tokio::time::Instant::now() + bound, respond_to,
+                        );
+                        tokio::pin!(reset);
+                        assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                        assert_eq!(ingress.current(), Some(old.clone()));
+                        assert_eq!(received.lock().await.len(), 1);
+                        assert!(matches!(event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                        let mut later = std::pin::pin!(ingress.request(&old, RequestPolicy::ParentOnly));
+                        assert!(futures_util::poll!(later.as_mut()).is_pending());
+                        if expire {
+                            tokio::time::advance(bound).await;
+                            reset.as_mut().await?;
+                            tokio::time::resume();
+                            assert!(matches!(response.await.unwrap(),
+                                ResetSessionOutcome::Failed { message }
+                                if message == "reset deadline expired while agent callbacks were in flight"));
+                            assert!(held.is_some());
+                            drop(later.as_mut().await?);
+                            drop(ingress.notification(notification(), None)
+                                .now_or_never().expect("expired writer releases notification progress")?
+                                .expect("original notification remains admitted"));
+                            assert_eq!(ingress.current(), Some(old.clone()));
+                            assert_eq!(received.lock().await.len(), 1);
+                            assert!(matches!(event_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+                        } else {
+                            drop(held.take());
+                            let (reset_result, later_result) = futures_util::join!(reset.as_mut(), later.as_mut());
+                            reset_result?;
+                            assert!(matches!(response.await.unwrap(),
+                                ResetSessionOutcome::Reset { new_acp_session_id }
+                                if new_acp_session_id == "s-fence-reset-reset-1"));
+                            let stale = later_result.map(|_| ()).unwrap_err();
+                            assert_eq!(stale.message, "sessionId does not identify the active native session");
+                        }
+                    }
+                    drop(held.take());
+                    if expire {
+                        let (respond_to, response) = oneshot::channel();
+                        session.reset_session(
+                            "/clear".into(), tokio::time::Instant::now() + Duration::from_secs(10), respond_to,
+                        ).await?;
+                        assert!(matches!(response.await.unwrap(),
+                            ResetSessionOutcome::Reset { new_acp_session_id }
+                            if new_acp_session_id == "s-fence-reset-reset-1"));
+                    }
+                    let fresh = SessionId::new("s-fence-reset-reset-1");
+                    assert_eq!(ingress.current(), Some(fresh.clone()));
+                    drop(ingress.request(&fresh, RequestPolicy::ParentOnly).await?);
+                    let mut events = Vec::new();
+                    while let Ok(event) = event_rx.try_recv() {
+                        events.push(event);
+                    }
+                    assert!(matches!(events.as_slice(), [
+                        Event::SessionCleared,
+                        Event::SessionContextReset { .. },
+                        Event::AcpSessionAssigned { acp_session_id },
+                        Event::Stopped { reason },
+                    ] if acp_session_id == "s-fence-reset-reset-1" && reason == "session_reset"), "{events:?}");
+                    let received = received.lock().await;
+                    assert_eq!(received.len(), 2);
+                    assert!(received.iter().all(|frame| frame["method"] == "session/new"));
+                    assert_ne!(received[0]["id"], received[1]["id"]);
+                    Ok(())
+                },
+            )).await.expect("real reset fixture completes").expect("SDK connection completes");
+            agent.abort();
+            let _ = agent.await;
         }
     }
 }

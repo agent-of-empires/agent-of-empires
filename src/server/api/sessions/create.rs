@@ -1521,7 +1521,9 @@ pub(crate) async fn create_session_with(
                     "Repository hook configuration changed; review it again",
                 );
             }
-            if e.is::<crate::session::NativeStoreUnavailable>() {
+            if e.is::<crate::session::NativeStoreUnavailable>()
+                || e.is::<crate::session::LaunchFinalizationPending>()
+            {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             // A repo whose hooks need approval gets a distinct, structured
@@ -1663,6 +1665,8 @@ pub(super) fn create_failure(
         || e.downcast_ref::<crate::server::session_service::CreationCancelled>()
             .is_some()
         || e.downcast_ref::<crate::session::NativeStoreUnavailable>()
+            .is_some()
+        || e.downcast_ref::<crate::session::LaunchFinalizationPending>()
             .is_some()
     {
         return None;
