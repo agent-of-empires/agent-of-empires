@@ -977,7 +977,12 @@ impl SessionFeed {
         if self.mutations_available() {
             return None;
         }
-        let connected = self
+        // The writer keeps its channel open after the read side drops, so the
+        // latest runtime result decides whether the daemon is still there.
+        let connected = matches!(
+            self.receiver.borrow().as_ref(),
+            Some(SessionFeedResult::Snapshot(_))
+        ) && self
             .commands
             .as_ref()
             .is_some_and(|commands| !commands.is_closed());
