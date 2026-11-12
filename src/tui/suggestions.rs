@@ -1063,11 +1063,12 @@ impl SuggestionsFeed {
         self.reload();
     }
 
-    /// Sets the profile the TUI shows. A change reloads at once, so the list
-    /// follows a profile switch.
-    pub(super) fn set_profile(&mut self, profile: String) {
-        let switched = self.profile.as_deref().is_some_and(|p| p != profile);
-        self.profile = Some(profile);
+    /// Sets the profile the TUI shows, `None` while it shows every profile
+    /// (nothing to compare). A change reloads at once, so the list follows a
+    /// profile switch.
+    pub(super) fn set_profile(&mut self, profile: Option<String>) {
+        let switched = self.profile.is_some() && self.profile != profile;
+        self.profile = profile;
         if switched {
             self.snapshot = None;
             self.foreign_profile = None;
@@ -2172,7 +2173,7 @@ mod tests {
         let worker = Worker::seeded_for_test("t", Res::Snapshot(Ok(published("default"))));
         let mut rig = view_with(vec![], worker);
         rig.store.snapshot = None;
-        rig.store.set_profile("work".into());
+        rig.store.set_profile(Some("work".into()));
         rig.store.busy = true;
         let mut polled = rig.store.poll();
         for _ in 0..200 {
@@ -2190,7 +2191,7 @@ mod tests {
 
         // The same profile is shown.
         rig.store.busy = false;
-        rig.store.set_profile("default".into());
+        rig.store.set_profile(Some("default".into()));
         assert!(rig.store.foreign_profile.is_none());
     }
 }
