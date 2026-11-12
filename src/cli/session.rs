@@ -1679,10 +1679,6 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         let rules_tool =
             crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
         let status = if let Some((status, _)) =
-            crate::plugin::agent_integration::owned_status(inst, tmux_session.is_pane_dead())
-        {
-            status
-        } else if let Some((status, _)) =
             inst.detect_pane_now(profile, &tmux_session, Some((&raw, args.lines)))
         {
             status.unwrap_or(inst.status)

@@ -645,6 +645,12 @@ pub(crate) fn session_status_override(
     }
 }
 
+/// Detection rule for a status the integration reported itself.
+pub(crate) const OWNED_RULE: &str = "agent_integration";
+
+/// Detection rule for an owned status with no readable report.
+pub(crate) const OWNED_UNAVAILABLE_RULE: &str = "agent_integration_unavailable";
+
 /// Resolve ownership and the report against one registry snapshot.
 pub(crate) fn owned_status(
     instance: &Instance,

@@ -276,9 +276,9 @@ impl Instance {
             self.status = status;
             self.detection.pending = None;
             self.detection.rule = Some(if reported {
-                "agent_integration"
+                crate::plugin::agent_integration::OWNED_RULE
             } else {
-                "agent_integration_unavailable"
+                crate::plugin::agent_integration::OWNED_UNAVAILABLE_RULE
             });
             if self.status == Status::Error {
                 if is_dead {
@@ -455,6 +455,16 @@ impl Instance {
         session: &tmux::Session,
         reuse: Option<(&str, usize)>,
     ) -> Option<(Option<Status>, &'static str)> {
+        if let Some((status, reported)) =
+            crate::plugin::agent_integration::owned_status(self, session.is_pane_dead())
+        {
+            let rule = if reported {
+                crate::plugin::agent_integration::OWNED_RULE
+            } else {
+                crate::plugin::agent_integration::OWNED_UNAVAILABLE_RULE
+            };
+            return Some((Some(status), rule));
+        }
         let alias = tmux::status_rules::effective_detect_as(profile, &self.tool, &self.detect_as);
         let manifest_tool: &str = if alias.is_empty() { &self.tool } else { &alias };
         let rules_tool = tmux::status_rules::detection_tool(profile, &self.tool, &self.detect_as);
