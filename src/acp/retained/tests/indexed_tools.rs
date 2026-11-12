@@ -220,7 +220,7 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
         if split == 0 {
             for id in ["input", "late-input"] {
                 let row = memory
-                    .rows
+                    .rows()
                     .iter()
                     .find(|row| row.tool_call_id.as_deref() == Some(id) && row.tool.is_some())
                     .unwrap();
