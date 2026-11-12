@@ -1146,6 +1146,44 @@ pub(crate) async fn create_session_with(
         return resp;
     }
 
+    if let Some(origin) = body.suggestion.clone() {
+        let host = state.plugin_host.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            let Some(host) = host else {
+                return Ok(false);
+            };
+            let providers = crate::plugin::suggestions::providers();
+            host.with_suggestions_db(|conn, profile| {
+                crate::plugin::suggestions::is_published(conn, profile, &providers, &origin)
+            })
+        })
+        .await;
+        match published {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "stale_suggestion",
+                    "Suggestion is no longer published; refresh and retry",
+                );
+            }
+            Ok(Err(error)) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    error.to_string(),
+                );
+            }
+        }
+    }
+
     let validation_profile = body.profile.as_deref().unwrap_or(&default_profile);
     if !validate_session_tool_identity(
         &body.tool,

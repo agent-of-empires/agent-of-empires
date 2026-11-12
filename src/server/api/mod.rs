@@ -23,7 +23,7 @@ mod setup;
 mod skills;
 mod suggestions;
 #[cfg(test)]
-mod suggestions_tests;
+pub(crate) mod suggestions_tests;
 pub(crate) mod system;
 mod telemetry;
 
