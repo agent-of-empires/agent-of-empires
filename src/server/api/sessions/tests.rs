@@ -10133,6 +10133,14 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         (origin.provider_id.as_str(), origin.id.as_str()),
         ("acme.gh", "42")
     );
+    // Created in `chosen-default`, published under the host's `default`.
+    assert_ne!(instances[0].source_profile, "default");
+    assert_eq!(origin.profile.as_deref(), Some("default"));
+    let started = crate::plugin::suggestions::started_sessions(instances.iter(), "default");
+    assert_eq!(
+        started[&("acme.gh".to_string(), "42".to_string())]["id"],
+        instances[0].id
+    );
 }
 
 #[tokio::test]

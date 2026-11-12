@@ -376,11 +376,15 @@ pub struct PluginCreateIdempotency {
 /// Largest accepted `initial_prompt`, in bytes.
 pub const MAX_INITIAL_PROMPT_BYTES: usize = 64 * 1024;
 
-/// The suggestion a session was started from.
+/// The suggestion a session was started from. `profile` is the profile the
+/// suggestion was published under, which can differ from the session's own
+/// profile; the server sets it, so a client-supplied value is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SuggestionOrigin {
     pub provider_id: String,
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 #[cfg(test)]

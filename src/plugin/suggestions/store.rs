@@ -365,7 +365,8 @@ pub(crate) fn started_sessions<'a>(
         let Some(origin) = &inst.suggestion else {
             continue;
         };
-        if inst.is_trashed() || inst.source_profile != profile {
+        let origin_profile = origin.profile.as_deref().unwrap_or(&inst.source_profile);
+        if inst.is_trashed() || origin_profile != profile {
             continue;
         }
         let slot = oldest
@@ -870,6 +871,7 @@ mod tests {
             i.suggestion = Some(crate::session::SuggestionOrigin {
                 provider_id: "acme.github".into(),
                 id: "a".into(),
+                profile: None,
             });
             i
         };
