@@ -154,6 +154,8 @@ async fn send_terminal_message_inner(
         .ok_or(SendKeysError::NotFound)?;
     let revived = instance.lifecycle_generation != before.lifecycle_generation;
     let worker_state = state.clone();
+    let typed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let typed_in_worker = typed.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         use crate::session::SessionStore;
         let native = crate::server::session_store::NativeSessionStore::open(
@@ -186,6 +188,7 @@ async fn send_terminal_message_inner(
             &message,
             crate::agents::send_keys_enter_delay(&instance.tool),
         )?;
+        typed_in_worker.store(true, std::sync::atomic::Ordering::Release);
         store.update(|rows, _| {
             let row = rows
                 .iter_mut()
@@ -204,12 +207,14 @@ async fn send_terminal_message_inner(
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
     drop(guard);
-    drop(_submission);
-    drop(namespace);
-    if result.is_ok() {
-        // A newer prompt supersedes an undelivered initial one, as in ACP.
+    // A newer prompt supersedes an undelivered initial one, as in ACP. Cleared
+    // while still holding the submission and once tmux accepted the text, even
+    // if the recency write failed.
+    if typed.load(std::sync::atomic::Ordering::Acquire) {
         service.clear_pending_initial_turn(id).await;
     }
+    drop(_submission);
+    drop(namespace);
     result.map_err(|error| {
         if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
             SendKeysError::Blocked(*blocked)
