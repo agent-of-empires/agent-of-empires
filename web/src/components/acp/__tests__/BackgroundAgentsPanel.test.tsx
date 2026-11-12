@@ -515,14 +515,16 @@ describe("BackgroundAgentsPanel", () => {
       ...over,
     });
 
-    it("POSTs the child cancel route and surfaces a failure", async () => {
+    it("asks before POSTing the child cancel route, and surfaces a failure", async () => {
       const fetchMock = vi.fn(() =>
         Promise.resolve({ ok: false, status: 409, text: () => Promise.resolve("subagent cannot be cancelled") }),
       );
       vi.stubGlobal("fetch", fetchMock);
       agentsMock.mockReturnValue([agent()]);
       subagentsMock.mockReturnValue([record()]);
-      const { getByRole, findByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      const { getByRole, getByTitle, findByText } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByTitle("Stop this sub-agent"));
+      expect(fetchMock).not.toHaveBeenCalled();
       fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       expect(await findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
@@ -544,14 +546,15 @@ describe("BackgroundAgentsPanel", () => {
           stop_reason: "end_turn",
         }),
       ]);
-      const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      const { container, getAllByTitle, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
       expect(container.textContent).toContain("Background · 2");
       expect(container.textContent).toContain("Explore repo");
       expect(container.textContent).toContain("Unlinked");
       expect(container.textContent).toContain("done");
-      const stops = getAllByRole("button", { name: "Stop sub-agent" });
+      const stops = getAllByTitle("Stop this sub-agent");
       expect(stops).toHaveLength(1);
       fireEvent.click(stops[0]!);
+      fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       vi.unstubAllGlobals();
       subagentsMock.mockReturnValue([]);
@@ -643,8 +646,8 @@ describe("BackgroundAgentsPanel", () => {
       for (const [a, roster] of cases) {
         agentsMock.mockReturnValue([a]);
         subagentsMock.mockReturnValue(roster);
-        const { queryByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-        expect(queryByRole("button", { name: "Stop sub-agent" })).toBeNull();
+        const { queryByTitle, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+        expect(queryByTitle("Stop this sub-agent")).toBeNull();
         unmount();
       }
       subagentsMock.mockReturnValue([]);
@@ -656,10 +659,10 @@ describe("BackgroundAgentsPanel", () => {
         agent({ agentId: "u", toolCallId: "t-u", status: "unknown" }),
       ]);
       subagentsMock.mockReturnValue([record({ parent_tool_call_id: "t-w" })]);
-      const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      const { container, getAllByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
       expect(container.textContent).toContain("Waiting on you");
       expect(container.textContent).toContain("Unknown");
-      expect(getAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(1);
+      expect(getAllByTitle("Stop this sub-agent")).toHaveLength(1);
       subagentsMock.mockReturnValue([]);
     });
   });

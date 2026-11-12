@@ -2,7 +2,7 @@
 // StructuredView's existing WebSocket, so this pane opens no connection of its own.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Bot, ChevronDown, ChevronLeft, ChevronRight, Square, Workflow } from "lucide-react";
+import { Bot, ChevronDown, ChevronLeft, ChevronRight, Workflow } from "lucide-react";
 
 import {
   useActivity,
@@ -27,7 +27,7 @@ import {
 } from "./backgroundAgentsContext";
 import { ShellDetailModal, ShellRow } from "./BackgroundShells";
 import { fromBackground } from "./subagents/model";
-import { StopSession } from "./subagents/StopSession";
+import { StopSession, StopSubagent } from "./subagents/StopSession";
 import { SubagentDetail } from "./subagents/SubagentDetail";
 
 type Entry =
@@ -380,7 +380,7 @@ function AgentRow({
   const stoppable = !!roster?.cancel_capable && !!sessionId && isActiveAgent(agent);
   return (
     <div className="border-b border-surface-800">
-      <div className="flex items-center hover:bg-surface-800">
+      <div className="flex flex-wrap items-center pr-2 hover:bg-surface-800">
         <button
           type="button"
           onClick={() => onSelect(agent.agentId)}
@@ -396,15 +396,10 @@ function AgentRow({
           <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-dim" />
         </button>
         {stoppable && (
-          <button
-            type="button"
-            title="Stop this sub-agent"
-            aria-label="Stop sub-agent"
-            onClick={async () => setStopError(await cancelSubagent(sessionId, roster.session_id))}
-            className="shrink-0 px-1.5 py-2 text-text-dim hover:text-rose-300"
-          >
-            <Square className="h-3 w-3 fill-current" strokeWidth={0} />
-          </button>
+          <StopSubagent
+            childId={roster.session_id}
+            cancel={async (id) => setStopError(await cancelSubagent(sessionId, id))}
+          />
         )}
       </div>
       {stopError && <div className="px-3 pb-1.5 pl-9 text-[11px] text-status-error">{stopError}</div>}
