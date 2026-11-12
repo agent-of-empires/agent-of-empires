@@ -666,6 +666,8 @@ pub(crate) async fn spawn_structured_session(
                     creation_guard.phase(CreationPhase::CreateHooks);
                     if let Some(sandbox) = instance.sandbox_info.as_ref().filter(|_| pull_latest_image) {
                         pull_latest(&sandbox.image, progress.as_deref(), &creation_guard.cancellation())?;
+                        // A cancel that lands as the pull exits must still stop the hooks.
+                        creation_guard.check()?;
                     }
                     if instance.sandbox_info.is_some() {
                         if let Some(progress) = progress.as_deref() {
