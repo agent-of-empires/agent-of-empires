@@ -90,8 +90,10 @@ impl Shared {
 
     /// Publish each child that fell silent past the floor as cancelled, so the
     /// log stops counting it. Its idle state keeps it from publishing twice.
+    /// Check and edit share both locks, so a concurrent update is never
+    /// overwritten.
     pub(super) async fn expire_silent_subagents(&self, now_ms: i64) {
-        let expired: Vec<(String, String)> = {
+        let expired: Vec<SubagentRecord> = {
             let seen = self
                 .subagent_seen
                 .lock()
@@ -99,17 +101,21 @@ impl Shared {
             self.subagents
                 .lock()
                 .expect("subagents mutex poisoned")
-                .iter()
+                .iter_mut()
                 .filter(|(id, record)| {
                     record.state.is_active() && !heard_within_floor(&seen, id, now_ms)
                 })
-                .map(|(id, record)| (record.parent_session_id.clone(), id.clone()))
+                .map(|(_, record)| {
+                    record.state = SubagentState::Idle;
+                    record.stop_reason = Some("cancelled".into());
+                    record.clone()
+                })
                 .collect()
         };
-        for (parent, child) in expired {
-            self.publish_subagent(&parent.into(), &child.into(), |record| {
-                record.state = SubagentState::Idle;
-                record.stop_reason = Some("cancelled".into());
+        for subagent in expired {
+            self.emit(Event::SubagentUpdated {
+                subagent,
+                at: chrono::Utc::now(),
             })
             .await;
         }

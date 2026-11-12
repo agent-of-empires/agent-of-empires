@@ -468,6 +468,92 @@ mod tests {
         assert_eq!(sup.worker_state(id).await, Running);
     }
 
+    /// One log: a child running past the root's `Stopped` keeps the row busy and
+    /// the worker alive; its idle releases both.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_running_child_holds_the_session_until_it_idles() {
+        use crate::acp::state::test_support::{prompt, stopped};
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName, SubagentRecord, SubagentState};
+        use crate::session::Status;
+        let id = "child-session";
+        let (_home, state, _project) = super::super::test_fixtures::test_state(id);
+        let app_dir = crate::session::get_app_dir().unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[acp]\nauto_stop_idle_secs = 60\n",
+        )
+        .unwrap();
+        let store = &state.acp_event_store;
+        let sup = &state.acp_supervisor;
+        let stale_ms = Utc::now().timestamp_millis() - 3_600_000;
+        let child = |state| Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "root".into(),
+                parent_tool_call_id: None,
+                title: None,
+                description: None,
+                state,
+                stop_reason: None,
+                error: None,
+                cancel_capable: true,
+                model: None,
+                background: true,
+            },
+            at: Utc::now(),
+        };
+        let events = [
+            prompt("go"),
+            child(SubagentState::Running),
+            stopped("end_turn"),
+        ];
+        for (seq, event) in (1..).zip(&events) {
+            store.record_at(id, seq, event, stale_ms).unwrap();
+        }
+        sup.test_insert_worker(id).await;
+        sup.running_lease(id)
+            .unwrap()
+            .test_backdate_idle_baseline(stale_ms);
+        let sidebar = || {
+            let mut folded =
+                AcpState::new(AcpSessionId(id.into()), AgentName("claude".into()), None);
+            for (seq, event) in store.replay_from(id, 0) {
+                folded.apply_event(seq, event).unwrap();
+            }
+            folded.sidebar_status()
+        };
+        let dormant = || async {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .is_idle_dormant()
+        };
+
+        assert_eq!(sidebar(), Status::Running);
+        assert_eq!(store.holds_live_work(id), Some(true));
+        reap_idle_workers(&state).await;
+        assert!(!dormant().await, "a running child is not idle");
+        assert_eq!(
+            sup.worker_state(id).await,
+            crate::daemon::AcpWorkerState::Running
+        );
+
+        store
+            .record_at(id, 4, &child(SubagentState::Idle), stale_ms)
+            .unwrap();
+        assert_eq!(sidebar(), Status::Idle);
+        assert_eq!(store.holds_live_work(id), Some(false));
+        reap_idle_workers(&state).await;
+        assert!(dormant().await, "the idle child releases the worker");
+        assert_ne!(
+            sup.worker_state(id).await,
+            crate::daemon::AcpWorkerState::Running
+        );
+    }
+
     /// Case 0 replays the real occurrence: an agent-initiated turn after the
     /// prompt's own `Stopped`, ending on the cost-bearing marker. The rest are vetoes.
     #[tokio::test]

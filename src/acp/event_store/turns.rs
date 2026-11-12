@@ -78,25 +78,20 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
      ORDER BY started.seq ASC";
 
 /// Each subagent's latest snapshot, where it is still working. An
-/// `AgentSwitched` drops the children announced before it.
-const OPEN_SUBAGENTS_SQL: &str = "SELECT snapshot.event_json
-     FROM acp_events AS snapshot
-     WHERE snapshot.session_id = ?1
-       AND snapshot.discriminant = 'SubagentUpdated'
-       AND json_extract(snapshot.event_json, '$.SubagentUpdated.subagent.state')
+/// `AgentSwitched` drops the children announced before it. SQLite takes the
+/// bare `event_json` from the `MAX(seq)` row of each group.
+const OPEN_SUBAGENTS_SQL: &str = "SELECT latest.event_json
+     FROM (SELECT event_json, MAX(seq) AS seq
+           FROM acp_events
+           WHERE session_id = ?1
+             AND discriminant = 'SubagentUpdated'
+             AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                 WHERE session_id = ?1
+                                   AND discriminant = 'AgentSwitched'), 0)
+           GROUP BY json_extract(event_json, '$.SubagentUpdated.subagent.session_id')) AS latest
+     WHERE json_extract(latest.event_json, '$.SubagentUpdated.subagent.state')
            IN ('running', 'requires_action')
-       AND snapshot.seq > COALESCE((SELECT MAX(seq) FROM acp_events
-                                    WHERE session_id = ?1
-                                      AND discriminant = 'AgentSwitched'), 0)
-       AND NOT EXISTS (
-           SELECT 1 FROM acp_events AS later
-           WHERE later.session_id = ?1
-             AND later.discriminant = 'SubagentUpdated'
-             AND later.seq > snapshot.seq
-             AND json_extract(later.event_json, '$.SubagentUpdated.subagent.session_id') =
-                 json_extract(snapshot.event_json, '$.SubagentUpdated.subagent.session_id')
-       )
-     ORDER BY snapshot.seq ASC";
+     ORDER BY latest.seq ASC";
 
 /// The agents of workflow run `run_id` the log has launched, and those of
 /// them it has completed.
