@@ -283,8 +283,8 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::lifecycle::TerminalClaim;
     use crate::acp::acp_client::session_identity::SessionIngress;
+    use crate::acp::acp_client::SessionState;
     use crate::acp::agent_profiles::CLAUDE;
     use agent_client_protocol::v1::schema::SessionNotification;
     use std::sync::atomic::AtomicBool;
@@ -347,7 +347,7 @@ mod tests {
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(false)),
             None,
             ingress.clone(),
@@ -536,7 +536,7 @@ mod tests {
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(false)),
             None,
             ingress.clone(),
@@ -593,7 +593,7 @@ mod tests {
             "test".into(),
             &CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(false)),
             None,
             ingress.clone(),
