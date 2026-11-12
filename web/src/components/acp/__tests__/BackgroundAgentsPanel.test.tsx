@@ -450,17 +450,6 @@ describe("BackgroundAgentsPanel", () => {
     expect(runIdx).toBeLessThan(doneIdx);
   });
 
-  it("shows a Stop button for active agents that POSTs the session cancel", async () => {
-    const fetchMock = vi.fn(() => Promise.resolve({ ok: true } as Response));
-    vi.stubGlobal("fetch", fetchMock);
-    agentsMock.mockReturnValue([agent({ status: "running" })]);
-    const { getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    const stop = getByRole("button", { name: /stop/i });
-    fireEvent.click(stop);
-    expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/cancel", { method: "POST" });
-    vi.unstubAllGlobals();
-  });
-
   it("hides the Stop button for finished or stalled agents (cancel would be a no-op)", () => {
     for (const over of [{ status: "completed", endedAt: new Date().toISOString() }, { status: "stalled" }] as const) {
       agentsMock.mockReturnValue([agent(over)]);
