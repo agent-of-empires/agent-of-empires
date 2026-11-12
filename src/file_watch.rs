@@ -1382,12 +1382,18 @@ mod tests {
     #[test]
     fn dispatcher_dead_when_its_runtime_shuts_down() {
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
         let svc = runtime.block_on(async {
             let svc = FileWatchService::new().expect("init");
-            // The guard exists only once the dispatcher has been polled.
-            tokio::task::yield_now().await;
+            // The barrier ack proves the dispatcher was polled, so its exit guard exists.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                super::test_support::dispatch_barrier(&svc),
+            )
+            .await
+            .expect("dispatcher acknowledges the barrier");
             svc
         });
         assert!(!svc.dispatcher_dead.load(Ordering::Acquire));
