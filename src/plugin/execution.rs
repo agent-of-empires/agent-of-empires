@@ -339,7 +339,7 @@ mod tests {
             .unwrap()
             .unwrap();
         std::fs::write(root.join("start"), b"").unwrap();
-        async fn captured(path: &std::path::Path) -> crate::process::CapturedProcess {
+        async fn captured(path: &std::path::Path) -> (u32, crate::process::CapturedProcess) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     if let Some(pid) = std::fs::read_to_string(path)
@@ -350,7 +350,7 @@ mod tests {
                             if let Some(process) =
                                 crate::process::CapturedProcess::capture(pid, &birth).unwrap()
                             {
-                                return process;
+                                return (pid, process);
                             }
                         }
                     }
@@ -360,8 +360,8 @@ mod tests {
             .await
             .unwrap()
         }
-        let leader = captured(&root.join("leader")).await;
-        let late = captured(&root.join("late")).await;
+        let (_, leader) = captured(&root.join("leader")).await;
+        let (late_pid, late) = captured(&root.join("late")).await;
         std::fs::write(root.join("release"), b"").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !leader.exited().unwrap() {
@@ -370,7 +370,22 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!late.exited().unwrap());
+        assert!(!late.exited().unwrap(), "{}", {
+            let identity = crate::process::process_birth_identity(late_pid).unwrap();
+            let recapture = identity
+                .as_ref()
+                .map(|birth| {
+                    crate::process::CapturedProcess::capture(late_pid, birth)
+                        .unwrap()
+                        .is_some()
+                })
+                .unwrap_or(false);
+            format!(
+                "late child pid={late_pid} identity={identity:?} recapture={recapture} \
+                 file={:?}",
+                std::fs::read_to_string(root.join("late")).ok()
+            )
+        });
         observe.release();
         let output = tokio::time::timeout(Duration::from_secs(10), task)
             .await
