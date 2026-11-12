@@ -4082,6 +4082,125 @@ mod tests {
         crate::hooks::cleanup_hook_status_dir("sess-term-stale");
     }
 
+    /// A session archived, snoozed or relaunched while the drain waits for the
+    /// agent is not typed into, and the stale wait records no error on it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_revalidates_the_row_after_the_readiness_wait() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        type Change = fn(&mut Instance);
+        let changes: [(&str, Change); 3] = [
+            ("archived", |i| i.archive()),
+            ("snoozed", |i| i.snooze(60)),
+            ("relaunched", |i| i.lifecycle_generation += 1),
+        ];
+        for (case, change) in changes {
+            let id = format!("sess-term-wait-{case}");
+            let inst =
+                terminal_turn_instance(&id, &format!("term-wait-{case}"), "must-not-be-typed");
+            let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
+                .session_service
+                .clone();
+            let budget = std::time::Duration::from_secs(10);
+            // The mutation lands while the drain polls for the missing pane; the
+            // pane comes up after it, so the wait succeeds against a changed row.
+            let (retry, pane) = tokio::join!(
+                service.drain_terminal_initial_turn_once(&id, budget),
+                async {
+                    change(
+                        service
+                            .instances
+                            .write()
+                            .await
+                            .iter_mut()
+                            .find(|i| i.id == id)
+                            .expect("row"),
+                    );
+                    start_terminal_pane(&inst, READY_AGENT_SCRIPT, false)
+                },
+            );
+            assert!(!retry, "{case}");
+            assert!(!pane_text(&pane).contains("must-not-be-typed"), "{case}");
+            let turn = pending_turn(&service, &id).await.expect("turn is kept");
+            assert!(turn.error.is_none(), "{case}");
+        }
+    }
+
+    /// A failed wait for a launch that was replaced meanwhile is not recorded
+    /// on the replacement; the new launch gets its own attempt.
+    #[tokio::test]
+    async fn a_failed_wait_does_not_poison_a_replacement_launch() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-term-replaced", "term-replaced", "later");
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        let (retry, ()) = tokio::join!(
+            service.drain_terminal_initial_turn_once(
+                "sess-term-replaced",
+                std::time::Duration::from_millis(300),
+            ),
+            async {
+                service
+                    .instances
+                    .write()
+                    .await
+                    .iter_mut()
+                    .find(|i| i.id == "sess-term-replaced")
+                    .expect("row")
+                    .lifecycle_generation += 1;
+            },
+        );
+        assert!(retry);
+        let turn = pending_turn(&service, "sess-term-replaced")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_none());
+    }
+
+    /// A user message supersedes an undelivered initial turn: the drain that
+    /// was waiting never types it after the message.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_terminal_send_supersedes_the_pending_initial_turn() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-term-super", "term-super", "initial-turn-A");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let pane = start_terminal_pane(&inst, READY_AGENT_SCRIPT, false);
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let service = state.session_service.clone();
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        let sent = crate::server::api::sessions::send_terminal_message(
+            &service,
+            "sess-term-super",
+            "user-message-B".to_string(),
+            false,
+        )
+        .await;
+        assert!(sent.is_ok());
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-term-super",
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        let text = pane_text(&pane);
+        assert!(text.contains("user-message-B"), "{text}");
+        assert!(!text.contains("initial-turn-A"), "{text}");
+        assert!(pending_turn(&service, "sess-term-super").await.is_none());
+    }
+
     /// An archived or snoozed session is set aside: its pending turn is
     /// neither typed nor marked failed.
     #[tokio::test]
