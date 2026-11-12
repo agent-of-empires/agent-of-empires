@@ -46,7 +46,7 @@ pub use close::CloseSessionOutcome;
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
 pub(crate) use control::ControlLoss;
 pub use delete::DeleteSessionOutcome;
-pub use errors::{AcpError, IncompatibleAgentError};
+pub use errors::{is_authentication_failure, AcpError, IncompatibleAgentError};
 pub use list::{list_native_sessions, ListSessionsError};
 pub use reset::ResetSessionOutcome;
 pub use resolve_command::{

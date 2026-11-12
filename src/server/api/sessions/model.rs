@@ -142,6 +142,7 @@ pub(super) fn session_response_from_instance_with_plan(
         pending_approvals: Vec::new(),
         rate_limit: None,
         rate_limit_auto_resume: None,
+        rate_limit_failover_to: None,
         // Built-in ACP capability resolves here from a process-wide
         // registry (no IO). Custom agents depend on profile config, which
         // the list and create handlers overlay without a per-row read.

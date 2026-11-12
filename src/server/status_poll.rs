@@ -364,9 +364,16 @@ pub(super) async fn maintenance_loop(
     let mut last_credential_refresh = std::time::Instant::now();
     let mut last_purge_recovery = std::time::Instant::now() - std::time::Duration::from_secs(30);
     loop {
+        let mut rate_limit_parked = false;
         tokio::select! {
             _ = state.shutdown.cancelled() => return,
             _ = interval.tick() => {}
+            _ = state.acp_supervisor.rate_limit_parked() => rate_limit_parked = true,
+        }
+        // A fresh park is registered by this pass's resume step, so the reaper acts on it from
+        // the next one; both run now instead of waiting out the reaper cadence.
+        if rate_limit_parked {
+            acp_reap_cadence.rate_limit = None;
         }
         {
             let rows = state.instances.read().await;
@@ -403,6 +410,9 @@ pub(super) async fn maintenance_loop(
             &mut acp_capacity_deferred,
         )
         .await;
+        if rate_limit_parked {
+            acp_reap_cadence.rate_limit = None;
+        }
         reap_idle_sessions(&state, &mut last_session_idle_reap).await;
         update_sleep_inhibit(
             &state,
