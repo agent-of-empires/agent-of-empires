@@ -85,4 +85,17 @@ describe("SuggestionMappingWizard", () => {
     expect(onClose).not.toHaveBeenCalled();
     expect(onSaved).not.toHaveBeenCalled();
   });
+
+  it("ignores Escape and a backdrop click while a save is in flight", async () => {
+    let finish: (v: unknown) => void = () => {};
+    api.putSuggestionMapping.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    const { onClose } = await open();
+    fireEvent.click(screen.getByRole("button", { name: "Save 1 mapping" }));
+    await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledTimes(1));
+    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.click(screen.getByTestId("suggestion-mapping-wizard"));
+    expect(onClose).not.toHaveBeenCalled();
+    finish({ ok: true, data: {} });
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
 });
