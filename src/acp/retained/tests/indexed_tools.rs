@@ -1,7 +1,7 @@
 use super::*;
 use crate::acp::transcript::{storage::DeltaOf, TranscriptModel, TranscriptRow};
 
-type ToolSignature = (String, String, String, String, DateTime<Utc>);
+type ToolSignature = (String, String, String, String, Option<String>, DateTime<Utc>);
 type RowSignature = (
     String,
     String,
@@ -25,6 +25,7 @@ fn memory_row(row: &TranscriptRow) -> RowSignature {
                 tool.name.clone(),
                 tool.kind.clone(),
                 tool.args_preview.clone(),
+                tool.prompt.clone(),
                 tool.started_at,
             )
         }),
@@ -56,6 +57,7 @@ fn disk_delta(context: &Context, delta: &DeltaOf<Disk>) -> DeltaSignature {
                 text(context, tool.name),
                 text(context, tool.kind),
                 text(context, tool.args_preview),
+                tool.prompt.map(|value| text(context, value)),
                 tool.started_at,
             )
         }),
@@ -67,7 +69,7 @@ fn disk_delta(context: &Context, delta: &DeltaOf<Disk>) -> DeltaSignature {
     }
 }
 
-fn compare(events: &[Event], split: usize) {
+fn compare(events: &[Event], split: usize) -> TranscriptModel {
     let context = Context::new(Arc::new(AtomicBool::new(false))).unwrap();
     let mut disk = Core::new(Disk(Rc::clone(&context))).unwrap();
     let mut memory = TranscriptModel::new();
@@ -100,6 +102,7 @@ fn compare(events: &[Event], split: usize) {
             Ok(())
         })
         .unwrap();
+    memory
 }
 
 #[test]
@@ -134,7 +137,29 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
         tool_call_id: id.into(),
         title: Some("Retitled".into()),
         args_preview: Some("{\"path\":\"updated\"}".into()),
+        prompt: None,
         started_at: Some(at()),
+        diffs: None,
+    };
+    let full_input = "a\u{301} full input ".repeat(2048) + "FULL-INPUT-END";
+    let cut_preview = format!("{{\"prompt\":\"cut{}", crate::acp::state::ARGS_CUT_MARKER);
+    let mut input_start = tool("input");
+    if let Event::ToolCallStarted { tool_call } = &mut input_start {
+        tool_call.name = "Task".into();
+        tool_call.kind = "execute".into();
+        tool_call.args_preview = cut_preview.clone();
+        tool_call.prompt = Some(full_input.clone());
+    }
+    let mut input_short = tool("input");
+    if let Event::ToolCallStarted { tool_call } = &mut input_short {
+        tool_call.args_preview = "{\"prompt\":\"short start\"}".into();
+    }
+    let input_update = |id: &str, args: &str, prompt: Option<&str>| Event::ToolCallUpdated {
+        tool_call_id: id.into(),
+        title: None,
+        args_preview: Some(args.into()),
+        prompt: prompt.map(str::to_owned),
+        started_at: None,
         diffs: None,
     };
     let events = vec![
@@ -167,6 +192,15 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
         Event::SessionCleared,
         tool("a"),
         update("a"),
+        input_start,
+        input_update("input", &cut_preview, None),
+        tool("input"),
+        input_short,
+        input_update("input", &cut_preview, Some(&full_input)),
+        input_update("input", &cut_preview, None),
+        input_update("input", "{\"prompt\":\"short update\"}", None),
+        input_update("late-input", &cut_preview, Some(&full_input)),
+        input_update("input", &cut_preview, Some(&full_input)),
         Event::Stopped {
             reason: "done".into(),
         },
@@ -174,7 +208,28 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
     ];
     for split in 0..=events.len() {
         super::super::records::ROW_READS.with(|reads| reads.set(0));
-        compare(&events, split);
+        let memory = compare(&events, split);
+        if split == 0 {
+            for id in ["input", "late-input"] {
+                let row = memory
+                    .rows
+                    .iter()
+                    .find(|row| {
+                        row.tool_call_id.as_deref() == Some(id) && row.tool.is_some()
+                    })
+                    .unwrap();
+                assert_eq!(
+                    row.tool.as_ref().unwrap().prompt.as_deref(),
+                    Some(full_input.as_str())
+                );
+                let wire = serde_json::to_value(row).unwrap();
+                assert_eq!(
+                    wire["tool"]["prompt"].as_str(),
+                    Some(full_input.as_str()),
+                    "the rendered subagent input consumes this complete public row field"
+                );
+            }
+        }
         super::super::records::ROW_READS.with(|reads| reads.set(0));
     }
 }

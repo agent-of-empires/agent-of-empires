@@ -172,6 +172,8 @@ pub(crate) trait Backend: Sized + 'static {
     fn trim_empty<'a>(&self, value: Self::Input<'a>) -> Result<bool, Self::Error>;
     fn trim<'a>(&self, value: Self::Input<'a>) -> Result<Self::Input<'a>, Self::Error>;
     fn starts_with<'a>(&self, value: Self::Input<'a>, prefix: &str) -> Result<bool, Self::Error>;
+    fn ends_with<'a>(&self, value: Self::Input<'a>, suffix: &str) -> Result<bool, Self::Error>;
+    fn contains<'a>(&self, value: Self::Input<'a>, needle: &str) -> Result<bool, Self::Error>;
     fn writer(&self, capacity_hint: u64) -> Self::Writer<'_>;
     fn borrow_recall<'a>(&self, value: &'a Self::Recall) -> Self::RecallInput<'a>;
     fn borrow_diffs<'a>(&self, value: &'a Self::Diffs) -> Self::DiffsInput<'a>;
@@ -234,6 +236,7 @@ pub(crate) trait Backend: Sized + 'static {
             name: self.borrow(&value.name),
             kind: self.borrow(&value.kind),
             args_preview: self.borrow(&value.args_preview),
+            prompt: value.prompt.as_ref().map(|value| self.borrow(value)),
             started_at: value.started_at,
             parent_tool_call_id: value
                 .parent_tool_call_id
@@ -253,6 +256,7 @@ pub(crate) trait Backend: Sized + 'static {
             name: self.retain(value.name)?,
             kind: self.retain(value.kind)?,
             args_preview: self.retain(value.args_preview)?,
+            prompt: value.prompt.map(|value| self.retain(value)).transpose()?,
             started_at: value.started_at,
             parent_tool_call_id: value
                 .parent_tool_call_id
@@ -287,6 +291,11 @@ pub(crate) trait Backend: Sized + 'static {
                 self.retain(value.args_preview)?
             } else {
                 prev.args_preview.clone()
+            },
+            prompt: match value.prompt {
+                Some(prompt) => Some(self.retain(prompt)?),
+                None if self.contains(value.args_preview, r#""prompt""#)? => None,
+                None => prev.prompt.clone(),
             },
             started_at: value.started_at.max(prev.started_at),
             parent_tool_call_id: match value.parent_tool_call_id {
@@ -419,6 +428,12 @@ impl Backend for Memory {
     }
     fn starts_with(&self, value: &str, prefix: &str) -> Result<bool, Infallible> {
         Ok(value.starts_with(prefix))
+    }
+    fn ends_with(&self, value: &str, suffix: &str) -> Result<bool, Infallible> {
+        Ok(value.ends_with(suffix))
+    }
+    fn contains(&self, value: &str, needle: &str) -> Result<bool, Infallible> {
+        Ok(value.contains(needle))
     }
     fn writer(&self, capacity: u64) -> MemoryWriter {
         MemoryWriter(String::with_capacity(

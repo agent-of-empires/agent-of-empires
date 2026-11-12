@@ -295,6 +295,56 @@ impl Backend for Disk {
             prefix,
         )
     }
+    fn ends_with<'a>(&self, value: TextRef, suffix: &str) -> io::Result<bool> {
+        let length = suffix.len() as u64;
+        if value.len < length {
+            return Ok(false);
+        }
+        json::text_is(
+            &self.0.spool,
+            value.subrange(value.len - length..value.len)?,
+            suffix,
+        )
+    }
+    fn contains<'a>(&self, value: TextRef, needle: &str) -> io::Result<bool> {
+        let length = needle.len() as u64;
+        if length == 0 {
+            return Ok(true);
+        }
+        if value.len < length {
+            return Ok(false);
+        }
+        let source = self.0.spool.view(value)?;
+        let needle_bytes = needle.as_bytes();
+        let first = needle_bytes[0];
+        let mut buffer = [0; 4096];
+        let mut offset = 0;
+        while offset < value.len {
+            let count = source.read_at(offset, &mut buffer)?;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "retained text disappeared",
+                ));
+            }
+            if buffer[..count].windows(needle.len()).any(|window| window == needle_bytes) {
+                return Ok(true);
+            }
+            // Only boundary-spanning candidates need another bounded spool comparison.
+            let boundary = count.saturating_sub(needle.len() - 1);
+            for (relative, &byte) in buffer[boundary..count].iter().enumerate() {
+                let start = offset + (boundary + relative) as u64;
+                if start <= value.len - length
+                    && byte == first
+                    && json::text_is(&self.0.spool, value.subrange(start..start + length)?, needle)?
+                {
+                    return Ok(true);
+                }
+            }
+            offset += count as u64;
+        }
+        Ok(false)
+    }
     fn writer(&self, _: u64) -> Writer<'_> {
         Writer {
             spool: &self.0.spool,

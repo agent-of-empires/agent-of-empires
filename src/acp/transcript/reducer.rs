@@ -334,7 +334,7 @@ impl<B: Backend> Core<B> {
                 let mut changes = if known {
                     self.backend.changes()
                 } else {
-                    self.ensure_tool_start(tool_call_id, None, None, completed_at, None)?
+                    self.ensure_tool_start(tool_call_id, None, None, None, completed_at, None)?
                 };
                 self.turn_has_output = true;
                 let mut row = self.completion_row(seq, tool_call_id, is_error, content)?;
@@ -355,9 +355,17 @@ impl<B: Backend> Core<B> {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
-            } => self.on_tool_updated(tool_call_id, title, args_preview, started_at, diffs),
+            } => self.on_tool_updated(
+                tool_call_id,
+                title,
+                args_preview,
+                prompt,
+                started_at,
+                diffs,
+            ),
             View::ElicitationRequested { tool_call_id } => {
                 let Some(id) = tool_call_id else {
                     return Ok(self.backend.changes());
@@ -712,6 +720,7 @@ impl<B: Backend> Core<B> {
         id: B::Input<'a>,
         title: Option<B::Input<'a>>,
         args: Option<B::Input<'a>>,
+        prompt: Option<B::Input<'a>>,
         started_at: Option<DateTime<Utc>>,
         diffs: Option<B::DiffsInput<'a>>,
     ) -> Result<B::Changes, B::Error> {
@@ -725,8 +734,14 @@ impl<B: Backend> Core<B> {
             return Ok(self.backend.changes());
         }
         let diffs = diffs.filter(|value| !value.is_empty());
-        let synthesized =
-            self.ensure_tool_start(id, title, args, started_at.unwrap_or_else(Utc::now), diffs)?;
+        let synthesized = self.ensure_tool_start(
+            id,
+            title,
+            args,
+            prompt,
+            started_at.unwrap_or_else(Utc::now),
+            diffs,
+        )?;
         if !synthesized.is_empty() {
             return Ok(synthesized);
         }
@@ -741,6 +756,17 @@ impl<B: Backend> Core<B> {
                     backend.replace(&mut tool.name, title)?;
                 }
                 if let Some(args) = args {
+                    if prompt.is_some()
+                        || !backend.ends_with(args, crate::acp::state::ARGS_CUT_MARKER)?
+                    {
+                        match prompt {
+                            Some(value) => match tool.prompt.as_mut() {
+                                Some(stored) => backend.replace(stored, value)?,
+                                None => tool.prompt = Some(backend.retain(value)?),
+                            },
+                            None => tool.prompt = None,
+                        }
+                    }
                     backend.replace(&mut tool.args_preview, args)?;
                 }
                 if let Some(started_at) = started_at {
@@ -760,6 +786,7 @@ impl<B: Backend> Core<B> {
         id: B::Input<'a>,
         name: Option<B::Input<'a>>,
         args: Option<B::Input<'a>>,
+        prompt: Option<B::Input<'a>>,
         started_at: DateTime<Utc>,
         diffs: Option<B::DiffsInput<'a>>,
     ) -> Result<B::Changes, B::Error> {
@@ -779,6 +806,7 @@ impl<B: Backend> Core<B> {
                 Some(args) => self.backend.retain(args)?,
                 None => self.backend.empty_text(),
             },
+            prompt: prompt.map(|value| self.backend.retain(value)).transpose()?,
             started_at,
             parent_tool_call_id: None,
             memory_recall: None,

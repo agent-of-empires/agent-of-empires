@@ -457,7 +457,11 @@ impl Shared {
                 self.bg_tasks.stop(task_id);
                 continue;
             }
-            update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
+            update_tool_context_cache(
+                &self.tool_context_cache,
+                &mut event,
+                &update_for_tool_context,
+            );
             if self.event_tx.send(event).await.is_err() {
                 break;
             }

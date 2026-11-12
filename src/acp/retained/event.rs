@@ -136,6 +136,7 @@ impl Context {
                     name: tool.text("name")?,
                     kind: tool.default_text("kind")?,
                     args_preview: tool.text("args_preview")?,
+                    prompt: tool.optional_text("prompt")?,
                     started_at: tool.date("started_at")?,
                     parent_tool_call_id: tool.optional_text("parent_tool_call_id")?,
                     memory_recall,
@@ -177,6 +178,7 @@ impl Context {
                 tool_call_id: object.text("tool_call_id")?,
                 title: object.optional_text("title")?,
                 args_preview: object.optional_text("args_preview")?,
+                prompt: object.optional_text("prompt")?,
                 started_at: object.optional_date("started_at")?,
                 diffs,
             });

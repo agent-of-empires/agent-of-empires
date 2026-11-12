@@ -171,6 +171,7 @@ async fn retained_blocks_preserve_groups_output_precedence_and_elicitation_remov
                 name: "Ask".into(),
                 kind: "execute".into(),
                 args_preview: "{}".into(),
+                prompt: None,
                 started_at: at,
                 parent_tool_call_id: None,
                 memory_recall: None,

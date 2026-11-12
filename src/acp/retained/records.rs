@@ -157,8 +157,9 @@ struct ToolExtra {
     parent: Option<TextRef>,
     recall: Option<ValueRef>,
     diffs: List,
+    prompt: Option<TextRef>,
 }
-record!(ToolExtra { parent: Option<TextRef>, recall: Option<ValueRef>, diffs: List });
+record!(ToolExtra { parent: Option<TextRef>, recall: Option<ValueRef>, diffs: List, prompt: Option<TextRef> });
 
 pub(crate) struct Owned<T>(pub T);
 impl<T> Deref for Owned<T> {
@@ -214,6 +215,7 @@ impl RowArena {
                 name: tool.name,
                 kind: tool.kind,
                 args_preview: tool.args,
+                prompt: extra.prompt,
                 started_at: tool.at.0,
                 parent_tool_call_id: extra.parent,
                 memory_recall: extra.recall,
@@ -305,6 +307,7 @@ impl RowArena {
                     parent: tool.parent_tool_call_id,
                     recall: tool.memory_recall,
                     diffs: tool.diffs,
+                    prompt: tool.prompt,
                 },
             )?;
         }

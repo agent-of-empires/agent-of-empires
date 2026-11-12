@@ -293,6 +293,7 @@ async fn malformed_retained_events_preserve_valid_output_and_report_incompletene
                 name: "Ask".into(),
                 kind: "execute".into(),
                 args_preview: "{}".into(),
+                prompt: None,
                 started_at: at,
                 parent_tool_call_id: None,
                 memory_recall: None,

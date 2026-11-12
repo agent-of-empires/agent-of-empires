@@ -219,6 +219,7 @@ mod tests {
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: name.into(),
             kind: "execute".into(),
@@ -228,6 +229,54 @@ mod tests {
             memory_recall: None,
             diffs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_repeated_start_keeps_the_full_prompt_unless_it_restates_a_prompt() {
+        let mut prev = tool("t", "Task");
+        prev.args_preview = r#"{"prompt":"cut"#.into();
+        prev.prompt = Some("full prompt".into());
+        let mut sparse = tool("t", "Task");
+        sparse.args_preview = String::new();
+        assert_eq!(
+            merge_tool_start(&prev, &sparse).prompt.as_deref(),
+            Some("full prompt")
+        );
+        let mut changed = tool("t", "Task");
+        changed.args_preview = r#"{"prompt":"other"}"#.into();
+        assert_eq!(merge_tool_start(&prev, &changed).prompt, None);
+        let mut bookkeeping = tool("t", "Task");
+        bookkeeping.args_preview = r#"{"_aoe_title":"external_directory"}"#.into();
+        assert_eq!(
+            merge_tool_start(&prev, &bookkeeping).prompt.as_deref(),
+            Some("full prompt")
+        );
+    }
+
+    #[test]
+    fn an_update_keeps_the_stored_prompt_only_while_the_preview_stays_cut() {
+        let mut start = tool("t", "Task");
+        start.args_preview = "{\"prompt\":\"cut\u{2026}[truncated]".into();
+        start.prompt = Some("full prompt".into());
+        let m = fold([
+            started(start.clone()),
+            updated("t", None, Some(&start.args_preview), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt.as_deref(),
+            Some("full prompt"),
+            "a deduplicated repeat of the cut call"
+        );
+
+        let m = fold([
+            started(start),
+            updated("t", None, Some(r#"{"prompt":"B"}"#), None),
+        ]);
+        assert_eq!(
+            tool_of(&m, "start-t").prompt,
+            None,
+            "an explicit short replacement drops the old prompt"
+        );
     }
 
     fn started(tool_call: ToolCall) -> Event {
@@ -252,6 +301,7 @@ mod tests {
         diffs: Option<Vec<DiffPreview>>,
     ) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: id.into(),
             title: title.map(Into::into),
             args_preview: args.map(Into::into),
