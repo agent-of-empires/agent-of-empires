@@ -422,4 +422,8 @@ describe("expandTemplate", () => {
   it("substitutes known names once and leaves the rest as typed", () => {
     expect(expandTemplate("{a} {b} {a{c}}", { a: "{b}", c: "1" })).toBe("{b} {b} {a1}");
   });
+
+  it("leaves inherited object names as typed", () => {
+    expect(expandTemplate("{toString} {constructor} {a}", { a: "1" })).toBe("{toString} {constructor} 1");
+  });
 });
