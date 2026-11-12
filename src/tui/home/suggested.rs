@@ -112,8 +112,8 @@ impl HomeView {
     }
 
     /// Selects the Session a suggestion was started as, expanding the Archived
-    /// or Trash section or switching profile when that is where it sits. False,
-    /// with the reason flashed, when it cannot be shown.
+    /// or Trash section when that is where it sits. False, with the reason
+    /// flashed, when it cannot be shown (including another profile's).
     pub(super) fn open_linked_session(&mut self, id: &str) -> bool {
         let Some(row) = self.session_feed.applied_session(id) else {
             self.flash_status("That session no longer exists");
@@ -125,13 +125,15 @@ impl HomeView {
             row.archived_at.is_some(),
         );
         if self.active_profile.as_deref().is_some_and(|p| p != profile) {
-            if let Err(error) = self.switch_profile(Some(profile)) {
-                self.flash_status(format!(
-                    "Could not switch to the session's profile: {error}"
-                ));
-                return false;
-            }
+            self.flash_status(format!(
+                "That session is in profile {profile}. Switch to it to open it"
+            ));
+            return false;
         }
+        let sections = (
+            self.trashed_section_collapsed,
+            self.archived_section_collapsed,
+        );
         if trashed {
             self.trashed_section_collapsed = false;
         } else if archived {
@@ -141,6 +143,11 @@ impl HomeView {
         self.jump_to_session_id(id);
         let shown = self.selected_session.as_deref() == Some(id);
         if !shown {
+            (
+                self.trashed_section_collapsed,
+                self.archived_section_collapsed,
+            ) = sections;
+            self.rebuild_flat_items();
             self.flash_status("That session could not be shown");
         }
         shown
