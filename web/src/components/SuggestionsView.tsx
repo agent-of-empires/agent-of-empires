@@ -129,7 +129,9 @@ export function SuggestionsView({
           <div>
             <h1 className="text-lg font-semibold">Suggested sessions</h1>
             <p className="mt-2 max-w-2xl text-sm text-text-secondary">
-              Start opens the new session wizard with the draft prompt. Nothing runs until you press Launch.
+              {snapshot?.prefs.start_without_review
+                ? "Start creates the session and sends the draft prompt right away."
+                : "Start opens the new session wizard with the draft prompt. Nothing runs until you press Launch."}
             </p>
           </div>
           <div className="flex flex-none items-center gap-1">
