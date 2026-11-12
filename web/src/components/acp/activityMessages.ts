@@ -63,6 +63,8 @@ export function activityToThreadMessages(
   const messages: (ThreadMessageLike | AssistantBuilder)[] = [];
   let currentAssistant: AssistantBuilder | null = null;
   const builderByToolId = new Map<string, AssistantBuilder>();
+  // Sub-agent calls whose card is outside these rows: never thread rows of their own.
+  const hiddenChildIds = new Set<string>();
   const flushAssistant = () => {
     if (!currentAssistant) return;
     messages.push(currentAssistant);
@@ -139,12 +141,18 @@ export function activityToThreadMessages(
     }
 
     if (row.kind === "tool_start" && row.tool) {
-      const parentBuilder = builderByToolId.get(row.tool.parent_tool_call_id ?? "");
+      const parentId = row.tool.parent_tool_call_id;
+      const parentBuilder = parentId ? builderByToolId.get(parentId) : undefined;
+      if (parentId && !parentBuilder) {
+        hiddenChildIds.add(row.tool.id);
+        continue;
+      }
       const builder = parentBuilder ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
       builder.appendToolCall(row.tool, !!parentBuilder);
       builderByToolId.set(row.tool.id, builder);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
       const toolCallId = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
+      if (hiddenChildIds.has(toolCallId)) continue;
       const builder = builderByToolId.get(toolCallId) ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
       builder.completeToolCall(
         toolCallId,
@@ -320,7 +328,7 @@ function subagentPart(parent: ToolPart, children: ToolPart[], async?: true): Too
 
 /** Fold each subagent into one synthetic part: a parent with inline children
  *  (linked by `_aoe_parent_tool_call_id`), an async launch, or a profile-declared
- *  off-protocol subagent tool. Children whose parent is elsewhere stay put. */
+ *  off-protocol subagent tool. */
 function collapseSubagents(parts: DraftPart[], routedChildren: ToolPart[], profile: AgentProfile): DraftPart[] {
   const toolParts = [...parts.filter((p): p is ToolPart => p.type === "tool-call"), ...routedChildren];
   const presentIds = new Set(toolParts.map((p) => p.toolCallId));
