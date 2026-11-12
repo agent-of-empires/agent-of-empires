@@ -3795,3 +3795,43 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
     }
 }
+
+/// A committed deletion reports its cleanup notes without a modal: the delete
+/// already happened, and an InfoDialog here can land underneath a permission or
+/// question dialog and swallow every keystroke until it is acknowledged.
+#[test]
+#[serial]
+fn purge_cleanup_messages_flash_instead_of_opening_a_modal() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.record_purge_outcome(
+        &id,
+        crate::daemon::PurgeOutcome::Deleted {
+            messages: vec!["Branch 'aoe/work' deleted".to_string()],
+            cleanup_errors: Vec::new(),
+        },
+    );
+    assert!(env.view.info_dialog.is_none());
+    assert_eq!(
+        env.view.status_flash_text(),
+        Some("Branch 'aoe/work' deleted")
+    );
+
+    env.view.record_purge_outcome(
+        &id,
+        crate::daemon::PurgeOutcome::Deleted {
+            messages: Vec::new(),
+            cleanup_errors: vec!["Branch: not fully merged".to_string()],
+        },
+    );
+    assert!(
+        env.view.info_dialog.is_none(),
+        "the modal opens on the next apply_session_feed"
+    );
+    env.view.apply_session_feed();
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|d| d.title()),
+        Some("Runtime change"),
+        "an incomplete cleanup still needs an acknowledgement"
+    );
+}

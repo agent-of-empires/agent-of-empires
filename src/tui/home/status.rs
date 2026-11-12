@@ -1088,14 +1088,18 @@ impl HomeView {
         self.runtime_outcome_messages.push(message);
     }
 
-    fn record_purge_outcome(&mut self, id: &str, outcome: crate::daemon::PurgeOutcome) {
+    pub(super) fn record_purge_outcome(&mut self, id: &str, outcome: crate::daemon::PurgeOutcome) {
         match outcome {
             crate::daemon::PurgeOutcome::Deleted {
                 messages,
                 cleanup_errors,
             } => {
+                // A committed deletion needs no acknowledgement, and a modal here
+                // can land under a permission or question dialog and swallow keys.
+                // Its cleanup notes belong in the status line and the log.
                 for message in messages {
-                    self.record_runtime_message(format!("{id}: {message}"));
+                    tracing::info!(target: "tui.runtime_outcome", session = %id, message = %message, "Session deletion cleanup");
+                    self.flash_status(message);
                 }
                 for error in cleanup_errors {
                     self.record_runtime_message(format!(
@@ -1315,7 +1319,7 @@ impl HomeView {
                 },
             }
         }
-        if self.info_dialog.is_none() && !self.runtime_outcome_messages.is_empty() {
+        if !self.has_non_live_send_overlay() && !self.runtime_outcome_messages.is_empty() {
             let messages = std::mem::take(&mut self.runtime_outcome_messages);
             self.info_dialog = Some(InfoDialog::sized_to_fit(
                 "Runtime change",
