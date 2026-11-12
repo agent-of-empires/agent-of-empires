@@ -76,7 +76,8 @@ run() {
 
 self_test() {
   local dir base main_tip skip_tip breaking_tip tree rel rel_main rel_skip fresh stale skipped_only breaking out
-  export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+  export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
   dir="$(mktemp -d)"
   trap 'rm -rf "$dir"' EXIT
   cd "$dir"
