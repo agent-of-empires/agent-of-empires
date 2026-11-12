@@ -8,7 +8,7 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `20`. The host rejects a manifest whose `api_version` is newer than it supports. |
+| `api_version` | The manifest *schema* version. The current schema is `21`. The host rejects a manifest whose `api_version` is newer than it supports. |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
 Each key below notes the `api_version` it needs. Target the newest schema your plugin uses, and set `aoe_version` to the host range you have tested.
@@ -19,7 +19,7 @@ Each key below notes the `api_version` it needs. Target the newest schema your p
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 20
+api_version = 21
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]
@@ -30,7 +30,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `20`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `21`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
@@ -119,6 +119,7 @@ Capabilities gate plugin resource access and host interactions. They are prompte
 | `session.unattended` | Creating a session in a host-classified *unattended* approval mode. A distinct, high-severity grant, never implied by `session.create` or `session.prompt` (`api_version >= 9`). See [Session-driving RPCs](#session-driving-rpcs). |
 | `session.message` | Pushing a text message into **any** session, including ones the plugin did not create, via `sessions.message.send`. A structured session shows the message as sent by the plugin, and the call reaches sessions the plugin did not create, so it is a separate grant, never implied by `session.prompt` (`api_version >= 15`). |
 | `session.integration` | Provider-native status and user-requested replies for an agent (`api_version >= 19`). Launch-only agent metadata does not require this capability. |
+| `mcp.rewrite` | Serving the `mcp.rewrite` hook. The worker receives each session's resolved MCP server definitions **including secret env and header values**, and returns the set AoE forwards to the agent (`api_version >= 21`). A distinct, high-severity grant, never implied by another. See [Hooks](#hooks). |
 
 A capability this host version does not recognize is rejected, not granted.
 
@@ -348,6 +349,55 @@ Status notifications follow canonical row adoption. Rejected or stale operations
 | `capability_missing` | The manifest lacks, or the user has not approved, `session.message`. |
 
 **Timing.** The call is synchronous. It returns, or fails with `delivery_timeout`, within 25 seconds (a 10 second worker-ready wait plus 15 seconds for a terminal resume), so a worker may call it from a scheduler loop.
+
+## Hooks
+
+### `[hooks.mcp_rewrite]` (`api_version >= 21`)
+
+Lets a worker rewrite the MCP servers AoE forwards to a session's agent. Requires the `mcp.rewrite` capability and a `[runtime]` worker. The hook runs only while the plugin is active: enabled, loaded, and with a grant covering the current manifest hash. While it is inactive (disabled, failed to load, or awaiting re-approval after an update changed its manifest) no hook runs and sandboxes get the full resolved set.
+
+```toml
+[hooks.mcp_rewrite]
+applies_to = "sandbox"   # "sandbox" (default) or "all"
+timeout_ms = 5000        # 1..=30000
+order = 0                # lower runs first; ties break by plugin id
+```
+
+Plugins that inject servers should keep the default or a negative `order`. A plugin that must see everything the others add, such as a security proxy, should declare a high `order` (for example `1000`) so it runs last.
+
+After AoE merges the MCP layers and before it hands the set to the agent, on every launch and respawn, the host sends the worker a `mcp.rewrite` request. It is a host-initiated JSON-RPC request whose `id` is a string of the form `h-<n>`. The worker answers with a JSON-RPC response carrying the same string `id` and either a `result` (the edit below) or an `error` object. A worker that is still starting is waited for until `timeout_ms` elapses.
+
+```json
+{
+  "session_id": "…", "agent": "…", "sandboxed": true,
+  "profile": null, "cwd": "/path",
+  "sandbox": {
+    "container_workdir": "/workspace/foo",
+    "mounts": [ { "host": "/abs/host/foo", "container": "/workspace/foo", "read_only": false } ]
+  },
+  "servers": [
+    { "name": "docs", "type": "http", "url": "https://…", "headers": { "Authorization": "Bearer …" } },
+    { "name": "fs", "type": "stdio", "command": "…", "args": [], "env": { "K": "V" } }
+  ]
+}
+```
+
+`sandbox` is present only when `sandboxed` is true. `mounts` are the volumes AoE creates the container with, so a plugin can map container paths back to the host: a linked worktree lists both the worktree and its main repo, and a workspace (multi-repo) session lists the workspace directory plus every main repo outside it. Host paths are sent as they are: not redacted, and not secret. `container_workdir` is the directory the agent runs in, or `null` when AoE cannot determine it. When AoE cannot compute the mounts, `mounts` is empty and the session is still reported as sandboxed.
+
+The `result` is an edit; unknown fields are rejected:
+
+```json
+{
+  "drop": ["fs"],
+  "add": [ { "name": "docs", "type": "http", "url": "http://gateway/mcp/docs" } ]
+}
+```
+
+`drop` is a list of names or `"*"`. `add` entries use the standard `mcpServers` shape plus `name`; an added server replaces any server of the same name, and a later duplicate in `add` wins. Plugins run in ascending `order`, ties broken by plugin id, each seeing the previous result.
+
+A sandboxed session whose hook fails (no worker within the timeout, error reply, invalid reply) is given **no** MCP servers, and AoE raises a notification attributed to the plugin. A sandboxed session with an applicable hook also gets no servers when the plugin host could not start. An `error` reply is reported as a rejection without the worker's text, so a worker cannot write into AoE's logs or notifications through it. Other sessions keep their resolved set.
+
+AoE does not copy host MCP definitions into a Claude sandbox's agent store, though `.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are. Other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so for those agents the hook alone does not keep host MCP secrets out of the sandbox.
 
 ## Plugin storage
 

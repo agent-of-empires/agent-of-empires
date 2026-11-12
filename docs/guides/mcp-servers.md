@@ -43,6 +43,10 @@ agent-native  <  mcp.json (global)  <  profile mcp.json  <  project-local .mcp.j
 
 Each override is logged.
 
+## Rewriting the forwarded set
+
+A plugin holding the `mcp.rewrite` capability can drop and replace servers per session, usually to route host credentials through a gateway instead of handing them to a sandbox. The hook is documented in [Plugin API](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so the hook alone does not keep host MCP secrets out of those sandboxes.
+
 ## Project-local servers need repo trust
 
 A project stdio server would launch its `command` the moment a session starts, so opening a cloned, untrusted repo would be a zero-click way to run its code. It therefore sits behind the same trust gate as repository hooks.
