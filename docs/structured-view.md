@@ -100,6 +100,7 @@ Features depend on the ACP adapter and its profile:
 | `/clear` boundary divider | `/clear` | `/new` | `/new` | none | none |
 | TodoWrite / Skill / ExitPlanMode / ScheduleWakeup cards | ✓ | — | — | — | — |
 | Subagent indentation | ✓ | — | unverified | — | — |
+| Per-subagent state and Stop | ✓ | — | — | — | — |
 | Workflow agents in the Sub agents pane | ✓ | — | — | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
@@ -118,7 +119,7 @@ aoe add . --agent codex --model gpt-5
 aoe add . --agent codex --effort high
 ```
 
-`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
+`--agent` implies structured view and refuses an uninstalled adapter with an install hint. `--structured-view` without `--agent` can fall back to terminal view with a warning. If you decline the repository hooks needed to find the adapter, creation is refused instead. The TUI and the web dashboard refuse such a session with the same hint before anything is created. The web wizard also disables Structured view ahead of time, as "ACP adapter not installed", when the server reports that the selected Profile and project would refuse it (counting both their hooks), Sandbox is off and there is no command override. Until the server answers for a newly chosen project, Structured view stays available for an agent that is ACP-capable without the repository, and the create's own check decides; an agent that only the repository's `agent_detect_as` makes ACP-capable shows Structured view as unavailable until the answer arrives. An adapter counts as installed when aoe finds it, when it is on the PATH set by [`environment`](guides/configuration.md#host-environment), or when a `before_session` hook is configured, or an `on_create` or `on_launch` hook will run first (the profile's, or the repository's unless this create skips it), since any of them may set PATH or install the adapter. A relative PATH entry is searched from the session's directory; for a new worktree or scratch session, which doesn't exist yet when the check runs, it counts. Sandboxed sessions skip the check, since the adapter runs inside the container, whose image must bundle it.
 
 ## Requirements
 

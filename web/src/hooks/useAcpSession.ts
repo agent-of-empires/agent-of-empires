@@ -12,6 +12,7 @@ import {
   type QueuedPrompt,
 } from "../lib/acpTypes";
 import {
+  cancelSubagent,
   clearServerQueue,
   editServerQueuedPrompt,
   enqueueServerPrompt,
@@ -26,7 +27,14 @@ import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache
 import { useLatestRef } from "./useLatestRef";
 
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
-export { clearAcpCache, useBackgroundAgents, useBackgroundTasks, useWorkflowRuns } from "./acpSession/stateCache";
+export {
+  clearAcpCache,
+  useBackgroundAgents,
+  useBackgroundShells,
+  useBackgroundTasks,
+  useSubagents,
+  useWorkflowRuns,
+} from "./acpSession/stateCache";
 
 type PromptSendResult =
   | { kind: "dispatched" }
@@ -354,6 +362,15 @@ export function useAcpSession(
     await postReportingErrors(dispatch, acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
   }, [sessionId]);
 
+  const cancelSubagentById = useCallback(
+    async (childId: string) => {
+      if (!sessionId) return;
+      const message = await cancelSubagent(sessionId, childId);
+      if (message) dispatch({ kind: "error", message });
+    },
+    [sessionId],
+  );
+
   const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
 
   // A non-steerable running turn is cancelled and the server drains the row instead.
@@ -436,6 +453,7 @@ export function useAcpSession(
     resolveElicitation,
     sendPrompt,
     cancelPrompt,
+    cancelSubagent: cancelSubagentById,
     forceEndTurn,
     ...dismissers,
     removeQueuedPrompt,

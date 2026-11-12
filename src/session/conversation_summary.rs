@@ -278,7 +278,7 @@ mod serve {
         session_id: String,
         trigger: SummaryTrigger,
     ) {
-        let Some((profile, tool, command, project_path, sandboxed, structured)) = ({
+        let Some((profile, tool, command, project_path, config_path, sandboxed, structured)) = ({
             let instances = state.instances.read().await;
             instances.iter().find(|i| i.id == session_id).map(|i| {
                 (
@@ -286,6 +286,7 @@ mod serve {
                     i.tool.clone(),
                     i.command.clone(),
                     i.project_path.clone(),
+                    i.repo_config_path().to_path_buf(),
                     i.is_sandboxed(),
                     i.is_structured(),
                 )
@@ -296,7 +297,7 @@ mod serve {
 
         let resolved = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
             &profile,
-            std::path::Path::new(&project_path),
+            &config_path,
         );
         if trigger == SummaryTrigger::Auto && !resolved.session.conversation_summary {
             return;

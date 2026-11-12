@@ -46,6 +46,8 @@ pub enum Intent {
     CancelElicitation,
     /// Cancel the in-flight prompt (Ctrl-C style).
     CancelInFlight,
+    /// Stop the newest running subagent without ending the root turn.
+    StopSubagent,
     /// Drop every queued (not-yet-sent) prompt.
     ClearQueue,
     /// Hide a session notice in this view, `None` meaning the oldest visible
@@ -157,6 +159,10 @@ pub fn dispatch(focus: Focus, key: &KeyEvent, ctx: InputContext) -> Intent {
     // typing "no" into the composer doesn't open a tab.
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
         return Intent::OpenInBrowser;
+    }
+    // Universal: Ctrl-t stops the newest running subagent; the root turn goes on.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        return Intent::StopSubagent;
     }
     // Universal: Ctrl-x drops every queued prompt, intercepted before the
     // composer sees it so a backlog can always be abandoned. No-op when empty.
@@ -545,10 +551,11 @@ mod tests {
                 Is(Intent::CancelInFlight),
             );
             check(focus, Char('x'), CTRL, ctx(), Is(Intent::ClearQueue));
+            check(focus, Char('t'), CTRL, ctx(), Is(Intent::StopSubagent));
             check(focus, Char('q'), CTRL, ctx_pending(), Is(Intent::Exit));
         }
         // Unmodified, the same letters are ordinary composer text.
-        for ch in "cxqo".chars() {
+        for ch in "cxqot".chars() {
             check(Focus::Composer, Char(ch), NONE, ctx(), Composes);
         }
     }

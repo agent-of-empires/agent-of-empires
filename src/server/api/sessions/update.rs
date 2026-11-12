@@ -300,6 +300,29 @@ pub(super) fn apply_diff_base_override(
     }
 }
 
+/// The repo entry a diff-base write lands on. Rejects a target that names no
+/// entry, so a stale client cannot write an override the diff never reads. A
+/// single-repo workspace has one unambiguous entry, so an unnamed write lands
+/// there, matching the diff's one named entry.
+pub(super) fn diff_base_target(
+    inst: &crate::session::Instance,
+    repo: Option<String>,
+) -> Result<Option<String>, String> {
+    match (repo, inst.all_repos()) {
+        (Some(name), repos) if repos.iter().any(|r| r.name == name) => Ok(Some(name)),
+        (Some(_), _) => Err("unknown workspace repo".to_string()),
+        (None, [only]) => Ok(Some(only.name.clone())),
+        (None, []) => Ok(None),
+        (None, repos) => {
+            let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+            Err(format!(
+                "this session is a multi-repo workspace; name the repo to set a diff base for ({})",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
 pub async fn update_session_diff_base(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -308,7 +331,7 @@ pub async fn update_session_diff_base(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
@@ -325,28 +348,9 @@ pub async fn update_session_diff_base(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return crate::server::api::session_not_found();
         };
-        // Reject a target that names no entry, so a stale client cannot write
-        // an override the diff never reads.
-        match body.repo.as_deref() {
-            Some(name) => {
-                if !inst.all_repos().iter().any(|r| r.name == name) {
-                    return api_error(
-                        StatusCode::BAD_REQUEST,
-                        "bad_request",
-                        "unknown workspace repo",
-                    );
-                }
-            }
-            None => {
-                if inst.workspace_info.is_some() {
-                    let names: Vec<&str> =
-                        inst.all_repos().iter().map(|r| r.name.as_str()).collect();
-                    return api_error(StatusCode::BAD_REQUEST, "bad_request", format!(
-                                "this session is a multi-repo workspace; name the repo to set a diff base for ({})",
-                                names.join(", ")
-                            ));
-                }
-            }
+        match diff_base_target(inst, body.repo.take()) {
+            Ok(target) => body.repo = target,
+            Err(message) => return api_error(StatusCode::BAD_REQUEST, "bad_request", message),
         }
         inst.source_profile.clone()
     };

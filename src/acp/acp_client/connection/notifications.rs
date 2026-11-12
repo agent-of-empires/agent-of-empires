@@ -3,7 +3,7 @@
 
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
-use crate::acp::state::{BackgroundTaskLaunch, Event};
+use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
 use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionNotification, SessionUpdate,
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
@@ -22,7 +23,8 @@ use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
-    restore_wake_tool_title, update_tool_context_cache, ToolCallContextCache, ToolContextCache,
+    restore_wake_tool_title, shell_command, update_tool_context_cache, ToolCallContextCache,
+    ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -80,8 +82,11 @@ pub(super) struct Shared {
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     compaction: std::sync::Mutex<CompactionTracker>,
     pub(super) tool_context_cache: ToolContextCache,
+    /// Merged snapshot per subagent session; see `subagents.rs`.
+    pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
+    pub(super) aoe: AoeIngress,
     claude_home: Option<std::path::PathBuf>,
 }
 
@@ -128,8 +133,10 @@ impl Shared {
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
+            subagents: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
+            aoe: AoeIngress::default(),
             claude_home,
         }
     }
@@ -201,9 +208,84 @@ impl Shared {
     /// per-prompt watchdog.
     pub(super) async fn handle_notification(
         &self,
-        mut notification: SessionNotification,
+        notification: SessionNotification,
         local_prompt_signals: bool,
     ) {
+        // A frame the contract consumes without delivering (a lease renewal)
+        // still proves the agent is alive.
+        self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        self.settle_discarded().await;
+        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        let ingested = self
+            .aoe
+            .ingest(notification, local_prompt_signals, epoch, now_ms());
+        self.handle_ingested(ingested).await;
+    }
+
+    /// Frames the session identity dropped still count in the proxy's
+    /// numbering, so a tailer frame anchored after them is not held for
+    /// adapter output that already happened.
+    pub(super) async fn settle_discarded(&self) {
+        let skipped = self.ingress.take_discarded_adapter_frames();
+        if skipped > 0 {
+            let ingested = self.aoe.skip_frames(skipped, now_ms());
+            self.handle_ingested(ingested).await;
+        }
+    }
+
+    async fn handle_ingested(&self, ingested: Ingested) {
+        let (frames, lost) = match ingested {
+            Ingested::Deliver(frames) => (frames, None),
+            Ingested::Lost(reason) => (Vec::new(), Some(reason)),
+            Ingested::DeliverThenLost(frames, reason) => (frames, Some(reason)),
+        };
+        for frame in frames {
+            self.handle_adapter_notification(
+                frame.notification,
+                frame.local_prompt_signals,
+                frame.epoch,
+            )
+            .await;
+        }
+        if let Some(reason) = lost {
+            tracing::warn!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                ?reason,
+                "agent integration lost; ignoring further frames"
+            );
+            self.emit(Event::IntegrationLost { reason }).await;
+        }
+    }
+
+    async fn handle_adapter_notification(
+        &self,
+        mut notification: SessionNotification,
+        local_prompt_signals: bool,
+        epoch: u64,
+    ) {
+        // Subagent traffic never feeds the root session's dedup, compaction
+        // or watchdog state: a busy child would hold its parent's turn open.
+        let from_child = self.ingress.child_route(&notification.session_id).is_some();
+        match notification.update {
+            SessionUpdate::SubagentUpdate(update) => {
+                return self
+                    .handle_subagent_update(notification.session_id, update)
+                    .await;
+            }
+            SessionUpdate::SessionMessage(message) => {
+                return self
+                    .handle_session_message(notification.session_id, message)
+                    .await;
+            }
+            SessionUpdate::SessionMessageChunk(_) => return,
+            update if from_child => {
+                return self
+                    .handle_child_notification(notification.session_id, update)
+                    .await;
+            }
+            update => notification.update = update,
+        }
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
@@ -243,9 +325,8 @@ impl Shared {
         let restored_wake_event = restored_title
             .as_deref()
             .and_then(|title| restored_wake_tool_event(self.profile, &notification.update, title));
-        // One epoch per notification, so its signals belong to the prompt
-        // that was current when it arrived.
-        let epoch = self.prompt_epoch.load(Ordering::Relaxed);
+        // `epoch` is the prompt current when the frame arrived, so its signals
+        // belong to that prompt even if the frame was held.
         let (lifecycle, wakeup) = classify_watchdog_notification_signals(
             &notification.update,
             restored_title.as_deref(),
@@ -298,14 +379,16 @@ impl Shared {
             &self.session_label,
         )
         .await;
-        for event in events {
+        for mut event in events {
             if let Event::BackgroundAgentLaunched {
                 agent_id,
                 output_file,
                 ..
             } = &event
             {
-                if !suppressing && !output_file.is_empty() {
+                // A subagents session gets the agent's state from its child
+                // session, so nothing tails the transcript.
+                if !suppressing && !output_file.is_empty() && !self.profile.supports_subagents {
                     spawn_tailer(
                         agent_id.clone(),
                         output_file.clone(),
@@ -326,6 +409,17 @@ impl Shared {
                     "dropping post-load history-replay event"
                 );
                 continue;
+            }
+            if let Event::BackgroundTaskStarted {
+                tool_call_id: Some(call),
+                description,
+                workflow: None,
+                ..
+            } = &mut event
+            {
+                if let Some(command) = shell_command(&self.tool_context_cache, call) {
+                    *description = command;
+                }
             }
             if let Event::BackgroundTaskStarted {
                 task_id,

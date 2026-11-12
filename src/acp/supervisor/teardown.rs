@@ -1565,6 +1565,7 @@ mod tests {
                     tool_call_id: None,
                     description: "work".into(),
                     workflow: None,
+                    started_at: None,
                 },
             );
             sup.publish_next(
@@ -1736,6 +1737,7 @@ mod tests {
                 tool_call_id: None,
                 description: "work".into(),
                 workflow: None,
+                started_at: None,
             })
             .await
             .unwrap();
@@ -1853,6 +1855,7 @@ mod tests {
                     tool_call_id: None,
                     description: "new work".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
         });
@@ -2337,6 +2340,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();
@@ -2432,6 +2436,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();
@@ -2599,6 +2604,7 @@ mod tests {
                 tool_call_id: None,
                 description: "sleep".into(),
                 workflow: None,
+                started_at: None,
             })
             .await
             .unwrap();
@@ -2686,6 +2692,7 @@ mod tests {
                     tool_call_id: None,
                     description: "sleep".into(),
                     workflow: None,
+                    started_at: None,
                 },
             )
             .unwrap();

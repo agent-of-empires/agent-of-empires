@@ -27,13 +27,14 @@ mod worker;
 pub(crate) use attachments::{sniff_image_mime, validate_attachments};
 pub use config::{acp_set_config_option, acp_set_mode};
 pub use history::{
-    acp_context_primer, acp_files, acp_replay, acp_worker_log, list_importable_sessions,
+    acp_context_primer, acp_files, acp_replay, acp_task_output, acp_worker_log,
+    list_importable_sessions,
 };
 pub(crate) use history::{importable_sessions, list_error_response, read_log_tail};
 pub use install::{agent_install_info, install_agent};
 pub use prompt::{
-    acp_attachment, acp_cancel, acp_force_end_turn, acp_prompt, acp_prompt_diff_comments,
-    resolve_approval, resolve_elicitation,
+    acp_attachment, acp_cancel, acp_cancel_subagent, acp_force_end_turn, acp_prompt,
+    acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
 pub use view::{acp_disable, acp_enable};
 pub(crate) use view::{
@@ -178,6 +179,7 @@ pub(crate) fn spawn_request_for(
         agent,
         tool: instance.tool.clone(),
         cwd: PathBuf::from(&instance.project_path),
+        config_path: instance.repo_config_path().to_path_buf(),
         additional_dirs: vec![],
         provider_env: vec![],
         provider: instance.agent_provider.clone(),
@@ -259,7 +261,7 @@ async fn pick_agent(
             &instance.tool,
             explicit,
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         )
         .await
 }
