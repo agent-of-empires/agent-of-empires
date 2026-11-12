@@ -824,7 +824,7 @@ export function SettingsView({
             readOnly={readOnly ?? false}
             onOpenSuggestions={onOpenSuggestions}
             templateFocus={templateFocus}
-            pluginSettings={cityhall ? undefined : { schema, settings, onSaveField: sendSave }}
+            pluginSettings={cityhall ? undefined : { schema, settings, onSaveField: sendSave, notice: schemaGuard() }}
           />
         );
       case "structured-view": {
