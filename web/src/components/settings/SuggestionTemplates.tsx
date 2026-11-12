@@ -253,6 +253,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [wizard, setWizard] = useState(false);
+  const [saving, setSaving] = useState(false);
   const mounted = useRef(true);
 
   const load = useCallback(async () => {
@@ -275,11 +276,14 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
     };
   }, [load]);
 
+  // Mapping controls stay off until the reload lands: each edit is built from the rendered row.
   const mutate = async (request: Promise<SuggestionResult<unknown>>) => {
     setError(null);
+    setSaving(true);
     const result = await request;
     if (mounted.current && !result.ok) setError(result.error);
     await load();
+    if (mounted.current) setSaving(false);
   };
 
   return (
@@ -334,7 +338,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
           items={snapshot.items}
           mappings={mappings}
           projects={projects}
-          disabled={disabled}
+          disabled={disabled || saving}
           onChange={mutate}
         />
       </section>
