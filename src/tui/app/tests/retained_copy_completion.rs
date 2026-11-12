@@ -124,22 +124,62 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     let mut bytes = Vec::new();
     let mut parsed = 0;
     let mut ticker = tokio::time::interval(Duration::from_millis(10));
-    tokio::time::timeout(Duration::from_secs(12), async {
+    let mut phase = "present-populated-window";
+    let initial_scene = tokio::time::timeout(Duration::from_secs(12), async {
         loop {
             ticker.tick().await;
             app.reconcile_structured_preview().await;
             drain_terminal(&mut master, &mut bytes);
             app.draw(&mut terminal).unwrap();
-            drain_terminal(&mut master, &mut bytes);
-            screen.process(&bytes[parsed..]);
-            parsed = bytes.len();
-            if app.home.presentation_ready && screen.screen().contents().contains(CONTENT) {
+            if app.home.presentation_ready
+                && app.pending_presentation.is_none()
+                && app
+                    .home
+                    .retained_preview
+                    .as_ref()
+                    .is_some_and(|view| view.effective_offset() == Some(0))
+                && app.home.preview_text_view.total_lines > 0
+                && !app.home.preview_text_view.pane.is_empty()
+            {
                 break;
             }
         }
+        // Observe the acknowledged frame's bytes without capturing its replacement.
+        phase = "observe-emitted-content";
+        loop {
+            drain_terminal(&mut master, &mut bytes);
+            screen.process(&bytes[parsed..]);
+            parsed = bytes.len();
+            if screen.screen().contents().contains(CONTENT) {
+                break;
+            }
+            ticker.tick().await;
+        }
     })
-    .await
-    .unwrap();
+    .await;
+    if initial_scene.is_err() {
+        drain_terminal(&mut master, &mut bytes);
+        screen.process(&bytes[parsed..]);
+        parsed = bytes.len();
+        let content = screen.screen().contents();
+        panic!(
+            "initial retained scene timed out: phase={phase}; ready={}; pending={}; \
+             window_offset={:?}; pane={:?}; total_lines={}; bytes={}; parsed={}; \
+             content_present={}; content={:.240}",
+            app.home.presentation_ready,
+            app.pending_presentation.is_some(),
+            app.home
+                .retained_preview
+                .as_ref()
+                .and_then(|view| view.effective_offset()),
+            app.home.preview_text_view.pane,
+            app.home.preview_text_view.total_lines,
+            bytes.len(),
+            parsed,
+            content.contains(CONTENT),
+            content
+        );
+    }
     let pane = app.home.preview_text_view.pane;
     let (x, y) = (pane.y..pane.bottom())
         .find_map(|y| {
