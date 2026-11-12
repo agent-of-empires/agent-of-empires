@@ -1143,6 +1143,9 @@ fn is_installed_external(id: &str) -> Result<bool> {
 
 /// Drop the plugin's directory, config entry and lock entry.
 fn remove_external(id: &str) -> Result<()> {
+    // First, so a failed cleanup leaves the plugin installed rather than
+    // removed with live published rows.
+    forget_suggestion_publication(id)?;
     let dir = super::plugins_dir()?.join(id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -1152,9 +1155,8 @@ fn remove_external(id: &str) -> Result<()> {
     if lock.remove(id) {
         lock.save()?;
     }
-    let cleared = forget_suggestion_publication(id);
     super::reload_registry();
-    cleared
+    Ok(())
 }
 
 /// Whether an update replaces the installed `[suggestions]` block; an
@@ -1974,8 +1976,8 @@ mod tests {
         assert_eq!(count("suggestion_dismissals"), 1);
     }
 
-    /// A failed cleanup is an error, not a logged warning: the plugin is still
-    /// removed, but the caller is told stale rows may remain.
+    /// A failed cleanup is an error, not a logged warning, and it keeps the
+    /// plugin installed.
     #[test]
     #[serial]
     fn a_failed_publication_cleanup_is_reported() {
@@ -1986,7 +1988,10 @@ mod tests {
         std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
         let err = forget_suggestion_publication("acme.thing").unwrap_err();
         assert!(format!("{err:#}").contains("acme.thing"), "{err:#}");
+        let dir = super::super::plugins_dir().unwrap().join("acme.thing");
+        std::fs::create_dir_all(&dir).unwrap();
         assert!(remove_external("acme.thing").is_err());
+        assert!(dir.exists(), "a failed cleanup must not remove the plugin");
     }
 
     /// Uninstall removes only a configured external plugin's directory: a
