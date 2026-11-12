@@ -1841,19 +1841,19 @@ api_version = 21
 
 [[agent_integrations]]
 tool = "zzalpha"
-command = "helper | tee log"
+command = "prime-agent | tee log"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
 
 [[agent_integrations]]
 tool = "zzbeta"
-command = "helper # trailing"
+command = "prime-agent # trailing"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
 
 [[agent_integrations]]
 tool = "zzgamma"
-command = "helper"
+command = "prime-agent"
 [agent_integrations.launch]
 instruction_flag = "--prompt={}"
 "#;
@@ -1899,13 +1899,6 @@ instruction_flag = "--prompt={}"
         ]);
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
         install_shell_syntax_declarations();
-        // The declaration's binary must resolve, so the refusal under test is the
-        // one that fires rather than a missing-binary error.
-        let _bin = crate::session::test_support::install_login_shell_path_command(
-            temp.path(),
-            "helper",
-            "#!/bin/sh\nexit 0\n",
-        );
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
@@ -1932,6 +1925,10 @@ instruction_flag = "--prompt={}"
             .clone()
             .expect("the declaration names its command");
             let mut inst = declared(tool, &command);
+            // Host runtimes differ: without the fixture the runtime lookup fails
+            // on a runner that has no container runtime, before the append.
+            let config = inst.build_container_config_for_test().unwrap();
+            let _transport = install_container_transport(temp.path(), tool, &config.volumes);
             let error = match inst.prepare_launch_command(inst.conversation_state()) {
                 Err(error) => error,
                 Ok(_) => panic!("a shell command must not receive the declared instruction"),
@@ -1946,7 +1943,7 @@ instruction_flag = "--prompt={}"
 
         // YOLO off and a bare command: the instruction is appended as argv. The
         // transport is fixtures so the launch does not depend on a host runtime.
-        let mut direct = declared("zzgamma", "helper");
+        let mut direct = declared("zzgamma", "prime-agent");
         let config = direct.build_container_config_for_test().unwrap();
         let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
         let prepared = direct
