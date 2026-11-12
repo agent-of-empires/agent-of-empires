@@ -98,4 +98,15 @@ describe("SuggestionMappingWizard", () => {
     finish({ ok: true, data: {} });
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
   });
+
+  it("moves focus into the dialog and returns it to the opener on close", async () => {
+    const opener = document.createElement("button");
+    document.body.append(opener);
+    opener.focus();
+    await open();
+    expect(document.activeElement?.id).toBe("suggestion-mapping-wizard-intro");
+    cleanup();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
 });
