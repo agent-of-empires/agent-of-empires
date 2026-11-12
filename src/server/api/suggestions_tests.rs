@@ -45,17 +45,8 @@ struct Fixture {
     _temp: tempfile::TempDir,
 }
 
-fn fixture() -> Fixture {
-    fixture_with(Vec::new(), false)
-}
-
-fn fixture_with(prior: Vec<crate::session::Instance>, cityhall: bool) -> Fixture {
-    let temp = tempfile::tempdir().unwrap();
-    let env = crate::session::test_support::EnvGuard::set(&[
-        ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
-        ("HOME", temp.path().to_path_buf()),
-        ("USERPROFILE", temp.path().to_path_buf()),
-    ]);
+/// Installs and grants the fixture provider in the isolated app dir.
+pub(crate) fn register_provider() -> crate::plugin::ReloadRegistryOnDrop {
     let dir = crate::plugin::plugins_dir().unwrap().join(PROVIDER);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("aoe-plugin.toml"), MANIFEST).unwrap();
@@ -75,6 +66,21 @@ fn fixture_with(prior: Vec<crate::session::Instance>, cityhall: bool) -> Fixture
     .unwrap();
     let reload = crate::plugin::ReloadRegistryOnDrop;
     crate::plugin::reload_registry();
+    reload
+}
+
+fn fixture() -> Fixture {
+    fixture_with(Vec::new(), false)
+}
+
+fn fixture_with(prior: Vec<crate::session::Instance>, cityhall: bool) -> Fixture {
+    let temp = tempfile::tempdir().unwrap();
+    let env = crate::session::test_support::EnvGuard::set(&[
+        ("XDG_CONFIG_HOME", temp.path().to_path_buf()),
+        ("HOME", temp.path().to_path_buf()),
+        ("USERPROFILE", temp.path().to_path_buf()),
+    ]);
+    let reload = register_provider();
 
     let repo = temp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -117,6 +123,10 @@ fn fixture_with(prior: Vec<crate::session::Instance>, cityhall: bool) -> Fixture
 }
 
 impl Fixture {
+    fn seed_item(&self, id: &str, mapping_key: Option<&str>, number: &str) {
+        seed_item_on(&self.host, id, mapping_key, number);
+    }
+
     async fn call(&self, method: Method, uri: &str, body: Value) -> (StatusCode, String, Value) {
         let mut request = Request::builder()
             .method(method)
@@ -139,44 +149,44 @@ impl Fixture {
         let code = body["error"].as_str().unwrap_or_default().to_string();
         (status, code, body)
     }
+}
 
-    /// Publish `id` the way a worker would, with no hint and no mapping key.
-    fn seed_item(&self, id: &str, mapping_key: Option<&str>, number: &str) {
-        let mut item = json!({
-            "id": id,
-            "title": "Fix it",
-            "reason": "assigned to you",
-            "source_url": "https://example.com/1",
-            "source_ref": "acme/web#42",
-            "preview": "body",
-            "criterion": "assigned",
-            "variables": { "number": number },
-            "draft": { "title": "Fix #42", "prompt": "Fix #{number}" },
-        });
-        if let Some(key) = mapping_key {
-            item["mapping_key"] = json!(key);
-        }
-        let hash = crate::plugin::suggestions::spec_hash(
-            &crate::plugin::registry()
-                .get(PROVIDER)
-                .and_then(|p| p.manifest.suggestions.clone())
-                .expect("fixture plugin declares suggestions"),
-        );
-        self.host.with_suggestions_db(|conn, profile| {
-            conn.execute(
-                "INSERT OR REPLACE INTO suggestion_providers (profile, provider_id, updated_at)
-                 VALUES (?1, ?2, 0)",
-                [profile, PROVIDER],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO suggestion_items (profile, provider_id, item_id, item_json, spec_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                [profile, PROVIDER, id, &item.to_string(), &hash],
-            )
-            .unwrap();
-        });
+/// Publish `id` the way a worker would, with no hint and no mapping key.
+pub(crate) fn seed_item_on(host: &PluginHost, id: &str, mapping_key: Option<&str>, number: &str) {
+    let mut item = json!({
+        "id": id,
+        "title": "Fix it",
+        "reason": "assigned to you",
+        "source_url": "https://example.com/1",
+        "source_ref": "acme/web#42",
+        "preview": "body",
+        "criterion": "assigned",
+        "variables": { "number": number },
+        "draft": { "title": "Fix #42", "prompt": "Fix #{number}" },
+    });
+    if let Some(key) = mapping_key {
+        item["mapping_key"] = json!(key);
     }
+    let hash = crate::plugin::suggestions::spec_hash(
+        &crate::plugin::registry()
+            .get(PROVIDER)
+            .and_then(|p| p.manifest.suggestions.clone())
+            .expect("fixture plugin declares suggestions"),
+    );
+    host.with_suggestions_db(|conn, profile| {
+        conn.execute(
+            "INSERT OR REPLACE INTO suggestion_providers (profile, provider_id, updated_at)
+             VALUES (?1, ?2, 0)",
+            [profile, PROVIDER],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO suggestion_items (profile, provider_id, item_id, item_json, spec_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            [profile, PROVIDER, id, &item.to_string(), &hash],
+        )
+        .unwrap();
+    });
 }
 
 #[tokio::test]

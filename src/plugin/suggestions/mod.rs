@@ -20,7 +20,7 @@ use crate::session::config::profile_config::resolve_config_or_warn;
 use crate::session::config::repo_config::resolve_config_with_repo_or_warn;
 use crate::session::config::StructuredView;
 use crate::session::projects::{self, Project};
-use crate::session::{Instance, MAX_INITIAL_PROMPT_BYTES};
+use crate::session::{Instance, SuggestionOrigin, MAX_INITIAL_PROMPT_BYTES};
 use std::path::Path;
 
 const MAX_ITEMS: usize = 500;
