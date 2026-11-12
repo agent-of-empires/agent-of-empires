@@ -36,7 +36,7 @@ fn patch<T>(slot: &mut Option<T>, incoming: MaybeUndefined<T>) {
 }
 
 fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) {
-    let (state, stop_reason) = match state {
+    let (state, stop) = match state {
         MaybeUndefined::Undefined => return,
         MaybeUndefined::Null => (SubagentState::Unknown, None),
         MaybeUndefined::Value(StateUpdate::Running(_)) => (SubagentState::Running, None),
@@ -45,16 +45,25 @@ fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) 
         }
         MaybeUndefined::Value(StateUpdate::Idle(idle)) => {
             // The reason is an open string: the RFD reserves future values.
-            let reason = idle
+            let stop = idle
                 .stop_reason
-                .and_then(|reason| serde_json::to_value(reason).ok())
-                .and_then(|value| value.get("stopReason")?.as_str().map(str::to_owned));
-            (SubagentState::Idle, reason)
+                .and_then(|reason| serde_json::to_value(reason).ok());
+            (SubagentState::Idle, stop)
         }
         MaybeUndefined::Value(_) => (SubagentState::Unknown, None),
     };
+    let field = |key: &str| {
+        let value = stop.as_ref()?.get(key)?;
+        value.as_str().map(str::to_owned)
+    };
     record.state = state;
-    record.stop_reason = stop_reason;
+    record.stop_reason = field("stopReason");
+    record.error = stop.as_ref().and_then(|stop| {
+        stop.get("error")?
+            .get("message")?
+            .as_str()
+            .map(str::to_owned)
+    });
 }
 
 impl Shared {
@@ -99,6 +108,7 @@ impl Shared {
                     description: None,
                     state: SubagentState::default(),
                     stop_reason: None,
+                    error: None,
                     cancel_capable: false,
                     model: None,
                     background: false,
@@ -145,13 +155,15 @@ impl Shared {
         true
     }
 
-    /// An idle background child's answer completes its card. A cancelled or
-    /// orphaned one leaves it open for the turn's end to mark stopped.
+    /// An idle background child's answer, or its error, completes its card.
+    /// A cancelled or orphaned one leaves it open for the turn's end to mark stopped.
     async fn finish_background_report(&self, child: &SessionId) {
-        let stop_reason = {
+        let (stop_reason, error) = {
             let subagents = self.subagents.lock().expect("subagents mutex poisoned");
             match subagents.get(child.0.as_ref()) {
-                Some(record) if record.state == SubagentState::Idle => record.stop_reason.clone(),
+                Some(record) if record.state == SubagentState::Idle => {
+                    (record.stop_reason.clone(), record.error.clone())
+                }
                 _ => return,
             }
         };
@@ -163,12 +175,12 @@ impl Shared {
         else {
             return;
         };
-        let is_error = match stop_reason.as_deref() {
-            Some("end_turn") => false,
-            Some("error") => true,
+        let (text, is_error) = match stop_reason.as_deref() {
+            Some("end_turn") => (report.text, false),
+            Some("error") => (error.unwrap_or(report.text), true),
             _ => return,
         };
-        self.emit_card_completion(report.tool_call_id, report.text, is_error)
+        self.emit_card_completion(report.tool_call_id, text, is_error)
             .await;
     }
 
@@ -552,8 +564,8 @@ mod tests {
             })
         };
         for (stop, want) in [
-            ("end_turn", Some(false)),
-            ("error", Some(true)),
+            ("end_turn", Some(("The answer is 42.", false))),
+            ("error", Some(("Authentication required", true))),
             ("cancelled", None),
         ] {
             let (ingress, shared, events) = harness();
@@ -572,7 +584,8 @@ mod tests {
                 serde_json::json!({
                     "sessionId": "root",
                     "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
-                                "state": { "state": "idle", "stopReason": stop } },
+                                "state": { "state": "idle", "stopReason": stop,
+                                           "error": { "code": -32000, "message": "Authentication required" } } },
                 }),
             ] {
                 feed(&ingress, &shared, frame).await;
@@ -598,9 +611,7 @@ mod tests {
                 })
                 .collect();
             match want {
-                Some(is_error) => {
-                    assert_eq!(completions, [("The answer is 42.", is_error)], "{stop}")
-                }
+                Some(completion) => assert_eq!(completions, [completion], "{stop}"),
                 None => assert!(completions.is_empty(), "{stop}: {completions:?}"),
             }
         }

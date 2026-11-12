@@ -392,6 +392,8 @@ pub enum BackgroundAgentStatus {
     /// The agent cannot say what the subagent is doing (RFD `unknown`).
     Unknown,
     Completed,
+    /// Cancelled before it finished.
+    Stopped,
     /// The parent session ended before the agent finished.
     Detached,
     /// The transcript could not be read or parsed.
@@ -400,7 +402,10 @@ pub enum BackgroundAgentStatus {
 
 impl BackgroundAgentStatus {
     fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Detached | Self::Error)
+        matches!(
+            self,
+            Self::Completed | Self::Stopped | Self::Detached | Self::Error
+        )
     }
 }
 
@@ -507,6 +512,9 @@ pub struct SubagentRecord {
     /// Open string: the RFD reserves values for future stop reasons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
+    /// The error message an `error` stop carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Whether `session/cancel` may target this child.
     #[serde(default)]
     pub cancel_capable: bool,
@@ -1568,10 +1576,11 @@ impl BackgroundAgentRecord {
             SubagentState::Running => (BackgroundAgentStatus::Running, false),
             SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
             SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
-            SubagentState::Idle if child.stop_reason.as_deref() == Some("error") => {
-                (BackgroundAgentStatus::Error, true)
-            }
-            SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+            SubagentState::Idle => match child.stop_reason.as_deref() {
+                Some("error") => (BackgroundAgentStatus::Error, true),
+                Some("cancelled") => (BackgroundAgentStatus::Stopped, true),
+                _ => (BackgroundAgentStatus::Completed, true),
+            },
         };
         self.status = status;
         self.ended_at = ended.then(|| self.ended_at.unwrap_or(at));
@@ -2510,6 +2519,7 @@ mod tests {
                 description: None,
                 state,
                 stop_reason: stop_reason.map(str::to_owned),
+                error: None,
                 cancel_capable: true,
                 model: None,
                 background: false,
@@ -2531,6 +2541,12 @@ mod tests {
                 SubagentState::Idle,
                 Some("error"),
                 BackgroundAgentStatus::Error,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("cancelled"),
+                BackgroundAgentStatus::Stopped,
                 true,
             ),
             (
