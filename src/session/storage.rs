@@ -2109,30 +2109,6 @@ impl Storage {
         })
     }
 
-    pub(crate) fn bind_native_input(self, instance_id: &str) -> Result<NativeInputStore> {
-        super::validate_instance_id(instance_id)?;
-        self.verify_bound_profile()?;
-        let resolved = resolve_symlink_chain(&self.sessions_path)?;
-        let sessions_directory = super::anchored_fs::AnchoredDir::open_reference(
-            resolved.parent().context("sessions path needs a parent")?,
-        )?;
-        let leaf = resolved.file_name().context("sessions path needs a leaf")?;
-        let files = self.files.as_deref().context("unbound input store")?;
-        anyhow::ensure!(
-            sessions_directory
-                .bind_file(leaf)?
-                .same_target(&files.sessions)?,
-            "native input sessions binding changed"
-        );
-        self.verify_bound_profile()?;
-        Ok(NativeInputStore {
-            storage: self,
-            sessions_directory,
-            sessions_leaf: PathBuf::from(leaf),
-            lifecycle_leaf: format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock").into(),
-        })
-    }
-
     /// Serialize launch/restart and explicit resume-target mutation for one
     /// instance across every process using this profile.
     ///

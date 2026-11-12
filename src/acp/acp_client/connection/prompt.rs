@@ -3,7 +3,7 @@
 //! mid-turn steering.
 
 use crate::acp::state::{AcpConnectionSource, Event, RateLimitInfo};
-use agent_client_protocol::v1::schema::{PromptRequest, PromptResponse, StopReason};
+use agent_client_protocol::v1::schema::{ContentBlock, PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;

@@ -790,7 +790,6 @@ pub(crate) async fn spawn_structured_session(
                         resume_policy: crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
                         restart: false,
                         conversation_carry: None,
-                        start_admission,
                     },
                     launch_reservation,
                     Ok(()),

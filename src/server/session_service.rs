@@ -196,16 +196,6 @@ pub(crate) struct IdleDormancy {
 #[error("idle dormancy observation changed")]
 struct IdleDormancyDeclined;
 
-pub(crate) struct IdleDormancy {
-    pub stamp: chrono::DateTime<chrono::Utc>,
-    context: crate::acp::state::NativeEventContext,
-    storage: crate::session::Storage,
-    _transaction: PersistedMutation,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("idle dormancy observation changed")]
-struct IdleDormancyDeclined;
 
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

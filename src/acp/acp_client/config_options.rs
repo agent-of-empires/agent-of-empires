@@ -633,7 +633,7 @@ mod tests {
                     let predecessor = durable_row(&client.id).acp_establishment;
                     if case == "config" {
                         client
-                            .set_config_option("test-option", "new", None)
+                            .set_config_option("test-option", "new", false, None)
                             .await
                             .unwrap();
                     } else {
@@ -880,7 +880,7 @@ mod tests {
                     let predecessor = durable_row(&client.id).acp_establishment;
                     if case == "config" {
                         client
-                            .set_config_option("test-option", "new", None)
+                            .set_config_option("test-option", "new", false, None)
                             .await
                             .unwrap();
                     } else {

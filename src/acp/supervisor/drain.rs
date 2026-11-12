@@ -1709,41 +1709,6 @@ impl<S: BroadcastSink> Drain<S> {
         )));
     }
 
-    fn defer_respawn_install(
-        &self,
-        workers: &mut HashMap<String, super::WorkerHandle>,
-        reservation: &mut ResumeReservation,
-        client: Arc<crate::acp::acp_client::AcpClient>,
-        inbound: mpsc::Receiver<SdkEvent>,
-        config: SpawnConfig,
-        identity: Option<RunnerIdentity>,
-    ) {
-        let lease = reservation.lease();
-        if let Some(handle) = workers.remove(&self.session_id) {
-            assert_eq!(
-                &handle.lease, lease,
-                "only the original respawn observation is transferred"
-            );
-            lease.retirement().record_worker(handle);
-        }
-        reservation.deferred = Some(super::DeferredConstruction::Installation(Box::new(
-            super::ConstructionInstallation {
-                client,
-                inbound,
-                identity,
-                finish: super::ConstructionFinish::new(
-                    WorkerKind::Runner {
-                        spawn_config: Box::new(config),
-                    },
-                    self.context_reset.clone(),
-                    None,
-                    true,
-                ),
-                constructor: reservation.constructor.as_ref().map(|work| work.fork()),
-            },
-        )));
-    }
-
     /// Re-resolve what may have changed since the first launch: model pins,
     /// host hook env, and MCP servers.
     async fn refresh_launch_env(session_id: &str, config: &mut SpawnConfig) {

@@ -994,8 +994,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         if config.seed_history_replay {
             let sink = Arc::clone(&self.sink);
             let id = req.session_id.clone();
+            let next_seqs = Arc::clone(&self.next_seqs);
             with_durable_launch(req.launch_admission.clone(), id.clone(), move || {
-                sink.clear_session_events(&id).map_err(|error| {
+                sink.clear_session_events(&id, next_seqs).map_err(|error| {
                     AcpError::Spawn(format!("import replay clear failed: {error}"))
                 })
             })

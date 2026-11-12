@@ -105,7 +105,7 @@ impl EventStore {
             };
             let rows = {
                 let mut statement = tx.prepare(&format!(
-                    "SELECT seq, event_json FROM {table}
+                    "SELECT seq, event_json, scope, qualification_json FROM {table}
                  WHERE session_id = ?1 AND seq {comparison} ?2
                  ORDER BY seq {order} LIMIT ?3"
                 ))?;
@@ -115,7 +115,12 @@ impl EventStore {
                         i64::try_from(cursor).unwrap_or(i64::MAX),
                         i64::try_from(limit.saturating_add(1))?
                     ],
-                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?)),
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    )),
                 )?;
                 found.collect::<rusqlite::Result<Vec<_>>>()?
             };
@@ -127,7 +132,33 @@ impl EventStore {
             session_id,
             super::test_support::RetainedReadStage::BeforeDecode,
         );
-        let (mut events, last_scanned_seq, has_more) = decode_rows(session_id, rows, Some(limit));
+        let mut events = Vec::with_capacity(rows.len().min(limit));
+        let mut last_scanned_seq = None;
+        let mut has_more = false;
+        for (scanned, (seq, json, scope, qualification)) in rows.into_iter().enumerate() {
+            let seq = u64::try_from(seq).context("negative retained ACP sequence")?;
+            let metadata = EventMetadata::decode_private(scope, qualification.as_deref())?;
+            if scanned >= limit {
+                has_more = true;
+                break;
+            }
+            last_scanned_seq = Some(seq);
+            match serde_json::from_str::<Event>(&json) {
+                Ok(event) => {
+                    metadata.validate_for_event(&event)?;
+                    events.push(StoredEvent {
+                        seq,
+                        event: Arc::new(event),
+                        metadata,
+                    });
+                }
+                Err(error) if metadata.availability_denial => return Err(error.into()),
+                Err(error) => {
+                    warn!(target: "acp.event_store", session = %session_id, seq, %error,
+                        "unknown or malformed historical event");
+                }
+            }
+        }
         if before.is_some() {
             events.reverse();
         }
@@ -352,9 +383,9 @@ mod tests {
                 (id.as_str(), 2)
             );
             assert!(matches!(published.event.as_ref(), Event::ThinkingEnded));
-            assert_eq!(seqs(&store.replay_from("unrelated", 0)), [1]);
+            assert_eq!(seqs(&store.replay_from("unrelated", 0).unwrap()), [1]);
             assert_eq!(seqs(&page.events), [1]);
-            assert!(matches!(&page.events[0].1, Event::UserPromptSent { .. }));
+            assert!(matches!(page.events[0].event.as_ref(), Event::UserPromptSent { .. }));
             assert_eq!(
                 (page.highest_seq, page.lowest_seq, page.last_scanned_seq),
                 (1, Some(1), Some(1))
@@ -446,7 +477,7 @@ mod tests {
             (max + 1, vec![max - 1, max]),
             (u64::MAX, vec![max - 1, max]),
         ] {
-            assert_eq!(seqs(&store.replay_before("boundary", cursor)), expected);
+            assert_eq!(seqs(&store.replay_before("boundary", cursor).unwrap()), expected);
             let (page, _) = store
                 .retained_page("boundary", 0, Some(cursor), 10, None)
                 .unwrap()

@@ -271,16 +271,6 @@ impl Instance {
             self.fail_reserved_launch(storage, generation, &error, None, None);
             return Err(error);
         }
-        if handoff.is_none() {
-            if let Err(error) = admission.verify_context(self) {
-                self.fail_reserved_launch(storage, generation, &error, false);
-                return Err(error);
-            }
-        }
-        if let Err(error) = admission.verify() {
-            self.fail_reserved_launch(storage, generation, &error, false);
-            return Err(error);
-        }
         self.reconcile_sidecar_into_disk_in(storage)?;
         let expected = self.apply_fresh_launch_intent_in(storage);
         self.capture_resume_launch_target_in(CaptureStorage::Scoped(storage));

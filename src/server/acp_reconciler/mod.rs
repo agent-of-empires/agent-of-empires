@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 
 use super::AppState;
 use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
-use crate::acp::event_store::EventStore;
+use crate::acp::event_store::{ControlKnowledge, EventStore};
 use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 

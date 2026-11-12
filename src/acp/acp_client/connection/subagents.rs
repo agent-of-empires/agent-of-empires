@@ -8,7 +8,7 @@ use agent_client_protocol::v1::schema::{
 
 use super::notifications::Shared;
 use crate::acp::acp_client::config_options::map_acp_config_option;
-use crate::acp::acp_client::tool_context::update_tool_context_cache;
+use crate::acp::acp_client::tool_context::{capture_tool_context_input, update_tool_context_cache};
 use crate::acp::acp_client::tool_output::preview_args;
 use crate::acp::acp_client::update_events::map_update_to_events;
 use crate::acp::state::{
@@ -234,7 +234,7 @@ impl Shared {
                     .expect("subagents mutex poisoned")
                     .get(child.0.as_ref())
                     .and_then(|record| record.parent_tool_call_id.clone());
-                let source = tool.clone();
+                let mut source = capture_tool_context_input(&tool);
                 for mut event in map_update_to_events(tool, self.profile) {
                     match &mut event {
                         Event::ToolCallStarted { tool_call } => {
@@ -248,7 +248,7 @@ impl Shared {
                         | Event::DiffEmitted { .. } => {}
                         _ => continue,
                     }
-                    update_tool_context_cache(&self.tool_context_cache, &mut event, &source);
+                    update_tool_context_cache(&self.tool_context_cache, &mut event, &mut source);
                     if self.event_tx.send(event).await.is_err() {
                         break;
                     }

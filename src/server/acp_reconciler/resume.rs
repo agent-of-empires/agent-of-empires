@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::time::timeout_at;
 
-use super::{is_resumable, query_flushed, query_store, AppState, ResumeOutcome};
+use super::{is_resumable, query_flushed, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
     command_override_for_spawn, BroadcastSink, ResumeKind, ResumeReservation, SpawnRequest,
     Supervisor, SupervisorError,
@@ -713,108 +713,6 @@ async fn attach_retained_target(
             .ok_or_else(|| SupervisorError::SpawnCancelled(target.id.clone()))?;
         let config_path = row.repo_config_path().to_path_buf();
         row.sandbox_info.clone().map(|info| (info, config_path))
-    };
-    // Attached workers resume their background tailers independently in
-    // install_worker. Only an actual main turn owns a cached prompt completion.
-    let in_flight_turn = super::query_control(
-        &service.acp_event_store,
-        &target.id,
-        "retained main-turn adoption",
-        |store, id| store.has_in_flight_main_turn(id),
-    )
-    .await?;
-    let in_flight_turn = matches!(
-        in_flight_turn,
-        crate::acp::event_store::ControlKnowledge::Known(true)
-    );
-    service
-        .acp_supervisor
-        .attach_inner(
-            target.id.clone(),
-            PathBuf::from(&target.project_path),
-            vec![],
-            in_flight_turn,
-            sandbox,
-            reservation,
-        )
-        .await
-}
-
-pub(crate) async fn ensure_rate_limit_worker(
-    state: &Arc<AppState>,
-    id: &str,
-    authority: worker_registry::ResumeAuthority,
-    retained_only: bool,
-) -> Result<(), SupervisorError> {
-    if !state.acp_supervisor.is_running(id).await {
-        let target = resume_target_for_session(&state.session_service, id)
-            .await
-            .ok_or_else(|| SupervisorError::SpawnCancelled(id.to_owned()))?;
-        let probe_id = id.to_owned();
-        let record =
-            tokio::task::spawn_blocking(move || worker_registry::control_admission(&probe_id))
-                .await
-                .map_err(|_| SupervisorError::NativeStoreUnavailable)?
-                .map_err(|refusal| {
-                    SupervisorError::Acp(
-                        crate::acp::acp_client::AcpError::RetainedRuntimeUnavailable(Box::new(
-                            refusal,
-                        )),
-                    )
-                })?;
-        if record
-            .as_ref()
-            .is_some_and(worker_registry::retained_process_may_be_alive)
-        {
-            if let Some(mut reservation) = state
-                .acp_supervisor
-                .begin_resume(id, ResumeKind::Attach, authority)
-                .await?
-            {
-                reservation.expected_lifecycle_generation = Some(target.lifecycle_generation);
-                let deadline = reservation.admission_deadline();
-                timeout_at(
-                    deadline,
-                    attach_retained_target(&state.session_service, &target, reservation),
-                )
-                .await
-                .map_err(|_| {
-                    SupervisorError::Acp(crate::acp::acp_client::AcpError::AttachTimedOut)
-                })??;
-            }
-        } else {
-            if retained_only {
-                return Err(SupervisorError::ControlStateUnavailable);
-            }
-            match trigger_resume_background(&state.session_service, id, authority, None).await? {
-                ResumeTrigger::NotFound => {
-                    return Err(SupervisorError::UnknownSession(id.to_owned()))
-                }
-                ResumeTrigger::Started | ResumeTrigger::AlreadyResuming => {}
-            }
-        }
-    }
-    state.acp_supervisor.wait_until_ready(id).await
-}
-
-async fn attach_retained_target(
-    service: &Arc<SessionService>,
-    target: &ResumeTarget,
-    reservation: ResumeReservation,
-) -> Result<(), SupervisorError> {
-    let sandbox = {
-        let instances = service.instances.read().await;
-        let row = instances
-            .iter()
-            .find(|row| {
-                row.id == target.id
-                    && is_resumable(row)
-                    && row.source_profile == target.source_profile
-                    && row.created_at == target.created_at
-                    && row.lifecycle_generation == target.lifecycle_generation
-            })
-            .ok_or_else(|| SupervisorError::SpawnCancelled(target.id.clone()))?;
-        row.sandbox_info.clone()
     };
     // Attached workers resume their background tailers independently in
     // install_worker. Only an actual main turn owns a cached prompt completion.

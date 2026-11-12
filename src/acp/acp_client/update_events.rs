@@ -674,10 +674,8 @@ pub(super) fn map_update_to_events(
                         events.extend(cue.into_agent_event());
                     }
                     other => {
-                        let cue = background_resource_from_parts(
-                            Some(id.as_str()),
-                            update.meta.as_ref().and_then(|meta| meta.get("claudeCode")),
-                        );
+                        let payload =
+                            serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                         if profile.supports_wakeup_tools {
                             if let Some(cue) = other {
                                 events.extend(cue.into_monitor_event());
@@ -685,8 +683,6 @@ pub(super) fn map_update_to_events(
                             }
                             events.extend(background_task_stopped_from_value(&payload));
                         }
-                        let payload =
-                            serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
                         events.push(Event::RawAgentUpdate { payload });
                     }
                 }

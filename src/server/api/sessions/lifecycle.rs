@@ -4026,7 +4026,6 @@ async fn prepare_agent_session_inner(
                     native,
                     hooks,
                     conversation_carry,
-                    start_admission,
                 )))
             })
             .await

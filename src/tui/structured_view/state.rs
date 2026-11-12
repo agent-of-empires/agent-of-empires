@@ -433,7 +433,7 @@ impl StructuredViewState {
             .as_ref()
             .is_none_or(|choice| match &choice.purpose {
                 ChoicePurpose::OpenLink => true,
-                ChoicePurpose::Mode => self.native_input_available(),
+                ChoicePurpose::Mode | ChoicePurpose::Toggle => self.native_input_available(),
                 ChoicePurpose::Approval { nonce } => {
                     self.can_decide(nonce)
                         && self

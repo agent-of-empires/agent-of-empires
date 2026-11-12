@@ -160,26 +160,28 @@ async fn config_option_category(
     state: &Arc<AppState>,
     id: &str,
     config_id: &str,
-) -> Option<ConfigOptionCategory> {
+) -> anyhow::Result<Option<ConfigOptionCategory>> {
     let own = state
         .session_service
         .fold_control_state(id)
-        .await
+        .await?
         .config_options;
     if !own.is_empty() {
-        return own
+        return Ok(own
             .into_iter()
             .find(|opt| opt.id == config_id)
-            .map(|opt| opt.category);
+            .map(|opt| opt.category));
     }
-    let agent = catalog_agent(state, id).await?;
-    crate::acp::option_catalog::load()
+    let Some(agent) = catalog_agent(state, id).await else {
+        return Ok(None);
+    };
+    Ok(crate::acp::option_catalog::load()
         .agents
         .get(&agent)
         .into_iter()
         .flat_map(|entry| entry.options.iter())
         .find(|opt| opt.id == config_id)
-        .map(|opt| opt.category.clone())
+        .map(|opt| opt.category.clone()))
 }
 
 /// Set a selector via ACP `session/set_config_option` (#1403). Rejection
@@ -211,7 +213,17 @@ pub async fn acp_set_config_option(
     let selector = if req.config_id == "model" {
         Some(PersistedSelector::Model)
     } else {
-        match config_option_category(&state, &id, &req.config_id).await {
+        let category = match config_option_category(&state, &id, &req.config_id).await {
+            Ok(category) => category,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("config-option state read failed: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        match category {
             Some(ConfigOptionCategory::Model) => Some(PersistedSelector::Model),
             Some(ConfigOptionCategory::Mode) => Some(PersistedSelector::Mode),
             Some(ConfigOptionCategory::ThoughtLevel) => Some(PersistedSelector::ThoughtLevel),
@@ -282,6 +294,7 @@ pub async fn acp_set_config_option(
             return persist_failure_response(
                 &state,
                 &id,
+                &lease,
                 &format!("config-option pick for acp_model_config.{}", req.config_id),
                 &e,
             )
@@ -816,6 +829,7 @@ mod tests {
                 Ok(Json(SetConfigOptionRequest {
                     config_id: config_id.to_string(),
                     value: "on".to_string(),
+                    request_nonce: None,
                 })),
             )
             .await
@@ -882,11 +896,11 @@ mod tests {
         }
 
         assert_eq!(
-            config_option_category(&state, &with_id, "ultracode").await,
+            config_option_category(&state, &with_id, "ultracode").await.unwrap(),
             Some(toggle)
         );
         assert_eq!(
-            config_option_category(&state, &without_id, "ultracode").await,
+            config_option_category(&state, &without_id, "ultracode").await.unwrap(),
             None
         );
     }
@@ -937,7 +951,7 @@ mod tests {
             ("unknown", None),
         ] {
             assert_eq!(
-                config_option_category(&state, &id, config_id).await,
+                config_option_category(&state, &id, config_id).await.unwrap(),
                 expected
             );
         }

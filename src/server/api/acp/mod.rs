@@ -330,7 +330,7 @@ mod tests {
                 let state = session.state.clone();
                 let (_, original_lease) = state
                     .acp_supervisor
-                    .set_config_option(&id, "model", "new-model", None)
+                    .set_config_option(&id, "model", "new-model", false, None)
                     .await
                     .unwrap();
                 tokio::time::timeout(std::time::Duration::from_secs(10), async {

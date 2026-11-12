@@ -994,7 +994,7 @@ impl TranscriptModel {
             );
             row.at = now;
             row.tool_call_id = Some(id);
-            deltas.push(patch(row));
+            deltas.push(patch(&row));
         }
         deltas
     }

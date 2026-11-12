@@ -33,7 +33,7 @@ pub(crate) async fn project_sessions(
             Option<crate::daemon::AcpWorkerStart>,
         ),
     >,
-) -> anyhow::Result<anyhow::Result<Vec<SessionResponse>>> {
+) -> anyhow::Result<Vec<SessionResponse>> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Every positional overlay shares this filtered view.

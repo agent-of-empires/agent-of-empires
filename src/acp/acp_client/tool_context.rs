@@ -122,13 +122,13 @@ pub(super) fn update_tool_context_cache(
     event: &mut Event,
     source_input: &mut Option<ToolContextInput>,
 ) {
-    let (id, prompt) = match event {
-        Event::ToolCallStarted { tool_call } => (&tool_call.id, None),
+    let (id, prompt): (&str, Option<&mut Option<String>>) = match event {
+        Event::ToolCallStarted { tool_call } => (tool_call.id.as_str(), None),
         Event::ToolCallUpdated {
             tool_call_id,
             prompt,
             ..
-        } => (tool_call_id, Some(prompt)),
+        } => (tool_call_id.as_str(), Some(prompt)),
         Event::ToolCallCompleted { tool_call_id, .. } => {
             cache
                 .lock()
@@ -138,7 +138,7 @@ pub(super) fn update_tool_context_cache(
         }
         _ => return,
     };
-    if source_input.as_ref().is_some_and(|input| input.id == *id) {
+    if source_input.as_ref().is_some_and(|input| input.id == id) {
         let input = source_input.take().expect("matching tool input");
         let mut cache = cache.lock().expect("tool context cache mutex poisoned");
         if let Some(prompt) = prompt {
@@ -335,7 +335,8 @@ mod tests {
         };
         let prompt_after = |raw: serde_json::Value| {
             let mut event = updated(&raw);
-            update_tool_context_cache(&cache, &mut event, &update(raw));
+            let mut input = capture_tool_context_input(&update(raw));
+            update_tool_context_cache(&cache, &mut event, &mut input);
             let Event::ToolCallUpdated { prompt, .. } = event else {
                 unreachable!()
             };

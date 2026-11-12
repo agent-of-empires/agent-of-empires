@@ -445,7 +445,7 @@ pub async fn acp_replay(
             limit,
             q.history_identity.as_deref(),
         ) {
-            Ok(Some((page, identity))) => (page, Some(identity)),
+            Ok(Some((page, identity))) => (Ok(page), Some(identity)),
             Ok(None) => {
                 return (StatusCode::CONFLICT, "retained history changed during read")
                     .into_response()

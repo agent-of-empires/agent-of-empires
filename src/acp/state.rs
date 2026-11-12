@@ -2020,7 +2020,7 @@ impl AcpState {
                         // An uncut preview means the prompt is no longer oversized; a cut
                         // one with no prompt is a deduplicated repeat of the stored prompt.
                         if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
-                            tool.prompt = prompt;
+                            tool.prompt.clone_from(prompt);
                         }
                         tool.args_preview = args_preview.clone();
                     }
@@ -2231,7 +2231,7 @@ impl AcpState {
                 self.sidebar_phase = SidebarPhase::Error;
             }
             Event::IntegrationLost { reason } => {
-                self.integration_lost = Some(reason);
+                self.integration_lost = Some(reason.clone());
                 self.turn_active = false;
                 self.cancelling = false;
                 self.sidebar_phase = SidebarPhase::Error;
@@ -2320,7 +2320,7 @@ impl AcpState {
                 if let Some(child) = self.subagents.iter().find(|s| {
                     s.parent_tool_call_id.as_deref() == Some(record.tool_call_id.as_str())
                 }) {
-                    record.reconcile(child, started_at);
+                    record.reconcile(child, *started_at);
                 }
                 self.launch_background_agent(record);
             }
@@ -2365,7 +2365,7 @@ impl AcpState {
                     }
                 }
             }
-            Event::SubagentUpdated { subagent, at } => self.apply_subagent(subagent, at),
+            Event::SubagentUpdated { subagent, at } => self.apply_subagent(subagent.clone(), *at),
             Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
@@ -2375,12 +2375,12 @@ impl AcpState {
             } => {
                 // A reused task id replaces whatever run held it.
                 self.close_workflow_run(task_id, None);
-                self.background_shells.retain(|s| s.task_id != task_id);
+                self.background_shells.retain(|s| s.task_id != *task_id);
                 if workflow.is_none() {
                     self.background_shells.push(BackgroundShellRecord {
                         task_id: task_id.clone(),
-                        command: description,
-                        started_at,
+                        command: description.clone(),
+                        started_at: *started_at,
                         ended_at: None,
                         finished: false,
                     });
@@ -2413,10 +2413,10 @@ impl AcpState {
                 if let Some(shell) = self
                     .background_shells
                     .iter_mut()
-                    .find(|s| s.task_id == task_id)
+                    .find(|s| s.task_id == *task_id)
                 {
                     shell.finished = true;
-                    shell.ended_at = ended_at;
+                    shell.ended_at = *ended_at;
                 }
                 let finished = self.background_shells.iter().filter(|s| s.finished).count();
                 for _ in MAX_FINISHED_BACKGROUND_SHELLS..finished {
