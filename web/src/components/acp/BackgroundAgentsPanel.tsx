@@ -450,7 +450,7 @@ function StatusLabel({ status, toolCount }: { status: BackgroundAgentStatus; too
   return <span className={`shrink-0 text-[11px] ${tone}`}>{label}</span>;
 }
 
-/** Live-ticking elapsed for running agents; fixed duration once ended. */
+/** Live-ticking while active, fixed once ended; absent for a terminal agent with no end time. */
 function Elapsed({ startedAt, endedAt, active }: { startedAt: string; endedAt: string | null; active: boolean }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -458,6 +458,7 @@ function Elapsed({ startedAt, endedAt, active }: { startedAt: string; endedAt: s
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [active, endedAt]);
+  if (!active && !endedAt) return null;
   const start = Date.parse(startedAt);
   if (!Number.isFinite(start)) return null;
   const end = endedAt ? Date.parse(endedAt) : now;

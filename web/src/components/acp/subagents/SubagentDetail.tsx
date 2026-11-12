@@ -87,23 +87,26 @@ export function SubagentDetail({ record, alwaysOpen = false, actions, stopChildI
     <section
       data-tool-id={record.id}
       data-testid="subagent-detail"
-      className="my-1 rounded-md border border-surface-700 bg-surface-800/50 text-sm"
+      className="@container my-1 rounded-md border border-surface-700 bg-surface-800/50 text-sm"
     >
-      <div className="flex flex-wrap items-center gap-x-2">
+      {/* Actions wrap below the toggle when narrow; a Stop confirmation takes its own line. */}
+      <div className="flex flex-wrap items-center justify-end gap-x-2 pr-2">
         <button
           type="button"
           aria-expanded={open}
           aria-controls={`${uid}-body`}
           disabled={alwaysOpen}
           onClick={() => setOpen((v) => !v)}
-          className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left enabled:hover:bg-surface-800"
+          className="flex min-w-0 flex-[1_1_18rem] items-center gap-2 px-3 py-1.5 text-left enabled:hover:bg-surface-800"
         >
           <span className={`h-2 w-2 shrink-0 rounded-full ${st.dot}`} />
           <Sparkles className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-          <span className="hidden text-[11px] uppercase tracking-wider text-text-dim min-[480px]:inline">subagent</span>
+          <span className="hidden text-[11px] uppercase tracking-wider text-text-dim @min-[480px]:inline">
+            subagent
+          </span>
           <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">{record.description}</span>
           {record.background && (
-            <span className="hidden rounded bg-surface-700 px-1.5 text-[10px] text-text-dim min-[480px]:inline">
+            <span className="hidden rounded bg-surface-700 px-1.5 text-[10px] text-text-dim @min-[480px]:inline">
               background
             </span>
           )}
@@ -118,17 +121,15 @@ export function SubagentDetail({ record, alwaysOpen = false, actions, stopChildI
             />
           )}
         </button>
-        <div className="flex items-center gap-2 pr-2">
-          {actions}
-          {stopChildId && cancelSubagent && !readOnly ? (
-            <StopSubagent childId={stopChildId} cancel={cancelSubagent} />
-          ) : (
-            record.background &&
-            record.status === "running" &&
-            sessionId &&
-            !readOnly && <StopSession sessionId={sessionId} running={running} />
-          )}
-        </div>
+        {actions}
+        {stopChildId && cancelSubagent && !readOnly ? (
+          <StopSubagent childId={stopChildId} cancel={cancelSubagent} />
+        ) : (
+          record.background &&
+          record.status === "running" &&
+          sessionId &&
+          !readOnly && <StopSession sessionId={sessionId} running={running} />
+        )}
       </div>
       <span className="sr-only" role="status" aria-live="polite">
         {record.description} {st.word}

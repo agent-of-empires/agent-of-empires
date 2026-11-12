@@ -423,6 +423,23 @@ describe("BackgroundAgentsPanel", () => {
     expect(container.textContent).not.toContain("a1");
   });
 
+  it("shows a row duration only while active or once ended", () => {
+    const startedAt = new Date(Date.now() - 65_000).toISOString();
+    const ended = new Date(Date.parse(startedAt) + 30_000).toISOString();
+    for (const [over, shown] of [
+      [{ status: "running" }, /1m \d+s/],
+      [{ status: "completed", endedAt: ended }, /30s/],
+      [{ status: "stopped" }, null],
+    ] as const) {
+      agentsMock.mockReturnValue([agent({ startedAt, lastText: null, ...over })]);
+      const { container, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" readOnly />);
+      const row = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Map backend"))!;
+      if (shown) expect(row.textContent, over.status).toMatch(shown);
+      else expect(row.textContent, over.status).not.toMatch(/\d+s/);
+      unmount();
+    }
+  });
+
   it("orders running agents before finished ones", () => {
     agentsMock.mockReturnValue([
       agent({ agentId: "done", toolCallId: "t-done", description: "Done one", status: "completed" }),
@@ -594,6 +611,18 @@ describe("BackgroundAgentsPanel", () => {
       const bare = render(<BackgroundAgentsPanel sessionId="s-1" />);
       expect(bare.container.textContent).toContain("Explore repo");
       expect(bare.container.textContent).toContain("running");
+      subagentsMock.mockReturnValue([]);
+    });
+
+    it("opens the detail Stop confirmation on the header's wrapping row, not in its action group", () => {
+      agentsMock.mockReturnValue([agent()]);
+      subagentsMock.mockReturnValue([record()]);
+      const { getByRole, getByTitle } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
+      fireEvent.click(getByTitle("Stop this sub-agent"));
+      const row = getByRole("alertdialog").parentElement!;
+      expect(row.className).toContain("flex-wrap");
+      expect(row.querySelector("[aria-expanded]")?.textContent).toContain("Map backend lifecycle");
       subagentsMock.mockReturnValue([]);
     });
 
