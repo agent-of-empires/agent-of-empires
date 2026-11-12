@@ -212,6 +212,16 @@ describe("SuggestionsView", () => {
     });
   });
 
+  it("describes what Start does for the current start_without_review setting", async () => {
+    await open(snapshot());
+    expect(await screen.findByText(/Nothing runs until you press Launch/)).toBeTruthy();
+    cleanup();
+    const base = snapshot();
+    await open({ ...base, prefs: { ...base.prefs, start_without_review: true } });
+    expect(await screen.findByText(/Start creates the session and sends the draft prompt right away/)).toBeTruthy();
+    expect(screen.queryByText(/Nothing runs until you press Launch/)).toBeNull();
+  });
+
   it("Start without review creates the session from the prepared draft and skips the wizard", async () => {
     const session = { id: "s1" };
     const { onPrepare, onStarted } = await startWithoutReview({}, { ok: true, session });
