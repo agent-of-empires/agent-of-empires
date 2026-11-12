@@ -458,18 +458,19 @@ jobs:
           # refs/heads/gh-readonly-queue/main/pr-<N>-<sha>
           PR="${HEAD_REF##*/pr-}"
           PR="${PR%%-*}"
+          [[ $PR =~ ^[0-9]+$ ]] || { echo "::error::Cannot parse PR from $HEAD_REF"; exit 1; }
           echo "number=$PR" >> "$GITHUB_OUTPUT"
-          gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid \
-            --jq '"ref=\(.headRefName)\noid=\(.headRefOid)"' >> "$GITHUB_OUTPUT"
+          gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid,labels \
+            --jq '"ref=\(.headRefName)\noid=\(.headRefOid)\nrelease=\(any(.labels[]; .name == "release"))"' >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: startsWith(steps.pr.outputs.ref, 'release-plz-')
+        if: steps.pr.outputs.release == 'true' && startsWith(steps.pr.outputs.ref, 'release-plz-')
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Fail if main moved past the release PR
-        if: startsWith(steps.pr.outputs.ref, 'release-plz-')
+        if: steps.pr.outputs.release == 'true' && startsWith(steps.pr.outputs.ref, 'release-plz-')
         env:
           PR: ${{ steps.pr.outputs.number }}
           PR_HEAD: ${{ steps.pr.outputs.oid }}
