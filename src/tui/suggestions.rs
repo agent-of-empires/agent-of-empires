@@ -21,6 +21,9 @@ use crate::tui::worker::Worker;
 
 #[derive(Debug, Clone, Deserialize)]
 struct Snapshot {
+    /// The profile the daemon publishes suggestions under.
+    #[serde(default)]
+    profile: Option<String>,
     providers: Vec<Provider>,
     items: Vec<Item>,
     #[serde(default)]
@@ -645,6 +648,14 @@ impl SuggestionsView {
                 Style::default().fg(theme.waiting),
             )));
         }
+        if let Some(profile) = &store.foreign_profile {
+            footer.push(Line::from(Span::styled(
+                plain(&format!(
+                    "Suggestions are published under profile {profile}. Switch to it to see them."
+                )),
+                Style::default().fg(theme.waiting),
+            )));
+        }
         for provider in store
             .snapshot
             .iter()
@@ -909,6 +920,10 @@ pub(super) struct FeedPoll {
 /// keeps only its own UI state.
 pub(super) struct SuggestionsFeed {
     snapshot: Option<Snapshot>,
+    /// The profile the TUI shows; snapshots of another profile are not shown.
+    profile: Option<String>,
+    /// The other profile the daemon's suggestions belong to, while it differs.
+    foreign_profile: Option<String>,
     prepare_key: Option<ItemKey>,
     prepare_target: PrepareTarget,
     /// Epoch of the most recently opened full view.
@@ -947,6 +962,8 @@ impl SuggestionsFeed {
     fn with_worker(worker: Worker<Req, Res>) -> Self {
         Self {
             snapshot: None,
+            profile: None,
+            foreign_profile: None,
             prepare_key: None,
             prepare_target: PrepareTarget::Home,
             view_epoch: 0,
@@ -1044,6 +1061,19 @@ impl SuggestionsFeed {
             });
         }
         self.reload();
+    }
+
+    /// Sets the profile the TUI shows. A change reloads at once, so the list
+    /// follows a profile switch.
+    pub(super) fn set_profile(&mut self, profile: String) {
+        let switched = self.profile.as_deref().is_some_and(|p| p != profile);
+        self.profile = Some(profile);
+        if switched {
+            self.snapshot = None;
+            self.foreign_profile = None;
+            self.loaded_at = None;
+            self.load_attempt_at = None;
+        }
     }
 
     pub(super) fn is_recent(&self, key: &ItemKey) -> bool {
@@ -1276,7 +1306,22 @@ impl SuggestionsFeed {
             _ => ResKind::Other,
         };
         match res {
+            Res::Snapshot(Ok(snapshot))
+                if self
+                    .profile
+                    .as_deref()
+                    .zip(snapshot.profile.as_deref())
+                    .is_some_and(|(shown, published)| shown != published) =>
+            {
+                // The daemon's store belongs to another profile: showing,
+                // dismissing or preparing from it would act on the wrong one.
+                self.foreign_profile = snapshot.profile;
+                self.snapshot = None;
+                self.loaded_at = Some(std::time::Instant::now());
+                out.changed = true;
+            }
             Res::Snapshot(Ok(snapshot)) => {
+                self.foreign_profile = None;
                 self.snapshot = Some(snapshot);
                 self.settle_dismissals();
                 self.loaded_at = Some(std::time::Instant::now());
@@ -1355,6 +1400,7 @@ mod tests {
     fn view_with(items: Vec<Item>, worker: Worker<Req, Res>) -> Rig {
         let mut store = SuggestionsFeed::with_worker(worker);
         store.snapshot = Some(Snapshot {
+            profile: None,
             providers: vec![Provider {
                 id: "p".into(),
                 name: "GitHub".into(),
@@ -1448,6 +1494,7 @@ mod tests {
         it.reason = hostile("why\nmore");
         it.preview = hostile("body");
         let snapshot = Snapshot {
+            profile: None,
             providers: vec![Provider {
                 id: "p".into(),
                 name: hostile("GitHub"),
@@ -1500,6 +1547,7 @@ mod tests {
         press(&mut rig, KeyCode::Char('j'), true);
         assert_eq!(rig.view.selected_key().unwrap().1, "b");
         rig.store.snapshot = Some(Snapshot {
+            profile: None,
             providers: vec![],
             items: vec![
                 item("new", Some("p0"), false),
@@ -1632,6 +1680,7 @@ mod tests {
 
     fn dismissed_snapshot(rig: &mut Rig, dismissed: bool) {
         rig.store.snapshot = Some(Snapshot {
+            profile: None,
             providers: vec![],
             items: vec![item("a", None, dismissed)],
             prefs: Prefs::default(),
@@ -1681,6 +1730,7 @@ mod tests {
         let key = |id: &str| ("p".to_string(), id.to_string());
         rig.store.dismissing = vec![key("a"), key("b")];
         let snapshot = |a: bool, b: bool| Snapshot {
+            profile: None,
             providers: vec![],
             items: vec![item("a", None, a), item("b", None, b)],
             prefs: Prefs::default(),
@@ -2109,5 +2159,38 @@ mod tests {
                 .unwrap(),
             "load"
         );
+    }
+
+    #[test]
+    fn a_snapshot_of_another_profile_is_not_shown_and_says_so() {
+        let published = |profile: &str| Snapshot {
+            profile: Some(profile.into()),
+            providers: vec![],
+            items: vec![item("a", None, false)],
+            prefs: Prefs::default(),
+        };
+        let worker = Worker::seeded_for_test("t", Res::Snapshot(Ok(published("default"))));
+        let mut rig = view_with(vec![], worker);
+        rig.store.snapshot = None;
+        rig.store.set_profile("work".into());
+        rig.store.busy = true;
+        let mut polled = rig.store.poll();
+        for _ in 0..200 {
+            if polled.changed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            polled = rig.store.poll();
+        }
+        assert!(
+            rig.store.snapshot.is_none(),
+            "the other profile's items are not kept"
+        );
+        assert!(render_text(&rig).contains("published under profile default"));
+
+        // The same profile is shown.
+        rig.store.busy = false;
+        rig.store.set_profile("default".into());
+        assert!(rig.store.foreign_profile.is_none());
     }
 }
