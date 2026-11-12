@@ -856,9 +856,10 @@ impl NativeCallbackContext {
                 );
                 // A New callback does not select an id. A Load decision remains
                 // bound to its observed parent, including a registered child target.
-                if let (EstablishmentTarget::Load { session_id, .. }, Some(reported)) =
-                    (&self.original.attempt.target, self.parent_session_id.as_deref())
-                {
+                if let (EstablishmentTarget::Load { session_id, .. }, Some(reported)) = (
+                    &self.original.attempt.target,
+                    self.parent_session_id.as_deref(),
+                ) {
                     anyhow::ensure!(session_id == reported, EstablishmentRefusal::Superseded);
                 }
             }
@@ -870,16 +871,20 @@ impl NativeCallbackContext {
                     EstablishmentRefusal::Unconfirmed
                 );
                 anyhow::ensure!(
-                    self.parent_session_id.as_ref().is_none_or(|parent|
-                        self.target_session_id.as_ref() == Some(parent)),
+                    self.parent_session_id
+                        .as_ref()
+                        .is_none_or(|parent| self.target_session_id.as_ref() == Some(parent)),
                     EstablishmentRefusal::Superseded
                 );
             }
             if let (true, Some(postimage), Some(session_id)) = (
                 current || new_io,
                 self.original.postimage.get(),
-                if new_io { self.target_session_id.as_deref() }
-                else { self.parent_session_id.as_deref() },
+                if new_io {
+                    self.target_session_id.as_deref()
+                } else {
+                    self.parent_session_id.as_deref()
+                },
             ) {
                 anyhow::ensure!(
                     postimage.choice.acp_session_id.as_deref() == Some(session_id),

@@ -160,11 +160,24 @@ mod tests {
             text: "original".into(),
             message_id: None,
         };
-        first.record("selected", 1, &event, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+        first
+            .record(
+                "selected",
+                1,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let original = identity("selected");
         assert_ne!(original, empty);
         assert_eq!(read(&second.conn(), "selected").unwrap(), original);
-        first.record("selected", 1, &Event::ThinkingStarted, &crate::acp::event_sender::EventMetadata::history())
+        first
+            .record(
+                "selected",
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         assert_eq!(identity("selected"), original);
         second
@@ -209,7 +222,14 @@ mod tests {
         let moved = identity("selected");
         assert_ne!(moved, replaced);
         assert_ne!(identity("other"), other);
-        second.record("selected", 1, &event, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+        second
+            .record(
+                "selected",
+                1,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let recreated = identity("selected");
         assert_ne!(recreated, moved);
         first.delete_session_checked("selected").unwrap();
@@ -220,7 +240,14 @@ mod tests {
             .retained_page("selected", 0, None, 1, Some(&deleted))
             .unwrap()
             .is_some());
-        first.record("other", 2, &event, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+        first
+            .record(
+                "other",
+                2,
+                &event,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         assert_eq!(identity("selected"), deleted);
         drop(second);
         drop(first);

@@ -748,7 +748,7 @@ pub(super) async fn run_connection_task<W, R>(
                     let scope = shared.ingress.capture_request();
                     async move {
                         let state = shared.connection_state.clone();
-                        
+
                         spawn_native_callback(
                             &conn,
                             &state,
@@ -808,7 +808,7 @@ pub(super) async fn run_connection_task<W, R>(
                     let scope = shared.ingress.capture_request();
                     async move {
                         let state = shared.connection_state.clone();
-                        
+
                         spawn_native_callback(
                             &conn,
                             &state,

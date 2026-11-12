@@ -686,7 +686,11 @@ impl EventStore {
 
     /// True while a main turn, background task, or recently reporting background agent is open.
     pub fn has_in_flight_turn(&self, session_id: &str) -> Result<ControlKnowledge<bool>> {
-        if self.reader().prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)?.exists(params![session_id])? {
+        if self
+            .reader()
+            .prepare_cached(UNRESOLVED_BACKGROUND_TASKS_SQL)?
+            .exists(params![session_id])?
+        {
             return Ok(ControlKnowledge::Known(true));
         }
         let main = self.has_in_flight_main_turn(session_id)?;
@@ -1152,7 +1156,11 @@ mod tests {
         for (i, (events, holds)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
             record_projection(&store, &id, 1, events);
-            assert_eq!(store.holds_live_work(&id).unwrap(), ControlKnowledge::Known(holds), "case {i}");
+            assert_eq!(
+                store.holds_live_work(&id).unwrap(),
+                ControlKnowledge::Known(holds),
+                "case {i}"
+            );
         }
     }
 
@@ -1212,7 +1220,11 @@ mod tests {
         for (i, (events, open)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
             record_projection(&store, &id, 1, events);
-            assert_eq!(store.holds_live_work(&id).unwrap(), ControlKnowledge::Known(open), "case {i}");
+            assert_eq!(
+                store.holds_live_work(&id).unwrap(),
+                ControlKnowledge::Known(open),
+                "case {i}"
+            );
         }
     }
 
@@ -1227,7 +1239,10 @@ mod tests {
             1,
             vec![user_prompt("go"), stopped("prompt_complete")],
         );
-        assert_eq!(store.holds_live_work("s").unwrap(), ControlKnowledge::Known(false));
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
 
         store.test_set_unavailable(true);
         assert!(store.has_in_flight_main_turn("s").is_err());
@@ -1237,7 +1252,10 @@ mod tests {
         assert!(store.has_in_flight_turn("s").is_err());
 
         store.test_set_unavailable(false);
-        assert_eq!(store.holds_live_work("s").unwrap(), ControlKnowledge::Known(false));
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
     }
 
     /// An unhandled finish whose follow-up turn never came does not hold the
@@ -1251,10 +1269,23 @@ mod tests {
             task_id: "t".into(),
             ended_at: None,
         };
-        record_projection(&store, "s", 1, [user_prompt("go"), stopped("prompt_complete"), finished]);
-        store.conn().execute("UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
-            params!["s", old]).unwrap();
-        assert_eq!(store.holds_live_work("s").unwrap(), ControlKnowledge::Known(false));
+        record_projection(
+            &store,
+            "s",
+            1,
+            [user_prompt("go"), stopped("prompt_complete"), finished],
+        );
+        store
+            .conn()
+            .execute(
+                "UPDATE acp_events SET created_at=?2 WHERE session_id=?1",
+                params!["s", old],
+            )
+            .unwrap();
+        assert_eq!(
+            store.holds_live_work("s").unwrap(),
+            ControlKnowledge::Known(false)
+        );
     }
 
     #[test]
@@ -1715,7 +1746,14 @@ mod tests {
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;
-            store.record("s-1", seq, &event, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
         };
         let total = MAX_FINISHED_BACKGROUND_SHELLS + 5;
         for i in 0..total {
@@ -1748,11 +1786,16 @@ mod tests {
             });
         }
 
-        let kept: Vec<String> = store.replay_from("s-1", 0).expect("read retained events").into_iter()
-            .filter_map(|stored| match std::sync::Arc::unwrap_or_clone(stored.event) {
-                Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
-                _ => None,
-            })
+        let kept: Vec<String> = store
+            .replay_from("s-1", 0)
+            .expect("read retained events")
+            .into_iter()
+            .filter_map(
+                |stored| match std::sync::Arc::unwrap_or_clone(stored.event) {
+                    Event::BackgroundTaskStarted { task_id, .. } => Some(task_id),
+                    _ => None,
+                },
+            )
             .collect();
         let expected: Vec<String> = (total - MAX_FINISHED_BACKGROUND_SHELLS..total)
             .map(|i| format!("t{i}"))
@@ -1774,7 +1817,14 @@ mod tests {
         let mut seq = 0;
         let mut record = |event: Event| {
             seq += 1;
-            store.record("s-1", seq, &event, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &event,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
         };
         let finish = |id: &str| Event::BackgroundTaskFinished {
             task_id: id.into(),

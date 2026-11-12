@@ -1218,9 +1218,12 @@ mod tests {
     fn retained_notice_keeps_its_dismissal_identity_after_reconnect() {
         let directory = tempfile::tempdir().unwrap();
         let id = "notice-retention";
-        let store =
-            crate::acp::event_store::EventStore::open(&directory.path().join("events.db"), 2, Default::default())
-                .unwrap();
+        let store = crate::acp::event_store::EventStore::open(
+            &directory.path().join("events.db"),
+            2,
+            Default::default(),
+        )
+        .unwrap();
         store
             .record(
                 id,
@@ -1560,7 +1563,6 @@ mod tests {
             );
         }
     }
-
 
     /// Replay overlaps live broadcast; duplicates would leave unresolvable approvals.
     type TestSocket = tokio_tungstenite::WebSocketStream<

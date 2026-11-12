@@ -56,9 +56,7 @@ struct PassiveNativeAuthority {
 }
 
 /// Passive input has the same native custody prerequisites as real preview input.
-fn passive_env_with_cursor(
-    cursor: crate::tmux::PaneCursor,
-) -> PreviewFixture {
+fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> PreviewFixture {
     let mut env = create_test_env_with_sessions(3);
     setup_panes(&mut env);
     env.view.cursor = 1;

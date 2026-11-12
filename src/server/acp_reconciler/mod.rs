@@ -21,11 +21,11 @@ use crate::session::Instance;
 
 #[cfg(test)]
 pub(crate) use rate_limit::install_rate_limit_continuation;
-pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
-pub(crate) use resume::ensure_rate_limit_worker;
 pub(crate) use rate_limit::{
     install_prepared_continuation, resolve_continuation, ContinuationOutcome, PreparedContinuation,
 };
+pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
+pub(crate) use resume::ensure_rate_limit_worker;
 pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
@@ -220,7 +220,10 @@ pub(super) fn is_resumable(i: &Instance) -> bool {
 /// Scoped `(user-prompt turn, agent-initiated turn)` knowledge in the log.
 /// Only the first goes to attach: cached prompt completion cannot close an agent turn.
 fn open_turn_kinds(store: &EventStore, id: &str) -> anyhow::Result<ControlKnowledge<(bool, bool)>> {
-    match (store.has_in_flight_turn(id)?, store.has_open_agent_turn(id)?) {
+    match (
+        store.has_in_flight_turn(id)?,
+        store.has_open_agent_turn(id)?,
+    ) {
         (Known(prompt), Known(agent)) => Ok(Known((prompt, agent))),
         _ => Ok(Indeterminate),
     }
@@ -532,8 +535,15 @@ pub async fn reconcile_acp_workers(
             attempted.insert(id);
             continue;
         }
-        match query_flushed(&state.acp_supervisor, &state.acp_event_store, &id,
-            "open turn", open_turn_kinds).await {
+        match query_flushed(
+            &state.acp_supervisor,
+            &state.acp_event_store,
+            &id,
+            "open turn",
+            open_turn_kinds,
+        )
+        .await
+        {
             Some(Ok(Known((prompt, agent)))) => {
                 target.in_flight_turn = prompt;
                 target.agent_turn_open = agent;
@@ -545,8 +555,15 @@ pub async fn reconcile_acp_workers(
             }
             None => continue,
         }
-        match query_flushed(&state.acp_supervisor, &state.acp_event_store, &id,
-            "live work", |store, id| store.holds_live_work(id)).await {
+        match query_flushed(
+            &state.acp_supervisor,
+            &state.acp_event_store,
+            &id,
+            "live work",
+            |store, id| store.holds_live_work(id),
+        )
+        .await
+        {
             Some(Ok(Known(live))) => target.holds_live_work = live,
             Some(Ok(Indeterminate)) => {
                 target.historical_control_known = false;
@@ -559,28 +576,28 @@ pub async fn reconcile_acp_workers(
             None => continue,
         }
         if target.historical_control_known
-        && record_and_check_respawn_budget(respawn_history, &id, Instant::now())
-    {
-        tracing::warn!(
-            target: "acp.supervisor",
-            session = %id,
-            max_respawns = RECONCILER_MAX_RESPAWNS_IN_WINDOW,
-            window_secs = RECONCILER_RESPAWN_WINDOW.as_secs(),
-            "structured-view worker respawn budget exhausted; parking session"
-        );
-        if parked.insert(id.clone()) {
-            crate::server::api::publish_startup_error_if_current(
-                state,
-                &id,
-                &target.source_profile,
-                target.lifecycle_generation,
-                park_message(&target.project_path),
-            )
-            .await;
+            && record_and_check_respawn_budget(respawn_history, &id, Instant::now())
+        {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                max_respawns = RECONCILER_MAX_RESPAWNS_IN_WINDOW,
+                window_secs = RECONCILER_RESPAWN_WINDOW.as_secs(),
+                "structured-view worker respawn budget exhausted; parking session"
+            );
+            if parked.insert(id.clone()) {
+                crate::server::api::publish_startup_error_if_current(
+                    state,
+                    &id,
+                    &target.source_profile,
+                    target.lifecycle_generation,
+                    park_message(&target.project_path),
+                )
+                .await;
+            }
+            attempted.insert(id);
+            continue;
         }
-        attempted.insert(id);
-        continue;
-    }
         attempted.insert(id);
         tasks.push(target);
     }
@@ -1906,7 +1923,14 @@ mod tests {
         let stop = Event::Stopped {
             reason: "agent_idle".into(),
         };
-        store.record(id, 4, &stop, &crate::acp::event_sender::EventMetadata::host(&stop)).unwrap();
+        store
+            .record(
+                id,
+                4,
+                &stop,
+                &crate::acp::event_sender::EventMetadata::host(&stop),
+            )
+            .unwrap();
         assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, false)));
         assert_eq!(store.holds_live_work(id).unwrap(), Known(false));
     }

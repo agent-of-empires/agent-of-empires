@@ -893,33 +893,35 @@ impl RunnerShared {
             .or_else(|| request.as_ref().map(|(_, _, params)| params))
             .and_then(|params| params.get("sessionId").or_else(|| params.get(0)))
             .and_then(serde_json::Value::as_str);
-        let decision_request = request.as_ref().is_some_and(|(_, method, _)|
-            matches!(method.as_str(), "session/request_permission" | "elicitation/create"));
+        let decision_request = request.as_ref().is_some_and(|(_, method, _)| {
+            matches!(
+                method.as_str(),
+                "session/request_permission" | "elicitation/create"
+            )
+        });
         let source = if needs_session || resource_start {
             let native = self.native_channel.lock().expect("native channel lock");
             native
                 .receipt
                 .as_ref()
                 .filter(|receipt| {
-                    receipt
-                        .session_id()
-                        .is_some_and(|sid| decision_request
-                            || reported_session.is_none_or(|reported| reported == sid))
-                        || (request.is_some()
-                            && receipt.session_id().is_none()
-                            && native.calls.values().any(|call| {
-                                call.write == NativeWriteProgress::Complete
-                                    && matches!(&call.target, NativeReplyTarget::Handshake(_))
-                                    && call
-                                        .receipt
-                                        .as_ref()
-                                        .is_some_and(|original| Arc::ptr_eq(original, receipt))
-                                    && call.scope.origin(Some(receipt))
-                                        == crate::acp::state::NativeEventOrigin::owned_attempt(
-                                            &receipt.attempt,
-                                            Some(receipt.owner),
-                                        )
-                            }))
+                    receipt.session_id().is_some_and(|sid| {
+                        decision_request || reported_session.is_none_or(|reported| reported == sid)
+                    }) || (request.is_some()
+                        && receipt.session_id().is_none()
+                        && native.calls.values().any(|call| {
+                            call.write == NativeWriteProgress::Complete
+                                && matches!(&call.target, NativeReplyTarget::Handshake(_))
+                                && call
+                                    .receipt
+                                    .as_ref()
+                                    .is_some_and(|original| Arc::ptr_eq(original, receipt))
+                                && call.scope.origin(Some(receipt))
+                                    == crate::acp::state::NativeEventOrigin::owned_attempt(
+                                        &receipt.attempt,
+                                        Some(receipt.owner),
+                                    )
+                        }))
                 })
                 .zip(native.history_fence.as_ref())
                 .map(|(receipt, fence)| {
@@ -1110,8 +1112,9 @@ impl RunnerShared {
             .is_some_and(|(_, call, _)| call.write != NativeWriteProgress::Complete);
         drop(native);
         drop(held);
-        let observed_parent = source.as_ref().and_then(|(receipt, _, _)|
-            receipt.session_id().map(Arc::from));
+        let observed_parent = source
+            .as_ref()
+            .and_then(|(receipt, _, _)| receipt.session_id().map(Arc::from));
         let callback_authority = request
             .as_ref()
             .filter(|(_, method, _)| {

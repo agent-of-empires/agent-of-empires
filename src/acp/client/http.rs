@@ -1615,7 +1615,13 @@ mod tests {
         let id = instance.id.clone();
         let state = crate::server::test_support::build_test_app_state(vec![instance]);
         state
-            .acp_event_store.record(&id, 1, &Event::ThinkingStarted, &crate::acp::event_sender::EventMetadata::history())
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         let app = Router::new()
             .route(
@@ -1642,7 +1648,13 @@ mod tests {
             .await
             .unwrap();
         state
-            .acp_event_store.record(&id, 2, &Event::ThinkingEnded, &crate::acp::event_sender::EventMetadata::history())
+            .acp_event_store
+            .record(
+                &id,
+                2,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         let response = http
             .get(&url)
@@ -1789,8 +1801,9 @@ mod tests {
         use crate::acp::{event_store::EventStore, state::Event};
         use axum::{routing::get, Router};
         let dir = tempfile::tempdir().unwrap();
-        let store =
-            std::sync::Arc::new(EventStore::open(&dir.path().join("events.db"), 3, Default::default()).unwrap());
+        let store = std::sync::Arc::new(
+            EventStore::open(&dir.path().join("events.db"), 3, Default::default()).unwrap(),
+        );
         let inst = crate::session::Instance::new("pinned metadata", "/tmp");
         let id = inst.id.clone();
         store

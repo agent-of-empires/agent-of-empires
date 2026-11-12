@@ -21,7 +21,8 @@ use super::plan::{
     extract_plan_from_switch_mode, map_plan_status, plan_from_markdown, plan_status_to_str,
 };
 use super::raw_input::{
-    background_resource_from_parts, monitor_event_from_raw, wakeup_event_from_raw, BackgroundResourceCue, background_task_stopped_from_value,
+    background_resource_from_parts, background_task_stopped_from_value, monitor_event_from_raw,
+    wakeup_event_from_raw, BackgroundResourceCue,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -673,11 +674,10 @@ pub(super) fn map_update_to_events(
                         events.extend(cue.into_agent_event());
                     }
                     other => {
-                        let cue =
-                            background_resource_from_parts(
-                                Some(id.as_str()),
-                                update.meta.as_ref().and_then(|meta| meta.get("claudeCode")),
-                            );
+                        let cue = background_resource_from_parts(
+                            Some(id.as_str()),
+                            update.meta.as_ref().and_then(|meta| meta.get("claudeCode")),
+                        );
                         if profile.supports_wakeup_tools {
                             if let Some(cue) = other {
                                 events.extend(cue.into_monitor_event());

@@ -281,10 +281,18 @@ fn register_child(
     notification: &SessionNotification,
     source: Option<crate::acp::state::NativeEventOrigin>,
 ) {
-    let SessionUpdate::SubagentUpdate(update) = &notification.update else { return; };
+    let SessionUpdate::SubagentUpdate(update) = &notification.update else {
+        return;
+    };
     let parent = &notification.session_id;
     let child = &update.session_id;
-    if (Some(parent) != root && !children.get(parent).is_some_and(|route| route.source == source)) || child == parent || Some(child) == root {
+    if (Some(parent) != root
+        && !children
+            .get(parent)
+            .is_some_and(|route| route.source == source))
+        || child == parent
+        || Some(child) == root
+    {
         return;
     }
     match children.get(child) {
@@ -297,7 +305,9 @@ fn register_child(
         _ => {}
     }
     let route = children.entry(child.clone()).or_insert_with(|| ChildRoute {
-        parent: parent.clone(), cancel_capable: false, source,
+        parent: parent.clone(),
+        cancel_capable: false,
+        source,
     });
     if route.source != source {
         route.cancel_capable = false;
@@ -570,7 +580,6 @@ impl SessionIngress {
         generation
     }
 
-
     pub(super) fn authorize_original(
         &self,
         attempt: Arc<crate::acp::establishment::EstablishmentAttempt>,
@@ -717,13 +726,20 @@ impl SessionIngress {
             return None;
         }
         if let (Some(session), Some(reported)) = (original.known_session_id(), reported_session) {
-            if session != reported && !self.child_route(&SessionId::from(reported.to_owned()))
-                .is_some_and(|route| route.source == Some(physical.witness)) {
+            if session != reported
+                && !self
+                    .child_route(&SessionId::from(reported.to_owned()))
+                    .is_some_and(|route| route.source == Some(physical.witness))
+            {
                 return None;
             }
         }
-        let parent_session = history.as_ref().and_then(|history|
-            history.result_session_id.get().map(|session| Arc::clone(&session.0)));
+        let parent_session = history.as_ref().and_then(|history| {
+            history
+                .result_session_id
+                .get()
+                .map(|session| Arc::clone(&session.0))
+        });
         let history = history.filter(|history| {
             reported_session.is_some_and(|session| history.accepts_session(session))
         });
@@ -809,7 +825,12 @@ impl SessionIngress {
         &self,
         id: Option<SessionId>,
     ) -> agent_client_protocol::Result<Vec<PendingIngress>> {
-        let unmanaged = self.projection.lock().expect("ingress projection").strong_count() == 0;
+        let unmanaged = self
+            .projection
+            .lock()
+            .expect("ingress projection")
+            .strong_count()
+            == 0;
         let mut state = self.state.lock().unwrap();
         if state.failed {
             return Err(Self::overflow_error());
@@ -833,22 +854,34 @@ impl SessionIngress {
                 let source_admitted = match update.evidence.physical_source {
                     Some(physical) => state.original.as_ref().is_some_and(|original| {
                         crate::acp::state::NativeEventOrigin::owned_attempt(
-                            &original.attempt, Some(original.owner),
+                            &original.attempt,
+                            Some(original.owner),
                         ) == Some(physical.witness)
                     }),
                     None => unmanaged,
                 };
-                let routed = source_admitted && (Some(&update.notification.session_id) == id.as_ref()
-                    || children.get(&update.notification.session_id).is_some_and(|route|
-                        route.source == update.evidence.physical_source.map(|source| source.witness)));
+                let routed = source_admitted
+                    && (Some(&update.notification.session_id) == id.as_ref()
+                        || children
+                            .get(&update.notification.session_id)
+                            .is_some_and(|route| {
+                                route.source
+                                    == update.evidence.physical_source.map(|source| source.witness)
+                            }));
                 if routed {
-                    register_child(&mut children, id.as_ref(), &update.notification,
-                        update.evidence.physical_source.map(|source| source.witness));
+                    register_child(
+                        &mut children,
+                        id.as_ref(),
+                        &update.notification,
+                        update.evidence.physical_source.map(|source| source.witness),
+                    );
                 }
                 if routed || update.evidence.physical_source.is_some() {
                     true
                 } else {
-                    if is_adapter_frame(&update.notification) { discarded += 1; }
+                    if is_adapter_frame(&update.notification) {
+                        discarded += 1;
+                    }
                     false
                 }
             }
@@ -1062,7 +1095,12 @@ impl SessionIngress {
         notification: IngressUpdate,
         wire_bytes: Option<usize>,
     ) -> agent_client_protocol::Result<Option<IngressUpdate>> {
-        let unmanaged = self.projection.lock().expect("ingress projection").strong_count() == 0;
+        let unmanaged = self
+            .projection
+            .lock()
+            .expect("ingress projection")
+            .strong_count()
+            == 0;
         let mut state = self.state.lock().unwrap();
         if state.failed {
             return Ok(None);
@@ -1102,18 +1140,37 @@ impl SessionIngress {
         let source_admitted = match notification.evidence.physical_source {
             Some(physical) => state.original.as_ref().is_some_and(|original| {
                 crate::acp::state::NativeEventOrigin::owned_attempt(
-                    &original.attempt, Some(original.owner),
+                    &original.attempt,
+                    Some(original.owner),
                 ) == Some(physical.witness)
             }),
             None => unmanaged,
         };
-        let routed = source_admitted && (state.current.as_ref() == Some(&notification.notification.session_id)
-            || state.children.get(&notification.notification.session_id).is_some_and(|route|
-                route.source == notification.evidence.physical_source.map(|source| source.witness)));
+        let routed = source_admitted
+            && (state.current.as_ref() == Some(&notification.notification.session_id)
+                || state
+                    .children
+                    .get(&notification.notification.session_id)
+                    .is_some_and(|route| {
+                        route.source
+                            == notification
+                                .evidence
+                                .physical_source
+                                .map(|source| source.witness)
+                    }));
         if routed {
-            let IdentityState { current, children, .. } = &mut *state;
-            register_child(children, current.as_ref(), &notification.notification,
-                notification.evidence.physical_source.map(|source| source.witness));
+            let IdentityState {
+                current, children, ..
+            } = &mut *state;
+            register_child(
+                children,
+                current.as_ref(),
+                &notification.notification,
+                notification
+                    .evidence
+                    .physical_source
+                    .map(|source| source.witness),
+            );
         }
         if routed || notification.evidence.physical_source.is_some() {
             Ok(Some(notification))
@@ -1134,7 +1191,12 @@ impl SessionIngress {
         self.state.lock().unwrap().children.get(id).cloned()
     }
 
-    fn request_admission(&self, scope: &IngressRequestScope, id: &SessionId, policy: RequestPolicy) -> RequestAdmission {
+    fn request_admission(
+        &self,
+        scope: &IngressRequestScope,
+        id: &SessionId,
+        policy: RequestPolicy,
+    ) -> RequestAdmission {
         let state = self.state.lock().unwrap();
         if state.failed || state.callbacks_revoked || scope.generation != state.generation {
             return RequestAdmission::Reject;
@@ -1166,8 +1228,13 @@ impl SessionIngress {
         }
         if state.current.as_ref() == Some(id) {
             RequestAdmission::Active
-        } else if state.children.get(id).is_some_and(|route| route.source
-            == crate::acp::state::NativeEventOrigin::owned_attempt(&original.attempt, Some(original.owner))) {
+        } else if state.children.get(id).is_some_and(|route| {
+            route.source
+                == crate::acp::state::NativeEventOrigin::owned_attempt(
+                    &original.attempt,
+                    Some(original.owner),
+                )
+        }) {
             match policy {
                 RequestPolicy::ParentOrChild => RequestAdmission::Active,
                 RequestPolicy::ParentOnly => RequestAdmission::RootOnly,
@@ -1222,12 +1289,20 @@ impl SessionIngress {
         }
     }
 
-    async fn request_invalid(&self, scope: &IngressRequestScope, id: &SessionId, policy: RequestPolicy) {
+    async fn request_invalid(
+        &self,
+        scope: &IngressRequestScope,
+        id: &SessionId,
+        policy: RequestPolicy,
+    ) {
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if matches!(self.request_admission(scope, id, policy), RequestAdmission::Reject | RequestAdmission::RootOnly) {
+            if matches!(
+                self.request_admission(scope, id, policy),
+                RequestAdmission::Reject | RequestAdmission::RootOnly
+            ) {
                 return;
             }
             changed.await;
@@ -1813,99 +1888,160 @@ mod tests {
     #[serial_test::serial]
     async fn admitted_callbacks_share_progress_but_exclude_identity_writes() {
         use futures_util::FutureExt as _;
-        crate::acp::supervisor::test_support::managed::with_managed(|host| Box::pin(async move {
-            let directory = host.tempdir();
-            let (config, peer) = host.native_peer(directory.path().into(), "codex", "codex", |request| {
-                let result = match request["method"].as_str() {
-                    Some("initialize") => serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
-                    Some("session/new") => serde_json::json!({"sessionId":"shared-native-root"}),
-                    _ => serde_json::json!({}),
-                };
-                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
-            });
-            let mut client = host.spawn(config, "shared-native-admission").await.unwrap();
-            client.ready().await;
-            let control = client.actual().test_control();
-            let ingress = Arc::clone(&control.ingress);
-            let old = ingress.current().expect("actual Original result");
-            let scope = ingress.capture_request();
-            let request = ingress.request(&scope, &old, RequestPolicy::ParentOnly)
-                .await.unwrap().expect("committed Original admission");
-            peer.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
-                "sessionId":old,"update":{"sessionUpdate":"agent_message_chunk",
-                "content":{"type":"text","text":"progress while read admission is held"}}
-            }})).await;
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    match client.next_event().await {
-                        Some(crate::acp::state::Event::AgentMessageChunk { text, .. })
-                            if text == "progress while read admission is held" => break,
-                        Some(_) => {},
-                        None => panic!("actual native stream ended before progress"),
+        crate::acp::supervisor::test_support::managed::with_managed(|host| {
+            Box::pin(async move {
+                let directory = host.tempdir();
+                let (config, peer) =
+                    host.native_peer(directory.path().into(), "codex", "codex", |request| {
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => {
+                                serde_json::json!({"protocolVersion":1,"agentCapabilities":{}})
+                            }
+                            Some("session/new") => {
+                                serde_json::json!({"sessionId":"shared-native-root"})
+                            }
+                            _ => serde_json::json!({}),
+                        };
+                        Some(
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        )
+                    });
+                let mut client = host.spawn(config, "shared-native-admission").await.unwrap();
+                client.ready().await;
+                let control = client.actual().test_control();
+                let ingress = Arc::clone(&control.ingress);
+                let old = ingress.current().expect("actual Original result");
+                let scope = ingress.capture_request();
+                let request = ingress
+                    .request(&scope, &old, RequestPolicy::ParentOnly)
+                    .await
+                    .unwrap()
+                    .expect("committed Original admission");
+                peer.send(
+                    serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":old,"update":{"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"progress while read admission is held"}}
+                    }}),
+                )
+                .await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        match client.next_event().await {
+                            Some(crate::acp::state::Event::AgentMessageChunk { text, .. })
+                                if text == "progress while read admission is held" =>
+                            {
+                                break
+                            }
+                            Some(_) => {}
+                            None => panic!("actual native stream ended before progress"),
+                        }
                     }
-                }
-            }).await.expect("native progress cannot wait for the held admission");
-            let second = ingress.request(&scope, &old, RequestPolicy::ParentOnly)
-                .now_or_never().expect("another admitted callback shares the session")
-                .unwrap().expect("committed Original admission");
-            drop(second);
-            let mut transition = std::pin::pin!(ingress.fence.write());
-            assert!(futures_util::poll!(transition.as_mut()).is_pending());
-            let mut stale = std::pin::pin!(ingress.request(&scope, &old, RequestPolicy::ParentOnly));
-            assert!(futures_util::poll!(stale.as_mut()).is_pending(),
-                "queued writer excludes later readers");
-            drop(request);
-            let transition = transition.await;
-            ingress.revoke_requests();
-            drop(transition);
-            assert!(stale.await.is_err(), "old admission must be rechecked after the write");
-        })).await;
+                })
+                .await
+                .expect("native progress cannot wait for the held admission");
+                let second = ingress
+                    .request(&scope, &old, RequestPolicy::ParentOnly)
+                    .now_or_never()
+                    .expect("another admitted callback shares the session")
+                    .unwrap()
+                    .expect("committed Original admission");
+                drop(second);
+                let mut transition = std::pin::pin!(ingress.fence.write());
+                assert!(futures_util::poll!(transition.as_mut()).is_pending());
+                let mut stale =
+                    std::pin::pin!(ingress.request(&scope, &old, RequestPolicy::ParentOnly));
+                assert!(
+                    futures_util::poll!(stale.as_mut()).is_pending(),
+                    "queued writer excludes later readers"
+                );
+                drop(request);
+                let transition = transition.await;
+                ingress.revoke_requests();
+                drop(transition);
+                assert!(
+                    stale.await.is_err(),
+                    "old admission must be rechecked after the write"
+                );
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn candidate_callback_waits_without_blocking_commit_write() {
-        crate::acp::supervisor::test_support::managed::with_managed(|host| Box::pin(async move {
-            let directory = host.tempdir();
-            let (config, _peer) = host.native_peer(directory.path().into(), "codex", "codex", |request| {
-                let result = match request["method"].as_str() {
-                    Some("initialize") => serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
-                    Some("session/new") => serde_json::json!({"sessionId":"candidate-native-root"}),
-                    _ => serde_json::json!({}),
+        crate::acp::supervisor::test_support::managed::with_managed(|host| {
+            Box::pin(async move {
+                let directory = host.tempdir();
+                let (config, _peer) =
+                    host.native_peer(directory.path().into(), "codex", "codex", |request| {
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => {
+                                serde_json::json!({"protocolVersion":1,"agentCapabilities":{}})
+                            }
+                            Some("session/new") => {
+                                serde_json::json!({"sessionId":"candidate-native-root"})
+                            }
+                            _ => serde_json::json!({}),
+                        };
+                        Some(
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        )
+                    });
+                let client = host
+                    .spawn(config, "candidate-native-admission")
+                    .await
+                    .unwrap();
+                client.ready().await;
+                let control = client.actual().test_control();
+                let ingress = Arc::clone(&control.ingress);
+                let id = ingress.current().expect("actual Original result");
+                let original = ingress.state.lock().unwrap().original.clone().unwrap();
+                let generation = {
+                    let _guard = ingress.fence.write().await;
+                    ingress.begin()
                 };
-                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
-            });
-            let client = host.spawn(config, "candidate-native-admission").await.unwrap();
-            client.ready().await;
-            let control = client.actual().test_control();
-            let ingress = Arc::clone(&control.ingress);
-            let id = ingress.current().expect("actual Original result");
-            let original = ingress.state.lock().unwrap().original.clone().unwrap();
-            let generation = {
-                let _guard = ingress.fence.write().await;
-                ingress.begin()
-            };
-            ingress.resolve(Some(generation), id.clone());
-            let scope = ingress.capture_request();
-            let mut request = std::pin::pin!(ingress.request(&scope, &id, RequestPolicy::ParentOnly));
-            assert!(futures_util::poll!(request.as_mut()).is_pending());
-            let commit = ingress.fence.try_write().expect("AwaitCommit holds no read guard");
-            assert!(ingress.authorize_original(Arc::clone(&original.attempt), original.owner,
-                original.store.clone(), original.postimage.get().cloned()));
-            ingress.finish(Some(id.clone())).unwrap();
-            assert!(futures_util::poll!(request.as_mut()).is_pending(),
-                "callback cannot overtake commit replay");
-            drop(commit);
-            let admitted = request.await.unwrap().expect("committed Original admission");
-            drop(admitted);
-        })).await;
+                ingress.resolve(Some(generation), id.clone());
+                let scope = ingress.capture_request();
+                let mut request =
+                    std::pin::pin!(ingress.request(&scope, &id, RequestPolicy::ParentOnly));
+                assert!(futures_util::poll!(request.as_mut()).is_pending());
+                let commit = ingress
+                    .fence
+                    .try_write()
+                    .expect("AwaitCommit holds no read guard");
+                assert!(ingress.authorize_original(
+                    Arc::clone(&original.attempt),
+                    original.owner,
+                    original.store.clone(),
+                    original.postimage.get().cloned()
+                ));
+                ingress.finish(Some(id.clone())).unwrap();
+                assert!(
+                    futures_util::poll!(request.as_mut()).is_pending(),
+                    "callback cannot overtake commit replay"
+                );
+                drop(commit);
+                let admitted = request
+                    .await
+                    .unwrap()
+                    .expect("committed Original admission");
+                drop(admitted);
+            })
+        })
+        .await;
     }
 
     fn announce(parent: &str, child: &str) -> IngressUpdate {
-        SessionIngressNotification::decode_update(serde_json::json!({
-            "sessionId": parent,
-            "update": { "sessionUpdate": "subagent_update", "sessionId": child },
-        }), false).expect("subagent_update").0
+        SessionIngressNotification::decode_update(
+            serde_json::json!({
+                "sessionId": parent,
+                "update": { "sessionUpdate": "subagent_update", "sessionId": child },
+            }),
+            false,
+        )
+        .expect("subagent_update")
+        .0
     }
 
     async fn admitted(ingress: &SessionIngress, n: IngressUpdate) -> bool {
@@ -1940,36 +2076,65 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn requests_from_a_child_obey_the_policy() {
-        crate::acp::supervisor::test_support::managed::with_managed(|host| Box::pin(async move {
-            let directory = host.tempdir();
-            let (config, peer) = host.native_peer(directory.path().into(), "codex", "codex", |request| {
-                let result = match request["method"].as_str() {
-                    Some("initialize") => serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
-                    Some("session/new") => serde_json::json!({"sessionId":"policy-native-root"}),
-                    _ => serde_json::json!({}),
-                };
-                Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
-            });
-            let client = host.spawn(config, "child-native-policy").await.unwrap();
-            client.ready().await;
-            let control = client.actual().test_control();
-            let ingress = Arc::clone(&control.ingress);
-            let root = ingress.current().expect("actual Original result");
-            let scope = ingress.capture_request();
-            let child = SessionId::from("c1");
-            assert!(ingress.request(&scope, &child, RequestPolicy::ParentOrChild).await.is_err());
-            peer.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+        crate::acp::supervisor::test_support::managed::with_managed(|host| {
+            Box::pin(async move {
+                let directory = host.tempdir();
+                let (config, peer) =
+                    host.native_peer(directory.path().into(), "codex", "codex", |request| {
+                        let result = match request["method"].as_str() {
+                            Some("initialize") => {
+                                serde_json::json!({"protocolVersion":1,"agentCapabilities":{}})
+                            }
+                            Some("session/new") => {
+                                serde_json::json!({"sessionId":"policy-native-root"})
+                            }
+                            _ => serde_json::json!({}),
+                        };
+                        Some(
+                            serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        )
+                    });
+                let client = host.spawn(config, "child-native-policy").await.unwrap();
+                client.ready().await;
+                let control = client.actual().test_control();
+                let ingress = Arc::clone(&control.ingress);
+                let root = ingress.current().expect("actual Original result");
+                let scope = ingress.capture_request();
+                let child = SessionId::from("c1");
+                assert!(ingress
+                    .request(&scope, &child, RequestPolicy::ParentOrChild)
+                    .await
+                    .is_err());
+                peer.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":root,"update":{"sessionUpdate":"subagent_update","sessionId":child}
             }})).await;
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while ingress.child_route(&child).is_none() { tokio::task::yield_now().await; }
-            }).await.expect("the actual native parent declares its child");
-            assert!(ingress.request(&scope, &child, RequestPolicy::ParentOrChild).await.is_ok());
-            let refused = ingress.request(&scope, &child, RequestPolicy::ParentOnly)
-                .await.map(|_| ()).unwrap_err();
-            assert_eq!(refused.message, "subagent sessions cannot make this request");
-            assert!(ingress.request(&scope, &root, RequestPolicy::ParentOnly).await.is_ok());
-        })).await;
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while ingress.child_route(&child).is_none() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the actual native parent declares its child");
+                assert!(ingress
+                    .request(&scope, &child, RequestPolicy::ParentOrChild)
+                    .await
+                    .is_ok());
+                let refused = ingress
+                    .request(&scope, &child, RequestPolicy::ParentOnly)
+                    .await
+                    .map(|_| ())
+                    .unwrap_err();
+                assert_eq!(
+                    refused.message,
+                    "subagent sessions cannot make this request"
+                );
+                assert!(ingress
+                    .request(&scope, &root, RequestPolicy::ParentOnly)
+                    .await
+                    .is_ok());
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -1993,7 +2158,9 @@ mod tests {
         let ids: Vec<_> = replay
             .iter()
             .map(|entry| match entry {
-                PendingIngress::Update(notification) => notification.notification.session_id.0.to_string(),
+                PendingIngress::Update(notification) => {
+                    notification.notification.session_id.0.to_string()
+                }
                 _ => panic!("child replay contains only session updates"),
             })
             .collect();

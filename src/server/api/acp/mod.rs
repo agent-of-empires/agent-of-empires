@@ -299,7 +299,8 @@ mod tests {
     ) -> Arc<AppState> {
         let db_path = app_dir.join(format!("acp-events-{}.db", prior[0].id));
         let event_store = Arc::new(
-            crate::acp::event_store::EventStore::open(&db_path, 100, Default::default()).expect("event store"),
+            crate::acp::event_store::EventStore::open(&db_path, 100, Default::default())
+                .expect("event store"),
         );
         crate::server::test_support::build_test_app_state_impl_with_event_store(
             prior,

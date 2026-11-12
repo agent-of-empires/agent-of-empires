@@ -236,7 +236,7 @@ impl Session {
                 }
             }
         }
-    
+
         let admission =
             current_effect_wait(scope.as_ref(), native, &shared.connection_state, || {
                 let _admission = shared
@@ -268,11 +268,20 @@ impl Session {
                     .prompt_sent_since_attach
                     .store(true, Ordering::Relaxed);
                 shared.adopted_turn_active.store(false, Ordering::Relaxed);
-                *shared.last_prompt.lock().expect("last prompt mutex poisoned") = (
-                    blocks.iter().filter_map(|block| match block {
-                        ContentBlock::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    }).collect::<Vec<_>>().join("\n").trim().to_owned(),
+                *shared
+                    .last_prompt
+                    .lock()
+                    .expect("last prompt mutex poisoned") = (
+                    blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .trim()
+                        .to_owned(),
                     0,
                 );
                 let terminal_epoch = shared.terminal_claim.begin_turn();
@@ -833,8 +842,13 @@ impl Session {
                 turn.flags.shutdown = true;
                 return Ok(Flow::Break);
             }
-            ClientCmd::SetConfigOption { config_id, value, remember } => {
-                self.dispatch_config_option(config_id, value, remember, scope).await;
+            ClientCmd::SetConfigOption {
+                config_id,
+                value,
+                remember,
+            } => {
+                self.dispatch_config_option(config_id, value, remember, scope)
+                    .await;
             }
             ClientCmd::SetMode(mode_id) => self.dispatch_mode(mode_id, true, scope),
             ClientCmd::DeleteSession {
@@ -1160,7 +1174,11 @@ impl Session {
                                 shared.between_prompt.deactivate();
                             }
                             shared.reset_message_dedup();
-                            shared.last_prompt.lock().expect("last prompt mutex poisoned").1 = now_ms();
+                            shared
+                                .last_prompt
+                                .lock()
+                                .expect("last prompt mutex poisoned")
+                                .1 = now_ms();
                         });
                 });
             }

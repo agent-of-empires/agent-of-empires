@@ -360,8 +360,10 @@ mod tests {
             .acp_supervisor
             .publish_user_prompt(&id, "work".into())
             .await;
-        assert_eq!(state.acp_event_store.has_in_flight_turn(&id).unwrap(),
-            crate::acp::event_store::ControlKnowledge::Known(true));
+        assert_eq!(
+            state.acp_event_store.has_in_flight_turn(&id).unwrap(),
+            crate::acp::event_store::ControlKnowledge::Known(true)
+        );
 
         let (entered, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = std::sync::mpsc::sync_channel(1);
@@ -370,9 +372,16 @@ mod tests {
         state.acp_supervisor.test_run_on_writer(move || {
             entered.send(()).unwrap();
             wait.recv_timeout(Duration::from_secs(5)).unwrap();
-            let stopped = Event::Stopped { reason: "prompt_complete".into() };
-            store.record(&stopped_id, 2, &stopped,
-                &crate::acp::event_sender::EventMetadata::host(&stopped))
+            let stopped = Event::Stopped {
+                reason: "prompt_complete".into(),
+            };
+            store
+                .record(
+                    &stopped_id,
+                    2,
+                    &stopped,
+                    &crate::acp::event_sender::EventMetadata::host(&stopped),
+                )
                 .unwrap();
         });
         ready.await.unwrap();

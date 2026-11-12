@@ -1054,9 +1054,13 @@ impl DaemonControlClient {
         session_id: String,
         scope: crate::acp::establishment::NativeRequestScope,
     ) -> bool {
-        self.send(ControlBody::CancelSession { parent_session_id, session_id, scope })
-            .await
-            .is_ok()
+        self.send(ControlBody::CancelSession {
+            parent_session_id,
+            session_id,
+            scope,
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -3246,7 +3250,8 @@ mod tests {
         run_managed_prompt_relay(
             "acp::acp_client::control::tests::managed_prompt_relays_preserve_results_and_fence_eof",
             RealRelayTiming::ControlEofBeforeResult,
-        ).await;
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3264,7 +3269,8 @@ mod tests {
         run_managed_prompt_relay(
             "acp::acp_client::control::tests::runner_hangup_still_delivers_a_relayed_outcome",
             RealRelayTiming::ControlEofAfterMarker,
-        ).await;
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -4773,12 +4779,17 @@ mod tests {
     async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
         use crate::process::worker_registry::ControlRefusalReason;
         for version in [5, 6, control_protocol::CONTROL_PROTOCOL_VERSION + 1] {
-            let tmp = tempfile::Builder::new().prefix("aoe-protocol-refusal-").tempdir_in("/tmp").unwrap();
+            let tmp = tempfile::Builder::new()
+                .prefix("aoe-protocol-refusal-")
+                .tempdir_in("/tmp")
+                .unwrap();
             let (socket, listener) = bind(&tmp);
             let peer = tokio::spawn(async move {
                 let mut stream = accept_hello(&listener, "s", version).await;
-                assert!(matches!(control_protocol::read_frame(&mut stream).await, Ok(None)),
-                    "an incompatible Hello cannot receive Attach or a Native mutation");
+                assert!(
+                    matches!(control_protocol::read_frame(&mut stream).await, Ok(None)),
+                    "an incompatible Hello cannot receive Attach or a Native mutation"
+                );
             });
             let terminal = Arc::new(TerminalClaim::new());
             let error = match connect(&socket, "s", terminal.clone(), false).await {
@@ -4794,5 +4805,4 @@ mod tests {
             peer.await.unwrap();
         }
     }
-
 }

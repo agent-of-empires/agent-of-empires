@@ -159,10 +159,17 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             let _ = entered.send(());
             let _ = release.await;
         }
-        if !matches!(super::query_flushed(
-            &state.acp_supervisor, &state.acp_event_store, &id,
-            "idle-reap quota hold", |store, id| store.rate_limit_park(id),
-        ).await, Some(Ok(Known(None)))) {
+        if !matches!(
+            super::query_flushed(
+                &state.acp_supervisor,
+                &state.acp_event_store,
+                &id,
+                "idle-reap quota hold",
+                |store, id| store.rate_limit_park(id),
+            )
+            .await,
+            Some(Ok(Known(None)))
+        ) {
             continue;
         }
         let Some((lease, activity_seq)) = state.acp_supervisor.idle_observation(&id) else {

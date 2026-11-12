@@ -1062,7 +1062,10 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             |s, id| s.holds_live_work(id),
         )
         .await;
-        if !matches!(busy, Some(Ok(crate::acp::event_store::ControlKnowledge::Known(false)))) {
+        if !matches!(
+            busy,
+            Some(Ok(crate::acp::event_store::ControlKnowledge::Known(false)))
+        ) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
@@ -1640,5 +1643,4 @@ mod tests {
             assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(false));
         })).await;
     }
-
 }

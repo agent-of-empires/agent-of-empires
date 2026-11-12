@@ -639,7 +639,11 @@ pub(super) async fn retire_registered_clients(
     retire_registered_clients_locked(lifecycle, lease).await;
 }
 
-fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &Arc<super::SeqMap>, lease: &Lease) -> bool {
+fn finish_stop_completion<S: BroadcastSink>(
+    sink: &S,
+    seqs: &Arc<super::SeqMap>,
+    lease: &Lease,
+) -> bool {
     let Some(debt) = lease.pending_stop_completion() else {
         return true;
     };
@@ -653,8 +657,14 @@ fn finish_stop_completion<S: BroadcastSink>(sink: &S, seqs: &Arc<super::SeqMap>,
             return false;
         }
         if let Some(reason) = debt.reason {
-            if !super::publish_next_persisted(sink, seqs, id,
-                crate::acp::event_sender::AcpEventData::from_host(Event::Stopped { reason })).1 {
+            if !super::publish_next_persisted(
+                sink,
+                seqs,
+                id,
+                crate::acp::event_sender::AcpEventData::from_host(Event::Stopped { reason }),
+            )
+            .1
+            {
                 return false;
             }
         }
@@ -908,17 +918,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         drop(workers);
         if !super::publish::complete_stopped_worker_work(
-            &*self.sink, &self.next_seqs, session_id, None,
+            &*self.sink,
+            &self.next_seqs,
+            session_id,
+            None,
         ) {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
         if !stopped_already_persisted
             && !super::publish_next_persisted(
-                self.sink.as_ref(), &self.next_seqs, session_id,
+                self.sink.as_ref(),
+                &self.next_seqs,
+                session_id,
                 crate::acp::event_sender::AcpEventData::from_host(Event::Stopped {
                     reason: "user_stopped".to_owned(),
                 }),
-            ).1
+            )
+            .1
         {
             return Err(SupervisorError::TeardownPending(session_id.to_owned()));
         }
@@ -1241,8 +1257,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub(crate) async fn settle_idle_retirement(&self, retirement: IdleRetirement) {
-    self.settle_accepted_stop(&retirement.lease).await;
-}
+        self.settle_accepted_stop(&retirement.lease).await;
+    }
 
     /// Permanently discard a worker and wait for its matching retirement.
     /// Reversible stops must not delete the adapter-side transcript.
@@ -1682,18 +1698,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
         if let Some(target) = expected {
-        if !lifecycle.prepare_captured_stop(session_id, target.lease.as_ref()) {
-            return Err(SupervisorError::TeardownPending(session_id.into()));
+            if !lifecycle.prepare_captured_stop(session_id, target.lease.as_ref()) {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
+            }
+            if target.journalled
+                && target
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| !lifecycle.require_retirement_ack(lease))
+            {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
+            }
         }
-        if target.journalled
-            && target
-                .lease
-                .as_ref()
-                .is_some_and(|lease| !lifecycle.require_retirement_ack(lease))
-        {
-            return Err(SupervisorError::TeardownPending(session_id.into()));
-        }
-    }
         if let Some(handle) = workers.get(session_id) {
             if lifecycle.current_lease(session_id).as_ref() != Some(&handle.lease) {
                 return Err(SupervisorError::TeardownPending(session_id.into()));
@@ -2998,7 +3014,6 @@ mod tests {
             crate::acp::state::test_support::prompt("replacement turn"),
         );
         super::super::with_publication_seq(&p.sup.next_seqs, id, |seq| {
-            
             p.sup.sink.inner.publish(
                 id,
                 seq,
@@ -4034,9 +4049,14 @@ mod tests {
             replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
         ) -> bool {
             let parked = self.park(data.event.as_ref());
-            let persisted =
-                self.inner
-                    .publish_replay_from_worker(session_id, seq, data, generation, native_subject, replay);
+            let persisted = self.inner.publish_replay_from_worker(
+                session_id,
+                seq,
+                data,
+                generation,
+                native_subject,
+                replay,
+            );
             if parked {
                 let _ = self.done.send(());
             }
@@ -4254,7 +4274,7 @@ mod tests {
                         tool_call_id: None,
                         description: "sleep".into(),
                         workflow: None,
-                            started_at: None,
+                        started_at: None,
                     },
                 ),
             ))

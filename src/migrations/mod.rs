@@ -63,11 +63,11 @@ mod v051_structured_view;
 mod v052_runtime_filter_acp_target;
 mod v053_runtime_filter_reset;
 mod v054_acp_establishment;
+mod v054_retained_history_identity;
 mod v055_acp_event_scope;
+mod v055_global_max_concurrent_workers;
 mod v056_native_prompt_publication;
 mod v057_acp_budget_knowledge;
-mod v054_retained_history_identity;
-mod v055_global_max_concurrent_workers;
 mod v059_reconcile_acp_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.

@@ -130,7 +130,9 @@ impl ControlPayload<'_> {
             Self::RateLimit { .. } => ControlKind::Quota,
             Self::UserPromptSent { .. } => ControlKind::Prompt,
             Self::UserDiffCommentsPrompt { .. } => ControlKind::DiffPrompt,
-            Self::AgentMessageChunk { .. } | Self::AgentThoughtChunk { .. } | Self::ToolCallStarted { .. } => ControlKind::AgentWork,
+            Self::AgentMessageChunk { .. }
+            | Self::AgentThoughtChunk { .. }
+            | Self::ToolCallStarted { .. } => ControlKind::AgentWork,
             Self::AgentSwitched { .. } => ControlKind::Switched,
             Self::SessionCleared => ControlKind::Cleared,
             Self::SessionContextReset { .. } => ControlKind::ContextReset,
@@ -685,7 +687,8 @@ impl super::EventStore {
                 Some(cursor) => {
                     let latest: Option<i64> = tx.query_row(
                         "SELECT MAX(seq) FROM acp_events WHERE session_id = ?1",
-                        [session_id], |row| row.get(0),
+                        [session_id],
+                        |row| row.get(0),
                     )?;
                     let latest = latest.map(u64::try_from).transpose()?.unwrap_or(0);
                     if latest == cursor.seq {
@@ -913,7 +916,8 @@ mod tests {
                 store.record("s", seq + 1, &stopped, &metadata).unwrap();
                 assert_state(&store);
                 drop(store);
-                let cold = EventStore::open(&tmp.path().join("acp.db"), 0, Default::default()).unwrap();
+                let cold =
+                    EventStore::open(&tmp.path().join("acp.db"), 0, Default::default()).unwrap();
                 assert_state(&cold);
             }
         }

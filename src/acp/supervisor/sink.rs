@@ -29,13 +29,15 @@ pub trait BroadcastSink: Send + Sync + 'static {
         expected_seq: Option<u64>,
     ) -> Persisted {
         let seq = super::with_session_sequence(&next_seqs, session_id, |current| {
-            if expected_seq.is_some_and(|expected| expected != *current) { return None; }
+            if expected_seq.is_some_and(|expected| expected != *current) {
+                return None;
+            }
             *current = current.saturating_add(1);
             Some(*current)
         });
-        Persisted(Receipt::Ready(seq.map(|seq| {
-            (seq, self.publish_persisted(session_id, seq, &data))
-        })))
+        Persisted(Receipt::Ready(
+            seq.map(|seq| (seq, self.publish_persisted(session_id, seq, &data))),
+        ))
     }
 
     /// Store the prompt and its attachments in the same publication order.
@@ -47,7 +49,9 @@ pub trait BroadcastSink: Send + Sync + 'static {
         data: AcpEventData,
     ) -> Persisted {
         let seq = super::with_publication_seq(&next_seqs, session_id, |seq| seq);
-        let stored = attachments.iter().all(|blob| self.record_attachment(session_id, seq, blob))
+        let stored = attachments
+            .iter()
+            .all(|blob| self.record_attachment(session_id, seq, blob))
             && self.publish_persisted(session_id, seq, &data);
         Persisted(Receipt::Ready(Some((seq, stored))))
     }
@@ -82,7 +86,11 @@ pub trait BroadcastSink: Send + Sync + 'static {
         None
     }
     /// Erase durable session projections without resetting the publication counter.
-    fn clear_session_events(&self, _session_id: &str, _next_seqs: Arc<super::SeqMap>) -> anyhow::Result<()> {
+    fn clear_session_events(
+        &self,
+        _session_id: &str,
+        _next_seqs: Arc<super::SeqMap>,
+    ) -> anyhow::Result<()> {
         anyhow::bail!("a durable event store is required to clear session events")
     }
     fn unsuccessful_main(
@@ -159,7 +167,10 @@ pub struct WorkerPublication {
 
 impl WorkerPublication {
     pub(super) fn new(completion: impl Future<Output = ()> + Send + 'static) -> Self {
-        Self { runtime: tokio::runtime::Handle::current(), completion: Box::pin(completion) }
+        Self {
+            runtime: tokio::runtime::Handle::current(),
+            completion: Box::pin(completion),
+        }
     }
 
     pub(super) async fn complete(self) {
@@ -220,10 +231,7 @@ impl ChannelSink {
         tx: broadcast::Sender<crate::server::AcpBroadcastFrame>,
         event_store: Arc<EventStore>,
     ) -> Self {
-        let persister = Arc::new(Persister {
-            tx,
-            event_store,
-        });
+        let persister = Arc::new(Persister { tx, event_store });
         let (jobs, queue) = std::sync::mpsc::sync_channel(WRITE_QUEUE_CAPACITY);
         let worker = Arc::clone(&persister);
         let writer = std::thread::Builder::new()
@@ -258,7 +266,11 @@ impl ChannelSink {
     /// Queue `job` behind earlier publications; run it inline if the writer is gone.
     fn submit(&self, job: Job) {
         use std::sync::mpsc::TrySendError;
-        if self.writer.as_ref().is_some_and(|writer| writer.thread().id() == std::thread::current().id()) {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.thread().id() == std::thread::current().id())
+        {
             return self.persister.run(job);
         }
         let Some(jobs) = &self.jobs else {
@@ -301,7 +313,10 @@ impl ChannelSink {
 
 impl super::Supervisor<ChannelSink> {
     /// Probe turn state after this sink's queued publications reach the store.
-    pub fn has_in_flight_turn(&self, session_id: &str) -> anyhow::Result<crate::acp::event_store::ControlKnowledge<bool>> {
+    pub fn has_in_flight_turn(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<crate::acp::event_store::ControlKnowledge<bool>> {
         self.sink.flushed_store().has_in_flight_turn(session_id)
     }
 
@@ -344,10 +359,16 @@ impl BroadcastSink for ChannelSink {
     /// Queue original owned completion without a per-frame task or durable wait.
     fn publish_from_worker(&self, publication: WorkerPublication) -> Result<(), WorkerPublication> {
         use std::sync::mpsc::TrySendError;
-        if self.writer.as_ref().is_some_and(|writer| writer.thread().id() == std::thread::current().id()) {
+        if self
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.thread().id() == std::thread::current().id())
+        {
             return Err(publication);
         }
-        let Some(jobs) = &self.jobs else { return Err(publication); };
+        let Some(jobs) = &self.jobs else {
+            return Err(publication);
+        };
         let job = match jobs.try_send(Job::Worker(publication)) {
             Ok(()) => return Ok(()),
             Err(TrySendError::Disconnected(job)) => job,
@@ -356,59 +377,99 @@ impl BroadcastSink for ChannelSink {
                 Err(std::sync::mpsc::SendError(job)) => job,
             },
         };
-        let Job::Worker(publication) = job else { unreachable!("worker submission changed kind"); };
+        let Job::Worker(publication) = job else {
+            unreachable!("worker submission changed kind");
+        };
         Err(publication)
     }
 
     fn publish_replay_from_worker(
-        &self, session_id: &str, seq: u64, data: &AcpEventData, generation: u64,
+        &self,
+        session_id: &str,
+        seq: u64,
+        data: &AcpEventData,
+        generation: u64,
         native_subject: Option<crate::acp::state::NativeEventSubject>,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
     ) -> bool {
-        self.persister.publish_tagged(session_id, seq, data, Some(generation), native_subject, replay)
+        self.persister.publish_tagged(
+            session_id,
+            seq,
+            data,
+            Some(generation),
+            native_subject,
+            replay,
+        )
     }
 
     fn establishment_store(&self) -> Option<Arc<EventStore>> {
         Some(Arc::clone(&self.persister.event_store))
     }
 
-    fn clear_session_events(&self, session_id: &str, next_seqs: Arc<super::SeqMap>) -> anyhow::Result<()> {
+    fn clear_session_events(
+        &self,
+        session_id: &str,
+        next_seqs: Arc<super::SeqMap>,
+    ) -> anyhow::Result<()> {
         let expected = super::sequence_slot(&next_seqs, session_id);
         let (done, wait) = std::sync::mpsc::sync_channel(1);
         self.submit(Job::Clear(ClearJournal {
-            session_id: session_id.to_owned(), next_seqs, expected, done,
+            session_id: session_id.to_owned(),
+            next_seqs,
+            expected,
+            done,
         }));
-        blocking_io(|| wait.recv()).map_err(|_| anyhow::anyhow!("event writer ended before clearing the journal"))?
+        blocking_io(|| wait.recv())
+            .map_err(|_| anyhow::anyhow!("event writer ended before clearing the journal"))?
     }
 
-    fn unsuccessful_main(&self, session_id: &str) -> anyhow::Result<crate::acp::event_store::ControlKnowledge<bool>> {
-        self.flushed_store().has_unsuccessful_main_outcome(session_id)
+    fn unsuccessful_main(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<crate::acp::event_store::ControlKnowledge<bool>> {
+        self.flushed_store()
+            .has_unsuccessful_main_outcome(session_id)
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, data: &AcpEventData) -> bool {
-        self.persister.publish_tagged(session_id, seq, data, None, None, None)
+        self.persister
+            .publish_tagged(session_id, seq, data, None, None, None)
     }
 
     fn queue_persisted(
-        &self, session_id: &str, next_seqs: Arc<super::SeqMap>, data: AcpEventData,
+        &self,
+        session_id: &str,
+        next_seqs: Arc<super::SeqMap>,
+        data: AcpEventData,
         expected_seq: Option<u64>,
     ) -> Persisted {
         let (done, wait) = std::sync::mpsc::sync_channel(1);
         self.submit(Job::Publish(Box::new(Publication {
-            session_id: session_id.to_owned(), next_seqs, expected_seq, data,
-            attachments: Vec::new(), persisted: done,
+            session_id: session_id.to_owned(),
+            next_seqs,
+            expected_seq,
+            data,
+            attachments: Vec::new(),
+            persisted: done,
         })));
         Persisted(Receipt::Pending(wait))
     }
 
     fn queue_prompt(
-        &self, session_id: &str, next_seqs: Arc<super::SeqMap>, attachments: &[AttachmentBlob],
+        &self,
+        session_id: &str,
+        next_seqs: Arc<super::SeqMap>,
+        attachments: &[AttachmentBlob],
         data: AcpEventData,
     ) -> Persisted {
         let (done, wait) = std::sync::mpsc::sync_channel(1);
         self.submit(Job::Publish(Box::new(Publication {
-            session_id: session_id.to_owned(), next_seqs, expected_seq: None, data,
-            attachments: attachments.to_vec(), persisted: done,
+            session_id: session_id.to_owned(),
+            next_seqs,
+            expected_seq: None,
+            data,
+            attachments: attachments.to_vec(),
+            persisted: done,
         })));
         Persisted(Receipt::Pending(wait))
     }
@@ -432,7 +493,10 @@ impl BroadcastSink for ChannelSink {
             .unresolved_background_task_ids(session_id)
     }
 
-    fn unresolved_background_task_launches(&self, session_id: &str) -> anyhow::Result<Vec<BackgroundTaskLaunch>> {
+    fn unresolved_background_task_launches(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<BackgroundTaskLaunch>> {
         self.flushed_store()
             .unresolved_background_task_launches(session_id)
     }
@@ -472,27 +536,43 @@ fn inheritable_rate_limit_reset(
 
 impl Persister {
     fn bind_pending_publication(&self, session_id: &str, seq: u64, data: &AcpEventData) {
-        let Some(publication) = &data.pending_request else { return; };
-        if !Arc::ptr_eq(publication.event(), &data.event) || publication.metadata() != data.metadata {
+        let Some(publication) = &data.pending_request else {
+            return;
+        };
+        if !Arc::ptr_eq(publication.event(), &data.event) || publication.metadata() != data.metadata
+        {
             return;
         }
         publication.mark_published(seq);
         if publication.is_original() {
-            self.event_store.control_cache().bind_original_responders(session_id, publication.responders());
+            self.event_store
+                .control_cache()
+                .bind_original_responders(session_id, publication.responders());
         }
     }
 
     fn run(&self, job: Job) {
         match job {
             Job::Publish(publication) => {
-                let Publication { session_id, next_seqs, expected_seq, data, attachments, persisted } = *publication;
+                let Publication {
+                    session_id,
+                    next_seqs,
+                    expected_seq,
+                    data,
+                    attachments,
+                    persisted,
+                } = *publication;
                 let seq = super::with_session_sequence(&next_seqs, &session_id, |current| {
-                    if expected_seq.is_some_and(|expected| expected != *current) { return None; }
+                    if expected_seq.is_some_and(|expected| expected != *current) {
+                        return None;
+                    }
                     *current = current.saturating_add(1);
                     Some(*current)
                 });
                 let outcome = seq.map(|seq| {
-                    let stored = attachments.iter().all(|blob| self.event_store.record_attachment(&session_id, seq, blob))
+                    let stored = attachments
+                        .iter()
+                        .all(|blob| self.event_store.record_attachment(&session_id, seq, blob))
                         && self.publish_tagged(&session_id, seq, &data, None, None, None);
                     (seq, stored)
                 });
@@ -500,26 +580,41 @@ impl Persister {
             }
             Job::Worker(publication) => publication.run(),
             Job::Clear(clear) => {
-                let ClearJournal { session_id, next_seqs, expected, done } = clear;
+                let ClearJournal {
+                    session_id,
+                    next_seqs,
+                    expected,
+                    done,
+                } = clear;
                 let result = (|| -> anyhow::Result<()> {
                     let current = super::lock_recover(&next_seqs).get(&session_id).cloned();
-                    anyhow::ensure!(current.as_ref().is_some_and(|slot| Arc::ptr_eq(slot, &expected))
-                        && !super::lock_recover(&expected).retired,
-                        "journal publication namespace changed before clear");
+                    anyhow::ensure!(
+                        current
+                            .as_ref()
+                            .is_some_and(|slot| Arc::ptr_eq(slot, &expected))
+                            && !super::lock_recover(&expected).retired,
+                        "journal publication namespace changed before clear"
+                    );
                     // The writer orders clear with every append. No sequence/global lock
                     // survives the durable delete or a writer barrier.
                     self.event_store.delete_session_checked(&session_id)?;
                     let mut sequence = super::lock_recover(&expected);
                     let mut sequences = super::lock_recover(&next_seqs);
-                    anyhow::ensure!(sequences.get(&session_id).is_some_and(|slot| Arc::ptr_eq(slot, &expected)),
-                        "journal publication namespace changed during clear");
+                    anyhow::ensure!(
+                        sequences
+                            .get(&session_id)
+                            .is_some_and(|slot| Arc::ptr_eq(slot, &expected)),
+                        "journal publication namespace changed during clear"
+                    );
                     sequence.retired = true;
                     sequences.remove(&session_id);
                     Ok(())
                 })();
                 let _ = done.send(result);
             }
-            Job::Flush(done) => { let _ = done.send(()); }
+            Job::Flush(done) => {
+                let _ = done.send(());
+            }
             #[cfg(test)]
             Job::Test(run) => run(),
         }
@@ -657,14 +752,23 @@ mod tests {
             panic!("injected writer failure");
         })));
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         for seq in 1..=2 {
             let persister = Arc::clone(&sink.persister);
             let publication = {
                 let _entered = runtime.enter();
                 WorkerPublication::new(async move {
-                    assert!(persister.publish_tagged("writer-panic", seq,
-                        &AcpEventData::from_history(Event::ThinkingStarted), Some(7), None, None));
+                    assert!(persister.publish_tagged(
+                        "writer-panic",
+                        seq,
+                        &AcpEventData::from_history(Event::ThinkingStarted),
+                        Some(7),
+                        None,
+                        None
+                    ));
                 })
             };
             assert!(sink.publish_from_worker(publication).is_ok());
@@ -677,7 +781,10 @@ mod tests {
         flushed
             .recv_timeout(Duration::from_secs(5))
             .expect("writer must continue after a panic");
-        let seqs: Vec<_> = store.replay_from("writer-panic", 0).expect("read retained events").into_iter()
+        let seqs: Vec<_> = store
+            .replay_from("writer-panic", 0)
+            .expect("read retained events")
+            .into_iter()
             .map(|stored| stored.seq)
             .collect();
         assert_eq!(seqs, [1, 2]);
@@ -686,7 +793,11 @@ mod tests {
             assert_eq!(frame.seq, seq);
             assert_eq!(frame.worker_generation, Some(7));
         }
-        assert!(sink.publish_persisted("writer-panic", 3, &AcpEventData::from_history(Event::ThinkingStarted)));
+        assert!(sink.publish_persisted(
+            "writer-panic",
+            3,
+            &AcpEventData::from_history(Event::ThinkingStarted)
+        ));
         assert_eq!(store.highest_seq("writer-panic"), 3);
     }
 
@@ -711,7 +822,10 @@ mod tests {
     fn a_stalled_sync_publish_leaves_the_seq_lock_to_the_drain() {
         use std::time::Duration;
         for with_attachment in [false, true] {
-            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
             let (sink, store, _rx, _tmp) = channel_sink();
             let sup = Arc::new(super::super::Supervisor::new(Arc::clone(&sink)));
             let release = stall_writer(&sink);
@@ -721,39 +835,89 @@ mod tests {
                 let seqs = Arc::clone(&sup.next_seqs);
                 std::thread::spawn(move || {
                     let receipt = if with_attachment {
-                        let blob = AttachmentBlob { id: "a-1".into(),
+                        let blob = AttachmentBlob {
+                            id: "a-1".into(),
                             kind: crate::daemon::PromptAttachmentKind::Image,
-                            mime_type: "image/png".into(), name: None, data: vec![1, 2, 3] };
-                        sink.queue_prompt("stalled", seqs, &[blob],
-                            AcpEventData::from_host(crate::acp::state::test_support::prompt("look")))
+                            mime_type: "image/png".into(),
+                            name: None,
+                            data: vec![1, 2, 3],
+                        };
+                        sink.queue_prompt(
+                            "stalled",
+                            seqs,
+                            &[blob],
+                            AcpEventData::from_host(crate::acp::state::test_support::prompt(
+                                "look",
+                            )),
+                        )
                     } else {
-                        sink.queue_persisted("stalled", seqs, AcpEventData::from_history(Event::ThinkingStarted), None)
+                        sink.queue_persisted(
+                            "stalled",
+                            seqs,
+                            AcpEventData::from_history(Event::ThinkingStarted),
+                            None,
+                        )
                     };
                     submitted.send(()).unwrap();
                     receipt.wait()
                 })
             };
-            queued.recv_timeout(Duration::from_secs(5)).expect("the real host publication is enqueued before its receipt wait");
+            queued
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the real host publication is enqueued before its receipt wait");
             let counter = super::super::session_seq(&sup.next_seqs, "stalled");
-            assert_eq!(counter.try_lock().expect("a durable waiter must leave seq custody free").seq, 0);
+            assert_eq!(
+                counter
+                    .try_lock()
+                    .expect("a durable waiter must leave seq custody free")
+                    .seq,
+                0
+            );
             let persister = Arc::clone(&sink.persister);
             let seqs = Arc::clone(&sup.next_seqs);
             let publication = {
                 let _entered = runtime.enter();
                 WorkerPublication::new(async move {
                     let seq = super::super::with_publication_seq(&seqs, "stalled", |seq| seq);
-                    assert!(persister.publish_tagged("stalled", seq,
-                        &AcpEventData::from_history(Event::ThinkingEnded), Some(1), None, None));
+                    assert!(persister.publish_tagged(
+                        "stalled",
+                        seq,
+                        &AcpEventData::from_history(Event::ThinkingEnded),
+                        Some(1),
+                        None,
+                        None
+                    ));
                 })
             };
-            assert!(sink.publish_from_worker(publication).is_ok(), "the owned drain publication queues while the writer is stalled");
-            assert_eq!(counter.try_lock().expect("queued completion owns no seq guard").seq, 0);
-            assert!(!publisher.is_finished(), "the actual durable receipt remains blocked");
+            assert!(
+                sink.publish_from_worker(publication).is_ok(),
+                "the owned drain publication queues while the writer is stalled"
+            );
+            assert_eq!(
+                counter
+                    .try_lock()
+                    .expect("queued completion owns no seq guard")
+                    .seq,
+                0
+            );
+            assert!(
+                !publisher.is_finished(),
+                "the actual durable receipt remains blocked"
+            );
             release.send(()).unwrap();
             assert_eq!(publisher.join().unwrap(), Some((1, true)));
             sink.flush();
-            let stored: Vec<_> = store.replay_from("stalled", 0).unwrap().into_iter().map(|stored| stored.seq).collect();
-            assert_eq!(stored, [1, 2], "host and worker share actual allocation and durable FIFO order");
+            let stored: Vec<_> = store
+                .replay_from("stalled", 0)
+                .unwrap()
+                .into_iter()
+                .map(|stored| stored.seq)
+                .collect();
+            assert_eq!(
+                stored,
+                [1, 2],
+                "host and worker share actual allocation and durable FIFO order"
+            );
         }
     }
 
@@ -763,7 +927,12 @@ mod tests {
 
         let (sink, store, _rx, _tmp) = channel_sink();
         let release = stall_writer(&sink);
-        let receipt = sink.queue_persisted("shutdown", Default::default(), AcpEventData::from_history(Event::ThinkingStarted), None);
+        let receipt = sink.queue_persisted(
+            "shutdown",
+            Default::default(),
+            AcpEventData::from_history(Event::ThinkingStarted),
+            None,
+        );
         let alive = Arc::downgrade(&sink);
         let (dropped, done) = std::sync::mpsc::sync_channel(1);
         let dropper = std::thread::spawn(move || {

@@ -149,7 +149,6 @@ test("startup banner: native-binary branch + agent-log disclosure", async ({ pag
         },
       },
     },
-
   });
   seedSessionViaAoeAdd({ title: "story-native-binary", structuredView: true })(serve);
   const sessionId = await sessionIdByTitle(serve.baseUrl, "story-native-binary");

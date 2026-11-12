@@ -20,7 +20,8 @@
 import {
   Fragment,
   useCallback,
-  useEffect, useLayoutEffect,
+  useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,

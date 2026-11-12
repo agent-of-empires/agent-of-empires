@@ -479,7 +479,8 @@ mod tests {
                 };
                 assert_eq!(store.rate_limit_redelivery_streak("s").unwrap(), expected);
                 drop(store);
-                let cold = EventStore::open(&tmp.path().join("acp.db"), cap, Default::default()).unwrap();
+                let cold =
+                    EventStore::open(&tmp.path().join("acp.db"), cap, Default::default()).unwrap();
                 assert_eq!(cold.rate_limit_redelivery_streak("s").unwrap(), expected);
                 // An explicit input neither seeds a lost budget nor spends a historical resume.
                 let input = user_prompt("new explicit input");

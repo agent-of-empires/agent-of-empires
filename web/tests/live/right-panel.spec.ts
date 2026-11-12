@@ -266,7 +266,7 @@ test("right panel notifications: structured view comments banner appears on stag
   spawnServe,
 }) => {
   const serve = await spawnServe({ acp: true });
-    seedSessionViaAoeAdd({
+  seedSessionViaAoeAdd({
     title: "rp-notif",
     structuredView: true,
     // A modified hunk gives the comment gutter line numbers.

@@ -250,10 +250,23 @@ mod tests {
     async fn fixture_event_store_survives_app_state_drop() {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
         let store = std::sync::Arc::clone(&state.acp_event_store);
-        store.record("retained", 1, &agent_chunk("retained needle"), &crate::acp::event_sender::EventMetadata::history())
+        store
+            .record(
+                "retained",
+                1,
+                &agent_chunk("retained needle"),
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         drop(state);
-        store.record("retained", 2, &Event::ThinkingEnded, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+        store
+            .record(
+                "retained",
+                2,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .unwrap();
         let (page, _) = store
             .retained_page("retained", 0, None, 8, None)
             .unwrap()
@@ -278,7 +291,13 @@ mod tests {
             let id = instance.id.clone();
             let state = crate::server::test_support::build_test_app_state(vec![instance]);
             let store = Arc::clone(&state.acp_event_store);
-            store.record(&id, 1, &user_prompt("original snapshot"), &crate::acp::event_sender::EventMetadata::history())
+            store
+                .record(
+                    &id,
+                    1,
+                    &user_prompt("original snapshot"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
             let (_, initial_identity) =
                 store.retained_page(&id, 0, None, 8, None).unwrap().unwrap();
@@ -294,15 +313,19 @@ mod tests {
                 .expect("retained reader must reach its gate");
 
             let (tx, mut broadcasts) = tokio::sync::broadcast::channel(4);
-            let sink = ChannelSink::new(
-                tx,
-                Arc::clone(&store),
-            );
+            let sink = ChannelSink::new(tx, Arc::clone(&store));
             let (done, completed) = mpsc::channel();
             let writer_id = id.clone();
             let writer = std::thread::spawn(move || {
-                let persisted = sink.publish_persisted("unrelated", 1, &crate::acp::event_sender::AcpEventData::from_history(Event::ThinkingStarted))
-                    && sink.publish_persisted(&writer_id, 2, &crate::acp::event_sender::AcpEventData::from_history(Event::ThinkingEnded));
+                let persisted = sink.publish_persisted(
+                    "unrelated",
+                    1,
+                    &crate::acp::event_sender::AcpEventData::from_history(Event::ThinkingStarted),
+                ) && sink.publish_persisted(
+                    &writer_id,
+                    2,
+                    &crate::acp::event_sender::AcpEventData::from_history(Event::ThinkingEnded),
+                );
                 done.send(persisted).unwrap();
             });
             let publication = completed.recv_timeout(deadline);
@@ -359,8 +382,15 @@ mod tests {
     #[test]
     fn retained_and_search_reads_share_private_memory_and_temporary_databases() {
         for name in [":memory:", ""] {
-            let store = EventStore::open(std::path::Path::new(name), 0, Default::default()).unwrap();
-            store.record("private", 1, &agent_chunk("private needle"), &crate::acp::event_sender::EventMetadata::history())
+            let store =
+                EventStore::open(std::path::Path::new(name), 0, Default::default()).unwrap();
+            store
+                .record(
+                    "private",
+                    1,
+                    &agent_chunk("private needle"),
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
                 .unwrap();
             let (page, identity) = store
                 .retained_page("private", 0, None, 8, None)
@@ -371,7 +401,14 @@ mod tests {
             let hits = store.search_content("needle", 1);
             assert_eq!(hits.len(), 1);
             assert_eq!(hits[0].session_id, "private");
-            store.record("private", 2, &Event::ThinkingEnded, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+            store
+                .record(
+                    "private",
+                    2,
+                    &Event::ThinkingEnded,
+                    &crate::acp::event_sender::EventMetadata::history(),
+                )
+                .unwrap();
             assert!(store
                 .retained_page("private", 0, None, 8, Some(&identity))
                 .unwrap()
@@ -388,9 +425,21 @@ mod tests {
     fn backward_cursors_above_sqlite_max_include_maximum_sequence() {
         let (_tmp, store) = open_store(0);
         let max = i64::MAX as u64;
-        store.record("boundary", max - 1, &Event::ThinkingStarted, &crate::acp::event_sender::EventMetadata::history())
+        store
+            .record(
+                "boundary",
+                max - 1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
-        store.record("boundary", max, &Event::ThinkingEnded, &crate::acp::event_sender::EventMetadata::history())
+        store
+            .record(
+                "boundary",
+                max,
+                &Event::ThinkingEnded,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
             .unwrap();
         for (cursor, expected) in [
             (max, vec![max - 1]),
@@ -585,7 +634,14 @@ mod tests {
             hook.set(Some(Box::new(move || {
                 // A separate connection, as the event writer's would be.
                 let other = EventStore::open(&db, 1000, Default::default()).unwrap();
-                other.record("s-1", 4, &Event::ThinkingEnded, &crate::acp::event_sender::EventMetadata::history()).unwrap();
+                other
+                    .record(
+                        "s-1",
+                        4,
+                        &Event::ThinkingEnded,
+                        &crate::acp::event_sender::EventMetadata::history(),
+                    )
+                    .unwrap();
             })))
         });
         let page = store.replay_page("s-1", 0, None);

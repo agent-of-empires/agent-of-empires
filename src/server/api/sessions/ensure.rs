@@ -163,10 +163,10 @@ pub async fn ensure_tool(
                 return response;
             }
             if error.is::<crate::tmux::LegacyToolUnavailable>() {
-            return (StatusCode::CONFLICT,
+                return (StatusCode::CONFLICT,
                 Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
                 .into_response();
-        }
+            }
             if error.is::<crate::session::ToolLaunchUnavailable>() {
                 return (
                     StatusCode::BAD_REQUEST,

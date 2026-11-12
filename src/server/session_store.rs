@@ -417,7 +417,6 @@ impl NativeSessionStore {
         })
     }
 
-
     fn commit_canonical(
         &self,
         mutation: &mut SessionMutation<'_>,

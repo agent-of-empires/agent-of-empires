@@ -117,7 +117,12 @@ function toPersistedState(state: AcpState): AcpState {
       ? {
           ...state,
           optimisticRows: [],
-          inflightPromptIds: [], interactionError: null, restartInFlight: false, restartStoppedSent: false, restartFailure: null, }
+          inflightPromptIds: [],
+          interactionError: null,
+          restartInFlight: false,
+          restartStoppedSent: false,
+          restartFailure: null,
+        }
       : state;
   if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };

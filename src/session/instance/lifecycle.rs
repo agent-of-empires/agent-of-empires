@@ -363,44 +363,44 @@ impl Instance {
     }
 
     /// Settle a created launch only while its generation remains current.
-/// Readiness must not replace runtime activity admitted during the handshake.
-pub(crate) fn commit_created_launch(
-    &mut self,
-    storage: &dyn crate::session::SessionStore,
-    generation: u64,
-    status: Status,
-) -> Result<()> {
-    let idle = status == Status::Idle;
-    let mut committed = false;
-    let mut mutation = |instances: &mut Vec<Instance>,
-                        _groups: &mut Vec<crate::session::Group>| {
-        let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-            return Ok(());
+    /// Readiness must not replace runtime activity admitted during the handshake.
+    pub(crate) fn commit_created_launch(
+        &mut self,
+        storage: &dyn crate::session::SessionStore,
+        generation: u64,
+        status: Status,
+    ) -> Result<()> {
+        let idle = status == Status::Idle;
+        let mut committed = false;
+        let mut mutation = |instances: &mut Vec<Instance>,
+                            _groups: &mut Vec<crate::session::Group>| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(());
+            };
+            if stored.lifecycle_generation != generation {
+                return Ok(());
+            }
+            stored.status = status;
+            stored.idle_entered_at = if idle { self.idle_entered_at } else { None };
+            stored.last_accessed_at = self.last_accessed_at;
+            stored.sandbox_info = self.sandbox_info.clone();
+            stored.capture_started_at = self.capture_started_at;
+            stored.active_execution = self.active_execution.clone();
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            committed = true;
+            Ok(())
         };
-        if stored.lifecycle_generation != generation {
-            return Ok(());
+        if idle {
+            storage.commit_launch_ready(&mut mutation)?;
+        } else {
+            storage.commit(&mut mutation)?;
         }
-        stored.status = status;
-        stored.idle_entered_at = if idle { self.idle_entered_at } else { None };
-        stored.last_accessed_at = self.last_accessed_at;
-        stored.sandbox_info = self.sandbox_info.clone();
-        stored.capture_started_at = self.capture_started_at;
-        stored.active_execution = self.active_execution.clone();
-        stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
-        committed = true;
+        anyhow::ensure!(committed, LifecycleReservationError::Superseded);
+        self.lifecycle_reservation = None;
+        self.status = status;
+        self.idle_entered_at = if idle { self.idle_entered_at } else { None };
         Ok(())
-    };
-    if idle {
-        storage.commit_launch_ready(&mut mutation)?;
-    } else {
-        storage.commit(&mut mutation)?;
     }
-    anyhow::ensure!(committed, LifecycleReservationError::Superseded);
-    self.lifecycle_reservation = None;
-    self.status = status;
-    self.idle_entered_at = if idle { self.idle_entered_at } else { None };
-    Ok(())
-}
 
     /// Settle a created launch that no longer owns a reservation, keeping a
     /// failure to commit from masking the refusal that caused it.

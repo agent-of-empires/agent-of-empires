@@ -241,7 +241,13 @@ pub async fn acp_set_config_option(
     }
     let (operation, lease) = match state
         .acp_supervisor
-        .set_config_option(&id, &req.config_id, &req.value, is_model_config, req.request_nonce)
+        .set_config_option(
+            &id,
+            &req.config_id,
+            &req.value,
+            is_model_config,
+            req.request_nonce,
+        )
         .await
     {
         Ok(operation) => operation,

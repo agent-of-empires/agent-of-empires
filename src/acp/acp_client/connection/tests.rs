@@ -3,14 +3,14 @@
 use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::*;
 use crate::acp::acp_client::commands::ClientCmd;
-use crate::acp::acp_client::{SdkTaskObservation, SdkTestOptions};
 use crate::acp::acp_client::reset::ResetSessionOutcome;
+use crate::acp::acp_client::{SdkTaskObservation, SdkTestOptions};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_sender::WeakEventSender;
-use crate::acp::supervisor::test_support::managed::{ManagedClient, ManagedScope, ManagedTask};
 use crate::acp::fs_handler::FsPolicy;
 use crate::acp::state::{IntegrationLostReason, StartupErrorDetail, SubagentState};
+use crate::acp::supervisor::test_support::managed::{ManagedClient, ManagedScope, ManagedTask};
 use crate::acp::terminal_handler::TerminalManager;
 use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use futures_util::FutureExt;
@@ -409,7 +409,16 @@ async fn spawn_fake_connection(
     close_after_prompt: bool,
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> FakeConnection {
-    spawn_fake_connection_with(scope, session_id, mode, close_after_prompt, None, None, on_prompt).await
+    spawn_fake_connection_with(
+        scope,
+        session_id,
+        mode,
+        close_after_prompt,
+        None,
+        None,
+        on_prompt,
+    )
+    .await
 }
 
 /// `config_options` is the raw `configOptions` array `session/new` returns.
@@ -535,8 +544,11 @@ async fn spawn_fake_connection_raw(
     let ready = actual.wait_until_usable().await;
     if ready.is_ok() {
         event_rx.ready().await;
-        assert_eq!(actual.selected_native_session(), session_id,
-            "only the actual Original result selects identity");
+        assert_eq!(
+            actual.selected_native_session(),
+            session_id,
+            "only the actual Original result selects identity"
+        );
     }
     let cmd_tx = actual.test_command_sender();
     let pending_responders = actual.test_pending_responders();
@@ -650,7 +662,6 @@ async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
         })
     })
     .await;
-
 }
 
 #[tokio::test]
@@ -2081,54 +2092,63 @@ async fn idle_remote_control_message_records_and_returns_to_idle() {
 #[tokio::test]
 #[serial_test::serial]
 async fn default_mode_reaches_the_live_mode_option_only_when_configured() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-
-    // (default_mode, config values the agent received, mode the daemon last saw)
-    let cases: [(Option<&'static str>, &[&str], Option<&str>); 2] = [
-        (None, &[], None),
-        (Some("default"), &["default"], Some("default")),
-    ];
-    for (default_mode, want_sets, want_mode) in cases {
-        // The connection only dispatches a prompt once session setup, default
-        // mode included, is done; `ready_rx` fires before `session/new`.
-        let (prompted_tx, mut prompted_rx) = mpsc::unbounded_channel();
-        let mut fake = spawn_fake_connection_with(scope, "s-mode", None, false, default_mode, Some(MODE_OPTIONS), move |_| {
-            let _ = prompted_tx.send(());
-            Vec::new()
-        })
-        .await;
-        fake.cmd_tx
-            .send(ClientCmd::Prompt(vec![ContentBlock::Text(
-                TextContent::new("hi"),
-            )]))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), prompted_rx.recv())
-            .await
-            .expect("session setup must finish and dispatch the prompt")
-            .expect("fake agent must receive the prompt");
-        let mut last_mode = None;
-        while let Ok(event) = fake.event_rx.try_recv() {
-            if let Event::ConfigOptionsUpdated { options } = event {
-                last_mode = options
-                    .iter()
-                    .find(|o| o.id == "mode")
-                    .map(|o| o.current_value.clone());
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            // (default_mode, config values the agent received, mode the daemon last saw)
+            let cases: [(Option<&'static str>, &[&str], Option<&str>); 2] = [
+                (None, &[], None),
+                (Some("default"), &["default"], Some("default")),
+            ];
+            for (default_mode, want_sets, want_mode) in cases {
+                // The connection only dispatches a prompt once session setup, default
+                // mode included, is done; `ready_rx` fires before `session/new`.
+                let (prompted_tx, mut prompted_rx) = mpsc::unbounded_channel();
+                let mut fake = spawn_fake_connection_with(
+                    scope,
+                    "s-mode",
+                    None,
+                    false,
+                    default_mode,
+                    Some(MODE_OPTIONS),
+                    move |_| {
+                        let _ = prompted_tx.send(());
+                        Vec::new()
+                    },
+                )
+                .await;
+                fake.cmd_tx
+                    .send(ClientCmd::Prompt(vec![ContentBlock::Text(
+                        TextContent::new("hi"),
+                    )]))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), prompted_rx.recv())
+                    .await
+                    .expect("session setup must finish and dispatch the prompt")
+                    .expect("fake agent must receive the prompt");
+                let mut last_mode = None;
+                while let Ok(event) = fake.event_rx.try_recv() {
+                    if let Event::ConfigOptionsUpdated { options } = event {
+                        last_mode = options
+                            .iter()
+                            .find(|o| o.id == "mode")
+                            .map(|o| o.current_value.clone());
+                    }
+                }
+                assert_eq!(
+                    *fake.set_options.lock().await,
+                    want_sets,
+                    "{default_mode:?}"
+                );
+                if let Some(want) = want_mode {
+                    assert_eq!(last_mode.as_deref(), Some(want), "{default_mode:?}");
+                }
+                fake.agent.abort();
+                let _ = fake.agent.await;
             }
-        }
-        assert_eq!(
-            *fake.set_options.lock().await,
-            want_sets,
-            "{default_mode:?}"
-        );
-        if let Some(want) = want_mode {
-            assert_eq!(last_mode.as_deref(), Some(want), "{default_mode:?}");
-        }
-        fake.agent.abort();
-        let _ = fake.agent.await;
-    }
-
-    })).await;
+        })
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2439,13 +2459,12 @@ async fn request_failure_keeps_the_pending_permission_responder_usable() {
 #[tokio::test]
 #[serial_test::serial]
 async fn request_error_then_eof_survives_public_event_backpressure() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-
-    let mut fake =
-        spawn_fake_connection(scope, "s-backpressure", None, true, |id| {
-            let mut lines: Vec<_> = (0..80)
-                .map(|index| {
-                    serde_json::json!({
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            let mut fake = spawn_fake_connection(scope, "s-backpressure", None, true, |id| {
+                let mut lines: Vec<_> = (0..80)
+                    .map(|index| {
+                        serde_json::json!({
                         "jsonrpc": "2.0", "method": "session/update",
                         "params": {"sessionId": "s-backpressure", "update": {
                             "sessionUpdate": "agent_message_chunk",
@@ -2453,75 +2472,78 @@ async fn request_error_then_eof_survives_public_event_backpressure() {
                         }}
                     })
                     .to_string()
-                })
-                .collect();
-            lines.push(serde_json::json!({
+                    })
+                    .collect();
+                lines.push(serde_json::json!({
             "jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": "request failed"}
         }).to_string());
-            lines
-        })
-        .await;
-    fake.cmd_tx
-        .send(ClientCmd::Prompt(Vec::new()))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let capacity = fake
-                .event_queue
-                .upgrade()
-                .expect("connection still owns its event queue")
-                .capacity();
-            if capacity == 0 {
-                break;
+                lines
+            })
+            .await;
+            fake.cmd_tx
+                .send(ClientCmd::Prompt(Vec::new()))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let capacity = fake
+                        .event_queue
+                        .upgrade()
+                        .expect("connection still owns its event queue")
+                        .capacity();
+                    if capacity == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("public event queue fills before draining resumes");
+            let mut events = collect_terminal(&mut fake).await;
+            tokio::time::timeout(Duration::from_secs(10), fake.connection)
+                .await
+                .unwrap()
+                .unwrap();
+            while let Some(event) = fake.event_rx.recv().await {
+                events.push(event);
             }
-            tokio::task::yield_now().await;
-        }
+            let failure = events
+                .iter()
+                .position(|event| matches!(event, Event::PromptRuntimeError { .. }))
+                .unwrap();
+            let terminal = events
+                .iter()
+                .position(
+                    |event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed"),
+                )
+                .unwrap();
+            let closure = events
+                .iter()
+                .position(|event| matches!(event, Event::AcpConnectionUnavailable { .. }))
+                .unwrap();
+            assert!(failure < terminal && terminal < closure);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, Event::AgentStartupError { .. })));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Stopped { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::AgentMessageChunk { .. }))
+                    .count(),
+                80
+            );
+            fake.agent.abort();
+            let _ = fake.agent.await;
+        })
     })
-    .await
-    .expect("public event queue fills before draining resumes");
-    let mut events = collect_terminal(&mut fake).await;
-    tokio::time::timeout(Duration::from_secs(10), fake.connection)
-        .await
-        .unwrap()
-        .unwrap();
-    while let Some(event) = fake.event_rx.recv().await {
-        events.push(event);
-    }
-    let failure = events
-        .iter()
-        .position(|event| matches!(event, Event::PromptRuntimeError { .. }))
-        .unwrap();
-    let terminal = events
-        .iter()
-        .position(|event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed"))
-        .unwrap();
-    let closure = events
-        .iter()
-        .position(|event| matches!(event, Event::AcpConnectionUnavailable { .. }))
-        .unwrap();
-    assert!(failure < terminal && terminal < closure);
-    assert!(!events
-        .iter()
-        .any(|event| matches!(event, Event::AgentStartupError { .. })));
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, Event::Stopped { .. }))
-            .count(),
-        1
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, Event::AgentMessageChunk { .. }))
-            .count(),
-        80
-    );
-    fake.agent.abort();
-    let _ = fake.agent.await;
-
-    })).await;
+    .await;
 }
 
 #[tokio::test]
@@ -2839,53 +2861,72 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
 #[tokio::test]
 #[serial_test::serial]
 async fn proxy_hello_and_primitives_shape_the_event_stream() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-
-    let (ready, fake) =
-        spawn_fake_connection_raw(scope, "s-h", None, false, BAD_HELLO, None, None, |_| vec![]).await;
-    assert!(
-        matches!(&ready, Err(AcpError::IncompatibleAgent(e))
+    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+        Box::pin(async move {
+            let (ready, fake) = spawn_fake_connection_raw(
+                scope,
+                "s-h",
+                None,
+                false,
+                BAD_HELLO,
+                None,
+                None,
+                |_| vec![],
+            )
+            .await;
+            assert!(
+                matches!(&ready, Err(AcpError::IncompatibleAgent(e))
             if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
-        "{ready:?}"
-    );
-    fake.agent.abort();
-    fake.connection.abort();
+                "{ready:?}"
+            );
+            fake.agent.abort();
+            fake.connection.abort();
 
-    let (ready, mut fake) =
-        spawn_fake_connection_raw(scope, "s-h", None, false, GOOD_HELLO, None, None, |_| vec![]).await;
-    ready.expect("valid hello accepted");
-    let frames = [
-        tool_call_frame("t1", ""),
-        // Tailer-emitted: waits for adapter frame 3.
-        tool_call_frame("t2", r#"{"v":1,"key":"k2","after_adapter_sequence":3}"#),
-        tool_call_frame("t3", r#"{"v":1,"key":"k3","ephemeral":true}"#),
-        tool_call_frame("t4", r#"{"v":1,"key":"k4"}"#),
-        tool_call_frame("t4-again", r#"{"v":1,"key":"k4"}"#),
-        tool_call_frame("t5", ""),
-        tool_call_frame("t6", r#"{"v":1}"#),
-    ];
-    for frame in &frames {
-        write_line(&fake.agent_write, frame).await;
-    }
-    let (mut started, mut lost) = (Vec::new(), None);
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while lost.is_none() {
-            match fake.event_rx.recv().await.expect("connection remains open") {
-                Event::ToolCallStarted { tool_call } => started.push(tool_call.id),
-                Event::IntegrationLost { reason } => lost = Some(reason),
-                _ => {}
+            let (ready, mut fake) = spawn_fake_connection_raw(
+                scope,
+                "s-h",
+                None,
+                false,
+                GOOD_HELLO,
+                None,
+                None,
+                |_| vec![],
+            )
+            .await;
+            ready.expect("valid hello accepted");
+            let frames = [
+                tool_call_frame("t1", ""),
+                // Tailer-emitted: waits for adapter frame 3.
+                tool_call_frame("t2", r#"{"v":1,"key":"k2","after_adapter_sequence":3}"#),
+                tool_call_frame("t3", r#"{"v":1,"key":"k3","ephemeral":true}"#),
+                tool_call_frame("t4", r#"{"v":1,"key":"k4"}"#),
+                tool_call_frame("t4-again", r#"{"v":1,"key":"k4"}"#),
+                tool_call_frame("t5", ""),
+                tool_call_frame("t6", r#"{"v":1}"#),
+            ];
+            for frame in &frames {
+                write_line(&fake.agent_write, frame).await;
             }
-        }
+            let (mut started, mut lost) = (Vec::new(), None);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while lost.is_none() {
+                    match fake.event_rx.recv().await.expect("connection remains open") {
+                        Event::ToolCallStarted { tool_call } => started.push(tool_call.id),
+                        Event::IntegrationLost { reason } => lost = Some(reason),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("integration loss is reported");
+            assert_eq!(started, ["t1", "t4", "t2", "t5"]);
+            assert!(matches!(
+                lost,
+                Some(IntegrationLostReason::ContractViolation { .. })
+            ));
+            fake.agent.abort();
+            fake.connection.abort();
+        })
     })
-    .await
-    .expect("integration loss is reported");
-    assert_eq!(started, ["t1", "t4", "t2", "t5"]);
-    assert!(matches!(
-        lost,
-        Some(IntegrationLostReason::ContractViolation { .. })
-    ));
-    fake.agent.abort();
-    fake.connection.abort();
-
-    })).await;
+    .await;
 }

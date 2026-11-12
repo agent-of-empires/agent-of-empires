@@ -124,7 +124,11 @@ pub(super) fn update_tool_context_cache(
 ) {
     let (id, prompt) = match event {
         Event::ToolCallStarted { tool_call } => (&tool_call.id, None),
-        Event::ToolCallUpdated { tool_call_id, prompt, .. } => (tool_call_id, Some(prompt)),
+        Event::ToolCallUpdated {
+            tool_call_id,
+            prompt,
+            ..
+        } => (tool_call_id, Some(prompt)),
         Event::ToolCallCompleted { tool_call_id, .. } => {
             cache
                 .lock()

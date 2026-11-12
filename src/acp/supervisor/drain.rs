@@ -17,9 +17,9 @@ use super::launch::{
 };
 use super::teardown::{settle_sweeping_if_owed, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, with_publication_seq, BroadcastSink, Launcher,
-    PendingContextReset, ResumeReservation, SeqMap, SharedSet, Supervisor, SupervisorError,
-    WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
+    lock_recover, with_publication_seq, BroadcastSink, Launcher, PendingContextReset,
+    ResumeReservation, SeqMap, SharedSet, Supervisor, SupervisorError, WorkerKind, Workers,
+    MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::event_sender::{AcpEventData, EventScope, SdkEvent};
@@ -260,8 +260,10 @@ enum RestartDecision {
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
         let _receipt = self.sink.queue_persisted(
-            &self.session_id, Arc::clone(&self.next_seqs),
-            AcpEventData::from_host(event), None,
+            &self.session_id,
+            Arc::clone(&self.next_seqs),
+            AcpEventData::from_host(event),
+            None,
         );
     }
 
@@ -358,21 +360,36 @@ impl<S: BroadcastSink> Drain<S> {
             {
                 Ok(result) => {
                     if matches!(result, OwnedPublication::Published { current: true }) {
-                        if let Event::AcpSessionAssigned { acp_session_id, .. } = data.event.as_ref() {
+                        if let Event::AcpSessionAssigned { acp_session_id, .. } =
+                            data.event.as_ref()
+                        {
                             let mut workers = self.workers.lock().await;
                             let lifecycle = lock_recover(&self.lifecycle);
                             if lifecycle.current_lease(&self.session_id).as_ref() == Some(lease) {
-                                if let Some(handle) = workers.get_mut(&self.session_id).filter(|handle| handle.lease == *lease) {
-                                    let certified = handle.client.establishment_projection()
+                                if let Some(handle) = workers
+                                    .get_mut(&self.session_id)
+                                    .filter(|handle| handle.lease == *lease)
+                                {
+                                    let certified = handle
+                                        .client
+                                        .establishment_projection()
                                         .and_then(|projection| projection.applied())
                                         .is_some_and(|postimage| {
-                                            postimage.choice.acp_session_id.as_deref() == Some(acp_session_id.as_str())
-                                                && data.metadata.native_origin.is_some_and(|origin| origin.attempt_id == postimage.attempt_id)
+                                            postimage.choice.acp_session_id.as_deref()
+                                                == Some(acp_session_id.as_str())
+                                                && data.metadata.native_origin.is_some_and(
+                                                    |origin| {
+                                                        origin.attempt_id == postimage.attempt_id
+                                                    },
+                                                )
                                         });
                                     if certified {
                                         handle.native_session_id = Some(acp_session_id.clone());
-                                        if let WorkerKind::Runner { spawn_config } = &mut handle.kind {
-                                            spawn_config.stored_acp_session_id = Some(acp_session_id.clone());
+                                        if let WorkerKind::Runner { spawn_config } =
+                                            &mut handle.kind
+                                        {
+                                            spawn_config.stored_acp_session_id =
+                                                Some(acp_session_id.clone());
                                             spawn_config.seed_history_replay = false;
                                             spawn_config.fork_from = None;
                                         }
@@ -545,7 +562,12 @@ impl<S: BroadcastSink> Drain<S> {
         drop(workers);
         // The original native/request/history exclusions survive the append.
         let persisted = self.sink.publish_replay_from_worker(
-            &self.session_id, seq, data, lease.epoch(), native_subject, replay,
+            &self.session_id,
+            seq,
+            data,
+            lease.epoch(),
+            native_subject,
+            replay,
         );
         Ok(if persisted {
             OwnedPublication::Published { current }
@@ -661,7 +683,12 @@ impl<S: BroadcastSink> Drain<S> {
         drop(lifecycle);
         drop(workers);
         self.sink.publish_replay_from_worker(
-            &self.session_id, seq, &data, lease.epoch(), Some(subject), None,
+            &self.session_id,
+            seq,
+            &data,
+            lease.epoch(),
+            Some(subject),
+            None,
         );
         Ok(())
     }
@@ -900,12 +927,18 @@ impl<S: BroadcastSink> Drain<S> {
         )
     }
 
-    async fn pump(mut self, inbound: &mut mpsc::Receiver<SdkEvent>, lease: &Lease) -> (Self, StreamEnd) {
+    async fn pump(
+        mut self,
+        inbound: &mut mpsc::Receiver<SdkEvent>,
+        lease: &Lease,
+    ) -> (Self, StreamEnd) {
         let sink = Arc::clone(&self.sink);
         #[cfg(test)]
         let receive_owner = self.receive_owner.take();
         let completion = Arc::new(tokio::sync::Mutex::new(DrainCompletion {
-            drain: Some(self), end: StreamEnd::default(), established: false,
+            drain: Some(self),
+            end: StreamEnd::default(),
+            established: false,
         }));
         while let Some(incoming) = {
             #[cfg(test)]
@@ -921,9 +954,16 @@ impl<S: BroadcastSink> Drain<S> {
             let lease = lease.clone();
             let publication = super::WorkerPublication::new(async move {
                 let mut completion = completion.lock().await;
-                let DrainCompletion { drain, end, established } = &mut *completion;
-                drain.as_mut().expect("SDK item after ordered EOF")
-                    .complete_incoming(incoming, &lease, end, established).await;
+                let DrainCompletion {
+                    drain,
+                    end,
+                    established,
+                } = &mut *completion;
+                drain
+                    .as_mut()
+                    .expect("SDK item after ordered EOF")
+                    .complete_incoming(incoming, &lease, end, established)
+                    .await;
             });
             if let Err(publication) = sink.publish_from_worker(publication) {
                 publication.complete().await;
@@ -939,21 +979,34 @@ impl<S: BroadcastSink> Drain<S> {
         if let Err(publication) = sink.publish_from_worker(publication) {
             publication.complete().await;
         }
-        let (drain, end) = finished.await.expect("ordered worker completion ended before EOF");
+        let (drain, end) = finished
+            .await
+            .expect("ordered worker completion ended before EOF");
         #[cfg(test)]
-        let drain = { let mut drain = drain; drain.receive_owner = receive_owner; drain };
+        let drain = {
+            let mut drain = drain;
+            drain.receive_owner = receive_owner;
+            drain
+        };
         (drain, end)
     }
 
     async fn complete_incoming(
-        &mut self, incoming: SdkEvent, lease: &Lease, end: &mut StreamEnd, established: &mut bool,
+        &mut self,
+        incoming: SdkEvent,
+        lease: &Lease,
+        end: &mut StreamEnd,
+        established: &mut bool,
     ) {
         use crate::acp::event_sender::EstablishmentResolution;
         let mut data = match incoming {
             SdkEvent::EstablishmentClosed { delivery } => {
                 let mut resolution = self.resolve_establishment(lease, &delivery).await;
                 if let EstablishmentResolution::Applied(postimage) = &resolution {
-                    if !self.acknowledge_original_context_reset(lease, &delivery, postimage).await {
+                    if !self
+                        .acknowledge_original_context_reset(lease, &delivery, postimage)
+                        .await
+                    {
                         resolution = EstablishmentResolution::Unconfirmed;
                         end.startup_failed = true;
                     }
@@ -968,21 +1021,34 @@ impl<S: BroadcastSink> Drain<S> {
             SdkEvent::Data(data) => data,
         };
         let projection = lease.retirement().establishment_projection();
-        let mut processed = projection.as_deref().and_then(|state| state.received_event());
+        let mut processed = projection
+            .as_deref()
+            .and_then(|state| state.received_event());
         let ordinal = processed.as_ref().map(|event| event.ordinal());
         let mut replay = projection.as_ref().and_then(|state| {
             let (attempt, first) = state.original_window()?;
-            if !ordinal.is_some_and(|ordinal| state.original_range_contains(ordinal)) { return None; }
-            Some(state.take_replay().unwrap_or_else(|| crate::acp::event_store::ReplayCommit::new(attempt, first)))
+            if !ordinal.is_some_and(|ordinal| state.original_range_contains(ordinal)) {
+                return None;
+            }
+            Some(
+                state
+                    .take_replay()
+                    .unwrap_or_else(|| crate::acp::event_store::ReplayCommit::new(attempt, first)),
+            )
         });
         let publication = if matches!(data.event.as_ref(), Event::AgentStartupError { .. })
-            && self.restart_intended() {
+            && self.restart_intended()
+        {
             OwnedPublication::Discarded
         } else {
-            self.publish_owned(lease, &mut data, ordinal.zip(replay.as_mut())).await
+            self.publish_owned(lease, &mut data, ordinal.zip(replay.as_mut()))
+                .await
         };
         if let Some(journal) = data.journal_publication.take() {
-            let _ = journal.send(matches!(publication, OwnedPublication::Published { current: true }));
+            let _ = journal.send(matches!(
+                publication,
+                OwnedPublication::Published { current: true }
+            ));
         }
         if let (Some(projection), Some(mut replay)) = (&projection, replay) {
             if !matches!(publication, OwnedPublication::Published { .. }) {
@@ -991,21 +1057,33 @@ impl<S: BroadcastSink> Drain<S> {
             }
             projection.retain_replay(Some(replay));
         }
-        if let Some(processed) = processed.as_mut() { processed.complete(); }
+        if let Some(processed) = processed.as_mut() {
+            processed.complete();
+        }
         drop(processed);
         match publication {
             OwnedPublication::Published { current: true } => {}
-            OwnedPublication::Published { current: false } | OwnedPublication::Discarded | OwnedPublication::Failed => return,
-            OwnedPublication::Superseded => { end.superseded = true; return; }
+            OwnedPublication::Published { current: false }
+            | OwnedPublication::Discarded
+            | OwnedPublication::Failed => return,
+            OwnedPublication::Superseded => {
+                end.superseded = true;
+                return;
+            }
         }
         match data.event.as_ref() {
             Event::Stopped { reason } => match reason.as_str() {
-                "agent_unresponsive" | "prompt_orphaned" | "user_forced" => end.agent_unresponsive = true,
+                "agent_unresponsive" | "prompt_orphaned" | "user_forced" => {
+                    end.agent_unresponsive = true
+                }
                 "rate_limited" if !*established => end.startup_rate_limited = true,
                 _ => {}
             },
             Event::AgentStartupError { .. } if !*established => end.startup_failed = true,
-            Event::AcpSessionAssigned { .. } => { *established = true; end.startup_rate_limited = false; }
+            Event::AcpSessionAssigned { .. } => {
+                *established = true;
+                end.startup_rate_limited = false;
+            }
             _ => {}
         }
     }
@@ -3587,16 +3665,26 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn an_absent_worker_without_retained_custody_cannot_publish() {
-            use super::super::test_support::managed::with_managed;
-            for stopping in [false, true] {
-                with_managed(|scope| Box::pin(async move {
-                    let live = crate::server::test_support::managed_control_session(scope, "absent-publication-owner").await;
+        use super::super::test_support::managed::with_managed;
+        for stopping in [false, true] {
+            with_managed(|scope| {
+                Box::pin(async move {
+                    let live = crate::server::test_support::managed_control_session(
+                        scope,
+                        "absent-publication-owner",
+                    )
+                    .await;
                     let id = live.id().to_owned();
                     let supervisor = live.state.acp_supervisor.clone();
                     let store = live.state.acp_event_store.clone();
                     let cache = live.state.acp_control_cache.clone();
                     assert!(Arc::ptr_eq(&cache, store.control_cache()));
-                    let before = live.state.session_service.fold_control_state(&id).await.unwrap();
+                    let before = live
+                        .state
+                        .session_service
+                        .fold_control_state(&id)
+                        .await
+                        .unwrap();
                     let prefix = store.highest_seq(&id);
                     let lease = live.client.lease.clone();
                     let owner = live.client.actual().connected_runner().unwrap();
@@ -3604,49 +3692,94 @@ mod tests {
                         let mut workers = supervisor.workers.lock().await;
                         let removed = workers.remove(&id).unwrap();
                         if stopping {
-                            assert!(matches!(lock_recover(&supervisor.lifecycle).begin_stop(&id, "user_stopped", false),
-                                crate::acp::runner_lifecycle::StopDecision::TearDown { .. }));
+                            assert!(matches!(
+                                lock_recover(&supervisor.lifecycle).begin_stop(
+                                    &id,
+                                    "user_stopped",
+                                    false
+                                ),
+                                crate::acp::runner_lifecycle::StopDecision::TearDown { .. }
+                            ));
                         }
                         removed
                     };
-                    assert_eq!(lock_recover(&supervisor.lifecycle).current_lease(&id).as_ref(), Some(&lease));
+                    assert_eq!(
+                        lock_recover(&supervisor.lifecycle)
+                            .current_lease(&id)
+                            .as_ref(),
+                        Some(&lease)
+                    );
                     assert!(!lease.retirement().retains_original_client(owner));
                     let mut frames = live.state.acp_events_tx.subscribe();
                     let drain = Drain {
-                        session_id: id.clone(), identity_only: false, history_scope: lease.native_scope().unwrap(),
-                        sink: Arc::clone(&supervisor.sink), workers: Arc::clone(&supervisor.workers),
-                        next_seqs: Arc::clone(&supervisor.next_seqs), incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
-                        lifecycle: Arc::clone(&supervisor.lifecycle), process_control: Arc::clone(&supervisor.process_control),
-                        launcher: Arc::clone(&supervisor.launcher), notify: Arc::clone(&supervisor.worker_notify),
+                        session_id: id.clone(),
+                        identity_only: false,
+                        history_scope: lease.native_scope().unwrap(),
+                        sink: Arc::clone(&supervisor.sink),
+                        workers: Arc::clone(&supervisor.workers),
+                        next_seqs: Arc::clone(&supervisor.next_seqs),
+                        incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
+                        lifecycle: Arc::clone(&supervisor.lifecycle),
+                        process_control: Arc::clone(&supervisor.process_control),
+                        launcher: Arc::clone(&supervisor.launcher),
+                        notify: Arc::clone(&supervisor.worker_notify),
                         startup_requeues: Arc::clone(&supervisor.startup_requeues),
-                        pending_context_resets: Arc::clone(&supervisor.pending_context_resets), context_reset: None,
-                        respawned_in_place: Arc::clone(&supervisor.respawned_in_place), receive_owner: None,
+                        pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
+                        context_reset: None,
+                        respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
+                        receive_owner: None,
                     };
                     let mut data = AcpEventData::from_history(Event::AcpSessionAssigned {
-                        acp_session_id: "uncaptured-native-sid".into(), connection_ready: false, native_subject: None,
+                        acp_session_id: "uncaptured-native-sid".into(),
+                        connection_ready: false,
+                        native_subject: None,
                     });
-                    assert!(matches!(drain.publish_owned(&lease, &mut data, None).await, OwnedPublication::Superseded));
+                    assert!(matches!(
+                        drain.publish_owned(&lease, &mut data, None).await,
+                        OwnedPublication::Superseded
+                    ));
                     supervisor.sink.flush();
                     assert!(store.replay_from(&id, prefix).unwrap().is_empty());
                     assert_eq!(store.highest_seq(&id), prefix);
-                    assert_eq!(super::super::session_seq(&supervisor.next_seqs, &id).lock().unwrap().seq, prefix);
-                    assert!(matches!(frames.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
-                    let after = cache.get_or_hydrate(&id, || panic!("the same warm state must survive")).unwrap();
+                    assert_eq!(
+                        super::super::session_seq(&supervisor.next_seqs, &id)
+                            .lock()
+                            .unwrap()
+                            .seq,
+                        prefix
+                    );
+                    assert!(matches!(
+                        frames.try_recv(),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                    ));
+                    let after = cache
+                        .get_or_hydrate(&id, || panic!("the same warm state must survive"))
+                        .unwrap();
                     assert_eq!(after.last_seq, before.last_seq);
                     assert_eq!(after.operation_error, before.operation_error);
                     assert_eq!(after.session_id, before.session_id);
-                    assert!(supervisor.workers.lock().await.insert(id, removed).is_none());
-                })).await;
-            }
+                    assert!(supervisor
+                        .workers
+                        .lock()
+                        .await
+                        .insert(id, removed)
+                        .is_none());
+                })
+            })
+            .await;
         }
+    }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn superseded_worker_errors_never_allocate_persist_or_fold() {
-            use super::super::test_support::managed::with_managed;
-            use crate::daemon::AcpWorkerState;
-            use crate::session::{ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, OperationErrorEvidence, Status};
-            with_managed(|scope| Box::pin(async move {
+        use super::super::test_support::managed::with_managed;
+        use crate::daemon::AcpWorkerState;
+        use crate::session::{
+            ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, OperationErrorEvidence,
+            Status,
+        };
+        with_managed(|scope| Box::pin(async move {
                 let mut live = crate::server::test_support::managed_control_session(scope, "superseded-publication-owner").await;
                 let id = live.id().to_owned();
                 let old = live.client.lease.clone();
@@ -3718,38 +3851,60 @@ mod tests {
                 assert_eq!(supervisor.worker_state(&id).await, AcpWorkerState::Running);
                 assert!(supervisor.workers.lock().await.get(&id).unwrap().restart_history.is_empty());
             })).await;
-        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
     async fn a_stalled_event_save_does_not_stop_the_drain_reading_frames() {
-            let _home = crate::session::test_support::isolate_app_dir();
-            let (sink, store, _rx, tmp) = super::super::test_support::channel_sink();
-            let supervisor = Supervisor::new(Arc::clone(&sink));
-            let id = "s-stalled-save";
-            let lease = supervisor.test_install_stdio(id).await;
-            assert!(lease.retirement().establishment_projection().is_none(),
-                "this descriptive transport fixture cannot advance a real Native SDK frontier");
-            let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
-            blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
-            let (inbound_tx, inbound_rx) = mpsc::channel(64);
-            let drain = supervisor.start_drain_task(id.into(), lease, inbound_rx, None);
-            let frames = 256_u64;
-            let sent = tokio::time::timeout(Duration::from_secs(2), async {
-                for _ in 0..frames {
-                    inbound_tx.send(SdkEvent::Data(AcpEventData::from_history(Event::ThinkingStarted))).await.unwrap();
-                }
-            }).await;
-            blocker.execute_batch("COMMIT").unwrap();
-            sent.expect("the owned drain must keep reading frames while an actual SQLite save is stalled");
-            drop(inbound_tx);
-            tokio::time::timeout(Duration::from_secs(10), drain).await
-                .expect("ordered completion reaches EOF after every queued DATA frame").unwrap();
-            sink.flush();
-            let stored: Vec<_> = store.replay_from(id, 0).unwrap().into_iter()
-                .filter(|stored| matches!(stored.event.as_ref(), Event::ThinkingStarted))
-                .map(|stored| { assert_eq!(stored.metadata.scope, EventScope::HistoryOnly); stored.seq }).collect();
-            assert_eq!(stored, (1..=frames).collect::<Vec<_>>(), "every descriptive frame is stored once, in order, without Native authority");
-        }
-
+        let _home = crate::session::test_support::isolate_app_dir();
+        let (sink, store, _rx, tmp) = super::super::test_support::channel_sink();
+        let supervisor = Supervisor::new(Arc::clone(&sink));
+        let id = "s-stalled-save";
+        let lease = supervisor.test_install_stdio(id).await;
+        assert!(
+            lease.retirement().establishment_projection().is_none(),
+            "this descriptive transport fixture cannot advance a real Native SDK frontier"
+        );
+        let blocker = rusqlite::Connection::open(tmp.path().join("acp.db")).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (inbound_tx, inbound_rx) = mpsc::channel(64);
+        let drain = supervisor.start_drain_task(id.into(), lease, inbound_rx, None);
+        let frames = 256_u64;
+        let sent = tokio::time::timeout(Duration::from_secs(2), async {
+            for _ in 0..frames {
+                inbound_tx
+                    .send(SdkEvent::Data(AcpEventData::from_history(
+                        Event::ThinkingStarted,
+                    )))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+        blocker.execute_batch("COMMIT").unwrap();
+        sent.expect(
+            "the owned drain must keep reading frames while an actual SQLite save is stalled",
+        );
+        drop(inbound_tx);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .expect("ordered completion reaches EOF after every queued DATA frame")
+            .unwrap();
+        sink.flush();
+        let stored: Vec<_> = store
+            .replay_from(id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|stored| matches!(stored.event.as_ref(), Event::ThinkingStarted))
+            .map(|stored| {
+                assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                stored.seq
+            })
+            .collect();
+        assert_eq!(
+            stored,
+            (1..=frames).collect::<Vec<_>>(),
+            "every descriptive frame is stored once, in order, without Native authority"
+        );
+    }
 }

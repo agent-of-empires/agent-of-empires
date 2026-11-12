@@ -289,8 +289,10 @@ impl Session {
         let Some(route) = self.shared.ingress.child_route(&child) else {
             return false;
         };
-        if !route.cancel_capable || (self.control.is_some()
-            && route.source != scope.as_ref().and_then(NativeRequestContext::origin)) {
+        if !route.cancel_capable
+            || (self.control.is_some()
+                && route.source != scope.as_ref().and_then(NativeRequestContext::origin))
+        {
             return false;
         }
         let source = route.source;
@@ -299,7 +301,9 @@ impl Session {
             let Some(route) = self.shared.ingress.child_route(&ancestor) else {
                 return false;
             };
-            if route.source != source { return false; }
+            if route.source != source {
+                return false;
+            }
             ancestor = route.parent;
         }
         match self.control.as_ref() {
@@ -562,11 +566,12 @@ impl Session {
                     session_id,
                     respond_to,
                 } => {
-                    let sent = if require_operation(&scope, correlation, self.control.is_some()).is_ok() {
-                        self.cancel_child(session_id, scope).await
-                    } else {
-                        false
-                    };
+                    let sent =
+                        if require_operation(&scope, correlation, self.control.is_some()).is_ok() {
+                            self.cancel_child(session_id, scope).await
+                        } else {
+                            false
+                        };
                     let _ = respond_to.send(sent);
                 }
                 ClientCmd::Cancel => {
@@ -609,8 +614,13 @@ impl Session {
                 ClientCmd::SetMode(mode_id) => {
                     self.dispatch_mode(mode_id, false, scope);
                 }
-                ClientCmd::SetConfigOption { config_id, value, remember } => {
-                    self.dispatch_config_option(config_id, value, remember, scope).await;
+                ClientCmd::SetConfigOption {
+                    config_id,
+                    value,
+                    remember,
+                } => {
+                    self.dispatch_config_option(config_id, value, remember, scope)
+                        .await;
                 }
                 ClientCmd::DeleteSession {
                     acp_session_id,
@@ -775,16 +785,27 @@ impl Session {
         if self.shared.has_active_subagent() {
             let sender = scoped_sender(&self.shared, true, &original_scope);
             publish_scoped(
-                &self.shared, true, &original_scope, &sender,
-                Event::PromptRejected { reason: "agent_busy".into(), text }, false,
-            ).await;
+                &self.shared,
+                true,
+                &original_scope,
+                &sender,
+                Event::PromptRejected {
+                    reason: "agent_busy".into(),
+                    text,
+                },
+                false,
+            )
+            .await;
             let _ = respond_to.send(ResetSessionOutcome::Failed {
                 message: "a subagent is still running; wait for it to finish before clearing the conversation".into(),
             });
             return Ok(());
         }
         let work = self.shared.between_prompt.work_state();
-        if work.is_busy() || !self.shared.bg_tasks.is_empty() || self.shared.aoe.leases.any_live(now_ms()) {
+        if work.is_busy()
+            || !self.shared.bg_tasks.is_empty()
+            || self.shared.aoe.leases.any_live(now_ms())
+        {
             warn!(
                 target: "acp.protocol",
                 tool_calls_in_flight = work.tool_calls,
@@ -793,9 +814,17 @@ impl Session {
             );
             let sender = scoped_sender(&self.shared, true, &original_scope);
             publish_scoped(
-                &self.shared, true, &original_scope, &sender,
-                Event::PromptRejected { reason: "agent_busy".into(), text }, false,
-            ).await;
+                &self.shared,
+                true,
+                &original_scope,
+                &sender,
+                Event::PromptRejected {
+                    reason: "agent_busy".into(),
+                    text,
+                },
+                false,
+            )
+            .await;
             let _ = respond_to.send(ResetSessionOutcome::Failed {
                 message: "agent work is still in flight; wait for it to finish before clearing the conversation".into(),
             });
@@ -1357,7 +1386,14 @@ impl Session {
                 continue;
             }
             match self
-                .reset_set_option(new_id, SessionConfigId::new(id.clone()), value, deadline, false, scope.clone())
+                .reset_set_option(
+                    new_id,
+                    SessionConfigId::new(id.clone()),
+                    value,
+                    deadline,
+                    false,
+                    scope.clone(),
+                )
                 .await
             {
                 Some(Ok(options)) => toggles = model_config_values(&options),

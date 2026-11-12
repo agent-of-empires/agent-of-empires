@@ -13,7 +13,6 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::super::*;
@@ -39,9 +38,18 @@ mod tests {
 
     fn seed_profiles(app: &Path) {
         for (name, contents) in [
-            ("config.toml", "default_profile = 'work'\n[acp]\nmax_concurrent_workers = 100\n"),
-            ("profiles/work/config.toml", "[acp]\nmax_concurrent_workers = 3\nreplay_events = 9\n[theme]\nname = 'dracula'\n"),
-            ("profiles/other/config.toml", "[acp]\nmax_concurrent_workers = 1\n"),
+            (
+                "config.toml",
+                "default_profile = 'work'\n[acp]\nmax_concurrent_workers = 100\n",
+            ),
+            (
+                "profiles/work/config.toml",
+                "[acp]\nmax_concurrent_workers = 3\nreplay_events = 9\n[theme]\nname = 'dracula'\n",
+            ),
+            (
+                "profiles/other/config.toml",
+                "[acp]\nmax_concurrent_workers = 1\n",
+            ),
         ] {
             let path = app.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -76,7 +84,11 @@ mod tests {
             (2, r#"{"UserPromptSent":{"text":"retained prompt"}}"#),
             (3, OPAQUE_EVENT),
         ] {
-            conn.execute("INSERT INTO acp_events VALUES (?1,?2,?3,17)", params![SID, seq, event]).unwrap();
+            conn.execute(
+                "INSERT INTO acp_events VALUES (?1,?2,?3,17)",
+                params![SID, seq, event],
+            )
+            .unwrap();
         }
         conn.execute(
             "INSERT INTO acp_attachments VALUES (?1,2,'image','image','image/png',NULL,x'001122',17)",
@@ -109,21 +121,28 @@ mod tests {
              );
              CREATE INDEX acp_transcript_tools_phase_order
                  ON acp_transcript_tools(session_id,phase,order_seq,tool_call_id);",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO acp_transcript_frontier VALUES (?1,1,3,?2)",
             params![SID, r#"{"last_message_id":null,"last_thought_id":null}"#],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO acp_transcript_tools VALUES (?1,'old-open',1,2,2,0,NULL,NULL,NULL,0,?2)",
             params![SID, r#"{"Open":{"first_seq":null,"text":""}}"#],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn prepare_history(history: History, conn: &Connection) {
         match history {
             History::Main54 | History::Main55 => v054_retained_history_identity::run().unwrap(),
-            History::Acp54 | History::Acp55 | History::Acp56 | History::Acp57 | History::Frontier58 => {
+            History::Acp54
+            | History::Acp55
+            | History::Acp56
+            | History::Acp57
+            | History::Frontier58 => {
                 v054_acp_establishment::run().unwrap();
             }
             History::Legacy53 => {}
@@ -131,14 +150,21 @@ mod tests {
         if matches!(history, History::Main55) {
             v055_global_max_concurrent_workers::run().unwrap();
         }
-        if matches!(history, History::Acp55 | History::Acp56 | History::Acp57 | History::Frontier58) {
+        if matches!(
+            history,
+            History::Acp55 | History::Acp56 | History::Acp57 | History::Frontier58
+        ) {
             v055_acp_event_scope::run().unwrap();
             conn.execute(
                 "INSERT INTO acp_establishment_commit(session_id,seal_json) VALUES (?1,?2)",
                 params![SID, OPAQUE_SEAL],
-            ).unwrap();
+            )
+            .unwrap();
         }
-        if matches!(history, History::Acp56 | History::Acp57 | History::Frontier58) {
+        if matches!(
+            history,
+            History::Acp56 | History::Acp57 | History::Frontier58
+        ) {
             v056_native_prompt_publication::run().unwrap();
         }
         if matches!(history, History::Acp57 | History::Frontier58) {
@@ -173,15 +199,68 @@ mod tests {
 
     fn assert_preserved(app: &Path, conn: &Connection) {
         assert_eq!(fs::read(app.join("sessions.json")).unwrap(), SESSION_BYTES);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM acp_events", [], |row| row.get::<_, u64>(0)).unwrap(), 3);
-        assert_eq!(conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| row.get::<_, String>(0)).unwrap(), OPAQUE_EVENT);
-        assert_eq!(conn.query_row("SELECT data FROM acp_attachments", [], |row| row.get::<_, Vec<u8>>(0)).unwrap(), [0,17,34]);
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM acp_events WHERE scope!=0 OR qualification_json IS NOT NULL", [], |row| row.get::<_, u64>(0)).unwrap(), 0);
-        assert_eq!(conn.query_row("SELECT spent,armed,known FROM acp_rate_limit_budgets WHERE session_id='pruned'", [], |row| Ok((row.get::<_, u64>(0)?,row.get::<_, u64>(1)?,row.get::<_, u64>(2)?))).unwrap(), (7,1,1));
-        assert_eq!(conn.query_row("SELECT COUNT(*) FROM acp_rate_limit_budgets WHERE session_id=?1", [SID], |row| row.get::<_, u64>(0)).unwrap(), 0);
-        let config: toml::Table = fs::read_to_string(app.join("config.toml")).unwrap().parse().unwrap();
-        assert_eq!(config["acp"]["max_concurrent_workers"].as_integer(), Some(1));
-        let profile: toml::Table = fs::read_to_string(app.join("profiles/work/config.toml")).unwrap().parse().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM acp_events", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            OPAQUE_EVENT
+        );
+        assert_eq!(
+            conn.query_row("SELECT data FROM acp_attachments", [], |row| row
+                .get::<_, Vec<u8>>(0))
+                .unwrap(),
+            [0, 17, 34]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM acp_events WHERE scope!=0 OR qualification_json IS NOT NULL",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT spent,armed,known FROM acp_rate_limit_budgets WHERE session_id='pruned'",
+                [],
+                |row| Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, u64>(2)?
+                ))
+            )
+            .unwrap(),
+            (7, 1, 1)
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM acp_rate_limit_budgets WHERE session_id=?1",
+                [SID],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        let config: toml::Table = fs::read_to_string(app.join("config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            config["acp"]["max_concurrent_workers"].as_integer(),
+            Some(1)
+        );
+        let profile: toml::Table = fs::read_to_string(app.join("profiles/work/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
         assert_eq!(profile["acp"]["replay_events"].as_integer(), Some(9));
         assert_eq!(profile["theme"]["name"].as_str(), Some("dracula"));
         assert!(profile["acp"].get("max_concurrent_workers").is_none());
@@ -202,8 +281,16 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn reconciliation_preserves_published_histories_wal_data_and_retained_identity() {
-        for history in [History::Legacy53, History::Main54, History::Main55, History::Acp54,
-            History::Acp55, History::Acp56, History::Acp57, History::Frontier58] {
+        for history in [
+            History::Legacy53,
+            History::Main54,
+            History::Main55,
+            History::Acp54,
+            History::Acp55,
+            History::Acp56,
+            History::Acp57,
+            History::Frontier58,
+        ] {
             let home = tempfile::tempdir().unwrap();
             let _home = crate::session::test_support::isolate_app_dir_at(home.path());
             let app = crate::session::get_app_dir().unwrap();
@@ -217,10 +304,24 @@ mod tests {
             assert_preserved(&app, &conn);
             let reconciled_identity = identity(&conn).unwrap();
             if let Some(old) = old_identity {
-                assert_eq!(reconciled_identity, old, "scope reconciliation must not rotate retained content identity: {history:?}");
+                assert_eq!(
+                    reconciled_identity, old,
+                    "scope reconciliation must not rotate retained content identity: {history:?}"
+                );
             }
-            if matches!(history, History::Acp55 | History::Acp56 | History::Acp57 | History::Frontier58) {
-                assert_eq!(conn.query_row("SELECT seal_json FROM acp_establishment_commit WHERE session_id=?1", [SID], |row| row.get::<_, String>(0)).unwrap(), OPAQUE_SEAL);
+            if matches!(
+                history,
+                History::Acp55 | History::Acp56 | History::Acp57 | History::Frontier58
+            ) {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT seal_json FROM acp_establishment_commit WHERE session_id=?1",
+                        [SID],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    OPAQUE_SEAL
+                );
             }
             if matches!(history, History::Frontier58) {
                 assert_eq!(conn.query_row("SELECT version,through_seq,context_json FROM acp_transcript_frontier WHERE session_id=?1", [SID], |row| Ok((row.get::<_, u64>(0)?,row.get::<_, u64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,3,r#"{"last_message_id":null,"last_thought_id":null}"#.to_owned()));
@@ -230,14 +331,30 @@ mod tests {
             let backups = crate::session::migration_backups(&path).unwrap();
             for (_, backup) in &backups {
                 let snapshot = Connection::open(backup).unwrap();
-                assert_eq!(snapshot.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| row.get::<_, String>(0)).unwrap(), OPAQUE_EVENT);
-                assert_eq!(snapshot.query_row("SELECT data FROM acp_attachments", [], |row| row.get::<_, Vec<u8>>(0)).unwrap(), [0,17,34]);
+                assert_eq!(
+                    snapshot
+                        .query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .unwrap(),
+                    OPAQUE_EVENT
+                );
+                assert_eq!(
+                    snapshot
+                        .query_row("SELECT data FROM acp_attachments", [], |row| row
+                            .get::<_, Vec<u8>>(0))
+                        .unwrap(),
+                    [0, 17, 34]
+                );
             }
             super::run().unwrap();
             run_migrations().unwrap();
             assert_preserved(&app, &conn);
             assert_eq!(identity(&conn).unwrap(), reconciled_identity);
-            assert_eq!(crate::session::migration_backups(&path).unwrap().len(), backups.len());
+            assert_eq!(
+                crate::session::migration_backups(&path).unwrap().len(),
+                backups.len()
+            );
         }
     }
 
@@ -259,8 +376,22 @@ mod tests {
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
         assert_eq!(identity(&conn).unwrap(), old_identity);
-        assert_eq!(conn.query_row("SELECT known FROM acp_rate_limit_budgets WHERE session_id='pruned'", [], |row| row.get::<_, u64>(0)).unwrap(), 1);
-        assert_eq!(conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| row.get::<_, String>(0)).unwrap(), OPAQUE_EVENT);
+        assert_eq!(
+            conn.query_row(
+                "SELECT known FROM acp_rate_limit_budgets WHERE session_id='pruned'",
+                [],
+                |row| row.get::<_, u64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            OPAQUE_EVENT
+        );
         let path = app.join("acp_events.db");
         let backups = crate::session::migration_backups(&path).unwrap().len();
         fs::write(&other, valid_config).unwrap();
@@ -268,7 +399,10 @@ mod tests {
         assert_eq!(get_current_version(), 59);
         assert_preserved(&app, &conn);
         assert_eq!(identity(&conn).unwrap(), old_identity);
-        assert_eq!(crate::session::migration_backups(&path).unwrap().len(), backups);
+        assert_eq!(
+            crate::session::migration_backups(&path).unwrap().len(),
+            backups
+        );
     }
 
     #[test]
@@ -283,16 +417,32 @@ mod tests {
             let conn = seed_legacy_database(&app);
             prepare_history(History::Main55, &conn);
             if malformed_scope {
-                conn.execute_batch("ALTER TABLE acp_events ADD COLUMN scope TEXT").unwrap();
+                conn.execute_batch("ALTER TABLE acp_events ADD COLUMN scope TEXT")
+                    .unwrap();
             } else {
-                conn.execute("UPDATE acp_rate_limit_budgets SET spent=-1 WHERE session_id='pruned'", []).unwrap();
+                conn.execute(
+                    "UPDATE acp_rate_limit_budgets SET spent=-1 WHERE session_id='pruned'",
+                    [],
+                )
+                .unwrap();
             }
             let marker = fs::read(app.join(VERSION_FILE)).unwrap();
             assert!(run_migrations().is_err());
             assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
             assert_eq!(fs::read(app.join("sessions.json")).unwrap(), SESSION_BYTES);
-            assert_eq!(conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| row.get::<_, String>(0)).unwrap(), OPAQUE_EVENT);
-            assert_eq!(conn.query_row("SELECT data FROM acp_attachments", [], |row| row.get::<_, Vec<u8>>(0)).unwrap(), [0,17,34]);
+            assert_eq!(
+                conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+                OPAQUE_EVENT
+            );
+            assert_eq!(
+                conn.query_row("SELECT data FROM acp_attachments", [], |row| row
+                    .get::<_, Vec<u8>>(0))
+                    .unwrap(),
+                [0, 17, 34]
+            );
         }
     }
 
@@ -312,6 +462,12 @@ mod tests {
         assert!(run_migrations().is_err());
         assert_eq!(fs::read(app.join(VERSION_FILE)).unwrap(), marker);
         assert_eq!(fs::read(app.join("sessions.json")).unwrap(), malformed);
-        assert_eq!(conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| row.get::<_, String>(0)).unwrap(), OPAQUE_EVENT);
+        assert_eq!(
+            conn.query_row("SELECT event_json FROM acp_events WHERE seq=3", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap(),
+            OPAQUE_EVENT
+        );
     }
 }

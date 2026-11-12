@@ -706,28 +706,44 @@ fn trash_retained_transcript_is_read_only() {
     let schema = agent_of_empires::events::Schema::new("acp").unwrap();
     // Descriptive legacy data only: no private Native metadata, receipt or completion is minted.
     let seed_history = |connection: &rusqlite::Connection, id: &str, seq: u64, event: &Event| {
-        agent_of_empires::events::insert_event(connection, &schema, id, seq,
-            &serde_json::to_string(event).unwrap(), chrono::Utc::now().timestamp_millis())
+        agent_of_empires::events::insert_event(
+            connection,
+            &schema,
+            id,
+            seq,
+            &serde_json::to_string(event).unwrap(),
+            chrono::Utc::now().timestamp_millis(),
+        )
     };
     let store = agent_of_empires::events::open(&database, &schema).unwrap();
-    seed_history(&store, &id, 1, &Event::AvailableCommandsUpdated {
-        commands: Vec::new(),
-    })
-        .unwrap();
-    seed_history(&store, &id, 8, &Event::ToolCallStarted {
-        tool_call: ToolCall {
-            id: "unfinished-tool".into(),
-            name: "RetainedPendingTool".into(),
-            kind: "execute".into(),
-            args_preview: "{}".into(),
-            prompt: None,
-            started_at: chrono::Utc::now(),
-            parent_tool_call_id: None,
-            memory_recall: None,
-            diffs: Vec::new(),
+    seed_history(
+        &store,
+        &id,
+        1,
+        &Event::AvailableCommandsUpdated {
+            commands: Vec::new(),
         },
-    })
-        .unwrap();
+    )
+    .unwrap();
+    seed_history(
+        &store,
+        &id,
+        8,
+        &Event::ToolCallStarted {
+            tool_call: ToolCall {
+                id: "unfinished-tool".into(),
+                name: "RetainedPendingTool".into(),
+                kind: "execute".into(),
+                args_preview: "{}".into(),
+                prompt: None,
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
     for seq in 10..=1014 {
         let event = if seq == 1008 {
             Event::ToolCallContent {
@@ -745,65 +761,100 @@ fn trash_retained_transcript_is_read_only() {
         };
         seed_history(&store, &id, seq, &event).unwrap();
     }
-    seed_history(&store, &id, 1015, &Event::ToolCallCompleted {
-        tool_call_id: "retained-tool".into(),
-        is_error: false,
-        content: String::new(),
-        output: Vec::new(),
-        completed_at: chrono::Utc::now(),
-        async_subagent: false,
-    })
-        .unwrap();
-    seed_history(&store, &id, 1016, &Event::ToolCallContent {
-        tool_call_id: "failed-tool".into(),
-        content: (0..40)
-            .map(|i| format!("error-output-{i:02}\n"))
-            .collect::<String>()
-            + "ERROR-OUTPUT-END",
-    })
-        .unwrap();
-    seed_history(&store, &id, 1017, &Event::ToolCallCompleted {
-        tool_call_id: "failed-tool".into(),
-        is_error: true,
-        content: String::new(),
-        output: Vec::new(),
-        completed_at: chrono::Utc::now(),
-        async_subagent: false,
-    })
-        .unwrap();
+    seed_history(
+        &store,
+        &id,
+        1015,
+        &Event::ToolCallCompleted {
+            tool_call_id: "retained-tool".into(),
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: chrono::Utc::now(),
+            async_subagent: false,
+        },
+    )
+    .unwrap();
+    seed_history(
+        &store,
+        &id,
+        1016,
+        &Event::ToolCallContent {
+            tool_call_id: "failed-tool".into(),
+            content: (0..40)
+                .map(|i| format!("error-output-{i:02}\n"))
+                .collect::<String>()
+                + "ERROR-OUTPUT-END",
+        },
+    )
+    .unwrap();
+    seed_history(
+        &store,
+        &id,
+        1017,
+        &Event::ToolCallCompleted {
+            tool_call_id: "failed-tool".into(),
+            is_error: true,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: chrono::Utc::now(),
+            async_subagent: false,
+        },
+    )
+    .unwrap();
     for (seq, content) in [
         (1018, "superseded unfinished output".to_string()),
         (1019, "a".repeat(62) + "♥️x\nUNFINISHED-OUTPUT-END"),
     ] {
-        seed_history(&store, &id, seq, &Event::ToolCallContent {
-            tool_call_id: "unfinished-tool".into(),
-            content,
-        })
-            .unwrap();
+        seed_history(
+            &store,
+            &id,
+            seq,
+            &Event::ToolCallContent {
+                tool_call_id: "unfinished-tool".into(),
+                content,
+            },
+        )
+        .unwrap();
     }
-    seed_history(&store, &id, 1020, &Event::ToolCallContent {
-        tool_call_id: "media-tool".into(),
-        content: "MEDIA-RETAINED-TEXT".into(),
-    })
-        .unwrap();
-    seed_history(&store, &id, 1021, &Event::ToolCallCompleted {
-        tool_call_id: "media-tool".into(),
-        is_error: false,
-        content: String::new(),
-        output: vec![agent_of_empires::acp::state::ToolOutputBlock::Image {
-            mime_type: "image/png".into(),
-            data: None,
-            uri: None,
-        }],
-        completed_at: chrono::Utc::now(),
-        async_subagent: false,
-    })
-        .unwrap();
+    seed_history(
+        &store,
+        &id,
+        1020,
+        &Event::ToolCallContent {
+            tool_call_id: "media-tool".into(),
+            content: "MEDIA-RETAINED-TEXT".into(),
+        },
+    )
+    .unwrap();
+    seed_history(
+        &store,
+        &id,
+        1021,
+        &Event::ToolCallCompleted {
+            tool_call_id: "media-tool".into(),
+            is_error: false,
+            content: String::new(),
+            output: vec![agent_of_empires::acp::state::ToolOutputBlock::Image {
+                mime_type: "image/png".into(),
+                data: None,
+                uri: None,
+            }],
+            completed_at: chrono::Utc::now(),
+            async_subagent: false,
+        },
+    )
+    .unwrap();
     for seq in [1, 3] {
-        seed_history(&store, &empty_id, seq, &Event::AvailableCommandsUpdated {
-            commands: Vec::new(),
-        })
-            .unwrap();
+        seed_history(
+            &store,
+            &empty_id,
+            seq,
+            &Event::AvailableCommandsUpdated {
+                commands: Vec::new(),
+            },
+        )
+        .unwrap();
     }
     drop(store);
     let launch_marker = h.home_path().join("agent-launched");
@@ -911,11 +962,16 @@ fn trash_retained_transcript_is_read_only() {
     }
     let before = h.read_sessions();
     let events = agent_of_empires::events::open(&database, &schema).unwrap();
-    seed_history(&events, &id, 1022, &Event::AgentMessageChunk {
-        text: "LATE-RETAINED-OUTPUT\n\n".into(),
-        message_id: Some("late".into()),
-    })
-        .unwrap();
+    seed_history(
+        &events,
+        &id,
+        1022,
+        &Event::AgentMessageChunk {
+            text: "LATE-RETAINED-OUTPUT\n\n".into(),
+            message_id: Some("late".into()),
+        },
+    )
+    .unwrap();
     drop(events);
     h.wait_for("LATE-RETAINED-OUTPUT");
     h.assert_screen_contains("Esc: sessions");
@@ -946,17 +1002,27 @@ fn trash_retained_transcript_is_read_only() {
         std::fs::write(directory.join("trash-late-output.txt"), h.capture_screen()).unwrap();
     }
     let events = agent_of_empires::events::open(&database, &schema).unwrap();
-    seed_history(&events, &id, 1024, &Event::ConversationSummary {
-        text: "CONCURRENT-TEARDOWN-SUMMARY".into(),
-        summarized_until_seq: 1022,
-    })
-        .unwrap();
+    seed_history(
+        &events,
+        &id,
+        1024,
+        &Event::ConversationSummary {
+            text: "CONCURRENT-TEARDOWN-SUMMARY".into(),
+            summarized_until_seq: 1022,
+        },
+    )
+    .unwrap();
     h.wait_for("CONCURRENT-TEARDOWN-SUMMARY");
     h.assert_screen_not_contains("◼");
-    seed_history(&events, &id, 1023, &Event::Stopped {
-        reason: "user_stopped".into(),
-    })
-        .unwrap();
+    seed_history(
+        &events,
+        &id,
+        1023,
+        &Event::Stopped {
+            reason: "user_stopped".into(),
+        },
+    )
+    .unwrap();
     drop(events);
     h.wait_for_absent("completion unavailable", Duration::from_secs(45));
     h.assert_screen_contains("CONCURRENT-TEARDOWN-SUMMARY");

@@ -371,13 +371,31 @@ pub(super) async fn handle_control_connection(
             ControlBody::Cancel { scope } => {
                 if let Some(acp_session_id) = shared.acp_session_id().await {
                     shared
-                        .agent_cancel(&agent_stdin, attachment_id, &acp_session_id, &acp_session_id, scope)
+                        .agent_cancel(
+                            &agent_stdin,
+                            attachment_id,
+                            &acp_session_id,
+                            &acp_session_id,
+                            scope,
+                        )
                         .await;
                 }
                 continue;
             }
-            ControlBody::CancelSession { parent_session_id, session_id: child_session_id, scope } => {
-                shared.agent_cancel(&agent_stdin, attachment_id, &parent_session_id, &child_session_id, scope).await;
+            ControlBody::CancelSession {
+                parent_session_id,
+                session_id: child_session_id,
+                scope,
+            } => {
+                shared
+                    .agent_cancel(
+                        &agent_stdin,
+                        attachment_id,
+                        &parent_session_id,
+                        &child_session_id,
+                        scope,
+                    )
+                    .await;
                 continue;
             }
             reply @ (ControlBody::ServerResult { .. } | ControlBody::ServerError { .. }) => {

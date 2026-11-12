@@ -65,7 +65,9 @@ impl<'a> ControlKind<'a> {
             Event::RateLimit { .. } => Self::Quota,
             Event::UserPromptSent { .. } => Self::Prompt,
             Event::UserDiffCommentsPrompt { .. } => Self::DiffPrompt,
-            Event::AgentMessageChunk { .. } | Event::AgentThoughtChunk { .. } | Event::ToolCallStarted { .. } => Self::AgentWork,
+            Event::AgentMessageChunk { .. }
+            | Event::AgentThoughtChunk { .. }
+            | Event::ToolCallStarted { .. } => Self::AgentWork,
             Event::AgentSwitched { .. } => Self::Switched,
             Event::SessionCleared => Self::Cleared,
             Event::SessionContextReset { .. } => Self::ContextReset,

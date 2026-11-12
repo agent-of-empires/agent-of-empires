@@ -3319,7 +3319,6 @@ mod tests {
                 !resume_supported,
                 "{tool}: direct resume flags"
             );
-
         }
     }
 

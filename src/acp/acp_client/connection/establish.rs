@@ -110,21 +110,29 @@ pub(super) async fn establish(
                 })?
             }
             None => ordered_native_request(
-                &connection, &shared.connection_state, None,
+                &connection,
+                &shared.connection_state,
+                None,
                 build_initialize_request(shared.profile),
             )
             .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
-            .wait().await.into_result()?,
+            .wait()
+            .await
+            .into_result()?,
         };
         Ok::<_, agent_client_protocol::Error>(init)
-    }.await;
+    }
+    .await;
     let init = match initialized {
         Ok(init) => init,
         Err(error) => {
             if matches!(ctx.mode, ConnectMode::Fresh) {
-                shared.event_tx.close_establishment(Some(
-                    crate::acp::establishment::EstablishmentBlockReason::NotIssued,
-                )).await;
+                shared
+                    .event_tx
+                    .close_establishment(Some(
+                        crate::acp::establishment::EstablishmentBlockReason::NotIssued,
+                    ))
+                    .await;
             }
             return Err(error);
         }
@@ -307,7 +315,8 @@ pub(super) async fn establish(
     session.apply_default_model().await;
     session.apply_default_effort().await;
     session.apply_default_model_config().await;
-    if session.control.is_none() && arm_resume_watchdog && shared.connection_state.loss().is_none() {
+    if session.control.is_none() && arm_resume_watchdog && shared.connection_state.loss().is_none()
+    {
         spawn_resume_idle_watchdog(shared, &session.connection);
     }
     Ok(Some(session))
@@ -445,15 +454,16 @@ impl Session {
                 let req = LoadSessionRequest::new(session_id.clone(), self.agent_cwd.clone())
                     .mcp_servers(mcp_servers);
                 self.shared.aoe.set_loading_history(true);
-                let loaded = establish_session::<LoadSessionResponse>(control, "session/load", &req).await;
+                let loaded =
+                    establish_session::<LoadSessionResponse>(control, "session/load", &req).await;
                 self.shared.aoe.set_loading_history(false);
                 loaded.map(|response| {
-                        (
-                            SessionId::from(session_id.clone()),
-                            response.modes,
-                            response.config_options,
-                        )
-                    })
+                    (
+                        SessionId::from(session_id.clone()),
+                        response.modes,
+                        response.config_options,
+                    )
+                })
             }
             EstablishmentTarget::New => {
                 let req = NewSessionRequest::new(self.agent_cwd.clone()).mcp_servers(mcp_servers);
@@ -631,7 +641,12 @@ impl Session {
                     && postimage.choice.acp_session_id.as_deref() == Some(id.0.as_ref()) =>
             {
                 #[cfg(test)]
-                let gate = shared.connection_state.test_establishment_usable.lock().unwrap().take();
+                let gate = shared
+                    .connection_state
+                    .test_establishment_usable
+                    .lock()
+                    .unwrap()
+                    .take();
                 #[cfg(test)]
                 if let Some((entered, release)) = gate {
                     let _ = entered.send(());
@@ -641,7 +656,9 @@ impl Session {
                     && control.projection.applied().is_some()
                     && !shared.connection_state.is_stopping();
                 if publish_assignment {
-                    if ready { shared.connection_state.record_usable(); }
+                    if ready {
+                        shared.connection_state.record_usable();
+                    }
                     shared
                         .emit(Event::AcpSessionAssigned {
                             acp_session_id: id.0.to_string(),
@@ -777,18 +794,28 @@ impl Session {
             match self.channels.model_config.get(id) {
                 None => debug!(target: "acp.protocol", session = %label, config_id = %id,
                     "structured view model_config skipped; option not advertised"),
-                Some(current) if current == value => debug!(target: "acp.protocol", session = %label,
-                    config_id = %id, "structured view model_config already current"),
+                Some(current) if current == value => {
+                    debug!(target: "acp.protocol", session = %label,
+                    config_id = %id, "structured view model_config already current")
+                }
                 Some(_) => {
                     let result = apply_config_default(
-                        &self.connection, &self.shared.connection_state, &self.shared.event_tx,
+                        &self.connection,
+                        &self.shared.connection_state,
+                        &self.shared.event_tx,
                         agent_client_protocol::v1::schema::SetSessionConfigOptionRequest::new(
-                            self.acp_session_id.clone(), SessionConfigId::new(id.as_str()),
-                            agent_client_protocol::v1::schema::SessionConfigValueId::new(value.as_str()),
+                            self.acp_session_id.clone(),
+                            SessionConfigId::new(id.as_str()),
+                            agent_client_protocol::v1::schema::SessionConfigValueId::new(
+                                value.as_str(),
+                            ),
                         ),
                         label,
-                        self.control.as_ref().and_then(|control| control.original_request_context()),
-                    ).await;
+                        self.control
+                            .as_ref()
+                            .and_then(|control| control.original_request_context()),
+                    )
+                    .await;
                     if let Ok(options) = result {
                         self.channels.model_config = model_config_values(&options);
                     }
@@ -807,12 +834,28 @@ mod tests {
         use aoe_meta::{LeaseKind, LeaseOp, LeaseVerb};
         let leases = aoe_meta::lease::LeaseTable::default();
         let acquire = LeaseOp {
-            id: "bg".into(), kind: LeaseKind::Busy, op: LeaseVerb::Acquire, ttl_ms: Some(60_000),
+            id: "bg".into(),
+            kind: LeaseKind::Busy,
+            op: LeaseVerb::Acquire,
+            ttl_ms: Some(60_000),
         };
         leases.apply(&acquire, 0).unwrap();
-        for (now, idle, stop) in [(31_000,31_000,false),(59_999,59_999,false),(60_000,60_000,true)] {
-            assert_eq!(resume_idle_expired(idle,30_000,&leases,now),stop,"{now}");
+        for (now, idle, stop) in [
+            (31_000, 31_000, false),
+            (59_999, 59_999, false),
+            (60_000, 60_000, true),
+        ] {
+            assert_eq!(
+                resume_idle_expired(idle, 30_000, &leases, now),
+                stop,
+                "{now}"
+            );
         }
-        assert!(resume_idle_expired(30_000,30_000,&Default::default(),30_000));
+        assert!(resume_idle_expired(
+            30_000,
+            30_000,
+            &Default::default(),
+            30_000
+        ));
     }
 }

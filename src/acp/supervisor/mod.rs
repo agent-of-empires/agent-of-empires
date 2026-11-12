@@ -774,11 +774,13 @@ impl<S: BroadcastSink> Supervisor<S> {
             return Err(SupervisorError::TeardownPending(session_id.into()));
         }
         drop(lifecycle);
-        self.sink.clear_session_events(session_id, Arc::clone(&self.next_seqs)).map_err(|error| {
-            warn!(target: "acp.supervisor", session = %session_id, %error,
+        self.sink
+            .clear_session_events(session_id, Arc::clone(&self.next_seqs))
+            .map_err(|error| {
+                warn!(target: "acp.supervisor", session = %session_id, %error,
                 "could not clear the retired session journal");
-            SupervisorError::NativeStoreUnavailable
-        })?;
+                SupervisorError::NativeStoreUnavailable
+            })?;
         lock_recover(&self.startup_requeues).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
         Ok(())
@@ -1136,7 +1138,8 @@ fn publish_next_persisted<S: BroadcastSink + ?Sized>(
     data: crate::acp::event_sender::AcpEventData,
 ) -> (u64, bool) {
     sink.queue_persisted(session_id, Arc::clone(next_seqs), data, None)
-        .wait().expect("event writer ended before completing host publication")
+        .wait()
+        .expect("event writer ended before completing host publication")
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -3032,45 +3032,82 @@ mod tests {
     #[serial_test::serial]
     async fn acp_event_listener_keeps_the_running_to_idle_edge_across_a_folded_burst() {
         use crate::acp::supervisor::test_support::managed::with_managed;
-        with_managed(|scope| Box::pin(async move {
-            crate::session::set_unread_enabled(true);
-            let mut live = test_support::managed_control_session(scope, "listener-approved-burst").await;
-            let state = live.state.clone();
-            let id = live.id().to_owned();
-            let listener = start_managed_listener(scope, &state).await;
-            let request = live.start_prompt("go").await;
-            live.native.send(serde_json::json!({"jsonrpc":"2.0","id":"folded-burst-permission",
+        with_managed(|scope| {
+            Box::pin(async move {
+                crate::session::set_unread_enabled(true);
+                let mut live =
+                    test_support::managed_control_session(scope, "listener-approved-burst").await;
+                let state = live.state.clone();
+                let id = live.id().to_owned();
+                let listener = start_managed_listener(scope, &state).await;
+                let request = live.start_prompt("go").await;
+                live.native
+                    .send(
+                        serde_json::json!({"jsonrpc":"2.0","id":"folded-burst-permission",
                 "method":"session/request_permission","params":{"sessionId":live.sid,
                 "toolCall":{"toolCallId":"burst-tool","title":"Wait for user"},
-                "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}})).await;
-            let nonce = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if let Some(Event::ApprovalRequested { approval }) = live.client.next_event().await {
-                        break approval.nonce;
+                "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]}}),
+                    )
+                    .await;
+                let nonce = tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if let Some(Event::ApprovalRequested { approval }) =
+                            live.client.next_event().await
+                        {
+                            break approval.nonce;
+                        }
                     }
-                }
-            }).await.expect("the actual Original callback publishes its answerable nonce");
-            await_row(&state, &id, |row| row.status == Status::Waiting,
-                "the original callback genuinely enters Waiting").await;
-            let locked = state.clone();
-            let mirror = locked.instances.write().await;
-            state.acp_supervisor.resolve_permission(&id, nonce,
-                crate::acp::approvals::ApprovalDecision::Allow, Some("allow".into())).await.unwrap();
-            let reply = tokio::time::timeout(Duration::from_secs(10), live.native.reply()).await.unwrap();
-            assert_eq!(reply["id"], "folded-burst-permission");
-            assert_eq!(reply["result"]["outcome"]["optionId"], "allow");
-            live.finish_prompt(&request, None).await;
-            assert_eq!(state.acp_event_store.has_in_flight_main_turn(&id).unwrap(),
-                crate::acp::event_store::ControlKnowledge::Known(false));
-            assert!(state.acp_event_store.unresolved_approval_nonces(&id).is_empty());
-            drop(mirror);
-            let row = await_row(&state, &id, |row| row.unread,
-                "the burst's genuine Waiting-to-Running-to-Idle edge marks unread").await;
-            assert_eq!(row.status, Status::Idle);
-            assert!(load_profile_row("test", &id).unwrap().unread);
-            listener.abort();
-            let _ = listener.await;
-        })).await;
+                })
+                .await
+                .expect("the actual Original callback publishes its answerable nonce");
+                await_row(
+                    &state,
+                    &id,
+                    |row| row.status == Status::Waiting,
+                    "the original callback genuinely enters Waiting",
+                )
+                .await;
+                let locked = state.clone();
+                let mirror = locked.instances.write().await;
+                state
+                    .acp_supervisor
+                    .resolve_permission(
+                        &id,
+                        nonce,
+                        crate::acp::approvals::ApprovalDecision::Allow,
+                        Some("allow".into()),
+                    )
+                    .await
+                    .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(10), live.native.reply())
+                    .await
+                    .unwrap();
+                assert_eq!(reply["id"], "folded-burst-permission");
+                assert_eq!(reply["result"]["outcome"]["optionId"], "allow");
+                live.finish_prompt(&request, None).await;
+                assert_eq!(
+                    state.acp_event_store.has_in_flight_main_turn(&id).unwrap(),
+                    crate::acp::event_store::ControlKnowledge::Known(false)
+                );
+                assert!(state
+                    .acp_event_store
+                    .unresolved_approval_nonces(&id)
+                    .is_empty());
+                drop(mirror);
+                let row = await_row(
+                    &state,
+                    &id,
+                    |row| row.unread,
+                    "the burst's genuine Waiting-to-Running-to-Idle edge marks unread",
+                )
+                .await;
+                assert_eq!(row.status, Status::Idle);
+                assert!(load_profile_row("test", &id).unwrap().unread);
+                listener.abort();
+                let _ = listener.await;
+            })
+        })
+        .await;
     }
 
     /// The real original terminal durably marks unread and mirrors it into daemon memory.

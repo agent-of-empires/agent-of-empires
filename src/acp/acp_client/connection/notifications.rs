@@ -11,7 +11,8 @@ use crate::acp::event_sender::{EventMetadata, EventScope, EventSender};
 use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
 use agent_client_protocol::v1::schema::{
-    ContentBlock, SessionId, SessionNotification, SessionUpdate, ToolCallStatus, };
+    ContentBlock, SessionId, SessionNotification, SessionUpdate, ToolCallStatus,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,8 +33,7 @@ use crate::acp::acp_client::session_identity::{IngressUpdate, PendingIngress, Se
 use crate::acp::acp_client::session_sandbox::SessionSandbox;
 use crate::acp::acp_client::tool_context::{
     capture_tool_context_input, restore_wake_tool_title, shell_command, update_tool_context_cache,
-    ToolCallContextCache,
-    ToolContextCache,
+    ToolCallContextCache, ToolContextCache,
 };
 use crate::acp::acp_client::transcript_filter::{is_transcript_event, transcript_event_kind};
 use crate::acp::acp_client::update_events::{
@@ -287,7 +287,11 @@ impl Shared {
             return Ok(());
         }
         let _guard = self.ingress.fence.write().await;
-        let changed = self.ingress.current().as_ref().is_some_and(|current| current != &id);
+        let changed = self
+            .ingress
+            .current()
+            .as_ref()
+            .is_some_and(|current| current != &id);
         let replay = self.ingress.finish(Some(id))?;
         if changed {
             self.aoe.session_reset();

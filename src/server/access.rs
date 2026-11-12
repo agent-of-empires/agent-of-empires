@@ -453,7 +453,6 @@ pub(super) const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("DELETE", "/api/login/sessions/{id}"),
 ];
 
-
 /// Refuse unlisted mutations in CityHall mode with the canonical 403.
 /// Unmatched routes and omitted prefixes fail closed.
 pub(super) async fn cityhall_gate(

@@ -224,7 +224,6 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-
   });
 
   try {
@@ -317,7 +316,6 @@ base("structured view approval card", async ({ page }, testInfo) => {
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-
   });
 
   try {

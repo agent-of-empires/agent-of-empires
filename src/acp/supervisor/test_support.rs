@@ -302,7 +302,9 @@ impl VecSink {
         let mut frames = self.frames.lock().unwrap();
         loop {
             match completed.try_recv() {
-                Ok(frame) => frames.push((frame.session_id, frame.seq, frame.event.as_ref().clone())),
+                Ok(frame) => {
+                    frames.push((frame.session_id, frame.seq, frame.event.as_ref().clone()))
+                }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(error) => panic!("actual completed observer publication was lost: {error}"),
             }
@@ -315,54 +317,103 @@ impl BroadcastSink for VecSink {
         self.durable.publish(session_id, seq, data);
         self.capture_completed();
     }
-    fn publish_persisted(&self, session_id: &str, seq: u64, data: &crate::acp::event_sender::AcpEventData) -> bool {
+    fn publish_persisted(
+        &self,
+        session_id: &str,
+        seq: u64,
+        data: &crate::acp::event_sender::AcpEventData,
+    ) -> bool {
         let stored = self.durable.publish_persisted(session_id, seq, data);
         self.capture_completed();
         stored
     }
-    fn queue_persisted(&self, session_id: &str, next_seqs: Arc<super::SeqMap>,
-        data: crate::acp::event_sender::AcpEventData, expected_seq: Option<u64>) -> super::Persisted {
-        let receipt = self.durable.queue_persisted(session_id, next_seqs, data, expected_seq);
+    fn queue_persisted(
+        &self,
+        session_id: &str,
+        next_seqs: Arc<super::SeqMap>,
+        data: crate::acp::event_sender::AcpEventData,
+        expected_seq: Option<u64>,
+    ) -> super::Persisted {
+        let receipt = self
+            .durable
+            .queue_persisted(session_id, next_seqs, data, expected_seq);
         self.durable.flush();
         self.capture_completed();
         receipt
     }
-    fn queue_prompt(&self, session_id: &str, next_seqs: Arc<super::SeqMap>,
+    fn queue_prompt(
+        &self,
+        session_id: &str,
+        next_seqs: Arc<super::SeqMap>,
         attachments: &[crate::acp::event_store::AttachmentBlob],
-        data: crate::acp::event_sender::AcpEventData) -> super::Persisted {
-        let receipt = self.durable.queue_prompt(session_id, next_seqs, attachments, data);
+        data: crate::acp::event_sender::AcpEventData,
+    ) -> super::Persisted {
+        let receipt = self
+            .durable
+            .queue_prompt(session_id, next_seqs, attachments, data);
         self.durable.flush();
         self.capture_completed();
         receipt
     }
-    fn publish_from_worker(&self, publication: super::WorkerPublication) -> Result<(), super::WorkerPublication> {
+    fn publish_from_worker(
+        &self,
+        publication: super::WorkerPublication,
+    ) -> Result<(), super::WorkerPublication> {
         self.durable.publish_from_worker(publication)
     }
-    fn publish_replay_from_worker(&self, session_id: &str, seq: u64,
-        data: &crate::acp::event_sender::AcpEventData, generation: u64,
+    fn publish_replay_from_worker(
+        &self,
+        session_id: &str,
+        seq: u64,
+        data: &crate::acp::event_sender::AcpEventData,
+        generation: u64,
         subject: Option<crate::acp::state::NativeEventSubject>,
-        replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>) -> bool {
-        let stored = self.durable.publish_replay_from_worker(session_id, seq, data, generation, subject, replay);
+        replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
+    ) -> bool {
+        let stored = self
+            .durable
+            .publish_replay_from_worker(session_id, seq, data, generation, subject, replay);
         self.capture_completed();
         stored
     }
-    fn establishment_store(&self) -> Option<Arc<EventStore>> { self.durable.establishment_store() }
-    fn clear_session_events(&self, session_id: &str, next_seqs: Arc<super::SeqMap>) -> anyhow::Result<()> {
+    fn establishment_store(&self) -> Option<Arc<EventStore>> {
+        self.durable.establishment_store()
+    }
+    fn clear_session_events(
+        &self,
+        session_id: &str,
+        next_seqs: Arc<super::SeqMap>,
+    ) -> anyhow::Result<()> {
         self.durable.clear_session_events(session_id, next_seqs)
     }
-    fn unsuccessful_main(&self, session_id: &str) -> anyhow::Result<crate::acp::event_store::ControlKnowledge<bool>> {
+    fn unsuccessful_main(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<crate::acp::event_store::ControlKnowledge<bool>> {
         self.durable.unsuccessful_main(session_id)
     }
     fn unresolved_background_task_ids(&self, session_id: &str) -> Vec<String> {
         self.durable.unresolved_background_task_ids(session_id)
     }
-    fn unresolved_background_task_launches(&self, session_id: &str) -> anyhow::Result<Vec<crate::acp::state::BackgroundTaskLaunch>> {
+    fn unresolved_background_task_launches(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<crate::acp::state::BackgroundTaskLaunch>> {
         self.durable.unresolved_background_task_launches(session_id)
     }
-    fn unresolved_background_agent_launches(&self, session_id: &str) -> anyhow::Result<Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>> {
-        self.durable.unresolved_background_agent_launches(session_id)
+    fn unresolved_background_agent_launches(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<crate::acp::event_store::UnresolvedBackgroundAgentLaunch>> {
+        self.durable
+            .unresolved_background_agent_launches(session_id)
     }
-    fn record_attachment(&self, session_id: &str, seq: u64, blob: &crate::acp::event_store::AttachmentBlob) -> bool {
+    fn record_attachment(
+        &self,
+        session_id: &str,
+        seq: u64,
+        blob: &crate::acp::event_store::AttachmentBlob,
+    ) -> bool {
         self.durable.record_attachment(session_id, seq, blob)
     }
     fn delete_attachments_for_seq(&self, session_id: &str, seq: u64) {
@@ -371,21 +422,27 @@ impl BroadcastSink for VecSink {
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
         let mut unresolved = self.durable.unresolved_approval_nonces(session_id);
         for nonce in self.stale_nonces.lock().unwrap().iter() {
-            if !unresolved.contains(nonce) { unresolved.push(nonce.clone()); }
+            if !unresolved.contains(nonce) {
+                unresolved.push(nonce.clone());
+            }
         }
         unresolved
     }
     fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
         let mut unresolved = self.durable.unresolved_elicitation_nonces(session_id);
         for nonce in self.stale_elicitation_nonces.lock().unwrap().iter() {
-            if !unresolved.contains(nonce) { unresolved.push(nonce.clone()); }
+            if !unresolved.contains(nonce) {
+                unresolved.push(nonce.clone());
+            }
         }
         unresolved
     }
     fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
         let mut unresolved = self.durable.unresolved_background_agent_ids(session_id);
         for id in self.stale_background_agent_ids.lock().unwrap().iter() {
-            if !unresolved.contains(id) { unresolved.push(id.clone()); }
+            if !unresolved.contains(id) {
+                unresolved.push(id.clone());
+            }
         }
         unresolved
     }
@@ -960,7 +1017,6 @@ with s:
 
         let (disconnected_tx, disconnected) = tokio::sync::oneshot::channel();
         let peer = tokio::spawn(async move {
-
             let mut disconnected_tx = Some(disconnected_tx);
             while let Some(line) = lines.next_line().await.unwrap() {
                 match line.as_str() {

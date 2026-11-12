@@ -1130,8 +1130,12 @@ done
     #[test]
     fn prior_message_marker_walks_back_through_batches() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::acp::event_store::EventStore::open(&dir.path().join("e.db"), 1000, Default::default())
-            .expect("event store");
+        let store = crate::acp::event_store::EventStore::open(
+            &dir.path().join("e.db"),
+            1000,
+            Default::default(),
+        )
+        .expect("event store");
         let chunk = Event::AgentMessageChunk {
             text: "A".into(),
             message_id: Some("m-a".into()),
