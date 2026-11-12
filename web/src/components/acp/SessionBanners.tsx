@@ -41,9 +41,13 @@ export function SessionBanners({
 }) {
   const nativeReady = nativeInputAvailable(state);
   const startupDiagnosticOnly = nativeReady || state.connectionUnavailable !== null;
+  const reason = state.integrationLost;
+  const startupError = reason
+    ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
+    : state.startupError;
   const variant = pickWorkerStoppedVariant({
     workerStopped: state.workerStopped,
-    startupError: state.startupError,
+    startupError,
     trashedAt,
     archivedAt,
     snoozedUntil,
@@ -53,22 +57,22 @@ export function SessionBanners({
     !state.workerStopped &&
     !state.workerRestarting &&
     !state.connectionUnavailable &&
-    (!state.startupError || nativeReady);
+    (!startupError || nativeReady);
   const idle = healthy && !state.turnActive;
   const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
-      {state.startupError && !startupDiagnosticOnly && (
+      {startupError && !startupDiagnosticOnly && (
         <StartupErrorBanner
           sessionId={sessionId}
-          message={state.startupError}
+          message={startupError}
           acpWorkerState={acpWorkerState}
           sentStopped={state.restartStoppedSent}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
-      {state.startupError && startupDiagnosticOnly && (
-        <InteractionErrorBanner message={state.startupError} onDismiss={dismissError} />
+      {startupError && startupDiagnosticOnly && (
+        <InteractionErrorBanner message={startupError} onDismiss={dismissError} />
       )}
       {state.connectionUnavailable ? (
         <NativeChannelNotice observation={state.connectionUnavailable} current />
@@ -99,7 +103,7 @@ export function SessionBanners({
           sentStopped={state.restartStoppedSent}
         />
       )}
-      {state.workerRestarting && !state.startupError && !state.workerStopped && (
+      {state.workerRestarting && !startupError && !state.workerStopped && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {startingAgent ? (
@@ -124,7 +128,7 @@ export function SessionBanners({
           </PulseBanner>
         )
       )}
-      {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
+      {showWorkerStoppingBanner({ acpWorkerState, startupError }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}

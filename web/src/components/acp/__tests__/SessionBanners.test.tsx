@@ -787,6 +787,7 @@ describe("accepted integration-loss snapshot diagnostics", () => {
       session_id: "snapshot-diagnostic", seq: 1, event: { IntegrationLost: { reason: { kind: "hold_overflow" } } },
     });
     const header = currentControlSnapshot(initial, { ready: false }, 20);
+    delete header.state.integration_lost;
     const state = applyReducedState(initial, header.state, [], header.seq);
     render(banners(state));
     expect(screen.getByText(message)).toBeTruthy();

@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
+import type * as AcpSessionHooks from "../../../hooks/useAcpSession";
 import { applyEvent, applyReducedState, emptyAcpState } from "../../../lib/acpTypes";
 import { currentControlSnapshot } from "../../../../tests/helpers/acpControlSnapshot";
 import { writeClipboard } from "../../../lib/clipboard";
+import { flushAsync, installAcpFakes, lastSocket, profileWrapper } from "../../../hooks/__tests__/acpHarness";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
 
@@ -479,6 +481,15 @@ describe("BackgroundAgentsPanel", () => {
     });
 
     it("POSTs the child cancel route and surfaces a failure", async () => {
+      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>(
+        "../../../hooks/useAcpSession",
+      );
+      installAcpFakes();
+      const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(runtime.result.current.state, { ready: true }));
+      await flushAsync();
       const fetchMock = vi.fn(() =>
         Promise.resolve({ ok: false, status: 409, text: () => Promise.resolve("subagent cannot be cancelled") }),
       );
@@ -489,11 +500,21 @@ describe("BackgroundAgentsPanel", () => {
       fireEvent.click(getByRole("button", { name: "Stop sub-agent" }));
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
       expect(await findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
+      runtime.unmount();
       vi.unstubAllGlobals();
       subagentsMock.mockReturnValue([]);
     });
 
     it("lists and stops a child that has no legacy background-agent record", async () => {
+      const { useAcpSession } = await vi.importActual<typeof AcpSessionHooks>(
+        "../../../hooks/useAcpSession",
+      );
+      installAcpFakes();
+      const runtime = renderHook(() => useAcpSession("s-1"), { wrapper: profileWrapper });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(runtime.result.current.state, { ready: true }));
+      await flushAsync();
       const fetchMock = vi.fn(() => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve("") }));
       vi.stubGlobal("fetch", fetchMock);
       agentsMock.mockReturnValue([]);
@@ -516,6 +537,7 @@ describe("BackgroundAgentsPanel", () => {
       expect(stops).toHaveLength(1);
       fireEvent.click(stops[0]!);
       expect(fetchMock).toHaveBeenCalledWith("/api/sessions/s-1/acp/subagents/child-1/cancel", { method: "POST" });
+      runtime.unmount();
       vi.unstubAllGlobals();
       subagentsMock.mockReturnValue([]);
     });

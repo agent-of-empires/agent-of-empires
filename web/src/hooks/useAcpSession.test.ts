@@ -1336,15 +1336,22 @@ describe("live panel cancellation authority", () => {
     const view = renderView(panelElements(id), { wrapper: profileWrapper });
     const region = view.getByRole("region", { name: "desktop background work" });
     const stop = within(region).getByRole("button", { name: "Stop sub-agent" });
-    clickAtCommit = () => fireEvent.click(stop);
-    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+    clickAtCommit = () => stop.click();
+    await act(async () => {
+      lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+    });
     expect(clickAtCommit).toBeUndefined();
     await flushAsync();
     expect(posts("/cancel")).toEqual([]);
     await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
 
-    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }, 20));
-    fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+    await act(async () => {
+      lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }, 20));
+    });
+    expect(nativeInputAvailable(hook.result.current.state)).toBe(true);
+    await act(async () => {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+    });
     await flushAsync();
     expect(posts("/cancel")).toEqual([
       { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },

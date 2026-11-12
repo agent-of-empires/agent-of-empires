@@ -1014,7 +1014,7 @@ pub struct AcpState {
     pub(crate) native_availability: Option<(u64, NativeEventSubject)>,
     #[serde(skip)]
     pub(crate) native_control_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub integration_lost: Option<IntegrationLostReason>,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
@@ -3898,7 +3898,7 @@ mod tests {
         let stopped = Event::Stopped {
             reason: "end_turn".into(),
         };
-        let assigned = Event::AcpSessionAssigned {
+        let unqualified = Event::AcpSessionAssigned {
             acp_session_id: "s2".into(),
             connection_ready: true,
             native_subject: None,
@@ -3907,8 +3907,19 @@ mod tests {
             state.apply_event(seq as u64 + 1, event).unwrap();
         }
         assert_eq!(state.sidebar_phase, SidebarPhase::Error);
-        state.apply_event(3, assigned).unwrap();
+        assert_eq!(
+            serde_json::to_value(&state).unwrap().get("integration_lost"),
+            Some(&serde_json::json!({"kind": "hold_overflow"}))
+        );
+        state.apply_event(3, unqualified).unwrap();
+        assert!(state.integration_lost.is_some());
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        state.apply_event(4, observed_channel_ready("s2")).unwrap();
         assert!(state.integration_lost.is_none());
         assert_ne!(state.sidebar_phase, SidebarPhase::Error);
+        assert_eq!(
+            serde_json::to_value(&state).unwrap().get("integration_lost"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

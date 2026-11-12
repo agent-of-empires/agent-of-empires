@@ -1,7 +1,7 @@
 // Structured view session: reduces the ACP stream into AcpState and exposes the user's actions.
 // Failed actions surface through transient interaction errors without replacing operation diagnostics.
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, type Dispatch } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef } from "react";
 import {
   emptyAcpState,
   nativeInputAvailable,
@@ -23,9 +23,11 @@ import {
   reportAcpInteraction,
   setSessionSnooze,
 } from "../lib/api";
-import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
+import { classifyResolveResponse, reducer } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
-import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
+import {
+  cacheGet, cacheSet, sweepExpiredStorage, registerLiveAcpActions, ownsLiveAcpActions, NATIVE_INPUT_UNCONFIRMED,
+} from "./acpSession/stateCache";
 import { useLatestRef } from "./useLatestRef";
 
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
@@ -79,25 +81,23 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** POST and report a failure as `Could not <verb>` or `Network error <gerund>`, calling `onFail` first. */
-async function postReportingErrors(
-  dispatch: Dispatch<Action>,
+/** Return a POST's user-facing failure, calling `onFail` before the caller reports it. */
+async function postErrorMessage(
   url: string,
   init: RequestInit,
   [verb, gerund]: [string, string],
   onFail?: () => void,
-): Promise<boolean> {
+): Promise<string | null> {
   try {
     const res = await fetch(url, init);
-    if (res.ok) return true;
+    if (res.ok) return null;
     const detail = await safeText(res);
     onFail?.();
-    dispatch({ kind: "error", message: `Could not ${verb} (${res.status}). ${detail}`.trim() });
+    return `Could not ${verb} (${res.status}). ${detail}`.trim();
   } catch (e) {
     onFail?.();
-    dispatch({ kind: "error", message: `Network error ${gerund}: ${describeError(e)}` });
+    return `Network error ${gerund}: ${describeError(e)}`;
   }
-  return false;
 }
 
 // A UUID v4 even on plain-HTTP LAN hosts, where `crypto.randomUUID` is unavailable.
@@ -112,8 +112,6 @@ function optimisticPromptId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-const NATIVE_INPUT_UNCONFIRMED =
-  "Native input is not currently confirmed. The retained conversation has not been replaced.";
 
 export function useAcpSession(
   sessionId: string | null,
@@ -139,6 +137,7 @@ export function useAcpSession(
     inputStateRef.current = state;
     connectionStatusRef.current = status;
   }, [state, status]);
+  const actionOwner = useMemo(() => Symbol(), [sessionId]);
   const requireNativeInput = useCallback(
     (
       target?: NonNullable<AcpState["interactionError"]>["target"],
@@ -443,19 +442,35 @@ export function useAcpSession(
   }, [sessionId]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
-  const cancelPrompt = useCallback(async () => {
-    if (!sessionId || !requireNativeInput()) return false;
-    return postReportingErrors(dispatch, acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"]);
-  }, [sessionId, requireNativeInput]);
+  const performCancelPrompt = useCallback(async (): Promise<string | null> => {
+    if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
+    if (!requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
+    const message = await postErrorMessage(
+      acpUrl(sessionId, "cancel"), { method: "POST" }, ["cancel", "cancelling"],
+    );
+    if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
+    return message;
+  }, [sessionId, actionOwner, requireNativeInput]);
+  const cancelPrompt = useCallback(async () => (await performCancelPrompt()) === null, [performCancelPrompt]);
 
-  const cancelSubagentById = useCallback(
-    async (childId: string) => {
-      if (!sessionId || !requireNativeInput()) return;
-      const message = await cancelSubagent(sessionId, childId);
-      if (message) dispatch({ kind: "error", message });
-    },
-    [sessionId, requireNativeInput],
-  );
+  const performCancelSubagent = useCallback(async (childId: string): Promise<string | null> => {
+    if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
+    if (!requireNativeInput()) return NATIVE_INPUT_UNCONFIRMED;
+    const message = await cancelSubagent(sessionId, childId);
+    if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
+    return message;
+  }, [sessionId, actionOwner, requireNativeInput]);
+  const cancelSubagentById = useCallback(async (childId: string) => {
+    await performCancelSubagent(childId);
+  }, [performCancelSubagent]);
+
+  useLayoutEffect(() => {
+    if (!sessionId) return;
+    return registerLiveAcpActions(sessionId, actionOwner, {
+      cancelPrompt: performCancelPrompt,
+      cancelSubagent: performCancelSubagent,
+    });
+  }, [sessionId, actionOwner, performCancelPrompt, performCancelSubagent]);
 
   const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
 
@@ -498,13 +513,13 @@ export function useAcpSession(
       if (!sessionId) return;
       if (!requireNativeInput()) return;
       dispatch({ kind: "set_pending_config_option", configId, value });
-      await postReportingErrors(
-        dispatch,
+      const message = await postErrorMessage(
         acpUrl(sessionId, "config-option"),
         jsonPost({ config_id: configId, value }),
         [`set ${configId}`, `setting ${configId}`],
         () => dispatch({ kind: "clear_pending_config_option_if_match", configId, value }),
       );
+      if (message) dispatch({ kind: "error", message });
     },
     [sessionId, requireNativeInput],
   );
@@ -513,10 +528,11 @@ export function useAcpSession(
   const forceEndTurn = useCallback(async () => {
     if (!sessionId) return;
     lastActivityRef.current = Date.now();
-    await postReportingErrors(dispatch, acpUrl(sessionId, "force_end_turn"), { method: "POST" }, [
+    const message = await postErrorMessage(acpUrl(sessionId, "force_end_turn"), { method: "POST" }, [
       "force end turn",
       "forcing end turn",
     ]);
+    if (message) dispatch({ kind: "error", message });
   }, [sessionId, lastActivityRef]);
 
   const dismissers = useMemo(

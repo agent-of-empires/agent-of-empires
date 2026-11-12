@@ -12,7 +12,7 @@ import {
   useWorkflowRuns,
 } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, BackgroundAgentTool, SubagentRecord } from "../../lib/acpTypes";
-import { cancelSubagent } from "../../lib/api";
+import { getLiveAcpActions, NATIVE_INPUT_UNCONFIRMED } from "../../hooks/acpSession/stateCache";
 import { findSubagent, isActiveAgent, paneAgents, workflowPhases, workflowRunning } from "./backgroundAgentsContext";
 import { BackgroundShells } from "./BackgroundShells";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
@@ -157,7 +157,9 @@ function WorkflowGroup({
 /** Stops the whole turn, and with it every running sub-agent. A row's own Stop ends just that one. */
 function StopButton({ sessionId }: { sessionId: string }) {
   const [busy, setBusy] = useState(false);
+  const [stopError, setStopError] = useState<string | null>(null);
   return (
+    <div className="flex flex-col items-end">
     <button
       type="button"
       disabled={busy}
@@ -165,9 +167,8 @@ function StopButton({ sessionId }: { sessionId: string }) {
       onClick={async () => {
         setBusy(true);
         try {
-          await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/cancel`, { method: "POST" });
-        } catch {
-          // best-effort; the tailer marks idle agents stalled regardless
+          const actions = getLiveAcpActions(sessionId);
+          setStopError(actions ? await actions.cancelPrompt() : NATIVE_INPUT_UNCONFIRMED);
         } finally {
           setBusy(false);
         }
@@ -182,6 +183,8 @@ function StopButton({ sessionId }: { sessionId: string }) {
       <Square className="h-3 w-3 fill-current" strokeWidth={0} />
       Stop
     </button>
+      {stopError && <p role="alert" className="max-w-xs text-xs text-status-error">{stopError}</p>}
+    </div>
   );
 }
 
@@ -224,7 +227,10 @@ function AgentRow({
             type="button"
             title="Stop this sub-agent"
             aria-label="Stop sub-agent"
-            onClick={async () => setStopError(await cancelSubagent(sessionId, record.session_id))}
+            onClick={async () => {
+              const actions = getLiveAcpActions(sessionId);
+              setStopError(actions ? await actions.cancelSubagent(record.session_id) : NATIVE_INPUT_UNCONFIRMED);
+            }}
             className="shrink-0 px-1.5 py-2 text-text-dim hover:text-rose-300"
           >
             <Square className="h-3 w-3 fill-current" strokeWidth={0} />

@@ -276,7 +276,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     case "clear_error":
       return state.interactionError
         ? { ...state, interactionError: null }
-        : { ...state, lastError: null, lastErrorEvidence: null, startupError: null };
+        : { ...state, lastError: null, lastErrorEvidence: null, startupError: null, integrationLost: null };
     case "approval_resolved_locally": {
       // Don't wait for the broadcast, which the seq dedupe can swallow (#1821).
       const pendingApprovals = state.pendingApprovals.filter((a) => a.nonce !== action.nonce);

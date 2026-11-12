@@ -30,6 +30,7 @@ export function isNewSessionStarting(
     startedBefore ||
     nativeInputAvailable(state) ||
     state.startupError ||
+    state.integrationLost ||
     state.workerStopped ||
     state.workerRestarting ||
     connectionRetriesExhausted(connection)

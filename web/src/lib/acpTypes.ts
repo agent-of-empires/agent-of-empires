@@ -592,6 +592,8 @@ export interface ReducedState {
   /** Open background task ids; the daemon omits the field when none are open. */
   background_tasks?: string[];
   operation_error?: OperationErrorEvidence | null;
+  /** Current daemons send null to clear; absence belongs to an older wire. */
+  integration_lost?: IntegrationLostReason | null;
   connection_unavailable?: AcpConnectionUnavailability | null;
   connection_ready?: boolean | null;
   /** Existing current WorkerDown queue/wake eligibility, not native health. */
@@ -661,6 +663,9 @@ export interface AcpState {
   oldestSeq: number;
   lagged: boolean;
   startupError: string | null;
+  integrationLost: IntegrationLostReason | null;
+  /** The accepted diagnostic boundary, independent of native-input authority. */
+  integrationLostSnapshotSeq: number | null;
   /** Adapter compatibility failure; replaces the session view with `StartupErrorScreen`. */
   incompatibleAgent: IncompatibleAgentDetail | null;
   lastError: string | null;
@@ -1071,6 +1076,8 @@ export function emptyAcpState(): AcpState {
     oldestSeq: 0,
     lagged: false,
     startupError: null,
+    integrationLost: null,
+    integrationLostSnapshotSeq: null,
     incompatibleAgent: null,
     lastError: null,
     lastErrorEvidence: null,
@@ -1475,10 +1482,9 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("IntegrationLost" in event) {
-    const { reason } = event.IntegrationLost;
-    next.startupError = `Agent integration lost: ${
-      reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")
-    }`;
+    if (state.integrationLostSnapshotSeq == null || frame.seq > state.integrationLostSnapshotSeq) {
+      next.integrationLost = event.IntegrationLost.reason;
+    }
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1554,6 +1560,9 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   if ("AcpSessionAssigned" in event) {
     // Session ids and replayed availability are history. Only a current daemon
     // projection may restore native controls or physical-worker chrome.
+    if (state.integrationLostSnapshotSeq == null || frame.seq > state.integrationLostSnapshotSeq) {
+      next.integrationLost = null;
+    }
     return next;
   }
   if ("RateLimitAutoResumed" in event) {
@@ -1743,10 +1752,11 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   return next;
 }
 
-/** Folds a child's RFD snapshot into its agent; `at` stamps a newly ended one. */
-function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): BackgroundAgent {
+/** Fold a child's state; only a raw update's timestamp may supply a new end. */
+function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at?: string): BackgroundAgent {
   const status = subagentStatus(child);
-  return child.state === "idle" ? { ...a, status, endedAt: a.endedAt ?? at } : { ...a, status, endedAt: null };
+  const endedAt = at === undefined ? a.endedAt : child.state === "idle" ? (a.endedAt ?? at) : null;
+  return a.status === status && a.endedAt === endedAt ? a : { ...a, status, endedAt };
 }
 
 /** The agent status a child's session state stands for. */
@@ -1813,6 +1823,17 @@ export function applyReducedState(
   ]);
   const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
   const resolved = new Set(locallyResolved);
+  let backgroundAgents = state.backgroundAgents;
+  if (reduced.subagents?.length && backgroundAgents.length) {
+    const children = new Map<string, SubagentRecord>();
+    for (const child of reduced.subagents) {
+      if (child.parent_tool_call_id) children.set(child.parent_tool_call_id, child);
+    }
+    backgroundAgents = backgroundAgents.map((agent) => {
+      const child = children.get(agent.toolCallId);
+      return child ? reconcileChild(agent, child) : agent;
+    });
+  }
   const next: AcpState = {
     ...state,
     replayTurnActive: state.replayTurnActive ?? state.serverTurnActive,
@@ -1853,6 +1874,7 @@ export function applyReducedState(
     backgroundShells: restoreBackgroundShells(state.backgroundShells, reduced.background_shells ?? []),
     workflowRuns: restoreWorkflowRuns(state.workflowRuns, reduced.workflow_runs ?? []),
     workflowSnapshotKeys: reduced.workflow_runs?.map((run) => run.tool_call_id) ?? [],
+    backgroundAgents,
     subagents: mergeSubagents(
       state.subagents,
       reduced.subagents ?? [],
@@ -1860,6 +1882,11 @@ export function applyReducedState(
     ),
     locallyResolved,
   };
+  if (authoritative && reduced.integration_lost !== undefined &&
+      (state.integrationLostSnapshotSeq == null || snapshotSeq >= state.integrationLostSnapshotSeq)) {
+    next.integrationLost = reduced.integration_lost;
+    next.integrationLostSnapshotSeq = snapshotSeq;
+  }
   if (connectionReady) {
     next.sessionAssigned = true;
     endRestart(next);
@@ -2082,6 +2109,8 @@ export function normaliseTurnState(
     connectionReady?: boolean;
     nativeSnapshotSeq?: number | null;
     promptWakeEligible?: boolean;
+    integrationLost?: IntegrationLostReason | null;
+    integrationLostSnapshotSeq?: number | null;
   },
 ): AcpState {
   const serverTurnActive =
@@ -2112,6 +2141,10 @@ export function normaliseTurnState(
   const next: AcpState = {
     ...state,
     oldestSeq,
+    integrationLost: state.integrationLost ?? null,
+    integrationLostSnapshotSeq: typeof state.integrationLostSnapshotSeq === "number" &&
+      Number.isFinite(state.integrationLostSnapshotSeq) && state.integrationLostSnapshotSeq >= 0
+      ? state.integrationLostSnapshotSeq : null,
     connectionUnavailable: state.connectionUnavailable ?? null,
     connectionUnavailableNotice: state.connectionUnavailableNotice ?? state.connectionUnavailable ?? null,
     connectionReady: state.connectionReady === true,

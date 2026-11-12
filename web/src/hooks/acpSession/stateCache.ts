@@ -25,6 +25,33 @@ const STATE_CACHE_CAP = 32;
 const stateCache = new Map<string, AcpState>();
 const stateListeners = new Map<string, Set<() => void>>();
 
+export const NATIVE_INPUT_UNCONFIRMED =
+  "Native input is not currently confirmed. The retained conversation has not been replaced.";
+
+export interface LiveAcpActions {
+  cancelPrompt: () => Promise<string | null>;
+  cancelSubagent: (childId: string) => Promise<string | null>;
+}
+
+const liveActions = new Map<string, { owner: symbol; actions: LiveAcpActions }>();
+
+/** Live callbacks have their own lifetime, never the cached state's lifetime. */
+export function registerLiveAcpActions(sessionId: string, owner: symbol, actions: LiveAcpActions): () => void {
+  const entry = { owner, actions };
+  liveActions.set(sessionId, entry);
+  return () => {
+    if (liveActions.get(sessionId) === entry) liveActions.delete(sessionId);
+  };
+}
+
+export function getLiveAcpActions(sessionId: string): LiveAcpActions | undefined {
+  return liveActions.get(sessionId)?.actions;
+}
+
+export function ownsLiveAcpActions(sessionId: string, owner: symbol): boolean {
+  return liveActions.get(sessionId)?.owner === owner;
+}
+
 function storageKey(sessionId: string): string {
   return STORAGE_KEY_PREFIX + sessionId;
 }
