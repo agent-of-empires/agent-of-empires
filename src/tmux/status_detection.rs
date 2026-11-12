@@ -1989,6 +1989,296 @@ report the issue.
    esc to interrupt
 ";
 
+    /// Codex 0.167.0 opening a fresh git repository, 72 columns.
+    const CODEX_FOLDER_TRUST_PROMPT: &str = "\
+  Folder access
+  /tmp/scratch/proj
+
+  Trust this folder? Codex can read, edit, and run files here, subject
+  to your permission settings. Folder settings can run code
+  automatically, even without a model request. Continue only if you
+  trust these files. Your trust decision will be saved.
+
+\u{203a} 1. Trust and continue
+  2. Back to Agent Command Center
+
+  enter continue \u{b7} esc back
+";
+
+    /// The same Codex at its first prompt, where the welcome list says "allowed".
+    const CODEX_WELCOME: &str = "\
+  >_ OpenAI Codex (v0.167.0)
+     /tmp/scratch/proj
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+\u{203a} Ask Codex to do anything
+
+  gpt-5.1-codex default \u{b7} /tmp/scratch/proj
+  \u{2190} for agents \u{b7} ? for shortcuts               \u{26a0} 1 warning \u{b7} f2 to view
+";
+
+    /// Codex 0.167.0 asking to run a command outside its sandbox, 72 columns.
+    const CODEX_APPROVAL_PROMPT: &str = "\
+  >_ OpenAI Codex (v0.167.0)
+     /tmp/scratch/proj
+
+\u{203a} make a probe file
+
+\u{2022} Running touch approval-probe.txt
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Create the probe file outside the sandbox
+
+  $ touch approval-probe.txt
+
+\u{203a} 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `touch
+     approval-probe.txt` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+";
+
+    /// Gemini CLI 0.67.0 opening an untrusted folder, 72 columns.
+    const GEMINI_FOLDER_TRUST_PROMPT: &str = "\
+ \u{259d}\u{259c}\u{2584}     Gemini CLI v0.67.0
+   \u{259d}\u{259c}\u{2584}
+  \u{2597}\u{259f}\u{2580}    Authenticated with gemini-api-key /auth
+ \u{259d}\u{2580}
+
+Tips for getting started:
+1. Create GEMINI.md files to customize your interactions
+2. /help for more information
+3. Ask coding questions, edit code or run commands
+4. Be specific for the best results
+
+\u{2139} Skipping project agents due to untrusted folder. To enable, ensure
+  that the project root is trusted.
+
+ \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}
+ \u{2502}                                                                    \u{2502}
+ \u{2502} Do you trust the files in this folder?                             \u{2502}
+ \u{2502}                                                                    \u{2502}
+ \u{2502} Trusting a folder allows Gemini CLI to load its local              \u{2502}
+ \u{2502} configurations, including custom commands, hooks, MCP servers,     \u{2502}
+ \u{2502} agent skills, and settings. These configurations could execute     \u{2502}
+ \u{2502} code on your behalf or change the behavior of the CLI.             \u{2502}
+ \u{2502}                                                                    \u{2502}
+ \u{2502}                                                                    \u{2502}
+ \u{2502} \u{25cf} 1. Trust folder (proj)                                           \u{2502}
+ \u{2502}   2. Trust parent folder (scratch)                                 \u{2502}
+ \u{2502}   3. Don't trust                                                   \u{2502}
+ \u{2502}                                                                    \u{2502}
+ \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+";
+
+    /// The same Gemini, 100 columns, restarted into its composer under the answered dialog.
+    const GEMINI_AFTER_TRUST: &str = "\
+ \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502} Do you trust the files in this folder?                                                         \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502} Trusting a folder allows Gemini CLI to load its local configurations, including custom         \u{2502}
+ \u{2502} commands, hooks, MCP servers, agent skills, and settings. These configurations could execute   \u{2502}
+ \u{2502} code on your behalf or change the behavior of the CLI.                                         \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502} \u{25cf} 1. Trust folder (proj)                                                                       \u{2502}
+ \u{2502}   2. Trust parent folder (scratch)                                                             \u{2502}
+ \u{2502}   3. Don't trust                                                                               \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+
+ Gemini CLI is restarting to apply the trust changes...
+
+ \u{259d}\u{259c}\u{2584}     Gemini CLI v0.67.0
+   \u{259d}\u{259c}\u{2584}
+  \u{2597}\u{259f}\u{2580}    Authenticated with gemini-api-key /auth
+ \u{259d}\u{2580}
+
+Tips for getting started:
+1. Create GEMINI.md files to customize your interactions
+2. /help for more information
+3. Ask coding questions, edit code or run commands
+4. Be specific for the best results
+
+                                                                                    ? for shortcuts
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+ Shift+Tab to accept edits
+
+ >   Type your message or @path/to/file
+
+ workspace (/directory)                                 sandbox                              /model
+ /tmp/scratch/proj                                  no sandbox                      gemini-2.5-pro
+";
+
+    /// Gemini CLI 0.67.0 confirming a shell command, 72 columns.
+    const GEMINI_APPROVAL_PROMPT: &str = "\
+ \u{259d}\u{259c}\u{2584}     Gemini CLI v0.67.0
+   \u{259d}\u{259c}\u{2584}
+  \u{2597}\u{259f}\u{2580}    Authenticated with gemini-api-key /auth
+ \u{259d}\u{2580}
+
+Tips for getting started:
+1. Create GEMINI.md files to customize your interactions
+2. /help for more information
+3. Ask coding questions, edit code or run commands
+4. Be specific for the best results
+
+ > make a probe file
+
+\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}
+\u{2502} ? Shell  touch approval-probe.txt                                    \u{2502}
+\u{2502} \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} \u{2502}
+\u{2502} \u{2502} touch approval-probe.txt                                         \u{2502} \u{2502}
+\u{2502} \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} \u{2502}
+\u{2502} Allow execution of [Shell]?                                          \u{2502}
+\u{2502}                                                                      \u{2502}
+\u{2502} \u{25cf} 1. Allow once                                                      \u{2502}
+\u{2502}   2. Allow for this session                                          \u{2502}
+\u{2502}   3. No, suggest changes (esc)                                       \u{2502}
+\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+";
+
+    /// A shell confirmation right after trusting, banner and tips hidden, 100 columns.
+    const GEMINI_APPROVAL_AFTER_TRUST: &str = "\
+\u{2139} Skipping project agents due to untrusted folder. To enable, ensure that the project root is
+  trusted.
+
+ \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502} Do you trust the files in this folder?                                                         \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502} Trusting a folder allows Gemini CLI to load its local configurations, including custom         \u{2502}
+ \u{2502} commands, hooks, MCP servers, agent skills, and settings. These configurations could execute   \u{2502}
+ \u{2502} code on your behalf or change the behavior of the CLI.                                         \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2502} \u{25cf} 1. Trust folder (proj)                                                                       \u{2502}
+ \u{2502}   2. Trust parent folder (scratch)                                                             \u{2502}
+ \u{2502}   3. Don't trust                                                                               \u{2502}
+ \u{2502}                                                                                                \u{2502}
+ \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+
+ Gemini CLI is restarting to apply the trust changes...
+
+ > make a probe file
+
+\u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e}
+\u{2502} ? Shell  touch approval-probe.txt                                                                \u{2502}
+\u{2502} \u{256d}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256e} \u{2502}
+\u{2502} \u{2502} touch approval-probe.txt                                                                     \u{2502} \u{2502}
+\u{2502} \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} \u{2502}
+\u{2502} Allow execution of [Shell]?                                                                      \u{2502}
+\u{2502}                                                                                                  \u{2502}
+\u{2502} \u{25cf} 1. Allow once                                                                                  \u{2502}
+\u{2502}   2. Allow for this session                                                                      \u{2502}
+\u{2502}   3. No, suggest changes (esc)                                                                   \u{2502}
+\u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f}
+";
+
+    #[test]
+    fn codex_and_gemini_first_run_screens() {
+        let detected = |agent: &str, content: &str| {
+            let content = strip_ansi(content);
+            let observation = Observation::new("", None, true);
+            let d = super::super::detect::detect(agent, &content, &observation)
+                .expect("agent has a manifest");
+            (d.rule, d.status.unwrap_or(Status::Idle))
+        };
+        let codex_quoting = "\
+\u{2022} The dialog reads: Trust this folder? Codex can read, edit, and run files
+  here, subject to your permission settings.
+  \u{203a} 1. Trust and continue
+    2. Back to Agent Command Center
+
+\u{2500} Worked for 12s \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+
+\u{203a} Ask Codex to do anything
+
+  gpt-5.1-codex default \u{b7} ~/proj
+";
+        let codex_quoting_bare =
+            codex_quoting.replace("\u{203a} Ask Codex to do anything", "\u{203a}");
+        let gemini_quoting = "\
+\u{2726} The first-run dialog asks: Do you trust the files in this folder? It
+  offers 1. Trust folder (proj), 2. Trust parent folder, 3. Don't trust.
+
+                                                    ? for shortcuts
+\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}
+ >   Type your message or @path/to/file
+";
+        // (agent, screen, deciding rule, status)
+        let cases = [
+            (
+                "codex",
+                CODEX_FOLDER_TRUST_PROMPT,
+                "folder_trust_prompt",
+                Status::Waiting,
+            ),
+            (
+                "codex",
+                CODEX_APPROVAL_PROMPT,
+                "numbered_choice_prompt",
+                Status::Waiting,
+            ),
+            ("codex", CODEX_WELCOME, "no_rule", Status::Idle),
+            (
+                "codex",
+                codex_quoting,
+                "completed_turn_prompt",
+                Status::Idle,
+            ),
+            (
+                "codex",
+                codex_quoting_bare.as_str(),
+                "no_rule",
+                Status::Idle,
+            ),
+            (
+                "gemini",
+                GEMINI_FOLDER_TRUST_PROMPT,
+                "folder_trust_prompt",
+                Status::Waiting,
+            ),
+            (
+                "gemini",
+                GEMINI_APPROVAL_PROMPT,
+                "approval_prompt",
+                Status::Waiting,
+            ),
+            (
+                "gemini",
+                GEMINI_APPROVAL_AFTER_TRUST,
+                "approval_prompt",
+                Status::Waiting,
+            ),
+            ("gemini", GEMINI_AFTER_TRUST, "no_rule", Status::Idle),
+            ("gemini", gemini_quoting, "no_rule", Status::Idle),
+        ];
+        for (agent, screen, rule, status) in cases {
+            assert_eq!(detected(agent, screen), (rule, status), "{agent}: {screen}");
+        }
+        // Codex's approval dialog is decided by its menu, but its approval rule still holds.
+        assert!(super::super::detect::rule_matches(
+            "codex",
+            "approval_prompt",
+            &strip_ansi(CODEX_APPROVAL_PROMPT),
+            "",
+            None
+        ));
+    }
+
     #[test]
     fn claude_prose_carrying_a_numbered_list_is_not_waiting() {
         let cases = [
