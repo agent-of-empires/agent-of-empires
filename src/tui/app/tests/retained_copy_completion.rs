@@ -252,6 +252,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     let completed_caption = format!("Copied {} bytes", CONTENT.len());
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            ticker.reset();
             ticker.tick().await;
             app.reconcile_structured_preview().await;
             drain_terminal(&mut master, &mut bytes);
@@ -294,6 +295,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         .unwrap();
     tokio::time::timeout(Duration::from_secs(12), async {
         loop {
+            ticker.reset();
             ticker.tick().await;
             app.reconcile_structured_preview().await;
             drain_terminal(&mut master, &mut bytes);
