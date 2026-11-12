@@ -136,14 +136,19 @@ fn wrap_prime_launch(
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
+///
+/// `supplied` is the command as the user or declaration wrote it, before AoE
+/// renders and pins it: the refusal is about that text, never about the quoting
+/// AoE's own rendering adds for a path.
 fn apply_yolo_mode(
     cmd: &mut String,
     yolo: &crate::agents::YoloMode,
     is_sandboxed: bool,
+    supplied: &str,
 ) -> Result<()> {
     match yolo {
         crate::agents::YoloMode::CliFlag(flag) => {
-            refuse_shell_consumed_argument(cmd, "mode flag")?;
+            refuse_shell_consumed_argument(supplied, "mode flag")?;
             *cmd = format!("{} {}", cmd, flag);
         }
         crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
@@ -1634,8 +1639,9 @@ impl Instance {
         if self.command.is_empty() {
             match agent {
                 Some(a) => {
+                    let supplied = a.launch_base_command();
                     let mut cmd = self.freeze_native_invocation(
-                        a.launch_base_command(),
+                        supplied.clone(),
                         execution,
                         unpinned,
                         launch_context,
@@ -1655,7 +1661,7 @@ impl Instance {
                     }
                     if host_command.is_none() {
                         if let Some(yolo) = yolo {
-                            apply_yolo_mode(&mut cmd, yolo, false)?;
+                            apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                         }
                     }
                     let is_existing = self.apply_session_flags_in(
@@ -1678,7 +1684,7 @@ impl Instance {
                             if let Some(yolo) =
                                 agent.and_then(|agent| resolved_yolo(agent, launch_context))
                             {
-                                apply_yolo_mode(&mut cmd, yolo, false)?;
+                                apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                             }
                         }
                     }
@@ -1740,8 +1746,9 @@ impl Instance {
                 }),
             }
         } else {
+            let supplied = self.command.clone();
             let mut cmd = self.freeze_native_invocation(
-                self.command.clone(),
+                supplied.clone(),
                 execution,
                 unpinned,
                 launch_context,
@@ -1754,7 +1761,7 @@ impl Instance {
             }
             if host_command.is_none() {
                 if let Some(yolo) = yolo {
-                    apply_yolo_mode(&mut cmd, yolo, false)?;
+                    apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                 }
             }
             let is_existing = self.apply_session_flags_in(
@@ -1776,7 +1783,7 @@ impl Instance {
                 if !defer_yolo && self.is_yolo_mode() {
                     if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
                     {
-                        apply_yolo_mode(&mut cmd, yolo, false)?;
+                        apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
                     }
                 }
             }
@@ -1913,6 +1920,38 @@ sandbox = "unsupported"
         })
         .unwrap();
         crate::plugin::reload_registry();
+    }
+
+    /// The mode flag is argv for the agent, so a shell-consumed supplied command
+    /// must be refused. AoE's own rendering quotes a resolved program path, and
+    /// that quoting is not the user's: it must not trip the refusal.
+    #[test]
+    fn the_mode_flag_guards_the_supplied_command_not_the_rendered_one() {
+        let mut rendered = "'/tmp/bin=tag/opencode' --standalone".to_owned();
+        apply_yolo_mode(
+            &mut rendered,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            "opencode",
+        )
+        .expect("a rendered program path must not read as shell syntax");
+        assert_eq!(rendered, "'/tmp/bin=tag/opencode' --standalone --yolo");
+
+        let mut plain = "opencode".to_owned();
+        let error = apply_yolo_mode(
+            &mut plain,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            "opencode | tee log",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("mode flag would reach the shell"),
+            "{error}"
+        );
+        assert_eq!(plain, "opencode", "a refused flag must not be appended");
     }
 
     /// A packaged (sandboxed) launch appends the configured instruction to the
