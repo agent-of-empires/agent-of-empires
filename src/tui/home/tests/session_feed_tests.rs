@@ -3674,10 +3674,12 @@ fn retained_trash_context_menu_keeps_opening_epoch() {
 async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_files() {
     use super::pickers_groups_sort::receipt_cursor;
     use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
-    for (action, fresh) in [
-        ("Restore selected Trash", false),
-        ("Retry selected unfinished", false),
-        ("Retry selected unfinished", true),
+    for (action, pending, fresh) in [
+        ("Restore selected Trash", false, false),
+        ("Restore selected Trash", true, false),
+        ("Restore selected Trash", true, true),
+        ("Retry selected unfinished", true, false),
+        ("Retry selected unfinished", true, true),
     ] {
         let mut env = create_test_env_with_sessions(1);
         let id = env.view.instance_at(0).id.clone();
@@ -3690,7 +3692,7 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
         env.view.mutate_instance(&id, |row| {
             row.terminal_scopes = Some(scopes.clone());
             row.project_path = path.to_string_lossy().into_owned();
-            if !restore {
+            if pending {
                 row.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Trash,
                     Instance::LIFECYCLE_RESERVATION_TTL,
@@ -3727,7 +3729,20 @@ async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_file
             env.view.handle_key(key(KeyCode::Char(ch)), None);
         }
         env.view.handle_key(key(KeyCode::Enter), None);
-        let captured = capture().expect("palette recovery submitted");
+        let captured = capture();
+        if restore && pending {
+            assert!(captured.is_none(), "unfinished Trash cannot start Restore");
+            assert!(env.view.get_instance(&id).unwrap().has_pending_trash());
+            assert!(env.view.session_feed.can_submit(&id));
+            assert_eq!(
+                std::fs::read(storage.sessions_path()).unwrap(),
+                registry_before
+            );
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+            assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
+            continue;
+        }
+        let captured = captured.expect("palette recovery submitted");
         assert_eq!(captured.id, id);
         let (suffix, body, request_epoch) = match &captured.request {
             SessionRequest::Restore => ("restore", serde_json::json!({}), epoch.as_str()),

@@ -136,8 +136,8 @@ fn env_mouse_capture_allows() -> bool {
         .unwrap_or(true)
 }
 
-/// Restore cooked input before joining application workers, including on unwind.
-/// Display cleanup is bounded best effort; aborts and fatal signals skip Drop.
+/// Restore input before worker joins; aborts and fatal signals skip Drop.
+/// Display cleanup cannot guarantee delivery after process exit.
 struct TerminalGuard<B: ratatui::backend::Backend = app::TuiBackend> {
     // Mosh never captures the mouse; other terminals may toggle capture at runtime.
     disable_mouse: bool,

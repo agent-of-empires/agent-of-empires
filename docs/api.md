@@ -900,7 +900,6 @@ unverified checkout stays visible in Trash until those checks can settle it.
 UI requests capture their original profile, generation, and runtime epoch;
 replacement state requires fresh consent.
 
-
 ## Explicit structured worker stop
 
 `DELETE /api/sessions/:id/acp` is a durable user stop, not a daemon detach. It commits the native stopped/dormant generation before retiring the captured original worker and returns `204` only after retirement is proven. Generic `POST /api/sessions/:id/stop` uses the same structured-worker stop boundary.
