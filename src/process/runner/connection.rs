@@ -37,44 +37,68 @@ pub(super) async fn fanout_agent_stdout(
     shared.abort_agent_calls(&session_id).await;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlWriteCause {
+    TimedOut,
+    Io(std::io::ErrorKind),
+}
+
+/// Payload-free evidence for the write that ended an attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ControlWriteFailure {
+    pub(super) cause: ControlWriteCause,
+    pub(super) frame_bytes: usize,
+    pub(super) queued_frames: usize,
+    pub(super) queued_bytes: usize,
+}
+
 /// The queue keeps the front entry until a full write and flush succeeds.
 pub(super) async fn run_control_writer(
     mut out: tokio::net::unix::OwnedWriteHalf,
     shared: Arc<RunnerShared>,
-    session_id: String,
     attachment_id: u64,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> Option<ControlWriteFailure> {
     loop {
         if *shutdown.borrow() {
-            return;
+            return None;
         }
         while let Some((entry_id, wire)) = shared.next_outbound(attachment_id).await {
             let written = tokio::select! {
                 biased;
                 _ = shutdown.changed() => {
                     shared.release_outbound(entry_id).await;
-                    return;
+                    return None;
                 }
                 result = tokio::time::timeout(
                     CONTROL_WRITE_TIMEOUT,
                     control_protocol::write_encoded_frame(&mut out, &wire),
-                ) => matches!(result, Ok(Ok(()))),
+                ) => result,
             };
-            if !written {
-                warn!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    "control write failed or timed out; retaining frame for the next attach"
-                );
-                shared.release_outbound(entry_id).await;
-                return;
-            }
-            shared.commit_outbound(attachment_id, entry_id).await;
+            let cause = match written {
+                Ok(Ok(())) => {
+                    shared.commit_outbound(attachment_id, entry_id).await;
+                    continue;
+                }
+                Ok(Err(error)) => ControlWriteCause::Io(
+                    error
+                        .downcast_ref::<std::io::Error>()
+                        .map_or(std::io::ErrorKind::Other, std::io::Error::kind),
+                ),
+                Err(_) => ControlWriteCause::TimedOut,
+            };
+            shared.release_outbound(entry_id).await;
+            let (queued_frames, queued_bytes) = shared.control_queue_depth().await;
+            return Some(ControlWriteFailure {
+                cause,
+                frame_bytes: wire.len(),
+                queued_frames,
+                queued_bytes,
+            });
         }
         tokio::select! {
             _ = shared.control_wake.notified() => {}
-            _ = shutdown.changed() => return,
+            _ = shutdown.changed() => return None,
         }
     }
 }
@@ -175,7 +199,6 @@ pub(super) async fn handle_control_connection(
             .take()
             .expect("write half present after greeting"),
         Arc::clone(&shared),
-        session_id.clone(),
         attachment_id,
         writer_shutdown_rx,
     ));
@@ -359,7 +382,7 @@ pub(super) async fn handle_control_connection(
     let _ = control_closed_tx.send(true);
     if !writer_finished {
         let _ = writer_shutdown_tx.send(true);
-        let _ = writer.await;
+        log_writer_exit(writer.await, &session_id);
     }
     shared
         .disconnect_control(attachment_id, &agent_stdin, &session_id)
@@ -368,8 +391,75 @@ pub(super) async fn handle_control_connection(
     let _ = handshake_worker.await;
     terminate_runner
 }
-pub(super) fn log_writer_exit(result: Result<(), tokio::task::JoinError>, session_id: &str) {
-    if let Err(error) = result {
-        warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}");
+pub(super) fn log_writer_exit(
+    result: Result<Option<ControlWriteFailure>, tokio::task::JoinError>,
+    session_id: &str,
+) {
+    match result {
+        Ok(Some(failure)) => warn!(
+            target: "acp.runner",
+            session = %session_id,
+            cause = ?failure.cause,
+            timeout_ms = CONTROL_WRITE_TIMEOUT.as_millis() as u64,
+            frame_bytes = failure.frame_bytes,
+            queued_frames = failure.queued_frames,
+            queued_bytes = failure.queued_bytes,
+            "control write failed; retaining frame for the next attach"
+        ),
+        Ok(None) => {}
+        Err(error) => {
+            warn!(target: "acp.runner", session = %session_id, "control writer task failed: {error}")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::runner::shared::{DeliveryScope, QueuedKind};
+
+    /// A failed write reports why and how much was waiting, never what.
+    #[tokio::test(start_paused = true)]
+    async fn writer_failure_separates_timeout_from_io_error() {
+        for (peer_holds_open_unread, expected) in [
+            (true, ControlWriteCause::TimedOut),
+            (false, ControlWriteCause::Io(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            let shared = Arc::new(RunnerShared::new(None));
+            let attachment = shared.begin_attachment().await;
+            shared.control.lock().await.session_announced = true;
+            // Larger than any socket buffer, so an idle reader stalls the write.
+            let frames = [4 * 1024 * 1024, 16].map(|len| ControlBody::Notify {
+                method: "session/update".into(),
+                params: serde_json::json!({ "text": "x".repeat(len) }),
+            });
+            let wire: Vec<usize> = frames
+                .iter()
+                .map(|frame| control_protocol::encode_frame(frame).unwrap().len())
+                .collect();
+            for frame in frames {
+                assert!(
+                    shared
+                        .enqueue(DeliveryScope::Persistent, QueuedKind::Notify, frame)
+                        .await
+                );
+            }
+            let (daemon, runner) = UnixStream::pair().unwrap();
+            let _daemon = peer_holds_open_unread.then_some(daemon);
+            let (_read, write) = runner.into_split();
+            let (_shutdown, shutdown_rx) = watch::channel(false);
+            let failure = run_control_writer(write, Arc::clone(&shared), attachment, shutdown_rx)
+                .await
+                .expect("the write fails");
+            assert_eq!(
+                failure,
+                ControlWriteFailure {
+                    cause: expected,
+                    frame_bytes: wire[0],
+                    queued_frames: 2,
+                    queued_bytes: wire.iter().sum(),
+                }
+            );
+        }
     }
 }

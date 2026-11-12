@@ -25,7 +25,7 @@ fn wants_text_selection_tracks_copy_friendly_surfaces() {
     assert!(!env.view.wants_text_selection());
 
     use crate::tui::dialogs::ServeView;
-    env.view.serve_view = Some(ServeView::new());
+    env.view.serve_view = Some(ServeView::new(&mut env.view.serve_jobs));
     assert!(env.view.wants_text_selection());
     env.view.serve_view = None;
     assert!(!env.view.wants_text_selection());
@@ -1812,14 +1812,19 @@ async fn d_then_d_confirms_the_trash_and_persists_the_marker() {
         "the first d must only open the dialog"
     );
     let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
+    let expected_epoch = env.view.session_feed.applied_epoch().unwrap().to_owned();
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
-        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_generation: Some(generation),
-        }),
+        crate::tui::session_feed::SessionRequest::Trash {
+            body: crate::daemon::TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+                expected_profile: Some("test".into()),
+            },
+            expected_epoch,
+        },
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
             Ok(())
@@ -1865,14 +1870,19 @@ async fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
     let id = env.view.selected_session.clone().unwrap();
 
     let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
+    let expected_epoch = env.view.session_feed.applied_epoch().unwrap().to_owned();
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
-        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_generation: Some(generation),
-        }),
+        crate::tui::session_feed::SessionRequest::Trash {
+            body: crate::daemon::TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+                expected_profile: Some("test".into()),
+            },
+            expected_epoch,
+        },
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
             Ok(())
@@ -1907,14 +1917,19 @@ async fn confirm_delete_dont_ask_again_persists_the_opt_out() {
     env.view.handle_key(key(KeyCode::Down), None);
     env.view.handle_key(key(KeyCode::Char(' ')), None);
     let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
+    let expected_epoch = env.view.session_feed.applied_epoch().unwrap().to_owned();
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
-        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_generation: Some(generation),
-        }),
+        crate::tui::session_feed::SessionRequest::Trash {
+            body: crate::daemon::TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+                expected_profile: Some("test".into()),
+            },
+            expected_epoch,
+        },
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
             Ok(())
@@ -1973,14 +1988,19 @@ async fn d_with_confirm_delete_prompts_before_trashing() {
 
     // A second `d` accepts, trashing via the same trash_session_by_id path.
     let generation = env.view.get_instance(&id).unwrap().lifecycle_generation;
+    let expected_epoch = env.view.session_feed.applied_epoch().unwrap().to_owned();
     super::pickers_groups_sort::settle_row_command(
         &state,
         &mut env.view,
         &id,
-        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_generation: Some(generation),
-        }),
+        crate::tui::session_feed::SessionRequest::Trash {
+            body: crate::daemon::TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+                expected_profile: Some("test".into()),
+            },
+            expected_epoch,
+        },
         |view| {
             view.handle_key(key(KeyCode::Char('d')), None);
             Ok(())

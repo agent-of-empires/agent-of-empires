@@ -46,6 +46,7 @@ pub use execution::{
 mod flags;
 mod hooks;
 pub(crate) use hooks::HostHookApprovalRequired;
+pub(crate) use status_update::CAPTURE_FAILED_RULE;
 mod identity_sidecar;
 mod kill;
 mod launch_command;

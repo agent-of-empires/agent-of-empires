@@ -760,6 +760,11 @@ impl RunnerShared {
         self.control_space.notify_waiters();
     }
 
+    pub(super) async fn control_queue_depth(&self) -> (usize, usize) {
+        let channel = self.control.lock().await;
+        (channel.queue.len(), channel.queued_bytes)
+    }
+
     pub(super) async fn release_outbound(&self, entry_id: u64) {
         let mut channel = self.control.lock().await;
         if channel.in_flight == Some(entry_id) {

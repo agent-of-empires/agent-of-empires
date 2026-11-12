@@ -18,6 +18,11 @@ export interface SessionResponse {
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
   dormant: boolean;
   lifecycle_generation: number;
+  lifecycle_reservation?: {
+    op: "launch" | "capture" | "stop" | "purge" | "restore" | "trash";
+    generation: number;
+    at: string;
+  } | null;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;

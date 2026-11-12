@@ -158,7 +158,7 @@ pub(super) async fn settle_row_command(
         let base = format!("/api/sessions/{id}");
         match request {
             SessionRequest::Rename(body) => ("PATCH", base, serde_json::to_value(body).unwrap()),
-            SessionRequest::Trash(body) => (
+            SessionRequest::Trash { body, .. } => (
                 "POST",
                 format!("{base}/trash"),
                 serde_json::to_value(body).unwrap(),
@@ -179,29 +179,39 @@ pub(super) async fn settle_row_command(
         }
     }
     let before_rows = serde_json::to_value(view.cloned_instances()).unwrap();
-    let mut respond = view.session_feed.request_driver_for_test();
+    let mut capture = view.session_feed.capture_request_driver_for_test();
     if view.confirm_dialog.is_some()
         || view.unified_delete_dialog.is_some()
         || view.group_delete_options_dialog.is_some()
     {
         render_geometry(view);
     }
+    let opened_epoch = view.session_feed.applied_epoch().unwrap().to_owned();
     action(view)?;
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),
         before_rows
     );
-    let (method, path, body) = wire(id, &expected);
-    let (status, headers, value) = request_with_headers(state, method, &path, body.clone()).await;
+    let captured = capture().expect("typed request admitted");
+    assert_eq!(captured.id, id);
+    assert_eq!(
+        std::mem::discriminant(&captured.request),
+        std::mem::discriminant(&expected)
+    );
+    let epoch = match &captured.request {
+        SessionRequest::Trash { expected_epoch, .. } => expected_epoch.as_str(),
+        _ => &opened_epoch,
+    };
+    let (method, path, body) = wire(&captured.id, &captured.request);
+    let (status, headers, value) =
+        request_at_epoch_with_headers(state, method, &path, body, epoch).await;
     if !status.is_success() {
         assert!(
             status.is_client_error(),
             "unknown commit is not rejection: {status} {value}"
         );
         let error = value.to_string();
-        let (captured_id, captured) = respond(Err(error.clone())).expect("typed request admitted");
-        assert_eq!(captured_id, id);
-        assert_eq!(wire(id, &captured), (method, path, body));
+        captured.finish(Err(error.clone()));
         view.apply_session_feed();
         apply_published(view, state).await;
         assert!(
@@ -211,12 +221,12 @@ pub(super) async fn settle_row_command(
         anyhow::bail!("{error}");
     }
     let cursor = receipt_cursor(&headers);
-    let outcome = match expected {
+    let outcome = match &captured.request {
         SessionRequest::Rename(_) => SessionCommandOutcome::Renamed(MutationReceipt {
             cursor,
             outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
         }),
-        SessionRequest::Trash(_) => SessionCommandOutcome::Trashed(MutationReceipt {
+        SessionRequest::Trash { .. } => SessionCommandOutcome::Trashed(MutationReceipt {
             cursor,
             outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
         }),
@@ -242,9 +252,7 @@ pub(super) async fn settle_row_command(
         }
         _ => unreachable!("wire rejected non-edit command"),
     };
-    let (captured_id, captured) = respond(Ok(outcome)).expect("typed request admitted");
-    assert_eq!(captured_id, id);
-    assert_eq!(wire(id, &captured), (method, path, body));
+    captured.finish(Ok(outcome));
     view.apply_session_feed();
     assert_eq!(
         serde_json::to_value(view.cloned_instances()).unwrap(),
@@ -516,14 +524,20 @@ pub(super) async fn settle_trash(
     id: &str,
 ) {
     let generation = view.get_instance(id).unwrap().lifecycle_generation;
+    let expected_profile = view.get_instance(id).unwrap().source_profile.clone();
+    let expected_epoch = view.session_feed.applied_epoch().unwrap().to_owned();
     settle_row_command(
         state,
         view,
         id,
-        crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
-            kill_pane: true,
-            expected_generation: Some(generation),
-        }),
+        crate::tui::session_feed::SessionRequest::Trash {
+            body: crate::daemon::TrashSessionBody {
+                kill_pane: true,
+                expected_generation: Some(generation),
+                expected_profile: Some(expected_profile),
+            },
+            expected_epoch,
+        },
         |view| {
             view.trash_session_by_id(id);
             Ok(())

@@ -1219,14 +1219,17 @@ pub fn print_qr_code(url: &str) {
 }
 
 /// Check if cloudflared is installed and accessible on PATH.
-pub fn check_cloudflared() -> anyhow::Result<()> {
-    match std::process::Command::new("cloudflared")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => Ok(()),
+pub fn check_cloudflared(cancel: &tokio_util::sync::CancellationToken) -> anyhow::Result<()> {
+    match crate::process::run_status_with_timeout_process_group(
+        std::process::Command::new("cloudflared")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        PROBE_TIMEOUT,
+        Some(cancel),
+    ) {
+        Ok(Some(status)) if status.success() => Ok(()),
         _ => anyhow::bail!(
             "cloudflared is not installed or not on PATH.\n\
              Install it: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/\n\
@@ -1244,20 +1247,18 @@ pub fn check_cloudflared() -> anyhow::Result<()> {
 /// opens the view, or hold the Daemon's tunnel selection until its startup deadline.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Sync counterpart of `tailscale_probe()` for use from the TUI (which avoids spinning
-/// up a tokio runtime just to probe for a CLI).
-pub fn tailscale_probe_sync() -> TailscaleProbe {
-    tailscale_probe_sync_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT)
+/// Synchronous availability check for the cancellable Serve worker.
+pub fn tailscale_probe_sync(cancel: &tokio_util::sync::CancellationToken) -> TailscaleProbe {
+    tailscale_probe_sync_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT, cancel)
 }
 
 fn tailscale_probe_sync_with(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> TailscaleProbe {
-    // Unlike the async path, this runs on the TUI render hot path, so we keep it cheap and
-    // quiet on the happy path.
     for arg in ["--version", "status"] {
-        match probe_succeeds(program, arg, timeout) {
+        match probe_succeeds(program, arg, timeout, cancel) {
             Some(true) => {}
             Some(false) => return TailscaleProbe::Unavailable,
             None => return TailscaleProbe::TimedOut,
@@ -1266,36 +1267,33 @@ fn tailscale_probe_sync_with(
     TailscaleProbe::Available
 }
 
-/// Whether `program arg` exits zero within `timeout`, or `None` when it is still running, in
-/// which case it is killed.
 fn probe_succeeds(
     program: &std::ffi::OsStr,
     arg: &str,
     timeout: std::time::Duration,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<bool> {
-    let spawned = std::process::Command::new(program)
-        .arg(arg)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-    let status =
-        spawned.and_then(|mut child| crate::process::wait_with_timeout(&mut child, timeout));
+    let status = crate::process::run_status_with_timeout_process_group(
+        std::process::Command::new(program)
+            .arg(arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+        timeout,
+        Some(cancel),
+    );
     match status {
         Ok(Some(status)) if status.success() => Some(true),
         Ok(Some(status)) => {
-            debug!(exit = ?status.code(), "tailscale_probe_sync: `tailscale {arg}` failed");
+            debug!(target: "serve.tunnel", exit = ?status.code(), "tailscale_probe_sync: `tailscale {arg}` failed");
             Some(false)
         }
         Ok(None) => {
-            debug!(
-                timeout_s = timeout.as_secs_f32(),
-                "tailscale_probe_sync: `tailscale {arg}` timed out"
-            );
+            debug!(target: "serve.tunnel", timeout_s = timeout.as_secs_f32(), "tailscale_probe_sync: `tailscale {arg}` timed out or cancelled");
             None
         }
         Err(error) => {
-            debug!(%error, "tailscale_probe_sync: `tailscale {arg}` could not run");
+            debug!(target: "serve.tunnel", %error, "tailscale_probe_sync: `tailscale {arg}` could not run");
             Some(false)
         }
     }
@@ -1311,44 +1309,63 @@ pub enum FunnelCapability {
     TimedOut,
 }
 
-/// Sync counterpart of `check_funnel_capability()`.
-pub fn tailscale_funnel_cap_sync() -> FunnelCapability {
-    tailscale_funnel_cap_sync_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT)
+/// Synchronous capability check for the cancellable Serve worker.
+pub fn tailscale_funnel_cap_sync(cancel: &tokio_util::sync::CancellationToken) -> FunnelCapability {
+    tailscale_funnel_cap_sync_with(std::ffi::OsStr::new("tailscale"), PROBE_TIMEOUT, cancel)
 }
 
 fn tailscale_funnel_cap_sync_with(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> FunnelCapability {
     // Tailscale emits the cap key with the allowed-port list appended as a query string,
     // e.g. `?ports=443,8443,10000`.
     const FUNNEL_CAP_PREFIX: &str = "https://tailscale.com/cap/funnel-ports";
-    let out = crate::process::run_with_timeout(
-        std::process::Command::new(program)
-            .args(["status", "--json"])
-            .stdin(std::process::Stdio::null()),
-        timeout,
-    );
-    let out = match out {
+    if cancel.is_cancelled() {
+        return FunnelCapability::TimedOut;
+    }
+    use std::io::{Read, Seek};
+    let out = (|| -> std::io::Result<_> {
+        let mut stdout = tempfile::tempfile()?;
+        let Some(status) = crate::process::run_status_with_timeout_process_group(
+            std::process::Command::new(program)
+                .args(["status", "--json"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(stdout.try_clone()?))
+                .stderr(std::process::Stdio::null()),
+            timeout,
+            Some(cancel),
+        )?
+        else {
+            return Ok(None);
+        };
+        stdout.rewind()?;
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+        Ok(Some((status, bytes)))
+    })();
+    let (status, stdout) = match out {
         Ok(Some(out)) => out,
         Ok(None) => {
-            debug!("tailscale_funnel_cap_sync: timed out");
+            debug!(target: "serve.tunnel", "tailscale_funnel_cap_sync: timed out or cancelled");
             return FunnelCapability::TimedOut;
         }
         Err(_) => {
-            debug!("tailscale_funnel_cap_sync: spawn failed");
+            debug!(target: "serve.tunnel", "tailscale_funnel_cap_sync: spawn failed");
             return FunnelCapability::NotEnabled;
         }
     };
-    if !out.status.success() {
+    if !status.success() {
         debug!(
-            exit = ?out.status.code(),
+            target: "serve.tunnel",
+            exit = ?status.code(),
             "tailscale_funnel_cap_sync: tailscale status --json non-zero"
         );
         return FunnelCapability::NotEnabled;
     }
-    let Ok(parsed): Result<serde_json::Value, _> = serde_json::from_slice(&out.stdout) else {
-        debug!("tailscale_funnel_cap_sync: JSON parse failed");
+    let Ok(parsed): Result<serde_json::Value, _> = serde_json::from_slice(&stdout) else {
+        debug!(target: "serve.tunnel", "tailscale_funnel_cap_sync: JSON parse failed");
         return FunnelCapability::NotEnabled;
     };
     let self_obj = parsed.get("Self");
@@ -1357,6 +1374,7 @@ fn tailscale_funnel_cap_sync_with(
         .and_then(|m| m.as_object());
     let has_cap = cap_map.is_some_and(|m| m.keys().any(|k| k.starts_with(FUNNEL_CAP_PREFIX)));
     debug!(
+        target: "serve.tunnel",
         has_funnel_cap = has_cap,
         cap_count = cap_map.map(|m| m.len()).unwrap_or(0),
         "tailscale_funnel_cap_sync: inspected Self.CapMap"
@@ -2004,7 +2022,11 @@ esac
             let timeout = std::time::Duration::from_secs(1);
             let started = std::time::Instant::now();
             assert_eq!(
-                tailscale_probe_sync_with(fake.as_os_str(), timeout),
+                tailscale_probe_sync_with(
+                    fake.as_os_str(),
+                    timeout,
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
                 probe,
                 "sync: {body}"
             );
@@ -2053,7 +2075,11 @@ esac
             let timeout = std::time::Duration::from_secs(1);
             let started = std::time::Instant::now();
             assert_eq!(
-                tailscale_funnel_cap_sync_with(fake.as_os_str(), timeout),
+                tailscale_funnel_cap_sync_with(
+                    fake.as_os_str(),
+                    timeout,
+                    &tokio_util::sync::CancellationToken::new(),
+                ),
                 want,
                 "{body}"
             );

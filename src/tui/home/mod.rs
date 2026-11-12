@@ -91,6 +91,13 @@ pub(super) struct SessionDialogTarget {
     lifecycle_generation: u64,
 }
 
+pub(super) struct TrashDialogTarget {
+    session_id: String,
+    source_profile: String,
+    lifecycle_generation: u64,
+    epoch: String,
+}
+
 pub(super) struct SessionDeleteDialog {
     dialog: UnifiedDeleteDialog,
     target: SessionDialogTarget,
@@ -317,9 +324,12 @@ pub struct HomeView {
     pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     pub(super) serve_view: Option<ServeView>,
+    pub(super) serve_jobs: super::dialogs::ServeJobs,
     pub(super) connections_view: Option<super::dialogs::ConnectionsView>,
     pub(super) pending_dashboard_launch: Option<super::dialogs::ServeLaunchRequest>,
+    pub(super) pending_dashboard_stop: Option<super::app::DashboardStopRequest>,
     pub(super) dashboard_launch: Option<super::dialogs::DashboardLaunch>,
+    pub(super) dashboard_stop: Option<super::dialogs::DashboardStop>,
     pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
     pub(super) tips_dialog: Option<super::dialogs::TipsDialog>,
@@ -384,7 +394,7 @@ pub struct HomeView {
     pub(super) confirmation_input_revision: u64,
     /// Exact canonical purge owner captured when Force Remove confirmation opens.
     pub(super) pending_force_remove_session: Option<(String, std::num::NonZeroU64)>,
-    pub(super) pending_trash_session: Option<SessionDialogTarget>,
+    pub(super) pending_trash_session: Option<TrashDialogTarget>,
     pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     pub(super) search_active: bool,
     pub(super) search_query: Input,
