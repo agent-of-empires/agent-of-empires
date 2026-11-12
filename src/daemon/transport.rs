@@ -5,7 +5,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::DaemonClientError;
-use crate::util::{runtime_path_refusal, RuntimePathRemedy};
 
 const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b' ')
@@ -22,6 +21,142 @@ const PATH_SEGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
     .add(b'{')
     .add(b'|')
     .add(b'}');
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimePathRemedy {
+    Advice(&'static str),
+    Command {
+        template: &'static str,
+        manual: &'static str,
+    },
+}
+
+/// Format a refused directory without terminal controls or lossy shell commands.
+fn runtime_path_refusal(
+    path: &std::path::Path,
+    mode: u32,
+    cause: &str,
+    remedy: RuntimePathRemedy,
+) -> String {
+    fn append_path(output: &mut String, template: &str, path: impl std::fmt::Display) {
+        use std::fmt::Write;
+        let mut parts = template.split("{path}");
+        output.push_str(parts.next().unwrap_or_default());
+        for part in parts {
+            write!(output, "{path}{part}").unwrap();
+        }
+    }
+
+    let mut message = format!(
+        "Unsafe runtime directory: {path:?} is {cause} (mode {:04o}). ",
+        mode & 0o7777
+    );
+    match remedy {
+        RuntimePathRemedy::Advice(advice) => {
+            message.push_str("Resolve this by: ");
+            message.push_str(advice);
+        }
+        RuntimePathRemedy::Command { template, manual } => {
+            let text = path.to_str().filter(|text| {
+                !text.contains(|c: char| {
+                    // Bidi_Control characters are not covered by is_control().
+                    c.is_control()
+                        || matches!(
+                            c,
+                            '`' | '\u{061c}'
+                                | '\u{200e}'..='\u{200f}'
+                                | '\u{202a}'..='\u{202e}'
+                                | '\u{2066}'..='\u{2069}'
+                        )
+                })
+            });
+            if let Some(text) = text {
+                message.push_str("Resolve this by: `");
+                append_path(
+                    &mut message,
+                    template,
+                    crate::session::environment::shell_escape(text),
+                );
+                message.push_str("`, then retry.");
+            } else {
+                message.push_str(manual);
+                message.push_str(
+                    " manually, then retry. No copyable shell command is available for this path.",
+                );
+            }
+        }
+    }
+    message
+}
+
+enum PermissionRepair {
+    Private,
+    RemoveGroupOtherWrite,
+}
+
+fn permission_refusal(
+    path: &Path,
+    mode: u32,
+    repair: PermissionRepair,
+    owner: u32,
+) -> anyhow::Error {
+    use std::fmt::Write;
+
+    let (cause, template, manual) = match repair {
+        PermissionRepair::Private => (
+            "not private to its owner",
+            "chmod -- 0700 {path}",
+            "Set this directory to mode 0700",
+        ),
+        PermissionRepair::RemoveGroupOtherWrite => (
+            "writable by its group or by others",
+            "chmod -- go-w {path}",
+            "Remove group/other write permission from this directory",
+        ),
+    };
+    let mut highest_unsafe_ancestor = None;
+    let mut unverified_ancestor = None;
+    for ancestor in path.ancestors().skip(1) {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) if trusted_directory(&metadata, owner) => {}
+            Ok(_) => {
+                highest_unsafe_ancestor = Some(ancestor);
+                // Lower metadata failures cannot hide a higher unsafe ancestor.
+                unverified_ancestor = None;
+            }
+            Err(_) => unverified_ancestor = Some(ancestor),
+        }
+    }
+    let remedy = if highest_unsafe_ancestor.is_none() && unverified_ancestor.is_none() {
+        RuntimePathRemedy::Command { template, manual }
+    } else {
+        RuntimePathRemedy::Advice(
+            "Repair or replace unsafe parent directories, or select a location with trusted ancestors. Then retry before changing this directory.",
+        )
+    };
+    let mut message = runtime_path_refusal(path, mode, cause, remedy);
+    if let Some(ancestor) = unverified_ancestor {
+        write!(
+            message,
+            " Ancestor trust could not be verified at {ancestor:?}; the highest unsafe ancestor cannot be determined."
+        )
+        .unwrap();
+    } else if let Some(ancestor) = highest_unsafe_ancestor {
+        write!(
+            message,
+            " Start with the highest unsafe ancestor: {ancestor:?}."
+        )
+        .unwrap();
+    }
+    anyhow::anyhow!(message)
+}
+
+fn trusted_directory(metadata: &std::fs::Metadata, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+        && trusted_ancestor(metadata.uid(), metadata.mode(), owner)
+}
 
 pub(crate) fn path_segment(
     value: &str,
@@ -69,15 +204,12 @@ pub(crate) fn prepare_runtime_directory(parent: &Path) -> anyhow::Result<()> {
         )
     );
     if directory.mode() & 0o777 != 0o700 {
-        return Err(anyhow::anyhow!(runtime_path_refusal(
+        return Err(permission_refusal(
             parent,
             directory.mode(),
-            "not private to its owner",
-            RuntimePathRemedy::Command {
-                template: "chmod -- 0700 {path}",
-                manual: "Set this directory to mode 0700",
-            },
-        )));
+            PermissionRepair::Private,
+            owner,
+        ));
     }
     Ok(())
 }
@@ -90,31 +222,15 @@ fn check_ancestor(ancestor: &Path, parent: &Path, owner: u32) -> anyhow::Result<
         && meta.mode() & 0o022 != 0
         && !trusted_ancestor(meta.uid(), meta.mode(), owner)
     {
-        if ancestor == parent {
-            return Err(anyhow::anyhow!(runtime_path_refusal(
-                ancestor,
-                meta.mode(),
-                "not private to its owner",
-                RuntimePathRemedy::Command {
-                    template: "chmod -- 0700 {path}",
-                    manual: "Set this directory to mode 0700",
-                },
-            )));
-        }
-        return Err(anyhow::anyhow!(runtime_path_refusal(
-            ancestor,
-            meta.mode(),
-            "writable by its group or by others",
-            RuntimePathRemedy::Command {
-                template: "chmod -- go-w {path}",
-                manual: "Remove group/other write permission from this directory",
-            },
-        )));
+        let repair = if ancestor == parent {
+            PermissionRepair::Private
+        } else {
+            PermissionRepair::RemoveGroupOtherWrite
+        };
+        return Err(permission_refusal(ancestor, meta.mode(), repair, owner));
     }
     anyhow::ensure!(
-        meta.is_dir()
-            && !meta.file_type().is_symlink()
-            && trusted_ancestor(meta.uid(), meta.mode(), owner),
+        trusted_directory(&meta, owner),
         "{}",
         runtime_path_refusal(
             ancestor,
@@ -614,6 +730,68 @@ mod tests {
         run_directory_recovery(&error);
         assert_eq!(std::fs::metadata(&ancestor).unwrap().mode() & 0o777, 0o755);
         prepare_runtime_directory(&parent).unwrap();
+    }
+
+    #[test]
+    fn unsafe_upper_ancestors_suppress_copyable_recovery_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for name in ["unsafe upper", "unsafe\x1b[31m\u{202e} upper"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let upper = root.path().canonicalize().unwrap().join(name);
+            let lower = upper.join("unsafe lower");
+            let app = lower.join("app");
+            let socket = app.join("daemon");
+            std::fs::create_dir_all(&socket).unwrap();
+            for directory in [&upper, &lower, &socket] {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777))
+                    .unwrap();
+            }
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let ancestor_diagnostic = prepare_runtime_directory(&socket).unwrap_err().to_string();
+            let socket_diagnostic =
+                check_ancestor(&socket, &socket, nix::unistd::geteuid().as_raw())
+                    .unwrap_err()
+                    .to_string();
+            for (diagnostic, refused) in [
+                (&ancestor_diagnostic, &lower),
+                (&socket_diagnostic, &socket),
+            ] {
+                assert!(diagnostic.contains(&format!("{refused:?}")), "{diagnostic}");
+                assert!(diagnostic.contains(&format!("{upper:?}")), "{diagnostic}");
+                assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+                assert!(!diagnostic.contains(['\x1b', '\u{202e}']), "{diagnostic:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ancestor_metadata_failures_do_not_hide_higher_unsafe_components() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        for ancestor in [base.join("missing"), base.join("not-a-directory")] {
+            if ancestor.ends_with("not-a-directory") {
+                std::fs::write(&ancestor, b"not a directory").unwrap();
+            }
+            let refused = ancestor.join("unverified/refused");
+            assert!(std::fs::symlink_metadata(refused.parent().unwrap()).is_err());
+            for repair in [
+                PermissionRepair::Private,
+                PermissionRepair::RemoveGroupOtherWrite,
+            ] {
+                let diagnostic =
+                    permission_refusal(&refused, 0o777, repair, nix::unistd::geteuid().as_raw())
+                        .to_string();
+                assert!(diagnostic.contains(&format!("{refused:?}")), "{diagnostic}");
+                assert!(
+                    diagnostic.contains(&format!("{ancestor:?}")),
+                    "{diagnostic}"
+                );
+                assert!(!diagnostic.contains("`chmod"), "{diagnostic}");
+            }
+        }
     }
 
     #[test]

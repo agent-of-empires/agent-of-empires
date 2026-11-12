@@ -14,6 +14,7 @@ pub(super) type SessionIdentityBaseline = (
     Option<std::time::SystemTime>,
     u64,
     crate::session::Status,
+    chrono::DateTime<chrono::Utc>,
 );
 
 /// Preserve concurrent changes to any part of the native conversation.
@@ -22,8 +23,14 @@ pub(super) fn apply_drained_identity_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _) = baseline;
-    if baseline_conversation.matches(live) && live.omp_capture_generation == *baseline_generation {
+    let (baseline_conversation, baseline_marker, baseline_generation, _, _, _, _, created_at) =
+        baseline;
+    if live.created_at == *created_at
+        && live.lifecycle_generation == baseline.5
+        && live.source_profile == drained.source_profile
+        && baseline_conversation.matches(live)
+        && live.omp_capture_generation == *baseline_generation
+    {
         live.adopt_conversation_state(drained.conversation_state());
         live.omp_capture_generation = drained.omp_capture_generation.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
@@ -40,7 +47,8 @@ fn apply_poller_repair_if_lifecycle_unchanged(
     backoff: &crate::session::poller::PollerRepairBackoff,
     baseline: &SessionIdentityBaseline,
 ) {
-    if live.lifecycle_generation == baseline.5
+    if live.created_at == baseline.7
+        && live.lifecycle_generation == baseline.5
         && live.active_execution == baseline.0.active
         && live.omp_capture_generation == baseline.2
         && live.tool == baseline.0.tool
@@ -54,7 +62,9 @@ fn apply_poller_runtime_if_unchanged(
     repaired: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    if live.tool == repaired.tool
+    if live.created_at == baseline.7
+        && live.source_profile == repaired.source_profile
+        && live.tool == repaired.tool
         && live.active_execution == repaired.active_execution
         && live.omp_capture_generation == repaired.omp_capture_generation
         && live.capture_poller.retry_after() == baseline.3
@@ -73,7 +83,10 @@ fn apply_drained_lifecycle_if_unchanged(
     baseline: &SessionIdentityBaseline,
 ) {
     let baseline_generation = baseline.5;
-    if live.lifecycle_generation == baseline_generation {
+    if live.created_at == baseline.7
+        && live.source_profile == drained.source_profile
+        && live.lifecycle_generation == baseline_generation
+    {
         live.lifecycle_generation = drained.lifecycle_generation;
         live.lifecycle_reservation = drained.lifecycle_reservation.clone();
     }
@@ -82,9 +95,11 @@ fn apply_drained_lifecycle_if_unchanged(
 pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     // Drain poller observations into sessions.json so daemon-only sessions persist
     // post-`/clear` sids.
+    let namespace = state.profile_namespace.clone().read_owned().await;
     let snapshot = state.instances.read().await.clone();
-    let file_watch = state.file_watch.clone();
-    match tokio::task::spawn_blocking(move || {
+    let worker_state = state.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _namespace = namespace;
         let baseline: std::collections::HashMap<String, SessionIdentityBaseline> = snapshot
             .iter()
             .map(|inst| {
@@ -98,14 +113,46 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                         inst.capture_started_at,
                         inst.lifecycle_generation,
                         inst.status,
+                        inst.created_at,
                     ),
                 )
             })
             .collect();
         let mut snapshot = snapshot;
+        // Open every canonical store before consuming an observation. A profile
+        // failure keeps the existing global NativeStoreUnavailable policy.
+        let mut stores: Vec<super::session_store::NativeSessionStore> = Vec::new();
+        for instance in &snapshot {
+            let profile = instance.source_profile.as_str();
+            if !stores
+                .iter()
+                .any(|store| crate::session::SessionStore::storage(store).profile() == profile)
+            {
+                stores.push(
+                    super::session_store::NativeSessionStore::open(
+                        worker_state.clone(),
+                        profile,
+                        None,
+                    )
+                    .map_err(|error| error.context(format!("capture profile {profile}")))?,
+                );
+            }
+        }
+        let provided = |profile: &str| -> anyhow::Result<&dyn crate::session::SessionStore> {
+            stores
+                .iter()
+                .find(|store| crate::session::SessionStore::storage(*store).profile() == profile)
+                .map(|store| store as &dyn crate::session::SessionStore)
+                .ok_or_else(|| {
+                    anyhow::Error::new(crate::session::NativeStoreUnavailable)
+                        .context(format!("capture profile {profile} unavailable"))
+                })
+        };
         // Preserve a final queued observation before replacing a stopped worker.
-        let mut outcome =
-            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
+        let mut outcome = crate::session::sync::drain_and_persist_session_ids_with_stores(
+            &mut snapshot,
+            &provided,
+        );
         // One observation for the whole repair walk, as on the TUI side.
         let live = crate::tmux::LiveSessionSnapshot::new();
         let backoff_before = repair_backoffs(&snapshot);
@@ -136,11 +183,18 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
             .collect();
         // The walk ran on a clone.
         let deferred = changed_repair_backoffs(&backoff_before, &snapshot);
-        (outcome, snapshot, baseline, runtime_changed, deferred)
+        Ok((
+            _namespace,
+            outcome,
+            snapshot,
+            baseline,
+            runtime_changed,
+            deferred,
+        ))
     })
     .await
     {
-        Ok((outcome, mutated, baseline, runtime_changed, deferred))
+        Ok(Ok((_namespace, outcome, mutated, baseline, runtime_changed, deferred)))
             if outcome.touched() || !runtime_changed.is_empty() || !deferred.is_empty() =>
         {
             let touched: std::collections::HashSet<&str> = outcome
@@ -162,6 +216,12 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 let Some(identity_baseline) = baseline.get(&src.id) else {
                     continue;
                 };
+                // The schedule-only reapply also belongs to this exact profile
+                // and creation, even when a reused id has the same generation.
+                if dst.created_at != identity_baseline.7 || dst.source_profile != src.source_profile
+                {
+                    continue;
+                }
                 if let Some(backoff) = deferred.get(&src.id) {
                     apply_poller_repair_if_lifecycle_unchanged(dst, backoff, identity_baseline);
                 }
@@ -176,7 +236,10 @@ pub(super) async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                 }
             }
         }
-        Ok(_) => {}
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(target: "session.sync", %error, "canonical capture stores unavailable");
+        }
         Err(e) => {
             tracing::error!(
                 target: "session.sync",
@@ -588,10 +651,11 @@ mod tests {
 
     #[test]
     fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
+        let original = Instance::new("session", "/tmp/project");
         let baseline = (
             crate::session::ConversationState {
                 session_id: Some("old-sid".into()),
-                ..Instance::new("session", "/tmp/project").conversation_state()
+                ..original.conversation_state()
             },
             Some("old-marker".to_string()),
             Some("generation-a".to_string()),
@@ -599,13 +663,14 @@ mod tests {
             None,
             0,
             crate::session::Status::Idle,
+            original.created_at,
         );
-        let mut drained = Instance::new("session", "/tmp/project");
+        let mut drained = original.clone();
         drained.agent_session_id = Some("captured-sid".to_string());
         drained.resume_probe_failed_sid = None;
         drained.omp_capture_generation = Some("generation-a".to_string());
 
-        let mut relaunched = Instance::new("session", "/tmp/project");
+        let mut relaunched = original.clone();
         relaunched.agent_session_id = Some("old-sid".to_string());
         relaunched.resume_probe_failed_sid = Some("old-marker".to_string());
         relaunched.omp_capture_generation = Some("generation-b".to_string());
@@ -616,7 +681,7 @@ mod tests {
         );
         assert_eq!(relaunched.agent_session_id.as_deref(), Some("old-sid"));
 
-        let mut marker_changed = Instance::new("session", "/tmp/project");
+        let mut marker_changed = original.clone();
         marker_changed.agent_session_id = Some("old-sid".to_string());
         marker_changed.resume_probe_failed_sid = Some("peer-marker".to_string());
         marker_changed.omp_capture_generation = Some("generation-a".to_string());
@@ -629,7 +694,7 @@ mod tests {
             marker_changed.resume_probe_failed_sid.as_deref(),
             Some("peer-marker")
         );
-        let mut peer = Instance::new("session", "/tmp/project");
+        let mut peer = original.clone();
         peer.adopt_conversation_state(baseline.0.clone());
         peer.omp_capture_generation = baseline.2.clone();
         peer.pi_session_path = Some("/peer/transcript.jsonl".into());
@@ -651,6 +716,7 @@ mod tests {
             None,
             0,
             crate::session::Status::Stopped,
+            live.created_at,
         );
         let mut drained = live.clone();
         drained.agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
@@ -671,6 +737,7 @@ mod tests {
             None,
             7,
             crate::session::Status::Idle,
+            live.created_at,
         );
         let mut walked = live.clone();
         let now = std::time::Instant::now();
@@ -710,16 +777,17 @@ mod tests {
 
     #[test]
     fn poller_runtime_reapply_keeps_a_deferred_retry() {
+        let mut live = Instance::new("session", "/tmp/project");
         let baseline: SessionIdentityBaseline = (
-            Instance::new("session", "/tmp/project").conversation_state(),
+            live.conversation_state(),
             None,
             None,
             None,
             None,
             0,
             crate::session::Status::Idle,
+            live.created_at,
         );
-        let mut live = Instance::new("session", "/tmp/project");
         let mut repaired = live.clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         repaired.capture_poller.set_retry_after(Some(deadline));
@@ -755,16 +823,18 @@ mod tests {
 
     #[test]
     fn drained_lifecycle_reapply_keeps_a_concurrent_reservation() {
+        let original = Instance::new("session", "/tmp/project");
         let baseline: SessionIdentityBaseline = (
-            Instance::new("session", "/tmp/project").conversation_state(),
+            original.conversation_state(),
             None,
             None,
             None,
             None,
             0,
             crate::session::Status::Idle,
+            original.created_at,
         );
-        let mut drained = Instance::new("session", "/tmp/project");
+        let mut drained = original.clone();
         drained.lifecycle_generation = 7;
         drained.lifecycle_reservation = Some(crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Capture,
@@ -773,14 +843,14 @@ mod tests {
         });
 
         // Nothing moved under the guard, so the drained values land.
-        let mut quiet = Instance::new("session", "/tmp/project");
+        let mut quiet = original.clone();
         apply_drained_lifecycle_if_unchanged(&mut quiet, &drained, &baseline);
         assert_eq!(quiet.lifecycle_generation, 7);
         assert_eq!(quiet.lifecycle_reservation, drained.lifecycle_reservation);
 
         // A relaunch advanced the generation while the drain ran: copying the
         // drained values would roll that reservation back, so it must not happen.
-        let mut relaunched = Instance::new("session", "/tmp/project");
+        let mut relaunched = original.clone();
         let reservation = crate::session::LifecycleReservation {
             op: crate::session::LifecycleOperation::Launch,
             generation: 9,
@@ -791,6 +861,53 @@ mod tests {
         apply_drained_lifecycle_if_unchanged(&mut relaunched, &drained, &baseline);
         assert_eq!(relaunched.lifecycle_generation, 9);
         assert_eq!(relaunched.lifecycle_reservation, Some(reservation));
+    }
+
+    #[test]
+    fn a_reused_row_rejects_every_part_of_the_old_walk() {
+        let original = Instance::new("reused", "/tmp/project");
+        let baseline: SessionIdentityBaseline = (
+            original.conversation_state(),
+            None,
+            None,
+            None,
+            None,
+            original.lifecycle_generation,
+            original.status,
+            original.created_at,
+        );
+        let mut walked = original.clone();
+        walked.agent_session_id = Some("11111111-2222-4333-8444-555555555555".into());
+        walked.lifecycle_generation += 1;
+        walked.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Capture,
+            generation: walked.lifecycle_generation,
+            at: chrono::Utc::now(),
+        });
+        let now = std::time::Instant::now();
+        walked.capture_poller.repair_mut().reprobe(now);
+        walked
+            .capture_poller
+            .set_retry_after(Some(now + std::time::Duration::from_secs(30)));
+        let mut reused = original.clone();
+        reused.created_at += chrono::Duration::seconds(1);
+        apply_drained_identity_if_unchanged(&mut reused, &walked, &baseline);
+        apply_poller_repair_if_lifecycle_unchanged(
+            &mut reused,
+            walked.capture_poller.repair(),
+            &baseline,
+        );
+        apply_poller_runtime_if_unchanged(&mut reused, &walked, &baseline);
+        apply_drained_lifecycle_if_unchanged(&mut reused, &walked, &baseline);
+        assert_eq!(reused.conversation_state(), original.conversation_state());
+        assert_eq!(reused.lifecycle_generation, original.lifecycle_generation);
+        assert!(reused.lifecycle_reservation.is_none());
+        assert!(reused.capture_poller.retry_after().is_none());
+        assert!(reused
+            .capture_poller
+            .repair()
+            .current_reprobe_delay()
+            .is_none());
     }
 
     /// A tool swap or a disk write can move a row's execution without moving its lifecycle counter,
@@ -824,6 +941,7 @@ mod tests {
             None,
             7,
             crate::session::Status::Idle,
+            live.created_at,
         );
         let mut walked = live.clone();
         walked
@@ -873,6 +991,7 @@ mod tests {
             None,
             7,
             crate::session::Status::Idle,
+            live.created_at,
         );
         let mut walked = live.clone();
         walked

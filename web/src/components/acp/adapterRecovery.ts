@@ -57,9 +57,10 @@ export function useAdapterInstall(sessionId: string, respawn: () => Promise<bool
 }
 
 // The event names the agent ("Failed to start structured view agent \"x\": ...");
-// a failed `/acp/spawn` answers "spawn failed: ...", sometimes after a reason code.
+// a failed `/acp/spawn` or `/acp/restart` answers "spawn failed: ..." or "restart spawn failed: ...",
+// sometimes after a reason code.
 const STARTUP_ERROR_PREFIX =
-  /^(?:Failed to start structured view agent "[^"]*":\s*|(?:worker_not_ready|rate_limited|spawn_cancelled):\s*)?(?:spawn failed:\s*)?/;
+  /^(?:Failed to start structured view agent "[^"]*":\s*|(?:worker_not_ready|rate_limited|spawn_cancelled):\s*)?(?:(?:restart )?spawn failed:\s*)?/;
 
 /** A startup error's own text, without the prefix that names where it came from. */
 export function startupErrorCause(message: string): string {

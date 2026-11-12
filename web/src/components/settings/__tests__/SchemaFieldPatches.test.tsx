@@ -37,6 +37,22 @@ const SCHEMA = [
     },
     { profile_overridable: false },
   ),
+  ...[
+    ["split_terminal_height_percent", "Split Terminal Height (%)", 1, 99],
+    ["split_terminal_min_width", "Split Terminal Minimum Width", 0, 1000],
+    ["split_terminal_min_height", "Split Terminal Minimum Height", 0, 1000],
+  ].map(([name, label, min, max]) =>
+    field(
+      "session",
+      name as string,
+      label as string,
+      { kind: "number", min: min as number, max: max as number },
+      {
+        tui_only: true,
+        profile_overridable: false,
+      },
+    ),
+  ),
   field("tmux", "status_bar", "Status Bar", { kind: "select", options: TMUX_MODES }),
   field("tmux", "mouse", "Mouse Support", { kind: "select", options: TMUX_MODES }),
   field(
@@ -173,6 +189,28 @@ describe("schema-driven settings field PATCH payloads", () => {
     // No call carries the untouched `mouse` field.
     for (const [updates] of vi.mocked(api.updateSettings).mock.calls) {
       expect((updates as { tmux?: Record<string, unknown> }).tmux).not.toHaveProperty("mouse");
+    }
+  });
+
+  it("edits paired terminal sizing in the Terminal UI group with sparse numeric patches", async () => {
+    const { container } = renderTab("session");
+    await screen.findByText("Snooze Duration (minutes)");
+    const fold = screen.getByRole("button", { name: /Terminal UI/ });
+    expect(screen.queryByText("Split Terminal Height (%)")).toBeNull();
+    fireEvent.click(fold);
+    for (const [name, label, min, max, value] of [
+      ["split_terminal_height_percent", "Split Terminal Height (%)", "1", "99", "30"],
+      ["split_terminal_min_width", "Split Terminal Minimum Width", "0", "1000", "110"],
+      ["split_terminal_min_height", "Split Terminal Minimum Height", "0", "1000", "35"],
+    ]) {
+      const input = numberInputByLabel(container, label);
+      expect(input.min).toBe(min);
+      expect(input.max).toBe(max);
+      expect(input.closest("div")?.parentElement?.textContent).toContain("Applies to all profiles");
+      commit(input, value);
+      await waitFor(() =>
+        expect(api.updateSettings).toHaveBeenCalledWith({ session: { [name]: Number(value) } }, "main"),
+      );
     }
   });
 

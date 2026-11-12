@@ -233,8 +233,8 @@ const ROWS_PRIOR_BATCH: usize = 256;
 /// Only an identified chunk before the page's first user turn can use an older marker.
 fn prior_message_marker_for_page(
     events: &[crate::acp::event_store::StoredEvent],
-    lookup: impl FnOnce(u64) -> anyhow::Result<Option<Arc<crate::acp::state::Event>>>,
-) -> anyhow::Result<Option<Arc<crate::acp::state::Event>>> {
+    lookup: impl FnOnce(u64) -> anyhow::Result<Option<crate::acp::event_store::StoredEvent>>,
+) -> anyhow::Result<Option<crate::acp::event_store::StoredEvent>> {
     use crate::acp::state::Event;
     for stored in events {
         match stored.event.as_ref() {
@@ -257,7 +257,7 @@ fn prior_message_marker(
     session_id: &str,
     before: u64,
     batch: usize,
-) -> anyhow::Result<Option<Arc<crate::acp::state::Event>>> {
+) -> anyhow::Result<Option<crate::acp::event_store::StoredEvent>> {
     let mut cursor = before;
     loop {
         let page = store.replay_page_before(session_id, cursor, Some(batch))?;
@@ -272,7 +272,7 @@ fn prior_message_marker(
             )
         });
         if let Some(stored) = marker {
-            return Ok(Some(Arc::clone(&stored.event)));
+            return Ok(Some(stored.clone()));
         }
         match page.last_scanned_seq {
             Some(next) if page.has_more && next < cursor => cursor = next,
@@ -324,7 +324,7 @@ pub async fn acp_replay(
             Err(error) => return blocking_failed("retained transcript marker read failed", error),
         };
         if let Some(prior) = prior {
-            model.observe_prior(&prior);
+            model.observe_prior(prior.seq, &prior.event, &prior.metadata);
         }
         for stored in &page.events {
             model.apply_scoped_event(stored.seq, &stored.event, &stored.metadata);
@@ -856,10 +856,14 @@ done
             let prior = prior_message_marker_for_page(&page, |before| {
                 calls += 1;
                 assert_eq!(before, 20, "{label}");
-                Ok(Some(std::sync::Arc::new(Event::AgentMessageChunk {
-                    text: "earlier".into(),
-                    message_id: Some("m-a".into()),
-                })))
+                Ok(Some(crate::acp::event_store::StoredEvent {
+                    seq: 19,
+                    event: Arc::new(Event::AgentMessageChunk {
+                        text: "earlier".into(),
+                        message_id: Some("m-a".into()),
+                    }),
+                    metadata: crate::acp::event_sender::EventMetadata::history(),
+                }))
             })
             .expect("read prior marker");
             assert_eq!(calls, reads, "{label}");
@@ -900,14 +904,16 @@ done
             }
         }
         assert!(matches!(
-            prior_message_marker(&store, "s-chunk", 72, 8).expect("read prior chunk").as_deref(),
-            Some(Event::AgentMessageChunk { message_id: Some(id), .. }) if id == "m-a"
+            prior_message_marker(&store, "s-chunk", 72, 8)
+                .expect("read prior chunk")
+                .map(|stored| (stored.seq, stored.event.as_ref().clone())),
+            Some((1, Event::AgentMessageChunk { message_id: Some(id), .. })) if id == "m-a"
         ));
         assert!(matches!(
             prior_message_marker(&store, "s-prompt", 72, 8)
                 .expect("read prior turn")
-                .as_deref(),
-            Some(Event::UserPromptSent { .. })
+                .map(|stored| (stored.seq, stored.event.as_ref().clone())),
+            Some((1, Event::UserPromptSent { .. }))
         ));
         assert!(prior_message_marker(&store, "s-none", 72, 8)
             .expect("read absent marker")

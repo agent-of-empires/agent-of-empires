@@ -44,11 +44,13 @@ pub fn augmented_command() -> Command {
     graft_onto(Cli::command(), plugin_commands())
 }
 
-/// True when the builtin `aoe.web` plugin is present and disabled.
-pub fn web_disabled() -> bool {
-    crate::plugin::registry()
+/// Whether global configuration disables the registered Web plugin.
+pub fn web_disabled(config: &crate::session::Config) -> bool {
+    config
+        .plugins
         .get("aoe.web")
-        .is_some_and(|p| !p.enabled)
+        .is_some_and(|plugin| !plugin.enabled)
+        && crate::plugin::registry().get("aoe.web").is_some()
 }
 
 /// Reject fresh web starts when `aoe.web` is disabled, not core recovery.

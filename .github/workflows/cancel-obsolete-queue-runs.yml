@@ -1,0 +1,30 @@
+name: Cancel obsolete queue runs
+
+on:
+  # Default-branch code only; no queue checkout, cache restoration or artifacts.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [CI, Tests]
+    types: [requested]
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: read
+
+jobs:
+  cancel:
+    if: github.event.workflow_run.event == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # workflow_run's SHA belongs to the default branch, never the queue head.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const cancel = require('./.github/scripts/cancel-obsolete-queue-runs.cjs');
+            await cancel({ github, context, core });

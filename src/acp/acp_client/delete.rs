@@ -2,8 +2,8 @@
 //! the dispatch that sends it.
 
 use crate::acp::establishment::NativeRequestContext;
-use agent_client_protocol::schema::v1::ErrorCode;
-use agent_client_protocol::{Agent, ConnectionTo, JsonRpcRequest, JsonRpcResponse};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, ErrorCode, JsonRpcRequest, JsonRpcResponse};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -18,7 +18,7 @@ use std::sync::Arc;
 #[request(method = "session/delete", response = DeleteSessionResponse)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DeleteSessionRequest {
-    session_id: agent_client_protocol::schema::v1::SessionId,
+    session_id: agent_client_protocol::v1::schema::SessionId,
     /// Optional in the TS schema, but sent so a strict
     /// `unstable_session_delete` validator cannot answer `-32602`.
     #[serde(rename = "_meta")]
@@ -74,7 +74,7 @@ pub(super) fn handle_delete_session_cmd(
         ));
         return;
     }
-    let target = agent_client_protocol::schema::v1::SessionId::from(acp_session_id);
+    let target = agent_client_protocol::v1::schema::SessionId::from(acp_session_id);
     let request = DeleteSessionRequest {
         session_id: target,
         meta: serde_json::Value::Object(serde_json::Map::new()),
@@ -90,7 +90,7 @@ pub(super) fn handle_delete_session_cmd(
         let outcome = match tokio::time::timeout(ACP_SESSION_DELETE_TIMEOUT, request.wait()).await {
             Ok(OrderedRequestResult::Correlated(Ok(_))) => DeleteSessionOutcome::Deleted,
             Ok(OrderedRequestResult::Correlated(Err(error)))
-                if error.code == ErrorCode::MethodNotFound =>
+                if error.code == ErrorCode::METHOD_NOT_FOUND =>
             {
                 DeleteSessionOutcome::UnsupportedMethod
             }

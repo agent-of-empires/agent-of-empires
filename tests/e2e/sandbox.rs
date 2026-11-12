@@ -418,6 +418,7 @@ async fn native_purge_never_starts_the_managed_container() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
+    h.run_cli_ok(&["serve", "--stop"]);
     let rows_path = app.join("profiles/default/sessions.json");
     let mut rows: Vec<Instance> = serde_json::from_slice(&fs::read(&rows_path).unwrap()).unwrap();
     let row = &mut rows[0];

@@ -5,7 +5,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use uuid::Uuid;
 
 use crate::session::AnchoredDir;
@@ -15,6 +15,41 @@ const CODEX_METADATA_MAX_BYTES: usize = 64 * 1024;
 const CODEX_SCAN_MAX_DEPTH: usize = 4;
 const CODEX_SCAN_MAX_ENTRIES: usize = 8 * 1024;
 const CODEX_SCAN_MAX_CANDIDATES: usize = 4 * 1024;
+/// Admission must see a whole store, unlike capture, which may stop early. It
+/// costs one readdir per directory and opens only the rollouts of one ID.
+const CODEX_ADMISSION_SCAN_MAX_ENTRIES: usize = 1024 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    static ADMISSION_SCAN_LIMIT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(CODEX_ADMISSION_SCAN_MAX_ENTRIES) };
+}
+
+#[cfg(not(test))]
+fn admission_scan_limit() -> usize {
+    CODEX_ADMISSION_SCAN_MAX_ENTRIES
+}
+
+#[cfg(test)]
+fn admission_scan_limit() -> usize {
+    ADMISSION_SCAN_LIMIT.get()
+}
+
+/// Runs `body` with a lower admission limit than a test could reach with real files.
+#[cfg(test)]
+pub(crate) fn with_codex_admission_scan_limit<T>(limit: usize, body: impl FnOnce() -> T) -> T {
+    let previous = ADMISSION_SCAN_LIMIT.replace(limit);
+    let result = body();
+    ADMISSION_SCAN_LIMIT.set(previous);
+    result
+}
+
+/// A store too large to prove that no other rollout of a conversation exists.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("Codex store has more than {limit} entries under sessions/, over the limit AoE scans to verify a conversation")]
+pub(crate) struct CodexRolloutScanLimit {
+    limit: usize,
+}
 
 /// The cwd from a rollout's metadata line. Any declared `session_id` / `id`
 /// must equal the filename UUID, so a child rollout pointing at its parent is rejected.
@@ -44,10 +79,13 @@ fn parse_codex_cwd_from_json(line: &str, filename_uuid: &str) -> Option<String> 
         .map(str::to_string)
 }
 
-/// The trailing 36-char UUID of `rollout-<timestamp>-<uuid>.jsonl[.zst]`.
+/// The thread UUID of `rollout-<timestamp>-<uuid>[_<rollout-id>].jsonl[.zst]`.
+/// A reverted thread's file appends a distinct rollout ID, per openai/codex
+/// `codex-rs/rollout/src/rollout_file_name.rs` at 4ef836f.
 fn extract_codex_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let stem = stem.strip_suffix(".jsonl").unwrap_or(stem);
+    let stem = stem.split_once('_').map_or(stem, |(thread, _)| thread);
     let candidate = stem.get(stem.len().checked_sub(36)?..)?;
     Uuid::parse_str(candidate).ok()?;
     Some(candidate.to_string())
@@ -82,10 +120,8 @@ fn read_limited_first_line(reader: impl Read, max_bytes: usize) -> Option<String
     String::from_utf8(bytes).ok()
 }
 
-fn read_codex_metadata(root: &AnchoredDir, relative: &Path) -> Option<String> {
-    let file = root
-        .open_regular(relative, CODEX_ROLLOUT_MAX_BYTES)
-        .ok()??;
+fn read_codex_metadata(root: &AnchoredDir, relative: &Path, max_bytes: usize) -> Option<String> {
+    let file = root.open_regular(relative, max_bytes).ok()??;
     if relative.extension().and_then(|e| e.to_str()) == Some("zst") {
         let decoder = zstd::stream::read::Decoder::new(file).ok()?;
         read_limited_first_line(decoder, CODEX_METADATA_MAX_BYTES)
@@ -128,6 +164,106 @@ fn collect_codex_sessions_anchored(
     Ok(())
 }
 
+/// Rollouts named for `target`. Unlike the capture scan, anything that could
+/// hide a rollout fails: an unreadable entry, a walk over `limit` entries in
+/// total, or a date entry that is not a real directory. Non-numeric entries
+/// under `sessions/` are ignored: Codex resolves an exact UUID only under
+/// `YYYY/MM/DD`.
+fn find_codex_rollouts(
+    root: &AnchoredDir,
+    relative: &Path,
+    depth: usize,
+    target: Uuid,
+    limit: usize,
+    visited: &mut usize,
+    found: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let remaining = limit.saturating_sub(*visited);
+    let names = root.read_dir_complete(relative, remaining + 1)?;
+    if names.len() > remaining {
+        return Err(CodexRolloutScanLimit { limit }.into());
+    }
+    *visited += names.len();
+    for name in names {
+        let path = relative.join(&name);
+        let numeric = name
+            .to_str()
+            .is_some_and(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit()));
+        if numeric && depth < CODEX_SCAN_MAX_DEPTH {
+            root.directory_modified(&path)?
+                .context("Codex rollout date entry is not a directory")?;
+            find_codex_rollouts(root, &path, depth + 1, target, limit, visited, found)?;
+        } else if is_codex_rollout(&path)
+            && extract_codex_uuid_from_filename(&path)
+                .and_then(|id| Uuid::parse_str(&id).ok())
+                .is_some_and(|id| id == target)
+        {
+            found.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `sid` is a UUID, which Codex resolves exactly rather than by name,
+/// and every rollout of it in `store` is a root thread whose cwd satisfies
+/// `cwd_matches`. Only exceeding `limit` is reported; other failures are `false`.
+fn codex_rollouts_record(
+    store: &Path,
+    sid: &str,
+    limit: usize,
+    cwd_matches: impl Fn(&str) -> bool,
+) -> Result<bool, CodexRolloutScanLimit> {
+    let verify = || -> Result<bool> {
+        let target = Uuid::parse_str(sid)?;
+        let root = AnchoredDir::open(store)?;
+        let sessions = Path::new("sessions");
+        if root.directory_modified(sessions)?.is_none() {
+            return Ok(false);
+        }
+        let mut found = Vec::new();
+        find_codex_rollouts(&root, sessions, 0, target, limit, &mut 0, &mut found)?;
+        Ok(!found.is_empty()
+            && found.iter().all(|relative| {
+                // Only the first line is read, so a long conversation's size is irrelevant.
+                read_codex_metadata(&root, relative, usize::MAX)
+                    .and_then(|line| parse_codex_cwd_from_json(&line, sid))
+                    .is_some_and(|recorded| cwd_matches(&recorded))
+            }))
+    };
+    verify().or_else(|error| match error.downcast() {
+        Ok(limit) => Err(limit),
+        Err(_) => Ok(false),
+    })
+}
+
+/// [`codex_rollouts_record`] for a cwd on this host.
+pub(crate) fn codex_rollout_records_cwd(
+    store: &Path,
+    sid: &str,
+    cwd: &Path,
+) -> Result<bool, CodexRolloutScanLimit> {
+    let Ok(cwd) = cwd.canonicalize() else {
+        return Ok(false);
+    };
+    codex_rollouts_record(store, sid, admission_scan_limit(), |recorded| {
+        Path::new(recorded)
+            .canonicalize()
+            .is_ok_and(|recorded| recorded == cwd)
+    })
+}
+
+/// [`codex_rollouts_record`] for a cwd inside a container, which has no host
+/// path to canonicalize and compares literally, as capture does.
+pub(crate) fn codex_rollout_records_container_cwd(
+    store: &Path,
+    sid: &str,
+    cwd: &str,
+) -> Result<bool, CodexRolloutScanLimit> {
+    codex_rollouts_record(store, sid, admission_scan_limit(), |recorded| {
+        recorded == cwd
+    })
+}
+
 /// Polls the mounted Codex store for the newest post-launch rollout whose cwd matches the container.
 pub(crate) fn codex_poll_fn_sandboxed_store(
     store: PathBuf,
@@ -153,7 +289,7 @@ pub(crate) fn codex_poll_fn_sandboxed_store(
             if exclusion.contains(&id) {
                 return None;
             }
-            let first_line = read_codex_metadata(&root, &relative)?;
+            let first_line = read_codex_metadata(&root, &relative, CODEX_ROLLOUT_MAX_BYTES)?;
             (parse_codex_cwd_from_json(&first_line, &id).as_deref() == Some(container_cwd.as_str()))
                 .then_some(id)
                 .and_then(super::validated_session_id)
@@ -176,6 +312,146 @@ mod tests {
             HashSet::new(),
             None,
         )
+    }
+
+    #[test]
+    fn codex_rollout_records_cwd_requires_an_exact_root_thread_here() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let day = store.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        let project = temp.path().join("project");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let (here, there) = (project.to_str().unwrap(), other.to_str().unwrap());
+        let long = "11111111-2222-4333-8444-555555555551";
+        let foreign = "11111111-2222-4333-8444-555555555552";
+        let child = "11111111-2222-4333-8444-555555555553";
+        let split = "11111111-2222-4333-8444-555555555554";
+        let name = |id: &str, n: u8| day.join(format!("rollout-2026-11-06T12-00-0{n}-{id}.jsonl"));
+        std::fs::write(name(long, 0), rollout_line(long, here)).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(name(long, 0))
+            .unwrap()
+            .set_len(CODEX_ROLLOUT_MAX_BYTES as u64 + 1)
+            .unwrap();
+        std::fs::write(name(foreign, 0), rollout_line(foreign, there)).unwrap();
+        std::fs::write(
+            name(child, 0),
+            format!(
+                "{{\"payload\":{{\"id\":\"{child}\",\"cwd\":\"{here}\",\"parent_thread_id\":\"{long}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(name(split, 0), rollout_line(split, here)).unwrap();
+        std::fs::write(name(split, 1), rollout_line(split, there)).unwrap();
+        let revert_id = "11111111-2222-4333-8444-666666666666";
+        let reverted_here = "11111111-2222-4333-8444-555555555555";
+        let reverted_away = "11111111-2222-4333-8444-555555555556";
+        let segment = |id: &str| {
+            day.join(format!(
+                "rollout-2026-11-06T13-00-00-{id}_{revert_id}.jsonl"
+            ))
+        };
+        std::fs::write(segment(reverted_here), rollout_line(reverted_here, here)).unwrap();
+        std::fs::write(name(reverted_away, 0), rollout_line(reverted_away, here)).unwrap();
+        std::fs::write(segment(reverted_away), rollout_line(reverted_away, there)).unwrap();
+
+        for (sid, expected) in [
+            (long, true),
+            (foreign, false),
+            (child, false),
+            (split, false),
+            (reverted_here, true),
+            (reverted_away, false),
+            (revert_id, false),
+            ("11111111-2222-4333-8444-555555555559", false),
+            ("my-thread-name", false),
+        ] {
+            assert_eq!(
+                codex_rollout_records_cwd(&store, sid, &project),
+                Ok(expected),
+                "{sid}"
+            );
+            assert_eq!(
+                codex_rollout_records_container_cwd(&store, sid, here),
+                Ok(expected),
+                "{sid}"
+            );
+        }
+        assert_eq!(codex_rollout_records_cwd(&store, foreign, &other), Ok(true));
+        // A container path need not exist on this host.
+        assert_eq!(
+            codex_rollout_records_container_cwd(&store, foreign, there),
+            Ok(true)
+        );
+
+        // This refuses the whole scan, so it follows the table.
+        std::os::unix::fs::symlink(&other, store.join("sessions/2025")).unwrap();
+        assert_eq!(codex_rollout_records_cwd(&store, long, &project), Ok(false));
+    }
+
+    #[test]
+    fn codex_rollout_scan_limit_is_shared_across_directories_and_named() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let id = "11111111-2222-4333-8444-555555555551";
+        let day = store.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-11-06T12-00-00-{id}.jsonl")),
+            rollout_line(id, "/workspace"),
+        )
+        .unwrap();
+        // Every directory stays under the limit; only the whole walk reaches it.
+        for month in ["01", "02", "03"] {
+            let padded = store.join("sessions/2026").join(month);
+            std::fs::create_dir_all(&padded).unwrap();
+            for n in 0..4 {
+                std::fs::write(padded.join(format!("pad-{n}")), "").unwrap();
+            }
+        }
+        let scan = |limit| codex_rollouts_record(&store, id, limit, |cwd| cwd == "/workspace");
+        let entries = 19;
+        assert_eq!(scan(entries), Ok(true));
+        let refused = scan(entries - 1).unwrap_err();
+        assert_eq!(refused.limit, entries - 1);
+        assert!(
+            refused.to_string().contains("more than 18 entries"),
+            "{refused}"
+        );
+    }
+
+    /// Nine or so months of history is past the capture budget, which admission must not inherit.
+    #[test]
+    fn codex_rollout_admission_verifies_a_store_past_the_capture_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "11111111-2222-4333-8444-555555555551";
+        let today = store.join("sessions/2026/11/08");
+        std::fs::create_dir_all(&today).unwrap();
+        std::fs::write(
+            today.join(format!("rollout-2026-11-08T12-00-00-{id}.jsonl")),
+            rollout_line(id, project.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut rollouts = 0;
+        for (month, day) in (1..=12).flat_map(|month| (1..=28).map(move |day| (month, day))) {
+            let dir = store.join(format!("sessions/2025/{month:02}/{day:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for n in 0..30 {
+                let other = Uuid::new_v4();
+                let name = format!("rollout-2025-{month:02}-{day:02}T12-00-{n:02}-{other}.jsonl");
+                std::fs::write(dir.join(name), "{}\n").unwrap();
+                rollouts += 1;
+            }
+        }
+        assert!(rollouts > CODEX_SCAN_MAX_ENTRIES, "{rollouts}");
+        assert_eq!(codex_rollout_records_cwd(&store, id, &project), Ok(true));
     }
 
     fn rollout_line(id: &str, cwd: &str) -> String {
@@ -243,6 +519,13 @@ mod tests {
         let path = PathBuf::from(format!("rollout-2025-03-06T12-00-00-{uuid}.jsonl"));
         assert_eq!(
             extract_codex_uuid_from_filename(&path).as_deref(),
+            Some(uuid)
+        );
+        let reverted = PathBuf::from(format!(
+            "rollout-2025-03-06T12-00-00-{uuid}_11111111-2222-4333-8444-555555555555.jsonl"
+        ));
+        assert_eq!(
+            extract_codex_uuid_from_filename(&reverted).as_deref(),
             Some(uuid)
         );
         assert_eq!(

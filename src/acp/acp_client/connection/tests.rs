@@ -6,7 +6,7 @@ use crate::acp::acp_client::{SdkTaskObservation, SdkTestOptions};
 use crate::acp::approvals::Nonce;
 use crate::acp::event_sender::WeakEventSender;
 use crate::acp::supervisor::test_support::managed::{ManagedClient, ManagedScope, ManagedTask};
-use agent_client_protocol::schema::v1::{ContentBlock, TextContent};
+use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use futures_util::FutureExt;
 use std::future::Future;
 use std::pin::Pin;

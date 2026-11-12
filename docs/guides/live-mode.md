@@ -38,9 +38,42 @@ Almost every key goes to the agent, so AoE reserves one **leader** chord, tmux-s
 
 While the leader is armed the status bar becomes a which-key menu. Only the leader itself is taken from the agent, and pressing it twice still delivers it downstream, so every other chord, `Ctrl+K` included, passes through untouched. The command palette layers over live mode: `Esc` drops back into the relay, while choosing a command leaves live mode first, so the preview never shows one session while your keystrokes go to another. The sidebar stays as you left it when you exit live mode; click the collapsed strip to bring it back.
 
+The paired terminal split also toggles with `|` outside live mode. In `[session]`,
+`split_terminal_height_percent` sets its share of the preview (1 to 99, default 50).
+`split_terminal_min_width` and `split_terminal_min_height` set the minimum whole
+window size (0 to 1000, defaults 100 columns and 30 rows). Below either threshold
+the split is hidden without changing the toggle; Terminal view remains available.
+The unfocused split pane is observed without resizing its shared tmux pane.
+In Terminal view, scrolling to the newest output keeps the preview at the tail
+until the preview target changes.
+
 `Shift+PageUp` and `Shift+PageDown` scroll the preview through the agent's history without leaving live mode; bare `PageUp` and `PageDown` still pass through for agents that page their own UI.
 
 `Shift+Enter` inserts a newline into the agent's input box on kitty-protocol-capable terminals (Ghostty, Kitty, WezTerm, foot, Konsole 24+, Alacritty 0.13+, recent xterm). Elsewhere it submits like bare `Enter`, so use `Alt+Enter` (`Option+Enter` on macOS), which sends `ESC+CR` natively on many terminals, or configure your terminal to send `ESC+CR` for `Shift+Enter`.
+
+## Captured input scope
+
+An error banner is not evidence that a native agent died. Opening or sending to an already-live pane preserves that runtime; an uncertain pane observation refuses the operation rather than choosing Restart. Confirmed missing or dead panes use the governed launch path. Dead-pane cleanup removes the exact owned corpse directly, without briefly respawning a shell or traversing a defunct process tree.
+
+A dead observation can legitimately report an empty PID after a live birth. Cleanup carries that freshly validated dead snapshot forward, correlated to the birth's server incarnation, session and pane; the native removal command still checks the exact current PID/dead state. It never treats an arbitrary missing PID as permission to remove a pane.
+
+Live input is bound when it enters the queue: the native instance's creation and generation, physical profile, original tmux server and pane, and captured transport. Each input batch checks current native authority under lifecycle exclusion. Body, paste and a delayed Enter keep that same target and are checked separately. A failed socket write is not replayed through another channel or a freshly looked-up name. Native effect acknowledgement means transport acceptance, not that the application has read or acted on the bytes.
+
+Preparation also retains its original row and physical profile before it waits. An already-live Agent keeps that physical owner; a missing/dead Agent can use only the selected context captured for that preparation, checked again after launch hooks. The returned target is that operation's own result, never a replacement found by looking up the row after the wait. Unknown or changed preconditions refuse the old action; a new explicit action can capture the current scope. These equality checks do not grant fresh-conversation or retry permission.
+
+The original selected-context digest and physical profile are captured before a send waits for admission. A title or tmux-name change alone does not revoke an otherwise unchanged live physical owner: captured input and Agent readiness query the original server/session/pane IDs, not a newly resolved name. A transport that actually closes still refuses delivery without replay.
+
+An applied live target must still publish a non-empty tmux label together with its physical observation. A renamed label can retain the same physical owner; an absent or empty label is an unqualified target and refuses the waiting preparation, even when an older snapshot carried the physical observation.
+
+After launch exclusions are reacquired, the internal Created receipt retains its own physical observation and is checked against durable creation/generation, never a replacement seen through a stale daemon cache. Created is not a public `/ensure` status: HTTP returns `restarted` after launch and `alive` when reusing the captured runtime.
+
+If required conversation publication is known to have been refused after a new native birth, cleanup is limited to that owned birth under its current reservation and creation/generation fences; peer conversation pins are preserved. An uncertain commit is different: the exact bound store must be reconciled, and a possibly applied or unreadable publication does not authorize destroying the native runtime or replaying the request.
+
+Successful input bookkeeping only updates recency for the captured creation, generation and physical profile. It is not the explicit Access gesture: it does not clear archive, snooze, dormancy, a newer error, or a newer lifecycle state. Restart completion likewise does not merge an old lifecycle snapshot over a peer's newer state.
+
+A native generation can change while the Agent PTY survives, for example when another session-owned terminal is launched or stopped. A stale view therefore stops accepting input even if its output remains live; a freshly captured action can use the surviving runtime. Already accepted bytes are not retracted. The raw `pipe-pane -I` transport and its native mode behavior remain unchanged; fallback sends retain their original physical target.
+
+These fences cover AoE-managed replacement and queued actions. They do not promise protection against arbitrary external `respawn-pane`, external hooks that redirect input, or every externally linked window surviving `kill-session`.
 
 ## Captured input scope
 

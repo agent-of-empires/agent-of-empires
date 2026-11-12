@@ -73,7 +73,7 @@ static NEXT_REPORTER_ID: AtomicU64 = AtomicU64::new(1);
 /// go to the newest installed reporter whose guard is still alive, so guards
 /// may drop in any order: each removes only its own registration. `None`
 /// installs nothing and leaves an outer reporter, if any, in effect.
-pub(super) fn install(reporter: Option<Reporter>) -> ReporterGuard {
+pub(crate) fn install(reporter: Option<Reporter>) -> ReporterGuard {
     let id = reporter.map(|reporter| {
         let id = NEXT_REPORTER_ID.fetch_add(1, Ordering::Relaxed);
         REPORTERS.with(|reporters| reporters.borrow_mut().push((id, reporter)));
@@ -82,7 +82,7 @@ pub(super) fn install(reporter: Option<Reporter>) -> ReporterGuard {
     ReporterGuard(id)
 }
 
-pub(super) struct ReporterGuard(Option<u64>);
+pub(crate) struct ReporterGuard(Option<u64>);
 
 impl Drop for ReporterGuard {
     fn drop(&mut self) {

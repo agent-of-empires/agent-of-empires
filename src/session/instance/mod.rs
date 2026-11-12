@@ -38,13 +38,14 @@ mod accessors;
 mod capture_slot;
 mod container;
 mod execution;
-pub(crate) use capture_slot::{Handoff, Held, Unserved};
+pub(crate) use capture_slot::{Held, Unserved};
 pub(crate) use execution::{ActiveExecution, CaptureContext, ConversationKey, ConversationState};
 pub use execution::{
     ConversationBinding, ConversationProvenance, ExecutionBinding, ExecutionLocation,
 };
 mod flags;
 mod hooks;
+pub(crate) use hooks::HostHookApprovalRequired;
 mod identity_sidecar;
 mod kill;
 mod launch_command;
@@ -84,11 +85,11 @@ pub(crate) use identity_sidecar::FAIL_PI_PATH_WRITES;
 pub use polling::PollerStart;
 pub use ready::{EnsureReadyError, EnsureReadyOutcome, SessionGone};
 pub(crate) use ready::{NativeInputError, NativeInputFence};
-pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use resume::{
-    LaunchReservation, ManagedResumeRefused, NativeStartAdmission, ResumeAttemptPolicy,
+    LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused, ResumeAttemptPolicy,
     ResumeLaunchOptions,
 };
+pub use resume::{LaunchIndeterminateCause, ManagedResumeCause};
 pub(crate) use sid_persist::{
     persist_session_to_storage, CaptureCommit, SidPersistOutcome, SidWrite,
 };
@@ -139,7 +140,7 @@ pub(crate) use types::{
 };
 
 // Sibling items the submodules reach through `use super::*`.
-use hooks::status_hook_env_prefix;
+use hooks::host_launch_env_prefix;
 pub(crate) use hooks::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
     host_hook_post_install_notes,
@@ -243,6 +244,10 @@ pub(crate) struct TerminalHandoffLaunch {
     pub(crate) capture_started_at: Option<SystemTime>,
     pub(crate) omp_capture_metadata: Option<OmpCaptureMetadata>,
     pub(crate) confirm_desired_conversation: bool,
+    pub(crate) receipt: Option<std::sync::Arc<LegacyToolObservation>>,
+    /// Negative evidence only; never substitutes for the launch's birth receipt.
+    #[serde(default)]
+    pub(crate) birth_inventory: Option<crate::tmux::utils::PaneBirthInventory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

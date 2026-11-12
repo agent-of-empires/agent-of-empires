@@ -9,7 +9,7 @@ use crate::acp::elicitations::{parse_elicitation, ElicitationOutcome};
 use crate::acp::event_sender::EventSender;
 use crate::acp::permissions::build_approval;
 use crate::acp::state::{Event, ToolCall};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAction, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome,
@@ -33,7 +33,7 @@ use super::tool_output::{preview_optional_args, tool_kind_str};
 /// A kind we cannot map back is dropped rather than guessed at, so no client
 /// offers a button whose meaning is unknown.
 pub(super) fn approval_options(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    options: &[agent_client_protocol::v1::schema::PermissionOption],
 ) -> Vec<ApprovalOption> {
     options
         .iter()
@@ -59,10 +59,10 @@ pub(super) fn approval_options(
 /// by kind would send an option the user never picked, so it resolves to
 /// `None` and the caller cancels. Without one, the decision picks by kind.
 pub(super) fn pick_option_id(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
+    options: &[agent_client_protocol::v1::schema::PermissionOption],
     decision: ApprovalDecision,
     requested: Option<&str>,
-) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
+) -> Option<agent_client_protocol::v1::schema::PermissionOptionId> {
     if let Some(requested) = requested {
         return options
             .iter()
@@ -99,8 +99,8 @@ pub(super) fn pick_option_id(
 /// would broadcast as an allow and leave the tool card running. `None` for a
 /// kind newer than this build, which keeps the client's decision.
 fn decision_for_option(
-    options: &[agent_client_protocol::schema::v1::PermissionOption],
-    option_id: &agent_client_protocol::schema::v1::PermissionOptionId,
+    options: &[agent_client_protocol::v1::schema::PermissionOption],
+    option_id: &agent_client_protocol::v1::schema::PermissionOptionId,
 ) -> Option<ApprovalDecision> {
     let kind = options.iter().find(|o| &o.option_id == option_id)?.kind;
     match kind {
@@ -265,9 +265,8 @@ pub(super) async fn handle_permission_request(
     };
     if !published {
         if publication.is_some() {
-            return Err(agent_client_protocol::util::internal_error(
-                "native approval request could not be published",
-            ));
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("native approval request could not be published"));
         }
         // Receiver gone: cancel.
         pending.lock().await.remove(&nonce);
@@ -305,9 +304,8 @@ pub(super) async fn handle_permission_request(
                 .as_ref()
                 .is_some_and(|publication| !publication.published_at(u64::MAX)) =>
         {
-            return Err(agent_client_protocol::util::internal_error(
-                "native approval request could not be published",
-            ));
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("native approval request could not be published"));
         }
         Ok(ApprovalResolutionMessage::Decision {
             decision,
@@ -449,9 +447,8 @@ pub(super) async fn handle_elicitation_request(
     };
     if !published {
         if publication.is_some() {
-            return Err(agent_client_protocol::util::internal_error(
-                "native elicitation request could not be published",
-            ));
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("native elicitation request could not be published"));
         }
         return Ok(CreateElicitationResponse::new(ElicitationAction::Cancel));
     }
@@ -468,9 +465,8 @@ pub(super) async fn handle_elicitation_request(
                 .as_ref()
                 .is_some_and(|publication| !publication.published_at(u64::MAX)) =>
         {
-            return Err(agent_client_protocol::util::internal_error(
-                "native elicitation request could not be published",
-            ));
+            return Err(agent_client_protocol::Error::internal_error()
+                .data("native elicitation request could not be published"));
         }
         Err(_) => ElicitationResolutionMessage {
             response: CreateElicitationResponse::new(ElicitationAction::Cancel),
@@ -500,7 +496,7 @@ pub(super) async fn handle_elicitation_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
+    use agent_client_protocol::v1::schema::{PermissionOption, PermissionOptionId};
 
     fn option(id: &str, name: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption::new(PermissionOptionId::new(id), name, kind)
@@ -601,7 +597,7 @@ mod tests {
     /// `handle_permission_request`, so this drives the whole handler (#3741).
     #[tokio::test]
     async fn choice_list_with_no_picked_option_cancels_instead_of_picking_the_first() {
-        use agent_client_protocol::schema::v1::{
+        use agent_client_protocol::v1::schema::{
             RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };
         use std::collections::HashMap;
@@ -674,7 +670,7 @@ mod tests {
     /// not carry a plan even when its input has a `plan` field.
     #[tokio::test]
     async fn plan_is_only_attached_to_non_destructive_approvals() {
-        use agent_client_protocol::schema::v1::{
+        use agent_client_protocol::v1::schema::{
             RequestPermissionRequest, ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
         };
         use std::collections::HashMap;
@@ -823,6 +819,7 @@ mod tests {
             for original in [true, false] {
                 for question in [false, true] {
                     for discard in [false, true] {
+                        let phase = std::cell::Cell::new("creating original");
                         tokio::time::timeout(Duration::from_secs(30), async {
                             let directory = scope.tempdir();
                             let sid = uuid::Uuid::new_v4().to_string();
@@ -852,24 +849,35 @@ mod tests {
                             );
                             let mut client = scope.spawn(config, "unpublished-decision").await.unwrap();
                             let constructor_id = constructor_rx.await.unwrap();
+                            let state = client.app_state();
                             let mut prompt_id = None;
                             if !original {
                                 native.send(json!({"jsonrpc":"2.0","id":constructor_id,
                                     "result":{"sessionId":sid}})).await;
                                 client.ready().await;
+                                phase.set("awaiting creation finalization");
+                                let storage = crate::session::Storage::open_unwatched("test").unwrap();
+                                loop {
+                                    let row = storage.load_instances_complete().unwrap().into_iter()
+                                        .find(|row| row.id == client.id).unwrap();
+                                    if row.status == crate::session::Status::Idle {
+                                        drop(state.session_service.prompt_submission(&client.id).await);
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
                                 client.send_prompt("one explicit prompt", &[]).await.unwrap();
                                 prompt_id = Some(prompt_rx.await.unwrap());
                             }
-                            let state = client.app_state();
                             let actual = client.actual();
                             let owner = actual.connected_runner().unwrap();
                             let pause = client.pause_drain().await;
                             let prefix = state.acp_event_store.highest_seq(&client.id);
                             let params = if question {
                                 serde_json::to_value(CreateElicitationRequest::new(
-                                    agent_client_protocol::schema::v1::ElicitationFormMode::new(
-                                        agent_client_protocol::schema::v1::ElicitationSessionScope::new(sid.clone()),
-                                        agent_client_protocol::schema::v1::ElicitationSchema::new().string("name", true),
+                                    agent_client_protocol::v1::schema::ElicitationFormMode::new(
+                                        agent_client_protocol::v1::schema::ElicitationSessionScope::new(sid.clone()),
+                                        agent_client_protocol::v1::schema::ElicitationSchema::new().string("name", true),
                                     ),
                                     "A question the host cannot publish",
                                 )).unwrap()
@@ -916,6 +924,7 @@ mod tests {
                                 ).unwrap();
                             }
                             drop(pause);
+                            phase.set("awaiting host refusal");
                             let refused = native.reply().await;
                             assert_eq!(refused["id"], callback_id, "{refused}");
                             assert_eq!(refused["error"]["code"], -32603, "{refused}");
@@ -925,6 +934,7 @@ mod tests {
                             assert_eq!(actual.connected_runner(), Some(owner));
                             assert_unresolvable(&client, &nonce, question).await;
                             if !discard {
+                                phase.set("awaiting append failure notice");
                                 loop {
                                     match client.next_event().await.expect("public append failure") {
                                         Event::SessionNotice { severity, .. } if severity == "error" => {
@@ -936,6 +946,7 @@ mod tests {
                                     }
                                 }
                             }
+                            phase.set("restoring owned publication fault");
                             fault.restore().unwrap();
                             let reduced = state.session_service.fold_control_state(&client.id).await.unwrap();
                             assert!(reduced.pending_approvals.is_empty());
@@ -948,6 +959,7 @@ mod tests {
                                 | Event::SessionContextReset { .. })));
                             assert!(state.acp_supervisor.take_startup_requeues().is_empty());
                             if original {
+                                phase.set("settling original result");
                                 assert!(!reduced.connection_ready);
                                 assert_eq!(native.requests(), ["initialize", "session/new"]);
                                 native.send(json!({"jsonrpc":"2.0","id":constructor_id,
@@ -968,8 +980,12 @@ mod tests {
                                     while !matches!(client.next_event().await.expect("genuine prompt completion"), Event::Stopped { .. }) {}
                                 }
                             }
+                            phase.set("retiring captured original");
                             client.shutdown().await.unwrap();
-                        }).await.expect("actual unpublished Native callback must receive its host refusal");
+                        }).await.unwrap_or_else(|_| panic!(
+                            "unpublished Native callback deadline: original={original}, question={question}, discard={discard}, phase={}",
+                            phase.get(),
+                        ));
                     }
                 }
             }
@@ -1074,11 +1090,11 @@ mod tests {
                     assert!(!state.session_service.fold_control_state(&client.id).await.unwrap().connection_ready);
                     assert!(client.send_prompt("must not become a Current prompt", &[]).await.is_err());
                     let question = CreateElicitationRequest::new(
-                        agent_client_protocol::schema::v1::ElicitationFormMode::new(
-                            agent_client_protocol::schema::v1::ElicitationSessionScope::new(
+                        agent_client_protocol::v1::schema::ElicitationFormMode::new(
+                            agent_client_protocol::v1::schema::ElicitationSessionScope::new(
                                 "elicitation-native",
                             ),
-                            agent_client_protocol::schema::v1::ElicitationSchema::new()
+                            agent_client_protocol::v1::schema::ElicitationSchema::new()
                                 .string("name", true),
                         ),
                         "Please enter your name",

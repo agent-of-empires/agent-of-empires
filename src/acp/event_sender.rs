@@ -58,7 +58,7 @@ pub(crate) struct EventMetadata {
     pub(crate) native_prompt_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Exact Native payload SID, not permission or message authorship.
-    pub(crate) reported_session_id: Option<agent_client_protocol::schema::v1::SessionId>,
+    pub(crate) reported_session_id: Option<agent_client_protocol::v1::schema::SessionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) operation: Option<AcpOperationMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]

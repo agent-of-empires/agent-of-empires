@@ -189,19 +189,6 @@ pub(super) fn remember_last_mode(mode: ServeMode) {
     }
 }
 
-/// The port the next spawn reuses, if any; `None` means it picks a random one. Mirrors the reuse
-/// rule in `autostart::load_or_generate_port` without writing the file.
-pub(super) fn saved_port() -> Option<u16> {
-    saved_port_in(&crate::session::get_app_dir().ok()?)
-}
-
-fn saved_port_in(dir: &Path) -> Option<u16> {
-    std::fs::read_to_string(dir.join("serve.last_port"))
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u16>().ok())
-        .filter(|port| *port >= 49152)
-}
-
 /// Whether the next start reuses `serve.token`. `load_or_generate_token` keeps it only while it
 /// is under 24 hours old, and only remote serving refreshes it while running.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -221,15 +208,17 @@ pub(super) fn token_window() -> TokenWindow {
 }
 
 fn token_window_in(dir: &Path) -> TokenWindow {
-    const HOUR: u64 = 60 * 60;
+    let max_age = crate::server::TOKEN_REUSE_MAX_AGE;
     let age = std::fs::metadata(dir.join("serve.token"))
         .and_then(|meta| meta.modified())
         .ok()
         .map(|modified| modified.elapsed().unwrap_or_default());
     match age {
         None => TokenWindow::Renews,
-        Some(age) if age.as_secs() >= 24 * HOUR => TokenWindow::Renews,
-        Some(age) if age.as_secs() >= 23 * HOUR => TokenWindow::Boundary,
+        Some(age) if age >= max_age => TokenWindow::Renews,
+        Some(age) if age >= max_age - std::time::Duration::from_secs(60 * 60) => {
+            TokenWindow::Boundary
+        }
         Some(_) => TokenWindow::Reused,
     }
 }
@@ -399,25 +388,6 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(token_window_in(tmp.path()), window, "{age:?}");
-        }
-    }
-
-    #[test]
-    fn the_port_probe_only_reports_a_reusable_saved_port() {
-        for (saved, reused) in [
-            (None, None),
-            (Some("55555"), Some(55555)),
-            (Some("8080"), None),
-            (Some("not-a-number\n"), None),
-        ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let path = tmp.path().join("serve.last_port");
-            if let Some(saved) = saved {
-                std::fs::write(&path, saved).unwrap();
-            }
-            assert_eq!(saved_port_in(tmp.path()), reused, "{saved:?}");
-            // Read-only: a probe must not create the file the next spawn writes.
-            assert_eq!(path.exists(), saved.is_some(), "{saved:?}");
         }
     }
 }

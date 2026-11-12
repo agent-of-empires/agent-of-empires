@@ -189,10 +189,11 @@ base("structured view surfaces", async ({ page }, testInfo) => {
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    seedFn: seedSessionViaAoeAdd({ title: "wire-auth", structuredView: true }),
+
   });
 
   try {
+    seedSessionViaAoeAdd({ title: "wire-auth", structuredView: true })(serve);
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.setViewportSize(DESKTOP);
 
@@ -281,10 +282,11 @@ base("structured view approval card", async ({ page }, testInfo) => {
     fakeAcpScript: scriptPath,
     workerIndex: testInfo.workerIndex,
     parallelIndex: testInfo.parallelIndex,
-    seedFn: seedSessionViaAoeAdd({ title: "approve-push", structuredView: true }),
+
   });
 
   try {
+    seedSessionViaAoeAdd({ title: "approve-push", structuredView: true })(serve);
     await page.emulateMedia({ reducedMotion: "reduce" });
     await page.setViewportSize(DESKTOP);
 

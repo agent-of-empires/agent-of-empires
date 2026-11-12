@@ -6,6 +6,7 @@
   </p>
   <p align="center">
     <a href="https://github.com/agent-of-empires/agent-of-empires/actions/workflows/ci.yml"><img src="https://github.com/agent-of-empires/agent-of-empires/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://runs-on.com"><img src="https://img.shields.io/badge/CI%20runners-RunsOn-2ea44f" alt="CI runners: RunsOn"></a>
     <a href="https://formulae.brew.sh/formula/aoe"><img src="https://img.shields.io/homebrew/v/aoe" alt="Homebrew"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
     <a href="https://clawhub.ai/njbrake/aoe"><img src="https://img.shields.io/badge/ClawHub-aoe-blue" alt="ClawHub"></a>
@@ -110,7 +111,9 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md). Area owners and merge rules are
 in [MAINTAINERS.md](MAINTAINERS.md); local builds are in
 [docs/development.md](docs/development.md). AoE is supported by
 [Mozilla.ai](https://www.mozilla.ai/) and inspired by
-[agent-deck](https://github.com/asheshgoplani/agent-deck).
+[agent-deck](https://github.com/asheshgoplani/agent-deck). Thanks to
+[RunsOn](https://runs-on.com) for the free license that powers our CI
+runners.
 
 ## License
 

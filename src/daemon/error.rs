@@ -13,6 +13,7 @@ pub enum ApiErrorCode {
     AccessPolicyDenied,
     CityhallMode,
     LifecycleLocked,
+    TrashIncomplete,
     LifecycleSuperseded,
     PendingTargetGone,
     TlsRequired,
@@ -21,12 +22,16 @@ pub enum ApiErrorCode {
     LaunchIndeterminate,
     ManagedResumeRefused(ManagedResumeCause),
     StartFailed,
+    SandboxMigrationDeferred,
+    SandboxMigrationFailed,
     PurgeFailed,
     NoRevive,
     CreationTrustChanged,
     CreationCancelled,
     CreationNotPending,
     CreateHookFailed,
+    CreateOutcomeUnknown,
+    AgentHooksNotApproved,
     SmartRenameSkipped,
     SmartRenameFailed,
     SmartRenameTimeout,
@@ -34,6 +39,7 @@ pub enum ApiErrorCode {
     SessionNotRunning,
     SessionArchived,
     SessionTrashed,
+    AccountSwapUnavailable,
 }
 
 impl ApiErrorCode {
@@ -44,9 +50,12 @@ impl ApiErrorCode {
             Self::AccessPolicyDenied => "access_policy_denied",
             Self::CityhallMode => "cityhall_mode",
             Self::LifecycleLocked => "lifecycle_locked",
+            Self::TrashIncomplete => "trash_incomplete",
             Self::LifecycleSuperseded => "lifecycle_superseded",
             Self::PendingTargetGone => "pending_target_gone",
             Self::StartFailed => "start_failed",
+            Self::SandboxMigrationDeferred => "sandbox_migration_deferred",
+            Self::SandboxMigrationFailed => "sandbox_migration_failed",
             Self::PurgeFailed => "purge_failed",
             Self::TlsRequired => "tls_required",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
@@ -58,6 +67,8 @@ impl ApiErrorCode {
             Self::CreationCancelled => "creation_cancelled",
             Self::CreationNotPending => "creation_not_pending",
             Self::CreateHookFailed => "create_hook_failed",
+            Self::CreateOutcomeUnknown => "create_outcome_unknown",
+            Self::AgentHooksNotApproved => "agent_hooks_not_approved",
             Self::SmartRenameSkipped => "smart_rename_skipped",
             Self::SmartRenameFailed => "smart_rename_failed",
             Self::SmartRenameTimeout => "smart_rename_timeout",
@@ -65,6 +76,7 @@ impl ApiErrorCode {
             Self::SessionNotRunning => "session_not_running",
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
+            Self::AccountSwapUnavailable => "account_swap_unavailable",
         }
     }
 
@@ -75,27 +87,44 @@ impl ApiErrorCode {
             | Self::AccessPolicyDenied
             | Self::CityhallMode => StatusCode::FORBIDDEN,
             Self::LifecycleLocked
+            | Self::TrashIncomplete
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
             | Self::LaunchIndeterminate
             | Self::ManagedResumeRefused(_)
+            | Self::SandboxMigrationDeferred
             | Self::PurgeFailed
             | Self::NoRevive
             | Self::CreationTrustChanged
             | Self::CreationCancelled
             | Self::CreationNotPending
+            | Self::CreateOutcomeUnknown
+            | Self::AgentHooksNotApproved
             | Self::GroupNotEmpty
             | Self::SessionNotRunning
             | Self::SessionArchived
-            | Self::SessionTrashed => StatusCode::CONFLICT,
+            | Self::SessionTrashed
+            | Self::AccountSwapUnavailable => StatusCode::CONFLICT,
             Self::PendingTargetGone => StatusCode::NOT_FOUND,
             Self::TlsRequired => StatusCode::UPGRADE_REQUIRED,
             Self::CreateHookFailed => StatusCode::BAD_REQUEST,
             Self::SmartRenameSkipped => StatusCode::CONFLICT,
             Self::SmartRenameFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::StartFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    pub(crate) const fn sandbox_migration_message(self) -> Option<&'static str> {
+        match self {
+            Self::SandboxMigrationDeferred => Some(
+                "Sandbox migration is pending. Stop other sandbox users, then retry. For bulk migration, stop the daemon and run `aoe migrate`.",
+            ),
+            Self::SandboxMigrationFailed => Some(
+                "Sandbox migration failed. Apply the canonical state and check daemon logs before retrying.",
+            ),
+            _ => None,
         }
     }
 
@@ -120,10 +149,13 @@ impl ApiErrorCode {
             b"access_policy_denied" => Self::AccessPolicyDenied,
             b"cityhall_mode" => Self::CityhallMode,
             b"lifecycle_locked" => Self::LifecycleLocked,
+            b"trash_incomplete" => Self::TrashIncomplete,
             b"lifecycle_superseded" => Self::LifecycleSuperseded,
             b"pending_target_gone" if resolving_pending_target => Self::PendingTargetGone,
             b"tls_required" => Self::TlsRequired,
             b"runtime_epoch_mismatch" => Self::RuntimeEpochMismatch,
+            b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
+            b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
             b"launch_indeterminate" => Self::LaunchIndeterminate,
             b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
@@ -131,6 +163,8 @@ impl ApiErrorCode {
             b"creation_trust_changed" => Self::CreationTrustChanged,
             b"creation_cancelled" => Self::CreationCancelled,
             b"start_failed" => Self::StartFailed,
+            b"sandbox_migration_deferred" => Self::SandboxMigrationDeferred,
+            b"sandbox_migration_failed" => Self::SandboxMigrationFailed,
             b"purge_failed" => Self::PurgeFailed,
             b"creation_not_pending" => Self::CreationNotPending,
             b"create_hook_failed" => Self::CreateHookFailed,
@@ -141,6 +175,7 @@ impl ApiErrorCode {
             b"session_not_running" => Self::SessionNotRunning,
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
+            b"account_swap_unavailable" => Self::AccountSwapUnavailable,
             _ => return None,
         };
         (status == code.status()).then_some(code)
@@ -154,6 +189,9 @@ fn managed_resume_cause(headers: &HeaderMap) -> ManagedResumeCause {
             b"wrapper_contract_required" => ManagedResumeCause::WrapperContractRequired,
             b"unsupported_managed_arguments" => ManagedResumeCause::UnsupportedManagedArguments,
             b"opencode_schema_unattested" => ManagedResumeCause::OpenCodeSchemaUnattested,
+            b"pi_transcript_binding_required" => ManagedResumeCause::PiTranscriptBindingRequired,
+            b"omp_transcript_binding_required" => ManagedResumeCause::OmpTranscriptBindingRequired,
+            b"codex_conversation_unverified" => ManagedResumeCause::CodexConversationUnverified,
             _ => ManagedResumeCause::ExecutionContextUnattested,
         },
         _ => ManagedResumeCause::ExecutionContextUnattested,
@@ -267,6 +305,12 @@ mod tests {
                 Some(ApiErrorCode::GroupNotEmpty),
             ),
             (StatusCode::FORBIDDEN, "group_not_empty", false, None),
+            (
+                StatusCode::CONFLICT,
+                "account_swap_unavailable",
+                false,
+                Some(ApiErrorCode::AccountSwapUnavailable),
+            ),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));
@@ -289,10 +333,27 @@ mod tests {
             ("wrapper_contract_required", WrapperContractRequired),
             ("unsupported_managed_arguments", UnsupportedManagedArguments),
             ("opencode_schema_unattested", OpenCodeSchemaUnattested),
+            (
+                "pi_transcript_binding_required",
+                PiTranscriptBindingRequired,
+            ),
+            (
+                "omp_transcript_binding_required",
+                OmpTranscriptBindingRequired,
+            ),
+            ("codex_conversation_unverified", CodexConversationUnverified),
             ("execution_context_unattested", ExecutionContextUnattested),
             ("secret-token", ExecutionContextUnattested),
             (
                 "wrapper_contract_required, secret-token",
+                ExecutionContextUnattested,
+            ),
+            (
+                "omp_transcript_binding_required, execution_context_unattested",
+                ExecutionContextUnattested,
+            ),
+            (
+                "pi_transcript_binding_required, execution_context_unattested",
                 ExecutionContextUnattested,
             ),
             ("", ExecutionContextUnattested),

@@ -79,13 +79,15 @@ pub use groups::{
 #[cfg(test)]
 pub(crate) use instance::install_aliases;
 pub(crate) use instance::resolved_agent_for;
+#[cfg(all(test, unix))]
+pub(crate) use instance::test_helpers::frozen_test_helper;
 #[cfg(test)]
-pub(crate) use instance::test_helpers::publish_host_pi_transcript;
+pub(crate) use instance::test_helpers::{publish_host_pi_transcript, seed_claude_transcript};
 #[cfg(test)]
 pub(crate) use instance::ActiveExecution;
 pub(crate) use instance::{
-    duplicate_session_error, is_duplicate_session, PassiveStatusPatch, ResumeIntent, SidWrite,
-    ToolLaunchUnavailable,
+    duplicate_session_error, is_duplicate_session, HostHookApprovalRequired, PassiveStatusPatch,
+    ResumeIntent, SidWrite, ToolLaunchUnavailable,
 };
 pub(crate) use instance::{
     host_hook_agent, host_hook_disclosure, host_hook_disclosure_config_with_repo,
@@ -103,14 +105,15 @@ pub use instance::{
     TMUX_SESSION_GONE_ERROR,
 };
 pub(crate) use instance::{
-    ConversationState, LaunchReservation, ManagedResumeRefused, NativeInputError, NativeInputFence,
-    NativeStartAdmission, ResumeAttemptPolicy, ResumeLaunchOptions, TerminalContextResume,
+    ConversationState, LaunchFinalizationPending, LaunchReservation, ManagedResumeRefused,
+    NativeInputError, NativeInputFence, ResumeAttemptPolicy, ResumeLaunchOptions,
+    TerminalContextResume,
 };
 pub use instance::{
     ErrorBlockingScope, ErrorEvidenceGeneration, ErrorEvidenceSource, ErrorOperation, ErrorOrigin,
     OperationErrorEvidence, RuntimeEvidence,
 };
-pub(crate) use instance::{Handoff, Held, SandboxPin, Unserved};
+pub(crate) use instance::{Held, SandboxPin, Unserved};
 pub(crate) use instance::{
     TerminalHandoffContext, TerminalHandoffIntent, TerminalHandoffKey, TerminalHandoffStage,
     TerminalHandoffUnbornFence,
@@ -125,7 +128,9 @@ pub(crate) use storage::observe_lock_contention_for_test;
 pub(crate) use storage::{
     duplicate_reports, reconcile_profile_duplicates, DuplicateIdReport, ProfileMovePlan,
 };
-pub(crate) use storage::{try_acquire_terminal_handoff_driver, TerminalHandoffDriver};
+pub(crate) use storage::{
+    try_acquire_terminal_handoff_driver, with_storages_locked, TerminalHandoffDriver,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -207,9 +212,9 @@ pub(crate) use storage::{
     acquire_recovery_storage_flock, acquire_session_title_lock, acquire_storage_flock,
     acquire_storage_shared_flock, atomic_write, backup_before_migration, read_file_no_follow,
     replace_file_no_follow, resolve_symlink_chain, try_acquire_storage_flock, CaptureStorage,
-    GroupMovePlan, LaunchConfig, LockedDataFile, NativeStoreUnavailable, ProfileMoveRejected,
-    SessionCommitApplied, SessionMutation, SessionStore, StorageFlock, StorageTransition,
-    STORAGE_LOCK_FILENAME,
+    GroupMovePlan, LaunchConfig, LifecycleRelease, LockedDataFile, NativeStoreUnavailable,
+    ProfileMoveRejected, SessionCommitApplied, SessionMutation, SessionStore, StorageFlock,
+    StorageTransition, STORAGE_LOCK_FILENAME,
 };
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

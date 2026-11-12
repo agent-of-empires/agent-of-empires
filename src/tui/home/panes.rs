@@ -75,6 +75,10 @@ impl HomeView {
         size: Option<(u16, u16)>,
         intent: PaneIntent,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.get_instance(id).is_some_and(|inst| !inst.is_trashed()),
+            "Trash sessions are read-only"
+        );
         self.reconcile_native_attachment();
         if let Some(pending) = self.pending_native_attachment.as_mut() {
             if pending.id == id
@@ -183,6 +187,10 @@ impl HomeView {
             self.selected_session.as_deref() == Some(id),
             "Session is no longer selected"
         );
+        anyhow::ensure!(
+            self.get_instance(id).is_some_and(|inst| !inst.is_trashed()),
+            "Trash sessions are read-only"
+        );
         // The applied snapshot can trail by a frame; the profile the fence
         // compares comes from the row this view holds either way.
         let source_profile = self
@@ -256,6 +264,9 @@ impl HomeView {
                     || self.view_mode != pending.view_mode
                     || self.get_terminal_mode(&pending.id) != pending.terminal_mode
                     || self.has_non_live_send_overlay()
+                    || self
+                        .get_instance(&pending.id)
+                        .is_none_or(|inst| inst.is_trashed())
                     || self
                         .session_feed
                         .applied_session(&pending.id)

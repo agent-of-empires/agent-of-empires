@@ -9,9 +9,9 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 
+use super::DaemonEndpoint;
 use super::{ApiErrorCode, DaemonClientError};
 use crate::acp::client::http::HttpError;
-use crate::acp::client::DaemonEndpoint;
 use reqwest::header::{HeaderName, HeaderValue};
 
 #[derive(Debug, Error)]

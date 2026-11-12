@@ -7,14 +7,16 @@ import { DashboardUpdateBanner } from "./DashboardUpdateBanner";
 import { DisconnectBanner } from "./DisconnectBanner";
 import { PushHealthBanner } from "./PushHealthBanner";
 import { SandboxImageBanner } from "./SandboxImageBanner";
+import { ServerSettingsBanner } from "./ServerSettingsBanner";
 import { UpdateBanner } from "./UpdateBanner";
 
 /**
- * The connection and update banners, one at a time, most urgent first: Disconnected, Dashboard updated, the
- * Reconnected flash, Update available, then the sandbox image. The push banner may sit below that one, except
- * while Disconnected.
+ * The connection and update banners, one at a time, most urgent first: Disconnected, server settings
+ * unavailable, Dashboard updated, the Reconnected flash, Update available, then the sandbox image. The push
+ * banner may sit below that one, except while Disconnected. `onRetryServerSettings` is set while /api/about
+ * has no answer.
  */
-export function BannerStack() {
+export function BannerStack({ onRetryServerSettings }: { onRetryServerSettings?: () => void } = {}) {
   const connection = useConnectionBanner();
   const dashboardUpdated = useDashboardUpdate();
   const update = useUpdateBanner();
@@ -22,6 +24,7 @@ export function BannerStack() {
 
   let top: ReactNode = null;
   if (connection === "down") top = <DisconnectBanner state="down" />;
+  else if (onRetryServerSettings) top = <ServerSettingsBanner onRetry={onRetryServerSettings} />;
   else if (dashboardUpdated) top = <DashboardUpdateBanner />;
   else if (connection === "reconnected") top = <DisconnectBanner state="reconnected" />;
   else if (update) top = <UpdateBanner status={update.status} onDismiss={update.dismiss} />;

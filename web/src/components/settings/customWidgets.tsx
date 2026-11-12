@@ -23,7 +23,7 @@ function useOneshotAgents(): AgentInfo[] {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   useEffect(() => {
     fetchAgents()
-      .then(setAgents)
+      .then((a) => setAgents(a ?? []))
       .catch(() => setAgents([]));
   }, []);
   return agents.filter((a) => a.installed && a.oneshot_capable);

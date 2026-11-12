@@ -73,27 +73,21 @@ fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
     )
 }
 
-/// Run `aoe add --launch ...` for a kiro session and return the command tmux
-/// was told to run. `--launch` starts the tmux session and, since the test
-/// harness's `run_cli` has no controlling terminal, skips the interactive
-/// attach step instead of failing because of it; the exit status IS asserted
-/// here to cover that behavior. The session (and its recorded pane command)
-/// is created regardless, and `launched_tmux_name` fails loudly if it
-/// wasn't. The returned guard kills the session when the caller's scope
-/// ends, including on assertion panic.
+/// Launch Kiro and observe the argv recorded by its live agent process.
 fn launch_kiro_and_read_command(
     h: &mut TuiTestHarness,
     title: &str,
     extra: &[&str],
 ) -> (String, TmuxSessionGuard) {
-    // `aoe add --tool kiro` verifies `kiro-cli` is on PATH before persisting the
-    // session, so without a stub it bails (and never writes sessions.json) in
-    // CI / any machine without kiro-cli installed. A recording stub both lets
-    // `add` proceed AND captures the exact argv the launch actually executed:
-    // launches now run through an ephemeral env-file wrapper (`exec zsh <file>`)
-    // that keeps the command out of tmux's `pane_start_command`, so the stub's
-    // recorded argv is the only faithful observation of the launch command.
     let argv_file = h.install_recording_path_command("kiro-cli");
+    std::fs::write(
+        h.home_path().join("path-bin/kiro-cli"),
+        format!(
+            "#!/bin/sh\nprintf '%s ' \"$0\" \"$@\" > {}\nif [ \"$1\" = chat ]; then exec sleep 600; fi\n",
+            shell_words::quote(argv_file.to_str().unwrap())
+        ),
+    )
+    .expect("keep the interactive recorder alive");
 
     let project = h.project_path();
     let mut args = vec![

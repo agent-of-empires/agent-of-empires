@@ -368,8 +368,8 @@ impl NativeInputFence {
 
 impl Instance {
     /// Ensure physical presence without inferring death from Status or a shell.
-    /// The implicit launch path carries its own Missing/Dead proof across hooks.
-    /// Readiness for programmatic input is a separate, effect-time admission.
+    /// Implicit launch carries its Missing/Dead proof across hooks. Positive
+    /// readiness is still required here; input revalidates its physical fence at effect time.
     pub fn ensure_pane_ready(&mut self) -> Result<EnsureReadyOutcome, EnsureReadyError> {
         self.ensure_pane_ready_with_size(None)
     }
@@ -385,8 +385,7 @@ impl Instance {
     /// startup: if it lands before the agent installs its resize handler the
     /// reflow is lost, and because the per-frame resize loop is deduped on the
     /// (already-correct) tmux window size, nothing re-issues it. The pane then
-    /// stays pinned at ~80 cols (≈50% of a wide live area) until live mode is
-    /// exited and re-entered. Booting at the right size sidesteps the race.
+    /// stays pinned at ~80 cols until live mode is exited and re-entered.
     ///
     /// `None` keeps tmux's default for callers with no target geometry.
     pub fn ensure_pane_ready_with_size(
@@ -399,12 +398,38 @@ impl Instance {
         if self.is_structured() {
             return Err(EnsureReadyError::StructuredView);
         }
-        let (_, _, physical) = self.observe_native_pane().map_err(EnsureReadyError::from)?;
+        let (_, _, physical) = match self.observe_native_pane() {
+            Ok(observation) => observation,
+            Err(error) => {
+                if let Some(cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                    return Ok(EnsureReadyOutcome::Indeterminate { cause: *cause });
+                }
+                return Err(error.into());
+            }
+        };
         if physical == crate::tmux::utils::PaneProbe::Alive {
-            return Ok(EnsureReadyOutcome::AlreadyAlive);
+            return Ok(match self.positive_pane_readiness() {
+                Ok(true) => EnsureReadyOutcome::AlreadyAlive,
+                Ok(false) => EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::StabilizationExpired,
+                },
+                Err(_) => EnsureReadyOutcome::Indeterminate {
+                    cause: LaunchIndeterminateCause::ObservationFailed,
+                },
+            });
         }
         let generation = self.lifecycle_generation;
-        let outcome = self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)?;
+        // Sends permit resume regardless of the automatic restart setting.
+        let outcome = match self.start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if let Some(cause) = error.downcast_ref::<LaunchIndeterminateCause>() {
+                    return Ok(EnsureReadyOutcome::Indeterminate { cause: *cause });
+                }
+                return Err(error.into());
+            }
+        };
         match outcome {
             StartOutcome::ResumeFailed { sid } => {
                 return Ok(EnsureReadyOutcome::ResumeFailed { sid });
@@ -416,16 +441,88 @@ impl Instance {
             | StartOutcome::Fresh
             | StartOutcome::FreshAfterFailedResume { .. } => {}
         }
-        // A peer may have supplied a live pane before launch admission.
-        if self.lifecycle_generation == generation {
-            return Ok(EnsureReadyOutcome::AlreadyAlive);
+        if let Err(cause) = self.wait_for_pane_ready() {
+            return Ok(EnsureReadyOutcome::Indeterminate { cause });
         }
-        self.wait_for_pane_ready(&self.tmux_session().map_err(EnsureReadyError::Tmux)?);
-        Ok(if physical == crate::tmux::utils::PaneProbe::Dead {
+        // A peer's unchanged generation does not itself establish readiness.
+        Ok(if self.lifecycle_generation == generation {
+            EnsureReadyOutcome::AlreadyAlive
+        } else if physical == crate::tmux::utils::PaneProbe::Dead {
             EnsureReadyOutcome::Respawned
         } else {
             EnsureReadyOutcome::Started
         })
+    }
+
+    pub(super) fn positive_pane_readiness(&self) -> Result<bool> {
+        let panes = crate::tmux::batch_pane_metadata()?;
+        let Some((_, pane)) = crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)?
+        else {
+            return Ok(false);
+        };
+        self.pane_is_ready(pane)
+    }
+
+    pub(crate) fn pane_is_ready(&self, pane: &crate::tmux::PaneMetadata) -> Result<bool> {
+        if pane.pane_dead {
+            return Ok(false);
+        }
+        if self.expects_shell()
+            || self.has_command_override()
+            || self.current_launch_hook_status().is_some()
+        {
+            return Ok(true);
+        }
+        let command = pane
+            .pane_current_command
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Agent pane command is unknown"))?;
+        Ok(!crate::tmux::utils::is_pane_running_shell_command(
+            command,
+            pane.pane_start_command_is_protected,
+        ))
+    }
+
+    fn current_launch_hook_status(&self) -> Option<crate::session::Status> {
+        let active = self.active_execution.as_ref()?;
+        let binding = self.agent_session_binding.as_ref()?;
+        let session_id = self.agent_session_id.as_deref()?;
+        if active.binding.agent != self.tool
+            || binding.session_id != session_id
+            || !Self::execution_identity_matches(binding.execution.as_ref()?, &active.binding)
+        {
+            return None;
+        }
+        crate::hooks::read_hook_status_for_launch(&self.id, &active.launch_id, session_id)
+    }
+
+    /// Wait up to three seconds for a newly born live pane to leave its boot shell.
+    /// Missing, dead, unknown and still-settling panes remain indeterminate.
+    pub(crate) fn wait_for_pane_ready(&self) -> Result<(), LaunchIndeterminateCause> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+        loop {
+            let panes = crate::tmux::batch_pane_metadata()
+                .map_err(|error| self.probe_failure_cause(error))?;
+            let Some((_, pane)) =
+                crate::tmux::agent_pane_metadata_in(&panes, &self.id, &self.title)
+                    .map_err(|error| self.probe_failure_cause(error))?
+            else {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven);
+            };
+            if pane.pane_dead {
+                return Err(LaunchIndeterminateCause::OwnershipUnproven);
+            }
+            if self
+                .pane_is_ready(pane)
+                .map_err(|error| self.probe_failure_cause(error))?
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(LaunchIndeterminateCause::StabilizationExpired);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// Conditional equality for queued native preparation, not permission to launch.
@@ -504,40 +601,6 @@ impl Instance {
         }
         session.admit_agent_input(self.expects_shell())?;
         Ok(session)
-    }
-
-    /// Best-effort wait for a freshly-started pane to settle past its initial
-    /// shell/splash so subsequent `send-keys` land in the agent instead of a
-    /// boot prompt. Polls up to 3s in 50ms increments; returns even on
-    /// timeout so a sluggish agent doesn't block the send indefinitely.
-    ///
-    /// Readiness signal:
-    /// - Agents that expect a shell, run a custom command override, or have
-    ///   an active hook status file: just wait for the pane to not be dead.
-    ///   Wrapper scripts look like shells to tmux, so `is_pane_running_shell`
-    ///   would never clear for them and we would eat the full 3s every time.
-    ///   This mirrors the same guard chain `ensure_session` uses.
-    /// - Real agents (e.g. claude, opencode): also wait for the pane to no
-    ///   longer be running a shell, so a keystroke doesn't land in the boot
-    ///   prompt that runs before the agent binary takes over.
-    pub(crate) fn wait_for_pane_ready(&self, session: &tmux::Session) {
-        let shell_check_unreliable = self.expects_shell()
-            || self.has_command_override()
-            || crate::hooks::read_hook_status(&self.id).is_some();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(3000);
-        loop {
-            if !session.exists() {
-                return;
-            }
-            let pane_alive = !session.is_pane_dead();
-            if pane_alive && (shell_check_unreliable || !session.is_pane_running_shell()) {
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
     }
 }
 
@@ -862,6 +925,178 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn cached_presence_never_makes_an_unknown_probe_ready() {
+        if std::env::var_os("AOE_TEST_READY_UNKNOWN_CHILD").is_none() {
+            if !crate::tmux::test_helpers::tmux_available() {
+                return;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let not_directory = root.path().join("not-directory");
+            std::fs::write(&not_directory, b"not a socket directory").unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "session::instance::ready::tests::cached_presence_never_makes_an_unknown_probe_ready",
+                    "--nocapture",
+                ])
+                .env("AOE_TEST_READY_UNKNOWN_CHILD", "1")
+                .env("AOE_TMUX_SOCKET", not_directory.join("socket"))
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"));
+            let output =
+                crate::process::run_with_timeout(&mut child, crate::tmux::TMUX_COMMAND_TIMEOUT * 3)
+                    .unwrap()
+                    .expect("private unknown-probe test must complete");
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut instance = Instance::new("cached-unknown-readiness", root.path().to_str().unwrap());
+        instance.status = Status::Running;
+        let session = instance.tmux_session().unwrap();
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Unknown
+        );
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session.name()]);
+        assert!(
+            session.exists(),
+            "the stale positive cache must be established"
+        );
+        assert_eq!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::Indeterminate {
+                cause: LaunchIndeterminateCause::ObservationFailed,
+            }
+        );
+        assert_eq!(instance.status, Status::Running);
+        assert_eq!(instance.last_start_time, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn alive_boot_shell_requires_positive_readiness_before_reuse() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let mut instance = Instance::new("unsettled-readiness", root.path().to_str().unwrap());
+        instance.tool = "claude".into();
+        instance.command = "claude".into();
+        instance.source_profile = "unsettled-readiness".into();
+        instance.status = Status::Starting;
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let name = crate::tmux::Session::generate_name(&instance.id, &instance.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name, "/bin/sh",])
+            .status()
+            .unwrap()
+            .success());
+        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let panes = crate::tmux::batch_pane_metadata().unwrap();
+            let (_, observed) =
+                crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)
+                    .expect("unambiguous boot-shell target")
+                    .expect("the boot shell must appear in the readiness batch");
+            assert_eq!(observed.pane_id, pane);
+            if !observed.pane_dead
+                && observed.pane_pid.is_some()
+                && observed
+                    .pane_current_command
+                    .as_deref()
+                    .is_some_and(|command| {
+                        crate::tmux::utils::is_pane_running_shell_command(
+                            command,
+                            observed.pane_start_command_is_protected,
+                        )
+                    })
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the controlled unprotected boot shell did not become observable: {:?}",
+                observed.pane_current_command
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(matches!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::Indeterminate { .. }
+        ));
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+        assert!(crate::tmux::tmux_command()
+            .args(["respawn-pane", "-k", "-t", &pane, "exec sleep 60",])
+            .status()
+            .unwrap()
+            .success());
+        crate::tmux::test_helpers::wait_for_pane_command(&pane, "sleep");
+        assert_eq!(
+            instance.ensure_pane_ready().unwrap(),
+            EnsureReadyOutcome::AlreadyAlive
+        );
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_pane_with_positive_cache_requires_a_real_launch() {
+        crate::tmux::test_helpers::require_tmux!();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let mut instance = Instance::new("missing-positive-cache", root.path().to_str().unwrap());
+        instance.tool = "bash".into();
+        instance.command = "bash".into();
+        instance.source_profile = "missing-positive-cache".into();
+        let storage = crate::session::Storage::new_unwatched(&instance.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let session = instance.tmux_session().unwrap();
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session.name()]);
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Missing
+        );
+        let outcome = instance.ensure_pane_ready().unwrap();
+        assert_eq!(
+            crate::tmux::utils::probe_pane(session.name()),
+            crate::tmux::utils::PaneProbe::Alive,
+            "successful ensure must create a physical pane, not trust cached presence: {outcome:?}"
+        );
+        assert!(matches!(outcome, EnsureReadyOutcome::Started));
+    }
+
     /// Real-tmux integration: an alive pane yields AlreadyAlive with no
     /// status/start_time mutations. Skipped if tmux isn't installed.
     // Serialized: this test creates and kills a real tmux session.
@@ -873,30 +1108,36 @@ mod tests {
             return;
         }
 
-        let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
-        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
-        let created = crate::tmux::tmux_command()
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &tmux_name,
-                "-x",
-                "80",
-                "-y",
-                "24",
-                "sleep",
-                "60",
-            ])
-            .status();
-        if !created.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("tmux new-session failed; skipping");
-            return;
-        }
+        let root = tempfile::TempDir::new().unwrap();
+        let cwd = root.path().to_str().unwrap();
+        let mut inst = Instance::new("ensure_alive_test", cwd);
+        inst.tool = "claude".into();
+        inst.command = "sleep 60".into();
+        assert_eq!(
+            crate::agents::get_agent(&inst.tool).map(|agent| agent.binary),
+            Some("claude")
+        );
+        // An explicit command override accepts its live protected launch shell.
+        assert!(inst.has_command_override());
+        let session = inst.tmux_session().unwrap();
+        let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(session.name());
+        session
+            .create_with_size(
+                cwd,
+                Some(&inst.command),
+                Some((80, 24)),
+                &inst.source_profile,
+            )
+            .expect("managed agent pane");
         crate::tmux::refresh_session_cache();
+        let pane = crate::tmux::test_helpers::only_pane_id(session.name());
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let (_, before) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
+            .expect("unambiguous managed agent target")
+            .expect("managed agent pane appears in the readiness batch");
+        assert_eq!(before.pane_id, pane);
+        assert!(!before.pane_dead);
+        let pid = before.pane_pid.expect("live pane has a PID");
 
         inst.status = Status::Running;
         let prev_start = inst.last_start_time;
@@ -906,9 +1147,11 @@ mod tests {
         assert_eq!(outcome, EnsureReadyOutcome::AlreadyAlive);
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
-
-        let _ = crate::tmux::tmux_command()
-            .args(["kill-session", "-t", &tmux_name])
-            .output();
+        let panes = crate::tmux::batch_pane_metadata().unwrap();
+        let (_, after) = crate::tmux::agent_pane_metadata_in(&panes, &inst.id, &inst.title)
+            .unwrap()
+            .expect("same managed agent after ensure");
+        assert_eq!(after.pane_id, pane);
+        assert_eq!(after.pane_pid, Some(pid));
     }
 }

@@ -39,6 +39,7 @@ struct StopFence<'a> {
         &'a worker_registry::WorkerRecord,
     )>,
     dormancy_stamp: Option<chrono::DateTime<chrono::Utc>>,
+    admissions: Option<u64>,
 }
 
 pub(crate) struct IdleRetirement {
@@ -1220,10 +1221,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         .await
     }
 
+    /// Stop a worker reclaimed for inactivity; with `observed` (the epoch and
+    /// its admission count when seen idle), only while that epoch is still
+    /// running and has admitted no prompt since.
     pub(crate) async fn shutdown_idle(
         &self,
         session_id: &str,
-        observed: &Lease,
+        observed: (&Lease, u64),
         activity_seq: u64,
         stamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<IdleRetirement, SupervisorError> {
@@ -1233,7 +1237,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             false,
             None,
             StopFence {
-                observed: Some(observed),
+                observed: Some(observed.0),
+                admissions: Some(observed.1),
                 activity_seq: Some(activity_seq),
                 preserve_restart: true,
                 claim: None,
@@ -1246,8 +1251,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub(crate) async fn settle_idle_retirement(&self, retirement: IdleRetirement) {
-        self.settle_accepted_stop(&retirement.lease).await;
-    }
+    self.settle_accepted_stop(&retirement.lease).await;
+}
 
     /// Permanently discard a worker and wait for its matching retirement.
     /// Reversible stops must not delete the adapter-side transcript.
@@ -1370,6 +1375,17 @@ impl<S: BroadcastSink> Supervisor<S> {
             if tokio::time::timeout_at(deadline, notified).await.is_err() && still_owned() {
                 return Err(SupervisorError::TeardownPending(session_id.into()));
             }
+        }
+        let child_owner = match expected {
+            Some(target) => target.lease.as_ref(),
+            None => constructor.as_ref(),
+        };
+        while child_owner.is_some_and(|lease| lease.owned_child_wait_pending()) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(SupervisorError::TeardownPending(session_id.into()));
+            }
+            tokio::time::sleep(TEARDOWN_POLL.min(remaining)).await;
         }
         #[cfg(unix)]
         if let Some(identity) = identity_before {
@@ -1662,12 +1678,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if let Some(observed) = fence.observed {
             let current = lifecycle.running(session_id).map(|(lease, _)| lease);
-            let sequence = lock_recover(&self.next_seqs).get(session_id).cloned();
-            let activity = sequence
-                .as_ref()
-                .map_or(0, |sequence| lock_recover(sequence).seq);
+            let activity = super::try_activity_seq(&self.next_seqs, session_id)
+                .ok_or(SupervisorError::RegistryBusy)?;
             if current.as_ref() != Some(observed)
                 || fence.activity_seq != Some(activity)
+                || fence.admissions != Some(observed.admissions())
                 || registry
                     .stop()
                     .map_err(super::launch::registry_error)?
@@ -1677,18 +1692,18 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
         if let Some(target) = expected {
-            if !lifecycle.prepare_captured_stop(session_id, target.lease.as_ref()) {
-                return Err(SupervisorError::TeardownPending(session_id.into()));
-            }
-            if target.journalled
-                && target
-                    .lease
-                    .as_ref()
-                    .is_some_and(|lease| !lifecycle.require_retirement_ack(lease))
-            {
-                return Err(SupervisorError::TeardownPending(session_id.into()));
-            }
+        if !lifecycle.prepare_captured_stop(session_id, target.lease.as_ref()) {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
         }
+        if target.journalled
+            && target
+                .lease
+                .as_ref()
+                .is_some_and(|lease| !lifecycle.require_retirement_ack(lease))
+        {
+            return Err(SupervisorError::TeardownPending(session_id.into()));
+        }
+    }
         if let Some(handle) = workers.get(session_id) {
             if lifecycle.current_lease(session_id).as_ref() != Some(&handle.lease) {
                 return Err(SupervisorError::TeardownPending(session_id.into()));
@@ -3626,7 +3641,7 @@ mod tests {
 
         let (_, activity_seq) = sup.idle_observation(id).unwrap();
         let retirement = sup
-            .shutdown_idle(id, &lease, activity_seq, stamp)
+            .shutdown_idle(id, (&lease, lease.admissions()), activity_seq, stamp)
             .await
             .unwrap();
         sup.settle_idle_retirement(retirement).await;
@@ -4095,6 +4110,118 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn idle_observation_declines_a_gated_activity_publication_without_retiring_its_lease() {
+        let (_home, _tmp) = isolate_home();
+        let mut p = parked(|event| matches!(event, Event::BackgroundTaskStarted { .. }));
+        let id = "idle-busy-activity";
+        let identity = attested_test_identity(8873, 18);
+        let control = Arc::new(FakeProcessControl::default());
+        control.alive(identity.pid);
+        Arc::get_mut(&mut p.sup)
+            .expect("the parked fixture has one supervisor owner")
+            .process_control = control.clone();
+        save_attested_test_record(id, identity.pid, identity.generation);
+        let lease = p
+            .sup
+            .test_install_runner(
+                id,
+                runner_config(worker_registry::socket_path_for(id).unwrap()),
+                Some(identity),
+            )
+            .await;
+        lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+        let mut row = crate::session::Instance::new(id, "/tmp/idle-busy-activity");
+        row.id = id.to_owned();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = crate::session::Status::Idle;
+        let stamp = chrono::Utc::now();
+        row.idle_dormant_since = Some(stamp);
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        p.sup.test_bind_native_scope(&lease, &row);
+        worker_registry::mark_restart_pending(id, identity.generation).unwrap();
+        let (observed, activity) = p.sup.idle_observation(id).unwrap();
+        let admissions = lease.admissions();
+        let producer = {
+            let sup = Arc::clone(&p.sup);
+            std::thread::spawn(move || {
+                super::super::with_publication_seq(&sup.next_seqs, id, |seq| {
+                    sup.sink.publish_persisted(
+                        id,
+                        seq,
+                        &crate::acp::event_sender::AcpEventData::from_history(
+                            Event::BackgroundTaskStarted {
+                                task_id: "actual-gated-activity".into(),
+                                tool_call_id: None,
+                                description: "activity".into(),
+                                workflow: None,
+                            },
+                        ),
+                    )
+                })
+            })
+        };
+        p.entered().await;
+        let lifecycle_available = p.sup.lifecycle.try_lock().is_ok();
+        let while_publishing = p.sup.idle_observation(id);
+        let refused = p
+            .sup
+            .shutdown_idle(id, (&observed, admissions), activity, stamp)
+            .await;
+        p.release_and_wait().await;
+        assert!(
+            producer.join().unwrap(),
+            "the gated event was actually persisted"
+        );
+        assert!(
+            lifecycle_available,
+            "this producer holds only its activity cell"
+        );
+        assert!(
+            while_publishing.is_none(),
+            "busy activity must not look idle"
+        );
+        assert!(matches!(refused, Err(SupervisorError::RegistryBusy)));
+        assert_eq!(p.sup.current_lease(id).as_ref(), Some(&lease));
+        assert_eq!(
+            lock_recover(&p.sup.lifecycle).phase(id),
+            crate::acp::runner_lifecycle::WorkerPhase::Running
+        );
+        assert_eq!(
+            worker_registry::peek_restart_marker(id),
+            Some(identity.generation)
+        );
+        let (fresh, published) = p.sup.idle_observation(id).unwrap();
+        assert_eq!(fresh, lease);
+        assert_eq!(published, activity + 1);
+        assert_eq!(
+            p.store
+                .replay_from(id, 0)
+                .expect("durable replay")
+                .last()
+                .unwrap()
+                .seq,
+            published
+        );
+        assert!(matches!(
+            p.sup
+                .shutdown_idle(id, (&observed, admissions), activity, stamp)
+                .await,
+            Err(SupervisorError::Superseded(_))
+        ));
+        assert_eq!(p.sup.current_lease(id).as_ref(), Some(&lease));
+        assert_eq!(
+            worker_registry::peek_restart_marker(id),
+            Some(identity.generation)
+        );
+        assert!(
+            control.signals().is_empty(),
+            "neither refused stop may signal the runner"
+        );
+    }
+
     /// Publication holds its owner through persistence, before the reaper's final sweep.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
@@ -4140,6 +4267,10 @@ mod tests {
         assert!(
             p.sup.lifecycle.try_lock().is_err(),
             "publication retains its lifecycle fence"
+        );
+        assert!(
+            p.sup.idle_observation(id).is_none(),
+            "idle observation must not wait on the real worker publication's lifecycle fence"
         );
 
         let reaper = {

@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 import type { AgentInstallInfo } from "../../../lib/api";
+import type { AcpWorkerState } from "../../../lib/types";
+import { applyEvent, emptyAcpState } from "../../../lib/acpTypes";
+import { SessionBanners } from "../SessionBanners";
 import { StartupErrorBanner } from "../StartupErrorBanner";
 
 const writeClipboard = vi.fn();
@@ -40,11 +43,12 @@ type Reply = { status: number; body: unknown };
 const json = (body: unknown, status = 200): Reply => ({ status, body });
 
 /** Answers each endpoint the banner calls; unlisted ones 404. */
-function stubApi(routes: { info?: Reply; spawn?: Reply; install?: Reply; log?: Reply }) {
-  const spy = vi.fn(async (url: string) => {
+function stubApi(routes: { info?: Reply; spawn?: Reply; restart?: Reply; install?: Reply; log?: Reply }) {
+  const spy = vi.fn(async (url: string, _init?: RequestInit) => {
     const reply =
       (url.includes("/acp/install-info") && routes.info) ||
       (url.includes("/acp/spawn") && routes.spawn) ||
+      (url.includes("/acp/restart") && routes.restart) ||
       (url.includes("/acp/install-agent") && routes.install) ||
       (url.includes("/acp/worker-log") && routes.log) ||
       json("not found", 404);
@@ -61,11 +65,22 @@ function renderBanner({
   message = SPAWN_MSG,
   onSwitchToTerminal = vi.fn(),
   switchable = true,
-}: { message?: string; onSwitchToTerminal?: () => void; switchable?: boolean } = {}) {
+  acpWorkerState = "absent",
+  sentStopped = false,
+}: {
+  message?: string;
+  onSwitchToTerminal?: () => void;
+  switchable?: boolean;
+  acpWorkerState?: AcpWorkerState;
+  sentStopped?: boolean;
+} = {}) {
   return render(
     <StartupErrorBanner
       sessionId="s-1"
       message={message}
+      acpWorkerState={acpWorkerState}
+      canRecover
+      sentStopped={sentStopped}
       onSwitchToTerminal={switchable ? onSwitchToTerminal : undefined}
     />,
   );
@@ -142,8 +157,11 @@ describe("StartupErrorBanner layout", () => {
       info: claude({ sandboxed: true }),
       headline: "Claude couldn't start in Structured view",
       command: CLAUDE_NPM,
-      texts: ["Run this inside the container, then Retry", "sandbox image update available"],
-      absent: ["where the Daemon runs"],
+      texts: [
+        "Run this inside the container, then Retry",
+        'the dashboard\'s "Sandbox image update available" banner offers Update now to pull it, or shows the command to run.',
+      ],
+      absent: ["where the Daemon runs", "TUI"],
       actions: ["Retry", "Use Terminal view"],
     },
     {
@@ -236,6 +254,16 @@ describe("StartupErrorBanner layout", () => {
     fireEvent.click(await findByTestId("startup-error-banner-terminal"));
     expect(onSwitch).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    [true, "The message you sent was stopped. Send it again once Claude is ready."],
+    [false, null],
+  ])("with a restart's stopped message %s, says to send it again", async (sentStopped, caption) => {
+    stubApi({ info: json(claude()) });
+    const { findByText, queryByTestId } = renderBanner({ sentStopped });
+    await findByText("Claude couldn't start in Structured view");
+    expect(queryByTestId("startup-error-banner-sent-stopped")?.textContent ?? null).toBe(caption);
+  });
 });
 
 describe("StartupErrorBanner auth remediation", () => {
@@ -243,20 +271,34 @@ describe("StartupErrorBanner auth remediation", () => {
     {
       agent: "claude",
       info: claude(),
-      present: ["claude /login", "ANTHROPIC_API_KEY"],
-      absent: ["codex login"],
+      present: [
+        "claude auth login",
+        "host terminal",
+        "Or set ANTHROPIC_API_KEY in the environment that runs aoe serve, restart aoe serve, then click Retry.",
+      ],
+      absent: ["codex login", "claude /login", "[sandbox] environment"],
     },
     {
       agent: "codex",
       info: claude({ agent: "codex", display_name: "Codex" }),
       present: ["codex login", "OPENAI_API_KEY"],
-      absent: ["claude /login", "ANTHROPIC_API_KEY"],
+      absent: ["claude auth login", "ANTHROPIC_API_KEY", "--device-auth"],
+    },
+    {
+      agent: "codex",
+      info: claude({ agent: "codex", display_name: "Codex", sandboxed: true }),
+      present: [
+        "codex login --device-auth",
+        "Container terminal",
+        "Or set OPENAI_API_KEY in the environment that runs aoe serve, restart aoe serve, then click Retry.",
+      ],
+      absent: ["host terminal", "[sandbox] environment"],
     },
     {
       agent: "opencode",
       info: opencode,
-      present: ["OpenCode isn't signed in"],
-      absent: ["claude /login", "codex login"],
+      present: ["OpenCode isn't signed in", "Sign in to OpenCode"],
+      absent: ["claude auth login", "codex login"],
     },
   ])("names the $agent login step, not another agent's", async ({ agent, info, present, absent }) => {
     stubApi({ info: json(info) });
@@ -268,6 +310,17 @@ describe("StartupErrorBanner auth remediation", () => {
     });
     expect(banner.textContent).not.toContain("usually missing");
     for (const text of absent) expect(banner.textContent).not.toContain(text);
+  });
+
+  it("names no command while it can't tell host from Container", async () => {
+    const spy = stubApi({});
+    const message = 'Failed to start structured view agent "codex": authentication required';
+    const { findByTestId } = renderBanner({ message });
+    const banner = await findByTestId("startup-error-banner");
+    await waitFor(() => expect(calls(spy, "/acp/install-info")).toBe(1));
+    await act(async () => {});
+    expect(banner.textContent).toContain("Sign in to codex, then click Retry");
+    expect(banner.textContent).not.toContain("codex login");
   });
 });
 
@@ -381,19 +434,45 @@ describe("StartupErrorBanner install", () => {
 });
 
 describe("StartupErrorBanner Retry", () => {
-  it("says what happens next once the respawn is accepted", async () => {
-    stubApi({ info: json(claude()), spawn: json({}) });
-    const { getByTestId, findByText, queryByTestId } = renderBanner();
+  it.each([
+    ["spawns when no Worker is left", "absent", "/acp/spawn"],
+    ["restarts a Worker that hasn't settled, so it can't refuse the Retry", "running", "/acp/restart"],
+  ] as const)("%s, and says what happens next", async (_label, acpWorkerState, path) => {
+    const spy = stubApi({ info: json(claude()), spawn: json({}), restart: json({}) });
+    const { getByTestId, findByText, queryByTestId } = renderBanner({ acpWorkerState });
     fireEvent.click(getByTestId("startup-error-banner-retry"));
     await findByText("Retrying. Events will appear when Claude starts.");
+    expect(calls(spy, path)).toBe(1);
+    expect(calls(spy, path === "/acp/spawn" ? "/acp/restart" : "/acp/spawn")).toBe(0);
     expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
   });
 });
 
 describe("StartupErrorBanner Details", () => {
-  it("starts closed, then holds the raw error and the agent log", async () => {
-    stubApi({ info: json(claude()) });
-    const { getByTestId, queryByTestId } = renderBanner();
+  it("starts closed and keeps opened startup details and logs through an establishing connection loss", async () => {
+    const spy = stubApi({
+      info: json(claude({ install_allowed: true })),
+      log: json({ exists: true, tail: "bootstrap failed before input" }),
+    });
+    let state = { ...emptyAcpState(), startupError: SPAWN_MSG };
+    const props = {
+      sessionId: "s-1",
+      startingAgent: null,
+      canRestart: true,
+      acpWorkerState: "absent" as const,
+      trashedAt: null,
+      archivedAt: null,
+      snoozedUntil: null,
+      dismissError: vi.fn(),
+      onSwitchToTerminal: vi.fn(),
+    };
+    const { getByTestId, queryByTestId, findByTestId, rerender } = render(<SessionBanners {...props} state={state} />);
+    const actions = [
+      await findByTestId("startup-error-banner-install"),
+      getByTestId("startup-error-banner-retry"),
+      getByTestId("startup-error-banner-terminal"),
+    ];
+    for (const action of actions) expect(action.hasAttribute("disabled")).toBe(false);
     const toggle = getByTestId("startup-error-banner-details");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
@@ -402,6 +481,91 @@ describe("StartupErrorBanner Details", () => {
     const body = getByTestId("startup-error-banner-details-body");
     expect(body.textContent).toContain(SPAWN_MSG);
     expect(within(body).getByTestId("acp-agent-log-toggle")).toBeTruthy();
+    state = {
+      ...state,
+      connectionUnavailable: { source: "control", cause: "read_failed", phase: "establishing" },
+    };
+    rerender(<SessionBanners {...props} state={state} />);
+    expect(getByTestId("startup-error-banner-details-body")).toBe(body);
+    expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
+    for (const action of actions) {
+      expect(action.hasAttribute("disabled")).toBe(true);
+      action.click();
+    }
+    fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
+    await waitFor(() =>
+      expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input"),
+    );
+    state = { ...state, connectionUnavailable: null };
+    rerender(<SessionBanners {...props} state={state} />);
+    expect(getByTestId("startup-error-banner-details-body")).toBe(body);
+    expect(getByTestId("startup-error-banner-details").getAttribute("aria-expanded")).toBe("true");
+    expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("bootstrap failed before input");
+    for (const action of actions) expect(action.hasAttribute("disabled")).toBe(false);
+    expect(calls(spy, "/acp/worker-log")).toBe(1);
+    expect(calls(spy, "/acp/spawn")).toBe(0);
+    expect(calls(spy, "/acp/restart")).toBe(0);
+    expect(calls(spy, "/acp/install-agent")).toBe(0);
+    expect(props.onSwitchToTerminal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      label: "cold retained ownership uncertainty",
+      canRestart: true,
+      unavailable: { source: "runner_record", cause: "ownership_unconfirmed", phase: "establishing" },
+    },
+    {
+      label: "cold post-establishment connection loss",
+      canRestart: true,
+      unavailable: { source: "control", cause: "read_failed", phase: "established" },
+    },
+    { label: "read-only recovery policy", canRestart: false, unavailable: null },
+  ] as const)("keeps replayed startup diagnostics read-only during $label", async ({ canRestart, unavailable }) => {
+    const spy = stubApi({
+      info: json(claude({ install_allowed: true })),
+      log: json({ exists: true, tail: "retained startup diagnostic" }),
+    });
+    const replayed = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { AgentStartupError: { message: SPAWN_MSG } },
+    });
+    const onSwitchToTerminal = vi.fn();
+    const { getByTestId, findByTestId } = render(
+      <SessionBanners
+        sessionId="s-1"
+        state={{ ...replayed, connectionUnavailable: unavailable }}
+        startingAgent={null}
+        canRestart={canRestart}
+        acpWorkerState="running"
+        trashedAt={null}
+        archivedAt={null}
+        snoozedUntil={null}
+        dismissError={vi.fn()}
+        onSwitchToTerminal={onSwitchToTerminal}
+      />,
+    );
+    for (const action of [
+      await findByTestId("startup-error-banner-install"),
+      getByTestId("startup-error-banner-retry"),
+      getByTestId("startup-error-banner-terminal"),
+    ]) {
+      expect(action.hasAttribute("disabled")).toBe(true);
+      action.click();
+    }
+    fireEvent.click(getByTestId("startup-error-banner-details"));
+    const body = getByTestId("startup-error-banner-details-body");
+    expect(body.textContent).toContain(SPAWN_MSG);
+    fireEvent.click(within(body).getByTestId("acp-agent-log-toggle"));
+    await waitFor(() =>
+      expect(within(body).getByTestId("acp-agent-log-pre").textContent).toContain("retained startup diagnostic"),
+    );
+    expect(calls(spy, "/acp/worker-log")).toBe(1);
+    expect(calls(spy, "/acp/spawn")).toBe(0);
+    expect(calls(spy, "/acp/restart")).toBe(0);
+    expect(calls(spy, "/acp/install-agent")).toBe(0);
+    expect(onSwitchToTerminal).not.toHaveBeenCalled();
   });
 
   const cause = SPAWN_MSG.split(": ").slice(1).join(": ");
@@ -421,6 +585,13 @@ describe("StartupErrorBanner Details", () => {
       `spawn failed: ${longCause}`,
       "Retry failed: same error",
     ],
+    ["the same error from a restart", SPAWN_MSG, `restart spawn failed: ${cause}`, "Retry failed: same error"],
+    [
+      "the same error from a restart after a reason code",
+      SPAWN_MSG,
+      `worker_not_ready: restart spawn failed: ${cause}`,
+      "Retry failed: same error",
+    ],
     ["a new error", SPAWN_MSG, "spawn failed: capacity full", "Retry failed: capacity full"],
     [
       "a JSON refusal",
@@ -429,8 +600,11 @@ describe("StartupErrorBanner Details", () => {
       "Retry failed: session is archived; unarchive it first",
     ],
   ])("a retry failing with %s opens Details without the HTTP status", async (_label, message, body, line) => {
-    stubApi({ info: json(claude()), spawn: json(body, 500) });
-    const { getByTestId, findByTestId } = renderBanner({ message });
+    stubApi({ info: json(claude()), spawn: json(body, 500), restart: json(body, 500) });
+    const { getByTestId, findByTestId } = renderBanner({
+      message,
+      acpWorkerState: body.includes("restart") ? "running" : "absent",
+    });
     fireEvent.click(getByTestId("startup-error-banner-retry"));
     const details = await findByTestId("startup-error-banner-details-body");
     await waitFor(() => expect(details.textContent).toContain(line));

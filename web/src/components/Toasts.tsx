@@ -1,4 +1,14 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
 import { requestOpenSession } from "../lib/sessionRoute";
 import { openPluginLink } from "../lib/pluginCommands";
@@ -10,6 +20,7 @@ interface Toast {
   message: string;
   sessionId?: string;
   href?: string;
+  action?: { label: string; run: () => void };
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
@@ -46,13 +57,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   // A click-to-open toast (worker `ui.open_url`): a browser blocks `window.open`
   // from an async push, so opening waits for the tap.
   const pushWithHref = useCallback(
-    (message: string, href: string) => {
+    (message: string, href: string, kind: ToastKind = "info") => {
       const id = nextId.current++;
-      setToasts((t) => [...t, { id, kind: "info", message, href }]);
+      setToasts((t) => [...t, { id, kind, message, href }]);
       setTimeout(() => dismiss(id), TOAST_LIFETIME_MS);
     },
     [dismiss],
   );
+
+  const pushWithAction = useCallback((message: string, label: string, run: () => void) => {
+    const id = nextId.current++;
+    // Stays until used or dismissed: its action can be the only way back to what failed.
+    setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
+  }, []);
 
   const api = useMemo<ToastApi>(
     () => ({
@@ -60,8 +77,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       error: (m: string) => push(m, "error"),
       info: (m: string) => push(m, "info"),
       openLink: pushWithHref,
+      action: pushWithAction,
     }),
-    [push, pushWithHref],
+    [push, pushWithHref, pushWithAction],
   );
 
   // Service worker forwards incoming push payloads here when the PWA is already visible and focused, so we show
@@ -94,10 +112,26 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     };
   }, [push, pushWithSession]);
 
+  // Action toasts stay until used, so the column can outgrow the screen; keep the newest in view.
+  const listRef = useRef<HTMLDivElement>(null);
+  const newestId = toasts.at(-1)?.id;
+  // Ids only increase, so a smaller newest id means the newest was removed, not that one arrived.
+  const scrolledFor = useRef(0);
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    if (!list || newestId === undefined || newestId <= scrolledFor.current) return;
+    scrolledFor.current = newestId;
+    list.scrollTop = list.scrollHeight;
+  }, [newestId]);
+
   return (
     <ToastContext.Provider value={api}>
       {children}
-      <div className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 max-w-[92vw] sm:max-w-sm">
+      <div
+        ref={listRef}
+        data-testid="toast-list"
+        className="fixed bottom-4 right-4 z-[80] flex flex-col gap-2 max-w-[92vw] sm:max-w-sm max-h-[calc(100dvh-2rem)] overflow-y-auto"
+      >
         {toasts.map((t) => {
           const clickable = !!t.sessionId || !!t.href;
           const onToastClick = () => {
@@ -124,6 +158,19 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               } ${clickable ? "cursor-pointer hover:bg-surface-700 transition-colors" : ""}`}
             >
               <span className="flex-1 break-words">{t.message}</span>
+              {t.action && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    dismiss(t.id);
+                    t.action!.run();
+                  }}
+                  className="shrink-0 font-medium text-text-primary underline-offset-2 hover:underline cursor-pointer"
+                >
+                  {t.action.label}
+                </button>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation();

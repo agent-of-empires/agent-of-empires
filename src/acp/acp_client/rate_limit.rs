@@ -55,7 +55,7 @@ fn overage_covers(info: &serde_json::Value) -> bool {
 /// Only rejections are retained: a warning's epoch cannot be tied to the
 /// window that later rejects (#3152).
 pub(super) fn rate_limit_rejection_from_meta(
-    meta: &Option<agent_client_protocol::schema::v1::Meta>,
+    meta: &Option<agent_client_protocol::v1::schema::Meta>,
 ) -> Option<RateLimitRejection> {
     let info = meta.as_ref()?.get("_claude/rateLimit")?;
     if info.get("status")?.as_str()? != "rejected" || overage_covers(info) {
@@ -86,7 +86,7 @@ pub(super) fn rate_limit_rejection_from_meta(
 /// so a stale rejection cannot park a turn. Returns whether a rejection was kept.
 pub(super) fn record_rate_limit_report(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
-    meta: &Option<agent_client_protocol::schema::v1::Meta>,
+    meta: &Option<agent_client_protocol::v1::schema::Meta>,
 ) -> bool {
     let Some(info) = meta.as_ref().and_then(|m| m.get("_claude/rateLimit")) else {
         return false;

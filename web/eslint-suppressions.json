@@ -1,7 +1,7 @@
 {
   "src/App.tsx": {
     "react-you-might-not-need-an-effect/no-event-handler": {
-      "count": 2
+      "count": 1
     }
   }
 }

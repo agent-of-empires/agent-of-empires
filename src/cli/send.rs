@@ -90,8 +90,8 @@ fn refusal(error: HttpError, identifier: &str) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::client::DaemonEndpoint;
     use crate::daemon::ApiErrorCode;
+    use crate::daemon::DaemonEndpoint;
     use crate::server::api::{api_error_with_code_header, start_blocked_response};
     use axum::{extract::Path, routing::post, Router};
 
@@ -118,7 +118,7 @@ mod tests {
         let client = HttpClient::new(DaemonEndpoint::new(
             format!("http://{address}"),
             Some("secret".to_string()),
-            crate::acp::client::discovery::Source::Env,
+            crate::daemon::Source::Env,
         ))
         .unwrap();
 

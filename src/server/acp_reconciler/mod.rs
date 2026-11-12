@@ -20,10 +20,13 @@ use crate::daemon::AcpWorkerState;
 use crate::session::Instance;
 
 #[cfg(test)]
-pub(crate) use rate_limit::{install_rate_limit_continuation, ContinuationOutcome};
+pub(crate) use rate_limit::install_rate_limit_continuation;
 pub(crate) use rate_limit::{resume_rate_limited, QuotaDelivery, QuotaResume};
 pub(crate) use resume::ensure_rate_limit_worker;
-pub(crate) use resume::{command_override_for_spawn, trigger_resume_background, ResumeTrigger};
+pub(crate) use rate_limit::{
+    install_prepared_continuation, resolve_continuation, ContinuationOutcome, PreparedContinuation,
+};
+pub(crate) use resume::{trigger_resume_background, ResumeTrigger};
 
 use resume::{resume_one, ResumeTarget};
 
@@ -329,7 +332,11 @@ pub async fn reconcile_acp_workers(
     }
 
     // Triaged sessions are excluded so an archive/snooze teardown is not undone (#1581).
-    let (targets, with_queued_prompts): (Vec<ResumeTarget>, HashSet<String>) = {
+    let (targets, with_queued_prompts, queued_not_stopped): (
+        Vec<ResumeTarget>,
+        HashSet<String>,
+        HashSet<String>,
+    ) = {
         let instances = state.instances.read().await;
         (
             instances
@@ -340,6 +347,13 @@ pub async fn reconcile_acp_workers(
             instances
                 .iter()
                 .filter(|i| !i.queued_prompts.is_empty())
+                .map(|i| i.id.clone())
+                .collect(),
+            instances
+                .iter()
+                .filter(|i| {
+                    !i.queued_prompts.is_empty() && i.status != crate::session::Status::Stopped
+                })
                 .map(|i| i.id.clone())
                 .collect(),
         )
@@ -369,6 +383,12 @@ pub async fn reconcile_acp_workers(
                 continue;
             }
         }
+        // A session with a queue and no worker is retried under the normal
+        // budget, whatever its status short of Stopped (a failed spawn leaves
+        // Error): an earlier attempt must not strand the queue (#5200).
+        let retry_for_queue = attempted.contains(&id)
+            && queued_not_stopped.contains(&id)
+            && supervisor.worker_state(&id).await == AcpWorkerState::Absent;
         let worker_state = supervisor.worker_state(&id).await;
         let previous = resume_deferred
             .get(&id)
@@ -460,12 +480,14 @@ pub async fn reconcile_acp_workers(
         if attempted.contains(&id) {
             // A restart marker can land after the reaper ran: add-project (#3103)
             // writes it only once the moved workspace is durable.
-            if supervisor.worker_state(&id).await == AcpWorkerState::Stopping
-                || !supervisor.take_late_restart_marker(&id)
-            {
+            let restart_marker = supervisor.worker_state(&id).await != AcpWorkerState::Stopping
+                && supervisor.take_late_restart_marker(&id);
+            if !retry_for_queue && !restart_marker {
                 continue;
             }
-            forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
+            if restart_marker {
+                forget_session_budget(&id, attempted, parked, respawn_history, resume_deferred);
+            }
         }
         match supervisor.worker_state(&id).await {
             AcpWorkerState::Running | AcpWorkerState::Resuming => {
@@ -805,6 +827,7 @@ mod tests {
             size: None,
             path: project.path().to_string_lossy().into_owned(),
             group: String::new(),
+            parent_session_id: None,
             tool: "claude".into(),
             worktree_enabled: false,
             worktree_branch: None,
@@ -837,6 +860,7 @@ mod tests {
             import_acp_session_id: None,
             import_binding: None,
             fork_seed: None,
+            cli: None,
             progress: None,
         };
         crate::server::test_support::seed_instances_on_disk_for_test("default", Vec::new());
@@ -2092,6 +2116,150 @@ mod tests {
             })
         })
         .await;
+    }
+
+    /// A resume attempt that launch admission cancelled (row still `Stopped`)
+    /// pins the id; once the row reads `Idle` with a queue, the pin must lift
+    /// so the queue is not stranded behind a worker nothing starts (#5200).
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pinned_idle_session_with_a_queue_is_resumed() {
+        use crate::session::Status;
+
+        let cases = [
+            ("idle with a queue", Status::Idle, 1),
+            ("error with a queue", Status::Error, 1),
+            ("deliberately stopped with a queue", Status::Stopped, 0),
+        ];
+        for (name, status, expected_attempts) in cases {
+            let id = "sess-pinned";
+            let (_home, state, _project) = test_fixtures::test_state(id);
+            {
+                let mut instances = state.instances.write().await;
+                instances[0].status = status;
+                instances[0]
+                    .queued_prompts
+                    .push(test_fixtures::queued_prompt());
+            }
+
+            let mut tick = test_fixtures::Tick::default();
+            tick.attempted.insert(id.to_string());
+            tick.run(&state).await;
+
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                expected_attempts,
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn explicit_start_rearms_a_stopped_session_without_a_queue() {
+        use crate::session::Status;
+        use axum::{
+            extract::{Path, State},
+            response::IntoResponse,
+        };
+
+        let id = "sess-explicit-start";
+        let (_home, state, _project) = test_fixtures::test_state(id);
+        let stopped = {
+            let mut instances = state.instances.write().await;
+            instances[0].status = Status::Stopped;
+            crate::server::test_support::select_retained_for_test(&mut instances[0]);
+            instances[0].clone()
+        };
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &stopped.source_profile,
+            vec![stopped.clone()],
+        );
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut tick = test_fixtures::Tick::default();
+        tick.run(&state).await;
+        assert!(
+            tick.attempted.contains(id),
+            "stopped admission was attempted"
+        );
+        assert_eq!(test_fixtures::startup_errors(&state, id), 0);
+        {
+            let instances = state.instances.read().await;
+            assert_eq!(
+                instances[0].lifecycle_generation,
+                stopped.lifecycle_generation
+            );
+            assert_eq!(instances[0].resume_intent, stopped.resume_intent);
+            assert_eq!(instances[0].acp_establishment, stopped.acp_establishment);
+        }
+        let persisted = crate::session::Storage::new_unwatched(&stopped.source_profile)
+            .unwrap()
+            .load_instances_complete()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(persisted.lifecycle_generation, stopped.lifecycle_generation);
+        assert_eq!(persisted.resume_intent, stopped.resume_intent);
+        assert_eq!(persisted.acp_establishment, stopped.acp_establishment);
+
+        let mut publications = state.acp_events_tx.subscribe();
+        let response = crate::server::api::sessions::start_session(
+            State(Arc::clone(&state)),
+            Path(id.to_string()),
+            Ok(None),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tick.run(&state).await;
+        let startup = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let frame = publications
+                    .recv()
+                    .await
+                    .expect("actual startup publication");
+                if frame.session_id == id
+                    && matches!(frame.event.as_ref(), Event::AgentStartupError { .. })
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("the explicit background attempt reports its real startup failure");
+        let Event::AgentStartupError { message, .. } = startup.event.as_ref() else {
+            unreachable!("selected the actual startup failure");
+        };
+        let expected_error = crate::acp::supervisor::SupervisorError::UnknownAgent(
+            stopped
+                .agent_name
+                .clone()
+                .expect("the fixture selects an unknown agent"),
+        )
+        .to_string();
+        assert!(
+            message.contains(&expected_error),
+            "explicit start must reach agent resolution, not a selection refusal: {message}"
+        );
+        assert_eq!(
+            test_fixtures::startup_errors(&state, id),
+            1,
+            "explicit start must retry the fake agent without a queued prompt"
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.acp_supervisor.worker_state(id).await != AcpWorkerState::Absent {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the explicit construction settles before checking the no-loop tick");
+        tick.run(&state).await;
+        assert_eq!(
+            test_fixtures::startup_errors(&state, id),
+            1,
+            "one explicit start must not create a retry loop"
+        );
     }
 
     /// A launch-prep race (here: memory and disk disagree on the row) must not

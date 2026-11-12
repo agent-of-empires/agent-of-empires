@@ -185,7 +185,7 @@ pub(super) async fn adopt_profile_update<R>(
         Ok((result, rows, groups)) => crate::server::reload::adopt_committed_profiles(
             state,
             [(&profile, rows, groups)],
-            committed_status,
+            |id| committed_status(id).then_some(crate::server::reload::StatusCommit::Lifecycle),
             reload,
             publication,
         )

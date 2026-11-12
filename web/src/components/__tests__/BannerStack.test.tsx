@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import type { ServerAbout, UpdateStatus } from "../../lib/api";
 import type { PushHealth } from "../../lib/pushHealth";
@@ -80,6 +80,7 @@ function about(webBuildId: string): ServerAbout {
 
 const NAMES: [RegExp, string][] = [
   [/Server unreachable/, "disconnected"],
+  [/server's settings/, "server settings"],
   [/Dashboard updated/, "dashboard updated"],
   [/Reconnected/, "reconnected"],
   [/Sandbox image/, "sandbox image"],
@@ -134,6 +135,27 @@ describe("BannerStack", () => {
       expect(shown(container), JSON.stringify({ connection, dashboard, update, sandbox, pushUnhealthy })).toEqual(want);
       unmount();
     }
+  });
+
+  it("puts the server settings notice under Disconnected and over the rest, and Retry asks again", () => {
+    // (connection, banners top to bottom)
+    const cases: [ConnectionBannerState | null, string[]][] = [
+      ["down", ["disconnected"]],
+      [null, ["server settings", "push"]],
+      ["reconnected", ["server settings", "push"]],
+    ];
+    const retry = vi.fn();
+    for (const [connection, want] of cases) {
+      forced = { connection, dashboard: true, update: true, sandbox: true };
+      pushHealth = "revoked";
+      const { container, unmount } = render(<BannerStack onRetryServerSettings={retry} />);
+      expect(shown(container), String(connection)).toEqual(want);
+      unmount();
+    }
+    forced = { connection: null, dashboard: false, update: false, sandbox: false };
+    render(<BannerStack onRetryServerSettings={retry} />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledTimes(1);
   });
 
   it("re-checks both updates once on reconnect, and a new bundle replaces the stale offer", async () => {

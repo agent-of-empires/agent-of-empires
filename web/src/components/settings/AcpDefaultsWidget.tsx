@@ -252,7 +252,7 @@ export function AcpDefaultsWidget({ descriptor, value, save }: CustomWidgetProps
         fetchAcpOptionCatalog().catch(() => ({ version: 1, agents: {} })),
       ]);
       if (!alive) return;
-      setAgents(a);
+      setAgents(a ?? []);
       setCatalog(c.agents ?? {});
     })();
     return () => {

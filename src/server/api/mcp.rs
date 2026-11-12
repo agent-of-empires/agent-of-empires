@@ -145,6 +145,7 @@ pub async fn resolve_mcp_conflict(
             profile_opt,
             &session_env,
             None,
+            None,
         )?;
         let reconcile = mcp_state::reconcile_agent(&body.agent, &read)?;
         let Some(conflict) = reconcile

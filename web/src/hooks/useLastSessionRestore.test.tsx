@@ -11,12 +11,18 @@ type Params = {
   activeSessionId: string | null;
   sessions: readonly { id: string }[];
   sessionsLoaded: boolean;
+  trashedCount: number;
+  trashLoaded: boolean;
+  loadTrash: () => void;
 };
 
 const params = (over: Partial<Params> = {}): Params => ({
   activeSessionId: null,
   sessions: [{ id: "s1" }],
   sessionsLoaded: true,
+  trashedCount: 0,
+  trashLoaded: false,
+  loadTrash: () => {},
   ...over,
 });
 
@@ -64,6 +70,28 @@ describe("useLastSessionRestore", () => {
     stubStandalone(true);
     localStorage.setItem(LAST_SESSION_KEY, "gone");
     const { result } = setup("/");
+    await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBeNull());
+    expect(result.current.location.pathname).toBe("/");
+  });
+
+  it("resolves a stored id that is absent from the list through the trash before dropping it", async () => {
+    stubStandalone(true);
+    localStorage.setItem(LAST_SESSION_KEY, "trashed");
+    const loadTrash = vi.fn();
+    const { result, rerender } = setup("/", params({ trashedCount: 2, loadTrash }));
+    await waitFor(() => expect(loadTrash).toHaveBeenCalled());
+    // Kept, and still on the dashboard, while the lookup is pending.
+    expect(localStorage.getItem(LAST_SESSION_KEY)).toBe("trashed");
+    expect(result.current.location.pathname).toBe("/");
+
+    rerender(params({ trashedCount: 2, trashLoaded: true, sessions: [{ id: "s1" }, { id: "trashed" }], loadTrash }));
+    await waitFor(() => expect(result.current.location.pathname).toBe("/session/trashed"));
+  });
+
+  it("drops a stored id once the trash was read and still lacks it", async () => {
+    stubStandalone(true);
+    localStorage.setItem(LAST_SESSION_KEY, "gone");
+    const { result } = setup("/", params({ trashedCount: 2, trashLoaded: true }));
     await waitFor(() => expect(localStorage.getItem(LAST_SESSION_KEY)).toBeNull());
     expect(result.current.location.pathname).toBe("/");
   });

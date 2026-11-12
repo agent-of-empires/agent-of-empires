@@ -11,6 +11,7 @@ import { badgeLabel, badgeTone, resolveSkillSource, type SkillIndex } from "../.
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { ProvenanceBadge } from "../ProvenanceBadge";
 import { Tooltip } from "../Tooltip";
+import { SignInButton, type SignInContext } from "./SignInPopover";
 
 /** Flat item list shared by the `@` and `/` popovers; `/` passes a skill index for provenance badges. */
 export function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: SkillIndex }) {
@@ -285,7 +286,7 @@ function formatCost(amount: number, currency: string): string {
 /** The agent's own auth identity. Reporting only: the extension says which
  *  identity is in use, never whether its credentials still work, so a healthy
  *  looking chip is not a claim that the key is valid. */
-export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatus"] }) {
+export function AuthStatusHint({ authStatus, signIn }: { authStatus: AcpState["authStatus"]; signIn?: SignInContext }) {
   // Silence means "not reported", which is not the same as logged out.
   if (!authStatus) return null;
   const loggedOut = authStatus.kind === "none";
@@ -300,6 +301,7 @@ export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatu
   const explanation = loggedOut
     ? `The agent reports it is not logged in. Prompts will fail until you authenticate.${details.length ? ` ${details.join(" · ")}` : ""}`
     : `This session runs under ${authStatus.label}.${details.length ? ` ${details.join(" · ")}` : ""} Reported by the agent; it does not confirm the credentials are still valid.`;
+  if (loggedOut) return <SignInButton label={authStatus.label} explanation={explanation} signIn={signIn} />;
   return (
     <Tooltip text={explanation} multiline>
       <span
@@ -307,7 +309,7 @@ export function AuthStatusHint({ authStatus }: { authStatus: AcpState["authStatu
         data-auth-kind={authStatus.kind}
         role="img"
         tabIndex={0}
-        className={`inline-flex max-w-[12rem] items-center gap-1 truncate text-[11px] ${loggedOut ? "text-status-error-text" : "text-text-dim"}`}
+        className="inline-flex max-w-[12rem] items-center gap-1 truncate text-[11px] text-text-dim"
         aria-label={explanation}
       >
         <ShieldCheck className="size-3 shrink-0 opacity-70" aria-hidden />

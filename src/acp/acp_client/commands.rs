@@ -1,11 +1,25 @@
 //! The command channel the connection task pumps, and how each connection
 //! attempt reaches its agent.
 
-use agent_client_protocol::schema::v1::ContentBlock;
+use agent_client_protocol::v1::schema::ContentBlock;
 use tokio::sync::oneshot;
 
 use super::delete::DeleteSessionOutcome;
 use super::reset::ResetSessionOutcome;
+
+/// The actual command lane retains admission across every queue wait.
+pub(super) struct QueuedClientCmd {
+    pub(super) command: ClientCmd,
+    pub(super) scope: Option<crate::acp::establishment::NativeRequestContext>,
+    pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+}
+
+/// Steering fallback retains the same operation, not a freshly admitted turn.
+pub(super) struct QueuedPrompt {
+    pub(super) blocks: Vec<ContentBlock>,
+    pub(super) scope: Option<crate::acp::establishment::NativeRequestContext>,
+    pub(super) correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+}
 
 /// The actual command lane retains admission across every queue wait.
 pub(super) struct QueuedClientCmd {

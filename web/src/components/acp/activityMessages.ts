@@ -143,7 +143,7 @@ export function activityToThreadMessages(
     if (row.kind === "tool_start" && row.tool) {
       const parentBuilder = builderByToolId.get(row.tool.parent_tool_call_id ?? "");
       const builder = parentBuilder ?? (currentAssistant ??= new AssistantBuilder(row.id, row.at));
-      builder.appendToolCall(row.tool, !!parentBuilder);
+      builder.appendToolCall(row.tool, !!parentBuilder, row.output);
       builderByToolId.set(row.tool.id, builder);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
       const toolCallId = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
@@ -157,11 +157,10 @@ export function activityToThreadMessages(
         row.asyncSubagent ?? false,
         row.output,
       );
-    } else if (row.kind === "empty_output") {
-      // A turn with no output (interactive-only slash commands) gets a muted note.
-      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(`_${row.text}_`);
-    } else if (row.kind !== "thinking") {
-      // Thinking shows in the spinner; message and unknown kinds render as text.
+    } else if (row.kind === "thinking") {
+      (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendReasoning(row.text, row.messageStart);
+    } else {
+      // Message and unknown kinds render as text.
       (currentAssistant ??= new AssistantBuilder(row.id, row.at)).appendText(row.text, row.messageStart);
     }
   }
@@ -189,6 +188,7 @@ type ToolResult = {
 // Loose part shape, cast at build time; the renderer parses argsText itself.
 type DraftPart =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | {
       type: "tool-call";
       toolCallId: string;
@@ -222,8 +222,16 @@ class AssistantBuilder {
     this.paragraphBreak = false;
   }
 
+  /** Adjacent thinking rows join one part unless a new thought starts. */
+  appendReasoning(text: string, thoughtStart = false) {
+    if (!text) return;
+    const last = this.parts[this.parts.length - 1];
+    if (!thoughtStart && last && last.type === "reasoning") last.text += text;
+    else this.parts.push({ type: "reasoning", text });
+  }
+
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
-  appendToolCall(tool: ToolCall, isChild = false) {
+  appendToolCall(tool: ToolCall, isChild = false, output?: ToolOutputBlock[]) {
     const argsObj = parseJsonObject(tool.args_preview) ?? {};
     if (tool.name) argsObj._aoe_title = tool.name;
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;
@@ -232,6 +240,8 @@ class AssistantBuilder {
     if (tool.raw_name) argsObj._aoe_raw_tool_name = tool.raw_name;
     if (tool.memory_recall) argsObj._aoe_memory_recall = tool.memory_recall;
     if (tool.diffs?.length) argsObj._aoe_diffs = tool.diffs;
+    // Streamed output is not a tool result; keep the part open until a real terminal arrives.
+    if (output?.length) argsObj._aoe_partial_output = output;
     const part: ToolPart = {
       type: "tool-call",
       toolCallId: tool.id,

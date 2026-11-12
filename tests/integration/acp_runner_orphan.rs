@@ -98,7 +98,18 @@ fn spawn_runner_and_wait_for_record(test_name: &str, session_id: &str) -> (Owned
             owner.child.try_wait().unwrap().is_none(),
             "runner exited before native birth"
         );
-        if let Some(record) = worker_registry::load_strict(session_id).unwrap() {
+        let record = match worker_registry::load_strict(session_id) {
+            Ok(record) => record,
+            Err(error)
+                if error
+                    .downcast_ref::<worker_registry::RegistryBusy>()
+                    .is_some() =>
+            {
+                None
+            }
+            Err(error) => panic!("read original runner registration: {error:#}"),
+        };
+        if let Some(record) = record {
             if let Some(proof) = inspection
                 .native_spawn_proof_for_child(&owner.child, session_id, producer)
                 .unwrap()

@@ -9,6 +9,20 @@ import { safeGetItem, safeSetItem } from "./safeStorage";
  *  #1234, #1720, #3283. */
 export type SidebarAxis = "repo" | "org" | "group" | "repo+group";
 
+// Keyed by axis, so a new axis must say whether its headers are repositories.
+const DRAWS_REPO_HEADERS: Record<SidebarAxis, boolean> = {
+  repo: true,
+  org: true,
+  "repo+group": true,
+  group: false,
+};
+
+/** Whether the axis draws repository headers, which is where a Project with live Sessions, or a pinned one,
+ *  appears. Without them, the Projects section lists every registered Project (#5065). */
+export function axisDrawsRepoHeaders(axis: SidebarAxis): boolean {
+  return DRAWS_REPO_HEADERS[axis];
+}
+
 export const SIDEBAR_AXIS_KEY = "aoe-sidebar-axis";
 
 export function loadSidebarAxis(): SidebarAxis {

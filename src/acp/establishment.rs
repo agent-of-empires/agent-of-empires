@@ -1228,13 +1228,13 @@ impl NativeRequestContext {
 #[derive(Debug, Clone)]
 pub(crate) struct NativeResourceStartContext {
     context: std::sync::Arc<NativeRequestContext>,
-    session_id: agent_client_protocol::schema::v1::SessionId,
+    session_id: agent_client_protocol::v1::schema::SessionId,
 }
 
 impl NativeResourceStartContext {
     pub(crate) fn from_frame(
         context: std::sync::Arc<NativeRequestContext>,
-        session_id: agent_client_protocol::schema::v1::SessionId,
+        session_id: agent_client_protocol::v1::schema::SessionId,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             matches!(&context.scope, NativeRequestScope::Session { .. })
@@ -1304,7 +1304,7 @@ pub(crate) struct NativeResourceWitness {
     pub(crate) profile: String,
     pub(crate) session_id: String,
     pub(crate) created_at: chrono::DateTime<chrono::Utc>,
-    pub(crate) native_session_id: agent_client_protocol::schema::v1::SessionId,
+    pub(crate) native_session_id: agent_client_protocol::v1::schema::SessionId,
     pub(crate) postimage: std::sync::Arc<EstablishmentPostimage>,
     pub(crate) admitted: NativeSessionStamp,
 }

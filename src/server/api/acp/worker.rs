@@ -66,7 +66,7 @@ fn rate_limit_resume_marker_resets_at(
     )
 }
 
-async fn rate_limit_resume_probe(
+pub(in crate::server::api) async fn rate_limit_resume_probe(
     state: &AppState,
     id: &str,
 ) -> Result<ControlKnowledge<Option<DateTime<Utc>>>, SupervisorError> {

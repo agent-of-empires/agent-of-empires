@@ -21,8 +21,8 @@ fn start_session(h: &TuiTestHarness) -> String {
         TITLE,
         "--cmd-override",
         "sleep 600",
+        "--launch",
     ]);
-    h.run_cli_ok(&["session", "start", &id]);
     id
 }
 
@@ -85,7 +85,6 @@ async fn second_x_confirms_stop_in_terminal_and_agent_views() {
     let agent_pane = owned_pane(&h, &agent, "agent");
     let terminal = TerminalSession::generate_name(&id, TITLE);
 
-    h.run_cli_ok(&["serve", "--core-only", "--daemon"]);
     let sdk = DaemonClient::new_unix(app_dir_in(h.home_path()).join("daemon/api.sock")).unwrap();
     let epoch = sdk.runtime_info().await.unwrap().epoch;
     let receipt = sdk

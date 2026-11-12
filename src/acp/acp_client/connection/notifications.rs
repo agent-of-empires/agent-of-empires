@@ -10,7 +10,7 @@ use crate::acp::establishment::{
 use crate::acp::event_sender::{EventMetadata, EventScope, EventSender};
 use crate::acp::state::{BackgroundTaskLaunch, Event};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     SessionId, SessionNotification, SessionUpdate, ToolCallStatus,
 };
 use std::collections::HashMap;
@@ -58,6 +58,10 @@ pub(super) struct Shared {
     /// Set between a successful `session/load` and the first prompt, while
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
+    /// Set from an import's `session/load` until the first prompt, when
+    /// replayed user messages are the only record of them (#2276). Any other
+    /// `user_message_chunk` is the agent echoing a prompt already recorded.
+    pub(super) seed_user_replay: AtomicBool,
     /// Epoch-ms of the last inbound notification, for the resume-idle
     /// watchdog.
     pub(super) last_event_at: AtomicI64,
@@ -132,6 +136,7 @@ impl Shared {
             session_label,
             profile,
             suppress_history_replay: AtomicBool::new(false),
+            seed_user_replay: AtomicBool::new(false),
             last_event_at: AtomicI64::new(now_ms()),
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
@@ -447,6 +452,10 @@ impl Shared {
             history,
             suppress_replay,
         } = update;
+        // A fork prefix freezes only its original custody before the result.
+        // Certify its child identity now, without refreshing any Current scope.
+        let history =
+            history.filter(|history| history.accepts_session(notification.session_id.0.as_ref()));
         let mut metadata = EventMetadata::history();
         metadata.native_origin = evidence.physical_source.map(|source| source.witness);
         metadata.reported_session_id = Some(notification.session_id.clone());
@@ -569,10 +578,11 @@ impl Shared {
                     self.event_tx
                         .with_scoped_metadata(metadata, Some(Arc::clone(context)))
                 });
-        let sender = if let (true, Some(context)) = (session_metadata, current_scope) {
+        let sender = if let (true, Some(context)) = (session_metadata, current_scope.as_ref()) {
             metadata.scope = EventScope::SessionCurrent;
             metadata.native_origin = context.origin();
-            self.event_tx.with_scoped_metadata(metadata, Some(context))
+            self.event_tx
+                .with_scoped_metadata(metadata, Some(Arc::clone(context)))
         } else if let Some(context) = metadata_scope {
             self.event_tx.with_constructor(context)
         } else {
@@ -588,6 +598,13 @@ impl Shared {
         let mut tool_input = history
             .as_ref()
             .and_then(|_| capture_tool_context_input(&notification.update));
+        // Native history keeps its original custody, but live user echoes are
+        // already recorded by the local prompt path (#5224).
+        if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
+            && !(history.is_some() && self.seed_user_replay.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let events = map_update_to_events(notification.update, self.profile)
             .into_iter()
             .chain(restored);
@@ -698,6 +715,18 @@ impl Shared {
                     }
                 }
             }
+            // A qualified `TaskStop` ends tracking; only the tailer publishes
+            // the end after settling the task's agents.
+            if let Event::BackgroundTaskFinished { task_id, .. } = &event {
+                let _ = super::command_loop::current_effect_wait(
+                    current_scope.as_deref(),
+                    true,
+                    &self.connection_state,
+                    || self.bg_tasks.stop(task_id),
+                )
+                .await;
+                continue;
+            }
             if let Some(history) = &history {
                 update_tool_context_cache(&history.tool_context, &event, &mut tool_input);
             }
@@ -706,7 +735,6 @@ impl Shared {
             }
         }
     }
-
     /// `local_prompt_signals` is false for a replayed update committed with
     /// the session: it belongs to no local prompt, so it must not reach the
     /// per-prompt watchdog.
@@ -786,7 +814,13 @@ impl Shared {
         }
         self.capture_rate_limit(&notification.update);
         let mut tool_input = capture_tool_context_input(&notification.update);
-        let mut events = map_update_to_events(notification.update, self.profile);
+        let mut events = if matches!(notification.update, SessionUpdate::UserMessageChunk(_))
+            && !self.seed_user_replay.load(Ordering::Relaxed)
+        {
+            Vec::new()
+        } else {
+            map_update_to_events(notification.update, self.profile)
+        };
         events.extend(restored_wake_event);
         // Signals go first: if the event send backpressures, the watchdog must
         // not evaluate without a suppression-bearing signal.
@@ -815,6 +849,11 @@ impl Shared {
                     kind = transcript_event_kind(&event),
                     "dropping post-load history-replay event"
                 );
+                continue;
+            }
+            // Only `TaskStop` ends a task here; the tailer publishes the end.
+            if let Event::BackgroundTaskFinished { task_id, .. } = &event {
+                self.bg_tasks.stop(task_id);
                 continue;
             }
             update_tool_context_cache(&self.tool_context_cache, &event, &mut tool_input);
@@ -887,5 +926,59 @@ impl Shared {
             retained,
             "observed adapter rate-limit meta"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::v1::schema::{ContentBlock, ContentChunk, TextContent};
+
+    async fn user_echo_events(seed_user_replay: bool) -> Vec<Event> {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
+        let shared = Shared::new(
+            event_tx.into(),
+            "s-echo".to_string(),
+            &crate::acp::agent_profiles::CLAUDE,
+            lifecycle_tx,
+            Arc::new(TerminalClaim::new()),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            Arc::new(SessionIngress::new(Some(SessionId::from("native")))),
+            None,
+            Arc::default(),
+            None,
+            Arc::default(),
+        );
+        shared
+            .seed_user_replay
+            .store(seed_user_replay, Ordering::Relaxed);
+        let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));
+        shared
+            .handle_sdk_notification(
+                SessionNotification::new("native", SessionUpdate::UserMessageChunk(chunk)),
+                true,
+            )
+            .await;
+        drop(shared);
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            let crate::acp::event_sender::SdkEvent::Data(data) = event else {
+                panic!("user echo produced a private SDK barrier");
+            };
+            events.push(Arc::try_unwrap(data.event).unwrap());
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn user_message_chunk_records_only_while_seeding_import_replay() {
+        // Live echo is already recorded locally (#5224); import replay is not.
+        assert!(user_echo_events(false).await.is_empty());
+        assert!(matches!(
+            user_echo_events(true).await.as_slice(),
+            [Event::UserPromptSent { text, .. }] if text == "hello"
+        ));
     }
 }

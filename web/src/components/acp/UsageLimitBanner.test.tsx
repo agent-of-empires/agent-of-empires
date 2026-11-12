@@ -281,8 +281,8 @@ describe("UsageLimitSection", () => {
   });
 
   it("says why Switch Agent is missing when the Agent list fails", async () => {
-    // fetchAgents resolves an empty list, never rejects, when /api/agents fails.
-    vi.mocked(fetchAgents).mockResolvedValue([]);
+    // fetchAgents resolves null, never rejects, when /api/agents fails.
+    vi.mocked(fetchAgents).mockResolvedValue(null);
     mountSection();
     expect(await screen.findByText(/Couldn't list the other Agents, so Switch Agent isn't offered/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Switch Agent" })).toBeNull();

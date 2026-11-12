@@ -156,16 +156,17 @@ export function PlanModal({ plan, canDecide, submitting, offline, options, onDec
           >
             Close
           </button>
+          {/* Same order as the card: answers or Allow first, then Always, then the way out. */}
           {options ? (
             <>
-              {decide("Dismiss", "Cancelled", SECONDARY_BUTTON)}
               {options.map((o) => decide(o.name, "Allow", BRAND_BUTTON, o.option_id))}
+              {decide("Dismiss", "Cancelled", SECONDARY_BUTTON)}
             </>
           ) : (
             <>
-              {decide("Deny", "Deny", SECONDARY_BUTTON)}
-              {decide("Always", "AllowAlways", SECONDARY_BUTTON)}
               {decide("Allow", "Allow", BRAND_BUTTON)}
+              {decide("Always", "AllowAlways", SECONDARY_BUTTON)}
+              {decide("Deny", "Deny", SECONDARY_BUTTON)}
             </>
           )}
         </>

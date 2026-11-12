@@ -503,12 +503,14 @@ pub(super) async fn settle_trash(
     view: &mut HomeView,
     id: &str,
 ) {
+    let generation = view.get_instance(id).unwrap().lifecycle_generation;
     settle_row_command(
         state,
         view,
         id,
         crate::tui::session_feed::SessionRequest::Trash(crate::daemon::TrashSessionBody {
             kill_pane: true,
+            expected_generation: Some(generation),
         }),
         |view| {
             view.trash_session_by_id(id);

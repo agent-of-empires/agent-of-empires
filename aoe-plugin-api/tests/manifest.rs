@@ -35,6 +35,152 @@ fn minimal_manifest_parses_and_round_trips() {
 }
 
 #[test]
+fn agent_integrations_require_api_capability_and_unique_valid_tools() {
+    let base = r#"
+id = "acme.session-agent"
+name = "Session Agent"
+version = "0.1.0"
+api_version = {api_version}
+capabilities = {capabilities}
+[[agent_integrations]]
+tool = "session-agent"
+provider_versions = ["=1.2.3"]
+command = "session-agent --"
+replies = true
+"#;
+    let valid = base
+        .replace("{api_version}", "19")
+        .replace("{capabilities}", r#"["session.integration"]"#);
+    let parsed = PluginManifest::from_toml_str(&valid).expect("valid integration parses");
+    assert_eq!(
+        parsed.agent_integrations[0].command.as_deref(),
+        Some("session-agent --")
+    );
+    assert_eq!(parsed.agent_integrations[0].tool, "session-agent");
+    let launch_only = base
+        .replace("{api_version}", "19")
+        .replace("{capabilities}", "[]")
+        .replace("provider_versions = [\"=1.2.3\"]\n", "")
+        .replace("replies = true\n", "replies = false\n");
+    let parsed_launch_only =
+        PluginManifest::from_toml_str(&launch_only).expect("launch-only agent parses");
+    assert!(parsed_launch_only.agent_integrations[0]
+        .provider_versions
+        .is_empty());
+    for version in ["1.2.2", "1.2.4", "1.2.3-rc.1", "2.0.0", "unknown"] {
+        assert!(parsed.agent_integrations[0]
+            .provider_compat(version)
+            .is_err());
+    }
+    assert!(parsed.agent_integrations[0]
+        .provider_compat("1.2.3")
+        .is_ok());
+    for ranges in ["[]", r#"["not semver"]"#, r#"[""]"#] {
+        let invalid = valid.replace(r#"["=1.2.3"]"#, ranges);
+        assert!(matches!(
+            PluginManifest::from_toml_str(&invalid),
+            Err(ManifestError::Invalid(_))
+        ));
+    }
+
+    let cases = [
+        (
+            base.replace("{api_version}", "18")
+                .replace("{capabilities}", r#"["session.integration"]"#),
+            "require api_version >= 19",
+        ),
+        (
+            base.replace("{api_version}", "19")
+                .replace("{capabilities}", "[]"),
+            "require the session.integration capability",
+        ),
+        (
+            base.replace("{api_version}", "19")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("tool = \"session-agent\"", "tool = \"Session-Agent\""),
+            "lowercase agent id",
+        ),
+        (
+            format!("{valid}\n[[agent_integrations]]\ntool = \"session-agent\"\nprovider_versions = [\"=1.2.3\"]\n"),
+            "must not repeat tool",
+        ),
+        (
+            base.replace("{api_version}", "19")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace("tool = \"session-agent\"", "tool = \"\""),
+            "must be a nonempty lowercase agent id",
+        ),
+        (
+            launch_only.replace("replies = false", "replies = true"),
+            "require the session.integration capability",
+        ),
+        (
+            base.replace("{api_version}", "18")
+                .replace("{capabilities}", r#"["session.integration"]"#)
+                .replace(
+                    "\n[[agent_integrations]]\ntool = \"session-agent\"\nprovider_versions = [\"=1.2.3\"]\ncommand = \"session-agent --\"\nreplies = true\n",
+                    "\n",
+                ),
+            "session.integration capability requires api_version >= 19",
+        ),
+    ];
+    for (toml, expected_error) in cases {
+        let error = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains(expected_error))),
+            "expected {expected_error:?}, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_launch_commands_use_a_literal_prefix_grammar() {
+    let manifest = |command: &str| {
+        format!(
+            "id = \"acme.agent\"\nname = \"Agent\"\nversion = \"0.1.0\"\napi_version = 19\n\
+             [[agent_integrations]]\ntool = \"session-agent\"\ncommand = {command:?}\n"
+        )
+    };
+    // Only the prefix is constrained; agent arguments stay free-form.
+    for command in [
+        "session-agent",
+        "PATH=/opt/agents/bin session-agent --flag",
+        "TOKEN=local OTHER=2 session-agent --filter='a b' \"$(not run)\"",
+    ] {
+        PluginManifest::from_toml_str(&manifest(command))
+            .unwrap_or_else(|error| panic!("{command:?} should be accepted: {error}"));
+    }
+    // Shell syntax in the prefix disagrees with discovery, so it fails install.
+    for command in [
+        "PATH=$HOME/bin session-agent",
+        "PATH=\"$HOME/bin\" session-agent",
+        "PATH=${HOME}/bin session-agent",
+        "PATH=${HOME/bin session-agent",
+        "PATH=~/bin session-agent",
+        "~/bin/session-agent",
+        "PATH=/opt/agents\\\n/bin session-agent",
+        "\"session-agent",
+        "\"\" session-agent",
+        "PATH=$(printf /tmp) session-agent",
+        "PATH=`echo /tmp` session-agent",
+        "9INVALID=1 session-agent",
+        "-i session-agent",
+        // A newline ends the shell command before `env` gets an executable.
+        "TOKEN=local\nsession-agent",
+        // Separators and globs rewrite the words `env` receives.
+        "TOKEN=local; session-agent",
+        "TOKEN=local|session-agent",
+        "PATH=/opt/*/bin session-agent",
+    ] {
+        let error = PluginManifest::from_toml_str(&manifest(command)).unwrap_err();
+        assert!(
+            matches!(&error, ManifestError::Invalid(errors) if errors.iter().any(|item| item.contains("literal executable"))),
+            "{command:?} should be rejected, got {error:?}"
+        );
+    }
+}
+
+#[test]
 fn contribution_sections_parse() {
     let m = parse(
         4,

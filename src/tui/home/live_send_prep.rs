@@ -103,6 +103,12 @@ impl HomeView {
         if !lease.is_valid() || !self.session_feed.native_interaction_available() {
             return Err(());
         }
+        if self
+            .get_instance(session_id)
+            .is_none_or(|inst| inst.is_trashed())
+        {
+            return Err(());
+        }
         // An archived or trashed agent takes no input, even with a live pane
         // (#4118). The runtime refuses the prepare before this point, so the
         // check only decides which refusal the operator reads; what it reads

@@ -105,6 +105,9 @@ impl HomeView {
         self.row_tag_mode = config.session.row_tag;
         self.show_activity_age = config.session.show_activity_age;
         self.set_sidebar_position(config.session.sidebar_position);
+        self.split_terminal_height_percent = config.session.split_terminal_height_percent;
+        self.split_terminal_min_width = config.session.split_terminal_min_width;
+        self.split_terminal_min_height = config.session.split_terminal_min_height;
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.show_shortcut_bar = config.session.show_shortcut_bar;
         self.set_link_prefixes(&config.session.preview_link_prefixes);

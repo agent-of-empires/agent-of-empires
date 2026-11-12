@@ -75,7 +75,11 @@ export function mergeRegisteredProjects(
   return merged;
 }
 
-// Unpinned saved projects without a live group, one per path, for the sidebar Projects section.
+/**
+ * The registered Projects the sidebar's Projects section lists, one per path. Where the axis draws repository
+ * headers, a Project with a live group or a pin already has one, so only unpinned Projects without one are
+ * listed. Otherwise (By group) every registered Project is, since it has nowhere else to appear (#5065).
+ */
 export function unpinnedSavedProjects(
   repoGroups: RepoGroup[],
   projects: ProjectInfo[],
@@ -83,6 +87,7 @@ export function unpinnedSavedProjects(
     alias: (repoPath: string) => string | null;
     color: (repoPath: string) => RepoColor | null;
   },
+  { drawsRepoHeaders = true }: { drawsRepoHeaders?: boolean } = {},
 ): RepoGroup[] {
   // An all-sunk repo does not render above, so its saved project still surfaces here.
   const livePaths = new Set<string>();
@@ -104,8 +109,8 @@ export function unpinnedSavedProjects(
 
   const out: RepoGroup[] = [];
   for (const [key, registrations] of byKey) {
-    if (livePaths.has(key)) continue; // shown above as a live group
-    if (registrations.some((p) => p.pinned)) continue; // shown above as a pinned header
+    if (drawsRepoHeaders && livePaths.has(key)) continue; // shown above as a live group
+    if (drawsRepoHeaders && registrations.some((p) => p.pinned)) continue; // shown above as a pinned header
     const primary = registrations[0];
     if (!primary) continue;
     const defaultDisplayName = primary.path.split("/").pop() || primary.path;

@@ -389,6 +389,16 @@ pub(crate) fn lifecycle_env_vars(
     env
 }
 
+/// A hook that exited non-zero. `Display` carries its output for the TUI and
+/// logs; only `command` and `exit_code` may be shown remotely.
+#[derive(Debug, thiserror::Error)]
+#[error("{detail}")]
+pub struct HookFailed {
+    pub command: String,
+    pub exit_code: Option<i32>,
+    detail: String,
+}
+
 fn format_hook_error(
     cmd: &str,
     exit_code: Option<i32>,
@@ -443,13 +453,18 @@ fn run_hooks_captured(
             format!("Failed to execute hook: {}", cmd)
         })?;
         if !output.status.success() {
-            anyhow::bail!(format_hook_error(
-                cmd,
-                output.status.code(),
-                &String::from_utf8_lossy(&output.stderr),
-                &String::from_utf8_lossy(&output.stdout),
-                target.in_container()
-            ));
+            return Err(HookFailed {
+                command: cmd.clone(),
+                exit_code: output.status.code(),
+                detail: format_hook_error(
+                    cmd,
+                    output.status.code(),
+                    &String::from_utf8_lossy(&output.stderr),
+                    &String::from_utf8_lossy(&output.stdout),
+                    target.in_container(),
+                ),
+            }
+            .into());
         }
         tracing::debug!(target: "session.store",
             "Hook completed: {} (stdout: {} bytes, stderr: {} bytes)",
@@ -584,7 +599,12 @@ fn run_hooks_streamed(
         if let Some(progress) = progress {
             progress(HookProgress::Output(detail.clone()));
         }
-        anyhow::bail!(detail);
+        return Err(HookFailed {
+            command: cmd.clone(),
+            exit_code: status.code(),
+            detail,
+        }
+        .into());
     }
     Ok(())
 }

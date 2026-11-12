@@ -154,6 +154,100 @@ fn test_row_tag_profile_modes_in_filtered_view() {
     }
 }
 
+#[test]
+#[serial]
+fn plugin_statuses_align_before_activity_age() {
+    let (_temp, _guard) = test_home();
+    let mut first = Instance::new("short", "/tmp/a");
+    first.status = Status::Idle;
+    first.idle_entered_at = Some(chrono::Utc::now() - chrono::Duration::minutes(5));
+    let mut second = Instance::new("a longer title", "/tmp/a");
+    second.view = crate::session::View::Structured;
+    let ids = [first.id.clone(), second.id.clone()];
+    seed_profile("alpha", &[first, second]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.show_activity_age = true;
+    view.flat_items = view.build_flat_items();
+    view.plugin_ui.snapshot = serde_json::from_value(serde_json::json!({
+        "entries": [
+            {"plugin_id":"gh","slot":"row-badge","id":"a","session_id":ids[0],"payload":{"text":"LONG"}},
+            {"plugin_id":"linear","slot":"row-badge","id":"b","session_id":ids[1],"payload":{"text":"X"}}
+        ],
+        "notifications": []
+    })).unwrap();
+    let theme = crate::tui::styles::Theme::default();
+    for (id, label) in ids.iter().zip(["LONG", "X"]) {
+        let row = view
+            .flat_items
+            .iter()
+            .find(|item| matches!(item, Item::Session { id: row_id, .. } if row_id == id))
+            .unwrap();
+        let line = view.render_item_line(row, false, false, &theme, 60, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            crate::tui::components::rendered_width(&text),
+            60,
+            "{text:?}"
+        );
+        let end = text.find(label).unwrap() + label.len();
+        assert_eq!(
+            crate::tui::components::rendered_width(&text[..end]),
+            53,
+            "{text:?}"
+        );
+        if id == &ids[0] {
+            assert!(text.ends_with("5m "), "{text:?}");
+        } else {
+            assert!(text.ends_with("       "), "{text:?}");
+        }
+    }
+    view.plugin_ui.snapshot.entries[0].payload["text"] = serde_json::json!("日本語日本語");
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { id, .. } if id == &ids[0]))
+        .unwrap()
+        .clone();
+    let mut saw_truncated = false;
+    for width in 20..60 {
+        let line = view.render_item_line(&row, false, false, &theme, width, false);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        if text.contains("日…") && text.ends_with("5m ") {
+            saw_truncated = true;
+            assert_eq!(
+                crate::tui::components::rendered_width(&text),
+                width as usize,
+                "{text:?}"
+            );
+        }
+    }
+    assert!(saw_truncated, "expected a truncated wide glyph");
+
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { id, .. } if id == &ids[1]))
+        .unwrap()
+        .clone();
+    let mut saw_fallback = false;
+    for width in 20..60 {
+        view.show_activity_age = false;
+        let without = view.render_item_line(&row, false, false, &theme, width, false);
+        view.show_activity_age = true;
+        let with = view.render_item_line(&row, false, false, &theme, width, false);
+        let without: String = without.spans.iter().map(|s| s.content.as_ref()).collect();
+        let with: String = with.spans.iter().map(|s| s.content.as_ref()).collect();
+        if without.contains('X') && with.ends_with("X ") {
+            saw_fallback = true;
+        }
+    }
+    assert!(
+        saw_fallback,
+        "expected status to use the empty age slot when necessary"
+    );
+}
+
 /// `show_activity_age` hides the right-edge age column on an Idle row, and a title too
 /// long for a narrow pane is shortened with an ellipsis so the age stays.
 #[test]

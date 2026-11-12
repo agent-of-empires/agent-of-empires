@@ -63,7 +63,7 @@ const GLOBAL_ENTRIES = [
 
 async function mockApis(page: Page, sessions: MockSession[], ordering: string[], uiEntries: unknown[]) {
   await mockStaticApis(page);
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

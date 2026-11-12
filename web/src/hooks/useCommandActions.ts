@@ -68,6 +68,13 @@ interface Args {
   onGoDashboard: () => void;
   onToggleSidebar: () => void;
   onLogout: () => void;
+  /** This window is limited to the active session: switching, creation and sidebar commands are left out. */
+  focusMode: boolean;
+  /** Turns this window into a focus window on the given session. */
+  onEnterFocusMode: (sessionId: string) => void;
+  /** Opens the given session in a new focus-mode window; absent where a second window cannot open (phones). */
+  onOpenFocusWindow?: (sessionId: string) => void;
+  onExitFocusMode: () => void;
 }
 
 export function useCommandActions({
@@ -90,11 +97,45 @@ export function useCommandActions({
   onGoDashboard,
   onToggleSidebar,
   onLogout,
+  focusMode,
+  onEnterFocusMode,
+  onOpenFocusWindow,
+  onExitFocusMode,
 }: Args): CommandAction[] {
   return useMemo(() => {
     const actions: CommandAction[] = [];
 
-    if (!readOnly) {
+    if (focusMode) {
+      actions.push({
+        id: "action:exit-focus-mode",
+        title: "Show all Sessions",
+        group: "Actions",
+        keywords: ["focus", "exit", "sidebar", "sessions", "leave"],
+        perform: onExitFocusMode,
+      });
+    } else if (activeSessionId && !activeSession?.trashed_at) {
+      // A trashed session cannot show on its own, as in the Session menu (see `sessionActionTargets`).
+      actions.push({
+        id: "action:enter-focus-mode",
+        title: "Show only this Session",
+        subtitle: "current session, in this window",
+        group: "Actions",
+        keywords: ["focus", "single", "hide", "sidebar", "distraction"],
+        perform: () => onEnterFocusMode(activeSessionId),
+      });
+      if (onOpenFocusWindow) {
+        actions.push({
+          id: "action:open-focus-window",
+          title: "Open in its own window",
+          subtitle: "current session",
+          group: "Actions",
+          keywords: ["focus", "pop out", "popout", "window", "single"],
+          perform: () => onOpenFocusWindow(activeSessionId),
+        });
+      }
+    }
+
+    if (!readOnly && !focusMode) {
       actions.push({
         id: "action:new-session",
         title: "New session",
@@ -114,15 +155,17 @@ export function useCommandActions({
       });
     }
 
-    actions.push({
-      id: "action:go-dashboard",
-      title: "Go to dashboard",
-      group: "Actions",
-      keywords: ["home", "overview"],
-      perform: onGoDashboard,
-    });
+    if (!focusMode) {
+      actions.push({
+        id: "action:go-dashboard",
+        title: "Go to dashboard",
+        group: "Actions",
+        keywords: ["home", "overview"],
+        perform: onGoDashboard,
+      });
+    }
 
-    if (hasAttentionSession) {
+    if (hasAttentionSession && !focusMode) {
       actions.push({
         id: "action:jump-attention",
         title: "Go to next attention session",
@@ -173,14 +216,16 @@ export function useCommandActions({
       }
     }
 
-    actions.push({
-      id: "action:toggle-sidebar",
-      title: "Toggle sidebar",
-      group: "Actions",
-      keywords: ["hide", "show", "nav"],
-      shortcut: IS_MAC ? "⌘B" : "Ctrl+B",
-      perform: onToggleSidebar,
-    });
+    if (!focusMode) {
+      actions.push({
+        id: "action:toggle-sidebar",
+        title: "Toggle sidebar",
+        group: "Actions",
+        keywords: ["hide", "show", "nav"],
+        shortcut: IS_MAC ? "⌘B" : "Ctrl+B",
+        perform: onToggleSidebar,
+      });
+    }
 
     actions.push({
       id: "action:help",
@@ -209,7 +254,7 @@ export function useCommandActions({
       });
     }
 
-    for (const s of sessions) {
+    for (const s of focusMode ? [] : sessions) {
       if (s.id === activeSessionId) continue;
       const repo = (s.main_repo_path || s.project_path).split("/").filter(Boolean).pop() ?? "";
       const subtitleParts = [repo, s.branch, s.tool].filter(Boolean) as string[];
@@ -255,5 +300,9 @@ export function useCommandActions({
     onGoDashboard,
     onToggleSidebar,
     onLogout,
+    focusMode,
+    onEnterFocusMode,
+    onOpenFocusWindow,
+    onExitFocusMode,
   ]);
 }

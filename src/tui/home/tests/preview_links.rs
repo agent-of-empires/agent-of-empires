@@ -39,6 +39,26 @@ fn stage(env: &mut TestEnv, lines: &[&str], links: Vec<PaneLink>) {
 
 #[test]
 #[serial]
+fn trash_reader_never_opens_links_from_previous_pane() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.select_session_by_id(&id);
+    stage(
+        &mut env,
+        &["old link"],
+        vec![link("old link", "https://example.com/old")],
+    );
+    assert_eq!(
+        env.view.preview_link_at(PANE.x, PANE.y),
+        Some("https://example.com/old".into())
+    );
+    env.view
+        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    assert_eq!(env.view.preview_link_at(PANE.x, PANE.y), None);
+}
+
+#[test]
+#[serial]
 fn click_on_a_link_whose_text_hides_the_target_resolves_it() {
     let mut env = create_test_env_empty();
     stage(

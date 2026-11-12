@@ -18,7 +18,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-use crate::plugin::ui_state::{Notification, SortValue, Tone, UiEntry, UiSnapshot};
+use crate::plugin::ui_state::{
+    BadgePresentation, Notification, SortValue, Tone, UiEntry, UiSnapshot,
+};
 use crate::tui::styles::Theme;
 
 /// Global entries for `slot`: those a plugin pushed without a `session_id`.
@@ -163,7 +165,7 @@ pub fn compare_sort_values(
 pub fn session_row_statuses<'a>(
     snapshot: &'a UiSnapshot,
     session_id: &'a str,
-) -> impl Iterator<Item = (&'a str, Option<Tone>)> {
+) -> impl Iterator<Item = (&'a str, &'a str, Option<Tone>, BadgePresentation)> + Clone {
     snapshot
         .entries
         .iter()
@@ -177,7 +179,7 @@ pub fn session_row_statuses<'a>(
                 items
                     .into_iter()
                     .flat_map(|items| items.iter())
-                    .filter_map(|item| {
+                    .filter_map(move |item| {
                         let text = item
                             .get("text")
                             .or_else(|| item.get("tooltip"))
@@ -187,22 +189,42 @@ pub fn session_row_statuses<'a>(
                         let tone = item
                             .get("tone")
                             .and_then(|value| serde_json::from_value(value.clone()).ok());
-                        Some((text, tone))
+                        let presentation = row_badge_presentation(item, item.get("text").is_some());
+                        Some((entry.plugin_id.as_str(), text, tone, presentation))
                     });
             let fallback = std::iter::once(entry)
                 .filter(move |_| items.is_none())
                 .filter_map(|entry| {
-                    let text = entry_text(entry).or_else(|| {
+                    let label = entry_text(entry);
+                    let text = label.or_else(|| {
                         (entry.slot == UiSlot::RowBadge)
                             .then(|| entry.payload.get("tooltip").and_then(Value::as_str))
                             .flatten()
                             .map(str::trim)
                             .filter(|text| !text.is_empty())
                     })?;
-                    Some((text, entry_tone(entry)))
+                    let presentation = if entry.slot == UiSlot::RowBadge {
+                        row_badge_presentation(&entry.payload, label.is_some())
+                    } else {
+                        BadgePresentation::Text
+                    };
+                    Some((
+                        entry.plugin_id.as_str(),
+                        text,
+                        entry_tone(entry),
+                        presentation,
+                    ))
                 });
             item_statuses.chain(fallback)
         })
+}
+
+fn row_badge_presentation(payload: &Value, uses_text: bool) -> BadgePresentation {
+    if uses_text && payload.get("presentation").and_then(Value::as_str) == Some("glyph") {
+        BadgePresentation::Glyph
+    } else {
+        BadgePresentation::Text
+    }
 }
 
 /// Map a tone to a foreground style against the active theme. `None` renders
@@ -922,7 +944,9 @@ mod tests {
     fn session_row_statuses_selects_badges_and_columns_for_exact_session() {
         let snap = snapshot(
             json!([
-                {"plugin_id":"gh","slot":"row-badge","id":"pr","session_id":"s1","payload":{"items":[{"text":"#42","tone":"success"},{"icon":"check","tooltip":"CI failed","tone":"danger"},{"icon":"check"}]}},
+                {"plugin_id":"gh","slot":"row-badge","id":"pr","session_id":"s1","payload":{"items":[{"text":"#42","icon":"git","tone":"success"},{"text":"✓","icon":"check","presentation":"glyph"},{"icon":"check","tooltip":"CI failed","presentation":"glyph","tone":"danger"},{"icon":"check"}]}},
+                {"plugin_id":"gh","slot":"row-badge","id":"top","session_id":"s1","payload":{"text":"◐","presentation":"glyph"}},
+                {"plugin_id":"gh","slot":"row-badge","id":"fallback","session_id":"s1","payload":{"tooltip":"fallback","presentation":"glyph"}},
                 {"plugin_id":"linear","slot":"row-column","id":"issue","session_id":"s1","payload":{"text":"In Progress","tone":"info"}},
                 {"plugin_id":"gh","slot":"row-badge","id":"pr","session_id":"s2","payload":{"text":"other"}},
                 {"plugin_id":"gh","slot":"row-badge","id":"global","payload":{"text":"global"}}
@@ -933,9 +957,22 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("#42", Some(Tone::Success)),
-                ("CI failed", Some(Tone::Danger)),
-                ("In Progress", Some(Tone::Info)),
+                ("gh", "#42", Some(Tone::Success), BadgePresentation::Text),
+                ("gh", "✓", None, BadgePresentation::Glyph),
+                (
+                    "gh",
+                    "CI failed",
+                    Some(Tone::Danger),
+                    BadgePresentation::Text
+                ),
+                ("gh", "◐", None, BadgePresentation::Glyph),
+                ("gh", "fallback", None, BadgePresentation::Text),
+                (
+                    "linear",
+                    "In Progress",
+                    Some(Tone::Info),
+                    BadgePresentation::Text
+                ),
             ]
         );
     }

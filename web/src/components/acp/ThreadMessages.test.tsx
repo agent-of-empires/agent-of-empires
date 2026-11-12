@@ -55,6 +55,62 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("AssistantMessage nonterminal native tool output", () => {
+  it("renders streamed output after a correlated local failure without inventing a terminal", async () => {
+    const at = "2026-05-12T00:00:00Z";
+    const rows: ActivityRow[] = [
+      { id: "prompt", kind: "user_prompt", text: "run", at },
+      {
+        id: "start-native-tool",
+        kind: "tool_start",
+        text: "Bash",
+        at,
+        toolCallId: "native-tool",
+        tool: {
+          id: "native-tool",
+          name: "Bash",
+          kind: "execute",
+          args_preview: JSON.stringify({ command: "printf streaming" }),
+          started_at: at,
+        },
+        output: [{ kind: "text", text: "partial native output" }],
+      },
+    ];
+    const messages = activityToThreadMessages(rows, false);
+    const parts = messages.flatMap((message) => (typeof message.content === "string" ? [] : message.content));
+    const tool = parts.find((part) => part.type === "tool-call");
+    expect(tool).toBeDefined();
+    expect(tool && "result" in tool ? tool.result : undefined).toBeUndefined();
+    const { container, rerender } = render(<Harness messages={messages} />);
+    fireEvent.click(screen.getByRole("button", { name: /printf streaming/ }));
+    expect(screen.getByText("partial native output")).toBeTruthy();
+    expect(container.textContent).toContain("running");
+    expect(screen.queryByText("done")).toBeNull();
+    expect(screen.queryByText("stopped")).toBeNull();
+    expect(screen.queryByText("failed")).toBeNull();
+    rerender(
+      <Harness
+        messages={activityToThreadMessages(
+          [
+            ...rows,
+            {
+              id: "done-native-tool",
+              kind: "tool_complete",
+              text: "native final output",
+              at,
+              toolCallId: "native-tool",
+            },
+          ],
+          false,
+        )}
+      />,
+    );
+    await waitFor(() => expect(container.textContent).toContain("native final output"));
+    expect(screen.queryByText("partial native output")).toBeNull();
+    expect(screen.getByText("done")).toBeTruthy();
+  });
+});
+
 describe("UserMessage image part", () => {
   it("renders an attachment through authenticated fetch, never as a bare <img src>", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, blob: async () => new Blob(["x"]) }));
@@ -199,6 +255,44 @@ describe("AssistantMessage compaction summary", () => {
     expect(details!.open).toBe(false);
     expect(details!.querySelector("summary")?.textContent).toContain("Compaction summary");
     expect(details!.textContent).toContain("PINEAPPLE-42");
+  });
+});
+
+describe("AssistantMessage thinking", () => {
+  it("renders summarized thinking collapsed ahead of the reply", () => {
+    const rows: ActivityRow[] = [
+      { id: "thought-1", kind: "thinking", text: "Weighing PINEAPPLE-7", at: "2026-10-06T00:00:00Z" },
+      { id: "msg-2", kind: "message", text: "Done.", at: "2026-10-06T00:00:00Z" },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    const details = container.querySelector("details");
+    expect(details).not.toBeNull();
+    expect(details!.open).toBe(false);
+    expect(details!.querySelector("summary")?.textContent).toBe("Thinking");
+    expect(details!.textContent).toContain("PINEAPPLE-7");
+    const reply = screen.getByText("Done.");
+    expect(details!.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("renders each thought start as its own collapsed block", () => {
+    const rows: ActivityRow[] = [
+      { id: "thought-1", kind: "thinking", text: "Weighing PINEAPPLE-7", at: "2026-10-06T00:00:00Z" },
+      {
+        id: "thought-2",
+        kind: "thinking",
+        text: "Checking PINEAPPLE-8",
+        at: "2026-10-06T00:00:00Z",
+        messageStart: true,
+      },
+      { id: "msg-3", kind: "message", text: "Done.", at: "2026-10-06T00:00:00Z" },
+    ];
+    const { container } = render(<Harness messages={activityToThreadMessages(rows, false)} />);
+    const blocks = container.querySelectorAll("details");
+    expect(blocks).toHaveLength(2);
+    expect(blocks[0].open).toBe(false);
+    expect(blocks[1].open).toBe(false);
+    expect(blocks[0].textContent).toContain("PINEAPPLE-7");
+    expect(blocks[1].textContent).toContain("PINEAPPLE-8");
   });
 });
 

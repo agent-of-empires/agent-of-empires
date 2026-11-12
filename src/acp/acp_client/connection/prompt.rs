@@ -3,7 +3,7 @@
 //! mid-turn steering.
 
 use crate::acp::state::{AcpConnectionSource, Event, RateLimitInfo};
-use agent_client_protocol::schema::v1::{PromptRequest, PromptResponse, StopReason};
+use agent_client_protocol::v1::schema::{PromptRequest, PromptResponse, StopReason};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -236,7 +236,7 @@ impl Session {
                 }
             }
         }
-
+    
         let admission =
             current_effect_wait(scope.as_ref(), native, &shared.connection_state, || {
                 let _admission = shared
@@ -253,6 +253,7 @@ impl Session {
                     control.supersede_adopted_turn();
                 }
                 shared.reset_message_dedup();
+                shared.seed_user_replay.store(false, Ordering::Relaxed);
                 if shared
                     .suppress_history_replay
                     .swap(false, Ordering::Relaxed)
@@ -968,6 +969,19 @@ impl Session {
         let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
+            // The turn finished but the PromptResponse never came: end cleanly
+            // as prompt_complete with no flag set (#2237).
+            info!(
+                target: "acp.protocol",
+                session = %self.shared.session_label,
+                grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
+                "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
+            );
+            // The runner may still be running the turn; without this the next
+            // local prompt hits the stale waiter and kills the connection.
+            if let Some(control) = self.control.as_ref() {
+                control.release_local_prompt();
+            }
             return Flow::Break;
         }
         if !fire {

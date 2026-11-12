@@ -660,8 +660,20 @@ impl PluginHost {
             .iter()
             .map(|u| (u.slot, u.id.clone()))
             .collect();
+        let deep_link_pages: HashSet<String> = plugin
+            .manifest
+            .ui
+            .iter()
+            .filter(|u| u.slot == UiSlot::Page && u.deep_link)
+            .map(|u| u.id.clone())
+            .collect();
 
-        let launch = resolve_launch(plugin, &OsLaunchResolver)?;
+        let node_env = if crate::plugin::needs_node(&plugin.manifest) {
+            tokio::task::spawn_blocking(crate::plugin::node_env).await?
+        } else {
+            crate::plugin::NodeEnv::new()
+        };
+        let launch = resolve_launch(plugin, &OsLaunchResolver::new(node_env.clone()))?;
         let prepared = self.sandbox.prepare(&launch)?;
 
         let worker_id = uuid::Uuid::new_v4().to_string();
@@ -680,6 +692,7 @@ impl PluginHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log))
             .kill_on_drop(true);
+        cmd.envs(node_env);
         for (k, v) in &prepared.env {
             cmd.env(k, v);
         }
@@ -787,6 +800,7 @@ impl PluginHost {
             plugin_id: plugin_id.to_string(),
             granted_capabilities: granted,
             ui_contributions,
+            deep_link_pages,
             ui_generation,
         });
         serve_connection(
@@ -930,50 +944,54 @@ async fn serve_connection(
             }
         };
 
-        let invocation_api = api.clone();
         let invocation_ctx = ctx.clone();
-        let invocation_deps = session_rpc.cloned();
         let params = request.params;
         let method_log = method.clone();
-        let outcome = work
-            .run("plugin.rpc", async move {
-                if crate::plugin::session_api::handles(&method) {
-                    match invocation_deps {
-                        Some(deps) => {
-                            crate::plugin::session_api::dispatch(
-                                &deps,
-                                &invocation_ctx,
-                                &method,
-                                &params,
-                            )
-                            .await
-                        }
-                        None => {
-                            let unavailable = crate::plugin::host_api::DispatchError::with_kind(
-                                codes::SERVICE_UNAVAILABLE,
-                                "service_unavailable",
-                                "session service is not available in this host",
-                            );
-                            match crate::plugin::session_api::required_capability(&method) {
-                                Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
-                                None => Err(unavailable),
-                            }
+        let outcome = if crate::plugin::session_api::handles(&method) {
+            let invocation_deps = session_rpc.cloned();
+            // Bound the heavy session future before supervised spawning, not at
+            // Tokio's final spawn after its concrete value crossed each wrapper.
+            let invocation = Box::pin(async move {
+                match invocation_deps {
+                    Some(deps) => {
+                        crate::plugin::session_api::dispatch(
+                            &deps,
+                            &invocation_ctx,
+                            &method,
+                            &params,
+                        )
+                        .await
+                    }
+                    None => {
+                        let unavailable = crate::plugin::host_api::DispatchError::with_kind(
+                            codes::SERVICE_UNAVAILABLE,
+                            "service_unavailable",
+                            "session service is not available in this host",
+                        );
+                        match crate::plugin::session_api::required_capability(&method) {
+                            Some(cap) => invocation_ctx.require(cap).and(Err(unavailable)),
+                            None => Err(unavailable),
                         }
                     }
-                } else {
-                    tokio::task::spawn_blocking(move || {
-                        dispatch(&invocation_api, &invocation_ctx, &method, &params)
-                    })
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(target: "plugin.host", %error, "host dispatch task failed");
-                        Err(crate::plugin::host_api::DispatchError::internal(
-                            "host dispatch task failed",
-                        ))
-                    })
                 }
+            });
+            work.run("plugin.rpc", invocation).await
+        } else {
+            let invocation_api = api.clone();
+            work.run("plugin.rpc", async move {
+                tokio::task::spawn_blocking(move || {
+                    dispatch(&invocation_api, &invocation_ctx, &method, &params)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(target: "plugin.host", %error, "host dispatch task failed");
+                    Err(crate::plugin::host_api::DispatchError::internal(
+                        "host dispatch task failed",
+                    ))
+                })
             })
-            .await;
+            .await
+        };
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(crate::server::runtime::RuntimeWorkError::ShuttingDown) => {
@@ -1443,6 +1461,7 @@ mod tests {
             plugin_id: "acme.worker".to_string(),
             granted_capabilities: vec!["runtime.worker".to_string()],
             ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         });
 
@@ -1513,6 +1532,7 @@ process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:1,method:"session.meta.set
             plugin_id: "acme.worker".into(),
             granted_capabilities: vec!["runtime.worker".into()],
             ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 0,
         });
 

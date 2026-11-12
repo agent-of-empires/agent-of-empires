@@ -20,9 +20,10 @@ fn event_commands(event: &ResolvedHookEvent, target: HookInstallTarget) -> Vec<S
     let identity = event
         .identity_field
         .map(|field| hook_command_session_id(target, field, event.publisher));
-    let status = event
-        .status
-        .map(|status| status_command_for_event(status, &event.waiting_tools, target));
+    let status = event.status.map(|status| {
+        let bound = event.publisher == Some("claude");
+        status_command_for_event(status, &event.waiting_tools, target, bound)
+    });
     identity.into_iter().chain(status).collect()
 }
 

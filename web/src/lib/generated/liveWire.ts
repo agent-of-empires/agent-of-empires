@@ -26,6 +26,8 @@ mouse: boolean,
  */
 mouseSgr: boolean, pane0: LivePane0 | null, };
 
+export type LiveTransportReason = "pipe_owned";
+
 export type LiveServerMessage = { "type": "frame", seq: number, content: string, 
 /**
  * Rows of live screen at the end of `content`; the rest is history.
@@ -66,6 +68,6 @@ mouse: boolean,
 /**
  * SGR (1006) mouse encoding rather than legacy X10.
  */
-mouseSgr: boolean, pane0: LivePane0 | null, } | { "type": "size_owner", is_owner: boolean, } | { "type": "clipboard", text: string, } | { "type": "transport", grid: boolean, };
+mouseSgr: boolean, pane0: LivePane0 | null, } | { "type": "size_owner", is_owner: boolean, } | { "type": "clipboard", text: string, } | { "type": "transport", grid: boolean, reason?: LiveTransportReason, };
 
 export type LiveClientMessage = { "type": "resize", cols: number, rows: number, } | { "type": "window", lines: number, } | { "type": "cadence", fast: boolean, } | { "type": "claim_if_vacant" } | { "type": "claim" } | { "type": "caps", deflate: boolean, patch: boolean, } | { "type": "resync" } | { "type": "paste", text: string, submit: boolean, };

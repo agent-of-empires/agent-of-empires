@@ -25,7 +25,7 @@ interface MockProject {
 
 async function mockApis(page: Page, sessions: MockSession[], projects: MockProject[]) {
   await page.route("**/api/login/status*", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

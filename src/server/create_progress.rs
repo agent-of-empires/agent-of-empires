@@ -54,6 +54,14 @@ struct State {
     output: VecDeque<String>,
 }
 
+/// Unregistered, for a create without an idempotency key: nothing polls it,
+/// but its failure still reports the stage.
+impl Default for CreateProgress {
+    fn default() -> Self {
+        Self::new(CreateProgressVisibility::UnixOwnerOnly)
+    }
+}
+
 impl CreateProgress {
     fn new(visibility: CreateProgressVisibility) -> Self {
         Self {
@@ -88,6 +96,11 @@ impl CreateProgress {
         }
     }
 
+    /// The stage alone, which a failure may report whoever made the request.
+    pub fn stage(&self) -> CreateStage {
+        self.state.lock().expect("create progress poisoned").stage
+    }
+
     fn snapshot(&self) -> CreateProgressSnapshot {
         let state = self.state.lock().expect("create progress poisoned");
         CreateProgressSnapshot {
@@ -99,12 +112,50 @@ impl CreateProgress {
 }
 
 /// A failed create's response. A retry whose first response was lost gets it
-/// back instead of running the create, and its hooks, again.
+/// back, with the original `stage` and `reference`, instead of running the
+/// create, and its hooks, again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateFailure {
     pub status: axum::http::StatusCode,
     pub code: &'static str,
     pub message: String,
+    pub stage: CreateStage,
+    /// The `X-Request-Id` of the attempt that failed, as logged with it.
+    pub reference: String,
+}
+
+impl CreateFailure {
+    /// The one place a failure message is capped.
+    pub fn new(
+        status: axum::http::StatusCode,
+        code: &'static str,
+        message: &str,
+        stage: CreateStage,
+        reference: &str,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.chars().take(MAX_FAILURE_MESSAGE_CHARS).collect(),
+            stage,
+            reference: reference.to_owned(),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for CreateFailure {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            axum::Json(serde_json::json!({
+                "error": self.code,
+                "message": self.message,
+                "stage": self.stage,
+                "reference": self.reference,
+            })),
+        )
+            .into_response()
+    }
 }
 
 pub struct CreateProgressRegistry {
@@ -188,12 +239,7 @@ impl CreateProgressRegistry {
 
     /// Record before the create releases its idempotency lock, so a waiting retry sees it.
     /// The cap is soft: creates admitted by `has_failure_capacity` still record.
-    pub fn record_failure(&self, key: &str, mut failure: CreateFailure) {
-        failure.message = failure
-            .message
-            .chars()
-            .take(MAX_FAILURE_MESSAGE_CHARS)
-            .collect();
+    pub fn record_failure(&self, key: &str, failure: CreateFailure) {
         let mut failures = self.failures.lock().expect("create failures poisoned");
         if failures.len() >= MAX_FAILURES {
             failures.retain(|_, (at, _)| at.elapsed() < FAILURE_TTL);
@@ -231,6 +277,8 @@ mod tests {
             status: axum::http::StatusCode::BAD_REQUEST,
             code: "create_failed",
             message: format!("failure {n}"),
+            stage: CreateStage::Preparing,
+            reference: format!("ref-{n}"),
         };
         for n in 0..MAX_FAILURES {
             assert!(registry.has_failure_capacity());
@@ -242,17 +290,14 @@ mod tests {
         assert_eq!(registry.recent_failure("k0"), Some(failure(0)));
         assert_eq!(registry.recent_failure("late"), Some(failure(MAX_FAILURES)));
 
-        registry.record_failure(
-            "long",
-            CreateFailure {
-                message: "x".repeat(5000),
-                ..failure(0)
-            },
+        let long = CreateFailure::new(
+            axum::http::StatusCode::BAD_REQUEST,
+            "create_failed",
+            &"x".repeat(5000),
+            CreateStage::Preparing,
+            "ref",
         );
-        assert_eq!(
-            registry.recent_failure("long").unwrap().message.len(),
-            MAX_FAILURE_MESSAGE_CHARS
-        );
+        assert_eq!(long.message.len(), MAX_FAILURE_MESSAGE_CHARS);
     }
 
     #[test]

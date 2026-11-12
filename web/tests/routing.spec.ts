@@ -63,7 +63,7 @@ test.describe("URL routing", () => {
       releaseSessions = resolve;
     });
     let requested = false;
-    await page.route("**/api/sessions", async (route) => {
+    await page.route(/\/api\/sessions(\?.*)?$/, async (route) => {
       if (route.request().method() === "POST") return route.fulfill({ status: 400 });
       requested = true;
       await sessionsPending;
@@ -88,7 +88,7 @@ test.describe("URL routing", () => {
 
   test("refresh on /session/<id> for a known session keeps the user on that session", async ({ page }) => {
     // The known session must resolve to its terminal on both navigations.
-    await page.route("**/api/sessions", (r) => {
+    await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
         headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },
@@ -119,7 +119,7 @@ test.describe("URL routing", () => {
 const LAST_SESSION_KEY = "aoe-last-session-id";
 
 async function stubSessions(page: import("@playwright/test").Page, ids: string[]) {
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
       headers: { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" },

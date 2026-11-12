@@ -79,8 +79,16 @@ export function evictOldestPersistedAcpState(currentKey: string): boolean {
 function toPersistedState(state: AcpState): AcpState {
   state = revokeNativeAuthority(state);
   const base: AcpState =
-    state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0 || state.interactionError
-      ? { ...state, optimisticRows: [], inflightPromptIds: [], interactionError: null }
+    state.optimisticRows.length > 0 ||
+    state.inflightPromptIds.length > 0 ||
+    state.restartInFlight ||
+    state.restartStoppedSent ||
+    state.restartFailure !== null ||
+    state.interactionError
+      ? {
+          ...state,
+          optimisticRows: [],
+          inflightPromptIds: [], interactionError: null, restartInFlight: false, restartStoppedSent: false, restartFailure: null, }
       : state;
   if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return { ...base, queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length) };

@@ -184,18 +184,18 @@ export async function sessionIdByTitle(baseUrl: string, title: string): Promise<
 }
 
 type SpawnServe = (opts?: ServeOptions) => Promise<ServeHandle>;
-type AcpSessionOptions = ServeOptions & { title: string; tool?: string };
+type AcpSessionOptions = Omit<ServeOptions, "seedFn"> & { title: string; tool?: string };
 
-/** Seed an unstarted structured session with a genuine first-creation selection. */
+/** Create after daemon startup so seeding cannot interrupt Original establishment. */
 export async function seedAcpSession(
   spawnServe: SpawnServe,
   { title, tool, ...opts }: AcpSessionOptions,
 ): Promise<{ serve: ServeHandle; sessionId: string }> {
   const serve = await spawnServe({
     acp: true,
-    seedFn: seedSessionViaAoeAdd({ title, tool, structuredView: true }),
     ...opts,
   });
+  seedSessionViaAoeAdd({ title, tool, structuredView: true })(serve);
   return { serve, sessionId: await sessionIdByTitle(serve.baseUrl, title) };
 }
 
@@ -261,6 +261,7 @@ export async function openStructuredView(
   const box = composer(page);
   if (prompt !== undefined) {
     await box.fill(prompt);
+    await expect(page.getByTestId("composer-actions").getByRole("button").last()).toBeEnabled();
     await page.getByRole("button", { name: "Send message", exact: true }).click();
   }
   return box;

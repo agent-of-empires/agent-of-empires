@@ -1,108 +1,39 @@
 //! Native endpoint discovery: explicit remote URL, otherwise the local Unix API.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use thiserror::Error;
 
 use crate::cli::serve::daemon_pid;
-use crate::daemon::{DaemonClient, DaemonClientError};
+use crate::daemon::{DaemonEndpoint, Source};
 
-#[derive(Clone)]
-pub struct DaemonEndpoint {
-    /// Browser-reachable dashboard origin used for plugin-relative links.
-    ///
-    /// This is deliberately independent from the API transport below: a
-    /// core-only daemon has no TCP listener, and a remote daemon's API may be
-    /// reached through a different origin than its dashboard.
-    dashboard_url: Option<String>,
-    pub base_url: String,
-    token: Option<String>,
-    pub source: Source,
-    unix_path: Option<PathBuf>,
+/// Resolve the local dashboard origin without coupling the transport value to disk.
+pub(crate) fn local_unix_endpoint(path: PathBuf) -> DaemonEndpoint {
+    let dashboard_url = crate::cli::serve::read_serve_urls()
+        .into_iter()
+        .next()
+        .map(|entry| entry.url);
+    DaemonEndpoint::local_unix(path, dashboard_url)
 }
 
-impl std::fmt::Debug for DaemonEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonEndpoint")
-            .field("source", &self.source)
-            .field("authenticated", &self.has_token())
-            .finish_non_exhaustive()
+/// Explicit TCP credentials require HTTPS or a direct loopback transport.
+pub(crate) fn resolved_passphrase(endpoint: &DaemonEndpoint) -> Option<String> {
+    if endpoint.unix_path().is_some() || !transport_is_safe_for_passphrase(&endpoint.base_url) {
+        return None;
     }
+    env_passphrase_override()
 }
 
-impl DaemonEndpoint {
-    /// Endpoint for a daemon reachable over its local unix socket. The peer
-    /// owner authorizes it, so it carries no bearer token.
-    pub fn local_unix(path: PathBuf) -> Self {
-        Self {
-            // Legacy ACP HTTP helpers still use this field. Daemon RPCs use
-            // `unix_path`; browser links use `dashboard_url` instead.
-            base_url: "http://localhost".to_owned(),
-            dashboard_url: crate::cli::serve::read_serve_urls()
-                .into_iter()
-                .next()
-                .map(|entry| entry.url),
-            token: None,
-            source: Source::LocalDaemon,
-            unix_path: Some(path),
-        }
-    }
-
-    pub(crate) fn unix_path(&self) -> Option<&Path> {
-        self.unix_path.as_deref()
-    }
-
-    pub(crate) fn new(base_url: String, token: Option<String>, source: Source) -> Self {
-        Self {
-            base_url,
-            dashboard_url: None,
-            token,
-            source,
-            unix_path: None,
-        }
-    }
-
-    pub fn daemon_client(&self) -> Result<DaemonClient, DaemonClientError> {
-        if let Some(path) = &self.unix_path {
-            DaemonClient::new_unix(path)
-        } else {
-            DaemonClient::new(&self.base_url, self.bearer_token())
-        }
-    }
-
-    pub(crate) fn bearer_token(&self) -> Option<&str> {
-        self.token.as_deref()
-    }
-
-    pub(crate) fn has_token(&self) -> bool {
-        self.token.is_some()
-    }
-
-    /// The browser origin for dashboard navigation, when this daemon exposes
-    /// one. API transport and dashboard reachability are separate contracts.
-    pub fn dashboard_url(&self) -> Option<&str> {
-        self.dashboard_url.as_deref()
-    }
-
-    /// Explicit TCP credentials require HTTPS or a direct loopback transport.
-    pub(crate) fn resolved_passphrase(&self) -> Option<String> {
-        if self.unix_path.is_some() || !transport_is_safe_for_passphrase(&self.base_url) {
-            return None;
-        }
-        env_passphrase_override()
-    }
-
-    /// Cache CLI login credentials separately for each explicit TCP endpoint.
-    pub(crate) fn session_cache_dir(&self) -> Option<PathBuf> {
-        self.resolved_passphrase()?;
-        let app_dir = crate::session::get_app_dir().ok()?;
-        Some(
-            app_dir
-                .join("remote-passphrase-sessions")
-                .join(remote_cache_key(&self.base_url)),
-        )
-    }
+/// Cache CLI login credentials separately for each explicit TCP endpoint.
+pub(crate) fn session_cache_dir(endpoint: &DaemonEndpoint) -> Option<PathBuf> {
+    resolved_passphrase(endpoint)?;
+    let app_dir = crate::session::get_app_dir().ok()?;
+    Some(
+        app_dir
+            .join("remote-passphrase-sessions")
+            .join(remote_cache_key(&endpoint.base_url)),
+    )
 }
 
 /// Filesystem-safe cache key for a remote endpoint's base URL. A character
@@ -121,18 +52,9 @@ fn env_passphrase_override() -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// A passphrase may only travel to an endpoint that can't be read in
-/// transit: `https://`, or loopback (never leaves the host). Anything
-/// else — a plaintext `http://` URL to a non-loopback host — would hand
-/// the shared secret to an on-path attacker.
+/// Passphrases require HTTPS or loopback to avoid exposing them in transit.
 fn transport_is_safe_for_passphrase(base_url: &str) -> bool {
     base_url.starts_with("https://") || is_loopback(base_url)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Source {
-    Env,
-    LocalDaemon,
 }
 
 #[derive(Debug, Error)]
@@ -168,6 +90,10 @@ pub fn discover_env() -> Option<DaemonEndpoint> {
         .ok()
         .map(|token| token.trim().to_owned())
         .filter(|token| !token.is_empty());
+    let dashboard_url = env::var("AOE_DASHBOARD_URL")
+        .ok()
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty());
     Some(
         // A `?token=` in the URL is stripped: the credential belongs in
         // AOE_DAEMON_TOKEN, and a query would make the base URL unusable as
@@ -177,17 +103,8 @@ pub fn discover_env() -> Option<DaemonEndpoint> {
             token,
             Source::Env,
         )
-        .with_dashboard_url(env::var("AOE_DASHBOARD_URL").ok()),
+        .with_dashboard_url(dashboard_url),
     )
-}
-
-impl DaemonEndpoint {
-    fn with_dashboard_url(mut self, url: Option<String>) -> Self {
-        self.dashboard_url = url
-            .map(|url| url.trim().trim_end_matches('/').to_owned())
-            .filter(|url| !url.is_empty());
-        self
-    }
 }
 
 pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
@@ -196,7 +113,7 @@ pub fn discover_local() -> Result<DaemonEndpoint, DiscoveryError> {
     }
     let path =
         crate::daemon::transport::local_socket_path().map_err(|_| DiscoveryError::LocalPath)?;
-    Ok(DaemonEndpoint::local_unix(path))
+    Ok(local_unix_endpoint(path))
 }
 
 fn is_loopback(url: &str) -> bool {
@@ -215,16 +132,14 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// The dashboard origin is resolved from the running web daemon's own
-    /// published URL, not from the Unix-socket transport placeholder, so a
-    /// relative plugin link lands on the port the dashboard actually serves.
+    /// Local dashboard links use the published origin, not the API placeholder.
     #[test]
     #[serial]
     fn local_daemon_separates_transport_from_the_dashboard_origin() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(temp.path());
 
-        let core_only = DaemonEndpoint::local_unix(PathBuf::from("/tmp/aoe.sock"));
+        let core_only = local_unix_endpoint(PathBuf::from("/tmp/aoe.sock"));
         assert!(
             core_only.dashboard_url().is_none(),
             "a core-only daemon serves no dashboard to navigate to"
@@ -236,7 +151,7 @@ mod tests {
             "http://127.0.0.1:7777/?token=secret\nlocalhost\thttp://127.0.0.1:7777/\n",
         )
         .expect("publish the web daemon URL");
-        let web = DaemonEndpoint::local_unix(PathBuf::from("/tmp/aoe.sock"));
+        let web = local_unix_endpoint(PathBuf::from("/tmp/aoe.sock"));
         assert_eq!(
             web.dashboard_url(),
             Some("http://127.0.0.1:7777/?token=secret")
@@ -283,7 +198,7 @@ mod tests {
         ] {
             let endpoint = DaemonEndpoint::new(url.into(), None, Source::Env);
             assert_eq!(
-                endpoint.resolved_passphrase().as_deref(),
+                resolved_passphrase(&endpoint).as_deref(),
                 allowed.then_some("from-env"),
                 "{url}"
             );
@@ -291,15 +206,15 @@ mod tests {
         let app = crate::session::get_app_dir().unwrap();
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(app.join("serve.passphrase"), "from-file").unwrap();
-        let unix = DaemonEndpoint::local_unix(app.join("daemon.sock"));
-        assert_eq!(unix.resolved_passphrase(), None);
-        assert_eq!(unix.session_cache_dir(), None);
+        let unix = local_unix_endpoint(app.join("daemon.sock"));
+        assert_eq!(resolved_passphrase(&unix), None);
+        assert_eq!(session_cache_dir(&unix), None);
         drop(env);
         let _env = crate::session::test_support::EnvGuard::unset(&["AOE_DAEMON_PASSPHRASE"]);
         for source in [Source::LocalDaemon, Source::Env] {
             let endpoint = DaemonEndpoint::new("http://127.0.0.1:8080".into(), None, source);
-            assert_eq!(endpoint.resolved_passphrase(), None);
-            assert_eq!(endpoint.session_cache_dir(), None);
+            assert_eq!(resolved_passphrase(&endpoint), None);
+            assert_eq!(session_cache_dir(&endpoint), None);
         }
     }
 
@@ -316,8 +231,7 @@ mod tests {
             ),
         ]);
         let endpoint = DaemonEndpoint::new("https://remote.example.com".into(), None, Source::Env);
-        let dir = endpoint
-            .session_cache_dir()
+        let dir = session_cache_dir(&endpoint)
             .expect("a remote endpoint with a usable passphrase should cache");
         assert!(dir.starts_with(crate::session::get_app_dir().unwrap()));
         assert_eq!(
@@ -327,6 +241,6 @@ mod tests {
 
         // A different URL must not collide with the first one's cache.
         let other = DaemonEndpoint::new("https://other.example.com".into(), None, Source::Env);
-        assert_ne!(other.session_cache_dir(), endpoint.session_cache_dir());
+        assert_ne!(session_cache_dir(&other), session_cache_dir(&endpoint));
     }
 }

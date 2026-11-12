@@ -330,6 +330,9 @@ sid=''
 update() {
   printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$1" "$2"
 }
+user() {
+  printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"%s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$1" "$2"
+}
 while IFS= read -r line; do
   printf '%s\n' "$line" >> "__CAPTURE__"
   id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
@@ -343,12 +346,15 @@ while IFS= read -r line; do
     *'"method":"session/fork"'*)
       sid=child
       update "$sid" early-fork
+      user "$sid" user-history
       printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"%s"}}\n' "$id" "$sid" ;;
     *'"method":"session/load"'*)
       sid=$(printf '%s' "$line" | sed -En 's/.*"sessionId":"([^"]+)".*/\1/p')
       update "$sid" history
+      user "$sid" user-history
       printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
     *'"method":"session/prompt"'*)
+      user "$sid" user-live
       update "$sid" live
       printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
   esac
@@ -387,11 +393,23 @@ done
     async fn native_identity_preserves_pre_response_new_fork_and_load_updates() {
         crate::acp::supervisor::test_support::managed::with_managed(|scope| {
             Box::pin(async move {
-                for (operation, imported, expected) in [
-                    ("new", false, vec!["early-1", "live"]),
-                    ("fork", false, vec!["early-fork", "live"]),
-                    ("load", true, vec!["history", "live"]),
-                    ("load", false, vec!["live"]),
+                // Only replayed user messages of an import or fork are recorded (#5224).
+                for (operation, imported, expected, expected_user) in [
+                    ("new", false, vec!["early-1", "live"], vec![]),
+                    (
+                        "fork",
+                        false,
+                        vec!["early-fork", "live"],
+                        vec!["user-history"],
+                    ),
+                    (
+                        "fork",
+                        true,
+                        vec!["early-fork", "live"],
+                        vec!["user-history"],
+                    ),
+                    ("load", true, vec!["history", "live"], vec!["user-history"]),
+                    ("load", false, vec!["live"], vec![]),
                 ] {
                     let temp = scope.tempdir();
                     let script = write_early_identity_agent(temp.path());
@@ -418,8 +436,159 @@ done
                         expected,
                         "operation={operation} imported={imported}"
                     );
+                    let user: Vec<&str> = events
+                        .iter()
+                        .filter_map(|event| match event {
+                            Event::UserPromptSent { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(
+                        user, expected_user,
+                        "user chunks: operation={operation} imported={imported}"
+                    );
                     scope.finish_conversation_case().await;
                 }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_fork_certifies_pre_result_user_history_once_without_current_scope() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let phase = std::cell::Cell::new("priming parent");
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    let directory = scope.tempdir();
+                    let (prime_config, _) =
+                        scope.native_peer(directory.path().into(), "claude", "claude", |request| {
+                            let id = request.get("id")?;
+                            Some(match request["method"].as_str().unwrap() {
+                                "initialize" => serde_json::json!({
+                                    "jsonrpc":"2.0","id":id,"result":{
+                                        "protocolVersion":1,"agentCapabilities":{}
+                                    }
+                                }),
+                                "session/new" => serde_json::json!({
+                                    "jsonrpc":"2.0","id":id,"result":{"sessionId":"parent"}
+                                }),
+                                other => panic!("unexpected original operation: {other}"),
+                            })
+                        });
+                    let original = scope
+                        .spawn(prime_config, "fork-prefix-parent")
+                        .await
+                        .unwrap();
+                    original.ready().await;
+                    let (fork_result, fork_requested) = oneshot::channel();
+                    let mut fork_result = Some(fork_result);
+                    let (config, native) = scope.native_peer(
+                        directory.path().into(),
+                        "claude",
+                        "claude",
+                        move |request| {
+                            let id = request.get("id")?;
+                            match request["method"].as_str().unwrap() {
+                                "initialize" => Some(serde_json::json!({
+                                    "jsonrpc":"2.0","id":id,"result":{
+                                        "protocolVersion":1,
+                                        "agentCapabilities":{"sessionCapabilities":{"fork":{}}}
+                                    }
+                                })),
+                                "session/fork" => {
+                                    assert_eq!(request["params"]["sessionId"], "parent");
+                                    fork_result.take().unwrap().send(id.clone()).unwrap();
+                                    None
+                                }
+                                "session/prompt" => Some(serde_json::json!({
+                                    "jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}
+                                })),
+                                other => panic!("unexpected child operation: {other}"),
+                            }
+                        },
+                    );
+                    let (gate, release, entered) = scope.gate();
+                    scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
+                        update: Some(gate),
+                        ..Default::default()
+                    });
+                    phase.set("creating child");
+                    let mut child = scope
+                        .fork_after(original, config, "fork-prefix-child")
+                        .await;
+                    phase.set("awaiting actual fork request");
+                    let result_id = fork_requested.await.unwrap();
+                    native
+                        .send(serde_json::json!({
+                            "jsonrpc":"2.0","method":"session/update","params":{
+                                "sessionId":"child","update":{
+                                    "sessionUpdate":"user_message_chunk",
+                                    "content":{"type":"text","text":"original fork history"}
+                                }
+                            }
+                        }))
+                        .await;
+                    // The runner holds this Native prefix until its original receipt exists.
+                    native
+                        .send(serde_json::json!({
+                            "jsonrpc":"2.0","id":result_id,"result":{"sessionId":"child"}
+                        }))
+                        .await;
+                    phase.set("awaiting SDK prefix admission");
+                    entered.await.unwrap();
+                    assert!(release.release());
+                    phase.set("awaiting child readiness");
+                    child.ready().await;
+                    phase.set("awaiting actual child terminal");
+                    child.send_prompt("after fork", &[]).await.unwrap();
+                    let events = identity_events_until_stop(&mut child).await;
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|event| matches!(
+                                event, Event::UserPromptSent { text, .. }
+                                    if text == "original fork history"
+                            ))
+                            .count(),
+                        1,
+                        "the SDK-admitted prefix survives the result exactly once"
+                    );
+                    phase.set("retiring child");
+                    child.shutdown().await.unwrap();
+                    let stored = scope
+                        .state
+                        .acp_event_store
+                        .replay_from(&child.id, 0)
+                        .unwrap();
+                    let prefix: Vec<_> = stored
+                        .iter()
+                        .filter(|stored| {
+                            matches!(
+                                stored.event.as_ref(), Event::UserPromptSent { text, .. }
+                                    if text == "original fork history"
+                            )
+                        })
+                        .collect();
+                    assert_eq!(prefix.len(), 1);
+                    assert_eq!(
+                        prefix[0].metadata.scope,
+                        crate::acp::event_sender::EventScope::HistoryOnly
+                    );
+                    assert_eq!(
+                        prefix[0]
+                            .metadata
+                            .reported_session_id
+                            .as_ref()
+                            .unwrap()
+                            .0
+                            .as_ref(),
+                        "child"
+                    );
+                    assert!(prefix[0].metadata.native_origin.is_some());
+                })
+                .await
+                .unwrap_or_else(|_| panic!("original fork prefix deadline during {}", phase.get()));
             })
         })
         .await;
@@ -1081,7 +1250,7 @@ done
     #[tokio::test]
     #[serial_test::serial]
     async fn unavailable_resume_stays_durably_blocked_without_replacement() {
-        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+        Box::pin(crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     for (name, stored, load_capable, load_fails, new_fails, fork) in [
         ("unavailable", true, false, false, false, false),
@@ -1151,9 +1320,9 @@ done
             identity_events_until_stop(&mut original).await;
             selected_source = Some(original.selected_native_session());
             if fork {
-                scope.fork_after(original, config, name).await
+                Box::pin(scope.fork_after(original, config, name)).await
             } else {
-                scope.retained_after(original, config, name).await
+                Box::pin(scope.retained_after(original, config, name)).await
             }
         } else {
             scope.spawn(config, name).await.unwrap()
@@ -1232,7 +1401,7 @@ done
         assert!(!requests.iter().any(|request| request["method"] == "session/fork"), "{name}");
         client.shutdown().await.unwrap();
         scope.finish_conversation_case().await;
-    } })).await;
+    } }))).await;
     }
 
     /// The deadline starts before enqueueing, so an expired command never

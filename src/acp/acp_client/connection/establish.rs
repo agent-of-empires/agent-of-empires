@@ -4,12 +4,13 @@
 use crate::acp::agent_compat::{self, ExpectedAgent};
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ForkSessionRequest, ForkSessionResponse, InitializeResponse, LoadSessionRequest,
     LoadSessionResponse, McpServer, NewSessionRequest, NewSessionResponse, SessionConfigId,
     SessionId,
 };
-use agent_client_protocol::{Agent, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::Agent;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -362,6 +363,15 @@ impl Session {
             .projection
             .attempt()
             .ok_or_else(|| acp_internal_error("no durable native establishment attempt".into()))?;
+        // An import or imported fork seeds an empty store from the replay (#5224).
+        self.shared.seed_user_replay.store(
+            attempt.destination.import_pending == Some(true)
+                || matches!(
+                    attempt.target,
+                    EstablishmentTarget::Load { import: true, .. }
+                ),
+            Ordering::Relaxed,
+        );
         let mut failure = None;
         let constructor = self.shared.ingress.constructor_scope();
         let response = match &attempt.target {
@@ -473,10 +483,10 @@ impl Session {
                     &self.connection,
                     &self.shared.connection_state,
                     &self.shared.event_tx,
-                    agent_client_protocol::schema::v1::SetSessionConfigOptionRequest::new(
+                    agent_client_protocol::v1::schema::SetSessionConfigOptionRequest::new(
                         id.clone(),
                         SessionConfigId::new(option.clone()),
-                        agent_client_protocol::schema::v1::SessionConfigValueId::new(mode),
+                        agent_client_protocol::v1::schema::SessionConfigValueId::new(mode),
                     ),
                     &self.shared.session_label,
                     self.control
@@ -659,10 +669,10 @@ impl Session {
             &self.connection,
             &self.shared.connection_state,
             &self.shared.event_tx,
-            agent_client_protocol::schema::v1::SetSessionConfigOptionRequest::new(
+            agent_client_protocol::v1::schema::SetSessionConfigOptionRequest::new(
                 self.acp_session_id.clone(),
                 SessionConfigId::new(option.id.clone()),
-                agent_client_protocol::schema::v1::SessionConfigValueId::new(model),
+                agent_client_protocol::v1::schema::SessionConfigValueId::new(model),
             ),
             label,
             scope.clone(),
@@ -703,10 +713,10 @@ impl Session {
                     &self.connection,
                     &self.shared.connection_state,
                     &self.shared.event_tx,
-                    agent_client_protocol::schema::v1::SetSessionConfigOptionRequest::new(
+                    agent_client_protocol::v1::schema::SetSessionConfigOptionRequest::new(
                         self.acp_session_id.clone(),
                         SessionConfigId::new(config_id.to_string()),
-                        agent_client_protocol::schema::v1::SessionConfigValueId::new(effort),
+                        agent_client_protocol::v1::schema::SessionConfigValueId::new(effort),
                     ),
                     &self.shared.session_label,
                     self.control

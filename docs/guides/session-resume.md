@@ -6,6 +6,9 @@ Runtime conversation changes such as `/clear`, `/new`, fork, continue, or a fres
 
 Physical launch and pane adoption decisions probe the exact tmux name live.
 A cached tmux session snapshot cannot suppress recreation of a missing pane.
+Launch admission uses a fresh marked Agent inventory, not the display resolver's title-derived fallback. Multiple candidates, including corpses or a candidate with the derived name, refuse admission before a new launch reservation. Launch paths recheck uniqueness after hooks and before physical birth; a missing selected target does not authorize substitution. Display and auxiliary name resolution retain their separate policies.
+
+Capture handoffs transfer only live watchers serving the same tool and execution. A missing or stopped launch snapshot cannot replace a compatible running canonical watcher, including when Pi publishes a new transcript path during a probe. A compatible live offered watcher still takes priority. Stopped handles remain available to their own final drain; capture pacing stays separate from watcher adoption. Capture continuity does not establish Native readiness or physical ownership.
 
 ## Automatic capture matrix
 
@@ -41,7 +44,7 @@ Shell pipelines, remote launchers, redirections, expansion, and unrecognized con
 ## Supported managed contexts
 
 - **Claude:** on a host launch, the store its conversation recorded, a declared `agent_config_dir`, the resolved `CLAUDE_CONFIG_DIR`, or the default Claude store; a sandboxed session takes a per-session child of the entry instead. A recorded conversation store outranks a conflicting configuration-directory setting; see [Swapping the engine on a restart](#swapping-the-engine-on-a-restart). Managed arguments allow namespace-neutral `--mcp-config` with one or more files or JSON strings, and zero-arity `--strict-mcp-config`, per the [Claude CLI reference](https://code.claude.com/docs/en/cli-reference). Extra native session selectors and unsupported configuration-routing options remain refused.
-- **Codex:** a local host-readable `CODEX_HOME`, file-backed API-key authentication, and local SQLite/thread storage. Cloud, keyring, profile, project-routing, managed-policy, and host macOS contexts are not currently proven.
+- **Codex:** a local host-readable `CODEX_HOME`, file-backed API-key authentication, and local SQLite/thread storage. Cloud, keyring, profile, project-routing, managed-policy, and host macOS contexts are not currently proven. On a host whose only gap is macOS managed preferences or its credentials (ChatGPT login, keyring, no `auth.json`), a Default restart still runs `codex resume <uuid>` when every rollout of that exact ID found under the store's `sessions/YYYY/MM/DD` directories is a root thread (not a subagent) that records the session's working directory. A sandbox with those credentials gets the same check against its private store and container workdir; legacy shared stores and wrappers refuse. A store with more than 1,048,576 entries under `sessions/` cannot be checked and refuses. A `config_toml_base64` or `requirements_toml_base64` value in the `com.openai.codex` preference domain, forced or not, can route the store, so it refuses, as do a profile, project routing, a remote thread store, and, on a host, `session.agent_config_dir`.
 - **OpenCode:** an explicit `OPENCODE_DB`, or the common database when `OPENCODE_DISABLE_CHANNEL_DB` is already enabled. Sandboxed explicit resume requires a host-readable database mount; the target working directory is still validated inside the container. Target routing is read only from the session table selected by the prepared executable's verified release/build identity. An inactive table cannot supply a missing target or override its working directory or workspace. A workspace-routed target or different stored working directory is refused. Managed current-generation launches and resumes use `--standalone` so an existing background service cannot redirect them to another database.
 - **Pi and OMP:** the verified transcript and exact store. Recovery uses `--store` with the transcript file. A Pi row that has an id but no recorded transcript path looks for `<timestamp>_<id>.jsonl` in the store, then resumes it with `--session <path>`. OMP also verifies its stored working directory and pins the resolved profile.
 - **Gemini, Cursor, Kimi, and Copilot:** their native config/share/home store inputs. AoE does not combine unrelated environment roots.
@@ -70,16 +73,28 @@ Disabling `agent_status_hooks` removes status writers only; identity hooks decla
 
 ## Common managed resume and fork refusals
 
-Automatic resume also refuses when native execution cannot be resolved in these contexts. The table describes explicit pin and fork operations, not interface status labels. `set-session-id` uses the recorded active execution when available; otherwise it resolves the current launch configuration. For agents identified by their store alone, restoring the original configuration can resolve the refusal. Pi and OMP also require their exact transcript; recover it with `--store` as described below rather than selecting a recent conversation.
+Automatic resume also refuses when native execution cannot be resolved in these contexts. The table describes explicit pin and fork operations, not interface status labels. `set-session-id` uses the recorded active execution when available; otherwise it resolves the current launch configuration. For agents identified by their store alone, restoring the original configuration can resolve the refusal.
 
 When native execution resolution fails for a recorded managed conversation under `Default`, including Prime Agent, the API returns HTTP `409` with `aoe-error-code: managed_resume_refused` and a fixed recovery reason. Missing wrapper contracts identify the trusted settings to restore; their declarations must match the actual native agent and original store. The [API receipt contract](../api.md#native-mutation-completion) describes the finite cause metadata.
+
+Transcript-specific refusals distinguish the agents' requirements:
+
+- **OMP:** resume requires a binding to the exact transcript file; the native ID alone is insufficient.
+- **Pi:** a matching binding must supply the required transcript path, or permitted discovery must find it. Nonexplicit preallocated bindings are exempt from this check.
+
+Neither refusal deletes the conversation or proves that its transcript is missing
+or its configuration changed. For host sessions, use
+[exact-file recovery](#pinning-or-resetting-a-conversation), not a recent conversation.
+Manual transcript rebinding is unsupported for sandboxed Pi/OMP terminal sessions.
+They can explicitly choose fresh as described in that section, replacing the AoE
+conversation association on a subsequent launch without deleting the original transcript.
 
 Local diagnostics include the native refusal chain and any scope-retirement error; public recovery messages exclude both. If scope retirement remains unproven, inspect its diagnostic before retrying. A refused launch does not prove that every process in the outgoing scope has stopped.
 
 | Context | `set-session-id` | Fork | Remedy |
 |---------|------------------|------|--------|
-| Unsandboxed Codex on a macOS host | Refused | Refused | None yet; run Codex in a managed container |
-| Codex signed in with a ChatGPT login | Refused | Refused | A local OpenAI API key, per [Codex](#supported-managed-contexts) |
+| Unsandboxed Codex on a macOS host | Refused | Refused | Default restarts resume a [verified rollout](#supported-managed-contexts); otherwise clear the ID, restart, and run `/resume <id>` in Codex. A managed container with a local OpenAI API key supports all three |
+| Codex with a ChatGPT login, keyring, or no `auth.json` | Refused | Refused | Default restarts on a host or in a private sandbox store resume a [verified rollout](#supported-managed-contexts); a local OpenAI API key supports all three |
 | OpenCode with no provable durable database | Refused | Refused | Point `OPENCODE_DB` at a durable database (`opencode debug paths` prints the current one); otherwise `OPENCODE_DISABLE_CHANNEL_DB` must be exactly `1` or `true`, and `:memory:` never qualifies, per [OpenCode](#supported-managed-contexts) |
 | OpenCode with an unlisted release/build identity | May be recorded; resume refused | Refused | Use a listed identity; Default restarts also refuse without guessing the active schema |
 | Sandboxed OpenCode fork, or a current-generation wrapper-mediated store fork | n/a | Refused | Disable the sandbox; for a current-generation store fork, launch `opencode` directly |
@@ -96,19 +111,41 @@ Pin a terminal session to a specific native conversation:
 aoe session set-session-id <session-name-or-id> <native-session-id>
 ```
 
-For sandboxed sessions, pin while the container is running. Resolving a new native execution context requires reading its environment and canonical paths.
+Pi/OMP transcript rebinding is host-only. For other agents that support sandboxed pinning, keep the container running so AoE can resolve its environment and canonical paths.
 
 This records an assertion about the intended native target, separately from any observed conversation. The pin is sticky. If the execution context changes, restore it or explicitly rebind the intended conversation before retrying. Legacy IDs and IDs from old unqualified publishers remain unknown after migration; current configuration does not relabel them.
 
 When a launch requests resume, AoE preserves an unknown stored ID and attempts it only when native execution resolves. A qualified capture can establish its binding. If the native resume probe fails, AoE preserves the ID, records a durable failure marker, and returns `resume_failed` without starting fresh in that call.
 
-If a resume or fresh-pinned readiness probe cannot observe the exact owned pane, AoE returns `launch_indeterminate`, not `resume_failed` or ready success. Command timeouts, failed or malformed tmux observations, and changed ownership do not prove that the Agent exited. Expiry of the stabilization window is a separate outcome and proves neither death nor loaded history.
+An inconclusive resume or fresh-pinned probe, a missing created-pane identity on a fresh launch, or an unknown query of an existing pane returns `launch_indeterminate`, never ready success. Observation errors and stabilization expiry prove neither death nor loaded history.
 
-AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
+AoE preserves the pane, process, conversation association, capture poller and scope ownership on this outcome. It releases only its own launch reservation when storage permits, without teardown even if release fails. The observed sandbox workdir is retained unless a concurrent change supersedes its container context. Sends, attach preparation and restart wake messages stop at this refusal. Inspect the existing pane and restore tmux access before retrying; do not assume that the Agent needs a replacement. This does not restrict an explicit owned Stop.
 
-A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup also rechecks death and ownership. If that recheck becomes inconclusive, AoE returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
+An indeterminate creation still finalizes its idempotency key: its durable status changes from `Creating` to `Starting`, never to ready. A keyed retry returns that same session without another launch. If durable finalization fails, the request reports unavailable; the existing lifecycle work queue can finalize only that same generation after storage recovers. A concurrent status or launch generation is not overwritten. A later ensure rechecks live-pane readiness, using the existing shell and command-override exemptions. Hook readiness must match the active launch, conversation ID and execution binding; another launch's status cannot authorize input.
 
-Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. Capturing a different ID clears it; an explicit `set-session-id` assertion or a successful launch can also clear it.
+Post-hook creation failures release namespace, submission and mutation guards before rollback cleanup re-enters them.
+
+An ACP account restart captures the qualified original quota state and interrupted-turn selection before retiring its worker. It publishes the quota breadcrumb under the current generation and prompt-submission guard before installing either a replacement worker or a pending turn. A failed journal write preserves existing pending intent and cannot create a new pending turn, install a worker or authorize autonomous input.
+
+The interrupted prompt and attachments come from the original worker before retirement. Queue priority is decided from the current queue after launch hooks, under the same submission guard as publication and installation. A prompt added during a hook can supersede the continuation; removing that prompt restores the captured continuation without querying the retired worker.
+
+A renamed pane is not confirmed absence: AoE checks its captured session and pane IDs on the original tmux server. Cleanup rechecks death, ownership and exclusive occupancy of that session. Added panes or windows refuse whole-session cleanup and scope release. An inconclusive recheck returns `launch_indeterminate` without changing the current Status or recording a new failed-resume marker. A marker already justified by confirmed death remains intact if later removal becomes indeterminate.
+
+This exclusive-occupancy check also protects later revival and direct-start replacement. The tmux command rechecks immutable pane/server identity and topology atomically before any process-tree signalling or scope release. A legacy corpse does not acquire an invented process PID. A peer split immediately before removal refuses revival; explicit Stop retains its separate authority.
+
+A live-pane teardown authorization requires the pane to remain live with the exact captured PID; it cannot consume a later corpse. Corpse cleanup does not capture new process handles. Exclusive occupancy also excludes windows linked into another session, including grouped sessions.
+
+Revival takes the pane state, PID, physical IDs and server birth from one captured observation before acquiring process handles; it does not combine separate name-based and cached batch lookups.
+
+Some tmux versions display a corpse's previous PID, while others hide it. Revival preserves that observed value for its dead-pane guard without capturing or signalling it as a live process.
+
+Launch admission carries that same physical observation across pre-launch hooks. Readiness checks and each input effect revalidate the captured target instead of substituting a name lookup or status label. Refused-publication cleanup still requires the owned launch generation and one of the operation's captured conversation states; it never rewrites the captured PID or rolls back a peer's selected context.
+
+Same-ID observations, including binding qualification and OMP launch confirmation, preserve the durable failure marker. A matching OMP confirmation can consume an explicit pin during stabilization without changing the captured launch owner. Capturing a different ID clears the marker; an explicit `set-session-id` assertion or a successful launch can also clear it.
+
+An accepted OMP pin confirmation also converges the local launch intent, so the first subsequent capture can record a different conversation. An empty outgoing launch poller does not erase a compatible canonical poller installed during adoption.
+
+Reloads retain the compatible row's capture-repair pacing and managed-start retry deadline even when it has no poller handle. They use the existing tool-and-execution handoff guards, not the separate relaunch reset policy.
 
 On the next orchestrated restart or send-driven revival under `Default`, a resume-capable conversation with that marker starts fresh instead of repeating the probe. This applies to both restart policies, including when `auto_resume_on_restart = false`. The fresh launch abandons the AoE association with the old conversation, not its native transcript. CLI restart reports the fresh result; sends and restart wake messages may then reach the new conversation.
 
@@ -118,17 +155,42 @@ To retry the original conversation through the restart cascade, first restore it
 
 Direct `aoe session start` keeps its separate policy: it may retry a previously failed ID when native execution and target validation succeed. It performs that shared preflight before replacing an ordinary dead pane, but does not run the cascade's final resume probe. A successful start therefore does not prove that the native conversation loaded.
 
+Terminal handoff additionally requires a physical receipt captured after pane creation and persisted under its owned launch generation before finalizing projection cleanup. A prepared launch payload, environment marker or healthy process is not a birth receipt. Missing evidence preserves the actual terminal, pending handoff and retained projection across maintenance and restart.
+
+To recover an unproven terminal handoff, close its exact pane explicitly in tmux first. Then use `aoe session set-session-id <session> <native-id> --store /absolute/native/store`, or `aoe session set-session-id <session> ""` to select fresh. The command refuses a live pane, an unproven corpse, an incomplete tmux inventory or an original structured worker whose retirement is unproven. After confirmed absence, it records a new target generation without attesting the old birth. Retry the terminal-view switch to launch that target once and finish projection cleanup. Selecting a target neither recovers nor deletes the original native history.
+
+Recovery inventories every pane on the captured physical socket, without AoE-name, pane-index or first-window filtering. Renaming a pane or moving it between windows does not prove that it closed. Before dispatch, a durable census records pre-existing live peers and their births. That negative evidence permits unchanged peers to remain after an unrecorded launch is explicitly closed; it never attests the launch itself. Missing legacy scope evidence, new or changed peers, and incomplete inspections refuse target selection rather than guessing that a missing receipt means absence.
+
+The recovery command separately checks the strict current Native registry and control-socket peer, the captured Original retirement, and the target's recorded scope obligations. A replaced Native identity, a live owned scope or an unknown inspection refuses selection; recovery never stops an unrelated new peer. An empty pane inventory is not Native process-retirement authority.
+
+An unscoped launch has no recorded cgroup proof. The command cannot verify shutdown of an unregistered Native agent or arbitrary detached subprocess outside its captured ownership. If such work may survive closing the pane, externally settle that exact execution and retain independent evidence before selecting another target. `set-session-id` does not attest this external prerequisite, upgrade missing evidence or authorize killing those processes.
+
+A direct-start indeterminate refusal releases only its captured, still-owned Launch reservation, without cleanup or changes to the pending handoff. After an unrelated split is removed, an immediate explicit retry is not held by that refused start. A superseding generation keeps its own reservation; failed release preserves the refusal and runtime rather than granting teardown authority.
+
 An explicit pin or fork that migration left unqualified resumes against the store current configuration resolves. Agents that resolve their store or transcript before that check still refuse, for the reasons listed in [Supported managed contexts](#supported-managed-contexts). An armed pin is the exception to the rule above: no capture qualifies the binding it names.
 
 An agent that publishes its own conversation spends the pin at launch; its recorded binding remains unqualified until a capture qualifies it. A spent pin follows the `Default` failed-probe policy above. An agent without such a publisher keeps its persistent `Use` pin armed, including after a failed probe; that pin remains retryable without another assertion. Each retry still validates the resolved execution context and any qualified binding. A dispatched fork is always spent, whether or not it resumes. `set-session-id` is the only way to assert a store without launching:
+
+For Claude, `--store` selects its configuration directory:
 
 ```sh
 aoe session set-session-id <session> <native-id> --store /absolute/native/store
 ```
 
-`--store` explicitly selects a Claude configuration directory. For Pi and OMP it must name the exact existing transcript file, whose header must name the requested ID. Other agents resolve their store from configuration and reject explicit store routing.
+For Pi and OMP (host sessions only), use the exact existing transcript file, not
+its directory. The file's header must name the requested ID:
 
-To start fresh once:
+```sh
+aoe session set-session-id <session> <native-id> --store /absolute/path/to/transcript.jsonl
+```
+
+The file must belong to the configured store. If store routing changed, restore
+the original store configuration before rebinding.
+
+Then start or restart the session. Other agents resolve their store from
+configuration and reject explicit `--store` routing.
+
+To start fresh once, including for sandboxed terminal sessions:
 
 ```sh
 aoe session set-session-id <session-name-or-id> ""
@@ -170,6 +232,8 @@ The restart dialog can change the tool a session runs. Session IDs live in per-a
 Two tool names can also point at the same agent on different accounts, through `[session.agent_config_dir]`. That swap changes the agent's config root, so the conversation is still on disk but under the account you swapped away from. AoE carries it across: it copies the transcript into the incoming account's config root so the agent resumes where it left off, and the row keeps its conversation id, model, and effort setting, since none of those changed agent.
 
 The carry applies only when the new tool resolves to the same built-in agent, the session has a conversation to carry, and AoE knows the agent's transcript layout (Claude Code today). Anything else takes the parking swap above.
+
+The CLI reaches this swap with `aoe session restart <session> --tool <tool>`, and for a structured session `aoe acp switch-account <session> <tool>` does the same but refuses instead of parking when the carry does not apply. A structured session parked on a rate limit continues with the interrupted prompt instead of the restart wake message; see [Switching accounts manually](../structured-view/troubleshooting.md#switching-accounts-manually).
 
 The outgoing account keeps its own copy, so swapping accounts back and forth stays continuous: the account you swap away from is the one that was just running, so on the way back its transcript replaces the older copy the earlier swap left behind. A copy the incoming account wrote more recently than the outgoing one is left alone.
 

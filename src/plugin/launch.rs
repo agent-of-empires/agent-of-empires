@@ -66,11 +66,37 @@ pub trait LaunchResolver {
     fn is_executable(&self, path: &Path) -> bool;
 }
 
-pub struct OsLaunchResolver;
+/// Resolves against the Node env resolved once by the caller, so a lookup never probes Node.
+#[derive(Default)]
+pub struct OsLaunchResolver {
+    node_env: super::NodeEnv,
+}
+
+impl OsLaunchResolver {
+    pub fn new(node_env: super::NodeEnv) -> Self {
+        Self { node_env }
+    }
+}
 
 impl LaunchResolver for OsLaunchResolver {
     fn which(&self, program: &str) -> Option<PathBuf> {
-        which::which(program).ok()
+        // The resolved Node's directory leads the same PATH the child gets, so
+        // `node` and `npm` resolve on a machine with no system Node.
+        let var = |name: &str| {
+            self.node_env
+                .iter()
+                .find_map(|(k, v)| (*k == name).then(|| v.clone()))
+        };
+        // A configured executable need not be named `node`.
+        if program == "node" {
+            if let Some(node) = var("AOE_NODE") {
+                return Some(PathBuf::from(node));
+            }
+        }
+        match var("PATH") {
+            Some(path) => which::which_in(program, Some(path), std::env::current_dir().ok()?).ok(),
+            None => which::which(program).ok(),
+        }
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -249,6 +275,34 @@ mod tests {
         fn is_executable(&self, path: &Path) -> bool {
             self.executable.contains(path)
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn os_resolver_finds_bare_commands_in_the_resolved_node_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let node = crate::plugin::write_fake_node(temp.path(), "node");
+        let tool = temp.path().join("aoe-node-dir-tool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+
+        let resolver = OsLaunchResolver::new(crate::plugin::node_env());
+        assert_eq!(resolver.which("aoe-node-dir-tool"), Some(tool));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn bare_node_resolves_to_the_configured_executable() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = crate::plugin::write_fake_node(temp.path(), "node22");
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_ACP_NODE", &node)]);
+
+        let resolver = OsLaunchResolver::new(crate::plugin::node_env());
+        assert_eq!(resolver.which("node"), Some(node));
     }
 
     fn plugin(runtime: Option<&str>, dir: Option<&str>) -> LoadedPlugin {

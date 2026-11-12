@@ -1,8 +1,9 @@
 //! Capability-gated session release, distinct from deleting persisted history.
 
 use crate::acp::establishment::NativeRequestContext;
-use agent_client_protocol::schema::v1::{CloseSessionRequest, ErrorCode, SessionId};
-use agent_client_protocol::{Agent, ConnectionTo};
+use agent_client_protocol::v1::schema::{CloseSessionRequest, SessionId};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, ErrorCode};
 use tokio::sync::oneshot;
 
 use super::connection::ConnectionState;
@@ -61,7 +62,7 @@ pub(super) fn dispatch_close(
         let outcome = match tokio::time::timeout(CLOSE_TIMEOUT, request.wait()).await {
             Ok(OrderedRequestResult::Correlated(Ok(_))) => CloseSessionOutcome::Closed,
             Ok(OrderedRequestResult::Correlated(Err(error)))
-                if error.code == ErrorCode::MethodNotFound =>
+                if error.code == ErrorCode::METHOD_NOT_FOUND =>
             {
                 CloseSessionOutcome::Unsupported
             }

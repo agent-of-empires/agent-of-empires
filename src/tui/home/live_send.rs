@@ -1510,7 +1510,12 @@ impl LiveCaptureWorker {
                                 name.clone(),
                                 generation_now,
                                 nudge_thread.clone(),
-                                crate::tmux::vt::VtChannel::acquire_with_deadline,
+                                |name, deadline| {
+                                    crate::tmux::vt::VtChannel::acquire_with_deadline(
+                                        name, deadline,
+                                    )
+                                    .ok()
+                                },
                             ));
                         }
                         // A channel whose forwarder disconnected stops updating its grid,
@@ -2411,12 +2416,15 @@ impl Drop for OneshotSlot {
 
 /// Capture a passive-preview wheel target before starting its bounded one-shot worker.
 /// Failed capture or dispatch drops the notch without resolving a replacement name.
-pub(super) fn send_key_oneshot(lease: crate::tui::session_feed::NativeLease, key: TmuxKey) {
+pub(super) fn send_key_oneshot(lease: crate::tui::session_feed::NativeLease, key: TmuxKey) -> bool {
     use std::sync::atomic::Ordering;
+    if !lease.is_valid() {
+        return false;
+    }
     // Reserve a slot before capture so a dropped notch does no native store work.
     if INFLIGHT_ONESHOT.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_ONESHOT {
         INFLIGHT_ONESHOT.fetch_sub(1, Ordering::AcqRel);
-        return;
+        return false;
     }
     let session = match lease.input_session() {
         Ok(session) => session,
@@ -2425,7 +2433,7 @@ pub(super) fn send_key_oneshot(lease: crate::tui::session_feed::NativeLease, key
             lease.cancel_continuation();
             tracing::warn!(target: "tui.live_send", error = %error,
                 "passive-preview input capture failed; notch dropped");
-            return;
+            return false;
         }
     };
     let action = match key {
@@ -2435,10 +2443,7 @@ pub(super) fn send_key_oneshot(lease: crate::tui::session_feed::NativeLease, key
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
         TmuxKey::Paste(text) => TmuxAction::Paste(text),
     };
-    // `Builder::spawn` returns the OS error instead of panicking, so a thread-creation
-    // failure under load can't take down the calling UI thread. The `OneshotSlot` guard
-    // inside the closure releases the slot on completion or panic; a spawn that never
-    // starts releases it here.
+    // The guard releases the slot on completion or panic; failed spawn releases it here.
     let spawned = std::thread::Builder::new()
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
@@ -2462,7 +2467,9 @@ pub(super) fn send_key_oneshot(lease: crate::tui::session_feed::NativeLease, key
             target: "tui.live_send",
             "could not spawn wheel-forward thread; notch dropped",
         );
+        return false;
     }
+    true
 }
 
 /// What the translator says to do with one incoming key event. The exit-chord check lives

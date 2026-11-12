@@ -101,6 +101,12 @@ updates:
           - "tailwindcss"
           - "@tailwindcss/*"
         update-types: ["minor", "patch"]
+      vitest:
+        applies-to: version-updates
+        patterns:
+          - "vitest"
+          - "@vitest/*"
+        update-types: ["major"]
       web-minor-patch:
         patterns: ["*"]
         exclude-patterns:
@@ -110,18 +116,13 @@ updates:
           - "@types/react-dom"
           - "tailwindcss"
           - "@tailwindcss/*"
-          # Pre-1.0 packages: a minor bump is a breaking change by semver
-          # convention, but dependabot still classifies it as "minor" and so
-          # would group it with the routine updates. Excluding them gives each
-          # its own PR, so one breaking library cannot hold the rest hostage.
-          # In #3394, @assistant-ui/react 0.14 to 0.15 dropped three hooks and
-          # blocked 15 unrelated bumps behind a red build.
+          # Pre-1.0 minor updates may break compatibility; project policy
+          # keeps them in separate PRs for review.
           - "@assistant-ui/*"
           - "eslint-plugin-react-refresh"
           - "oxfmt"
         update-types: ["minor", "patch"]
-      # Patch bumps of the pre-1.0 packages above are safe to batch; their
-      # minor bumps still get one PR each.
+      # Batch pre-1.0 patches by project choice, not a SemVer compatibility guarantee.
       web-pre1-patch:
         patterns:
           - "@assistant-ui/*"
@@ -283,3 +284,41 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "@tailwindcss/*"
         update-types: ["version-update:semver-major"]
+
+  # pip: CI toolchain editor
+  - package-ecosystem: "pip"
+    directory: "/.github/scripts"
+    schedule:
+      interval: "monthly"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "area:infra"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28
+
+  # pip: optional X publishing
+  - package-ecosystem: "pip"
+    directory: "/marketing/x"
+    versioning-strategy: "increase-if-necessary"
+    schedule:
+      interval: "monthly"
+      time: "06:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    cooldown:
+      default-days: 7
+      semver-minor-days: 14
+      semver-major-days: 28

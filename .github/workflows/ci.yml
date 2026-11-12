@@ -10,13 +10,16 @@ on:
   merge_group:
 
 # The event keeps a queue run and the push of its fast-forwarded commit apart.
-# Queue refs are unique per entry; newer PR and main pushes cancel older runs.
+# Queue generations have distinct refs; cancel-obsolete-queue-runs handles them.
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # .cargo/config.toml caps jobs at 4 for shared dev machines; CI runners are
+  # single-tenant, so use every vCPU.
+  CARGO_BUILD_JOBS: default
 
 permissions:
   contents: read
@@ -44,16 +47,21 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-clippy-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/rust-toolchain
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: clippy
       # `--all-features` so the `web`-gated dashboard tree gets linted too.
       # The web-dist placeholder stands in for the npm bundle that build.rs
       # would otherwise build, so this job still needs no Node setup; same
@@ -93,8 +101,14 @@ jobs:
 
   msrv:
     name: MSRV
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-msrv-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read rust-version
         id: msrv
@@ -103,10 +117,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: msrv
       # Lib and bins only: dev-dependencies such as `serial_test` may need a
       # newer compiler without affecting anyone building aoe.
       - name: Check the locked graph on rust-version (core)
@@ -161,14 +174,23 @@ jobs:
   docs:
     # Also the skill check: both build xtask.
     name: Docs
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-docs-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/rust-toolchain
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: ./.github/actions/kache
         with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          manifest-key: docs
+      - name: Build xtask and workspace member tests
+        run: |
+          cargo build -p xtask
+          cargo test -p xtask -p aoe-plugin-api --no-run
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
       # The workspace declares no `default-members`, so every other `cargo
@@ -209,10 +231,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - run: node --test .github/scripts/cancel-obsolete-queue-runs.test.cjs
       - run: scripts/verify-shared-target.sh --self-test
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
       - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+      - run: python3 scripts/check-no-claude-in-core.py --self-test
+      # Disabled until C25 to C29 remove Claude from core on
+      # integration/claude-removal; enable there by dropping the `if`.
+      - name: Check core has no Claude references
+        if: ${{ false }}
+        run: python3 scripts/check-no-claude-in-core.py
 
   nix:
     name: Nix Eval
@@ -281,7 +310,7 @@ jobs:
 
   nix-build:
     name: Nix Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-nix-build-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 45
     # Builds the default (aoe) crate through crane. Nix Eval only evaluates
     # derivations, so a flake recipe that compiles nowhere (a bad source filter,
@@ -297,6 +326,8 @@ jobs:
     # `src/**`, `Cargo.*`, the build scripts or an embedded-asset directory
     # (see its `paths:` list), so wider breakage still surfaces there.
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -347,11 +378,13 @@ jobs:
 
   nix-build-web:
     name: Nix Build Web
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || format('runs-on={0}-nix-build-web-{1}/runner=8cpu-linux-x64/family=m8a+c8i+m8i/image=ubuntu26-full-x64/volume=80gb/extras=s3-cache', github.run_id, github.run_attempt) }}
     timeout-minutes: 30
     # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
     # is offline. Path-gated so Rust-only PRs keep fast feedback.
     steps:
+      # Routes actions/cache to the RunsOn S3 bucket (Magic Cache); no-op on GitHub-hosted runners.
+      - uses: runs-on/action@284bff869d4a825f778ac7c38e50f1e31ef198fd # v2.6.0
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
@@ -412,6 +445,9 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: website/package-lock.json
-      - name: Install and build
+      - name: Install dependencies
         working-directory: website
-        run: npm install && npm run build
+        run: npm install
+      - name: Build
+        working-directory: website
+        run: npm run build

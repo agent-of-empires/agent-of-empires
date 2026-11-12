@@ -6,11 +6,11 @@ use crate::acp::control_protocol::{
 };
 use crate::acp::establishment::NativeRequestScope;
 use crate::acp::state::{AcpConnectionCause, AcpConnectionSource, Event};
-use agent_client_protocol::schema::v1::{PromptResponse, RequestId};
+use agent_client_protocol::v1::schema::{PromptResponse, RequestId};
 use agent_client_protocol::JsonRpcMessage as _;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -58,6 +58,10 @@ pub(super) struct DaemonControlClient {
     native_cache: Arc<AtomicBool>,
     native_ready: Arc<AtomicBool>,
     pub(super) completion: Arc<std::sync::Mutex<PromptCompletion>>,
+    /// Released waiters whose `PromptStarted` has not arrived. The runner
+    /// starts prompts in order, so the next that many starts belong to them.
+    /// Only touched under the `completion` lock.
+    abandoned_starts: Arc<AtomicUsize>,
     /// A matched local outcome held until the crate reaches its
     /// [`PromptCompletedMarker`], or until one of the reader's relays fails.
     settled: Arc<std::sync::Mutex<Option<LocalOutcome>>>,
@@ -322,6 +326,18 @@ fn observe_test_relay<T: serde::Serialize + ?Sized>(
         let _ = observer.send(TestRelayObservation { stage, payload });
     }
 }
+
+fn settle_unreachable_sdk_route(
+    settled: &std::sync::Mutex<Option<LocalOutcome>>,
+    state: &ConnectionState,
+    source: AcpConnectionSource,
+    cause: AcpConnectionCause,
+) {
+    state.observe(source, cause);
+    release_settled(settled);
+    state.mark_ordered_loss();
+}
+
 /// A failed relay releases any local outcome whose marker can no longer arrive.
 async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
     duplex: &Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>,
@@ -336,12 +352,12 @@ async fn shim_write_line_releasing<T: serde::Serialize + ?Sized>(
         observe_test_relay(state, value, TestRelayStage::Relayed);
         return true;
     }
-    state.observe(
-        crate::acp::state::AcpConnectionSource::Control,
-        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+    settle_unreachable_sdk_route(
+        settled,
+        state,
+        AcpConnectionSource::Control,
+        AcpConnectionCause::ForwardPumpEnded,
     );
-    release_settled(settled);
-    state.mark_ordered_loss();
     #[cfg(test)]
     observe_test_relay(state, value, TestRelayStage::Failed);
     false
@@ -352,8 +368,8 @@ impl DaemonControlClient {
     pub(super) fn register_forward<T>(
         &self,
         scope: NativeRequestScope,
-        send: impl FnOnce() -> agent_client_protocol::SentRequest<T>,
-    ) -> (agent_client_protocol::SentRequest<T>, u64) {
+        send: impl FnOnce() -> agent_client_protocol::v1::SentRequest<T>,
+    ) -> (agent_client_protocol::v1::SentRequest<T>, u64) {
         let mut correlation = self.correlation.lock().expect("shim correlation");
         let call_id = correlation.forward_id();
         let sent = send();
@@ -415,14 +431,11 @@ impl DaemonControlClient {
         ))
     }
 
-    pub(super) fn admit_reverse_callback(
-        &self,
-        id: &agent_client_protocol::schema::v1::RequestId,
-    ) -> ReverseCallbackAdmission {
+    pub(super) fn admit_reverse_callback(&self, id: &RequestId) -> ReverseCallbackAdmission {
         let ticket = self.connection_state.admit(|| {
             let correlation = self.correlation.lock().expect("shim correlation");
             match id {
-                agent_client_protocol::schema::v1::RequestId::Number(id) => correlation
+                RequestId::Number(id) => correlation
                     .reverse
                     .get(id)
                     .map(|ticket| ticket.admitted.then(|| ticket.callback.clone()).flatten()),
@@ -623,6 +636,11 @@ impl DaemonControlClient {
             .map(|slot| (slot.attempt, slot.context))
     }
 
+    pub(super) fn close_sdk_route(&self, source: AcpConnectionSource, cause: AcpConnectionCause) {
+        // Only an already-correlated outcome may precede the ordered loss wakeup.
+        settle_unreachable_sdk_route(&self.settled, &self.connection_state, source, cause);
+        self.shutdown();
+    }
     pub(super) fn shutdown(&self) {
         self.connection_state.observe(
             AcpConnectionSource::Control,
@@ -970,6 +988,19 @@ impl DaemonControlClient {
         }
     }
 
+    /// Drop a local waiter the daemon abandons before the runner completes the
+    /// turn, so the next local prompt is not refused as a duplicate. The
+    /// runner's late `PromptCompleted` for the abandoned id is then ignored.
+    pub(super) fn release_local_prompt(&self) {
+        let mut completion = self.completion.lock().expect("completion mutex poisoned");
+        if let PromptCompletion::Pending { prompt_req_id, .. } = &*completion {
+            if prompt_req_id.is_none() {
+                self.abandoned_starts.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            *completion = PromptCompletion::LocalIdle;
+        }
+    }
+
     /// Registers the completion waiter before sending the `Prompt` frame.
     pub(super) async fn prompt(
         &self,
@@ -1216,6 +1247,8 @@ pub(super) async fn connect_runner_control(
         prompt_head,
     )));
     let reader_completion = completion.clone();
+    let abandoned_starts = Arc::new(AtomicUsize::new(0));
+    let reader_abandoned_starts = abandoned_starts.clone();
     let settled = Arc::new(std::sync::Mutex::new(None));
     let reader_settled = settled.clone();
     let reader_session = session_label.clone();
@@ -1250,6 +1283,7 @@ pub(super) async fn connect_runner_control(
         native_cache,
         native_ready,
         completion,
+        abandoned_starts,
         settled,
         raw_fd,
         peer_identity: expected_owner,
@@ -1453,7 +1487,10 @@ pub(super) async fn connect_runner_control(
                     Ok(Some((ControlBody::PromptStarted { prompt_req_id, correlation, window_id }, _))) => {
                         let mut completion =
                             reader_completion.lock().expect("completion mutex poisoned");
-                        if let PromptCompletion::Pending {
+                        let abandoned = reader_abandoned_starts.load(AtomicOrdering::Relaxed);
+                        if abandoned > 0 {
+                            reader_abandoned_starts.store(abandoned - 1, AtomicOrdering::Relaxed);
+                        } else if let PromptCompletion::Pending {
                             prompt_req_id: id @ None,
                             scope,
                             window_id: window,
@@ -1817,22 +1854,18 @@ pub(super) async fn connect_runner_control(
             line.clear();
             match tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line).await {
                 Ok(0) => {
-                    pump_connection_state.observe(
-                        crate::acp::state::AcpConnectionSource::Control,
-                        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::ForwardPumpEnded,
                     );
-                    // SAFETY: pump_write retains this exact socket.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                     return;
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    pump_connection_state.observe(
-                        crate::acp::state::AcpConnectionSource::Control,
-                        crate::acp::state::AcpConnectionCause::ForwardPumpEnded,
+                    pump_control.close_sdk_route(
+                        AcpConnectionSource::Control,
+                        AcpConnectionCause::ForwardPumpEnded,
                     );
-                    // SAFETY: pump_write retains this exact socket.
-                    unsafe { libc::shutdown(raw_fd, libc::SHUT_RDWR) };
                     debug!(
                         target: "acp.protocol",
                         session = %pump_session,
@@ -2348,6 +2381,7 @@ pub(super) fn prompt_outcome_to_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::event_sender::EventScope;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -3312,7 +3346,190 @@ mod tests {
         )
         .await
     }
+    async fn own_stop(fixture: &ManagedControlFixture, request: &serde_json::Value) {
+        real_control_deadline(async {
+                loop {
+                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
+                    if events.iter().any(|stored| {
+                        stored.metadata.scope == EventScope::OperationCurrent
+                            && stored.metadata.native_prompt_id == request["id"].as_i64()
+                            && matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete")
+                    }) { break; }
+                    tokio::task::yield_now().await;
+                }
+            }).await;
+    }
 
+    async fn drained_old_completion(
+        fixture: &mut ManagedControlFixture,
+        callback_id: &str,
+        forbidden: &std::path::Path,
+    ) {
+        fixture.native.send(serde_json::json!({"jsonrpc":"2.0","id":callback_id,
+                "method":"fs/write_text_file","params":{
+                    "sessionId":"foreign-correlation-barrier","path":forbidden,"content":"must not be written"
+                }})).await;
+        let reply = real_control_deadline(fixture.native.reply()).await;
+        assert_eq!(reply["id"], callback_id);
+        assert_eq!(reply["error"]["code"], control_protocol::INVALID_PARAMS);
+        assert!(!forbidden.exists());
+        // A direct refusal proves reader progress, not SDK or parent application.
+        let barrier = format!("parent-processed-{callback_id}");
+        fixture.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":"foreign-correlation-barrier","update":{
+                    "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":barrier}
+                }
+            }})).await;
+        real_control_deadline(async {
+            loop {
+                let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
+                if let Some(stored) = events.iter().find(|stored| {
+                    matches!(stored.event.as_ref(),
+                        Event::AgentMessageChunk { text, .. } if text == &barrier
+                    )
+                }) {
+                    assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
+                    assert_eq!(
+                        stored
+                            .metadata
+                            .reported_session_id
+                            .as_ref()
+                            .map(|id| id.0.as_ref()),
+                        Some("foreign-correlation-barrier")
+                    );
+                    assert!(stored.metadata.operation.is_none());
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    async fn release_real_prompt_and_keep_the_next_owner(release_before_start: bool) {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(move |scope| {
+            Box::pin(async move {
+                let directory = scope.tempdir();
+                let forbidden = directory.path().join("foreign-write");
+                let mut fixture = ManagedControlFixture::new(scope).await;
+                let actual = fixture.client.actual();
+                let control = actual.test_control();
+                let state = actual.test_connection_state();
+                let terminal = state.test_terminal.get().unwrap().clone();
+                let in_flight = state.test_in_flight.get().unwrap().clone();
+                let shim = state.test_shim.get().unwrap().clone();
+                let mut observed = observe_real_relay(&control);
+                let relay_gate = if release_before_start {
+                    let write = shim.lock().await;
+                    fixture.native.send(serde_json::json!({
+                        "jsonrpc":"2.0","method":"session/update","params":{
+                            "sessionId":"release-before-start-barrier","update":{
+                                "sessionUpdate":"agent_message_chunk",
+                                "content":{"type":"text","text":"block the actual control reader"}
+                            }
+                        }
+                    })).await;
+                    real_relay_observation(
+                        &mut observed,
+                        TestRelayStage::Prepared,
+                        "session/update",
+                    )
+                    .await;
+                    Some(write)
+                } else {
+                    None
+                };
+                let old = fixture.start_prompt("real abandoned input").await;
+                let (old_scope, old_window) = if release_before_start {
+                    let completion = control.completion.lock().unwrap();
+                    match &*completion {
+                        PromptCompletion::Pending {
+                            prompt_req_id: None,
+                            scope,
+                            window_id: None,
+                            ..
+                        } => (scope.clone(), None),
+                        _ => panic!("reader must not have bound the abandoned start"),
+                    }
+                } else {
+                    let (scope, window) = real_pending_scope(&control, &old).await;
+                    (scope, Some(window))
+                };
+                control.release_local_prompt();
+                assert!(matches!(
+                    *control.completion.lock().unwrap(),
+                    PromptCompletion::LocalIdle
+                ));
+                assert_eq!(
+                    control.abandoned_starts.load(AtomicOrdering::Relaxed),
+                    usize::from(release_before_start),
+                );
+                let next = fixture.start_prompt("real next explicit input").await;
+                assert_ne!(old["id"], next["id"]);
+                // Both requests reached the Native peer before the delayed start is released.
+                drop(relay_gate);
+                let (next_scope, next_window) = real_pending_scope(&control, &next).await;
+                assert_ne!(old_scope.correlation(), next_scope.correlation());
+                if let Some(old_window) = old_window {
+                    assert_ne!(old_window, next_window);
+                }
+                assert_eq!(control.abandoned_starts.load(AtomicOrdering::Relaxed), 0);
+                let turn = terminal.current_turn();
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                fixture.complete(&old, "end_turn").await;
+                drained_old_completion(&mut fixture, "released-original-barrier", &forbidden).await;
+                assert_eq!(
+                    real_pending_scope(&control, &next).await,
+                    (next_scope.clone(), next_window),
+                );
+                assert_eq!(terminal.current_turn(), turn);
+                assert!(!terminal.claimed());
+                assert!(in_flight.load(AtomicOrdering::Acquire));
+                let before = fixture.store.highest_seq(&fixture.client.id);
+                fixture.complete(&next, "end_turn").await;
+                own_stop(&fixture, &next).await;
+                assert_one_real_stopped(&fixture, before, &next, &next_scope, next_window);
+                assert_eq!(terminal.current_turn(), turn);
+                assert!(terminal.claimed());
+                assert!(!in_flight.load(AtomicOrdering::Acquire));
+                let methods = fixture.native.requests();
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| *method == "session/new")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| *method == "session/prompt")
+                        .count(),
+                    2
+                );
+                assert!(!methods.iter().any(|method| matches!(
+                    method.as_str(),
+                    "session/load" | "session/fork" | "session/cancel"
+                )));
+                fixture.client.shutdown().await.unwrap();
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn released_local_prompt_lets_the_next_prompt_through_and_ignores_the_late_completion() {
+        release_real_prompt_and_keep_the_next_owner(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
+        release_real_prompt_and_keep_the_next_owner(true).await;
+    }
     #[tokio::test]
     async fn oversized_reverse_reply_becomes_error_without_poisoning_connection() {
         use tokio::io::AsyncWriteExt;
@@ -4203,7 +4420,7 @@ mod tests {
                         assert!(!task.is_finished(), "socket EOF is not the owned child's death");
                         phase.store(13, AtomicOrdering::Relaxed);
                         let _ = control.cancel(operation_scope.clone()).await;
-                        let request: agent_client_protocol::schema::v1::PromptRequest =
+                        let request: agent_client_protocol::v1::schema::PromptRequest =
                             serde_json::from_value(serde_json::json!({
                                 "sessionId":"sid-adopted",
                                 "prompt":[{"type":"text","text":"must be refused after observed EOF"}]
@@ -4392,66 +4609,6 @@ mod tests {
     async fn resumed_prompt_completes_only_for_its_own_runner_request() {
         use crate::acp::event_sender::EventScope;
         use crate::acp::supervisor::test_support::managed::with_managed;
-
-        async fn own_stop(fixture: &ManagedControlFixture, request: &serde_json::Value) {
-            real_control_deadline(async {
-                loop {
-                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
-                    if events.iter().any(|stored| {
-                        stored.metadata.scope == EventScope::OperationCurrent
-                            && stored.metadata.native_prompt_id == request["id"].as_i64()
-                            && matches!(stored.event.as_ref(), Event::Stopped { reason } if reason == "prompt_complete")
-                    }) { break; }
-                    tokio::task::yield_now().await;
-                }
-            }).await;
-        }
-
-        async fn drained_old_completion(
-            fixture: &mut ManagedControlFixture,
-            callback_id: &str,
-            forbidden: &std::path::Path,
-        ) {
-            fixture.native.send(serde_json::json!({"jsonrpc":"2.0","id":callback_id,
-                "method":"fs/write_text_file","params":{
-                    "sessionId":"foreign-correlation-barrier","path":forbidden,"content":"must not be written"
-                }})).await;
-            let reply = real_control_deadline(fixture.native.reply()).await;
-            assert_eq!(reply["id"], callback_id);
-            assert_eq!(reply["error"]["code"], control_protocol::INVALID_PARAMS);
-            assert!(!forbidden.exists());
-            // A direct refusal proves reader progress, not SDK or parent application.
-            let barrier = format!("parent-processed-{callback_id}");
-            fixture.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
-                "sessionId":"foreign-correlation-barrier","update":{
-                    "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":barrier}
-                }
-            }})).await;
-            real_control_deadline(async {
-                loop {
-                    let events = fixture.store.replay_from(&fixture.client.id, 0).unwrap();
-                    if let Some(stored) = events.iter().find(|stored| {
-                        matches!(stored.event.as_ref(),
-                            Event::AgentMessageChunk { text, .. } if text == &barrier
-                        )
-                    }) {
-                        assert_eq!(stored.metadata.scope, EventScope::HistoryOnly);
-                        assert_eq!(
-                            stored
-                                .metadata
-                                .reported_session_id
-                                .as_ref()
-                                .map(|id| id.0.as_ref()),
-                            Some("foreign-correlation-barrier")
-                        );
-                        assert!(stored.metadata.operation.is_none());
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
-        }
 
         with_managed(|scope| {
             Box::pin(async move {

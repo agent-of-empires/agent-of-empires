@@ -22,6 +22,6 @@ pub(crate) mod passphrase_session;
 pub mod ws;
 
 pub use daemon_manager::{ensure_daemon, locate_daemon, require_daemon, ManagerError};
-pub use discovery::{discover, DaemonEndpoint, DiscoveryError, Source};
+pub use discovery::{discover, DiscoveryError};
 pub use http::{HttpClient, HttpError, PluginCommandView, REPLAY_PAGE_SIZE};
 pub use ws::{connect as ws_connect, connect_with as ws_connect_with, WsHandle, WsMessage};

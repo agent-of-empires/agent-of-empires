@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use serial_test::parallel;
 
-use crate::harness::{pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness};
+use crate::harness::{
+    init_git_repo, pick_free_port, require_node, require_tmux, wait_for_port, TuiTestHarness,
+};
 
 /// Pushes an absolute- and a relative-href `detail-badge` per session, writes
 /// a marker on `plugin.command.invoke`, and fires a relative-href
@@ -127,8 +129,8 @@ const send = (method, params) => {
   process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: ++nextId, method, params }) + '\n');
 };
 const resources = {
-  github: { id: 'pr', text: 'Open', tone: 'success' },
-  linear: { id: 'issue', text: 'WIP', tone: 'info' },
+  github: { id: 'pr', text: '⇄', tone: 'success' },
+  linear: { id: 'issue', text: '◐', tone: 'info' },
 };
 const resource = resources[process.argv[2]];
 const rl = readline.createInterface({ input: process.stdin });
@@ -141,7 +143,9 @@ rl.on('line', (line) => {
         slot: 'row-badge',
         id: resource.id,
         session_id: session.id,
-        payload: { text: resource.text, tone: resource.tone },
+        payload: process.argv[2] === 'github'
+          ? { items: [{ text: '⇄', presentation: 'glyph', tone: 'success' }, { text: '✓', presentation: 'glyph', tone: 'success' }, { text: '✉', presentation: 'glyph', tone: 'warn' }, { text: 'OPEN' }] }
+          : { text: resource.text, presentation: 'glyph', tone: resource.tone },
       });
     }
   }
@@ -224,21 +228,23 @@ fn tui_executes_plugin_commands_with_live_daemon() {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("worker.js"), WORKER_JS).unwrap();
     std::fs::write(src.join("aoe-plugin.toml"), manifest("worker.js")).unwrap();
-    for args in [
-        &["plugin", "install", src.to_str().unwrap(), "--yes"][..],
-        &["plugin", "enable", "acme.gh"],
-    ] {
-        let out = h.run_cli(args);
-        assert!(
-            out.status.success(),
-            "{args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let installed = h.run_cli(&["plugin", "install", src.to_str().unwrap(), "--yes"]);
+    assert!(
+        installed.status.success(),
+        "plugin install failed: {}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    // `plugin enable` goes through the Daemon, which must already run and see
+    // the env below.
     let opened = h.home_path().join("opened-urls.txt");
     h.set_env("AOE_OPEN_URL_TO", opened.to_str().unwrap());
-
     let (port, session_id) = h.start_structured_session("plugin-exec");
+    let enabled = h.run_cli(&["plugin", "enable", "acme.gh"]);
+    assert!(
+        enabled.status.success(),
+        "plugin enable failed: {}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
     h.spawn(&["acp", "attach", &session_id]);
     h.wait_for("Message the agent");
 
@@ -323,21 +329,7 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
     std::fs::write(&script_path, r#"{ "turns": [] }"#).expect("write fake ACP script");
     h.install_acp_shim(&script_path);
     let project = h.project_path();
-    for args in [
-        vec!["init", "-q"],
-        vec!["commit", "--allow-empty", "-q", "-m", "init"],
-    ] {
-        let output = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&project)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("run git");
-        assert!(output.status.success(), "git {args:?} failed");
-    }
+    init_git_repo(&project);
     h.stop_daemon_on_drop();
     let port = pick_free_port();
     let port_s = port.to_string();
@@ -356,7 +348,7 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
         "add",
         project.to_str().unwrap(),
         "-t",
-        "Plugin Resources",
+        "PR",
         "-c",
         "claude",
         "--structured-view",
@@ -366,24 +358,30 @@ fn run_plugin_row_status_scenario(scenario: &str, include_github: bool, include_
         "session creation failed: {}",
         String::from_utf8_lossy(&add.stderr)
     );
-    if include_github {
-        h.wait_for_timeout("Open", Duration::from_secs(30));
-    }
-    if include_linear {
-        h.wait_for_timeout("WIP", Duration::from_secs(30));
-    }
-    let home_screen = h.capture_screen();
-    let status_row = home_screen
-        .lines()
-        .find(|line| line.contains("Plugin Resources"))
-        .unwrap_or_else(|| panic!("session row missing from screen: {home_screen}"));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status_row = loop {
+        let screen = h.capture_screen();
+        if let Some(row) = screen.lines().find(|line| {
+            line.contains("PR")
+                && line.contains("⇄") == include_github
+                && line.contains("◐") == include_linear
+                && (!include_github || line.contains("✓ ✉  OPEN"))
+        }) {
+            break row.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "plugin badges missing for {scenario}: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     assert_eq!(
-        status_row.contains("Open"),
+        status_row.contains("⇄"),
         include_github,
         "GitHub row badge presence mismatch for {scenario}: {status_row}"
     );
     assert_eq!(
-        status_row.contains("WIP"),
+        status_row.contains("◐"),
         include_linear,
         "Linear row badge presence mismatch for {scenario}: {status_row}"
     );

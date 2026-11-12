@@ -773,7 +773,9 @@ impl CurrentNativeAvailability {
         self.ready = selected && self.client.connection_ready();
         self.unavailable = self.client.connection_unavailable();
         self.ready &= self.unavailable.is_none();
-        Ok(self.ready || self.unavailable.is_some())
+        Ok(self.ready
+            || self.unavailable.is_some()
+            || self.client.initial_prompt_intent_available())
     }
 
     /// After refresh, qualify ownership under the Native fence without a registry guard.
@@ -875,7 +877,9 @@ impl NativeAvailabilityProjection {
                 ready: current.ready && current.unavailable.is_none(),
                 unavailable: current.unavailable,
                 control_failure: None,
-                prompt_wake_eligible: false,
+                prompt_wake_eligible: !current.ready
+                    && current.unavailable.is_none()
+                    && current.client.initial_prompt_intent_available(),
                 context: Some(context),
                 owner: current.owner,
             };
@@ -946,7 +950,6 @@ impl Event {
         }
     }
 }
-
 /// Lifecycle status of an async background sub-agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1437,6 +1440,13 @@ pub enum Event {
     AgentMessageChunk {
         text: String,
         /// The ACP message this chunk belongs to; a change starts a new message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+    },
+    /// Summarized model thinking. Never fed back as context.
+    AgentThoughtChunk {
+        text: String,
+        /// The ACP message this chunk belongs to; a change starts a new thought.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
@@ -1940,7 +1950,7 @@ impl AcpState {
                     .saturating_sub(Self::MAX_RECENT_DIFFS);
                 self.recent_diffs.drain(..excess);
             }
-            Event::ThinkingStarted => {
+            Event::ThinkingStarted | Event::AgentThoughtChunk { .. } => {
                 self.thinking = Some(ThinkingSignal {
                     started_at: Utc::now(),
                 });

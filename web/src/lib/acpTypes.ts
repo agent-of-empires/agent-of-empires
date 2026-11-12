@@ -432,11 +432,11 @@ export type AcpEvent =
       };
     }
   | { AgentMessageChunk: { text: string; message_id?: string } }
+  | { AgentThoughtChunk: { text: string; message_id?: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
   | { PromptRuntimeError: { message: string; evidence?: OperationErrorEvidence | null } }
-  | { AcpConnectionUnavailable: AcpConnectionUnavailability }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | {
       UserPromptSent: {
@@ -464,7 +464,7 @@ export type AcpEvent =
         steering?: boolean;
       };
     }
-  | { AcpSessionAssigned: { acp_session_id: string; connection_ready?: boolean | null } }
+  | { AcpSessionAssigned: Record<string, unknown> }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
@@ -479,6 +479,8 @@ export type AcpEvent =
   | { BackgroundTaskFinished: { task_id: string; ended_at?: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
+  | { AcpConnectionUnavailable: AcpConnectionUnavailability }
+  | { AcpSessionAssigned: { acp_session_id: string; connection_ready?: boolean | null } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
 
 export interface PromptAttachmentRefWire {
@@ -606,6 +608,17 @@ export interface AcpState {
   optimisticRows: ActivityRow[];
   /** Frames with `seq` at or below this are dropped, so replays are idempotent. */
   lastSeq: number;
+  /** A current input receipt was observed for this connection. */
+  sessionAssigned: boolean;
+  /** This dashboard restarted a start still in progress; its own stop doesn't read as a stopped Worker. Not persisted. */
+  restartInFlight: boolean;
+  /** Counts restarts ended by a current receipt, startup error or another stop. */
+  restartEpoch: number;
+  /** A restart stopped the sent prompt and it hasn't been sent again. Kept here because the restart's stop
+   *  unmounts the startup line before the restart answers. Not persisted. */
+  restartStoppedSent: boolean;
+  /** Why a restart failed after its stop, which unmounts the startup line; the stopped banner shows it. Not persisted. */
+  restartFailure: string | null;
   /** Lowest loaded seq; older history pages load with `?before=<oldestSeq>`. */
   oldestSeq: number;
   lagged: boolean;
@@ -784,7 +797,6 @@ export interface ActivityRow {
     | "user_prompt"
     | "user_diff_comments"
     | "elicitation_answered"
-    | "empty_output"
     | "context_reset"
     | "notice"
     | "advisory"
@@ -821,7 +833,7 @@ export interface TranscriptRow {
   seq?: number;
   clear_after_seq?: number;
   group_id: string;
-  kind: Exclude<ActivityRow["kind"], "thinking">;
+  kind: ActivityRow["kind"];
   at: string;
   text: string;
   tool_call_id?: string;
@@ -958,31 +970,28 @@ export function emptyAcpState(): AcpState {
     locallyResolved: [],
     thinking: false,
     rateLimit: null,
-    rateLimitRetriesExhausted: null,
-    rateLimitParked: null,
+
     sessionUsage: null,
     usageBaseline: null,
     compactionReminderDismissed: null,
     activity: [],
     optimisticRows: [],
     lastSeq: 0,
+    sessionAssigned: false,
+    restartInFlight: false,
+    restartEpoch: 0,
+    restartStoppedSent: false,
+    restartFailure: null,
     oldestSeq: 0,
     lagged: false,
     startupError: null,
     incompatibleAgent: null,
     lastError: null,
     lastErrorEvidence: null,
-    connectionUnavailable: null,
-    connectionUnavailableNotice: null,
-    connectionReady: false,
-    nativeSnapshotSeq: null,
-    originalDecisionNonces: [],
-    promptWakeEligible: false,
     interactionError: null,
     turnActive: false,
     serverTurnActive: false,
-    replayTurnActive: false,
-    inflightPromptIds: [],
+
     promptSeq: 0,
     availableModes: [],
     currentModeId: null,
@@ -1015,6 +1024,17 @@ export function emptyAcpState(): AcpState {
     pendingConfigOption: null,
     sessionNotices: [],
     dismissedNoticeIds: [],
+    connectionUnavailableNotice: null,
+    replayTurnActive: false,
+    workflowSnapshotKeys: [],
+    rateLimitRetriesExhausted: null,
+    rateLimitParked: null,
+    connectionUnavailable: null,
+    connectionReady: false,
+    nativeSnapshotSeq: null,
+    originalDecisionNonces: [],
+    promptWakeEligible: false,
+    inflightPromptIds: [],
   };
 }
 
@@ -1229,6 +1249,17 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
       next.lastErrorEvidence = null;
       next.interactionError = null;
     }
+    if (event === "SessionCleared") {
+      next.lastError = null;
+      next.lastErrorEvidence = null;
+      next.interactionError = null;
+    }
+    return next;
+  }
+  if ("AgentThoughtChunk" in event) {
+    // Same turn signal as `ThinkingStarted`.
+    next.serverTurnActive = true;
+    next.turnActive = true;
     return next;
   }
   if ("ToolCallStarted" in event) {
@@ -1341,8 +1372,10 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
       next.rateLimit = null;
     }
+    // A restart stops the old Worker as `user_stopped`; any other stop ends the restart.
+    if (event.Stopped.reason !== "user_stopped") endRestart(next);
     if (event.Stopped.reason === "user_stopped") {
-      next.workerStopped = true;
+      next.workerStopped = !state.restartInFlight;
       next.workerRestarting = false;
       next.agentUnresponsive = false;
       next.agentOrphaned = false;
@@ -1375,6 +1408,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
+    endRestart(next);
     next.agentUnresponsive = false;
     closeTurn(next);
     return next;
@@ -1410,6 +1444,7 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("UserPromptSent" in event) {
+    next.restartStoppedSent = false;
     // Opening the turn here keeps `turnActive` from flickering between settling the id and the `reduced_state` frame.
     const pid = event.UserPromptSent.prompt_id;
     const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
@@ -1596,6 +1631,12 @@ function closeWorkflowRun(
   return key ? { ...runs, [key]: { ...runs[key]!, finished: true, endedAt } } : runs;
 }
 
+function endRestart(next: AcpState): void {
+  next.restartInFlight = false;
+  next.restartEpoch += 1;
+  next.restartFailure = null;
+}
+
 /** Fold a self-contained run of frames from an empty state, e.g. an older history page. */
 export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
@@ -1668,6 +1709,8 @@ export function applyReducedState(
     locallyResolved,
   };
   if (connectionReady) {
+    next.sessionAssigned = true;
+    endRestart(next);
     next.workerStopped = false;
     next.workerRestarting = false;
     next.workerIdleStopped = false;

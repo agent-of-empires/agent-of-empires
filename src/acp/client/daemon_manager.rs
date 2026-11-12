@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use thiserror::Error;
 
-use super::discovery::{discover, discover_env, DaemonEndpoint, DiscoveryError};
+use super::discovery::{discover, discover_env, DiscoveryError};
 use super::http::HttpError;
+use crate::daemon::DaemonEndpoint;
 
 #[derive(Debug, Error)]
 pub enum ManagerError {
@@ -82,6 +83,14 @@ pub(crate) async fn require_local_read_daemon() -> Result<DaemonEndpoint, Manage
         .map_err(|error| ManagerError::AutostartFailed(error.to_string()))?;
     announce_start(started);
     Ok(endpoint)
+}
+
+/// Acquire configuration authority without requiring an existing session profile.
+pub(crate) async fn require_config_daemon() -> Result<DaemonEndpoint, ManagerError> {
+    if discover_env().is_some() {
+        return require_daemon().await;
+    }
+    require_local_read_daemon().await
 }
 
 fn announce_start(started: Option<u32>) {

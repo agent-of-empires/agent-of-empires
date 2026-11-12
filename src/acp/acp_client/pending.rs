@@ -5,7 +5,7 @@ use crate::acp::elicitations::{
     build_response, summarize_answers, Elicitation, ElicitationAnswer, ElicitationOutcome,
     ElicitationResolution,
 };
-use agent_client_protocol::schema::v1::CreateElicitationResponse;
+use agent_client_protocol::v1::schema::CreateElicitationResponse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};

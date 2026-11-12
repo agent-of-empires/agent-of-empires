@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
 use super::spawn::{
-    allowlisted_env_pairs, is_host_only_path_env, request_env_denyreason, SpawnConfig,
+    adapter_default_env_pairs, allowlisted_env_pairs, is_host_only_path_env,
+    request_env_denyreason, SpawnConfig,
 };
 
 /// Sandbox handles a connection task needs to route ACP fs/* and
@@ -157,7 +158,11 @@ pub(super) fn build_sandbox_docker_argv(
         .filter(|&(key, _)| request_env_denyreason(key).is_none())
         .cloned();
     let adapter_allowlist = allowlisted_env_pairs(config);
-    for (key, value) in request_auth.chain(adapter_allowlist) {
+    let adapter_defaults = adapter_default_env_pairs(config);
+    for (key, value) in request_auth
+        .chain(adapter_allowlist)
+        .chain(adapter_defaults)
+    {
         if forwards_into_container(&key) {
             if seen_keys.insert(key.clone()) {
                 docker_args.push("-e".into());
@@ -437,6 +442,32 @@ mod tests {
         // Never as `-e KEY=VALUE`, which would leak the secret into argv.
         assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-session-request");
     }
+
+    /// The Claude thinking default crosses into the container, and a
+    /// `sandbox.environment` entry for the same key wins over it.
+    #[test]
+    fn build_sandbox_docker_argv_claude_thinking_default_yields_to_sandbox_env() {
+        const KEY: &str = "CLAUDE_CODE_THINKING_DISPLAY";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut info = sandbox("aoe-sandbox-thinking", None);
+        let argv =
+            build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
+                .unwrap();
+        assert_named_without_value(&argv, KEY, "summarized");
+
+        info.extra_env = Some(vec![format!("{KEY}=omitted")]);
+        let argv =
+            build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
+                .unwrap();
+        let named: Vec<&String> = argv
+            .docker_args
+            .iter()
+            .filter(|a| a.starts_with(KEY))
+            .collect();
+        assert_eq!(named, [&format!("{KEY}=omitted")]);
+        assert!(!argv.inherit_env.iter().any(|(k, _)| k == KEY));
+    }
+
     #[test]
     fn build_sandbox_docker_argv_rejects_host_only_provider_paths() {
         let tmp = tempfile::tempdir().unwrap();

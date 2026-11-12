@@ -124,7 +124,7 @@ export async function installTrashMocks(
   await mockStaticApis(page);
   await mockSessionShellApis(page);
 
-  await page.route("**/api/sessions", (r) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, (r) => {
     if (r.request().method() !== "GET") return r.fulfill({ status: 400 });
     const live = sessions.filter((s) => !handle.deletedIds.includes(s.id)).map((s) => sessionPayload(state.get(s.id)!));
     return r.fulfill({

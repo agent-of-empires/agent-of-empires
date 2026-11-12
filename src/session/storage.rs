@@ -101,28 +101,30 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Injected `sessions.json` write failure. Global rather than per-`Storage` so
-/// a test can arm it on a handle it still holds while the code under test
-/// writes through a backend it opened itself; every test that arms it runs
-/// serially and disarms it again.
 #[cfg(test)]
-static FAIL_WRITES_FOR_TEST: AtomicBool = AtomicBool::new(false);
+static WRITE_FAILURES_FOR_TEST: std::sync::LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Disarms [`FAIL_WRITES_FOR_TEST`] on drop, so an armed test can never leak
-/// the injection into the rest of the suite, since a panic unwinds through
-/// `Drop` and a bare `set(false)` after the failing call would not run.
 #[cfg(test)]
-pub(crate) struct WriteFailureGuard;
+pub(crate) struct WriteFailureGuard {
+    path: PathBuf,
+}
 
 #[cfg(test)]
 impl Drop for WriteFailureGuard {
     fn drop(&mut self) {
-        FAIL_WRITES_FOR_TEST.store(false, Ordering::SeqCst);
+        let mut failures = WRITE_FAILURES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = failures.get_mut(&self.path) {
+            *count -= 1;
+            if *count == 0 {
+                failures.remove(&self.path);
+            }
+        }
     }
 }
 
@@ -944,7 +946,7 @@ impl Storage {
 #[cfg(test)]
 fn report_lock_contention_for_test(path: &Path, shared_flock: bool) {
     LOCK_CONTENTION_OBSERVER.with(|slot| {
-        if let Some(sender) = slot.borrow_mut().take() {
+        if let Some(sender) = slot.borrow().as_ref() {
             let _ = sender.send(path.to_path_buf());
         }
     });
@@ -1417,6 +1419,27 @@ pub(crate) struct NativeStoreUnavailable;
 #[error("session metadata was committed but canonical adoption failed")]
 pub(crate) struct SessionCommitApplied;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LifecycleRelease {
+    Reservation(super::LifecycleOperation),
+    IndeterminateLaunch,
+}
+
+impl LifecycleRelease {
+    pub(crate) fn apply(self, row: &mut Instance, generation: u64) {
+        let operation = match self {
+            Self::Reservation(operation) => operation,
+            Self::IndeterminateLaunch => super::LifecycleOperation::Launch,
+        };
+        if row.release_lifecycle_reservation_if_owned(operation, generation)
+            && matches!(self, Self::IndeterminateLaunch)
+            && row.status == super::Status::Creating
+        {
+            row.status = super::Status::Starting;
+        }
+    }
+}
+
 pub(crate) trait SessionStore: Send + Sync {
     fn storage(&self) -> &Storage;
     fn load(&self) -> Result<Vec<Instance>>;
@@ -1433,6 +1456,10 @@ pub(crate) trait SessionStore: Send + Sync {
     /// Runs synchronously, at most once and exactly once on success.
     /// Mutation errors must prevent the write.
     fn commit(&self, mutation: &mut SessionMutation<'_>) -> Result<()>;
+    /// Finalize initial readiness without replacing newer runtime activity.
+    fn commit_launch_ready(&self, mutation: &mut SessionMutation<'_>) -> Result<()> {
+        self.commit(mutation)
+    }
     /// Canonical post-launch metadata checkpoint on this already bound store.
     /// The mutation must fence its original physical context, producer and full
     /// selection. Launch-only presentation fields are not metadata authority.
@@ -1442,7 +1469,7 @@ pub(crate) trait SessionStore: Send + Sync {
     fn release_lifecycle_reservation(
         &self,
         id: &str,
-        operation: super::LifecycleOperation,
+        release: LifecycleRelease,
         generation: u64,
         lifecycle: Option<StorageFlock>,
     ) -> Result<()> {
@@ -1453,7 +1480,7 @@ pub(crate) trait SessionStore: Send + Sync {
         };
         self.commit(&mut |rows, _| {
             if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
-                row.release_lifecycle_reservation_if_owned(operation, generation);
+                release.apply(row, generation);
             }
             Ok(())
         })
@@ -1461,7 +1488,7 @@ pub(crate) trait SessionStore: Send + Sync {
     fn defer_lifecycle_release(
         self,
         id: String,
-        operation: super::LifecycleOperation,
+        release: LifecycleRelease,
         generation: u64,
         lifecycle: Option<StorageFlock>,
     ) where
@@ -1471,7 +1498,7 @@ pub(crate) trait SessionStore: Send + Sync {
         if let Err(error) = std::thread::Builder::new()
             .name("aoe-lifecycle-reservation-release".into())
             .spawn(move || {
-                if let Err(error) = self.release_lifecycle_reservation(&id, operation, generation, lifecycle) {
+                if let Err(error) = self.release_lifecycle_reservation(&id, release, generation, lifecycle) {
                     tracing::warn!(target: "session.lifecycle", session = %id, %error, "deferred reservation release failed");
                 }
             })
@@ -1495,7 +1522,6 @@ pub(crate) trait SessionStore: Send + Sync {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()>;
 }
@@ -1517,6 +1543,8 @@ impl LaunchConfig {
 pub(crate) enum CaptureStorage<'a> {
     Profiles(&'a Arc<FileWatchService>),
     Scoped(&'a dyn SessionStore),
+    /// Caller-provided profile stores; Capture still acquires lifecycle ownership.
+    Provided(&'a dyn Fn(&str) -> Result<&'a dyn SessionStore>),
 }
 
 impl CaptureStorage<'_> {
@@ -1527,12 +1555,8 @@ impl CaptureStorage<'_> {
     ) -> Result<LaunchConfig> {
         match self {
             Self::Profiles(_) => Ok(local_launch_configuration(profile, project)),
-            Self::Scoped(storage) => {
-                anyhow::ensure!(
-                    storage.storage().profile() == profile,
-                    "capture profile changed during launch"
-                );
-                storage.launch_configuration(project)
+            Self::Scoped(_) | Self::Provided(_) => {
+                self.with_store(profile, |storage| storage.launch_configuration(project))
             }
         }
     }
@@ -1542,19 +1566,19 @@ impl CaptureStorage<'_> {
         profile: &str,
         action: impl FnOnce(&dyn SessionStore) -> Result<R>,
     ) -> Result<R> {
-        match self {
+        let storage = match self {
             Self::Profiles(file_watch) => {
                 let storage = Storage::new(profile, (*file_watch).clone())?;
-                action(&storage)
+                return action(&storage);
             }
-            Self::Scoped(storage) => {
-                anyhow::ensure!(
-                    storage.storage().profile() == profile,
-                    "capture profile changed during launch"
-                );
-                action(*storage)
-            }
-        }
+            Self::Scoped(storage) => *storage,
+            Self::Provided(provider) => provider(profile)?,
+        };
+        anyhow::ensure!(
+            storage.storage().profile() == profile,
+            "capture profile changed during launch"
+        );
+        action(storage)
     }
 }
 
@@ -1664,10 +1688,14 @@ impl SessionStore for Storage {
     fn migrate_sandbox_store(
         &self,
         id: &str,
-        reporter: Option<crate::migrations::progress::Reporter>,
         runtime: &crate::containers::ContainerRuntime,
     ) -> Result<()> {
-        crate::migrations::migrate_sandbox_store_for_with(id, reporter, self, runtime)
+        crate::migrations::migrate_sandbox_store_for_with(
+            id,
+            Some(crate::migrations::progress::tracing_reporter()),
+            self,
+            runtime,
+        )
     }
 
     fn managed_capture_store_is_exclusive(
@@ -2055,6 +2083,30 @@ impl Storage {
         })
     }
 
+    pub(crate) fn bind_native_input(self, instance_id: &str) -> Result<NativeInputStore> {
+        super::validate_instance_id(instance_id)?;
+        self.verify_bound_profile()?;
+        let resolved = resolve_symlink_chain(&self.sessions_path)?;
+        let sessions_directory = super::anchored_fs::AnchoredDir::open_reference(
+            resolved.parent().context("sessions path needs a parent")?,
+        )?;
+        let leaf = resolved.file_name().context("sessions path needs a leaf")?;
+        let files = self.files.as_deref().context("unbound input store")?;
+        anyhow::ensure!(
+            sessions_directory
+                .bind_file(leaf)?
+                .same_target(&files.sessions)?,
+            "native input sessions binding changed"
+        );
+        self.verify_bound_profile()?;
+        Ok(NativeInputStore {
+            storage: self,
+            sessions_directory,
+            sessions_leaf: PathBuf::from(leaf),
+            lifecycle_leaf: format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock").into(),
+        })
+    }
+
     /// Serialize launch/restart and explicit resume-target mutation for one
     /// instance across every process using this profile.
     ///
@@ -2121,11 +2173,16 @@ impl Storage {
         .is_none()
     }
 
-    /// Inject `sessions.json` write failures until the guard drops; the flag is process-wide.
+    /// Fail writes through any handle for this sessions path until the guard drops.
     #[cfg(test)]
     pub(crate) fn fail_writes_for_test(&self) -> crate::session::storage::WriteFailureGuard {
-        FAIL_WRITES_FOR_TEST.store(true, Ordering::SeqCst);
-        crate::session::storage::WriteFailureGuard
+        let path = self.sessions_path.clone();
+        *WRITE_FAILURES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(path.clone())
+            .or_default() += 1;
+        crate::session::storage::WriteFailureGuard { path }
     }
 
     pub fn profile(&self) -> &str {
@@ -2692,7 +2749,11 @@ impl Storage {
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
-        if FAIL_WRITES_FOR_TEST.load(Ordering::SeqCst) {
+        if WRITE_FAILURES_FOR_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&self.sessions_path)
+        {
             anyhow::bail!("injected sessions write failure");
         }
 
@@ -4339,6 +4400,45 @@ mod tests {
     use crate::session::GroupTree;
     use serial_test::serial;
     use tempfile::tempdir;
+
+    #[test]
+    #[serial]
+    fn write_failure_is_scoped_to_path_across_handles_and_guards() -> Result<()> {
+        let root = tempdir()?;
+        let paths = [root.path().join("a"), root.path().join("b")];
+        for path in &paths {
+            fs::create_dir(path)?;
+        }
+        let stores = paths.map(|path| {
+            Storage::new_for_test_path("failure-isolation", path.join("sessions.json"))
+        });
+        let write = |storage: &Storage| {
+            storage.update(|rows, _| {
+                rows.push(Instance::new("persisted", "/tmp"));
+                Ok(())
+            })
+        };
+        let first = stores[0].fail_writes_for_test();
+        write(&stores[1])?;
+        let peer =
+            Storage::new_for_test_path("failure-isolation", stores[0].sessions_path().to_owned());
+        std::thread::scope(|scope| {
+            assert!(scope.spawn(|| write(&peer)).join().unwrap().is_err());
+        });
+        assert!(stores[0].load()?.is_empty());
+        let nested = peer.fail_writes_for_test();
+        let other = stores[1].fail_writes_for_test();
+        drop(first);
+        assert!(write(&peer).is_err());
+        drop(nested);
+        write(&peer)?;
+        assert!(write(&stores[1]).is_err());
+        drop(other);
+        write(&stores[1])?;
+        assert_eq!(stores[0].load()?[0].title, "persisted");
+        assert_eq!(stores[1].load()?.len(), 2);
+        Ok(())
+    }
 
     #[test]
     #[serial]

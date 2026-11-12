@@ -52,6 +52,11 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
+    /// Provider-native status and terminal prompt replies. Requires API v19
+    /// and the `session.integration` capability.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_integrations: Vec<crate::agent_integration::AgentIntegrationContribution>,
+
     /// Host-rendered UI slots the plugin may populate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -622,6 +627,17 @@ pub struct UiContribution {
     /// Plugin-relative path to the page's self-contained HTML file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// `page` only: the dashboard hands the page the `?link=` value of its URL.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deep_link: bool,
+}
+
+/// An opaque page deep-link value: 1 to 128 URL-safe characters, so it never needs escaping.
+pub fn deep_link_value_ok(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'))
 }
 
 /// How the plugin's worker is launched.
@@ -732,6 +748,13 @@ impl PluginManifest {
             .iter()
             .find(|u| u.slot == UiSlot::Page && u.id == id)
             .and_then(|u| u.entry.as_deref())
+    }
+
+    /// Whether page `id` opted in to receive deep-link values.
+    pub fn page_deep_link(&self, id: &str) -> bool {
+        self.ui
+            .iter()
+            .any(|u| u.slot == UiSlot::Page && u.id == id && u.deep_link)
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
@@ -966,6 +989,74 @@ impl PluginManifest {
                 format!("status[{i}].id must not be empty"),
             );
         }
+        let mut integration_tools = std::collections::HashSet::new();
+        let status_integration = self
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == "session.integration");
+        for (i, integration) in self.agent_integrations.iter().enumerate() {
+            check(
+                if status_integration {
+                    !integration.provider_versions.is_empty()
+                        && integration.provider_versions.iter().all(|range| {
+                            !range.trim().is_empty() && semver::VersionReq::parse(range).is_ok()
+                        })
+                } else {
+                    integration.provider_versions.is_empty()
+                },
+                format!(
+                    "agent_integrations[{i}].provider_versions must be empty for launch-only agents or valid semver requirements for status integrations"
+                ),
+            );
+            check(
+                !integration.tool.is_empty()
+                    && integration.tool.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                    }),
+                format!("agent_integrations[{i}].tool must be a nonempty lowercase agent id"),
+            );
+            check(
+                integration
+                    .command
+                    .as_ref()
+                    .is_none_or(|command| !command.trim().is_empty()),
+                format!("agent_integrations[{i}].command must not be blank"),
+            );
+            if let Some(command) = integration
+                .command
+                .as_deref()
+                .filter(|command| !command.trim().is_empty())
+            {
+                check(
+                    crate::agent_integration::launch_prefix(command).is_some(),
+                    format!(
+                        "agent_integrations[{i}].command {command:?} must start with literal \
+                         NAME=value assignments and a literal executable that does not begin \
+                         with `-`; quotes, backslashes, `$`, backticks, `~`, `#`, empty words, \
+                         invalid assignment names, command separators, redirections, globs, \
+                         braces and whitespace other than single spaces or tabs are not \
+                         supported there (arguments after the executable are free-form)"
+                    ),
+                );
+            }
+            check(
+                integration_tools.insert(integration.tool.as_str()),
+                format!(
+                    "agent_integrations must not repeat tool {:?}",
+                    integration.tool
+                ),
+            );
+        }
+        if self
+            .agent_integrations
+            .iter()
+            .any(|integration| integration.replies || !integration.provider_versions.is_empty())
+        {
+            check(
+                status_integration,
+                "provider status integrations require the session.integration capability".into(),
+            );
+        }
         check(
             self.screenshots.len() <= MAX_SCREENSHOTS,
             format!(
@@ -1103,6 +1194,25 @@ impl PluginManifest {
                 "per_project settings require api_version >= 18".into(),
             );
         }
+        if self.api_version < 19 {
+            check(
+                self.agent_integrations.is_empty(),
+                "agent_integrations require api_version >= 19".into(),
+            );
+            check(
+                !self
+                    .capabilities
+                    .iter()
+                    .any(|c| c.as_str() == "session.integration"),
+                "the session.integration capability requires api_version >= 19".into(),
+            );
+        }
+        if self.api_version < 20 {
+            check(
+                self.ui.iter().all(|u| !u.deep_link),
+                "deep_link requires api_version >= 20".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1114,8 +1224,10 @@ impl PluginManifest {
             check(!u.id.is_empty(), format!("ui[{i}].id must not be empty"));
             if u.slot != UiSlot::Page {
                 check(
-                    u.title.is_none() && u.icon.is_none() && u.entry.is_none(),
-                    format!("ui[{i}]: title, icon and entry are only valid on a page slot"),
+                    u.title.is_none() && u.icon.is_none() && u.entry.is_none() && !u.deep_link,
+                    format!(
+                        "ui[{i}]: title, icon, entry and deep_link are only valid on a page slot"
+                    ),
                 );
                 continue;
             }
@@ -1409,6 +1521,48 @@ mod tests {
                 "only valid on a page slot",
             ),
         ]);
+    }
+
+    #[test]
+    fn page_deep_link_is_a_page_only_opt_in_and_values_are_checked() {
+        let page = |extra: &str| {
+            format!(
+                "{HEAD}20\n\n[[ui]]\nslot = \"page\"\nid = \"b\"\ntitle = \"B\"\nentry = \"x.html\"\n{extra}"
+            )
+        };
+        let m = PluginManifest::from_toml_str(&page("deep_link = true\n")).expect("parses");
+        assert!(m.page_deep_link("b"));
+        let m = PluginManifest::from_toml_str(&page("")).expect("parses");
+        assert!(!m.page_deep_link("b"));
+        assert!(!m.page_deep_link("other"));
+        rejects(&[(
+            "deep_link on another slot",
+            format!("{HEAD}20\n\n[[ui]]\nslot = \"card\"\nid = \"c\"\ndeep_link = true\n"),
+            "only valid on a page slot",
+        )]);
+        rejects(&[(
+            "deep_link before api_version 20",
+            format!(
+                "{HEAD}19\n\n[[ui]]\nslot = \"page\"\nid = \"b\"\ntitle = \"B\"\nentry = \"x.html\"\ndeep_link = true\n"
+            ),
+            "deep_link requires api_version >= 20",
+        )]);
+
+        for ok in ["a", "abc-123_.~X", &"a".repeat(128)] {
+            assert!(deep_link_value_ok(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "a b",
+            "a/b",
+            "a?b",
+            "a&b",
+            "a%20b",
+            "é",
+            &"a".repeat(129),
+        ] {
+            assert!(!deep_link_value_ok(bad), "{bad:?}");
+        }
     }
 
     #[test]

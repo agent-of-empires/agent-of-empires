@@ -296,6 +296,33 @@ impl Instance {
             self.tool,
             self.has_command_override()
         );
+        let integration_configured = crate::plugin::agent_integration::configured(self);
+        let integration_snapshot = integration_configured
+            .then(|| crate::plugin::agent_integration::snapshot(self))
+            .flatten();
+        if let Some(status) = crate::plugin::agent_integration::session_status_override(
+            integration_configured,
+            is_dead,
+            integration_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.status),
+        ) {
+            self.status = status;
+            self.detection.pending = None;
+            self.detection.rule = Some("agent_integration");
+            if self.status == Status::Error {
+                if is_dead {
+                    self.explain_error_from_pane(&session);
+                } else if self.last_error.is_none() {
+                    self.last_error = Some(summarize_error_from_pane(
+                        &session.capture_pane(20).unwrap_or_default(),
+                    ));
+                }
+            } else {
+                self.last_error = None;
+            }
+            return;
+        }
 
         // Two detection identities: hooks are installed for (and must be interpreted by) the
         // `agent_detect_as` alias when one is set, so hook reconciliation keeps the alias identity.
@@ -1278,7 +1305,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("earlier operation failed"));
         assert_eq!(inst.agent_session_id.as_deref(), Some("native-history"));
-        let response = crate::daemon::SessionResponse::from_instance(&inst, false);
+        let response = crate::server::api::sessions::session_response_from_instance(&inst, false);
         let public: crate::daemon::SessionResponse =
             serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
         let evidence = public
@@ -1299,7 +1326,6 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         assert!(stored.get("last_error").is_none());
         assert!(stored.get("last_error_evidence").is_none());
     }
-
     /// A turn's running and idle frames can share tmux's activity second.
     #[test]
     #[serial_test::serial]
@@ -1641,7 +1667,10 @@ HISTORY_READY",
         );
         assert!(wait_for_pane(&session_name, "HISTORY_READY"));
         let cache = crate::tmux::SessionCacheGuard::capture();
-        cache.force_present(&[session_name.as_str()]);
+        let poll = |inst: &mut Instance, metadata: &tmux::PaneMetadata| {
+            cache.force_present(&[session_name.as_str()]);
+            inst.update_status_with_metadata_inner(Some(metadata), Some(&session_name));
+        };
         let mut metadata = agent_pane_metadata("omp", None);
         metadata.pane_title = Some(String::new());
         for status in [
@@ -1655,7 +1684,7 @@ HISTORY_READY",
                 (status == Status::Error).then(|| "Provider denied request".to_owned());
             let diagnostic = inst.last_error.clone();
             for _ in 0..2 {
-                inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+                poll(&mut inst, &metadata);
                 assert_eq!(inst.status, status);
                 assert_eq!(inst.last_error, diagnostic);
             }
@@ -1663,8 +1692,8 @@ HISTORY_READY",
         inst.status = Status::Running;
         inst.last_error = None;
         metadata.pane_current_command = Some("bash".to_owned());
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        poll(&mut inst, &metadata);
+        poll(&mut inst, &metadata);
         assert_eq!(
             inst.status,
             Status::Idle,
@@ -1673,14 +1702,14 @@ HISTORY_READY",
         inst.last_error = None;
         metadata.pane_start_command_is_protected = true;
         inst.status = Status::Waiting;
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        poll(&mut inst, &metadata);
         assert_eq!(
             inst.status,
             Status::Waiting,
             "a live protected wrapper owns history"
         );
         metadata.pane_dead = true;
-        inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        poll(&mut inst, &metadata);
         assert_eq!(
             inst.status,
             Status::Error,

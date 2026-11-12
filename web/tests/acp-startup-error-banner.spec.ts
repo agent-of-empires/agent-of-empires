@@ -39,7 +39,7 @@ async function openFailedSession(page: Page) {
   return { banner, disables };
 }
 
-test("Use Terminal view confirms through the switch-view dialog, in keyboard order", async ({ page }) => {
+test("Use Terminal view confirms through the switch-view dialog, in keyboard order", async ({ page }, testInfo) => {
   const { banner, disables } = await openFailedSession(page);
 
   await banner.getByRole("button", { name: "Copy" }).focus();
@@ -55,6 +55,9 @@ test("Use Terminal view confirms through the switch-view dialog, in keyboard ord
   await expect(dialog).toContainText("Switch this session back to a tmux terminal?");
   // The banner only opens the confirmation; the switch waits for it.
   expect(disables).toEqual([]);
+  const capture = testInfo.outputPath("runtime-startup-refusal-terminal-confirmation.png");
+  await page.screenshot({ path: capture, fullPage: true, animations: "disabled" });
+  await testInfo.attach("runtime-startup-refusal-terminal-confirmation", { path: capture, contentType: "image/png" });
   await dialog.getByRole("button", { name: "Cancel" }).click();
   await expect(dialog).toBeHidden();
   expect(disables).toEqual([]);

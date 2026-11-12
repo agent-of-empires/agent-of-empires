@@ -21,7 +21,7 @@ use crate::acp::event_sender::EventSender;
 use crate::acp::state::{
     AcpConnectionCause, AcpConnectionPhase, AcpConnectionSource, AcpConnectionUnavailability, Event,
 };
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationScope, KillTerminalRequest, KillTerminalResponse, McpServer,
     ReadTextFileRequest, ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
@@ -29,7 +29,8 @@ use agent_client_protocol::schema::v1::{
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
     WriteTextFileRequest, WriteTextFileResponse,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, ByteStreams, Client};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -123,7 +124,7 @@ pub(crate) struct ConnectionState {
     #[cfg(test)]
     pub(super) test_session_update: std::sync::Mutex<
         Option<(
-            agent_client_protocol::schema::v1::SessionId,
+            agent_client_protocol::v1::schema::SessionId,
             super::SdkTestGate,
         )>,
     >,
@@ -239,6 +240,14 @@ impl ConnectionState {
 
     pub(super) fn ready(&self) -> bool {
         self.usable.load(Ordering::Acquire)
+            && self.loss().is_none()
+            && !self.is_stopping()
+            && !self.driver_finished()
+    }
+
+    pub(super) fn initial_prompt_intent_available(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == 1
+            && !self.usable.load(Ordering::Acquire)
             && self.loss().is_none()
             && !self.is_stopping()
             && !self.driver_finished()
@@ -408,7 +417,6 @@ impl ConnectionState {
         Some(observation)
     }
 }
-
 pub(super) struct RunnerLink {
     pub(super) control: Arc<DaemonControlClient>,
     /// Shared with the control reader, which claims an adopted turn's
@@ -593,7 +601,7 @@ pub(super) async fn run_connection_task<W, R>(
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
     let builder = Client
-        .builder()
+        .v1()
         .name("aoe-acp")
         .on_close({
             let control = control.clone();
@@ -603,12 +611,16 @@ pub(super) async fn run_connection_task<W, R>(
                     .connection_state
                     .sdk_closing
                     .store(true, Ordering::Release);
-                shared
-                    .connection_state
-                    .observe(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
-                shared.connection_state.mark_ordered_loss();
                 if let Some(control) = control {
-                    control.shutdown();
+                    control.close_sdk_route(
+                        AcpConnectionSource::Sdk,
+                        AcpConnectionCause::IncomingEnded,
+                    );
+                } else {
+                    shared
+                        .connection_state
+                        .observe(AcpConnectionSource::Sdk, AcpConnectionCause::IncomingEnded);
+                    shared.connection_state.mark_ordered_loss();
                 }
                 // Preserve an earlier correlated response's diagnostic and
                 // terminal before this actual SDK close cancels foreground.

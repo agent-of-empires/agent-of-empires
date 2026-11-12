@@ -157,11 +157,16 @@ pub async fn ensure_tool(
             if error.is::<crate::server::pane::AuxiliaryTargetUnavailable>() {
                 return StatusCode::CONFLICT.into_response();
             }
-            if error.is::<crate::tmux::LegacyToolUnavailable>() {
-                return (StatusCode::CONFLICT,
-                    Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
-                    .into_response();
+            if let Some(response) =
+                super::lifecycle::sandbox_migration_response(&state, &id, &error).await
+            {
+                return response;
             }
+            if error.is::<crate::tmux::LegacyToolUnavailable>() {
+            return (StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":"legacy_tool_ownership_unavailable", "message":error.to_string()})))
+                .into_response();
+        }
             if error.is::<crate::session::ToolLaunchUnavailable>() {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -196,7 +201,7 @@ pub async fn ensure_session(
 
 pub(super) fn physical_agent_target(
     instance: &Instance,
-) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>)>> {
+) -> anyhow::Result<Option<(String, Arc<crate::session::LegacyToolObservation>, bool)>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
         crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
@@ -206,10 +211,11 @@ pub(super) fn physical_agent_target(
     if pane.pane_dead {
         return Ok(None);
     }
+    let ready = instance.pane_is_ready(pane)?;
     let physical = pane
         .physical_observation()
         .ok_or(crate::session::LaunchIndeterminateCause::OwnershipUnproven)?;
-    Ok(Some((name.to_owned(), physical)))
+    Ok(Some((name.to_owned(), physical, ready)))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -282,6 +288,18 @@ pub(super) async fn agent_target_response(
     if instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if outcome.is_some() {
+        instance = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            instance.wait_for_pane_ready()?;
+            Ok(instance)
+        })
+        .await
+        {
+            Ok(Ok(instance)) => instance,
+            Ok(Err(error)) => return agent_target_error(state, error),
+            Err(error) => return agent_target_error(state, error.into()),
+        };
+    }
     let namespace = state.profile_namespace.read().await;
     let lock = state.instance_lock(id).await;
     let guard = lock.lock().await;
@@ -302,7 +320,9 @@ pub(super) async fn agent_target_response(
         );
         anyhow::ensure!(!instance.is_structured(), AgentTargetUnavailable);
         native.configuration(Some(&instance.source_profile))?;
-        let (name, physical) = physical_agent_target(&instance)?.ok_or(AgentTargetUnavailable)?;
+        let (name, physical, _) = physical_agent_target(&instance)?
+            .filter(|(_, _, ready)| *ready)
+            .ok_or(AgentTargetUnavailable)?;
         native.adopt_agent_observation(
             &instance,
             crate::session::PaneObservation {
@@ -410,10 +430,15 @@ pub(super) async fn prepared_agent_target_response(
 }
 
 fn agent_target_error(state: &AppState, error: anyhow::Error) -> axum::response::Response {
+    if let Some(cause) = error.downcast_ref::<crate::session::LaunchIndeterminateCause>() {
+        return indeterminate_launch_response(*cause);
+    }
     if let Some(response) = lifecycle_rejection(state, &error) {
         return response;
     }
-    if error.is::<crate::session::NativeStoreUnavailable>() {
+    if error.is::<crate::session::NativeStoreUnavailable>()
+        || error.is::<crate::session::LaunchFinalizationPending>()
+    {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
     if error.is::<AgentTargetUnavailable>() {
@@ -605,6 +630,11 @@ pub async fn ensure_container_terminal(
             }
             if error.is::<crate::session::NativeStoreUnavailable>() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if let Some(response) =
+                super::lifecycle::sandbox_migration_response(&state, &id, &error).await
+            {
+                return response;
             }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "container terminal ensure failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

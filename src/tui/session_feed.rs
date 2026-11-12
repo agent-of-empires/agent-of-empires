@@ -132,8 +132,10 @@ impl CommandFailure {
     fn classify(error: crate::daemon::DaemonClientError, submitted: bool) -> Self {
         use crate::daemon::DaemonClientError;
         let rejected = match &error {
-            DaemonClientError::Status { status, .. } => {
-                status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT
+            DaemonClientError::Status { status, code, .. } => {
+                status.is_client_error()
+                    && *status != reqwest::StatusCode::REQUEST_TIMEOUT
+                    && *code != Some(crate::daemon::ApiErrorCode::CreateOutcomeUnknown)
             }
             DaemonClientError::InvalidBaseUrl { .. }
             | DaemonClientError::InvalidPathSegment
@@ -224,7 +226,11 @@ impl NativePreparationScope {
             row.lifecycle_generation == self.identity.lifecycle_generation
                 && (!fixed
                     || pane.is_some_and(|pane| {
-                        (self.pane.physical.is_some()
+                        ((self.pane.physical.is_some()
+                            && pane
+                                .tmux_session
+                                .as_deref()
+                                .is_some_and(|name| !name.is_empty()))
                             || pane.tmux_session == self.pane.tmux_session)
                             && pane.physical == self.pane.physical
                             && pane.legacy_tool == self.pane.legacy_tool
@@ -270,6 +276,10 @@ impl NativeInputScope {
                 };
                 pane.state == crate::session::PanePresence::Alive
                     && pane.legacy_tool.is_none()
+                    && pane
+                        .tmux_session
+                        .as_deref()
+                        .is_some_and(|name| !name.is_empty())
                     && self.target.physical.is_some()
                     && pane.physical == self.target.physical
             })
@@ -730,6 +740,7 @@ async fn run_command_writer(
     #[cfg(test)] creation_count: Option<tokio::sync::watch::Sender<usize>>,
 ) {
     let mut creations = tokio::task::JoinSet::new();
+    let mut preparations = tokio::task::JoinSet::new();
     loop {
         let request = tokio::select! {
             request = requests.recv() => match request {
@@ -743,22 +754,14 @@ async fn run_command_writer(
                 }
                 continue;
             }
+            _ = preparations.join_next(), if !preparations.is_empty() => continue,
         };
-        let allowed = request.native.as_ref().map_or_else(
-            || grant.load(Ordering::SeqCst) == request.lease,
-            NativeLease::can_dispatch,
-        );
-        let expected = if allowed {
-            request.native.as_ref().and_then(|native| {
-                native
-                    .preparation
-                    .as_ref()
-                    .map(|preparation| preparation.identity.clone())
-            })
-        } else {
-            None
-        };
-        if allowed && matches!(&request.request, CommandRequest::Create(_)) {
+        if matches!(&request.request, CommandRequest::Create(_))
+            && request.native.as_ref().map_or_else(
+                || grant.load(Ordering::SeqCst) == request.lease,
+                NativeLease::can_dispatch,
+            )
+        {
             let SessionCommand {
                 request: CommandRequest::Create(body),
                 result,
@@ -783,7 +786,58 @@ async fn run_command_writer(
             }
             continue;
         }
-        let result = if !allowed {
+        let is_preparation = matches!(
+            &request.request,
+            CommandRequest::Session {
+                request: SessionRequest::EnsureAgent { .. }
+                    | SessionRequest::EnsureAuxiliary { .. }
+                    | SessionRequest::Mutation(
+                        SessionMutation::Start(_) | SessionMutation::Restart(_)
+                    ),
+                ..
+            }
+        );
+        if is_preparation {
+            let client = client.clone();
+            let epoch = epoch.clone();
+            let grant = grant.clone();
+            preparations.spawn(crate::task_util::supervise(
+                "tui.session_preparation",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    run_queued_command(&client, &epoch, &grant, request).await;
+                },
+            ));
+        } else {
+            run_queued_command(&client, &epoch, &grant, request).await;
+        }
+    }
+    creations.shutdown().await;
+    preparations.shutdown().await;
+}
+
+async fn run_queued_command(
+    client: &crate::daemon::DaemonClient,
+    epoch: &str,
+    grant: &AtomicU64,
+    request: SessionCommand,
+) {
+    let allowed = request.native.as_ref().map_or_else(
+        || grant.load(Ordering::SeqCst) == request.lease,
+        NativeLease::can_dispatch,
+    );
+    let expected = if allowed {
+        request.native.as_ref().and_then(|native| {
+            native
+                .preparation
+                .as_ref()
+                .map(|preparation| preparation.identity.clone())
+        })
+    } else {
+        None
+    };
+    let result =
+        if !allowed {
             Err(CommandFailure::Rejected(
                 "Request not submitted: runtime permission changed or continuation was cancelled"
                     .into(),
@@ -791,12 +845,12 @@ async fn run_command_writer(
         } else {
             match request.request {
                 CommandRequest::Create(_) => unreachable!(),
-                CommandRequest::Namespace(mutation) => run_namespace(&client, mutation, &epoch)
+                CommandRequest::Namespace(mutation) => run_namespace(client, mutation, epoch)
                     .await
                     .map(CommandReply::Namespace),
                 CommandRequest::Session { id, request } => match request {
                     SessionRequest::SmartRename => client
-                        .smart_rename_session(&id, &epoch)
+                        .smart_rename_session(&id, epoch)
                         .await
                         .map(|receipt| {
                             CommandReply::SmartRename(MutationReceipt {
@@ -805,35 +859,35 @@ async fn run_command_writer(
                             })
                         }),
                     SessionRequest::Trash(body) => client
-                        .trash_session(&id, &body, &epoch)
+                        .trash_session(&id, &body, epoch)
                         .await
                         .map(CommandReply::Trash),
                     SessionRequest::Purge(body) => client
-                        .purge_session(&id, &body, &epoch)
+                        .purge_session(&id, &body, epoch)
                         .await
                         .map(CommandReply::Purge),
                     SessionRequest::Restore => client
-                        .restore_session(&id, &epoch)
+                        .restore_session(&id, epoch)
                         .await
                         .map(CommandReply::Restore),
                     SessionRequest::Rename(body) => client
-                        .rename_session(&id, &body, &epoch)
+                        .rename_session(&id, &body, epoch)
                         .await
                         .map(CommandReply::Rename),
                     SessionRequest::SetWorktreeName(body) => client
-                        .set_worktree_name(&id, &body, &epoch)
+                        .set_worktree_name(&id, &body, epoch)
                         .await
                         .map(CommandReply::WorktreeName),
                     SessionRequest::AttachProject(body) => client
-                        .attach_session_project(&id, &body, &epoch)
+                        .attach_session_project(&id, &body, epoch)
                         .await
                         .map(CommandReply::AttachProject),
                     SessionRequest::Mutation(SessionMutation::Restart(body)) => client
-                        .restart_session(&id, &body, &epoch)
+                        .restart_session(&id, &body, epoch)
                         .await
                         .map(CommandReply::Restart),
                     SessionRequest::Mutation(mutation) => client
-                        .mutate_session(&id, &mutation, &epoch)
+                        .mutate_session(&id, &mutation, epoch)
                         .await
                         .map(CommandReply::Mutation),
                     SessionRequest::EnsureAuxiliary {
@@ -848,7 +902,7 @@ async fn run_command_writer(
                                         &id,
                                         index,
                                         &StartSessionBody { expected, size },
-                                        &epoch,
+                                        epoch,
                                     )
                                     .await
                             }
@@ -858,7 +912,7 @@ async fn run_command_writer(
                                         &id,
                                         index,
                                         &StartSessionBody { expected, size },
-                                        &epoch,
+                                        epoch,
                                     )
                                     .await
                             }
@@ -872,7 +926,7 @@ async fn run_command_writer(
                                             size,
                                             adoption,
                                         },
-                                        &epoch,
+                                        epoch,
                                     )
                                     .await
                             }
@@ -880,12 +934,12 @@ async fn run_command_writer(
                         receipt.map(CommandReply::Terminal)
                     }
                     SessionRequest::EnsureAgent { size } => client
-                        .ensure_agent(&id, &StartSessionBody { expected, size }, &epoch)
+                        .ensure_agent(&id, &StartSessionBody { expected, size }, epoch)
                         .await
                         .map(CommandReply::Terminal),
 
                     SessionRequest::CancelCreation => client
-                        .cancel_creation(&id, &epoch)
+                        .cancel_creation(&id, epoch)
                         .await
                         .map(CommandReply::Mutation),
                 },
@@ -900,6 +954,9 @@ async fn run_command_writer(
                         code,
                         crate::daemon::ApiErrorCode::PurgeFailed
                             | crate::daemon::ApiErrorCode::ManagedResumeRefused(_)
+                            | crate::daemon::ApiErrorCode::SandboxMigrationDeferred
+                            | crate::daemon::ApiErrorCode::LaunchIndeterminate
+                            | crate::daemon::ApiErrorCode::SandboxMigrationFailed
                     ) {
                         CommandFailure::Rejected(message)
                     } else {
@@ -910,10 +967,9 @@ async fn run_command_writer(
                 error => Err(CommandFailure::submitted(error)),
             })
         };
-        let _ = request.result.send(result);
-    }
-    creations.shutdown().await;
+    let _ = request.result.send(result);
 }
+
 #[derive(Clone)]
 struct QuitCancellationHandle {
     client: crate::daemon::DaemonClient,
@@ -930,6 +986,8 @@ pub struct SessionFeed {
     progress_receiver: tokio::sync::watch::Receiver<Option<Vec<CreationProgress>>>,
     diagnostics: tokio::sync::watch::Sender<Vec<crate::daemon::OwnerLoadDiagnostic>>,
     diagnostics_receiver: tokio::sync::watch::Receiver<Vec<crate::daemon::OwnerLoadDiagnostic>>,
+    sandbox_progress: tokio::sync::watch::Sender<Vec<crate::daemon::SandboxProgress>>,
+    sandbox_progress_receiver: tokio::sync::watch::Receiver<Vec<crate::daemon::SandboxProgress>>,
     quit_control: tokio::sync::watch::Sender<Option<QuitCancellationHandle>>,
     task: Option<tokio::task::JoinHandle<()>>,
     grant: Arc<AtomicU64>,
@@ -961,6 +1019,7 @@ impl SessionFeed {
         let (progress, progress_receiver) = tokio::sync::watch::channel(None);
         let (quit_control, _) = tokio::sync::watch::channel(None);
         let (diagnostics, diagnostics_receiver) = tokio::sync::watch::channel(Vec::new());
+        let (sandbox_progress, sandbox_progress_receiver) = tokio::sync::watch::channel(Vec::new());
         Self {
             sender,
             receiver,
@@ -970,6 +1029,8 @@ impl SessionFeed {
             task: None,
             diagnostics,
             diagnostics_receiver,
+            sandbox_progress,
+            sandbox_progress_receiver,
             grant: Arc::new(AtomicU64::new(0)),
             native_grant: Arc::new(AtomicU64::new(0)),
             preview_input: std::sync::Mutex::new(None),
@@ -1030,6 +1091,8 @@ impl SessionFeed {
         let sender = self.sender.clone();
         let quit_control = self.quit_control.clone();
         let diagnostics = self.diagnostics.clone();
+        let sandbox_progress = self.sandbox_progress.clone();
+        sandbox_progress.send_replace(Vec::new());
         self.task = Some(tokio::spawn(async move {
             let result: anyhow::Result<()> = async {
                 let (mut connection, client) = match prepared {
@@ -1077,10 +1140,14 @@ impl SessionFeed {
                             Ok(RuntimeEvent::Progress(progresses)) => {
                                 progress.send_replace(Some(progresses));
                             }
+                            Ok(RuntimeEvent::Sandbox(current)) => {
+                                sandbox_progress.send_replace(current);
+                            }
                             Err(error) => {
                                 set_grant(&grant, false);
                                 set_grant(&native_grant, false);
                                 progress.send_replace(Some(Vec::new()));
+                                sandbox_progress.send_replace(Vec::new());
                                 sender.send_replace(Some(SessionFeedResult::Unavailable(
                                     error.to_string(),
                                 )));
@@ -1104,11 +1171,39 @@ impl SessionFeed {
             set_grant(&grant, false);
             set_grant(&native_grant, false);
             quit_control.send_replace(None);
+            sandbox_progress.send_replace(Vec::new());
             if let Err(error) = result {
                 sender.send_replace(Some(SessionFeedResult::Unavailable(error.to_string())));
             }
         }));
     }
+    pub(crate) fn poll_sandbox_progress(&mut self) -> bool {
+        let changed = self
+            .sandbox_progress_receiver
+            .has_changed()
+            .unwrap_or(false);
+        self.sandbox_progress_receiver.borrow_and_update();
+        changed
+    }
+
+    pub(crate) fn sandbox_status_line(&self) -> Option<String> {
+        if !self.native_interaction_available() {
+            return None;
+        }
+        let progress = self.sandbox_progress_receiver.borrow();
+        let current = progress.iter().find(|item| {
+            self.pending.contains_key(&item.session_id)
+                && self
+                    .applied_session(&item.session_id)
+                    .is_some_and(|row| row.profile == item.profile)
+        })?;
+        let title = &self.applied_session(&current.session_id)?.title;
+        Some(format!(
+            "moving the agent store of '{title}': {}",
+            current.activity
+        ))
+    }
+
     pub(crate) fn take_diagnostics(&mut self) -> Option<Vec<crate::daemon::OwnerLoadDiagnostic>> {
         self.diagnostics_receiver
             .has_changed()
@@ -2665,6 +2760,11 @@ mod tests {
         for (request, code, known) in [
             (
                 SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "launch_indeterminate",
+                true,
+            ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
                 "start_failed",
                 false,
             ),
@@ -2678,10 +2778,20 @@ mod tests {
                 "managed_resume_refused",
                 true,
             ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "sandbox_migration_deferred",
+                true,
+            ),
+            (
+                SessionRequest::Mutation(SessionMutation::Start(StartSessionBody::default())),
+                "sandbox_migration_failed",
+                true,
+            ),
         ] {
             let app = axum::Router::new().fallback(move || async move {
                 (
-                    if code == "start_failed" {
+                    if matches!(code, "start_failed" | "sandbox_migration_failed") {
                         axum::http::StatusCode::INTERNAL_SERVER_ERROR
                     } else {
                         axum::http::StatusCode::CONFLICT
@@ -2748,7 +2858,7 @@ mod tests {
         let mut instance = crate::session::Instance::new("original-title", "/tmp/rename");
         instance.id = "rename".into();
         instance.source_profile = "test".into();
-        let row = crate::daemon::SessionResponse::from_instance(&instance, false);
+        let row = crate::server::api::sessions::session_response_from_instance(&instance, false);
         let mut original = snapshot("test", 1);
         Arc::make_mut(&mut original)
             .contents
@@ -2862,6 +2972,79 @@ mod tests {
                     .unwrap(),
             }),
         })
+    }
+
+    #[test]
+    fn sandbox_progress_follows_applied_identity_and_pending_canonical_settlement() {
+        let (mut feed, mut requests) = feed_with_native_lane();
+        let mut original = native_identity_snapshot(1);
+        Arc::make_mut(&mut original).contents.sessions[0].title = "original-title".into();
+        feed.publish_for_test(SessionFeedResult::Snapshot(original.clone()));
+        feed.mark_snapshot_applied(original);
+        let mut prepared = feed.ensure_agent("session".into(), None).unwrap();
+        let command = requests.try_recv().unwrap();
+        let progress = |id: &str, profile: &str, activity: &str| crate::daemon::SandboxProgress {
+            operation_id: format!("{id}-{profile}"),
+            session_id: id.into(),
+            profile: profile.into(),
+            activity: activity.into(),
+        };
+        feed.sandbox_progress.send_replace(vec![
+            progress("unrelated", "test", "unrelated-activity"),
+            progress("session", "foreign", "foreign-activity"),
+            progress("session", "test", "owned-activity"),
+        ]);
+        let line = feed.sandbox_status_line().unwrap();
+        assert!(
+            line.contains("original-title") && line.contains("owned-activity"),
+            "{line}"
+        );
+        assert!(!line.contains("foreign-activity") && !line.contains("unrelated-activity"));
+        assert!(feed.has_pending("session"));
+        assert!(prepared.result.try_recv().is_err());
+
+        let mut moved = native_identity_snapshot(2);
+        let row = &mut Arc::make_mut(&mut moved).contents.sessions[0];
+        row.profile = "moved".into();
+        row.title = "moved-title".into();
+        feed.publish_for_test(SessionFeedResult::Snapshot(moved.clone()));
+        let line = feed.sandbox_status_line().unwrap();
+        assert!(line.contains("original-title") && !line.contains("moved-title"));
+        feed.mark_snapshot_applied(moved);
+        assert!(feed.sandbox_status_line().is_none());
+        feed.sandbox_progress
+            .send_replace(vec![progress("session", "moved", "current-activity")]);
+        let line = feed.sandbox_status_line().unwrap();
+        assert!(line.contains("moved-title") && line.contains("current-activity"));
+
+        command
+            .result
+            .send(Ok(CommandReply::CommittedFailure {
+                cursor: RuntimeCursor {
+                    epoch: "test".into(),
+                    revision: 3,
+                },
+                failure: CommandFailure::Rejected("migration deferred".into()),
+            }))
+            .unwrap();
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(feed.sandbox_status_line().is_some());
+        assert!(prepared.result.try_recv().is_err());
+        let mut committed = native_identity_snapshot(3);
+        Arc::make_mut(&mut committed).contents.sessions[0].profile = "moved".into();
+        feed.publish_for_test(SessionFeedResult::Snapshot(committed.clone()));
+        feed.mark_snapshot_applied(committed);
+        assert!(feed.drain_command_errors().is_empty());
+        assert!(!feed.has_pending("session"));
+        assert!(feed.can_submit("session"));
+        assert!(feed.sandbox_status_line().is_none());
+        assert!(prepared.result.try_recv().unwrap().is_err());
+
+        let _next = feed.ensure_agent("session".into(), None).unwrap();
+        let _next_command = requests.try_recv().unwrap();
+        assert!(feed.sandbox_status_line().is_some());
+        set_grant(&feed.native_grant, false);
+        assert!(feed.sandbox_status_line().is_none());
     }
 
     fn native_identity_snapshot(revision: u64) -> Arc<RuntimeSnapshot> {
@@ -3327,6 +3510,114 @@ mod tests {
             panic!("expected the queued row");
         };
         assert_eq!(id, format!("row-{COMMAND_CAPACITY}"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_sandbox_preparation_does_not_block_another_sessions_stop() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = entered.clone();
+        let gate = release.clone();
+        let app = axum::Router::new()
+            .route(
+                "/api/sessions/slow/ensure",
+                axum::routing::post(move || {
+                    let started = started.clone();
+                    let gate = gate.clone();
+                    async move {
+                        started.notify_one();
+                        gate.notified().await;
+                        (
+                            [
+                                (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                                (crate::daemon::RUNTIME_REVISION_HEADER, "3"),
+                            ],
+                            axum::Json(serde_json::json!({
+                                "tmux_session": "ready", "status": "alive",
+                                "profile": "work", "lifecycle_generation": 1,
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/other/stop",
+                axum::routing::post(|| async {
+                    [
+                        (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
+                        (crate::daemon::RUNTIME_REVISION_HEADER, "2"),
+                    ]
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = crate::daemon::DaemonClient::new(&format!("http://{address}"), None).unwrap();
+        let (requests, receiver) = tokio::sync::mpsc::channel(COMMAND_CAPACITY);
+        let writer = tokio::spawn(run_command_writer(
+            client,
+            "test".into(),
+            Arc::new(AtomicU64::new(1)),
+            receiver,
+            None,
+        ));
+        let lease = NativeLease {
+            grant: Arc::new(AtomicU64::new(1)),
+            generation: 1,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            scope: Arc::new(std::sync::OnceLock::new()),
+            preparation: None,
+            latest: None,
+        };
+        let (slow_result, mut slow_reply) = tokio::sync::oneshot::channel();
+        requests
+            .send(SessionCommand {
+                request: CommandRequest::Session {
+                    id: "slow".into(),
+                    request: SessionRequest::EnsureAgent { size: None },
+                },
+                lease: 1,
+                native: Some(lease.clone()),
+                result: slow_result,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        lease.cancel_continuation();
+        let (stop_result, stop_reply) = tokio::sync::oneshot::channel();
+        requests
+            .send(SessionCommand {
+                request: CommandRequest::Session {
+                    id: "other".into(),
+                    request: SessionRequest::Mutation(SessionMutation::Stop),
+                },
+                lease: 1,
+                native: None,
+                result: stop_result,
+            })
+            .await
+            .unwrap();
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(3), stop_reply)
+            .await
+            .expect("stop must not wait behind the held sandbox copy")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(stopped, CommandReply::Mutation(cursor) if cursor.revision == 2));
+        assert!(matches!(
+            slow_reply.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.notify_one();
+        let prepared = slow_reply.await.unwrap().unwrap();
+        assert!(
+            matches!(prepared, CommandReply::Terminal(receipt) if receipt.cursor.revision == 3 && receipt.outcome.tmux_session == "ready")
+        );
+        drop(requests);
+        writer.await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
@@ -3993,14 +4284,53 @@ mod tests {
     #[tokio::test]
     async fn agent_ensure_failures_preserve_refusal_quarantine_and_commit_fences() {
         use axum::response::IntoResponse;
-        for (ensure_status, committed_revision) in [
-            (axum::http::StatusCode::FORBIDDEN, None),
-            (axum::http::StatusCode::CONFLICT, None),
-            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, None),
-            (axum::http::StatusCode::OK, None),
-            (axum::http::StatusCode::CONFLICT, Some("1")),
-            (axum::http::StatusCode::CONFLICT, Some("2")),
-            (axum::http::StatusCode::CONFLICT, Some("3")),
+        for (ensure_status, committed_revision, code) in [
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "launch_indeterminate",
+            ),
+            (
+                axum::http::StatusCode::FORBIDDEN,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                None,
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                None,
+                "managed_resume_refused",
+            ),
+            (axum::http::StatusCode::OK, None, "managed_resume_refused"),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("1"),
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("2"),
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "managed_resume_refused",
+            ),
+            (
+                axum::http::StatusCode::CONFLICT,
+                Some("3"),
+                "sandbox_migration_deferred",
+            ),
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Some("3"),
+                "sandbox_migration_failed",
+            ),
         ] {
             let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
             let app = axum::Router::new().route(
@@ -4014,10 +4344,7 @@ mod tests {
                                 return (
                                     ensure_status,
                                     [
-                                        (
-                                            crate::daemon::ERROR_CODE_HEADER,
-                                            "managed_resume_refused",
-                                        ),
+                                        (crate::daemon::ERROR_CODE_HEADER, code),
                                         (crate::daemon::RUNTIME_EPOCH_HEADER, "test"),
                                         (crate::daemon::RUNTIME_REVISION_HEADER, revision),
                                     ],
@@ -4095,7 +4422,8 @@ mod tests {
                 }
             }
             assert!(preparation.result.try_recv().unwrap().is_err());
-            let unknown = ensure_status.is_server_error() || ensure_status.is_success();
+            let unknown = committed_revision.is_none()
+                && (ensure_status.is_server_error() || ensure_status.is_success());
             assert_eq!(feed.can_submit("id"), !unknown);
             assert_eq!(errors.iter().any(|error| error.outcome_unknown), unknown);
             assert_eq!(*seen.lock().unwrap(), ["ensure"]);
@@ -4385,6 +4713,7 @@ mod tests {
             Invalidation::Presence(PanePresence::Dead),
             Invalidation::Presence(PanePresence::Unknown),
             Invalidation::TargetName(None),
+            Invalidation::TargetName(Some("")),
             Invalidation::TargetName(Some("another-owned-target")),
         ] {
             let target = AuxiliaryTarget::Tool {
@@ -4489,10 +4818,11 @@ mod tests {
             let ready = prepared.result.try_recv().unwrap();
             assert_eq!(
                 ready.is_ok(),
-                matches!(
-                    invalidation,
-                    Invalidation::None | Invalidation::TargetName(_)
-                ),
+                matches!(invalidation, Invalidation::None)
+                    || matches!(
+                        invalidation,
+                        Invalidation::TargetName(Some(name)) if !name.is_empty()
+                    ),
                 "{invalidation:?}"
             );
             assert!(feed.can_submit("session"));

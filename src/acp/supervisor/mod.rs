@@ -36,7 +36,7 @@ use crate::daemon::{AcpWorkerStart, AcpWorkerStartKind, AcpWorkerState};
 use crate::session::SandboxInfo;
 pub(crate) use teardown::{NativeBindingCheckpoint, RetirementResources, RetirementTarget};
 
-pub(crate) use agents::apply_agent_command_override;
+pub(crate) use agents::{apply_agent_command_override, command_override_for_spawn};
 pub(crate) use launch::{host_spawn_environment, with_durable_launch};
 pub use sink::{BroadcastSink, ChannelSink};
 
@@ -151,6 +151,14 @@ pub enum PromptDisposition {
     /// A clear command the adapter cannot handle natively: drive
     /// [`Supervisor::reset_session_context`] instead of forwarding it.
     ResetContext,
+}
+
+/// A published user prompt: how to route its text, and the seq of its
+/// `UserPromptSent` event, which is `None` when that event was not persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedPrompt {
+    pub disposition: PromptDisposition,
+    pub seq: Option<u64>,
 }
 
 /// How this supervisor acquired the worker.
@@ -806,12 +814,13 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub(crate) fn idle_observation(&self, session_id: &str) -> Option<(Lease, u64)> {
-        let lifecycle = lock_recover(&self.lifecycle);
+        let lifecycle = match self.lifecycle.try_lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
         let (lease, _) = lifecycle.running(session_id)?;
-        let sequence = lock_recover(&self.next_seqs).get(session_id).cloned();
-        let activity = sequence
-            .as_ref()
-            .map_or(0, |sequence| lock_recover(sequence).seq);
+        let activity = try_activity_seq(&self.next_seqs, session_id)?;
         Some((lease, activity))
     }
 
@@ -1072,6 +1081,24 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
+/// Idle observation must not wait for another publisher's durable store I/O.
+fn try_activity_seq(next_seqs: &SeqMap, session_id: &str) -> Option<u64> {
+    let sessions = match next_seqs.try_lock() {
+        Ok(sessions) => sessions,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let Some(counter) = sessions.get(session_id) else {
+        return Some(0);
+    };
+    let activity = match counter.try_lock() {
+        Ok(activity) => activity,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(activity.seq)
+}
+
 fn sequence_slot(next_seqs: &SeqMap, session_id: &str) -> Arc<std::sync::Mutex<SessionSequence>> {
     let mut sequences = lock_recover(next_seqs);
     match sequences.get(session_id) {
@@ -1089,14 +1116,15 @@ fn with_session_sequence<T>(
     session_id: &str,
     publish: impl FnOnce(&mut u64) -> T,
 ) -> T {
-    loop {
+    // Both store I/O and waiters leave the async worker while publication is serialized.
+    sink::blocking_io(|| loop {
         let slot = sequence_slot(next_seqs, session_id);
         let mut sequence = lock_recover(&slot);
         if sequence.retired {
             continue;
         }
         return publish(&mut sequence.seq);
-    }
+    })
 }
 
 fn with_publication_seq<T>(

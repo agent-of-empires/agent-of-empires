@@ -489,4 +489,48 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn restart_tool_and_switch_account_parse() {
+        let Commands::Session {
+            command: crate::cli::session::SessionCommands::Restart(args),
+        } = Cli::try_parse_from([
+            "aoe",
+            "session",
+            "restart",
+            "demo",
+            "--tool",
+            "claude-b",
+            "--to-profile",
+            "work",
+        ])
+        .expect("parse")
+        .command
+        .expect("command")
+        else {
+            panic!("not a session restart");
+        };
+        assert_eq!(args.identifier.as_deref(), Some("demo"));
+        assert_eq!(args.tool.as_deref(), Some("claude-b"));
+        assert_eq!(args.to_profile.as_deref(), Some("work"));
+
+        for argv in [
+            ["aoe", "session", "restart", "--all", "--tool", "claude-b"],
+            ["aoe", "session", "restart", "--tool", "claude-b", "--all"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+
+        let Commands::Acp {
+            command: crate::cli::acp::AcpCommands::SwitchAccount { session, tool },
+        } = Cli::try_parse_from(["aoe", "acp", "switch-account", "abc123", "claude-b"])
+            .expect("parse")
+            .command
+            .expect("command")
+        else {
+            panic!("not a switch-account");
+        };
+        assert_eq!((session.as_str(), tool.as_str()), ("abc123", "claude-b"));
+        assert!(Cli::try_parse_from(["aoe", "acp", "switch-account", "abc123"]).is_err());
+    }
 }

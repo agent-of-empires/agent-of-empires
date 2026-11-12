@@ -252,6 +252,15 @@ impl PaneEnvMutation {
 const SIZE_OWNER_OPT: &str = "@aoe_size_owner";
 const SIZE_OWNER_HB_OPT: &str = "@aoe_size_owner_hb";
 
+/// Outcome of claiming a tmux owner lease. `Held` means a live owner exists;
+/// `Error` means tmux could not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerClaim {
+    Claimed,
+    Held,
+    Error,
+}
+
 /// tmux user options holding the cross-process VT-pipe owner lock. `tmux
 /// pipe-pane` is exclusive per pane: a second process arming it silently
 /// kills the first process's forwarder, so two aoe processes previewing the
@@ -1000,7 +1009,7 @@ impl Session {
             [
                 "-P".to_owned(),
                 "-F".to_owned(),
-                "#{session_id}|#{pane_id}|#{pane_pid}|#{socket_path}|#{pid}".to_owned(),
+                "#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{socket_path}".to_owned(),
             ],
         );
         let target = format!("={}:", self.name);
@@ -1170,7 +1179,10 @@ impl Session {
                         physical,
                         &crate::tmux::TmuxCommandDeadline::new(),
                     )?,
-                    Some((super::utils::PaneProbe::Alive, _, _))
+                    Some(super::utils::OwnedPaneProbe {
+                        state: super::utils::PaneProbe::Alive,
+                        ..
+                    })
                 ),
                 "Native attachment target is no longer physically available"
             );
@@ -1906,15 +1918,9 @@ impl Session {
         Ok(())
     }
 
-    /// Sends exactly the given token sequence to the pane, in order, with no
-    /// implicit trailing key. Unlike [`send_keys_with_delay`](Self::send_keys_with_delay),
-    /// which always appends a submitting `Enter`, the caller's token list
-    /// fully controls what reaches the pane: a bare menu-digit selection
-    /// needs zero `Enter`s, while a multi-step button navigation needs
-    /// exactly as many as its shape requires. Used to answer an agent CLI's
-    /// own interactive permission prompt; see
-    /// [`crate::agents::PermissionResponse`].
-    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken]) -> Result<()> {
+    /// Send exactly these tokens, with no implicit Enter, to answer an agent's own
+    /// permission prompt.
+    pub fn send_key_tokens(&self, tokens: &[crate::agents::KeyToken<'_>]) -> Result<()> {
         if self.physical.is_none() && !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
@@ -2186,10 +2192,22 @@ impl Session {
         ttl: Duration,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) -> bool {
+        self.claim_owner_outcome_with_deadline(opt, hb_opt, owner_id, ttl, deadline)
+            == OwnerClaim::Claimed
+    }
+
+    fn claim_owner_outcome_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        ttl: Duration,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> OwnerClaim {
         let (observed_owner, observed_heartbeat) =
             match self.owner_snapshot_with_deadline(opt, hb_opt, deadline) {
                 Ok(snapshot) => snapshot,
-                Err(_) => return false,
+                Err(_) => return OwnerClaim::Error,
             };
         let current = Self::parse_owner_snapshot(&observed_owner, &observed_heartbeat)
             .ok()
@@ -2201,7 +2219,7 @@ impl Session {
             Some((_, hb)) => now.saturating_sub(*hb) > ttl.as_millis() as u64,
         };
         if !claimable {
-            return false;
+            return OwnerClaim::Held;
         }
         let heartbeat = next_owner_heartbeat(current.as_ref().map_or(0, |(_, hb)| *hb));
         let replaced = self.replace_owner_pair_if_observed_with_deadline(
@@ -2213,21 +2231,25 @@ impl Session {
             deadline,
         );
         if matches!(replaced, Ok(true)) {
-            return true;
+            return OwnerClaim::Claimed;
         }
 
-        if matches!(
-            self.owner_at_result_with_deadline(opt, hb_opt, deadline),
-            Ok(Some((id, _))) if id == owner_id
-        ) {
-            return true;
+        let after = self.owner_at_result_with_deadline(opt, hb_opt, deadline);
+        if matches!(&after, Ok(Some((id, _))) if id == owner_id) {
+            return OwnerClaim::Claimed;
         }
         if replaced.is_err() {
             self.release_owner_pair_at_with_deadline(
                 opt, hb_opt, owner_id, heartbeat, false, deadline,
             );
+            return OwnerClaim::Error;
         }
-        false
+        match after {
+            Ok(Some((_, hb))) if now_ms().saturating_sub(hb) <= ttl.as_millis() as u64 => {
+                OwnerClaim::Held
+            }
+            _ => OwnerClaim::Error,
+        }
     }
 
     fn refresh_owner_at(&self, opt: &str, hb_opt: &str, owner_id: &str) -> bool {
@@ -2287,7 +2309,7 @@ impl Session {
 
     pub fn claim_vt_owner(&self, owner_id: &str, ttl: Duration) -> bool {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
-        self.claim_vt_owner_with_deadline(owner_id, ttl, &deadline)
+        self.claim_vt_owner_with_deadline(owner_id, ttl, &deadline) == OwnerClaim::Claimed
     }
 
     pub(crate) fn claim_vt_owner_with_deadline(
@@ -2295,8 +2317,14 @@ impl Session {
         owner_id: &str,
         ttl: Duration,
         deadline: &crate::tmux::TmuxCommandDeadline,
-    ) -> bool {
-        self.claim_owner_at_with_deadline(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, ttl, deadline)
+    ) -> OwnerClaim {
+        self.claim_owner_outcome_with_deadline(
+            VT_OWNER_OPT,
+            VT_OWNER_HB_OPT,
+            owner_id,
+            ttl,
+            deadline,
+        )
     }
 
     pub fn refresh_vt_owner(&self, owner_id: &str) -> bool {
@@ -4316,6 +4344,14 @@ mod tests {
         assert!(session.claim_vt_owner("pid-1", Duration::from_secs(10)));
         assert!(session.claim_vt_owner("pid-1", Duration::from_secs(10)));
         assert!(!session.claim_vt_owner("pid-2", Duration::from_secs(10)));
+        assert_eq!(
+            session.claim_vt_owner_with_deadline(
+                "pid-2",
+                Duration::from_secs(10),
+                &crate::tmux::TmuxCommandDeadline::new()
+            ),
+            OwnerClaim::Held
+        );
         assert!(session.refresh_vt_owner("pid-1"));
         assert!(!session.refresh_vt_owner("pid-2"));
         std::thread::sleep(Duration::from_millis(5));
@@ -4684,7 +4720,10 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::ZERO);
         let before = crate::tmux::TMUX_COMMAND_EXECUTIONS.with(std::cell::Cell::get);
         let session = Session::from_name("aoe_test_expired_owner");
-        assert!(!session.claim_vt_owner_with_deadline("owner", Duration::from_secs(10), &deadline,));
+        assert_eq!(
+            session.claim_vt_owner_with_deadline("owner", Duration::from_secs(10), &deadline),
+            OwnerClaim::Error
+        );
         session.release_vt_owner_with_deadline("owner", &deadline);
         session.release_vt_pipe_owner_with_deadline("owner", "%1", &deadline);
         assert_eq!(
@@ -5968,7 +6007,7 @@ mod tests {
     /// Holds `ENV_LOCK` across the `PATH` read it hands to a child.
     #[test]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
-        let _env = crate::session::test_support::EnvGuard::read_lock();
+        let _env = crate::session::test_support::EnvGuard::set(&[("SHELL", "/bin/sh")]);
         let temp = tempfile::tempdir().unwrap();
         let host_output = temp.path().join("host-env");
         let payload_output = temp.path().join("container-env");
@@ -6133,6 +6172,7 @@ mod tests {
             "aoe-session-example-1.scope",
             "aoe session example",
             "example",
+            "example-id",
         ));
         let env_bin = which::which("env").unwrap().to_string_lossy().into_owned();
         crate::process::systemd::ScopePrefix { argv, env_bin }

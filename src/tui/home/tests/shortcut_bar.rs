@@ -100,15 +100,42 @@ fn hidden_bar_preserves_temporary_feedback_and_keyboard_actions() {
     let screen = render_home_to_string(&mut env.view, 120, 24);
     assert!(screen.contains("k palette"));
     env.view.live_send_pending_leader = false;
-    env.view.flash_ctrl_c_hint();
-    let screen = render_home_to_string(&mut env.view, 120, 24);
-    assert!(screen.contains("Ctrl+C sent to agent"));
-    env.view.live_send_ctrl_c_flash_until = None;
     env.view.handle_key(
         KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
         None,
     );
     assert!(env.view.live_send.is_none());
+}
+
+#[test]
+#[serial]
+fn hidden_bar_ctrl_c_keeps_preview_geometry_stable() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.live_send = Some(live_state());
+    for width in [40, 80, 120] {
+        env.view.show_shortcut_bar = false;
+        env.view.live_send_ctrl_c_flash_until = None;
+        render_home_to_string(&mut env.view, width, 24);
+        let preview = env.view.preview_outer_area;
+        for _ in 0..3 {
+            env.view.flash_ctrl_c_hint();
+            let screen = render_home_to_string(&mut env.view, width, 24);
+            assert_eq!(env.view.preview_outer_area, preview);
+            assert!(!screen.contains("LIVE"));
+            assert!(!screen.contains("Ctrl+C sent to agent"));
+        }
+
+        env.view.show_shortcut_bar = true;
+        render_home_to_string(&mut env.view, width, 24);
+        assert_eq!(env.view.preview_outer_area.bottom(), preview.bottom() - 1);
+        env.view.show_shortcut_bar = false;
+        render_home_to_string(&mut env.view, width, 24);
+        assert_eq!(env.view.preview_outer_area, preview);
+
+        env.view.live_send_ctrl_c_flash_until = Some(std::time::Instant::now());
+        render_home_to_string(&mut env.view, width, 24);
+        assert_eq!(env.view.preview_outer_area, preview);
+    }
 }
 
 #[test]

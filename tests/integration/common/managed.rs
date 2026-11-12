@@ -119,7 +119,24 @@ impl ManagedClient {
         )
         .await
         .expect("actual SDK readiness deadline")
-        .expect("real SDK readiness and Applied");
+        .unwrap_or_else(|error| {
+            let rows = self.state.instances.try_read().ok();
+            let context = rows
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|row| row.id == self.id))
+                .map(|row| {
+                    (
+                        &row.title,
+                        row.status,
+                        row.lifecycle_generation,
+                        &row.acp_establishment,
+                    )
+                });
+            panic!(
+                "real SDK readiness and Applied for {} {context:?}: {error}",
+                self.id
+            );
+        });
     }
 
     pub(crate) async fn recv(&mut self) -> Option<Event> {
@@ -1472,6 +1489,7 @@ socket.on('error', error => { console.error(error); process.exit(1); });
                 State(state),
                 Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                 None,
+                None,
                 Ok(Json(body)),
             )
             .await
@@ -1480,7 +1498,9 @@ socket.on('error', error => { console.error(error); process.exit(1); });
         let response =
             tokio::time::timeout(Duration::from_secs(30), self.creators.last_mut().unwrap())
                 .await
-                .expect("creation driver deadline; retained for cleanup")
+                .unwrap_or_else(|error| {
+                    panic!("creation driver deadline ({label}); retained for cleanup: {error}")
+                })
                 .expect("creation driver");
         self.creators.pop();
         let status = response.status();
@@ -1862,9 +1882,34 @@ socket.on('error', error => { console.error(error); process.exit(1); });
             }
         }
         if fork {
-            return self
+            // Canonical structured creation owns both the parent identity and
+            // the one-shot replay into the child's empty store. A legacy test
+            // seed flag must not replace that durable fork custody.
+            let parent_native = row
+                .acp_session_id
+                .expect("the real original supplies the native fork parent");
+            let child = self
                 .create_with_inputs(inputs, label, None, Some(row.id))
                 .await;
+            let attempt = child
+                .actual()
+                .establishment_projection()
+                .expect("canonical fork owns its projection")
+                .attempt()
+                .expect("canonical fork owns its durable original attempt");
+            assert_eq!(
+                attempt.target,
+                crate::acp::establishment::EstablishmentTarget::Fork {
+                    session_id: parent_native,
+                },
+                "the child must fork the real original, not a fixture-provided native ID"
+            );
+            assert_eq!(
+                attempt.destination.import_pending,
+                Some(true),
+                "the real structured fork must seed its child's empty history"
+            );
+            return child;
         }
         self.resume_stopped_with_inputs(row.id, inputs).await
     }

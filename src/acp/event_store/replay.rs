@@ -247,6 +247,15 @@ mod tests {
                 .rows()
                 .iter()
                 .any(|row| row.kind == TranscriptRowKind::EmptyOutput));
+            assert_eq!(
+                transcript
+                    .rows()
+                    .iter()
+                    .filter(|row| row.kind == TranscriptRowKind::Notice)
+                    .count(),
+                1,
+                "a historical failure must not invent an additional output diagnosis"
+            );
             let retained: String = store
                 .conn()
                 .query_row(

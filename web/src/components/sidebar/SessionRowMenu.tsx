@@ -8,6 +8,7 @@ import {
   Container,
   FolderPen,
   FolderPlus,
+  Focus,
   Folders,
   GitFork,
   Moon,
@@ -19,6 +20,7 @@ import {
   ScrollText,
   SquareTerminal,
   Sparkles,
+  SquareArrowOutUpRight,
   Trash2,
 } from "lucide-react";
 import type { SessionResponse } from "../../lib/types";
@@ -95,6 +97,10 @@ export interface SingleRowActions {
   fork: (sessionId: string) => void;
   autoName: (sessionId: string) => void;
   summarize: (sessionId: string) => void;
+  /** Shows only this session in the current window (focus mode). */
+  showOnly: (sessionId: string) => void;
+  /** Opens the session alone in a new window; absent where a second window cannot open (phones). */
+  openOwnWindow?: (sessionId: string) => void;
   stop: (sessionId: string) => void;
   start: (sessionId: string) => void;
   restartUpdate: (sessionId: string) => void;
@@ -186,9 +192,13 @@ export function SingleRowMenuItems({
   const [pickerOpen, setPickerOpen] = useState<SessionAction | null>(null);
   const { actionTargets: t } = model;
   const write = !readOnly;
-  // A targeted item shows only when some sibling is a target, as before.
-  const item = (action: SessionAction, props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">) =>
-    write &&
+  // A targeted item shows only when some sibling is a target and it can `run`, which by default needs write access.
+  const item = (
+    action: SessionAction,
+    props: Omit<TargetedItemProps, "targets" | "open" | "onToggle" | "onRun">,
+    run: ((sessionId: string) => void) | undefined = write ? a[action] : undefined,
+  ) =>
+    run &&
     t[action].length > 0 && (
       <TargetedItem
         key={action}
@@ -196,10 +206,99 @@ export function SingleRowMenuItems({
         targets={t[action]}
         open={pickerOpen === action}
         onToggle={() => setPickerOpen((o) => (o === action ? null : action))}
-        onRun={a[action]}
+        onRun={run}
       />
     );
   const notifyHint = NOTIFY_OPTIONS.find((o) => o.preset === model.notifyPreset)?.hint;
+  const moreTiers = [
+    // Window entries change no state, so a read-only dashboard offers them too.
+    [
+      item(
+        "showOnly",
+        {
+          label: "Show only this Session",
+          testId: "sidebar-context-menu-show-only",
+          glyph: icon(Focus),
+          indent: true,
+        },
+        a.showOnly,
+      ),
+      item(
+        "openOwnWindow",
+        {
+          label: "Open in its own window",
+          testId: "sidebar-context-menu-own-window",
+          glyph: icon(SquareArrowOutUpRight),
+          indent: true,
+        },
+        a.openOwnWindow,
+      ),
+    ],
+    [
+      item("summarize", {
+        label: "Summarize conversation",
+        testId: "sidebar-context-menu-summarize",
+        glyph: icon(ScrollText),
+        indent: true,
+      }),
+      item("autoName", {
+        label: "Auto-name now",
+        testId: "sidebar-context-menu-auto-name",
+        glyph: icon(Sparkles),
+        indent: true,
+      }),
+      item("switchAgent", {
+        label: "Switch agent",
+        testId: "sidebar-context-menu-switch-agent",
+        glyph: icon(ArrowLeftRight),
+        indent: true,
+      }),
+    ],
+    [
+      write && (
+        <MenuItem
+          key="edit-group"
+          onClick={a.editGroup}
+          testId="sidebar-context-menu-edit-group"
+          icon={icon(Folders)}
+          indent
+        >
+          Move to another group
+        </MenuItem>
+      ),
+      write && !!model.sessionId && model.canAddProject && (
+        <MenuItem
+          key="add-project"
+          onClick={a.addProject}
+          testId="sidebar-context-menu-add-project"
+          icon={icon(FolderPlus)}
+          indent
+        >
+          Add project
+        </MenuItem>
+      ),
+      write && model.canEditWorkdir && (
+        <MenuItem
+          key="edit-workdir"
+          onClick={a.editWorkdir}
+          testId="sidebar-context-menu-edit-workdir"
+          icon={icon(FolderPen)}
+          indent
+        >
+          Rename workdir
+        </MenuItem>
+      ),
+    ],
+    [
+      item("recreateContainer", {
+        label: "Recreate container",
+        detail: "Resets anything installed inside it",
+        testId: "sidebar-context-menu-recreate-container",
+        glyph: icon(Container),
+        indent: true,
+      }),
+    ],
+  ];
   return (
     <Tiers
       tiers={[
@@ -242,7 +341,7 @@ export function SingleRowMenuItems({
           ),
         ],
         [
-          write && (
+          moreTiers.some((tier) => tier.some(Boolean)) && (
             <Fragment key="more">
               <MenuItem
                 onClick={() => setMoreOpen((o) => !o)}
@@ -254,72 +353,7 @@ export function SingleRowMenuItems({
                 More
               </MenuItem>
               <div id={moreId} hidden={!moreOpen}>
-                <Tiers
-                  tiers={[
-                    [
-                      item("summarize", {
-                        label: "Summarize conversation",
-                        testId: "sidebar-context-menu-summarize",
-                        glyph: icon(ScrollText),
-                        indent: true,
-                      }),
-                      item("autoName", {
-                        label: "Auto-name now",
-                        testId: "sidebar-context-menu-auto-name",
-                        glyph: icon(Sparkles),
-                        indent: true,
-                      }),
-                      item("switchAgent", {
-                        label: "Switch agent",
-                        testId: "sidebar-context-menu-switch-agent",
-                        glyph: icon(ArrowLeftRight),
-                        indent: true,
-                      }),
-                    ],
-                    [
-                      <MenuItem
-                        key="edit-group"
-                        onClick={a.editGroup}
-                        testId="sidebar-context-menu-edit-group"
-                        icon={icon(Folders)}
-                        indent
-                      >
-                        Move to another group
-                      </MenuItem>,
-                      !!model.sessionId && model.canAddProject && (
-                        <MenuItem
-                          key="add-project"
-                          onClick={a.addProject}
-                          testId="sidebar-context-menu-add-project"
-                          icon={icon(FolderPlus)}
-                          indent
-                        >
-                          Add project
-                        </MenuItem>
-                      ),
-                      model.canEditWorkdir && (
-                        <MenuItem
-                          key="edit-workdir"
-                          onClick={a.editWorkdir}
-                          testId="sidebar-context-menu-edit-workdir"
-                          icon={icon(FolderPen)}
-                          indent
-                        >
-                          Rename workdir
-                        </MenuItem>
-                      ),
-                    ],
-                    [
-                      item("recreateContainer", {
-                        label: "Recreate container",
-                        detail: "Resets anything installed inside it",
-                        testId: "sidebar-context-menu-recreate-container",
-                        glyph: icon(Container),
-                        indent: true,
-                      }),
-                    ],
-                  ]}
-                />
+                <Tiers tiers={moreTiers} />
               </div>
             </Fragment>
           ),

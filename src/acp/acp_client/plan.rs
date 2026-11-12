@@ -87,9 +87,9 @@ pub(super) fn strip_markdown_emphasis(s: &str) -> String {
 }
 
 pub(super) fn map_plan_status(
-    status: agent_client_protocol::schema::v1::PlanEntryStatus,
+    status: agent_client_protocol::v1::schema::PlanEntryStatus,
 ) -> PlanStepStatus {
-    use agent_client_protocol::schema::v1::PlanEntryStatus;
+    use agent_client_protocol::v1::schema::PlanEntryStatus;
     match status {
         PlanEntryStatus::Pending => PlanStepStatus::Pending,
         PlanEntryStatus::InProgress => PlanStepStatus::InProgress,
@@ -102,9 +102,9 @@ pub(super) fn map_plan_status(
 /// For the synthetic TodoWrite args payload. Matches what
 /// `web/src/components/acp/ToolCards.tsx::normaliseTodoStatus` accepts.
 pub(super) fn plan_status_to_str(
-    status: &agent_client_protocol::schema::v1::PlanEntryStatus,
+    status: &agent_client_protocol::v1::schema::PlanEntryStatus,
 ) -> &'static str {
-    use agent_client_protocol::schema::v1::PlanEntryStatus;
+    use agent_client_protocol::v1::schema::PlanEntryStatus;
     match status {
         PlanEntryStatus::Pending => "pending",
         PlanEntryStatus::InProgress => "in_progress",

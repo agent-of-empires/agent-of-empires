@@ -166,6 +166,213 @@ fn single_click_on_archived_row_selects_without_reviving() {
 
 #[test]
 #[serial]
+fn trash_inspection_never_requests_interaction() {
+    use crate::session::config::{update_config, AttachMode, ClickAction, ToolSessionConfig};
+    use crate::tui::home::{live_send::LiveSendState, ViewMode};
+    for archived in [false, true] {
+        for click in [ClickAction::LiveSend, ClickAction::SelectOnly] {
+            for attach in [AttachMode::Tmux, AttachMode::LiveSend] {
+                let mut env = create_test_env_with_sessions(3);
+                let mut commands = env.view.session_feed.request_driver_for_test();
+                update_config(|config| {
+                    config.session.click_action = click;
+                    config.session.default_attach_mode = attach;
+                    config.session.live_send_on_view_switch = true;
+                })
+                .unwrap();
+                let id = env.view.instance_at(0).id.clone();
+                env.view.mutate_instance(&id, |inst| {
+                    inst.trashed_at = Some(chrono::Utc::now());
+                    inst.archived_at = archived.then(chrono::Utc::now);
+                });
+                env.view.trashed_section_collapsed = false;
+                env.view.rebuild_flat_items();
+                let idx = env.view.flat_items.iter().position(
+                    |item| matches!(item, Item::Session { id: candidate, .. } if candidate == &id)
+                ).unwrap();
+                render_geometry(&mut env.view);
+                let row = shelf_row_for_idx(&env.view, idx);
+                env.view.live_send = Some(LiveSendState {
+                    session_id: "previous".into(),
+                    title: "previous".into(),
+                    tmux_name: "unused".into(),
+                    target: crate::tui::home::live_send::LiveSendTarget::Agent,
+                    exit_chords: Vec::new(),
+                    leader: None,
+                });
+                let now = std::time::Instant::now();
+                assert_eq!(env.view.handle_click_at(now, 5, row), None);
+                assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+                assert!(env.view.live_send.is_none());
+                assert_eq!(
+                    env.view
+                        .handle_click_at(now + std::time::Duration::from_millis(100), 5, row),
+                    None
+                );
+                for mode in [
+                    ViewMode::Structured,
+                    ViewMode::Terminal,
+                    ViewMode::Tool("probe".into()),
+                ] {
+                    env.view.view_mode = mode;
+                    assert_eq!(env.view.activate_selected_session(), None);
+                    assert_eq!(env.view.tab_attach_action(), None);
+                    assert_eq!(env.view.start_live_send(), None);
+                    assert_eq!(env.view.maybe_auto_start_live_send(), None);
+                    assert_eq!(env.view.handle_key(key(KeyCode::Enter), None), None);
+                    assert_eq!(env.view.handle_key(key(KeyCode::Tab), None), None);
+                    env.view.handle_paste("must not become a prompt");
+                    assert!(env.view.send_message_dialog.is_none());
+                    assert!(env.view.pending_paste.is_none());
+                }
+                env.view.view_mode = ViewMode::Structured;
+                for background in [false, true] {
+                    env.view.tool_configs.insert(
+                        "probe".into(),
+                        ToolSessionConfig {
+                            command: "never execute".into(),
+                            background,
+                            ..Default::default()
+                        },
+                    );
+                    env.view.tool_hotkey_cache =
+                        vec![("probe".into(), KeyCode::Char('g'), KeyModifiers::ALT)];
+                    assert_eq!(
+                        env.view
+                            .handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT), None),
+                        None
+                    );
+                    assert_eq!(env.view.view_mode, ViewMode::Structured);
+                }
+                for code in [KeyCode::Char('m'), KeyCode::Char('r'), KeyCode::Char('t')] {
+                    assert_eq!(env.view.handle_key(key(code), None), None);
+                }
+                assert!(env.view.send_message_dialog.is_none());
+                assert!(env.view.restart_dialog.is_none());
+                assert!(env.view.tool_picker_dialog.is_none());
+                assert!(env.view.pending_native_attachment.is_none());
+                assert!(commands(Err("unexpected interaction".into())).is_none());
+                env.view.strict_hotkeys = true;
+                env.view.handle_key(key(KeyCode::Char('a')), None);
+                assert!(
+                    env.view.pending_paste.is_none(),
+                    "Trash typing must not become a future prompt"
+                );
+                assert!(env.view.get_instance(&id).unwrap().is_trashed());
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn trash_enter_before_reader_mount_keeps_navigation_in_reader() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.instance_at(0).id.clone();
+    env.view
+        .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+    env.view.trashed_section_collapsed = false;
+    env.view.rebuild_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.retained_preview.is_none());
+    assert_eq!(env.view.handle_key(key(KeyCode::Enter), None), None);
+    env.view.handle_key(key(KeyCode::Home), None);
+    assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+}
+
+#[test]
+#[serial]
+fn trash_transition_discards_edit_dialog_and_stale_menu_actions() {
+    use crate::tui::{
+        dialogs::ContextMenuAction,
+        home::bindings::{self, ActionId},
+    };
+    for action in [ActionId::Rename, ActionId::SetWorktreeName] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = Status::Stopped;
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "fixture".into(),
+                main_repo_path: "/tmp".into(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+        });
+        env.view.select_session_by_id(&id);
+        env.view
+            .handle_key(bindings::key_event(action, false).unwrap(), None);
+        assert!(env.view.rename_dialog.is_some() || env.view.worktree_name_dialog.is_some());
+        env.view
+            .mutate_instance(&id, |inst| inst.trashed_at = Some(chrono::Utc::now()));
+        env.view.enforce_trash_read_only();
+        assert!(env.view.rename_dialog.is_none());
+        assert!(env.view.worktree_name_dialog.is_none());
+        let mut commands = env.view.session_feed.request_driver_for_test();
+        assert!(env
+            .view
+            .rename_selected("new title", None, None, false)
+            .is_err());
+        assert!(env
+            .view
+            .set_worktree_name_for_selected("new-name", false)
+            .is_err());
+        assert!(commands(Err("unexpected edit".into())).is_none());
+        env.view.context_menu = Some(crate::tui::dialogs::ContextMenuDialog::for_session(
+            (1, 1),
+            false,
+            None,
+            None,
+            false,
+            None,
+        ));
+        env.view.enforce_trash_read_only();
+        assert!(env.view.context_menu.is_none());
+        env.view.context_menu = Some(crate::tui::dialogs::ContextMenuDialog::for_trashed_session(
+            (1, 1),
+        ));
+        env.view.enforce_trash_read_only();
+        assert!(
+            env.view.context_menu.is_some(),
+            "management remains available"
+        );
+        env.view.context_menu = None;
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::Rename);
+        assert!(env.view.rename_dialog.is_none());
+    }
+}
+
+#[test]
+#[serial]
+fn trash_dwell_and_engagement_do_not_mark_retained_data_read() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.trashed_at = Some(chrono::Utc::now());
+        inst.mark_unread();
+    });
+    let snapshot = super::session_feed_tests::daemon_snapshot(&env.view, &id, "Stopped");
+    env.view.session_feed.publish_for_test(snapshot);
+    env.view.apply_session_feed();
+    let mut commands = env.view.session_feed.request_driver_for_test();
+    env.view.select_session_by_id(&id);
+    crate::session::set_unread_enabled(true);
+    assert!(!env.view.has_dialog());
+    assert!(env.view.session_feed.can_submit(&id));
+    let now = std::time::Instant::now();
+    assert!(!env.view.tick_unread_dwell(now));
+    assert!(!env
+        .view
+        .tick_unread_dwell(now + std::time::Duration::from_secs(3)));
+    assert!(!env.view.clear_unread_on_view(&id));
+    assert!(commands(Err("unexpected read mutation".into())).is_none());
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+}
+
+#[test]
+#[serial]
 fn select_only_click_honors_per_profile_override() {
     // Global stays LiveSend while the test profile pins SelectOnly through
     // SessionConfigOverride, so the resolver must pick the override: a single click returns

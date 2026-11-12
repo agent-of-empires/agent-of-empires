@@ -1,8 +1,9 @@
 //! Native session admission, selected only by the connection lifecycle.
 
-use agent_client_protocol::schema::v1::{RequestId, SessionId, SessionNotification};
+use agent_client_protocol::v1::schema::{RequestId, SessionId, SessionNotification};
+use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::{
-    Agent, ConnectionTo, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, UntypedMessage,
+    Agent, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, UntypedMessage,
 };
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -124,7 +125,7 @@ impl JsonRpcMessage for SessionIngressNotification {
 
     fn parse_message(
         method: &str,
-        params: &impl serde::Serialize,
+        params: &serde_json::Value,
     ) -> agent_client_protocol::Result<Self> {
         if SessionReplayed::matches_method(method) {
             return Ok(Self::Replayed(SessionReplayed::parse_message(
@@ -142,12 +143,12 @@ impl JsonRpcMessage for SessionIngressNotification {
             )?));
         }
         if method == AUTH_STATUS_UPDATE_METHOD {
-            return Ok(Self::AuthStatus(serde_json::to_value(params)?));
+            return Ok(Self::AuthStatus(params.clone()));
         }
         if !SessionNotification::matches_method(method) {
             return Err(agent_client_protocol::Error::method_not_found());
         }
-        Ok(Self::Update(serde_json::to_value(params)?))
+        Ok(Self::Update(params.clone()))
     }
 }
 
@@ -253,6 +254,8 @@ struct Establishment {
 type OriginalCallbackGrant = crate::acp::establishment::NativeCallbackOriginal;
 
 pub(super) struct OriginalIngressHistory {
+    /// Correlated result identity certifies history only, including signed Pending.
+    result_session_id: std::sync::OnceLock<SessionId>,
     original: Arc<OriginalCallbackGrant>,
     pub(super) dedup: StateMutex<AgentMessageDedup>,
     pub(super) compaction: StateMutex<CompactionTracker>,
@@ -269,8 +272,12 @@ impl std::fmt::Debug for OriginalIngressHistory {
 }
 
 impl OriginalIngressHistory {
-    fn accepts_session(&self, session: &str) -> bool {
+    pub(super) fn accepts_session(&self, session: &str) -> bool {
         self.original.known_session_id() == Some(session)
+            || self
+                .result_session_id
+                .get()
+                .is_some_and(|id| id.0.as_ref() == session)
     }
 }
 
@@ -681,13 +688,228 @@ impl SessionIngress {
         self.changed.notify_waiters();
     }
 
+    pub(super) fn authorize_original(
+        &self,
+        attempt: Arc<crate::acp::establishment::EstablishmentAttempt>,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+        store: Option<crate::session::ExecutionBinding>,
+        postimage: Option<Arc<crate::acp::establishment::EstablishmentPostimage>>,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.failed
+            || state.callbacks_revoked
+            || attempt.producer.is_none()
+            || owner.birth_fingerprint.is_none()
+        {
+            return false;
+        }
+        if state.pending.is_none() && state.current.is_none() {
+            state.generation += 1;
+            state.pending = Some(Establishment {
+                generation: state.generation,
+                candidate: None,
+                updates: Vec::new(),
+                encoded_bytes: 0,
+            });
+        }
+        if let Some(original) = &state.original {
+            if !original.same_source(&attempt, owner, store.as_ref()) {
+                return false;
+            }
+        } else {
+            let original = Arc::new(OriginalCallbackGrant {
+                attempt: Arc::clone(&attempt),
+                owner,
+                store,
+                postimage: std::sync::OnceLock::new(),
+                notification_scope: StateMutex::new(None),
+            });
+            state.history = Some(Arc::new(OriginalIngressHistory {
+                original: Arc::clone(&original),
+                result_session_id: std::sync::OnceLock::new(),
+                dedup: StateMutex::default(),
+                compaction: StateMutex::default(),
+                tool_context: Arc::default(),
+                constructor: std::sync::OnceLock::new(),
+            }));
+            state.original = Some(original);
+        }
+        let original = state.original.as_ref().expect("authorized original");
+        if let Some(postimage) = postimage {
+            if let Some(existing) = original.postimage.get() {
+                if existing.as_ref() != postimage.as_ref() {
+                    return false;
+                }
+            } else if original.postimage.set(postimage).is_err() {
+                return false;
+            }
+        }
+        if let crate::acp::establishment::EstablishmentTarget::Load { session_id, .. } =
+            &attempt.target
+        {
+            if let Some(pending) = state.pending.as_mut() {
+                pending.candidate = Some(SessionId::from(session_id.clone()));
+            }
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        true
+    }
+
+    /// Preserve terminal evidence for the owned failed ingress, never permission.
+    pub(super) fn failed_original_matches(
+        &self,
+        attempt: &crate::acp::establishment::EstablishmentAttempt,
+        owner: crate::acp::runner_lifecycle::RunnerIdentity,
+        store: Option<&crate::session::ExecutionBinding>,
+    ) -> bool {
+        let state = self.state.lock().unwrap();
+        state.failed
+            && state
+                .original
+                .as_ref()
+                .is_some_and(|original| original.same_source(attempt, owner, store))
+    }
+
+    pub(super) fn authorize_constructor(
+        &self,
+        attempt: &crate::acp::establishment::EstablishmentAttempt,
+        context: crate::acp::state::NativeEventContext,
+        fence: Arc<crate::session::NativeInputFence>,
+    ) -> bool {
+        let state = self.state.lock().expect("ingress identity");
+        let Some(history) = state.history.as_ref().filter(|history| {
+            history.original.attempt.as_ref() == attempt
+                && !state.failed
+                && !state.callbacks_revoked
+        }) else {
+            return false;
+        };
+        if history.constructor.get().is_some() {
+            return true;
+        }
+        let Ok(constructor) = crate::acp::establishment::NativeConstructorObservation::capture(
+            Arc::clone(&history.original),
+            context,
+            fence,
+        ) else {
+            return false;
+        };
+        history.constructor.set(constructor).is_ok()
+    }
+
+    pub(super) fn constructor_scope(
+        &self,
+    ) -> Option<Arc<crate::acp::establishment::NativeConstructorObservation>> {
+        let state = self.state.lock().expect("ingress identity");
+        if state.failed || state.callbacks_revoked {
+            return None;
+        }
+        state.history.as_ref()?.constructor.get().cloned()
+    }
+
+    pub(super) fn capture_native_callback(
+        self: &Arc<Self>,
+        evidence: crate::acp::control_protocol::NativeNotifyEvidence,
+        reported_session: Option<&str>,
+        connection: &Arc<ConnectionState>,
+    ) -> Option<Arc<CapturedCallback>> {
+        let physical = evidence.physical_source?;
+        let (generation, original, history) = {
+            let state = self.state.lock().unwrap();
+            if state.failed || state.callbacks_revoked {
+                return None;
+            }
+            (
+                state.generation,
+                state.original.clone()?,
+                state.history.clone(),
+            )
+        };
+        let expected = crate::acp::state::NativeEventOrigin::owned_attempt(
+            &original.attempt,
+            Some(original.owner),
+        )?;
+        if physical.witness != expected {
+            return None;
+        }
+        if let (Some(session), Some(reported)) = (original.known_session_id(), reported_session) {
+            if session != reported {
+                return None;
+            }
+        }
+        let history = history.filter(|history| {
+            reported_session.is_some_and(|session| history.accepts_session(session))
+        });
+        let ingress = IngressRequestScope {
+            generation,
+            expected: Some(Arc::clone(&original.attempt)),
+        };
+        let context = NativeRequestContext::callback(
+            original,
+            evidence.session_stamp,
+            evidence.original_request_stamp,
+            reported_session.map(Arc::from),
+        )
+        .ok()
+        .map(Arc::new);
+        Some(Arc::new(CapturedCallback {
+            ingress,
+            context,
+            history,
+            ingress_source: Arc::downgrade(self),
+            connection: Arc::downgrade(connection),
+        }))
+    }
+
+    pub(super) fn capture_request(&self) -> IngressRequestScope {
+        let generation = self.state.lock().unwrap().generation;
+        let expected = self
+            .projection
+            .lock()
+            .unwrap()
+            .upgrade()
+            .and_then(|projection| projection.attempt());
+        IngressRequestScope {
+            generation,
+            expected,
+        }
+    }
+
+    pub(super) fn revoke_requests(&self) {
+        self.state.lock().unwrap().callbacks_revoked = true;
+        self.changed.notify_waiters();
+    }
+
     /// Publish a response fact under the wire's ordering barrier, not an update's ID.
     pub(super) fn resolve(&self, generation: Option<u64>, id: SessionId) {
         let mut state = self.state.lock().unwrap();
         if !state.failed {
             if let Some(pending) = state.pending.as_mut() {
                 if generation.is_none_or(|generation| generation == pending.generation) {
-                    pending.candidate = Some(id);
+                    pending.candidate = Some(id.clone());
+                }
+            }
+        }
+        // Only the authenticated, correlated result for this frozen original
+        // can certify its pre-result child history. This grants no Current scope.
+        if !state.failed && generation.is_none_or(|generation| generation == state.generation) {
+            if let Some(history) = &state.history {
+                let receipt = self
+                    .projection
+                    .lock()
+                    .expect("ingress projection")
+                    .upgrade()
+                    .and_then(|projection| projection.receipt_snapshot());
+                if receipt.as_ref().is_some_and(|receipt| {
+                    receipt.session_id() == Some(id.0.as_ref())
+                        && history.original.same_source(
+                            &receipt.attempt,
+                            receipt.owner,
+                            receipt.store.as_ref(),
+                        )
+                }) {
+                    let _ = history.result_session_id.set(id);
                 }
             }
         }
@@ -785,7 +1007,13 @@ impl SessionIngress {
                             &history.original.attempt,
                             Some(history.original.owner),
                         ) == Some(physical.witness)
-                    }) && history.accepts_session(update.notification.session_id.0.as_ref())
+                    }) && (history.accepts_session(update.notification.session_id.0.as_ref())
+                        || (state.pending.is_some()
+                            && history.original.known_session_id().is_none()
+                            && matches!(
+                                history.original.attempt.target,
+                                crate::acp::establishment::EstablishmentTarget::Fork { .. }
+                            )))
                 })
                 .cloned()
         };
@@ -799,10 +1027,10 @@ impl SessionIngress {
         });
         update.metadata_scope = matches!(
             &update.notification.update,
-            agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(_)
-                | agent_client_protocol::schema::v1::SessionUpdate::UsageUpdate(_)
-                | agent_client_protocol::schema::v1::SessionUpdate::AvailableCommandsUpdate(_)
-                | agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(_)
+            agent_client_protocol::v1::schema::SessionUpdate::CurrentModeUpdate(_)
+                | agent_client_protocol::v1::schema::SessionUpdate::UsageUpdate(_)
+                | agent_client_protocol::v1::schema::SessionUpdate::AvailableCommandsUpdate(_)
+                | agent_client_protocol::v1::schema::SessionUpdate::ConfigOptionUpdate(_)
         )
         .then(|| self.original_metadata_scope(&update))
         .flatten();

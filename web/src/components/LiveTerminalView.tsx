@@ -19,9 +19,11 @@ import { reportError } from "../lib/toastBus";
 import {
   FOCUS_TERMINAL_EVENT,
   consumePendingTerminalFocus,
+  focusIntentMatches,
   setPendingTerminalFocus,
   type FocusTerminalDetail,
 } from "../lib/terminalFocus";
+import { safeGetItem, safeRemoveItem, safeSetItem } from "../lib/safeStorage";
 import { isSessionActive } from "../lib/session";
 import { StrokeIcon } from "./icons";
 
@@ -50,6 +52,8 @@ const SURFACES = {
 export function LiveTerminalView({ session, readOnly, active = true, surface = "agent", terminalIndex = 0 }: Props) {
   const base = SURFACES[surface];
   const { focusTarget, dataTerm } = base;
+  // Two docks can each show a paired terminal, so paired focus intents name the one they mean.
+  const focusIndex = surface === "agent" ? undefined : terminalIndex;
   // Paired terminals carry their instance index as a query param so the
   // server attaches the right tmux session; the agent surface ignores it.
   const wsPath = surface === "agent" ? base.wsPath : `${base.wsPath}?index=${terminalIndex}`;
@@ -78,18 +82,32 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     },
     [],
   );
+  // Each surface is its own pane, so a grid on one must not clear another's dismissal. Callers key this view by
+  // session, surface and index, so the key is fixed for its lifetime.
+  const pipeNoticeKey = `aoe-live-pipe-notice-dismissed:${session.id}:${surface}:${terminalIndex}`;
+  const [pipeNoticeDismissed, setPipeNoticeDismissed] = useState(() => safeGetItem(pipeNoticeKey) !== null);
+  const dismissPipeNotice = useCallback(() => {
+    safeSetItem(pipeNoticeKey, "1");
+    setPipeNoticeDismissed(true);
+  }, [pipeNoticeKey]);
+  const clearPipeNoticeDismissal = useCallback(() => {
+    // Another tab may have stored a dismissal this view never saw.
+    if (safeGetItem(pipeNoticeKey) !== null) safeRemoveItem(pipeNoticeKey);
+    if (pipeNoticeDismissed) setPipeNoticeDismissed(false);
+  }, [pipeNoticeDismissed, pipeNoticeKey]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
     readOnly || ensureState === "ready" ? session.id : null,
     readOnly,
     wsPath,
     receiveAgentClipboard,
+    clearPipeNoticeDismissal,
   );
   // The viewport hook supplies the iOS-regular-Safari bottom inset and the occlusion-based keyboardOpen used to
   // gate the pane's sizing latch (occlusion is what shrinks the container, whichever element is focused).
-  const { keyboardHeight, keyboardOpen } = useMobileKeyboard();
-  const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
+  const [inputFocused, setInputFocused] = useState(false);
   const policyRef = useRef({ readOnly, sessionId: session.id, surface, terminalIndex });
   useLayoutEffect(() => {
     policyRef.current = { readOnly, sessionId: session.id, surface, terminalIndex };
@@ -124,7 +142,12 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           : "Not sent: terminal not connected.",
     );
   }, [notOwner, readOnly]);
-  const { sendData, sendPaste } = live;
+  const { sendData, sendPaste, manualReconnect } = live;
+  // Automatic redials keep the dismissal; only a reconnect the user asked for brings the notice back.
+  const reconnect = useCallback(() => {
+    clearPipeNoticeDismissal();
+    manualReconnect();
+  }, [clearPipeNoticeDismissal, manualReconnect]);
   // Explicit sends (toolbar, paste, compose) report a drop; typed keys stay quiet.
   const sendDataOrReport = useCallback(
     (data: string) => {
@@ -253,29 +276,30 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     const policy = policyRef.current;
     if (policy.readOnly) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
-      if (consumePendingTerminalFocus(focusTarget)) focusSelf();
+      if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
       return;
     }
     retryEnsure();
-  }, [session.id, shelved, readOnly, focusSelf, focusTarget, retryEnsure]);
+  }, [session.id, shelved, readOnly, focusSelf, focusTarget, focusIndex, retryEnsure]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
     if (readOnly || ensureState !== "ready") return;
-    if (consumePendingTerminalFocus(focusTarget)) focusSelf();
-  }, [ensureState, readOnly, focusSelf, focusTarget]);
+    if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
+  }, [ensureState, readOnly, focusSelf, focusTarget, focusIndex]);
 
   // Cmd+` shortcut focuses this terminal when it is the dispatched target.
   useEffect(() => {
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
-      if (policyRef.current.readOnly || detail?.target !== focusTarget) return;
-      if (!focusSelf()) setPendingTerminalFocus(focusTarget);
+      if (policyRef.current.readOnly || !focusIntentMatches(detail, focusTarget, focusIndex)) return;
+      // Latch the request's own index, so an indexless one stays open to any paired view.
+      if (!focusSelf()) setPendingTerminalFocus(focusTarget, detail.terminalIndex);
     };
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
-  }, [focusSelf, focusTarget]);
+  }, [focusSelf, focusTarget, focusIndex]);
 
   // Stop then Start leaves a dead pane's closed socket behind. Latch the Start edge until the 4001 close
   // arrives (either order), consume it once so a crash-looping agent cannot retrigger it, and drop it
@@ -363,7 +387,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
         retryCount={live.state.retryCount}
         retryCountdown={live.state.retryCountdown}
         maxRetries={live.maxRetries}
-        onRetry={live.manualReconnect}
+        onRetry={reconnect}
         paneDead={live.state.paneDead}
         onRestart={readOnly ? undefined : retryEnsure}
       />
@@ -389,6 +413,33 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
             </StrokeIcon>
             Live on another device. Take over
           </button>
+        </div>
+      )}
+
+      {live.state.connected && live.state.transportReason === "pipe_owned" && !pipeNoticeDismissed && (
+        <div
+          data-live-pipe-notice
+          className={`absolute left-0 right-0 ${ensureWarning ? "top-24" : "top-14"} z-20 flex justify-center px-3 pointer-events-none`}
+        >
+          <div className="pointer-events-auto flex items-center gap-1 text-xs text-text-muted bg-surface-900/90 border border-surface-700/60 rounded-lg pl-3 pr-1 max-w-md">
+            <span className="py-1 break-words">Slower updates: another client is rendering this pane.</span>
+            <button
+              type="button"
+              onClick={reconnect}
+              aria-label="Retry faster updates"
+              className="h-8 shrink-0 px-2 rounded-md text-brand-500 hover:text-brand-400 cursor-pointer underline"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              onClick={dismissPipeNotice}
+              aria-label="Dismiss slower updates notice"
+              className="h-8 w-8 shrink-0 rounded-md text-text-muted hover:text-text-primary cursor-pointer text-base leading-none"
+            >
+              &times;
+            </button>
+          </div>
         </div>
       )}
 

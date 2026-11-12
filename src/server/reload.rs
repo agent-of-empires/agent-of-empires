@@ -2,7 +2,6 @@
 //! already holds in memory.
 
 use crate::file_watch::FileWatchService;
-use crate::session::Handoff;
 use crate::session::Instance;
 use crate::session::Status;
 use crate::session::Storage;
@@ -12,6 +11,17 @@ use std::sync::Arc;
 pub(crate) struct ProfileIdentity {
     device: u64,
     inode: u64,
+}
+
+impl ProfileIdentity {
+    pub(crate) fn verify_storage(self, storage: &Storage) -> anyhow::Result<()> {
+        let (device, inode) = storage.bound_profile_identity()?;
+        anyhow::ensure!(
+            self == Self { device, inode },
+            "Profile identity changed during read"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,11 +142,7 @@ fn read_inventory_instances(
     file_watch: Arc<FileWatchService>,
 ) -> anyhow::Result<Vec<Instance>> {
     let storage = Storage::open_inventory_reference(name, file_watch)?;
-    let (device, inode) = storage.bound_profile_identity()?;
-    anyhow::ensure!(
-        identity == ProfileIdentity { device, inode },
-        "Profile identity changed during read"
-    );
+    identity.verify_storage(&storage)?;
     let instances = storage.load_instances_readonly()?;
     storage.verify_bound_profile()?;
     Ok(instances)
@@ -335,6 +341,24 @@ pub(crate) struct LoadedProfiles {
     pub inventory: Vec<SelectableProfile>,
 }
 
+impl LoadedProfiles {
+    pub(crate) fn native_health(&self) -> crate::daemon::RuntimeHealth {
+        if self
+            .metadata
+            .profiles
+            .iter()
+            .any(|profile| profile.name == self.metadata.default_profile)
+        {
+            crate::daemon::RuntimeHealth::Healthy
+        } else {
+            crate::daemon::RuntimeHealth::Degraded {
+                code: crate::daemon::ReloadFailureCode::Metadata,
+                profiles: Vec::new(),
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("canonical profile load failed")]
 pub(crate) struct ReloadFailure {
@@ -356,6 +380,19 @@ impl ReloadFailure {
 pub(crate) fn load_all_profiles(
     file_watch: &Arc<FileWatchService>,
 ) -> Result<LoadedProfiles, ReloadFailure> {
+    load_profiles(file_watch, true)
+}
+
+pub(crate) fn load_configuration_profiles(
+    file_watch: &Arc<FileWatchService>,
+) -> Result<LoadedProfiles, ReloadFailure> {
+    load_profiles(file_watch, false)
+}
+
+fn load_profiles(
+    file_watch: &Arc<FileWatchService>,
+    require_default: bool,
+) -> Result<LoadedProfiles, ReloadFailure> {
     use crate::daemon::{ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth};
     let profiles = crate::session::list_profiles().map_err(|source| ReloadFailure {
         health: RuntimeHealth::Degraded {
@@ -366,14 +403,19 @@ pub(crate) fn load_all_profiles(
     })?;
     let (default_profile, workspace_ordering, global_projects) = (|| {
         let mut default_profile = crate::session::config::Config::load()?.default_profile;
-        anyhow::ensure!(!profiles.is_empty(), "Profile catalogue is empty");
+        if require_default {
+            anyhow::ensure!(!profiles.is_empty(), "Profile catalogue is empty");
+            if !default_profile.is_empty() {
+                anyhow::ensure!(
+                    profiles.contains(&default_profile),
+                    "Configured default profile is unavailable"
+                );
+            }
+        }
         if default_profile.is_empty() {
-            profiles[0].clone_into(&mut default_profile);
-        } else {
-            anyhow::ensure!(
-                profiles.contains(&default_profile),
-                "Configured default profile is unavailable"
-            );
+            if let Some(first) = profiles.first() {
+                first.clone_into(&mut default_profile);
+            }
         }
         let ordering = crate::session::load_workspace_ordering()?.order;
         let projects = crate::session::projects::load_global()?
@@ -488,9 +530,11 @@ pub(super) fn load_profile_details(profile: &str) -> anyhow::Result<ProfileDetai
     })
 }
 
-pub(super) enum StatusCommit {
+#[derive(Clone, Copy)]
+pub(crate) enum StatusCommit {
     Passive,
     Lifecycle,
+    LaunchReady,
 }
 
 pub(super) fn replace_committed_profiles<const N: usize>(
@@ -551,11 +595,20 @@ pub(super) fn replace_committed_profiles<const N: usize>(
                     row.merge_runtime_for_profile_move(previous);
                 }
                 if let Some(commit) = committed_status(&row.id) {
-                    row.status = status;
-                    row.idle_entered_at = idle_entered_at;
-                    if matches!(commit, StatusCommit::Lifecycle) {
-                        row.last_error = committed_error;
-                        row.last_error_evidence = committed_error_evidence;
+                    let owns_status = match commit {
+                        StatusCommit::LaunchReady => {
+                            previous.lifecycle_generation == row.lifecycle_generation
+                                && previous.status == crate::session::Status::Starting
+                        }
+                        StatusCommit::Passive | StatusCommit::Lifecycle => true,
+                    };
+                    if owns_status {
+                        row.status = status;
+                        row.idle_entered_at = idle_entered_at;
+                        if !matches!(commit, StatusCommit::Passive) {
+                            row.last_error = committed_error;
+                            row.last_error_evidence = committed_error_evidence;
+                        }
                     }
                 }
                 row.last_accessed_at = row.last_accessed_at.max(previous.last_accessed_at);
@@ -601,7 +654,7 @@ pub(super) fn replace_committed_profiles<const N: usize>(
 pub(crate) async fn adopt_committed_profiles<const N: usize>(
     state: &Arc<AppState>,
     committed: [(&str, Vec<Instance>, Vec<crate::session::Group>); N],
-    committed_status: impl Fn(&str) -> bool,
+    committed_status: impl Fn(&str) -> Option<StatusCommit>,
     _reload: &tokio::sync::OwnedRwLockWriteGuard<()>,
     _publication: &tokio::sync::RwLockWriteGuard<'_, ()>,
 ) -> Result<(), ReloadFailure> {
@@ -609,12 +662,10 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
     let mut current = state.instances.write().await;
     let prior_statuses: Vec<_> = current
         .iter()
-        .filter(|row| committed_status(&row.id))
+        .filter(|row| committed_status(&row.id).is_some())
         .map(|row| (row.id.clone(), row.status))
         .collect();
-    replace_committed_profiles(&mut current, &mut metadata, committed, |id| {
-        committed_status(id).then_some(StatusCommit::Lifecycle)
-    })?;
+    replace_committed_profiles(&mut current, &mut metadata, committed, committed_status)?;
     state
         .mutation_epoch
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -629,36 +680,30 @@ pub(crate) async fn adopt_committed_profiles<const N: usize>(
 
 /// Keep process state without replacing the committed lifecycle or identity.
 ///
-/// The poller guards live in [`Handoff`], shared with the status-poll
-/// branch of [`merge_loaded_rows`]: both hand a prior row's launch-owned process
-/// state to the fresh row, so both must decide the same way whether that row
-/// still runs what the prior one ran.
+/// CapturePollerSlot applies the same execution and live-watcher rules as the
+/// status-poll branch. A transient snapshot must not clear a canonical watcher
+/// or its own compatible repair pacing after that adoption has settled it.
 pub(super) fn merge_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = Handoff::decide(&prior.capture_poller, prior.held(), fresh.held());
     // `plugin_revival_pending` is `#[serde(skip)]`, so every fresh disk load
     // defaults it; dropping it here would stop counting a plugin revival that is
     // still waking toward its per-plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
     fresh.last_error_check = prior.last_error_check;
     fresh.inherit_runtime(prior, fresh.status == Status::Error);
-    handoff.settle(&mut fresh.capture_poller);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 
 /// Adopt the prior row's launch-owned process state onto a fresh row whose
 /// status, panes and detection this tick's tmux scrape already decided, and so
 /// must keep them: [`merge_runtime_fields`] would carry the prior row's
-/// observations back over the fresh ones. The poller guards are the same
-/// [`Handoff`] the full merge applies, because the poller and its repair
-/// window are launch-owned whatever decided the status, and `plugin_revival_pending`
-/// is `#[serde(skip)]` like the poller, so a fresh disk load defaults it.
+/// observations back over the fresh ones. Both paths share CapturePollerSlot's
+/// adoption guards. `plugin_revival_pending` is runtime-only like the poller,
+/// so a fresh disk load defaults it.
 fn merge_process_runtime_fields(prior: Instance, fresh: &mut Instance) {
-    let handoff = Handoff::decide(&prior.capture_poller, prior.held(), fresh.held());
     // `#[serde(skip)]` like the poller, so a fresh disk load defaults it and a
     // revival slower than one tick would stop counting toward its plugin cap.
     let plugin_revival_pending = prior.plugin_revival_pending;
-    fresh.inherit_process_runtime(prior);
-    handoff.settle(&mut fresh.capture_poller);
+    fresh.inherit_process_runtime_from_reload(prior);
     fresh.plugin_revival_pending = plugin_revival_pending;
 }
 
@@ -1617,6 +1662,65 @@ mod tests {
                 metadata.workspace_ordering,
                 original_metadata.workspace_ordering
             );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn configuration_repair_requires_complete_files_but_not_a_default_target() {
+        for (profiles, default, usable) in [
+            (&[][..], "", false),
+            (&[][..], "missing", false),
+            (&["alpha", "beta"][..], "", true),
+            (&["alpha", "beta"][..], "missing", false),
+            (&["alpha", "beta"][..], "beta", true),
+        ] {
+            let _home = crate::session::test_support::isolate_app_dir();
+            for profile in profiles {
+                Storage::new_unwatched(profile)
+                    .unwrap()
+                    .update(|rows, _| {
+                        rows.push(Instance::new(profile, "/tmp/repo"));
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            crate::session::config::update_config(|config| {
+                config.default_profile = default.to_owned();
+            })
+            .unwrap();
+            let loaded = load_configuration_profiles(&FileWatchService::noop()).unwrap();
+            assert_eq!(loaded.instances.len(), profiles.len());
+            assert_eq!(
+                loaded
+                    .metadata
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.name.as_str())
+                    .collect::<Vec<_>>(),
+                profiles
+            );
+            assert_eq!(
+                loaded.metadata.default_profile,
+                if default.is_empty() {
+                    profiles.first().copied().unwrap_or("")
+                } else {
+                    default
+                }
+            );
+            assert_eq!(
+                loaded.native_health() == crate::daemon::RuntimeHealth::Healthy,
+                usable
+            );
+            assert_eq!(load_all_profiles(&FileWatchService::noop()).is_ok(), usable);
+            assert_eq!(
+                crate::session::list_profiles().unwrap().len(),
+                profiles.len()
+            );
+            let config = crate::session::get_app_dir().unwrap().join("config.toml");
+            std::fs::write(&config, "[invalid").unwrap();
+            assert!(load_configuration_profiles(&FileWatchService::noop()).is_err());
+            assert_eq!(std::fs::read_to_string(config).unwrap(), "[invalid");
         }
     }
 

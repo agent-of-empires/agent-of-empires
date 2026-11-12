@@ -206,6 +206,97 @@ async fn right_click_trashed_row_offers_restore() {
 
 #[test]
 #[serial]
+fn trash_context_menu_rejects_changed_target() {
+    use crate::tui::session_feed::SessionFeedResult;
+    use std::sync::Arc;
+
+    for change in ["generation", "profile", "purge", "restore", "selection"] {
+        for delete in [false, true] {
+            for mouse in [false, true] {
+                let mut env = create_test_env_with_sessions(2);
+                env.view.trashed_section_collapsed = false;
+                for instance in env.view.cloned_instances() {
+                    env.view.mutate_instance(&instance.id, |row| row.trash());
+                }
+                let id = env.view.instances().next().unwrap().id.clone();
+                env.view
+                    .session_feed
+                    .publish_for_test(super::session_feed_tests::daemon_snapshot(
+                        &env.view, &id, "Stopped",
+                    ));
+                env.view.apply_session_feed();
+                let idx = env
+                    .view
+                    .flat_items
+                    .iter()
+                    .position(
+                        |item| matches!(item, Item::Session { id: target, .. } if target == &id),
+                    )
+                    .unwrap();
+                render_geometry(&mut env.view);
+                let row = shelf_row_for_idx(&env.view, idx);
+                assert!(env.view.handle_right_click(5, row));
+                assert!(env.view.context_menu.is_some());
+                let SessionFeedResult::Snapshot(mut snapshot) =
+                    super::session_feed_tests::daemon_snapshot(&env.view, &id, "Stopped")
+                else {
+                    unreachable!()
+                };
+                let next = Arc::make_mut(&mut snapshot);
+                match change {
+                    "generation" => next.contents.sessions[0].lifecycle_generation += 1,
+                    "profile" => next.contents.sessions[0].profile = "other".into(),
+                    "purge" => next.contents.sessions.retain(|row| row.id != id),
+                    "restore" => next.contents.sessions[0].trashed_at = None,
+                    "selection" => {}
+                    _ => unreachable!(),
+                }
+                env.view
+                    .session_feed
+                    .publish_for_test(SessionFeedResult::Snapshot(snapshot));
+                env.view.apply_session_feed();
+                if change == "selection" {
+                    let other = env
+                        .view
+                        .instances()
+                        .find(|row| row.id != id)
+                        .unwrap()
+                        .id
+                        .clone();
+                    env.view.select_session_by_id(&other);
+                }
+                let mut requests = env.view.session_feed.request_driver_for_test();
+                if mouse {
+                    render_geometry(&mut env.view);
+                    let menu_y = row.saturating_add(1).min(36);
+                    env.view
+                        .handle_context_menu_click(7, menu_y + 1 + u16::from(delete));
+                } else {
+                    if delete {
+                        send_key(&mut env, KeyCode::Down);
+                    }
+                    send_key(&mut env, KeyCode::Enter);
+                }
+                assert!(env.view.context_menu.is_none(), "{change}, delete={delete}");
+                assert!(
+                    env.view.unified_delete_dialog.is_none(),
+                    "{change}, delete={delete}"
+                );
+                assert!(
+                    env.view.pending_trash_session.is_none(),
+                    "{change}, delete={delete}"
+                );
+                assert!(
+                    requests(Err("unexpected menu action".into())).is_none(),
+                    "{change}, delete={delete}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[serial]
 fn right_click_fork_requires_provenance_not_a_tool_label() {
     let mut env = create_test_env_empty();
     let mut parent = observed_fork_parent("claude");

@@ -242,7 +242,7 @@ test.describe("Plugin pages (#4460)", () => {
       {
         aoeBridge: 1,
         event: "context",
-        data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1 },
+        data: { readOnly: false, cityhall: false, pluginId: "acme.kit", pageId: "board", bridgeVersion: 1, link: null },
       },
       { aoeBridge: 1, event: "theme", data: { appearance: "light", cssVars: { "--color-surface-900": "#ffffff" } } },
     ]);
@@ -312,6 +312,49 @@ test.describe("Plugin pages (#4460)", () => {
 
     await page.getByRole("button", { name: "Open full" }).click();
     await expect(page).toHaveURL("/session/sess-a");
+  });
+
+  test("split pane offers Retry when the Trash read for the opened session fails", async ({ page }) => {
+    await mockApis(page, [PAGE]);
+    const trashed = sessionResponse({
+      id: "sess-trashed",
+      title: "story-trashed",
+      project_path: "/tmp/story",
+      group_path: "/tmp",
+      status: "Stopped",
+      trashed_at: new Date().toISOString(),
+    });
+    const headers = { "aoe-runtime-epoch": "mock-runtime", "aoe-runtime-revision": "1" };
+    let trashFails = true;
+    await page.route(/\/api\/sessions\?state=untrashed$/, (r) =>
+      r.fulfill({ headers, json: { sessions: [], workspace_ordering: [], trashed_count: 1 } }),
+    );
+    await page.route(/\/api\/sessions\?state=trashed$/, (r) =>
+      trashFails
+        ? r.fulfill({ status: 500, body: "boom" })
+        : r.fulfill({ headers, json: { sessions: [trashed], workspace_ordering: [], trashed_count: 1 } }),
+    );
+
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: BRIDGE_FIXTURE }),
+    );
+    await page.route("**/api/plugins/acme.kit/sessions", (r) =>
+      r.fulfill({ json: { sessions: [{ id: "sess-trashed" }] } }),
+    );
+
+    await page.goto("/plugins/acme.kit/board");
+    await expect.poll(() => latestReport(page, "results")).toBeTruthy();
+    const frame = page.frames().find((f) => new URL(f.url()).pathname === PAGE.url)!;
+    await page.getByRole("button", { name: "Split view" }).click();
+    await frame.evaluate("call('openSession', { id: 'sess-trashed' })");
+    const pane = page.getByTestId("plugin-page-split-session");
+    const failed = pane.getByTestId("trash-read-failed");
+    await expect(failed).toBeVisible({ timeout: 10_000 });
+    await expect(pane).not.toContainText("Session not found");
+
+    trashFails = false;
+    await failed.getByRole("button", { name: "Retry" }).click();
+    await expect(failed).toHaveCount(0, { timeout: 10_000 });
   });
 
   test("session.contextMenu opens the sidebar's session menu over the page", async ({ page }) => {
@@ -429,5 +472,87 @@ test.describe("Plugin pages (#4460)", () => {
       [],
     );
     expect(actions).toEqual([]);
+  });
+
+  // Reports every `link` the host hands the page: the context push and later link pushes.
+  const LINK_FIXTURE = `<!doctype html><p>link fixture</p><script>
+const { port1, port2 } = new MessageChannel();
+port1.onmessage = (e) => {
+  const m = e.data;
+  if (m.event === "context" || m.event === "link") parent.postMessage({ kind: "link", event: m.event, link: m.data.link }, "*");
+};
+parent.postMessage({ aoeBridge: 1, id: 1, method: "ready", params: { nonce: location.hash.slice(1) } }, "*", [port2]);
+parent.postMessage({ kind: "referrer", value: document.referrer }, "*");
+</script>`;
+
+  const linkReports = (page: Page) =>
+    page.evaluate(() =>
+      (
+        window as typeof window & { __frameReports: { kind?: string; event?: string; link?: string | null }[] }
+      ).__frameReports
+        .filter((m) => m?.kind === "link")
+        .map(({ event, link }) => `${event}:${link}`),
+    );
+
+  test("a deep-linked page gets the URL's link over the bridge only when it opted in and the value is safe", async ({
+    page,
+  }) => {
+    const cases = [
+      { deepLink: true, query: "ab12-CD_3.~", want: "context:ab12-CD_3.~" },
+      { deepLink: true, query: "a%20b", want: "context:null" },
+      { deepLink: false, query: "ab12", want: "context:null" },
+    ];
+    for (const { deepLink, query, want } of cases) {
+      await mockApis(page, [{ ...PAGE, deep_link: deepLink }]);
+      await page.route(`**${PAGE.url}`, (r) =>
+        r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: LINK_FIXTURE }),
+      );
+      await page.goto(`/plugins/acme.kit/board?link=${query}`);
+      await expect(page.getByTestId("plugin-page-frame")).toHaveAttribute(
+        "src",
+        new RegExp(`^${PAGE.url}#[0-9a-f]{32}$`),
+      );
+      await expect.poll(() => linkReports(page)).toEqual([want]);
+      // The dashboard URL holds `?link=`; the page must not read it from the referrer.
+      const referrers = await page.evaluate(() =>
+        (window as typeof window & { __frameReports: { kind?: string; value?: string }[] }).__frameReports
+          .filter((m) => m?.kind === "referrer")
+          .map((m) => m.value),
+      );
+      expect(referrers).toEqual([""]);
+      await page.evaluate(() => ((window as typeof window & { __frameReports: unknown[] }).__frameReports.length = 0));
+    }
+  });
+
+  test("a notification toast with a link keeps its tone and opens the page on that item", async ({ page }) => {
+    const seed = { seq: 1, plugin_id: "acme.kit", tone: "info", title: "seed" };
+    const alert = {
+      seq: 2,
+      plugin_id: "acme.kit",
+      tone: "danger",
+      title: "Approve?",
+      link: "/plugins/acme.kit/board?link=ab12",
+    };
+    let polls = 0;
+    await mockApis(page, [{ ...PAGE, deep_link: true }]);
+    await page.route("**/api/plugins/ui-state", (r) =>
+      r.fulfill({
+        json: {
+          entries: [],
+          notifications: polls++ === 0 ? [seed] : [seed, alert],
+          pages: [{ ...PAGE, deep_link: true }],
+        },
+      }),
+    );
+    await page.route(`**${PAGE.url}`, (r) =>
+      r.fulfill({ contentType: "text/html", headers: { "content-security-policy": PAGE_CSP }, body: LINK_FIXTURE }),
+    );
+
+    await page.goto("/session/sess-a");
+    const toast = page.getByRole("alert").filter({ hasText: "Approve?" });
+    await expect(toast).toBeVisible({ timeout: 10_000 });
+    await toast.click();
+    await expect(page).toHaveURL("/plugins/acme.kit/board?link=ab12");
+    await expect.poll(() => linkReports(page)).toEqual(["context:ab12"]);
   });
 });

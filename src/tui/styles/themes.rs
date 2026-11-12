@@ -18,7 +18,7 @@ pub enum ThemeAppearance {
 
 /// Per-theme syntax-highlighter metadata, in `[syntax]` so renderer knobs stay
 /// out of the flat semantic color fields.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeSyntax {
     /// Shiki theme module the web loads. `None` falls back by appearance:
@@ -40,7 +40,7 @@ pub fn idle_decay_window(minutes: u64) -> Duration {
     Duration::from_secs(minutes.saturating_mul(60))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
     // Background and borders

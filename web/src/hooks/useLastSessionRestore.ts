@@ -10,8 +10,12 @@ export function useLastSessionRestore(params: {
   activeSessionId: string | null;
   sessions: readonly { id: string }[];
   sessionsLoaded: boolean;
+  /** The list omits the trash; a saved session that is not in it may be trashed rather than deleted. */
+  trashedCount: number;
+  trashLoaded: boolean;
+  loadTrash: () => void;
 }): void {
-  const { activeSessionId, sessions, sessionsLoaded } = params;
+  const { activeSessionId, sessions, sessionsLoaded, trashedCount, trashLoaded, loadTrash } = params;
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -40,8 +44,21 @@ export function useLastSessionRestore(params: {
     // eslint-disable-next-line react-you-might-not-need-an-effect/no-pass-data-to-parent
     if (sessions.some((s) => s.id === saved)) {
       navigate(`/session/${encodeURIComponent(saved)}`, { replace: true });
+    } else if (trashedCount > 0 && !trashLoaded) {
+      // Kept while the trash lookup is pending or failing; the rows landing re-run this effect.
+      loadTrash();
     } else {
       safeRemoveItem(LAST_SESSION_KEY);
     }
-  }, [location.key, location.pathname, activeSessionId, sessionsLoaded, sessions, navigate]);
+  }, [
+    location.key,
+    location.pathname,
+    activeSessionId,
+    sessionsLoaded,
+    sessions,
+    trashedCount,
+    trashLoaded,
+    loadTrash,
+    navigate,
+  ]);
 }

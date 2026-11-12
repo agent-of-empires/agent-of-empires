@@ -174,6 +174,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         let Some((lease, activity_seq)) = state.acp_supervisor.idle_observation(&id) else {
             continue;
         };
+        let admissions = lease.admissions();
         let Some(scope) = lease.native_scope().ok().flatten() else {
             continue;
         };
@@ -227,7 +228,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         }
         match state
             .acp_supervisor
-            .shutdown_idle(&id, &lease, activity_seq, receipt.stamp)
+            .shutdown_idle(&id, (&lease, admissions), activity_seq, receipt.stamp)
             .await
         {
             Ok(retirement) => {
@@ -323,13 +324,15 @@ mod tests {
         use crate::acp::supervisor::test_support::managed::with_managed;
         with_managed(|scope| {
             Box::pin(async move {
-                for case in ["fresh", "idle", "unknown"] {
+                for case in ["fresh", "idle", "unknown", "prompt_pending"] {
                     let live = managed_idle_session(scope, case).await;
                     let id = live.id().to_owned();
                     if case == "fresh" {
                         live.client
                             .lease
                             .test_backdate_idle_baseline(Utc::now().timestamp_millis());
+                    } else if case == "prompt_pending" {
+                        live.state.acp_supervisor.test_note_admission(&id);
                     } else if case == "unknown" {
                         let retained = live.state.acp_event_store.highest_seq(&id);
                         live.state
@@ -382,6 +385,56 @@ mod tests {
                         .iter()
                         .any(|method| method == "session/load"));
                 }
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn admitted_unpublished_prompt_vetoes_observed_idle_retirement() {
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| {
+            Box::pin(async move {
+                let live = managed_idle_session(scope, "idle-unpublished-admission").await;
+                let id = live.id().to_owned();
+                let lease = live.client.lease.clone();
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let release = scope.hold_release(release_tx);
+                *IDLE_DECISION_GATE.lock().unwrap() = Some((entered_tx, release_rx));
+                let state = live.state.clone();
+                let reaper = scope.spawn_helper(async move {
+                    reap_idle_workers(&state).await;
+                });
+                tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let before = live.state.acp_event_store.highest_seq(&id);
+                live.state.acp_supervisor.test_note_admission(&id);
+                assert_eq!(live.state.acp_event_store.highest_seq(&id), before);
+                assert!(release.release());
+                reaper.await.unwrap();
+                assert_eq!(live.state.acp_supervisor.current_lease(&id), Some(lease));
+                let row = live
+                    .state
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .clone();
+                let durable = crate::session::Storage::open_reference("test")
+                    .unwrap()
+                    .load()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.id == id)
+                    .unwrap();
+                assert!(row.idle_dormant_since.is_none());
+                assert!(durable.idle_dormant_since.is_none());
             })
         })
         .await;
@@ -530,12 +583,21 @@ mod tests {
                         let native_scope = lease.native_scope().unwrap().unwrap();
                         let receipt = if after_mark {
                             Some(
-                                state
-                                    .session_service
-                                    .mark_idle_dormant(&id, native_scope.clone())
-                                    .await
-                                    .unwrap()
-                                    .unwrap(),
+                                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                                    loop {
+                                        if let Some(receipt) = state
+                                            .session_service
+                                            .mark_idle_dormant(&id, native_scope.clone())
+                                            .await
+                                            .unwrap()
+                                        {
+                                            break receipt;
+                                        }
+                                        tokio::task::yield_now().await;
+                                    }
+                                })
+                                .await
+                                .unwrap(),
                             )
                         } else {
                             None

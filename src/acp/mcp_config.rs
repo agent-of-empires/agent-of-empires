@@ -1,6 +1,6 @@
 //! ACP boundary for MCP server forwarding.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     EnvVariable, HttpHeader, McpCapabilities, McpServer, McpServerHttp, McpServerSse,
     McpServerStdio,
 };
@@ -212,7 +212,7 @@ mod tests {
     ) -> serde_json::Value {
         let servers = project_servers_to_acp(resolved(json, provenance), session_env);
         serde_json::to_value(
-            agent_client_protocol::schema::v1::NewSessionRequest::new("/work").mcp_servers(servers),
+            agent_client_protocol::v1::schema::NewSessionRequest::new("/work").mcp_servers(servers),
         )
         .unwrap()
     }

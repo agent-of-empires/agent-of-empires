@@ -45,6 +45,67 @@ const expect2xx = (res: Response) => {
   expect(res.status).toBeLessThan(300);
 };
 
+test("original Native partial tool output survives a correlated prompt failure until its real terminal", async ({
+  page,
+  spawnServe,
+}, testInfo) => {
+  const toolId = "original-native-open-tool";
+  const partial = "NATIVE_PARTIAL_TOOL_OUTPUT";
+  const final = "NATIVE_REAL_TERMINAL_OUTPUT";
+  const failure = "NATIVE_LOCAL_REQUEST_FAILURE";
+  const { serve, sessionId } = await startAcpSession(spawnServe, {
+    title: "native-partial-tool-custody",
+    fakeAcpScript: script(
+      {
+        updates: [
+          {
+            sessionUpdate: "tool_call",
+            toolCallId: toolId,
+            title: "printf native-stream",
+            kind: "execute",
+            status: "in_progress",
+            rawInput: { command: "printf native-stream" },
+          },
+          {
+            sessionUpdate: "tool_call_update",
+            toolCallId: toolId,
+            status: "in_progress",
+            content: [{ type: "content", content: { type: "text", text: partial } }],
+          },
+        ],
+        error: { code: -32603, message: failure },
+      },
+      endTurn({
+        sessionUpdate: "tool_call_update",
+        toolCallId: toolId,
+        status: "completed",
+        content: [{ type: "content", content: { type: "text", text: final } }],
+      }),
+    ),
+  });
+  await openStructuredView(page, serve, sessionId);
+  await postPrompt(serve.baseUrl, sessionId, "start the original tool");
+  await expect
+    .poll(async () => {
+      const frames = JSON.stringify(await replayFrames(serve.baseUrl, sessionId));
+      return frames.includes(failure) && frames.includes("prompt_failed");
+    })
+    .toBe(true);
+  await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
+  const rows = (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/replay?view=rows&since=0`).then(
+    (response) => response.json(),
+  )) as { rows: { kind: string; tool_call_id?: string }[] };
+  expect(rows.rows.filter((row) => row.tool_call_id === toolId).map((row) => row.kind)).toEqual(["tool_start"]);
+  await page.reload();
+  await expect(page.getByText(partial, { exact: true }).first()).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("native-partial-after-local-failure.png"), fullPage: true });
+  await page.getByRole("button", { name: /printf native-stream/ }).click();
+  await postPrompt(serve.baseUrl, sessionId, "finish the same original tool explicitly");
+  await expect(page.getByText(final, { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(partial, { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("native-real-tool-terminal.png"), fullPage: true });
+});
+
 test("structured view prompt carries an image attachment end to end", async ({ spawnServe }) => {
   // #1000, #965
   const { serve, sessionId } = await startAcpSession(spawnServe, { title: "acp-attach", fakeAcpScript: IMAGE_CAPABLE });
@@ -143,11 +204,9 @@ test("staged composer image survives session switch and reload", async ({ page, 
   const serve = await spawnServe({
     acp: true,
     fakeAcpScript: IMAGE_CAPABLE,
-    seedFn: ({ home, env }) => {
-      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "draft-source");
-      aoeAdd(env, initWorkingRepo(join(home, "project-b"), env).path, "draft-target");
-    },
   });
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-a"), serve.env).path, "draft-source");
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-b"), serve.env).path, "draft-target");
   const source = await sessionIdByTitle(serve.baseUrl, "draft-source");
   const target = await sessionIdByTitle(serve.baseUrl, "draft-target");
   await spawnAcpAgentAndWait(serve.baseUrl, source, 30_000, serve.home);
@@ -218,10 +277,8 @@ test("staged photo past the localStorage quota survives reload without a storage
   const serve = await spawnServe({
     acp: true,
     fakeAcpScript: IMAGE_CAPABLE,
-    seedFn: ({ home, env }) => {
-      aoeAdd(env, initWorkingRepo(join(home, "project-a"), env).path, "photo-draft");
-    },
   });
+  aoeAdd(serve.env, initWorkingRepo(join(serve.home, "project-a"), serve.env).path, "photo-draft");
   const id = await sessionIdByTitle(serve.baseUrl, "photo-draft");
   await spawnAcpAgentAndWait(serve.baseUrl, id, 30_000, serve.home);
 
@@ -268,9 +325,9 @@ test("structured view transcript file links open in-app, scroll to cited line, a
       // project_path is the working tree, so absolute links under it resolve to repo files.
       const text = `See [a.ts](${projectDir}/src/a.ts:1), [b.ts](${projectDir}/src/b.ts:1), [deep](${projectDir}/src/long.ts:80) and [missing](/tmp/aoe-1718-not-a-repo/missing.ts:1).`;
       writeFileSync(fakeAcpScriptPath(home), JSON.stringify(script(endTurn(chunk(text)))));
-      aoeAdd(env, projectDir, "acp-filelink");
     },
   });
+  aoeAdd(serve.env, join(serve.home, "project"), "acp-filelink");
   const sessionId = await sessionIdByTitle(serve.baseUrl, "acp-filelink");
   await spawnAcpAgentAndWait(serve.baseUrl, sessionId);
   await openStructuredView(page, serve, sessionId);

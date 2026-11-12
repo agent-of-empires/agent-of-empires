@@ -53,6 +53,8 @@ pub(crate) struct StructuredSessionSpec {
     /// Initial prompt to persist with the instance and deliver once the ACP
     /// worker is live, stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<String>,
+    /// The session this one is a sub-session of, already checked by the caller.
+    pub parent_session_id: Option<String>,
     /// Explicit ACP approval-mode id to persist on the instance; the
     /// supervisor applies it after every worker (re)spawn. Stamped by the
     /// plugin host create path after host-side classification.
@@ -66,6 +68,7 @@ pub(crate) struct StructuredSessionSpec {
     pub fork_seed: Option<crate::session::ForkSeed>,
     /// Where the web wizard polls this create's stage and hook output.
     pub progress: Option<Arc<crate::server::create_progress::CreateProgress>>,
+    pub cli: Option<crate::daemon::CliCreationOptions>,
 }
 
 /// Created session and transient warnings; HTTP row authority is the runtime snapshot.
@@ -73,6 +76,14 @@ pub(crate) struct SpawnOutcome {
     pub instance: Instance,
     pub warnings: Vec<String>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct CliDuplicateSession(anyhow::Error);
+
+#[derive(Debug, thiserror::Error)]
+#[error("CLI creation committed, but finalization was not confirmed")]
+pub(crate) struct CliCreationOutcomeUnknown;
 
 /// Marker error the core returns when the blocking build task panicked, so the
 /// HTTP handler can keep answering `500 Internal Server Error` for that case
@@ -143,6 +154,7 @@ pub(crate) async fn spawn_structured_session(
             created_by_plugin,
             plugin_create_idempotency,
             pending_initial_turn,
+            parent_session_id,
             acp_mode_id,
             view,
             agent_name,
@@ -152,8 +164,8 @@ pub(crate) async fn spawn_structured_session(
             import_binding,
             fork_seed,
             progress,
+            cli,
         } = spec;
-
 
         let sandbox_image = sandbox_image.unwrap_or_else(|| {
             if config.sandbox.default_image.is_empty() {
@@ -190,6 +202,14 @@ pub(crate) async fn spawn_structured_session(
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
 
+        let sandbox_readiness = if cli.is_some()
+            && view == crate::session::View::Terminal
+            && hook_plan.on_create().is_empty()
+        {
+            builder::SandboxReadiness::InstalledOnly
+        } else {
+            builder::SandboxReadiness::RequireRunning
+        };
         let params = InstanceParams {
             title,
             title_typed,
@@ -227,6 +247,10 @@ pub(crate) async fn spawn_structured_session(
             },
             scratch,
             fork_seed,
+            generated_name: cli.as_ref().is_some_and(|options| options.generated_name),
+            no_submodules: cli.as_ref().is_some_and(|options| options.no_submodules),
+            tie_workdir_to_name: cli.is_some(),
+            worktree_path_id: cli.as_ref().and_then(|options| options.worktree_path_id.clone()),
         };
 
         let namespace = runtime.block_on(worker_state.profile_namespace.read());
@@ -247,9 +271,23 @@ pub(crate) async fn spawn_structured_session(
         };
         let title_refs: Vec<&str> = existing_titles.iter().map(String::as_str).collect();
         let branch_refs: Vec<&str> = existing_branches.iter().map(String::as_str).collect();
-        let mut plan = builder::plan_instance(params, &title_refs, &branch_refs, &profile)?;
+        let mut plan = builder::plan_instance(
+            params,
+            sandbox_readiness,
+            &title_refs,
+            &branch_refs,
+            &profile,
+        )?;
         let instance = &mut plan.result.instance;
         instance.source_profile = profile.clone();
+        // HTTP's `parent_session_id`, checked by the handler; a CLI create names its parent below.
+        instance.parent_session_id = parent_session_id;
+        if let Some(parent) = cli.as_ref().and_then(|options| options.parent.as_deref()) {
+            let rows = worker_state.instances.blocking_read();
+            let parent = super::api::sessions::resolve_cli_parent(&rows, &profile, parent)?;
+            instance.parent_session_id = Some(parent.id.clone());
+            instance.group_path = parent.group_path.clone();
+        }
         instance.file_watch = Some(worker_state.file_watch.clone());
         native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
@@ -323,6 +361,10 @@ pub(crate) async fn spawn_structured_session(
             )?;
             instance.status = Status::Creating;
             store.update(|rows, groups| {
+                anyhow::ensure!(!rows.iter().any(|row| row.id == instance.id), "created session already exists");
+                if cli.is_some() && crate::session::is_duplicate_session(rows.iter(), &instance.title, &instance.project_path, None) {
+                    return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
+                }
                 crate::acp::establishment::insert_created_instance(
                     rows, instance, native.storage(), crate::acp::establishment::CreationAdmission::Now,
                 )?;
@@ -343,97 +385,142 @@ pub(crate) async fn spawn_structured_session(
             }
         };
         let mut instance = build_result.instance;
-        let build_warnings = build_result.warnings;
+        let mut build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
+        let mut validation_error = None;
         let mut adapter_refusal = None;
         let agent_effort = if provision_error.is_none() {
-            let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-                &instance.source_profile,
-                std::path::Path::new(&instance.project_path),
+        let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        );
+        let acp_registry = crate::acp::AgentRegistry::with_defaults();
+        // The defaults, and the pin, are keyed by the agent the spawn
+        // runs, resolved the way the supervisor resolves it.
+        let agent_key = crate::acp::pick_acp_agent_name(
+            &acp_registry,
+            &resolved_config.session,
+            &resolved_config.acp,
+            &instance.tool,
+            instance.agent_name.as_deref(),
+        );
+        let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
+        // Preserve the explicit request model separately (trimmed to match the
+        // resolver's normalization) so a terminal fallback below can keep it while
+        // dropping any ACP-derived default; agent_model is ACP-only.
+        let explicit_model = agent_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // A profile pin wins, else the explicit request, else the per-agent default;
+        // effort is keyed on the resolved model.
+        let explicit_effort = agent_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let (resolved_model, mut agent_effort) =
+            crate::session::config::resolve_spawn_model_effort(
+                defaults,
+                explicit_model.clone(),
+                agent_effort,
             );
-            let acp_registry = crate::acp::AgentRegistry::with_defaults();
-            // The defaults, and the pin, are keyed by the agent the spawn
-            // runs, resolved the way the supervisor resolves it.
-            let agent_key = crate::acp::pick_acp_agent_name(
-                &acp_registry,
-                &resolved_config.session,
-                &resolved_config.acp,
-                &instance.tool,
-                instance.agent_name.as_deref(),
-            );
-            let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            // Preserve the explicit request model separately (trimmed to match the
-            // resolver's normalization) so a terminal fallback below can keep it while
-            // dropping any ACP-derived default; agent_model is ACP-only.
-            let explicit_model = agent_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            // A profile pin wins, else the explicit request, else the per-agent default;
-            // effort is keyed on the resolved model.
-            let explicit_effort = agent_effort
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let (resolved_model, mut agent_effort) =
-                crate::session::config::resolve_spawn_model_effort(
-                    defaults,
-                    explicit_model.clone(),
-                    agent_effort,
-                );
-            instance.agent_model = resolved_model;
-            instance.acp_effort = explicit_effort;
-            // Don't trust the client's capability decision.
-            if instance.is_structured() {
-                let resolved = instance
-                    .agent_name
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(instance.tool.as_str());
-                let resolved_session = &resolved_config.session;
-                // Check the resolved agent key AND the raw tool, the same pair `aoe add`'s
-                // precondition uses.
-                let acp_capable_key = |key: &str| {
-                    acp_registry.get(key).is_some()
-                        || resolved_session
-                            .agent_acp_cmd
-                            .get(key)
-                            .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
-                        // A custom agent that inherits a registry-backed base (e.g.
-                        || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
-                            .is_some()
-                };
-                let capable = acp_capable_key(resolved) || acp_capable_key(&instance.tool);
-                if capable {
-                    instance.view = crate::session::View::Structured;
-                } else if instance.acp_establishment.as_ref()
-                    .and_then(crate::acp::establishment::AcpEstablishment::attempt)
-                    .is_some_and(|attempt| attempt.target != crate::acp::establishment::EstablishmentTarget::New)
+        instance.agent_model = resolved_model;
+        instance.acp_effort = explicit_effort;
+        if cli.is_some() && instance.is_structured() {
+            use crate::session::builder::structured::{
+                preparation_hooks_apply, validate_structured_choice, StructuredChoice,
+                StructuredChoiceError,
+            };
+            let choice = StructuredChoice {
+                tool: &instance.tool,
+                agent_name: instance.agent_name.as_deref(),
+                command_override: &instance.command,
+                sandboxed: instance.is_sandboxed(),
+                project_path: Some(std::path::Path::new(&instance.project_path)),
+                preparation_hooks: &|| preparation_hooks_apply(
+                    &config.hooks,
+                    std::path::Path::new(&original_path),
+                    scratch,
+                    trust_hooks,
+                ),
+            };
+            if let Err(error) = validate_structured_choice(&choice, &resolved_config) {
+                if matches!(error, StructuredChoiceError::NotCapable(_))
+                    || instance.agent_name.is_some()
+                    || instance.acp_effort.is_some()
                 {
-                    adapter_refusal = Some(anyhow::anyhow!(
-                        "the selected agent cannot establish the requested structured conversation"
-                    ));
+                    validation_error = Some(anyhow::Error::new(error));
                 } else {
+                    build_warnings.push(format!("{error}; using terminal view"));
                     instance.view = crate::session::View::Terminal;
                 }
             }
-
-            if !instance.is_structured() {
-                agent_effort = None;
-                // Terminal sessions keep only an explicitly requested model,
-                // never an ACP-derived default (agent_model is ACP-only).
-                instance.agent_model = explicit_model;
-                // acp_effort is ACP-only too: nothing applies it in tmux mode.
-                instance.acp_effort = None;
+        }
+        // Don't trust the client's capability decision.
+        if instance.is_structured() {
+            let resolved = instance
+                .agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(instance.tool.as_str());
+            let resolved_session = &resolved_config.session;
+            // Check the resolved agent key AND the raw tool, the same pair `aoe add`'s
+            // precondition uses.
+            let acp_capable_key = |key: &str| {
+                acp_registry.get(key).is_some()
+                    || resolved_session
+                        .agent_acp_cmd
+                        .get(key)
+                        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(key, cmd).is_ok())
+                    // A custom agent that inherits a registry-backed base (e.g.
+                    || crate::acp::inherited_acp_base(key, &resolved_session.agent_detect_as)
+                        .is_some()
+            };
+            let capable = acp_capable_key(resolved) || acp_capable_key(&instance.tool);
+            if capable {
+                instance.view = crate::session::View::Structured;
+            } else if instance.acp_establishment.as_ref()
+                .and_then(crate::acp::establishment::AcpEstablishment::attempt)
+                .is_some_and(|attempt| attempt.target != crate::acp::establishment::EstablishmentTarget::New)
+            {
+                adapter_refusal = Some(anyhow::anyhow!(
+                    "the selected agent cannot establish the requested structured conversation"
+                ));
+            } else {
+                instance.view = crate::session::View::Terminal;
             }
+        }
 
-            agent_effort
+        // An always-Yolo agent skips permission prompts whatever the client asked, so record
+        // that for the agent this session actually runs.
+        let runs = if instance.is_structured() {
+            agent_key.as_str()
         } else {
-            None
+            instance.tool.as_str()
         };
+        instance.yolo_mode |= crate::acp::runs_always_yolo(
+            runs,
+            instance.view,
+            &resolved_config.session.agent_acp_cmd,
+            &resolved_config.session.agent_detect_as,
+        );
+
+        if !instance.is_structured() {
+            agent_effort = None;
+            // Terminal sessions keep only an explicitly requested model,
+            // never an ACP-derived default (agent_model is ACP-only).
+            instance.agent_model = explicit_model;
+            // acp_effort is ACP-only too: nothing applies it in tmux mode.
+            instance.acp_effort = None;
+        }
+
+        agent_effort
+            } else {
+        None
+    };
 
         let provisioning_failed = provision_error.is_some();
         let rollback = |native: super::session_store::NativeSessionStore, instance: Instance, provisioning_failed: bool| { use crate::session::deletion::{DeletionDisposition, DeletionRequest, PurgeTransaction};
@@ -528,6 +615,7 @@ pub(crate) async fn spawn_structured_session(
                     }
                 }
                 row.view = instance.view;
+                row.yolo_mode = instance.yolo_mode;
                 row.agent_model = instance.agent_model.clone();
                 row.acp_effort = instance.acp_effort.clone();
                 row.fork_pending = instance.fork_pending.clone();
@@ -540,7 +628,7 @@ pub(crate) async fn spawn_structured_session(
             rollback(native, instance, provisioning_failed);
             return Err(error);
         }
-        let creation = match provision_error.or(adapter_refusal) {
+        let creation = match provision_error.or(validation_error).or(adapter_refusal) {
             Some(error) => Err(error),
             None => creation_guard
                 .check()
@@ -569,6 +657,7 @@ pub(crate) async fn spawn_structured_session(
                             crate::server::api::sessions::CreateHookFailed::new(
                                 error,
                                 hint.as_deref(),
+                                hook_plan.on_create_from_repo,
                             ),
                         )
                     })
@@ -580,6 +669,30 @@ pub(crate) async fn spawn_structured_session(
             return Err(error);
         }
 
+        if cli.is_some() && !instance.is_structured() {
+            if let Err(error) = creation_guard.commit() {
+                rollback(native, instance, false);
+                return Err(error.into());
+            }
+            let _namespace = runtime.block_on(worker_state.profile_namespace.read());
+            let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+            let _guard = lock.blocking_lock();
+            store.update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == instance.id)
+                    .ok_or(crate::session::LifecycleReservationError::Superseded)?;
+                anyhow::ensure!(row.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation),
+                    crate::session::LifecycleReservationError::Superseded);
+                row.sandbox_info = instance.sandbox_info.clone();
+                row.status = Status::Stopped;
+                row.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+                instance = row.clone();
+                Ok(())
+            }).context(CliCreationOutcomeUnknown)?;
+            native.adopt_runtime_fields(&instance).context(CliCreationOutcomeUnknown)?;
+            crate::tips::record_session_creations(1);
+            return Ok((instance, build_warnings, agent_effort, native, creation_profile, None));
+        }
+
         if let Some(progress) = progress.as_deref() {
             progress.set_stage(crate::server::create_progress::CreateStage::Starting);
         }
@@ -589,7 +702,7 @@ pub(crate) async fn spawn_structured_session(
             let submission =
                 runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
             let guard = lock.blocking_lock();
-            let reservation = (|| -> anyhow::Result<Option<crate::session::NativeStartAdmission>> {
+            let reservation = (|| -> anyhow::Result<_> {
                 native.check_available()?;
                 let title_lock = crate::session::acquire_session_title_lock(&instance.id)?;
                 let lifecycle_lock =
@@ -604,22 +717,25 @@ pub(crate) async fn spawn_structured_session(
                     false,
                     crate::session::LaunchReservation {
                         generation,
+                        revival: start_admission
+                            .as_ref()
+                            .and_then(|admission| admission.revival_target()),
+                        start_admission,
                         title_lock,
                         lifecycle_lock,
                     },
-                )?;
-                Ok(start_admission)
+                )
             })();
             drop(guard);
             drop(submission);
             drop(namespace);
             reservation
         };
-        let start_admission = match launch_reservation {
-            Ok(admission) => admission,
+        let launch_reservation = match launch_reservation {
+            Ok(reservation) => reservation,
             Err(error) => {
                 if error.is::<crate::session::LaunchIndeterminateCause>() {
-                    instance.fail_reserved_launch(store, generation, &error, false);
+                    instance.fail_reserved_launch(store, generation, &error, None, None);
                     native.adopt_runtime_fields(&instance)?;
                 } else {
                     rollback(native, instance, false);
@@ -629,7 +745,7 @@ pub(crate) async fn spawn_structured_session(
         };
 
         creation_guard.phase(CreationPhase::LaunchHooks);
-        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress));
+        let hooks = instance.run_pre_launch_hooks(false, store, Some(&creation_progress), Some(generation));
         if let Err(error) = hooks {
             rollback(native, instance, false);
             return Err(error);
@@ -639,9 +755,9 @@ pub(crate) async fn spawn_structured_session(
             return Err(error.into());
         }
 
-        let _namespace = runtime.block_on(worker_state.profile_namespace.read());
-        let _submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
-        let _guard = lock.blocking_lock();
+        let namespace = runtime.block_on(worker_state.profile_namespace.read());
+        let submission = runtime.block_on(worker_state.session_service.prompt_submission(&instance.id));
+        let guard = lock.blocking_lock();
         let mut acp_reservation = None;
         let post_hooks: anyhow::Result<()> = (|| {
             if instance.is_structured() {
@@ -696,22 +812,44 @@ pub(crate) async fn spawn_structured_session(
                         conversation_carry: None,
                         start_admission,
                     },
-                    generation,
+                    launch_reservation,
                     Ok(()),
                 );
                 let _title = crate::session::acquire_session_title_lock(&instance.id)?;
                 let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&instance.id)?;
-                native.adopt_runtime_fields(&instance)?;
-                native.refresh_pane_observations(&instance)?;
-                outcome?;
+                let adoption = native
+                    .adopt_runtime_fields(&instance)
+                    .and_then(|()| native.refresh_pane_observations(&instance));
+                if let Err(error) = outcome {
+                    if let Err(adoption_error) = adoption {
+                        tracing::warn!(target: "session.store", session = %instance.id,
+                            error = %adoption_error,
+                            "canonical adoption also failed after refused launch finalization");
+                    }
+                    return Err(error);
+                }
+                adoption?;
             }
             Ok(())
         })();
+        // Rollback takes these guards again.
+        drop(guard);
+        drop(submission);
+        drop(namespace);
         if let Err(error) = post_hooks {
+            if let Some(pending) = error.downcast_ref::<crate::session::LaunchFinalizationPending>() {
+                native.defer_lifecycle_release(
+                    instance.id.clone(),
+                    crate::session::LifecycleRelease::IndeterminateLaunch,
+                    pending.generation,
+                    None,
+                );
+                return Err(error);
+            }
             if error.is::<crate::session::LaunchIndeterminateCause>() {
                 return Err(error);
             }
-            // Archiving during hooks preserves the row but refuses ACP admission.
+            // Archived rows refuse ACP admission without rollback.
             if !error.is::<crate::session::StartBlocked>() {
                 rollback(native, instance, false);
                 return Err(error);
@@ -719,16 +857,6 @@ pub(crate) async fn spawn_structured_session(
         }
 
         crate::tips::record_session_creations(1);
-        tracing::info!(
-            target: "session.create",
-            session = %instance.id,
-            title = %instance.title,
-            tool = %instance.tool,
-            view = if instance.is_structured() { "structured" } else { "terminal" },
-            project_path = %instance.project_path,
-            branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
-            "session created"
-        );
         Ok::<_, anyhow::Error>((
             instance,
             build_warnings,
@@ -742,6 +870,16 @@ pub(crate) async fn spawn_structured_session(
 
     match result {
         Ok(Ok((instance, warnings, agent_effort, native, creation_profile, acp_reservation))) => {
+            tracing::info!(
+                target: "session.create",
+                session = %instance.id,
+                title = %instance.title,
+                tool = %instance.tool,
+                view = if instance.is_structured() { "structured" } else { "terminal" },
+                project_path = %instance.project_path,
+                branch = ?instance.worktree_info.as_ref().map(|w| &w.branch),
+                "session created"
+            );
             let native = Arc::new(native);
             let acp_spawn_target = if instance.is_structured() && acp_reservation.is_some() {
                 Some((
@@ -798,7 +936,7 @@ pub(crate) async fn spawn_structured_session(
                     )
                     .await;
                 let command_override =
-                    crate::server::acp_reconciler::command_override_for_spawn(&tool, &command);
+                    crate::acp::supervisor::command_override_for_spawn(&tool, &command);
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
@@ -1118,6 +1256,7 @@ mod tests {
             created_by_plugin: None,
             plugin_create_idempotency: None,
             pending_initial_turn: None,
+            parent_session_id: None,
             acp_mode_id: None,
             view: crate::session::View::Terminal,
             agent_name: Some("claude".into()),
@@ -1127,6 +1266,7 @@ mod tests {
             import_binding: None,
             fork_seed: None,
             progress: None,
+            cli: None,
         };
         let result = spawn_structured_session(&state.session_service, spec).await;
         assert!(
@@ -1149,6 +1289,216 @@ mod tests {
                 .sessions_created,
             0
         );
+    }
+
+    /// `aoe add --sandbox -w`: `on_create` needs the container while the creation holds its
+    /// Launch reservation. Peers stay out until it settles, and a failure rolls back only itself.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn sandboxed_cli_create_runs_on_create_and_rolls_back_only_itself() {
+        use crate::session::{LifecycleOperation, LifecycleReservationError, Storage};
+        use std::os::unix::fs::PermissionsExt;
+        for (label, hook) in [
+            ("no hook", None),
+            ("hook", Some("echo created")),
+            ("slow hook", Some("echo slow")),
+            ("failing hook", Some("exit 7")),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+            let app = crate::session::get_app_dir().unwrap();
+            crate::session::purge_owners::initialize(&app).unwrap();
+            crate::tmux::tool_retirement::initialize(&app).unwrap();
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
+            })
+            .unwrap();
+            crate::session::config::update_config(|config| {
+                config.systemd.enabled = false;
+                config.hooks.on_create = hook.iter().map(|hook| hook.to_string()).collect();
+            })
+            .unwrap();
+            // Existing native config is what the store isolation copies on a real host.
+            std::fs::create_dir(root.path().join(".claude")).unwrap();
+            std::fs::write(root.path().join(".claude/settings.json"), "{}").unwrap();
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let calls = root.path().join("calls");
+            let started = root.path().join("hook-started");
+            let release = root.path().join("hook-release");
+            let script = format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{calls}'\ncase \"$*\" in\n\
+                 'image inspect'*) exit 0;;\n\
+                 *inspect*) echo 'Error: No such container (container not found)' >&2; exit 1;;\n\
+                 run\\ *|create\\ *) echo fake-id;;\n\
+                 exec*'echo slow'*) touch '{started}'; i=0; \
+                 until [ -e '{release}' ] || [ $i -ge 1200 ]; do sleep 0.05; i=$((i+1)); done;;\n\
+                 exec*'exit 7'*) exit 7;;\n\
+                 esac\nexit 0\n",
+                calls = calls.display(),
+                started = started.display(),
+                release = release.display(),
+            );
+            for runtime in ["docker", "podman", "container"] {
+                let path = bin.join(runtime);
+                std::fs::write(&path, &script).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let _path = crate::session::test_support::path_prepended(&bin);
+            let project = root.path().join("project");
+            std::fs::create_dir(&project).unwrap();
+            let repo = git2::Repository::init(&project).unwrap();
+            let signature = git2::Signature::now("t", "t@example.com").unwrap();
+            let tree = repo
+                .find_tree(repo.index().unwrap().write_tree().unwrap())
+                .unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+                .unwrap();
+            let profile = "default";
+            let peers: Vec<Instance> = (0..4)
+                .map(|index| {
+                    let mut peer =
+                        Instance::new(&format!("peer-{index}"), project.to_str().unwrap());
+                    peer.source_profile = profile.into();
+                    peer.sandbox_info = Some(crate::session::SandboxInfo {
+                        provider: None,
+                        enabled: true,
+                        container_id: None,
+                        image: "test-image".into(),
+                        container_name: crate::containers::DockerContainer::from_session_id(
+                            &peer.id,
+                        )
+                        .name,
+                        extra_env: None,
+                        custom_instruction: None,
+                        before_start_env: Vec::new(),
+                        before_start_hook_env: Vec::new(),
+                        container_workdir: None,
+                    });
+                    peer
+                })
+                .collect();
+            crate::server::test_support::seed_instances_on_disk_for_test(profile, peers.clone());
+            let state = crate::server::test_support::build_test_app_state(peers.clone());
+            crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+            let spec = StructuredSessionSpec {
+                title: Some("hooked".into()),
+                title_typed: true,
+                size: None,
+                path: project.to_string_lossy().into_owned(),
+                group: String::new(),
+                tool: "claude".into(),
+                worktree_enabled: true,
+                worktree_branch: Some("feature".into()),
+                create_new_branch: true,
+                base_branch: None,
+                sandbox: true,
+                sandbox_image: Some("test-image".into()),
+                yolo_mode: false,
+                extra_env: Vec::new(),
+                before_start_hook_env: Vec::new(),
+                extra_args: String::new(),
+                command_override: String::new(),
+                extra_repo_paths: Vec::new(),
+                repo_base_branches: Vec::new(),
+                scratch: false,
+                trust_hooks: None,
+                trust_review: None,
+                custom_instruction: None,
+                callback_url: None,
+                idempotency_key: Some("create-key".into()),
+                profile: profile.into(),
+                created_by_plugin: None,
+                plugin_create_idempotency: None,
+                pending_initial_turn: None,
+                parent_session_id: None,
+                acp_mode_id: None,
+                view: crate::session::View::Terminal,
+                agent_name: None,
+                agent_model: None,
+                agent_effort: None,
+                import_acp_session_id: None,
+                import_binding: None,
+                fork_seed: None,
+                progress: None,
+                cli: Some(crate::daemon::CliCreationOptions {
+                    parent: None,
+                    projects: Vec::new(),
+                    command: None,
+                    fork_source: None,
+                    generated_name: false,
+                    no_submodules: false,
+                    worktree_path_id: None,
+                }),
+            };
+            let create = tokio::spawn({
+                let service = state.session_service.clone();
+                async move { spawn_structured_session(&service, spec).await.map(|_| ()) }
+            });
+            if label == "slow hook" {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !started.exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the hook never started"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                let peer = Storage::open_unwatched(profile).unwrap().update(|rows, _| {
+                    rows.iter_mut()
+                        .find(|row| row.title == "hooked")
+                        .expect("the creation published its row before the hook")
+                        .try_acquire_lifecycle_reservation(
+                            LifecycleOperation::Capture,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .map_err(anyhow::Error::from)
+                });
+                assert_eq!(
+                    peer.unwrap_err()
+                        .downcast_ref::<LifecycleReservationError>(),
+                    Some(&LifecycleReservationError::Busy(LifecycleOperation::Launch)),
+                );
+                std::fs::write(&release, "").unwrap();
+            }
+            let result = create.await.unwrap();
+            let log = std::fs::read_to_string(&calls).unwrap_or_default();
+            let rows = Storage::open_unwatched(profile).unwrap().load().unwrap();
+            for peer in &peers {
+                let row = rows.iter().find(|row| row.id == peer.id);
+                assert!(
+                    row.is_some_and(|row| !row.is_trashed()
+                        && row.lifecycle_generation == peer.lifecycle_generation),
+                    "{label}: {} changed: {row:?}",
+                    peer.title
+                );
+                let container = crate::containers::DockerContainer::from_session_id(&peer.id).name;
+                assert!(
+                    !log.lines()
+                        .any(|line| line.starts_with("rm ") && line.contains(&container)),
+                    "{label}: removed {container}: {log}"
+                );
+            }
+            let branch = repo.find_branch("feature", git2::BranchType::Local);
+            if label == "failing hook" {
+                let error = format!("{:#}", result.expect_err("the hook failed"));
+                assert!(error.contains("on_create"), "{error}");
+                assert!(!rows.iter().any(|row| row.title == "hooked"), "{label}");
+                assert!(branch.is_err(), "{label}: the created branch was kept");
+            } else {
+                result.unwrap_or_else(|error| panic!("{label}: {error:#}\n{log}"));
+                let created = rows.iter().find(|row| row.title == "hooked").expect(label);
+                assert_eq!(created.status, crate::session::Status::Stopped, "{label}");
+                assert!(created.lifecycle_reservation.is_none(), "{label}");
+                assert!(branch.is_ok(), "{label}");
+                assert_eq!(
+                    log.lines().any(|line| line.contains("bash -c echo")),
+                    hook.is_some(),
+                    "{label}: {log}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1182,6 +1532,7 @@ mod tests {
                     State(state),
                     Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
                     None,
+                    None,
                     Ok(Json(body)),
                 )
                 .await
@@ -1214,10 +1565,480 @@ mod tests {
         );
     }
 
-    /// A create that answered has registered every resource the launch owns,
-    /// so a delete issued while its ACP handshake is still unanswered must
-    /// claim the row. Holding the launch reservation for that wait instead made
-    /// the pair unresolvable for as long as the agent took to answer.
+    /// A finalization failure after the launch hooks rolls back with the
+    /// spawn guards already released; holding them deadlocked the rollback on
+    /// the non-reentrant instance lock.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_launch_finalization_failure_rolls_back_without_deadlock() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        let barrier = tempfile::tempdir().unwrap();
+        let (ready, release) =
+            support::install_blocking_before_session_hook(barrier.path(), "launch");
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let state = support::build_test_app_state(Vec::new());
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title": "created-5212", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let create = tokio::spawn({
+            let state = state.clone();
+            async move {
+                crate::server::api::sessions::create_session(
+                    State(state),
+                    Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                    None,
+                    None,
+                    Ok(Json(body)),
+                )
+                .await
+                .into_response()
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch hook never ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Dropping the launch reservation fails finalization without being a
+        // StartBlocked refusal, so the creation rolls back.
+        let storage = crate::session::Storage::new_unwatched("test").unwrap();
+        let id = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.title == "created-5212")
+            .expect("row published before the launch hook")
+            .id;
+        {
+            let _lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+            storage
+                .update(|rows, _| {
+                    for row in rows.iter_mut().filter(|row| row.id == id) {
+                        row.lifecycle_reservation = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        std::fs::write(release, b"release").unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), create)
+            .await
+            .expect("rollback must return instead of waiting on its own guards")
+            .unwrap();
+        assert!(!response.status().is_success());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let _submission = state.session_service.prompt_submission(&id).await;
+            let _guard = state.instance_lock(&id).await.lock_owned().await;
+        })
+        .await
+        .expect("the session must be released for later operations");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn refused_control_admission_answers_create_without_deadlocking_rollback() {
+        use crate::server::test_support as support;
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
+        let app_dir = temp.path().join("x".repeat(96));
+        std::fs::create_dir(&app_dir).unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(&app_dir);
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .expect("acknowledge the agent hook paths");
+        support::seed_instances_on_disk_for_test("test", Vec::new());
+        let launcher: crate::acp::supervisor::Launcher = Arc::new(|_, _| {
+            Box::pin(async {
+                Err(crate::acp::acp_client::AcpError::Spawn(
+                    "control admission must refuse before Native launch".into(),
+                ))
+            })
+        });
+        let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        support::refresh_canonical_metadata_for_test(&state).await;
+        let body: crate::daemon::CreateSessionBody = serde_json::from_value(serde_json::json!({
+            "title": "refused-control", "path": "", "tool": "claude",
+            "scratch": true, "view": "structured", "profile": "test",
+        }))
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            crate::server::api::sessions::create_session(
+                State(Arc::clone(&state)),
+                Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                None,
+                None,
+                Ok(Json(body)),
+            ),
+        )
+        .await
+        .expect("refused control admission must complete rollback")
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        state.shutdown.cancel();
+    }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_terminal_creation_is_finalized_and_idempotent() {
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use std::os::unix::fs::PermissionsExt;
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let creations = root.path().join("creations");
+        let sends = root.path().join("sends");
+        let quote = crate::session::environment::shell_escape_script_word;
+        // Run the real server, but lose only its birth receipt. The pane remains alive.
+        let shim = bin.join("tmux");
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nfor arg do\ncase \"$arg\" in\nnew-session) printf 'birth\\n' >> {}; {} \"$@\" >/dev/null; exit $?;;\nsend-keys|paste-buffer) printf 'input\\n' >> {};;\nesac\ndone\nexec {} \"$@\"\n",
+            quote(&creations.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+            quote(&sends.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        crate::server::test_support::seed_instances_on_disk_for_test("test", Vec::new());
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let input = root.path().join("native-input");
+        let body = serde_json::json!({
+            "title": "indeterminate-created", "path": "", "tool": "claude",
+            "scratch": true, "view": "terminal", "profile": "test",
+            "idempotency_key": "indeterminate-creation",
+            "command_override": format!("exec cat > {}", quote(&input.to_string_lossy())),
+        });
+        let first = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body.clone()).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), axum::http::StatusCode::CREATED);
+        let rows = crate::server::test_support::load_instances_from_disk_for_test("test");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+        assert!(crate::tmux::Session::from_name(&name).exists_live());
+        assert!(row.lifecycle_reservation.is_none());
+        let second = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        assert!(
+            !sends.exists(),
+            "unknown readiness grants no input authority"
+        );
+        assert_eq!(
+            crate::server::test_support::load_instances_from_disk_for_test("test")[0].id,
+            row.id,
+        );
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+        assert_eq!(row.status, crate::session::Status::Starting);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn indeterminate_creation_write_failure_cannot_be_hidden_by_a_healthy_reload() {
+        if std::env::var_os("AOE_FROZEN_NATIVE_TEST_CHILD").is_some() {
+            crate::process::exec_frozen_environment().unwrap();
+            return;
+        }
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use axum::Json;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        crate::tmux::test_helpers::require_tmux!();
+        let real_tmux = which::which("tmux").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _environment = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", root.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", root.path().join(".config")),
+            ("CLAUDE_CONFIG_DIR", root.path().join(".claude")),
+        ]);
+        let _native_helper = crate::session::frozen_test_helper(
+            root.path(),
+            concat!(
+                module_path!(),
+                "::indeterminate_creation_write_failure_cannot_be_hidden_by_a_healthy_reload"
+            ),
+        );
+        let _agent = crate::session::test_support::install_login_shell_path_command(
+            root.path(),
+            "claude",
+            "#!/bin/sh\ncase \"$1\" in --help|--version) exit 1 ;; esac\nexec sleep 60\n",
+        );
+        let app = crate::session::get_app_dir().unwrap();
+        crate::session::purge_owners::initialize(&app).unwrap();
+        crate::tmux::tool_retirement::initialize(&app).unwrap();
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.session.agent_status_hooks = false;
+            config.session.smart_rename = false;
+        })
+        .unwrap();
+
+        // The canonical native fork API pre-pins its child. Plain Fresh/opaque
+        // creation has no prior SID and never enters the owned-pane SID probe.
+        let mut parent =
+            crate::session::Instance::new("attested-fork-source", root.path().to_str().unwrap());
+        parent.source_profile = "test".into();
+        parent.tool = "claude".into();
+        parent.command = "claude".into();
+        let parent_sid = crate::session::capture::generate_session_uuid();
+        crate::session::seed_claude_transcript(&mut parent, &parent_sid);
+        crate::server::test_support::seed_instances_on_disk_for_test("test", vec![parent.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![parent.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        struct OwnCreationCleanup;
+        impl Drop for OwnCreationCleanup {
+            fn drop(&mut self) {
+                if let Ok(rows) = crate::session::Storage::open_unwatched("test")
+                    .and_then(|storage| storage.load())
+                {
+                    for row in rows.into_iter().filter(|row| {
+                        row.title == "failed-indeterminate-finalization"
+                            && row.idempotency_key.as_deref()
+                                == Some("failed-indeterminate-finalization")
+                    }) {
+                        let name = crate::tmux::Session::generate_name(&row.id, &row.title);
+                        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(&name);
+                    }
+                }
+            }
+        }
+        let _cleanup = OwnCreationCleanup;
+        let bin = root.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let creations = root.path().join("real-births");
+        let sends = root.path().join("real-input");
+        let probe = root.path().join("post-finalization-owned-probe");
+        let release = root.path().join("write-failure-armed");
+        let quote = crate::session::environment::shell_escape_script_word;
+        let shim = bin.join("tmux");
+        std::fs::write(&shim, format!(
+            "#!/bin/sh\nOWNED=; for arg do\ncase \"$arg\" in\nnew-session) printf 'birth\\n' >> {};;\nsend-keys|paste-buffer) printf 'input\\n' >> {};;\n*'#{{window_linked}}'*) OWNED=1;;\nesac\ndone\nif [ -n \"$OWNED\" ] && [ ! -e {} ]; then\n: > {}; while [ ! -e {} ]; do sleep 0.01; done\nprintf '%s\\n' 'owned pane observation temporarily inaccessible' >&2; exit 1\nfi\nexec {} \"$@\"\n",
+            quote(&creations.to_string_lossy()), quote(&sends.to_string_lossy()),
+            quote(&probe.to_string_lossy()), quote(&probe.to_string_lossy()),
+            quote(&release.to_string_lossy()), quote(&real_tmux.to_string_lossy()),
+        )).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        let body = serde_json::json!({
+            "title": "failed-indeterminate-finalization", "path": root.path(), "tool": "claude",
+            "view": "terminal", "profile": "test",
+            "fork_session_id": parent.id,
+            "idempotency_key": "failed-indeterminate-finalization",
+        });
+        let create_state = state.clone();
+        let create_body = body.clone();
+        let mut create = tokio::spawn(async move {
+            crate::server::api::sessions::create_session(
+                State(create_state),
+                Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+                None,
+                None,
+                Ok(Json(serde_json::from_value(create_body).unwrap())),
+            )
+            .await
+            .into_response()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !probe.exists() {
+                if create.is_finished() {
+                    let response = (&mut create).await.unwrap();
+                    panic!(
+                        "canonical native fork finished before its ownership probe: HTTP {}",
+                        response.status()
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the real forked birth must reach its post-finalization ownership probe");
+        let storage = crate::session::Storage::open_unwatched("test").unwrap();
+        let before = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.idempotency_key.as_deref() == Some("failed-indeterminate-finalization"))
+            .expect("the real API-created child is durable");
+        assert_eq!(before.status, crate::session::Status::Creating);
+        let child_sid = before
+            .agent_session_id
+            .as_deref()
+            .expect("the production fork pre-pins its child");
+        assert_ne!(child_sid, parent_sid);
+        let generation = before.lifecycle_generation;
+        assert!(before.lifecycle_reservation_is_owned(
+            crate::session::LifecycleOperation::Launch,
+            generation
+        ));
+        let name = crate::tmux::Session::generate_name(&before.id, &before.title);
+        let pane = crate::tmux::test_helpers::only_pane_id(&name);
+        let pid = crate::tmux::test_helpers::pane_field(&pane, "#{pane_pid}")
+            .parse::<u32>()
+            .unwrap();
+        let birth = crate::process::process_birth_identity(pid)
+            .unwrap()
+            .expect("actual born process");
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        let write_failure = storage.fail_writes_for_test();
+        let heal_state = state.clone();
+        let healed = Arc::new(AtomicBool::new(false));
+        let heal_observed = healed.clone();
+        let heal_id = before.id.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let _failure =
+            crate::server::session_store::FailedCommitObserver::install(&storage, move || {
+                assert!(matches!(
+                    *heal_state.canonical_health.blocking_read(),
+                    crate::daemon::RuntimeHealth::Degraded { .. }
+                ));
+                drop(write_failure);
+                runtime.block_on(async {
+                    let fresh =
+                        crate::server::test_support::load_instances_from_disk_for_test("test");
+                    let row = fresh.iter().find(|row| row.id == heal_id).unwrap();
+                    assert_eq!(row.status, crate::session::Status::Creating);
+                    assert!(row.lifecycle_reservation_is_owned(
+                        crate::session::LifecycleOperation::Launch,
+                        generation
+                    ));
+                    crate::server::test_support::reload_disk_only_for_test(
+                        &heal_state,
+                        fresh,
+                        Vec::new(),
+                    )
+                    .await;
+                    assert_eq!(
+                        *heal_state.canonical_health.read().await,
+                        crate::daemon::RuntimeHealth::Healthy
+                    );
+                });
+                heal_observed.store(true, Ordering::SeqCst);
+            });
+        std::fs::write(
+            &release,
+            b"fail only the real finalization transaction, then reload",
+        )
+        .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), create)
+            .await
+            .expect("creation must not deadlock on the reloading store")
+            .unwrap();
+        assert!(
+            healed.load(Ordering::SeqCst),
+            "the actual failed transaction and healthy reload must both occur"
+        );
+        assert!(
+            crate::process::process_birth_is_live(pid, &birth).unwrap(),
+            "an unresolved finalization must not roll back its born process"
+        );
+        let current = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .unwrap();
+        if first.status() == axum::http::StatusCode::CREATED {
+            assert_eq!(current.status, crate::session::Status::Starting,
+                "healthy canonical adoption cannot turn a failed durable finalization into 201 Creating");
+            assert!(current.lifecycle_reservation.is_none());
+        } else {
+            assert_eq!(first.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        }
+        state.runtime.work.drain().await;
+        let finalized = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == before.id)
+            .unwrap();
+        assert_eq!(finalized.status, crate::session::Status::Starting);
+        assert!(finalized.lifecycle_reservation.is_none());
+        let second = crate::server::api::sessions::create_session(
+            State(state.clone()),
+            Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
+            None,
+            Ok(Json(serde_json::from_value(body).unwrap())),
+        )
+        .await
+        .into_response();
+        assert_eq!(second.status(), axum::http::StatusCode::OK);
+        assert_eq!(std::fs::read_to_string(&creations).unwrap(), "birth\n");
+        assert!(!sends.exists(), "finalization is not input permission");
+        assert_eq!(crate::tmux::test_helpers::only_pane_id(&name), pane);
+        assert_eq!(
+            crate::process::process_birth_identity(pid).unwrap(),
+            Some(birth)
+        );
+    }
+
+    /// Creation remains purgeable while its ACP handshake is unanswered.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_created_structured_session_is_purgeable_before_its_handshake_answers() {
@@ -1226,7 +2047,7 @@ mod tests {
         use axum::response::IntoResponse;
         use axum::Json;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in("/tmp").unwrap();
         let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
         let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
         crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
@@ -1266,6 +2087,7 @@ mod tests {
         let response = crate::server::api::sessions::create_session(
             State(Arc::clone(&state)),
             Query(crate::server::api::sessions::CreateSessionQuery { wait: None }),
+            None,
             None,
             Ok(Json(body)),
         )

@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::{api_error, AppState};
+use super::{api_error_with_code_header, AppState};
 use crate::daemon::{
     CreateProjectBody, ProfileSnapshot, ProjectResponse, ReloadFailureCode, RuntimeHealth,
 };
@@ -40,6 +40,9 @@ pub struct ProjectQuery {
     /// Profile whose registry entries to resolve; defaults to the served profile.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Client-anchored path for a remove, matched alongside the name.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 fn project_error(status: StatusCode, code: &str, message: &str) -> Response {
@@ -155,7 +158,40 @@ async fn commit_project(
     let namespace = state.profile_namespace.read().await;
     let publication = state.publication.write().await;
     if *state.canonical_health.read().await != RuntimeHealth::Healthy {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        let file_watch = state.file_watch.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            crate::server::reload::load_configuration_profiles(&file_watch)
+        })
+        .await;
+        let loaded = match loaded {
+            Ok(Ok(loaded)) => loaded,
+            Ok(Err(error)) => {
+                *state.canonical_health.write().await = error.health;
+                state.runtime.request_publish();
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.projects", %error, "configuration validation task failed");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        };
+        if loaded.native_health() == RuntimeHealth::Healthy {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let suppressed =
+            crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+        crate::server::reload::merge_loaded_rows(
+            &mut *state.instances.write().await,
+            loaded.instances,
+            crate::server::state::StatusSource::DiskOnly,
+            &suppressed,
+        );
+        *state.canonical_metadata.write().await = loaded.metadata;
+        state
+            .runtime_read_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inventory = loaded.inventory;
     }
     let selected_profile = if profile.is_some() || scope == ProjectScope::Profile {
         match profile_index(
@@ -342,9 +378,6 @@ pub async fn create_project(
         settings.retain(|_, value| !value.is_null());
         !settings.is_empty()
     });
-    if *state.canonical_health.read().await != RuntimeHealth::Healthy {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
     let scope = body.scope;
     let allow_override = body.allow_override;
     let preflight = tokio::task::spawn_blocking(move || {
@@ -416,7 +449,7 @@ pub async fn create_project(
     commit_project(
         state,
         scope,
-        Some(profile),
+        (!profile.is_empty()).then_some(profile),
         StatusCode::CREATED,
         move |profile, scope| {
             projects::add_guarded(profile, scope, project, allow_override, |effect| {
@@ -456,19 +489,27 @@ pub async fn delete_project(
         authorize(loopback.as_deref(), Capability::SkipElevation),
     )
     .await;
+    let anchored_path = query.path;
     commit_project(
         state,
         scope,
         query.profile,
         StatusCode::OK,
         move |profile, scope| {
-            projects::remove_guarded(profile, scope, &name, |entry, effect| {
-                if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop()) {
-                    Ok(())
-                } else {
-                    Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
-                }
-            })
+            projects::remove_guarded(
+                profile,
+                scope,
+                &name,
+                anchored_path.as_deref(),
+                |entry, effect| {
+                    if elevated || (entry.overrides.plugin_settings.is_empty() && effect.is_noop())
+                    {
+                        Ok(())
+                    } else {
+                        Err(RegistryError::Forbidden(PLUGIN_SETTINGS_ELEVATION.into()))
+                    }
+                },
+            )
             .map(|commit| commit.map_result(|removed| ProjectChange::Removed(removed.into())))
         },
     )
@@ -525,9 +566,8 @@ const PLUGIN_SETTINGS_ELEVATION: &str = "per-project plugin settings need a rece
 /// drop, reveal or shadow stored values: removing an entry, or one overriding another at its path.
 fn elevation_required() -> axum::response::Response {
     tracing::warn!(target: "http.api.projects", reason = "elevation_required", "rejected plugin settings write");
-    api_error(
-        StatusCode::FORBIDDEN,
-        "elevation_required",
+    api_error_with_code_header(
+        crate::daemon::ApiErrorCode::ElevationRequired,
         PLUGIN_SETTINGS_ELEVATION,
     )
 }
@@ -732,6 +772,7 @@ mod tests {
                     Query(ProjectQuery {
                         scope: Some("global".into()),
                         profile: Some("test".into()),
+                        path: None,
                     }),
                     Some(axum::Extension(AuthenticatedSession(session))),
                     None,
@@ -811,6 +852,7 @@ mod tests {
                 Query(ProjectQuery {
                     scope: Some("global".into()),
                     profile: Some("test".into()),
+                    path: None,
                 }),
                 ext(),
                 None,
@@ -900,6 +942,7 @@ mod tests {
                 Query(ProjectQuery {
                     scope: Some("profile".into()),
                     profile: Some("test".into()),
+                    path: None,
                 }),
                 Some(axum::Extension(AuthenticatedSession(session.clone()))),
                 None,
@@ -1011,6 +1054,7 @@ mod tests {
             Query(ProjectQuery {
                 scope: Some("profile".into()),
                 profile: Some("test".into()),
+                path: None,
             }),
             None,
             None,

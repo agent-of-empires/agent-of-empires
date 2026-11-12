@@ -26,6 +26,9 @@ pub struct PromptDispatchResponse {
     pub dispatch: PromptDispatch,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queued_id: Option<String>,
+    /// The prompt's event seq, when it was sent and recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 /// Transient resume failures are 503; typed channel refusal is not queue permission.
@@ -106,16 +109,125 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    let submission = PromptSubmission {
+        text: &req.text,
+        uploads: &req.attachments,
+        prompt_id: req.prompt_id.clone(),
+        queued_prompt_id: req.queued_prompt_id.clone(),
+        no_revive: req.no_revive,
+    };
+    match submit_prompt(&state, &SessionCaller::User, &id, submission).await {
+        Ok(PromptSubmitted {
+            dispatch,
+            queued_id,
+            seq,
+        }) => (
+            StatusCode::ACCEPTED,
+            Json(PromptDispatchResponse {
+                dispatch,
+                queued_id,
+                seq,
+            }),
+        )
+            .into_response(),
+        Err(PromptSubmitError::SessionNotFound) => session_not_found(),
+        Err(PromptSubmitError::RevivalRefused) => no_revive_refused(),
+        Err(PromptSubmitError::WorkerNotReady) => worker_not_ready(),
+        Err(PromptSubmitError::AdmissionRefused(response)) => response,
+        Err(PromptSubmitError::Blocked(blocked)) => {
+            crate::server::api::start_blocked_response(blocked)
+        }
+        Err(PromptSubmitError::Attachments(code, msg))
+        | Err(PromptSubmitError::Enqueue(code, msg)) => (code, msg).into_response(),
+        Err(PromptSubmitError::QueuedPromptGone) => queued_prompt_gone(),
+        Err(PromptSubmitError::QueuedPromptChanged) => queued_prompt_changed(),
+        Err(PromptSubmitError::QueuedAttachmentsMissing) => queued_attachments_missing(),
+        Err(PromptSubmitError::Turn(e)) => match e {
+            SendTurnError::SessionNotFound => session_not_found(),
+            SendTurnError::ResumeFailed(e) => resume_failed_response(&e),
+            SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
+                worker_not_ready()
+            }
+            SendTurnError::ControlStateUnavailable => control_state_unavailable(),
+            SendTurnError::RevivalRefused => no_revive_refused(),
+            SendTurnError::Unavailable(unavailability)
+            | SendTurnError::UnavailableAfterPublish(unavailability) => (
+                StatusCode::CONFLICT,
+                Json(PromptDispatch::Unavailable { unavailability }),
+            )
+                .into_response(),
+            // Unreachable for a User caller.
+            SendTurnError::NotOwner => {
+                (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
+            }
+            SendTurnError::ModeApplication(e) => {
+                supervisor_error_response("mode application failed", &e)
+            }
+            SendTurnError::Send(e) => supervisor_error_response("prompt failed", &e),
+        },
+    }
+}
+
+/// A prompt for a structured session, from any surface that submits on the user's
+/// behalf.
+pub(crate) struct PromptSubmission<'a> {
+    pub text: &'a str,
+    pub uploads: &'a [crate::acp::protocol::PromptAttachmentUpload],
+    pub prompt_id: Option<String>,
+    /// "Send now" for a row already in the session's queue.
+    pub queued_prompt_id: Option<String>,
+    pub no_revive: bool,
+}
+
+/// What [`submit_prompt`] did with a prompt.
+pub(crate) struct PromptSubmitted {
+    pub dispatch: PromptDispatch,
+    /// The queue row holding it, when `dispatch` is `Queued`.
+    pub queued_id: Option<String>,
+    /// The seq of its `UserPromptSent` event. `None` when it was queued, or when it was
+    /// sent but the event was not persisted.
+    pub seq: Option<u64>,
+}
+
+/// Why [`submit_prompt`] did not deliver a prompt.
+///
+/// Every `Turn` error for which [`SendTurnError::published`] holds comes after the pending
+/// initial turn was cleared, and the transcript may show a prompt the agent never received.
+/// The other variants leave the transcript, the queue and the pending initial turn as they
+/// were, though the session may already have been woken.
+pub(crate) enum PromptSubmitError {
+    SessionNotFound,
+    RevivalRefused,
+    WorkerNotReady,
+    AdmissionRefused(Response),
+    Blocked(crate::session::StartBlocked),
+    Attachments(StatusCode, String),
+    QueuedPromptGone,
+    QueuedPromptChanged,
+    QueuedAttachmentsMissing,
+    /// The dispatch chose the queue and the enqueue was refused, e.g. a full queue (429).
+    Enqueue(StatusCode, String),
+    Turn(SendTurnError),
+}
+
+/// Submit a prompt to a structured session: wake it, decide whether the prompt is
+/// sent, steered into the running turn or queued, then queue or send it.
+pub(crate) async fn submit_prompt(
+    state: &Arc<AppState>,
+    caller: &SessionCaller,
+    id: &str,
+    req: PromptSubmission<'_>,
+) -> Result<PromptSubmitted, PromptSubmitError> {
     let Some(_submission) = state
         .session_service
-        .prompt_submission_for_session(&id)
+        .prompt_submission_for_session(id)
         .await
     else {
-        return session_not_found();
+        return Err(PromptSubmitError::SessionNotFound);
     };
     let (woke_idle_dormant, resume_reservation) = match state
         .session_service
-        .touch_and_wake_on_prompt(&id, req.no_revive)
+        .touch_and_wake_on_prompt(id, req.no_revive)
         .await
     {
         PromptTouch::Touched {
@@ -123,22 +235,26 @@ pub async fn acp_prompt(
             resume_reservation,
         } => (idle_dormant, resume_reservation),
         PromptTouch::Establishment(refusal) => {
-            return supervisor_error_response("prompt refused", &refusal.into());
+            return Err(PromptSubmitError::Turn(SendTurnError::ResumeFailed(
+                refusal.into(),
+            )));
         }
-        PromptTouch::AdmissionRefused(response) => return response,
+        PromptTouch::AdmissionRefused(response) => {
+            return Err(PromptSubmitError::AdmissionRefused(response))
+        }
         PromptTouch::Unavailable(unavailability) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(PromptDispatch::Unavailable { unavailability }),
-            )
-                .into_response();
+            return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+                unavailability,
+            )));
         }
-        PromptTouch::RevivalRefused => return no_revive_refused(),
-        PromptTouch::WorkerNotReady => return worker_not_ready(),
-        PromptTouch::ControlStateUnavailable => return control_state_unavailable(),
-        PromptTouch::Blocked(blocked) => {
-            return crate::server::api::start_blocked_response(blocked)
+        PromptTouch::RevivalRefused => return Err(PromptSubmitError::RevivalRefused),
+        PromptTouch::WorkerNotReady => return Err(PromptSubmitError::WorkerNotReady),
+        PromptTouch::ControlStateUnavailable => {
+            return Err(PromptSubmitError::Turn(
+                SendTurnError::ControlStateUnavailable,
+            ))
         }
+        PromptTouch::Blocked(blocked) => return Err(PromptSubmitError::Blocked(blocked)),
     };
     // Validated before publishing or resuming, so a rejected prompt leaves no
     // trace in the transcript and spawns no worker.
@@ -146,32 +262,30 @@ pub async fn acp_prompt(
     let uploads: &[_] = if req.queued_prompt_id.is_some() {
         &[]
     } else {
-        &req.attachments
+        req.uploads
     };
-    let attachments = match validate_attachments(&state, &id, uploads) {
-        Ok(a) => a,
-        Err((code, msg)) => return (code, msg).into_response(),
-    };
+    let attachments = validate_attachments(state, id, uploads)
+        .map_err(|(code, msg)| PromptSubmitError::Attachments(code, msg))?;
     // "Send now" delivers a stored row under its stored sender. The row is only consumed
     // once the turn is accepted, so any refusal leaves it for a retry.
     let queued_row = match &req.queued_prompt_id {
         Some(queued_id) => {
             let row = state
                 .session_service
-                .queued_prompts_snapshot(&id)
+                .queued_prompts_snapshot(id)
                 .await
                 .into_iter()
                 .find(|r| &r.id == queued_id);
             match row {
                 Some(row) => Some(row),
-                None => return queued_prompt_gone(),
+                None => return Err(PromptSubmitError::QueuedPromptGone),
             }
         }
         None => None,
     };
     if let Some(row) = &queued_row {
         if row.text != req.text {
-            return queued_prompt_changed();
+            return Err(PromptSubmitError::QueuedPromptChanged);
         }
     }
     let origin_plugin = queued_row.as_ref().and_then(|r| r.origin_plugin.clone());
@@ -179,14 +293,13 @@ pub async fn acp_prompt(
     // (#3621). The wake already cleared the dormant marker, hence the flag.
     let dispatch = state
         .session_service
-        .prompt_dispatch_under_submission(&id, &req.text, woke_idle_dormant, req.no_revive)
-        .await;
-    let dispatch = match dispatch {
-        Ok(dispatch) => dispatch,
-        Err(_) => return control_state_unavailable(),
-    };
-    if matches!(dispatch, PromptDispatch::Unavailable { .. }) {
-        return (StatusCode::CONFLICT, Json(dispatch)).into_response();
+        .prompt_dispatch_under_submission(id, req.text, woke_idle_dormant, req.no_revive)
+        .await
+        .map_err(|_| PromptSubmitError::Turn(SendTurnError::ControlStateUnavailable))?;
+    if let PromptDispatch::Unavailable { unavailability } = dispatch {
+        return Err(PromptSubmitError::Turn(SendTurnError::Unavailable(
+            unavailability,
+        )));
     }
     // Refused before touching the pending-turn/queue state below, so a
     // rejected prompt leaves both untouched (#4081 review).
@@ -198,15 +311,13 @@ pub async fn acp_prompt(
             }
         )
     {
-        return no_revive_refused();
+        return Err(PromptSubmitError::RevivalRefused);
     }
     if let PromptDispatch::Queued { reason } = dispatch {
-        // A fresh prompt supersedes a queued rate-limit continuation (#3028).
-        // Only once queueing is certain: a `no_revive` refusal above must
-        // leave it in place (#4081 review).
-        state.session_service.clear_pending_initial_turn(&id).await;
+        // A fresh request supersedes pending intent only after queue admission.
         // The named row is already the parked copy; queueing again would duplicate it.
         let queued_id = if let Some(row) = &queued_row {
+            state.session_service.clear_pending_initial_turn(id).await;
             row.id.clone()
         } else {
             let prompt_id = req
@@ -214,13 +325,16 @@ pub async fn acp_prompt(
                 .clone()
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             match super::super::queue::buffer_and_enqueue(
-                &state,
-                &id,
-                &prompt_id,
-                req.text.clone(),
-                &attachments,
-                None,
-                origin_plugin.clone(),
+                state,
+                id,
+                super::super::queue::QueuedPrompt {
+                    prompt_id: &prompt_id,
+                    text: req.text.to_string(),
+                    blobs: &attachments,
+                    origin_device: None,
+                    origin_plugin: origin_plugin.clone(),
+                    supersede_pending_turn: true,
+                },
             )
             .await
             {
@@ -237,14 +351,14 @@ pub async fn acp_prompt(
                 Err((status, msg)) => {
                     tracing::warn!(target: "http.api.acp", session = %id, ?reason,
                         "prompt dispatch chose the queue but enqueue failed: {msg}");
-                    return (status, msg).into_response();
+                    return Err(PromptSubmitError::Enqueue(status, msg));
                 }
             }
         };
         if let Some(reservation) = resume_reservation {
             if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
                 &state.session_service,
-                &id,
+                id,
                 crate::process::worker_registry::ResumeAuthority::Explicit,
                 Some(reservation),
             )
@@ -255,47 +369,48 @@ pub async fn acp_prompt(
                     "queued intent retained; prepared wake was refused");
             }
         }
-        return (
-            StatusCode::ACCEPTED,
-            Json(PromptDispatchResponse {
-                dispatch,
-                queued_id: Some(queued_id),
-            }),
-        )
-            .into_response();
+        return Ok(PromptSubmitted {
+            dispatch,
+            queued_id: Some(queued_id),
+            seq: None,
+        });
     }
     // A named row is delivered with the bytes the daemon stored for it, never the request's.
     let attachments = match &queued_row {
         Some(row) => {
             let store = Arc::clone(&state.acp_event_store);
-            let (session_id, row_id) = (id.clone(), row.id.clone());
+            let (session_id, row_id) = (id.to_string(), row.id.clone());
             let stored = tokio::task::spawn_blocking(move || {
                 store.load_pending_attachments_for_ref(&session_id, &row_id)
             })
             .await
             .unwrap_or_default();
             if stored.len() != row.attachments.len() {
-                return queued_attachments_missing();
+                return Err(PromptSubmitError::QueuedAttachmentsMissing);
             }
             stored
         }
         None => attachments,
     };
+    let row_caller;
     let caller = match &origin_plugin {
-        Some(plugin_id) => SessionCaller::PluginMessage {
-            plugin_id: plugin_id.clone(),
-        },
-        None => SessionCaller::User,
+        Some(plugin_id) => {
+            row_caller = SessionCaller::PluginMessage {
+                plugin_id: plugin_id.clone(),
+            };
+            &row_caller
+        }
+        None => caller,
     };
     let outcome = state
         .session_service
         .send_turn(
-            &caller,
-            &id,
+            caller,
+            id,
             SendTurnRequest {
                 resume_reservation,
                 resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit,
-                text: &req.text,
+                text: req.text,
                 attachments: &attachments,
                 woke_idle_dormant,
                 prompt_id: req.prompt_id.clone(),
@@ -305,60 +420,33 @@ pub async fn acp_prompt(
         )
         .await;
     // A fresh prompt supersedes a queued rate-limit continuation (#3028),
-    // but only once delivery is certain: a `no_revive` refusal must leave
-    // the pending turn in place (#4081 review).
-    if !matches!(
-        outcome,
-        Err(SendTurnError::RevivalRefused | SendTurnError::Unavailable(_))
-    ) {
-        state.session_service.clear_pending_initial_turn(&id).await;
+    // but only once it is published: a prompt refused before that must leave
+    // the pending turn in place (#4081 review, #5253).
+    if outcome.as_ref().err().is_none_or(SendTurnError::published) {
+        state.session_service.clear_pending_initial_turn(id).await;
     }
-    match outcome {
-        Ok(()) => {
-            tracing::info!(
-                target: "acp.queue",
-                session = %id,
-                ?dispatch,
-                text_len = req.text.len(),
-                attachments = attachments.len(),
-                send_now = queued_row.is_some(),
-                ?origin_plugin,
-                "prompt sent"
-            );
-            if let Some(row) = &queued_row {
-                state
-                    .session_service
-                    .take_queued_prompt(&id, row.id.clone())
-                    .await;
-            }
-            (
-                StatusCode::ACCEPTED,
-                Json(PromptDispatchResponse {
-                    dispatch,
-                    queued_id: None,
-                }),
-            )
-                .into_response()
-        }
-        Err(SendTurnError::SessionNotFound) => session_not_found(),
-        Err(SendTurnError::ResumeFailed(e)) => resume_failed_response(&e),
-        Err(SendTurnError::WorkerNotReady) => worker_not_ready(),
-        Err(SendTurnError::ControlStateUnavailable) => control_state_unavailable(),
-        Err(SendTurnError::Unavailable(unavailability)) => (
-            StatusCode::CONFLICT,
-            Json(PromptDispatch::Unavailable { unavailability }),
-        )
-            .into_response(),
-        Err(SendTurnError::RevivalRefused) => no_revive_refused(),
-        // Unreachable for a User caller.
-        Err(SendTurnError::NotOwner) => {
-            (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
-        }
-        Err(SendTurnError::ModeApplication(e)) => {
-            supervisor_error_response("mode application failed", &e)
-        }
-        Err(SendTurnError::Send(e)) => supervisor_error_response("prompt failed", &e),
+    let seq = outcome.map_err(PromptSubmitError::Turn)?;
+    tracing::info!(
+        target: "acp.queue",
+        session = %id,
+        ?dispatch,
+        text_len = req.text.len(),
+        attachments = attachments.len(),
+        send_now = queued_row.is_some(),
+        ?origin_plugin,
+        "prompt sent"
+    );
+    if let Some(row) = &queued_row {
+        state
+            .session_service
+            .take_queued_prompt(id, row.id.clone())
+            .await;
     }
+    Ok(PromptSubmitted {
+        dispatch,
+        queued_id: None,
+        seq,
+    })
 }
 
 /// Why a diff-comments prompt cannot start a turn now; the dialog keeps the

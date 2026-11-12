@@ -322,15 +322,17 @@ pub fn validate_network_format(network: &str) -> Result<(), String> {
     }
 }
 
-/// A systemd slice name template with `{profile}` as the only placeholder,
+/// A systemd slice name template with `{profile}` and `{session}` as the only placeholders,
 /// checked by the same rule the scope setup applies at runtime.
 pub fn validate_systemd_slice(slice: &str) -> Result<(), String> {
-    // An escaped profile is never empty and never contains `-`, like `x`.
-    if crate::process::systemd::valid_slice(&slice.replace("{profile}", "x")) {
+    // An escaped profile or session id is never empty and never contains `-`, like `x`.
+    if crate::process::systemd::valid_slice(
+        &slice.replace("{profile}", "x").replace("{session}", "x"),
+    ) {
         Ok(())
     } else {
         Err(
-            "Must end in .slice, use only letters, digits and : . - _, have no empty part around a -, stay within 255 characters, with {profile} as the only placeholder (e.g. background-aoe-{profile}.slice)"
+            "Must end in .slice, use only letters, digits and : . - _, have no empty part around a -, stay within 255 characters, with {profile} and {session} as the only placeholders (e.g. background-aoe-{profile}-{session}.slice)"
                 .to_string(),
         )
     }

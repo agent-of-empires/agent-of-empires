@@ -2,7 +2,12 @@ import { useState } from "react";
 import { LiveTerminalView } from "./LiveTerminalView";
 import type { SessionResponse } from "../lib/types";
 
-type ShellMode = "host" | "container";
+export type ShellMode = "host" | "container";
+
+/** The owner controls the mode with both, or the pane keeps its own with neither. */
+type ModeControl =
+  | { mode: ShellMode; onModeChange: (mode: ShellMode) => void }
+  | { mode?: undefined; onModeChange?: undefined };
 
 /** Host/container shell shared by desktop docks and the mobile paired view. */
 export function PairedShellPane({
@@ -11,6 +16,8 @@ export function PairedShellPane({
   sessionId,
   active = true,
   terminalIndex = 0,
+  mode,
+  onModeChange,
 }: {
   readOnly: boolean;
   session: SessionResponse | null;
@@ -19,8 +26,10 @@ export function PairedShellPane({
   /** Which paired-terminal instance this tab renders (#2437). 0 is the
    *  primary shell shared with the native TUI. */
   terminalIndex?: number;
-}) {
-  const [shellMode, setShellMode] = useState<ShellMode>("host");
+} & ModeControl) {
+  const [ownMode, setOwnMode] = useState<ShellMode>("host");
+  const shellMode = mode ?? ownMode;
+  const setShellMode = onModeChange ?? setOwnMode;
   const isSandboxed = session?.is_sandboxed ?? false;
   // Container mode is only valid while the session is sandboxed; derive the
   // effective mode during render rather than resetting state in an effect, so
@@ -36,11 +45,19 @@ export function PairedShellPane({
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       <div className="flex items-center gap-1 px-2 py-1 bg-surface-900 border-b border-surface-700/20 shrink-0">
         <span className="text-xs text-text-dim mr-1">Shell</span>
-        <button onClick={() => setShellMode("host")} className={shellTabClass(effectiveMode === "host")}>
+        <button
+          onClick={() => setShellMode("host")}
+          aria-pressed={effectiveMode === "host"}
+          className={shellTabClass(effectiveMode === "host")}
+        >
           Host
         </button>
         {isSandboxed && (
-          <button onClick={() => setShellMode("container")} className={shellTabClass(effectiveMode === "container")}>
+          <button
+            onClick={() => setShellMode("container")}
+            aria-pressed={effectiveMode === "container"}
+            className={shellTabClass(effectiveMode === "container")}
+          >
             Container
           </button>
         )}

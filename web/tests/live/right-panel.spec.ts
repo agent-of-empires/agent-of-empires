@@ -65,7 +65,7 @@ test("diff pane in a non-git session stays closed until opened, then shows one n
   let release!: () => void;
   const gate = new Promise<void>((r) => (release = r));
   let heldGets = 0;
-  await page.route("**/api/sessions", async (route) => {
+  await page.route(/\/api\/sessions(\?.*)?$/, async (route) => {
     if (route.request().method() === "GET") {
       heldGets++;
       await gate;
@@ -265,16 +265,14 @@ test("right panel notifications: structured view comments banner appears on stag
   page,
   spawnServe,
 }) => {
-  const serve = await spawnServe({
-    acp: true,
-    seedFn: seedSessionViaAoeAdd({
-      title: "rp-notif",
-      structuredView: true,
-      // A modified hunk gives the comment gutter line numbers.
-      committed: { "notes.md": "line a\nline b\nline c\n" },
-      files: { "notes.md": "line A\nline B\nline C\n" },
-    }),
-  });
+  const serve = await spawnServe({ acp: true });
+    seedSessionViaAoeAdd({
+    title: "rp-notif",
+    structuredView: true,
+    // A modified hunk gives the comment gutter line numbers.
+    committed: { "notes.md": "line a\nline b\nline c\n" },
+    files: { "notes.md": "line A\nline B\nline C\n" },
+  })(serve);
   const sessionId = (await listSessions(serve.baseUrl)).find((s) => s.title === "rp-notif")?.id;
   if (!sessionId) throw new Error("seeded structured view session not visible in /api/sessions");
   await spawnAcpAgentAndWait(serve.baseUrl, sessionId, 30_000, serve.home);

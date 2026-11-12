@@ -41,6 +41,74 @@ async function revealOldestTurn(page: Page): Promise<void> {
   }).toPass({ timeout: 30_000 });
 }
 
+test("opening a cached session keeps its readable window through delayed catch-up", async ({ page }) => {
+  const mock = await mockAcpSession(page, { title: "stable-warm-window", initialEvents: longTranscript() });
+  await openStructuredSession(page, mock);
+  await waitForComposerConnected(page);
+  const key = `aoe:acp-state:v1:${mock.sessionId}`;
+  await expect
+    .poll(() =>
+      page.evaluate((key) => {
+        const entry = JSON.parse(localStorage.getItem(key) ?? "null");
+        return entry?.state?.activity?.filter((row: { kind: string }) => row.kind === "user_prompt").length ?? 0;
+      }, key),
+    )
+    .toBe(TURNS);
+  let release!: () => void;
+  let requested!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    requested = resolve;
+  });
+  await page.route(/\/acp\/replay(\?|$)/, async (route) => {
+    requested();
+    await held;
+    await route.fallback();
+  });
+  const viewport = page.getByTestId("acp-viewport");
+  try {
+    await page.reload();
+    await started;
+    await expect(viewport.locator('[data-message-id="user-seq-151"]')).toHaveCount(1);
+    const before = await viewport
+      .locator("[data-message-id]")
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-message-id")));
+    await viewport.evaluate((element) => {
+      const expected = Array.from(element.querySelectorAll("[data-message-id]")).map((node) =>
+        node.getAttribute("data-message-id"),
+      );
+      const monitor = { missing: [] as string[], observer: null as MutationObserver | null };
+      monitor.observer = new MutationObserver(() => {
+        for (const id of expected) {
+          if (!element.querySelector(`[data-message-id="${id}"]`)) monitor.missing.push(id!);
+        }
+      });
+      monitor.observer.observe(element, { childList: true, subtree: true });
+      (window as typeof window & { __warmWindowMonitor?: typeof monitor }).__warmWindowMonitor = monitor;
+    });
+    release();
+    await waitForComposerConnected(page);
+    const missing = await page.evaluate(() => {
+      const monitor = (
+        window as typeof window & { __warmWindowMonitor?: { missing: string[]; observer: MutationObserver } }
+      ).__warmWindowMonitor!;
+      monitor.observer.disconnect();
+      return monitor.missing;
+    });
+    expect(missing).toEqual([]);
+    const after = await viewport
+      .locator("[data-message-id]")
+      .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-message-id")));
+    expect(after).toEqual(before);
+    await expect(page.getByText("reply number 99", { exact: true })).toBeVisible();
+    expect(mock.promptBodies).toEqual([]);
+  } finally {
+    release();
+  }
+});
+
 // #2236: scrolling to the top loads earlier messages without a click.
 test("scrolling to the top auto-loads earlier messages", async ({ page }) => {
   const mock = await mockAcpSession(page, {

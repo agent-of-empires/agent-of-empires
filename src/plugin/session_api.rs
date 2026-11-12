@@ -540,6 +540,7 @@ async fn admit_and_create(
         // Set here (not just inside the service) so the idempotency probe below
         // hashes the same payload the create will.
         pending_initial_turn: req.initial_turn.as_ref().map(|t| t.text.clone()),
+        parent_session_id: None,
         acp_mode_id: req.mode_id.clone(),
         view: crate::session::View::Structured,
         agent_name: None,
@@ -549,6 +550,7 @@ async fn admit_and_create(
         import_binding: None,
         fork_seed: None,
         progress: None,
+        cli: None,
     };
 
     // Resolve an idempotent replay/conflict BEFORE charging admission, so a
@@ -1020,9 +1022,8 @@ async fn deliver_structured(
     // A stopped worker is resumed by `send_turn` below, not queued behind a drain nothing starts.
     if let PromptDispatch::Queued { reason } = dispatch {
         if reason != QueueReason::WorkerDown {
-            service.clear_pending_initial_turn(id).await;
             service
-                .enqueue_prompt(
+                .enqueue_prompt_superseding_continuation(
                     id,
                     uuid::Uuid::new_v4().to_string(),
                     req.message.clone(),
@@ -1031,6 +1032,7 @@ async fn deliver_structured(
                     Some(plugin_id.to_string()),
                 )
                 .await
+                .map_err(|_| DispatchError::internal("the message could not be saved; retry"))?
                 .ok_or_else(session_not_found)?;
             if let Some(reservation) = resume_reservation {
                 if let Err(error) = crate::server::acp_reconciler::trigger_resume_background(
@@ -1067,7 +1069,7 @@ async fn deliver_structured(
             },
         )
         .await;
-    if !matches!(sent, Err(SendTurnError::Unavailable(_))) {
+    if sent.as_ref().err().is_none_or(SendTurnError::published) {
         service.clear_pending_initial_turn(id).await;
     }
     sent.map_err(map_send_error)?;
@@ -1151,12 +1153,15 @@ fn map_send_error(e: SendTurnError) -> DispatchError {
             "control_state_unavailable",
             "session control state could not be read",
         ),
-        SendTurnError::WorkerNotReady => DispatchError::with_kind(
-            codes::SERVICE_UNAVAILABLE,
-            "worker_not_ready",
-            "worker not ready; retry",
-        ),
-        SendTurnError::Unavailable(unavailability) => DispatchError::with_kind(
+        SendTurnError::WorkerNotReady | SendTurnError::WorkerLostAfterPublish => {
+            DispatchError::with_kind(
+                codes::SERVICE_UNAVAILABLE,
+                "worker_not_ready",
+                "worker not ready; retry",
+            )
+        }
+        SendTurnError::Unavailable(unavailability)
+        | SendTurnError::UnavailableAfterPublish(unavailability) => DispatchError::with_kind(
             codes::FAILED_PRECONDITION,
             "native_channel_unavailable",
             crate::acp::acp_client::AcpError::ConnectionUnavailable(unavailability).to_string(),
@@ -1266,11 +1271,101 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn capacity_refusal_preserves_plugin_prompt_stop_fence_and_native_generation() {
+        use crate::process::worker_registry;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir().unwrap();
+        let mut row = Instance::new("plugin-stopped-capacity", project.path().to_str().unwrap());
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        row.status = Status::Stopped;
+        row.lifecycle_generation = 27;
+        row.idle_dormant_since = Some(chrono::Utc::now());
+        row.acp_session_id = Some("retained-native-plugin".into());
+        row.agent_name = Some("claude".into());
+        row.created_by_plugin = Some("cron".into());
+        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
+        let state = crate::server::test_support::build_test_app_state_with_launcher(
+            vec![row.clone()],
+            launcher,
+        );
+        seed_native_rows(&state).await;
+        state
+            .acp_supervisor
+            .test_insert_worker("occupied-plugin-slot")
+            .await;
+        let record = worker_registry::WorkerRecord::new(
+            row.id.clone(),
+            std::process::id(),
+            project.path().join("stopped.sock"),
+            "claude".into(),
+            "claude".into(),
+            project.path().to_owned(),
+            None,
+            vec![],
+            vec![],
+            row.acp_session_id.clone(),
+            Some("default".into()),
+        )
+        .with_generation(71);
+        worker_registry::save(&record).unwrap();
+        let intent = worker_registry::request_stop(&record).unwrap();
+        worker_registry::delete(&row.id).unwrap();
+        let policy_dir = tempfile::tempdir().unwrap();
+        let deps = Arc::new(SessionRpcDeps {
+            session_service: Arc::clone(&state.session_service),
+            policy: Arc::new(AutomationPolicy::open(&policy_dir.path().join("policy.db")).unwrap()),
+            profile: "default".into(),
+            cityhall_mode: false,
+        });
+        let error = dispatch(
+            &deps,
+            &ctx_with(&["session.prompt"]),
+            "sessions.turn.send",
+            &serde_json::json!({ "session_id": row.id, "text": "keep this stopped intent" }),
+        )
+        .await
+        .expect_err("the real ACP capacity admission refuses this wake");
+        assert_eq!(error.code, codes::SERVICE_UNAVAILABLE);
+        assert_eq!(kind(&error), "worker_not_ready");
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(worker_registry::stop_intent(&row.id).unwrap(), Some(intent));
+        let memory = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|saved| saved.id == row.id)
+            .unwrap()
+            .clone();
+        let persisted = crate::session::Storage::open_reference("default")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|saved| saved.id == row.id)
+            .unwrap();
+        for saved in [&memory, &persisted] {
+            assert_eq!(saved.status, row.status);
+            assert_eq!(saved.lifecycle_generation, row.lifecycle_generation);
+            assert_eq!(saved.idle_dormant_since, row.idle_dormant_since);
+            assert_eq!(saved.acp_session_id, row.acp_session_id);
+            assert!(!saved.plugin_revival_pending);
+        }
+        assert_eq!(
+            state.acp_supervisor.worker_state(&row.id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+    }
+
     fn ctx_with(caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
             plugin_id: "cron".to_string(),
             granted_capabilities: caps.iter().map(|c| c.to_string()).collect(),
             ui_contributions: std::collections::HashSet::new(),
+            deep_link_pages: Default::default(),
             ui_generation: 1,
         }
     }
@@ -1935,6 +2030,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn message_send_refused_before_publish_keeps_the_pending_turn() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let mut parked = Instance::new("parked", "/tmp/aoe-msg-project");
+        parked.id = "sess-msg-pending".to_string();
+        parked.view = crate::session::View::Structured;
+        parked.agent_name = Some("aoe-no-such-agent-msg".to_string());
+        let seeded = crate::session::PendingInitialTurn {
+            text: "queued before the park".to_string(),
+            attachments: Vec::new(),
+            synthesized: true,
+        };
+        parked.pending_initial_turn = Some(seeded.clone());
+        let (deps, state, _dir) = test_deps(vec![parked]);
+        seed_native_rows(&state).await;
+        let result = dispatch(
+            &deps,
+            &ctx_with(&["session.message"]),
+            "sessions.message.send",
+            &message_params("sess-msg-pending", "wake up"),
+        )
+        .await;
+        assert!(result.is_err(), "the fake agent cannot start");
+        assert_eq!(
+            state.instances.read().await[0].pending_initial_turn,
+            Some(seeded),
+            "a message refused before publication must keep the pending turn"
+        );
+    }
     #[tokio::test]
     #[serial_test::serial]
     async fn message_send_successfully_revives_stopped_nondormant_native_conversation() {

@@ -43,6 +43,8 @@ describe("Session menu tiers", () => {
   it("orders items by tier, with separators only between tiers that show something", () => {
     const quick = "pin archive snooze unread";
     const tail = "notify color | delete";
+    // More opens on the window entries, their own tier.
+    const more = "more show-only own-window |";
     // (state, sessions, options, header line, order with More open)
     const cases: [string, Partial<SessionResponse>[], object, string, string][] = [
       [
@@ -50,14 +52,14 @@ describe("Session menu tiers", () => {
         [{ status: "Idle" }],
         {},
         "Idle · Terminal view",
-        `${quick} | rename | stop | more edit-group add-project | ${tail}`,
+        `${quick} | rename | stop | ${more} edit-group add-project | ${tail}`,
       ],
       [
         "stopped",
         [{ status: "Stopped" }],
         {},
         "Stopped · Terminal view",
-        `${quick} | rename | start | more edit-group add-project | ${tail}`,
+        `${quick} | rename | start | ${more} edit-group add-project | ${tail}`,
       ],
       // Restart to update leads the Run tier.
       [
@@ -65,7 +67,7 @@ describe("Session menu tiers", () => {
         [{ status: "Idle", update_restart: true }],
         {},
         "Idle · Terminal view",
-        `${quick} | rename | restart-update stop | more edit-group add-project | ${tail}`,
+        `${quick} | rename | restart-update stop | ${more} edit-group add-project | ${tail}`,
       ],
       // Recreate container sits last in More, after its own separator.
       [
@@ -73,14 +75,14 @@ describe("Session menu tiers", () => {
         [{ status: "Running", is_sandboxed: true }],
         {},
         "Running · Terminal view",
-        `${quick} | rename | stop | more edit-group add-project | recreate-container | ${tail}`,
+        `${quick} | rename | stop | ${more} edit-group add-project | recreate-container | ${tail}`,
       ],
       [
         "structured, can fork",
         [{ status: "Idle", view: "structured", acp_session_id: "x", acp_can_fork: true }],
         {},
         "Idle · Structured view",
-        `${quick} | rename | stop switch-view | fork | more summarize auto-name switch-agent | edit-group add-project | ${tail}`,
+        `${quick} | rename | stop switch-view | fork | ${more} summarize auto-name switch-agent | edit-group add-project | ${tail}`,
       ],
       // Several Sessions: a count, and the targeted items keep their pickers.
       [
@@ -91,10 +93,10 @@ describe("Session menu tiers", () => {
         ],
         {},
         "2 Sessions",
-        `${quick} | rename | stop | more edit-group add-project | ${tail}`,
+        `${quick} | rename | stop | ${more} edit-group add-project | ${tail}`,
       ],
-      // Read-only hides every write action and leaves no stray separator.
-      ["read-only", [{ status: "Idle" }], { readOnly: true }, "Idle · Terminal view", "notify"],
+      // Read-only hides every write action and leaves no stray separator; the window entries stay.
+      ["read-only", [{ status: "Idle" }], { readOnly: true }, "Idle · Terminal view", `${more} notify`],
     ];
     for (const [state, sessions, options, header, expected] of cases) {
       open(sessions, options);

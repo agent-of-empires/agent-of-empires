@@ -4,7 +4,7 @@ use super::*;
 
 /// Re-enter one libtest entry to execute the real frozen-environment helper.
 #[cfg(unix)]
-pub(super) fn frozen_test_helper(
+pub(crate) fn frozen_test_helper(
     root: &std::path::Path,
     entry: &str,
 ) -> crate::process::test_support::NativeLaunchExecutable {
@@ -161,6 +161,10 @@ if (args[0] === "container" && args[1] === "inspect" && args.at(-1) === fixture.
   if (args.join(" ") === "env -0") {
     process.stdout.write("HOME=/root\0PATH=/usr/local/bin:/usr/bin:/bin\0");
   } else if (args[0] === "/bin/sh" && args[1] === "-c" && args[3] === "aoe-path") {
+    if (args[2].includes("exit 3")) {
+      const host = physical(canonical(args[4]));
+      process.exit(host && fs.existsSync(host) ? 0 : 3);
+    }
     process.stdout.write(canonical(args[4]) + "\n");
   } else if (args[0] === "/bin/sh" && args[1] === "-c" && args[3] === "aoe-native-program") {
     const command = args[5];
@@ -329,7 +333,7 @@ pub(super) fn write_reserved_claude_transcript(instance: &Instance, sid: &str) {
 }
 
 /// Seed a resumable Claude conversation in the isolated native store.
-pub(super) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
+pub(crate) fn seed_claude_transcript(instance: &mut Instance, sid: &str) {
     let home = std::env::var("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| dirs::home_dir().expect("home dir").join(".claude"));

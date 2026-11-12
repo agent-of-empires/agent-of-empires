@@ -8,7 +8,7 @@ use super::*;
 pub(super) fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> Option<&'static [crate::agents::KeyToken]> {
+) -> Option<&'static [crate::agents::KeyToken<'static>]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
         Allow => Some(response.allow),
@@ -164,6 +164,10 @@ impl HomeView {
                 "Respond Failed",
                 "Native interaction is unavailable.",
             ));
+            return;
+        }
+        if let Some(blocked) = self.start_blocked(session_id) {
+            self.info_dialog = Some(InfoDialog::new("Respond Failed", &blocked.to_string()));
             return;
         }
         let Some(inst) = self.get_instance(session_id) else {

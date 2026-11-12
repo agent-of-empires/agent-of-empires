@@ -421,15 +421,17 @@ impl TuiTestHarness {
         // Path to unique tmux socket for this test.
         let socket_path = home_dir.path().join("tmux.sock");
 
-        // Create a fake `claude` script so `which claude` succeeds.
+        // Create fake `claude` and `fake-agent` scripts so `which` succeeds.
         let stub_path = stub_dir.path().to_path_buf();
-        let claude_stub = stub_path.join("claude");
-        std::fs::write(&claude_stub, "#!/bin/sh\nexit 0\n").expect("write claude stub");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&claude_stub, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod claude stub");
+        for name in ["claude", "fake-agent"] {
+            let stub = stub_path.join(name);
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write agent stub");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod agent stub");
+            }
         }
 
         // Pre-seed config.toml to skip the welcome dialog and update checks.
@@ -490,6 +492,11 @@ last_seen_version = "{}"
             // aoe addresses tmux via `-S <socket>`, so pin it to the harness socket.
             extra_env: vec![
                 ("AOE_TMUX_SOCKET".into(), tmux_socket_env.into()),
+                // Discard port: tests that opt in to telemetry must never reach production.
+                (
+                    "AOE_TELEMETRY_ENDPOINT".into(),
+                    "http://127.0.0.1:9/ingest".into(),
+                ),
                 (
                     "XDG_RUNTIME_DIR".into(),
                     config_dir.join("runtime").into_os_string(),
@@ -918,6 +925,7 @@ last_seen_version = "{}"
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
             .env_remove("AOE_NO_AUTOSTART")
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
@@ -977,6 +985,7 @@ last_seen_version = "{}"
             .env("PATH", self.env_path())
             .env("TERM", "xterm-256color")
             .env_remove("NO_COLOR")
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)))
             .output()
             .expect("failed to run tmux new-session");
@@ -1407,7 +1416,7 @@ last_seen_version = "{}"
         );
     }
 
-    fn cli_command(&self, args: &[&str]) -> Command {
+    pub fn cli_command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(&self.binary_path);
         command
             .args(args)
@@ -1419,6 +1428,8 @@ last_seen_version = "{}"
             .env_remove("AOE_NO_AUTOSTART")
             .env_remove("AOE_DAEMON_URL")
             .env_remove("AOE_DAEMON_TOKEN")
+            // The harness creates only the `default` profile.
+            .env_remove("AGENT_OF_EMPIRES_PROFILE")
             .envs(self.extra_env.iter().map(|(key, value)| (key, value)));
         for key in &self.extra_env_remove {
             command.env_remove(key);

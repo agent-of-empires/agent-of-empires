@@ -51,6 +51,15 @@ pub struct LivePaneMeta {
     pub pane0: Option<LivePane0>,
 }
 
+/// Why a connection is on the capture fallback, when the daemon can say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LiveTransportReason {
+    /// Another process already owns this pane's `pipe-pane`.
+    PipeOwned,
+}
+
 /// Daemon to client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -87,7 +96,12 @@ pub enum LiveServerMessage {
     Clipboard { text: String },
     /// `false` is the capture fallback, which cannot suppress a half-drawn repaint.
     #[serde(rename = "transport")]
-    Transport { grid: bool },
+    Transport {
+        grid: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        reason: Option<LiveTransportReason>,
+    },
 }
 
 /// Client to daemon. Binary messages are pane input and carry no envelope.
@@ -141,6 +155,7 @@ pub fn typescript_declarations() -> String {
         LiveCursor::decl(&cfg),
         LivePane0::decl(&cfg),
         LivePaneMeta::decl(&cfg),
+        LiveTransportReason::decl(&cfg),
         LiveServerMessage::decl(&cfg),
         LiveClientMessage::decl(&cfg),
     ];
@@ -223,8 +238,18 @@ mod tests {
                 serde_json::json!({"type": "clipboard", "text": "copied\n"}),
             ),
             (
-                LiveServerMessage::Transport { grid: true },
+                LiveServerMessage::Transport {
+                    grid: true,
+                    reason: None,
+                },
                 serde_json::json!({"type": "transport", "grid": true}),
+            ),
+            (
+                LiveServerMessage::Transport {
+                    grid: false,
+                    reason: Some(LiveTransportReason::PipeOwned),
+                },
+                serde_json::json!({"type": "transport", "grid": false, "reason": "pipe_owned"}),
             ),
         ];
         for (message, expected) in cases {

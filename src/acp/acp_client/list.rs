@@ -6,11 +6,12 @@
 
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     ClientCapabilities, InitializeResponse, ListSessionsRequest, NewSessionRequest,
     NewSessionResponse, SessionConfigOption, SessionNotification, SessionUpdate,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
+use agent_client_protocol::v1::ConnectionTo;
+use agent_client_protocol::{Agent, ByteStreams, Client};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
@@ -120,7 +121,7 @@ pub(crate) async fn probe_option_catalog(
     let (snapshot_tx, mut snapshot_rx) = mpsc::channel(1);
     let notifications = snapshot_tx.clone();
     let result = Client
-        .builder()
+        .v1()
         .name("aoe-acp-catalog")
         .on_receive_notification(
             move |notification: SessionNotification, _cx| {
@@ -216,9 +217,10 @@ async fn list_with_timeout(
         return Err(ListSessionsError::Failed("agent has no stdio".into()));
     };
     let newest_first = NEWEST_FIRST_AGENTS.contains(&config.agent_key.as_str());
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+    let (read_half, write_half) = tokio::io::split(super::batch::wrap(stdout, stdin));
+    let transport = ByteStreams::new(write_half.compat_write(), read_half.compat());
     let result = Client
-        .builder()
+        .v1()
         .name("aoe-acp")
         .connect_with(transport, async move |connection: ConnectionTo<Agent>| {
             Ok(list_pages(&connection, owned, newest_first, step_timeout).await)
@@ -298,7 +300,7 @@ mod tests {
 
     #[test]
     fn catalog_keeps_first_nonempty_snapshot() {
-        use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+        use agent_client_protocol::v1::schema::SessionConfigSelectOption;
 
         let (snapshots, mut received) = mpsc::channel(1);
         capture_catalog_snapshot(None, &snapshots);
@@ -450,9 +452,14 @@ done
         stub(dir.path(), LISTING, 120, 2, "none");
         run(dir.path()).await.unwrap();
         let log = std::fs::read_to_string(dir.path().join("requests.log")).unwrap();
-        let lists: Vec<serde_json::Value> = log
+        let requests: Vec<serde_json::Value> = log
             .lines()
             .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .collect();
+        assert_eq!(requests[0]["method"], "initialize");
+        assert_eq!(requests[0]["params"]["protocolVersion"], 1);
+        let lists: Vec<_> = requests
+            .iter()
             .filter(|r| r["method"] == "session/list")
             .collect();
         assert!(lists.iter().all(|r| r["params"].get("cwd").is_none()));

@@ -19,6 +19,7 @@ import {
   themePayload,
   type BridgeCall,
 } from "../../lib/pluginBridge";
+import { isDeepLinkValue } from "../../lib/pluginHref";
 import { usePluginPages } from "../../lib/pluginUiContext";
 import type { SessionMenuRequest } from "./PluginSessionMenu";
 import { requestOpenSession } from "../../lib/sessionRoute";
@@ -35,6 +36,8 @@ interface Props {
   readOnly: boolean;
   cityhall: boolean;
   theme: ResolvedTheme | null;
+  /** The `?link=` value of the dashboard URL; forwarded only to a page that declares `deep_link`. */
+  link: string | null;
   /** The split pane's session, kept by the dashboard so its docks follow it. */
   selectedSessionId: string | null;
   onSelectSession: (id: string | null) => void;
@@ -59,6 +62,24 @@ const MAX_SPLIT = 0.8;
 const SPLIT_STEP = 0.05;
 // Rounded so arrow steps land on whole percents.
 const clampSplit = (f: number) => Math.round(Math.min(MAX_SPLIT, Math.max(MIN_SPLIT, f)) * 100) / 100;
+
+/** The `context` push: sent after `ready`, and again when `readOnly` or `cityhall` changes. */
+function contextPush(readOnly: boolean, cityhall: boolean, pluginId: string, pageId: string, link: string | null) {
+  return bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION, link });
+}
+
+/** Sends a `context` push on the open port unless the page already has these modes. */
+function pushChangedModes(
+  port: { current: MessagePort | null },
+  pushed: { current: string | null },
+  context: { readOnly: boolean; cityhall: boolean; pluginId: string; pageId: string; link: string | null },
+) {
+  const modes = `${context.readOnly}:${context.cityhall}`;
+  if (!port.current || pushed.current === modes) return;
+  pushed.current = modes;
+  const { readOnly, cityhall, pluginId, pageId, link } = context;
+  port.current.postMessage(contextPush(readOnly, cityhall, pluginId, pageId, link));
+}
 
 function closePort(port: { current: MessagePort | null }) {
   port.current?.close();
@@ -127,6 +148,7 @@ export function PluginPageView({
   readOnly,
   cityhall,
   theme,
+  link: rawLink,
   selectedSessionId,
   onSelectSession,
   renderSession,
@@ -134,6 +156,8 @@ export function PluginPageView({
 }: Props) {
   const pages = usePluginPages();
   const page = pages?.find((p) => p.plugin_id === pluginId && p.id === pageId);
+  const link = page?.deep_link && isDeepLinkValue(rawLink) ? rawLink : null;
+  const linkRef = useRef(link);
   const [attempt, setAttempt] = useState(0);
   // Keyed by URL, not the page object, which a poll replaces whenever any plugin's pages change.
   const pageUrl = page?.url;
@@ -144,6 +168,8 @@ export function PluginPageView({
   const loads = useRef(0);
   // Transferred by the page with `ready`; a later document can never reach it, so nothing crosses a navigation.
   const port = useRef<MessagePort | null>(null);
+  // The modes the page last heard in `context`, so a re-render with the same ones sends nothing.
+  const pushedModes = useRef<string | null>(null);
   // Rides the frame URL's fragment, which never reaches the server; `ready` must echo it, so a document the page navigates to cannot take its identity.
   const nonce = useRef<string | null>(null);
 
@@ -174,6 +200,16 @@ export function PluginPageView({
     shownRef.current = shown;
     port.current?.postMessage(bridgePush("selection", { sessionId: shown }));
   }, [shown]);
+  // A page opened while the modes were unsettled, such as before /api/about answered, learns the new ones.
+  useEffect(
+    () => pushChangedModes(port, pushedModes, { readOnly, cityhall, pluginId, pageId, link: linkRef.current }),
+    [readOnly, cityhall, pluginId, pageId],
+  );
+  // A second link while the page is open arrives here instead of remounting it.
+  useEffect(() => {
+    linkRef.current = link;
+    port.current?.postMessage(bridgePush("link", { link }));
+  }, [link]);
 
   // The last request stays mounted after its menu closes, so a picker it opened can finish.
   const [menuRequest, setMenuRequest] = useState<SessionMenuRequest | null>(null);
@@ -259,9 +295,8 @@ export function PluginPageView({
       port.current = channel;
       channel.onmessage = serve(channel);
       channel.postMessage(bridgeReply(req.id, null));
-      channel.postMessage(
-        bridgePush("context", { readOnly, cityhall, pluginId, pageId, bridgeVersion: BRIDGE_VERSION }),
-      );
+      pushedModes.current = null;
+      pushChangedModes(port, pushedModes, { readOnly, cityhall, pluginId, pageId, link: linkRef.current });
       if (theme) channel.postMessage(bridgePush("theme", themePayload(theme)));
       channel.postMessage(bridgePush("selection", { sessionId: shownRef.current }));
     };
@@ -319,6 +354,8 @@ export function PluginPageView({
             title={page.title}
             src={`${page.url}#${ticket.nonce}`}
             sandbox="allow-scripts allow-downloads"
+            // The dashboard URL carries `?link=` and `?session=`, which the page must not read from `document.referrer`.
+            referrerPolicy="no-referrer"
             onLoad={onFrameLoad}
             // The frame would swallow the divider's mousemove events mid-drag.
             className={`flex-1 min-h-0 w-full border-0 bg-surface-900 ${dragging ? "pointer-events-none" : ""}`}

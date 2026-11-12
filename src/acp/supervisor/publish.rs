@@ -3,7 +3,8 @@
 use tracing::info;
 
 use super::{
-    with_publication_seq, BroadcastSink, PromptDisposition, SeqMap, Supervisor, WorkerKind,
+    with_publication_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor,
+    WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
@@ -210,6 +211,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
         self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None)
             .await
+            .disposition
     }
 
     /// Record a `UserPromptSent` (attachments stored as blobs keyed to its seq)
@@ -224,7 +226,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         prompt_id: Option<String>,
         synthesized: bool,
         origin_plugin: Option<String>,
-    ) -> PromptDisposition {
+    ) -> PublishedPrompt {
+        // Before any await or store, so an idle stop cannot claim the worker in between.
+        super::lock_recover(&self.lifecycle).note_admission(session_id);
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let is_clear = profile.is_clear_command(&text);
@@ -233,12 +237,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         } else {
             PromptDisposition::Forward
         };
-        let persisted = with_publication_seq(&self.next_seqs, session_id, |seq| {
+        let unrecorded = PublishedPrompt {
+            disposition,
+            seq: None,
+        };
+        let recorded_seq = with_publication_seq(&self.next_seqs, session_id, |seq| {
             let mut refs = Vec::with_capacity(attachments.len());
             for blob in attachments {
                 if !self.sink.record_attachment(session_id, seq, blob) {
                     self.sink.delete_attachments_for_seq(session_id, seq);
-                    return false;
+                    return None;
                 }
                 refs.push(crate::daemon::PromptAttachmentRef {
                     id: blob.id.clone(),
@@ -260,17 +268,20 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .publish_persisted(session_id, seq, &AcpEventData::from_host(event))
             {
                 self.sink.delete_attachments_for_seq(session_id, seq);
-                return false;
+                return None;
             }
-            true
+            Some(seq)
         });
-        if !persisted {
-            return disposition;
-        }
+        let Some(seq) = recorded_seq else {
+            return unrecorded;
+        };
         if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, Event::SessionCleared);
         }
-        disposition
+        PublishedPrompt {
+            disposition,
+            seq: Some(seq),
+        }
     }
 
     /// Publish a "Send diff comments" submission; never treated as a clear command.
@@ -283,6 +294,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         comments: Vec<crate::acp::state::DiffComment>,
         assembled_markdown: String,
     ) {
+        super::lock_recover(&self.lifecycle).note_admission(session_id);
         self.publish_next(
             session_id,
             Event::UserDiffCommentsPrompt {
@@ -814,5 +826,126 @@ mod tests {
             })
             .collect();
         assert_eq!(flags, [false, true]);
+    }
+
+    /// The published seq is the `UserPromptSent` event's, and there is none when the
+    /// event did not reach the store; the text is still routed either way.
+    #[tokio::test]
+    async fn publish_user_prompt_reports_the_seq_it_recorded() {
+        struct RefusesToPersist;
+        impl BroadcastSink for RefusesToPersist {
+            fn publish(&self, _: &str, _: u64, _: &crate::acp::event_sender::AcpEventData) {}
+            fn publish_persisted(
+                &self,
+                _: &str,
+                _: u64,
+                _: &crate::acp::event_sender::AcpEventData,
+            ) -> bool {
+                false
+            }
+        }
+
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        sup.publish_user_prompt("s-1", "first".into()).await;
+        let published = sup
+            .publish_user_prompt_with_attachments("s-1", "second".into(), &[], None, false, None)
+            .await;
+        let recorded = sink.frames.lock().unwrap().last().unwrap().1;
+        assert_eq!(
+            published,
+            PublishedPrompt {
+                disposition: PromptDisposition::Forward,
+                seq: Some(recorded),
+            }
+        );
+
+        let sup = Supervisor::new(std::sync::Arc::new(RefusesToPersist));
+        let published = sup
+            .publish_user_prompt_with_attachments("s-1", "lost".into(), &[], None, false, None)
+            .await;
+        assert_eq!(
+            published,
+            PublishedPrompt {
+                disposition: PromptDisposition::Forward,
+                seq: None,
+            }
+        );
+    }
+
+    /// Records, for each broadcast, whether its session's seq counter was held.
+    #[derive(Default)]
+    struct LockProbeSink {
+        seqs: std::sync::OnceLock<std::sync::Arc<SeqMap>>,
+        held: std::sync::Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl BroadcastSink for LockProbeSink {
+        fn publish(&self, session_id: &str, seq: u64, _event: &AcpEventData) {
+            let counter = super::super::sequence_slot(self.seqs.get().unwrap(), session_id);
+            let held = matches!(counter.try_lock(), Err(std::sync::TryLockError::WouldBlock));
+            self.held.lock().unwrap().push((seq, held));
+        }
+    }
+
+    /// Records the running epoch's admission count as each prompt event is stored.
+    #[derive(Default)]
+    struct AdmissionProbeSink {
+        lease: std::sync::OnceLock<crate::acp::runner_lifecycle::Lease>,
+        seen: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl BroadcastSink for AdmissionProbeSink {
+        fn publish(&self, _: &str, _: u64, data: &AcpEventData) {
+            if matches!(
+                data.event.as_ref(),
+                Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
+            ) {
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push(self.lease.get().unwrap().admissions());
+            }
+        }
+    }
+
+    /// An idle stop claimed between a prompt's persistence and its admission
+    /// count would stop the worker the prompt was just recorded for (#5048), so
+    /// the count must already stand when the event is stored.
+    #[tokio::test]
+    async fn prompts_are_admitted_before_they_are_stored() {
+        let sink = std::sync::Arc::new(AdmissionProbeSink::default());
+        let sup = Supervisor::new(std::sync::Arc::clone(&sink));
+        sup.test_insert_worker("s-1").await;
+        sink.lease.set(sup.running_lease("s-1").unwrap()).unwrap();
+
+        sup.publish_user_prompt("s-1", "typed".into()).await;
+        sup.publish_user_diff_comments_prompt(
+            "s-1",
+            String::new(),
+            String::new(),
+            false,
+            Vec::new(),
+            "review".into(),
+        )
+        .await;
+
+        assert_eq!(*sink.seen.lock().unwrap(), [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn each_publish_runs_under_its_sessions_seq_lock() {
+        let sink = std::sync::Arc::new(LockProbeSink::default());
+        let sup = Supervisor::new(std::sync::Arc::clone(&sink));
+        assert!(sink.seqs.set(std::sync::Arc::clone(&sup.next_seqs)).is_ok());
+
+        sup.publish_startup_error("s-1", "boom".into());
+        sup.publish_user_prompt("s-1", "prompt".into()).await;
+        assert!(sup.publish_stopped_if_seq("s-1", "user_stopped", 2));
+
+        assert_eq!(
+            *sink.held.lock().unwrap(),
+            [(1, true), (2, true), (3, true)]
+        );
     }
 }

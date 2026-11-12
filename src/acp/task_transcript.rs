@@ -159,15 +159,40 @@ fn shared_watch() -> Arc<FileWatchService> {
     watch
 }
 
+#[cfg(test)]
+fn shared_watch() -> Arc<FileWatchService> {
+    static WATCHES: OnceLock<
+        Mutex<HashMap<tokio::runtime::Id, std::sync::Weak<FileWatchService>>>,
+    > = OnceLock::new();
+    let runtime = tokio::runtime::Handle::current().id();
+    let mut watches = WATCHES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    watches.retain(|_, watch| watch.strong_count() != 0);
+    if let Some(watch) = watches.get(&runtime).and_then(std::sync::Weak::upgrade) {
+        return watch;
+    }
+    let watch = FileWatchService::new().unwrap_or_else(|_| FileWatchService::noop());
+    watches.insert(runtime, Arc::downgrade(&watch));
+    watch
+}
+
 #[derive(Default)]
 pub(crate) struct ActiveTasks {
     owners: Mutex<HashMap<String, Arc<TaskOwner>>>,
+    /// Tasks `TaskStop` ended before any tailer followed them, as when the
+    /// result is replayed ahead of the resumed tailing.
+    stopped_early: Mutex<HashSet<String>>,
     publication: tokio::sync::Mutex<()>,
 }
 
 struct TaskOwner {
     tool_call_id: Option<String>,
+    /// Another launch took over the task: stop without reporting an end.
     cancellation: CancellationToken,
+    /// `TaskStop` killed the task: settle its agents, then report the end.
+    stop: CancellationToken,
     authority: Arc<NativeResourceAuthority>,
 }
 
@@ -178,6 +203,42 @@ impl ActiveTasks {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.lock().is_empty()
+    }
+    pub(crate) fn clear(&self) {
+        let mut owners = self.lock();
+        for owner in owners.values() {
+            owner.cancellation.cancel();
+        }
+        owners.clear();
+    }
+}
+#[derive(Clone)]
+pub(crate) struct TaskReadOwner {
+    active: Arc<ActiveTasks>,
+    task_id: Arc<str>,
+    owner: Arc<TaskOwner>,
+}
+
+    /// Ends `task_id` because `TaskStop` killed it. A following tailer
+    /// publishes the end itself; with none, the stop is kept for the resumed
+    /// tailer that registers next.
+    pub(crate) fn stop(&self, task_id: &str) {
+        match self.lock().get(task_id) {
+            Some(owner) => owner.stop.cancel(),
+            None => {
+                self.stopped_early
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(task_id.to_string());
+            }
+        }
+    }
+
+    fn take_early_stop(&self, task_id: &str) -> bool {
+        self.stopped_early
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(task_id)
     }
     pub(crate) fn clear(&self) {
         let mut owners = self.lock();
@@ -396,10 +457,17 @@ impl TaskTailer {
             let owner = Arc::new(TaskOwner {
                 tool_call_id: self.tool_call_id.clone(),
                 cancellation: CancellationToken::new(),
+                stop: CancellationToken::new(),
                 authority: self.authority.for_tracking_allocation(allocation)?,
             });
             if let Some(previous) = owners.insert(self.task_id.clone(), Arc::clone(&owner)) {
                 previous.cancellation.cancel();
+            }
+            // Under the owners lock, so a concurrent `stop` either finds this
+            // owner or leaves its marker here. A live launch supersedes a
+            // stale marker.
+            if self.active.take_early_stop(&self.task_id) && self.start == TailerStart::Resumed {
+                owner.stop.cancel();
             }
             Ok(Some(owner))
         });
@@ -455,6 +523,7 @@ impl TaskTailer {
             });
             let ended_at = tokio::select! {
                 () = owner.cancellation.cancelled() => return,
+                () = owner.stop.cancelled() => Some(Utc::now()),
                 ended_at = async {
                     match path {
                         Some(path) => self.follow(path, &access).await,
@@ -911,11 +980,13 @@ mod tests {
         _peer: NativePeer,
         authority: Arc<NativeResourceAuthority>,
         prior_authority: Option<Arc<NativeResourceAuthority>>,
+        second_authority: Option<Arc<NativeResourceAuthority>>,
         workflow: Option<(
             crate::acp::state::WorkflowLaunch,
             crate::acp::state::WorkflowAgents,
         )>,
         session_id: String,
+        task_id: String,
         home: PathBuf,
         transcript: PathBuf,
         active: Arc<ActiveTasks>,
@@ -927,6 +998,7 @@ mod tests {
 
     enum FixtureSource<'a> {
         Bash(Option<&'a str>),
+        BashPair,
         Workflow,
     }
 
@@ -949,8 +1021,9 @@ mod tests {
     ) -> Fixture {
         let prior_tool = match &source {
             FixtureSource::Bash(prior) => *prior,
-            FixtureSource::Workflow => None,
+            FixtureSource::BashPair | FixtureSource::Workflow => None,
         };
+        let selected_task = "t-1";
         let mut native = super::resource_test_support::NativeBootstrap::new(scope).await;
         let home = native.home.clone();
         let session_id = native.session_id.clone();
@@ -1042,20 +1115,31 @@ mod tests {
                         scope,
                         tool,
                         "Bash",
-                        serde_json::json!({"backgroundTaskId":"t-1"}),
+                        serde_json::json!({"backgroundTaskId":selected_task}),
                     )
                     .await;
                 tokio::time::timeout(Duration::from_secs(10), async {
                     while !matches!(native.managed.recv().await,
                         Some(Event::BackgroundTaskStarted { task_id, tool_call_id: Some(actual), .. })
-                            if task_id == "t-1" && actual == tool)
+                            if task_id == selected_task && actual == tool)
                     {}
                 }).await.expect("actual Native task allocation is published");
+            }
+            if matches!(source, FixtureSource::BashPair) {
+                native
+                    .tool(
+                        scope,
+                        "toolu_2",
+                        "Bash",
+                        serde_json::json!({"backgroundTaskId":"t-2"}),
+                    )
+                    .await;
             }
             None
         };
         let mut witness = None;
         let mut prior_witness = None;
+        let mut second_witness = None;
         for stored in scope
             .state
             .acp_event_store
@@ -1068,7 +1152,16 @@ mod tests {
                 ..
             } = stored.event.as_ref()
             {
-                if task_id != "t-1" {
+                if matches!(source, FixtureSource::BashPair)
+                    && task_id == "t-2"
+                    && tool == "toolu_2"
+                {
+                    if let Some(allocated) = stored.metadata.resource_witness {
+                        assert!(second_witness.replace(allocated).is_none());
+                    }
+                    continue;
+                }
+                if task_id != selected_task {
                     continue;
                 }
                 let Some(allocated) = stored.metadata.resource_witness else {
@@ -1098,11 +1191,13 @@ mod tests {
         let prior_authority = prior_witness
             .map(|witness| NativeResourceAuthority::adopt(witness, receipt.as_ref()).unwrap());
         assert_eq!(prior_authority.is_some(), prior_tool.is_some());
+        let second_authority = second_witness
+            .map(|witness| NativeResourceAuthority::adopt(witness, receipt.as_ref()).unwrap());
         if let Some(prior) = &prior_authority {
             assert!(matches!(prior.selector(),
                 crate::acp::establishment::NativeResourceSelector::Task {
                     task_id, tool_call_id: Some(tool), session_id: native, claude_home, workflow: None,
-                } if task_id == "t-1" && Some(tool.as_str()) == prior_tool
+                } if task_id == selected_task && Some(tool.as_str()) == prior_tool
                     && native == &session_id && claude_home == home.as_path()));
             assert_ne!(
                 prior.witness().unwrap().allocation,
@@ -1112,17 +1207,19 @@ mod tests {
         assert!(matches!(authority.selector(),
             crate::acp::establishment::NativeResourceSelector::Task {
                 task_id, tool_call_id: Some(tool), session_id: native, claude_home, workflow: selected,
-            } if task_id == "t-1" && tool == "toolu_1" && native == &session_id && claude_home == home.as_path()
+            } if task_id == selected_task && tool == "toolu_1" && native == &session_id && claude_home == home.as_path()
                 && selected.as_ref().map(|run| run.run_id.as_str()) == workflow.as_ref().map(|(run, _)| run.run_id.as_str())));
         std::fs::write(&transcript, initial).unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
         Fixture {
+            task_id: selected_task.to_string(),
             home,
             _managed: managed,
             _peer: peer,
             authority,
             prior_authority,
+            second_authority,
             workflow,
             session_id,
             transcript,
@@ -1142,7 +1239,7 @@ mod tests {
                 tool_call_id: Some("toolu_1".into()),
                 claude_home: Some(self.home.clone()),
                 watch: Arc::clone(&watch),
-                task_id: "t-1".into(),
+                task_id: self.task_id.clone(),
                 session_id: self.session_id.clone(),
                 active: self.active.clone(),
                 event_tx: self.tx.as_ref().expect("sender kept").downgrade().into(),
@@ -1215,6 +1312,16 @@ mod tests {
             self.tx = None;
         }
 
+        async fn released_task(&self, task_id: &str) {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while self.active.lock().contains_key(task_id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the tailer released its slot");
+        }
+
         async fn released(&self) {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while !self.active.is_empty() {
@@ -1270,6 +1377,207 @@ mod tests {
             })
         })
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stopped_task_reports_one_end_and_releases_its_slot() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut f = fixture(scope, "{\"type\":\"user\"}\n").await;
+                f.spawn(TailerStart::Live).await;
+                f.parked().await;
+                f.active.stop("t-1");
+                let finished = f.next().await;
+                assert!(matches!(finished.event.as_ref(),
+                Event::BackgroundTaskFinished { task_id, ended_at: Some(_) } if task_id == "t-1"));
+                assert_eq!(
+                    finished.metadata.resource_ref,
+                    Some(f.authority.witness().unwrap().allocation)
+                );
+                f.released().await;
+                f.active.stop("t-1");
+                assert!(
+                    f.active.take_early_stop("t-1"),
+                    "a stop with no tailer is kept"
+                );
+                f.append(&notification_line("t-1", Some("completed")));
+                f.drop_sender();
+                assert!(f.rx.recv().await.is_none(), "no second end event");
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_new_launch_forgets_an_earlier_stop_of_its_id() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut f = fixture(scope, "{\"type\":\"user\"}\n").await;
+                f.active.stop("t-1");
+                f.spawn(TailerStart::Live).await;
+                assert!(!f.active.take_early_stop("t-1"));
+                f.drop_sender();
+                f.released().await;
+            })
+        })
+        .await;
+    }
+
+    /// A task still open in the persisted log whose `TaskStop` result arrives
+    /// before tailing resumes ends Idle.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stop_before_resume_ends_the_persisted_task() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                use crate::session::Status;
+
+                let mut f = fixture(scope, "{\"type\":\"user\"}\n").await;
+                let mut state = scope
+                    .state
+                    .session_service
+                    .fold_control_state(&f._managed.id)
+                    .await
+                    .unwrap();
+                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id) + 1;
+                assert_eq!(state.sidebar_status(), Status::Running);
+                f.active.stop("t-1");
+                f.spawn(TailerStart::Resumed).await;
+                let finished = f.next().await;
+                assert_eq!(finished_id(&finished), "t-1");
+                assert_eq!(
+                    finished.metadata.resource_ref,
+                    Some(f.authority.witness().unwrap().allocation)
+                );
+                state
+                    .apply_scoped_event(seq, finished.event.as_ref(), &finished.metadata)
+                    .unwrap();
+                assert_eq!(state.sidebar_status(), Status::Idle);
+                f.released().await;
+            })
+        })
+        .await;
+    }
+
+    /// Stopping one of two tracked tasks leaves the other followed and the
+    /// session Running until it ends too.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stop_leaves_the_other_tracked_task_running() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                use crate::session::Status;
+
+                let mut f =
+                    fixture_for(scope, "{\"type\":\"user\"}\n", FixtureSource::BashPair).await;
+                let second = f.second_authority.as_ref().unwrap().clone();
+                let mut state = scope
+                    .state
+                    .session_service
+                    .fold_control_state(&f._managed.id)
+                    .await
+                    .unwrap();
+                let seq = scope.state.acp_event_store.highest_seq(&f._managed.id) + 1;
+                assert_eq!(state.sidebar_status(), Status::Running);
+                let watch = FileWatchService::new().unwrap();
+                f.spawn_with(watch.clone(), TailerStart::Live).await;
+                f.parked().await;
+                let (idle_tx, mut idle_rx) = tokio::sync::mpsc::unbounded_channel();
+                let idle: IdleHook = Arc::new(move || {
+                    let _ = idle_tx.send(());
+                });
+                drop(
+                    super::resource_test_support::wait_for_tracking(async || {
+                        let mut tailer = f.tailer(watch.clone(), TailerStart::Live);
+                        tailer.task_id = "t-2".into();
+                        tailer.tool_call_id = Some("toolu_2".into());
+                        tailer.authority = second.clone();
+                        tailer.idle = idle.clone();
+                        tailer.spawn(None).await
+                    })
+                    .await,
+                );
+                tokio::time::timeout(Duration::from_secs(10), idle_rx.recv())
+                    .await
+                    .expect("second tailer reached its wait")
+                    .expect("second hook alive");
+                f.active.stop("t-1");
+                let finished = f.next().await;
+                assert_eq!(finished_id(&finished), "t-1");
+                state
+                    .apply_scoped_event(seq, finished.event.as_ref(), &finished.metadata)
+                    .unwrap();
+                f.released_task("t-1").await;
+                assert!(f.active.lock().contains_key("t-2"), "t-2 is still followed");
+                assert_eq!(state.sidebar_status(), Status::Running);
+                f.append(
+                    &notification_line("t-2", Some("completed")).replace("toolu_1", "toolu_2"),
+                );
+                let finished = f.next().await;
+                assert_eq!(finished_id(&finished), "t-2");
+                assert_eq!(
+                    finished.metadata.resource_ref,
+                    Some(second.witness().unwrap().allocation)
+                );
+                state
+                    .apply_scoped_event(seq + 1, finished.event.as_ref(), &finished.metadata)
+                    .unwrap();
+                assert_eq!(state.sidebar_status(), Status::Idle);
+                f.released().await;
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_workflow_stopped_before_resume_settles_its_agents() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut f =
+                    fixture_for(scope, "{\"type\":\"user\"}\n", FixtureSource::Workflow).await;
+                f.active.stop("t-1");
+                f.spawn_with(FileWatchService::noop(), TailerStart::Resumed)
+                    .await;
+                assert_agent_settled_then_finished(&mut f).await;
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_stopped_workflow_settles_its_agents_before_it_finishes() {
+        with_managed(|scope| {
+            Box::pin(async move {
+                let mut f =
+                    fixture_for(scope, "{\"type\":\"user\"}\n", FixtureSource::Workflow).await;
+                f.spawn_with(FileWatchService::noop(), TailerStart::Resumed)
+                    .await;
+                f.parked().await;
+                f.active.stop("t-1");
+                assert_agent_settled_then_finished(&mut f).await;
+            })
+        })
+        .await;
+    }
+
+    async fn assert_agent_settled_then_finished(f: &mut Fixture) {
+        let child_allocation = f.workflow.as_ref().unwrap().1.resources["a1"].allocation;
+        let detached = f.next().await;
+        assert!(matches!(detached.event.as_ref(),
+            Event::BackgroundAgentCompleted { agent_id, status: crate::acp::state::BackgroundAgentStatus::Detached, .. }
+                if agent_id == "a1"));
+        assert_eq!(detached.metadata.resource_ref, Some(child_allocation));
+        let finished = f.next().await;
+        assert_eq!(finished_id(&finished), "t-1");
+        assert_eq!(
+            finished.metadata.resource_ref,
+            Some(f.authority.witness().unwrap().allocation)
+        );
+        f.released().await;
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ function dispatch(target: EventTarget, init: KeyboardEventInit) {
   return event;
 }
 
-function mount() {
+function mount(ready = true) {
   const actions = {
     onNew: vi.fn(),
     onFocusSidebar: vi.fn(),
@@ -25,7 +25,10 @@ function mount() {
     onToggleRightPanel: vi.fn(),
     onToggleTerminalFocus: vi.fn(),
   } satisfies ShortcutActions;
-  return { actions, ...renderHook(() => useKeyboardShortcuts(() => actions)) };
+  return {
+    actions,
+    ...renderHook(({ ready }) => useKeyboardShortcuts(() => actions, ready), { initialProps: { ready } }),
+  };
 }
 
 type ActionName = keyof ShortcutActions;
@@ -170,6 +173,15 @@ describe("useKeyboardShortcuts", () => {
   it("marks the document ready once the listener is attached", () => {
     delete document.documentElement.dataset.shortcutsReady;
     const { unmount } = mount();
+    expect(document.documentElement.dataset.shortcutsReady).toBe("true");
+    unmount();
+  });
+
+  it("waits to mark the document ready until the actions can act", () => {
+    delete document.documentElement.dataset.shortcutsReady;
+    const { rerender, unmount } = mount(false);
+    expect(document.documentElement.dataset.shortcutsReady).toBeUndefined();
+    rerender({ ready: true });
     expect(document.documentElement.dataset.shortcutsReady).toBe("true");
     unmount();
   });

@@ -5,12 +5,13 @@ import { vi } from "vitest";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { RuntimeCursor, SessionMutation } from "../../lib/api";
 import type { SessionResponse, Workspace } from "../../lib/types";
+import { sessionWorkspaces } from "../../lib/sessionWorkspace";
 import { SidebarCompactContext } from "../../lib/sidebarCompact";
 import { SessionColorsContext } from "../../lib/sessionColors";
 import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
 import { SessionRow } from "../sidebar/SessionRow";
-import type { RowBulkApi } from "../sidebar/types";
+import type { RowActivate, RowBulkApi } from "../sidebar/types";
 import { SessionActionProvider } from "../sidebar/SessionActionProvider";
 
 export function makeSession(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -102,6 +103,9 @@ interface RowOptions {
   onStart?: (sessionId: string) => void;
   onRestartForUpdate?: (sessionId: string) => void;
   onSwitchView?: (sessionId: string, toStructured: boolean) => void;
+  onActivate?: RowActivate;
+  activeSessionId?: string | null;
+  bulkApi?: RowBulkApi;
 }
 
 /** A single unselected SessionRow wired to the real triage hook, as the sidebar wires it. */
@@ -114,8 +118,11 @@ function Row({
   onStart,
   onRestartForUpdate,
   onSwitchView,
+  onActivate = () => {},
+  activeSessionId = null,
+  bulkApi = SINGLE_BULK_API,
 }: RowOptions & { ws: Workspace }) {
-  const triage = useSidebarTriage(useMemo(() => [ws], [ws]));
+  const triage = useSidebarTriage(useMemo(() => [ws, ...sessionWorkspaces([ws])], [ws]));
   const [canonical, setCanonical] = useState({
     source: ws,
     workspace: ws,
@@ -146,7 +153,9 @@ function Row({
         onSessionMutation={onSessionMutation}
         isActive={isActive}
         isSelected={false}
-        onActivate={() => {}}
+        onActivate={onActivate}
+        activeSessionId={activeSessionId}
+        optimisticFor={ws.sessions.length > 1 ? triage.optimisticFor : undefined}
         onCreateSession={onCreateSession}
         onStop={onStop}
         onStart={onStart}
@@ -158,7 +167,7 @@ function Row({
         onArchiveToggle={triage.archiveToggle}
         onSnooze={triage.snooze}
         onUnreadToggle={triage.unreadToggle}
-        bulkApi={SINGLE_BULK_API}
+        bulkApi={bulkApi}
       />
     </SessionActionProvider>
   );

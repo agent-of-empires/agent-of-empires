@@ -139,6 +139,7 @@ struct Construction {
     cancellation: CancellationToken,
     retirement_authorized: std::sync::atomic::AtomicBool,
     constructor_finished: std::sync::atomic::AtomicBool,
+    owned_child_wait_pending: std::sync::atomic::AtomicBool,
     runner: Mutex<Option<RunnerIdentity>>,
     scopes: Mutex<Vec<crate::process::worker_registry::ScopeOwnership>>,
     admission: Mutex<Option<crate::acp::supervisor::LaunchAdmission>>,
@@ -152,9 +153,10 @@ struct Construction {
     retire_previous: std::sync::atomic::AtomicBool,
     spawn_attestor:
         Mutex<Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>>>,
-    /// Wall-clock ms of admission, refreshed on install so a slow start
-    /// does not read as idle; atomic only so tests can backdate it.
+    /// Admission time, refreshed on installation so slow starts do not appear idle.
     idle_baseline_ms: std::sync::atomic::AtomicI64,
+    /// Prompts admitted to this epoch; an idle stop observed before one is void.
+    admissions: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     child_wait_completed: tokio::sync::watch::Sender<Option<bool>>,
     original_constructor_obligations: std::sync::atomic::AtomicUsize,
@@ -187,6 +189,8 @@ impl Default for Construction {
             child_wait_completed: tokio::sync::watch::channel(None).0,
             original_constructor_obligations: std::sync::atomic::AtomicUsize::new(usize::MAX),
             original_constructor_notify: std::sync::OnceLock::new(),
+            admissions: std::sync::atomic::AtomicU64::new(0),
+            owned_child_wait_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -495,16 +499,23 @@ impl Lease {
                 .unwrap_or_else(|error| error.into_inner());
             assert!(runner.is_none(), "one physical child per construction");
             *runner = Some(identity);
+            self.construction
+                .owned_child_wait_pending
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         #[cfg(test)]
         let wait_completed = self.construction.child_wait_completed.clone();
         if identity.birth_fingerprint.is_some() {
+            let construction = Arc::clone(&self.construction);
             tokio::spawn(async move {
                 let outcome = child.wait().await;
+                if outcome.is_ok() {
+                    construction
+                        .owned_child_wait_pending
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
                 #[cfg(test)]
                 let _ = wait_completed.send_replace(Some(outcome.is_ok()));
-                #[cfg(not(test))]
-                let _ = outcome;
             });
             return;
         }
@@ -534,10 +545,14 @@ impl Lease {
                 }
             }
             let outcome = child.wait().await;
+            if outcome.is_ok() {
+                owner
+                    .construction
+                    .owned_child_wait_pending
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
             #[cfg(test)]
             let _ = wait_completed.send_replace(Some(outcome.is_ok()));
-            #[cfg(not(test))]
-            let _ = outcome;
         });
     }
 
@@ -774,6 +789,18 @@ impl Lease {
         admission.generation = generation;
         admission.native_scope = Some(destination);
         true
+    }
+
+    pub(crate) fn owned_child_wait_pending(&self) -> bool {
+        self.construction
+            .owned_child_wait_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn admissions(&self) -> u64 {
+        self.construction
+            .admissions
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn record_scope(&self, scope: crate::process::worker_registry::ScopeOwnership) {
@@ -1860,6 +1887,22 @@ impl LifecycleTable {
         match entry.phase {
             Phase::Running { identity } => Some((self.lease(session_id, entry.epoch), identity)),
             _ => None,
+        }
+    }
+
+    /// Count a prompt against the running epoch and restart its idle clock,
+    /// since the prompt is not stored yet. Under the table lock so an idle
+    /// stop's check cannot interleave with it.
+    pub(crate) fn note_admission(&self, session_id: &str) {
+        if let Some((lease, _)) = self.running(session_id) {
+            lease.construction.idle_baseline_ms.fetch_max(
+                chrono::Utc::now().timestamp_millis(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            lease
+                .construction
+                .admissions
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
     }
 

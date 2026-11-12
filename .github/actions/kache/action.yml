@@ -1,0 +1,46 @@
+name: Kache build cache
+description: >
+  Wraps rustc with kache backed by the shared S3 bucket. main pushes write
+  `artifacts/`; same-repo PRs read it and write `artifacts-pr/`; fork PRs get
+  no OIDC token and build without a remote. The calling job needs
+  `id-token: write`.
+
+inputs:
+  manifest-key:
+    description: Scopes prefetch manifests per job so unrelated builds do not evict each other.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Pick kache role
+      id: role
+      shell: bash
+      env:
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      run: |
+        set -euo pipefail
+        if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+          echo "role=" >> "$GITHUB_OUTPUT"
+        elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+          echo "role=aoe-kache-ci-main" >> "$GITHUB_OUTPUT"
+        else
+          echo "role=aoe-kache-ci-pr" >> "$GITHUB_OUTPUT"
+        fi
+        echo "KACHE_PULL_REQUEST_PREFIX=artifacts-pr" >> "$GITHUB_ENV"
+    - if: steps.role.outputs.role != ''
+      uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+      with:
+        role-to-assume: arn:aws:iam::745600963472:role/${{ steps.role.outputs.role }}
+        aws-region: us-east-1
+        # Covers the longest job (90 min); the daemon keeps these credentials.
+        role-duration-seconds: 7200
+    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed # v1
+      with:
+        version: v2.0.0
+        s3-bucket: ${{ steps.role.outputs.role != '' && 'aoe-rust-kache' || '' }}
+        s3-region: us-east-1
+        save-cache: ${{ steps.role.outputs.role != '' }}
+        github-cache: "false"
+        manifest-key: ${{ inputs.manifest-key }}
+        pr-comment: "false"

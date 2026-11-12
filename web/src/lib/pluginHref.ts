@@ -74,3 +74,8 @@ function decodeSessionId(raw: string): string | null {
     return null;
   }
 }
+
+/** An opaque page deep-link value, mirroring the backend `deep_link_value_ok`. */
+export function isDeepLinkValue(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9._~-]{1,128}$/.test(value);
+}

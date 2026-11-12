@@ -1,7 +1,7 @@
 //! `terminal/*`: create, read output from, wait on, kill, and release the
 //! terminals an agent asks aoe to run.
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     CreateTerminalRequest, CreateTerminalResponse, KillTerminalRequest, KillTerminalResponse,
     ReleaseTerminalRequest, ReleaseTerminalResponse, TerminalId, TerminalOutputRequest,
     TerminalOutputResponse, WaitForTerminalExitRequest, WaitForTerminalExitResponse,
@@ -39,12 +39,13 @@ pub(super) async fn handle_create_terminal(
             .as_deref()
             .map(NativeRequestContext::try_original_io_guard)
             .transpose()
-            .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))?;
+            .map_err(|error| {
+                agent_client_protocol::Error::internal_error().data(error.to_string())
+            })?;
         // Policy resolution is synchronous; no guard survives the child await.
         if let Err(e) = res.fs_policy.resolve_inside(&cwd) {
-            let r = Err(agent_client_protocol::util::internal_error(format!(
-                "terminal cwd outside session roots: {e}"
-            )));
+            let r = Err(agent_client_protocol::Error::internal_error()
+                .data(format!("terminal cwd outside session roots: {e}")));
             trace!(
                 target: "acp.protocol.tool_dispatch",
                 handler = "create_terminal",
@@ -80,7 +81,7 @@ pub(super) async fn handle_create_terminal(
         .await
     {
         Ok(id) => Ok(CreateTerminalResponse::new(TerminalId::new(id))),
-        Err(e) => Err(agent_client_protocol::util::internal_error(e.to_string())),
+        Err(e) => Err(agent_client_protocol::Error::internal_error().data(e.to_string())),
     };
     trace!(
         target: "acp.protocol.tool_dispatch",
@@ -94,8 +95,8 @@ pub(super) async fn handle_create_terminal(
 
 pub(super) fn build_exit_status(
     exit_code: Option<i32>,
-) -> agent_client_protocol::schema::v1::TerminalExitStatus {
-    use agent_client_protocol::schema::v1::TerminalExitStatus;
+) -> agent_client_protocol::v1::schema::TerminalExitStatus {
+    use agent_client_protocol::v1::schema::TerminalExitStatus;
     let cast = exit_code.and_then(|c| u32::try_from(c).ok());
     TerminalExitStatus::new().exit_code(cast)
 }
@@ -105,9 +106,8 @@ fn require_native_context(
     state: &ConnectionState,
 ) -> agent_client_protocol::Result<()> {
     if context.is_none() && state.control.get().is_some() {
-        return Err(agent_client_protocol::util::internal_error(
-            "native terminal callback scope missing",
-        ));
+        return Err(agent_client_protocol::Error::internal_error()
+            .data("native terminal callback scope missing"));
     }
     Ok(())
 }
@@ -121,7 +121,7 @@ fn capture_terminal(
     require_native_context(context, state)?;
     res.terminals
         .capture(id, context)
-        .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))
+        .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
 }
 
 pub(super) fn handle_terminal_output(
@@ -143,7 +143,7 @@ pub(super) fn handle_terminal_output(
                 TerminalOutputResponse::new(format!("{}{}", output.stdout, output.stderr), false)
                     .exit_status(build_exit_status(output.exit_code))
             })
-            .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))
+            .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
     }
 }
 
@@ -166,7 +166,7 @@ pub(super) fn handle_wait_for_terminal_exit(
             .with_output(|output| {
                 WaitForTerminalExitResponse::new(build_exit_status(output.exit_code))
             })
-            .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))
+            .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
     }
 }
 
@@ -186,7 +186,7 @@ pub(super) fn handle_kill_terminal(
         // One-shot terminals have exited, but their original ownership is required.
         terminal?
             .with_output(|_| KillTerminalResponse::new())
-            .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))
+            .map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))
     }
 }
 
@@ -204,9 +204,9 @@ pub(super) fn handle_release_terminal(
         &state,
     );
     async move {
-        res.terminals
-            .release(&terminal?)
-            .map_err(|error| agent_client_protocol::util::internal_error(error.to_string()))?;
+        res.terminals.release(&terminal?).map_err(|error| {
+            agent_client_protocol::Error::internal_error().data(error.to_string())
+        })?;
         Ok(ReleaseTerminalResponse::new())
     }
 }
