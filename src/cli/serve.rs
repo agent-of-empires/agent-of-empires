@@ -1014,7 +1014,7 @@ fn resolve_launch_passphrase(
 /// plus a loopback alternate for same-host clients. Local mode may have
 /// multiple entries (Tailscale + LAN + localhost), and the user can Tab-cycle
 /// between them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeUrl {
     /// Optional human-readable label ("tailscale", "lan", "localhost").
     /// None for the primary URL, which does not need one.
@@ -1058,6 +1058,28 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
         }
     }
     out
+}
+
+/// Whether the Tailscale daemon's Funnel still routes here, from `$APP_DIR/serve.funnel`.
+pub fn read_serve_funnel() -> crate::server::tunnel::FunnelReach {
+    let raw = launch_file("serve.funnel")
+        .ok()
+        .and_then(|file| file.read().ok().flatten());
+    crate::server::tunnel::FunnelReach::from_marker(raw.as_deref())
+}
+
+/// The sentence Remote Access and `aoe serve --status` show while the Funnel URL is withdrawn.
+pub fn funnel_notice(reach: crate::server::tunnel::FunnelReach) -> Option<&'static str> {
+    use crate::server::tunnel::FunnelReach;
+    match reach {
+        FunnelReach::Ours => None,
+        FunnelReach::Lost => Some(
+            "Tailscale Funnel now routes to another server. This dashboard is reachable from this machine only. Restart Remote Access once the other server stops.",
+        ),
+        FunnelReach::Unknown => Some(
+            "Tailscale isn't answering, so the Funnel link is hidden until it does. This dashboard is reachable from this machine only for now.",
+        ),
+    }
 }
 
 fn read_serve_mode_label() -> Option<&'static str> {
@@ -1200,11 +1222,12 @@ fn classify_daemon_probe(
     }
 }
 
-const SERVE_STATE_FILES: [&str; 4] = [
+const SERVE_STATE_FILES: [&str; 5] = [
     "serve.url",
     "serve.mode",
     "serve.passphrase",
     "serve.launch",
+    "serve.funnel",
 ];
 
 /// Separate from the lifetime lock a running server holds, which this state is
@@ -2781,6 +2804,11 @@ fn print_local_status() -> Result<()> {
         }
     } else {
         println!("URL:    (serve.url missing)");
+    }
+    if mode == "tailscale" {
+        if let Some(notice) = funnel_notice(read_serve_funnel()) {
+            println!("Funnel: {notice}");
+        }
     }
     if let Some(p) = log_path {
         println!("Log:    {}", p.display());
