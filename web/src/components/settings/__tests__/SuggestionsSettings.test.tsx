@@ -293,6 +293,20 @@ describe("SuggestionsSettings", () => {
     expect(api.putSuggestionTemplate).toHaveBeenLastCalledWith("gh", "review-requested", "B");
   });
 
+  it("locks the mapping controls until a mapping save and its reload finish", async () => {
+    open();
+    let finish: (v: typeof ok) => void = () => {};
+    api.putSuggestionMapping.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const select = (await screen.findByLabelText("Map github.com/o/r")) as HTMLSelectElement;
+    await waitFor(() => expect(select.disabled).toBe(false));
+    fireEvent.change(select, { target: { value: "/p/aoe" } });
+    await waitFor(() => expect(api.putSuggestionMapping).toHaveBeenCalledWith("gh", "github.com/o/r", ["/p/aoe"]));
+    expect(select.disabled).toBe(true);
+    finish(ok);
+    await waitFor(() => expect(select.disabled).toBe(false));
+  });
+
   it("opens straight on a focused template and returns to the suggestions view", async () => {
     const openFull = open({
       templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
