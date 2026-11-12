@@ -109,15 +109,10 @@ fn resolve_projects(
     }
 }
 
-/// Sets `resolved_project` (`{ name, path }` or `null`) on every snapshot item,
-/// through the same rules `prepare` applies.
-pub(crate) fn attach_projects(
-    conn: &Connection,
-    profile: &str,
-    snapshot: &mut Value,
-    registered: &[Project],
-) -> anyhow::Result<()> {
-    let mut mappings: HashMap<(String, String), Vec<String>> = HashMap::new();
+/// The profile's project mappings, keyed by provider and mapping key.
+pub(crate) type Mappings = HashMap<(String, String), Vec<String>>;
+
+pub(crate) fn load_mappings(conn: &Connection, profile: &str) -> anyhow::Result<Mappings> {
     let rows: Vec<(String, String, String)> = conn
         .prepare(
             "SELECT provider_id, mapping_key, projects_json FROM suggestion_mappings
@@ -125,13 +120,20 @@ pub(crate) fn attach_projects(
         )?
         .query_map([profile], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<Result<_, _>>()?;
-    for (provider_id, key, paths) in rows {
-        if let Ok(paths) = serde_json::from_str(&paths) {
-            mappings.insert((provider_id, key), paths);
-        }
-    }
+    Ok(rows
+        .into_iter()
+        .filter_map(|(provider_id, key, paths)| {
+            Some(((provider_id, key), serde_json::from_str(&paths).ok()?))
+        })
+        .collect())
+}
+
+/// Sets `resolved_project` (`{ name, path }` or `null`) on every snapshot item,
+/// through the same rules `prepare` applies. Touches the filesystem, so call it
+/// without the store lock.
+pub(crate) fn attach_projects(mappings: &Mappings, snapshot: &mut Value, registered: &[Project]) {
     let Some(items) = snapshot["items"].as_array_mut() else {
-        return Ok(());
+        return;
     };
     for item in items {
         let provider_id = item["provider_id"].as_str().unwrap_or_default().to_string();
@@ -148,7 +150,6 @@ pub(crate) fn attach_projects(
             None => Value::Null,
         };
     }
-    Ok(())
 }
 
 /// The live item plus the mapping its `mapping_key` names, if any.
@@ -428,7 +429,11 @@ mod tests {
             { "provider_id": "acme.github", "id": "none" },
             { "provider_id": "other", "id": "unmapped", "mapping_key": "o/r" },
         ]});
-        attach_projects(&conn, "p", &mut snapshot, &registered).unwrap();
+        attach_projects(
+            &load_mappings(&conn, "p").unwrap(),
+            &mut snapshot,
+            &registered,
+        );
         let resolved = |i: usize| snapshot["items"][i]["resolved_project"].clone();
         assert_eq!(resolved(0)["name"], "api");
         assert_eq!(
