@@ -289,6 +289,25 @@ describe("SuggestionsSettings", () => {
     expect(field.value).toBe("new prompt");
   });
 
+  it("confirms a template save from the template fetch even when the mapping fetch fails", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    api.fetchSuggestionTemplates.mockResolvedValueOnce([
+      { provider_id: "gh", criterion: "review-requested", template: "new prompt" },
+    ]);
+    api.fetchSuggestionMappings.mockResolvedValueOnce(null);
+    fireEvent.change(field, { target: { value: "new prompt" } });
+    fireEvent.blur(field);
+    await screen.findByText(/Could not load mappings/);
+    // The draft is gone, so the field follows the stored value again.
+    api.fetchSuggestionTemplates.mockResolvedValue([
+      { provider_id: "gh", criterion: "review-requested", template: "server" },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(field.value).toBe("server"));
+  });
+
   it("clears the load error once Retry loads everything", async () => {
     api.fetchSuggestionMappings.mockResolvedValueOnce(null);
     open();
