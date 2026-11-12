@@ -1,8 +1,9 @@
 import { RefreshCw } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchProfileAgents } from "../../../lib/api";
 import type { AgentInfo } from "../../../lib/types";
 import { CopyCommand, GhostButton, PANEL, RadioRow, Section } from "../ui";
+import { usePersistedPick } from "../usePersistedPick";
 
 /** Shown with their install command when missing, so a fresh machine has somewhere to start. */
 const SUGGESTED = ["claude", "codex", "gemini"];
@@ -43,28 +44,11 @@ export function AgentsStep({ profile, defaultTool, structuredView, save, onAgent
 
   const installed = (agents ?? []).filter((a) => a.installed);
   const missing = (agents ?? []).filter((a) => !a.installed && SUGGESTED.includes(a.name));
-  const [tool, setTool] = useState(defaultTool);
+  const [tool, pickTool] = usePersistedPick(defaultTool, (name) => save("session", "default_tool", name));
   const savedView = structuredView === "terminal" || structuredView === "off" ? structuredView : "structured";
-  const [view, setView] = useState(savedView);
+  const [view, pickView] = usePersistedPick(savedView, (next) => save("acp", "structured_view", next));
   // No fallback pick: an unsaved selection would read as the default without being one.
   const chosen = tool && installed.some((a) => a.name === tool) ? tool : undefined;
-
-  // A failed pick rolls back to the last saved value, unless a newer pick superseded it.
-  const picks = useRef({ tool: { id: 0, saved: defaultTool }, view: { id: 0, saved: savedView } });
-  const pickTool = async (name: string) => {
-    const pick = picks.current.tool;
-    const id = ++pick.id;
-    setTool(name);
-    if (await save("session", "default_tool", name)) pick.saved = name;
-    else if (id === pick.id) setTool(pick.saved);
-  };
-  const pickView = async (next: string) => {
-    const pick = picks.current.view;
-    const id = ++pick.id;
-    setView(next);
-    if (await save("acp", "structured_view", next)) pick.saved = next;
-    else if (id === pick.id) setView(pick.saved);
-  };
 
   return (
     <>

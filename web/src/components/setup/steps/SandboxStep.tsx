@@ -1,9 +1,10 @@
 import { RefreshCw } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { fetchSetupRuntimes, type ContainerRuntimeKind, type RuntimeStatus } from "../../../lib/api";
 import type { SettingsFieldDescriptor } from "../../../lib/types";
 import { SchemaSection } from "../../settings/SchemaSection";
 import { GhostButton, PANEL, RadioRow, Section } from "../ui";
+import { usePersistedPick } from "../usePersistedPick";
 
 const LABELS: Record<ContainerRuntimeKind, string> = {
   docker: "Docker",
@@ -46,17 +47,10 @@ export function SandboxStep({ schema, values, onSaveField }: Props) {
     setChecks((n) => n + 1);
   };
 
-  const [selected, setSelected] = useState(
+  const [selected, pick] = usePersistedPick<string>(
     typeof values.container_runtime === "string" ? values.container_runtime : "docker",
+    (kind) => onSaveField("sandbox", "container_runtime", kind),
   );
-  // A failed pick rolls back to the last saved value, unless a newer pick superseded it.
-  const picks = useRef({ id: 0, saved: selected });
-  const pick = async (kind: ContainerRuntimeKind) => {
-    const id = ++picks.current.id;
-    setSelected(kind);
-    if (await onSaveField("sandbox", "container_runtime", kind)) picks.current.saved = kind;
-    else if (id === picks.current.id) setSelected(picks.current.saved);
-  };
 
   const none = !failed && runtimes !== null && !runtimes.some((r) => r.installed);
 

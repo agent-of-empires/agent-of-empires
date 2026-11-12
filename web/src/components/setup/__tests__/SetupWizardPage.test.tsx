@@ -344,6 +344,7 @@ function agentPicks() {
   const refresh = { hold: false, release: undefined as (() => void) | undefined };
   server.use(
     http.get("*/api/agents", () => HttpResponse.json(["claude", "codex", "gemini"].map(agent))),
+    http.get("*/api/settings", () => HttpResponse.json(committed.at(-1) ?? {})),
     http.patch("*/api/settings", async ({ request }) => {
       const body = (await request.json()) as { session: { default_tool: string } };
       if (body.session.default_tool === "gemini") return HttpResponse.json({ error: "invalid" }, { status: 400 });
@@ -475,3 +476,73 @@ it("an uncertain save that landed shows its value even after another field saves
     restore();
   }
 });
+
+it.each([
+  {
+    radio: "Default Agent",
+    step: "agents",
+    section: "session",
+    field: "default_tool",
+    picks: ["claude", "codex", "gemini"],
+    names: [/^claude/, /^codex/, /^gemini/],
+  },
+  {
+    radio: "Default view",
+    step: "agents",
+    section: "acp",
+    field: "structured_view",
+    picks: ["structured", "terminal", "off"],
+    names: [/^Structured view/, /^Terminal view/, /^Terminal only/],
+  },
+  {
+    radio: "Runtime",
+    step: "sandbox",
+    section: "sandbox",
+    field: "container_runtime",
+    picks: ["docker", "podman", "apple_container"],
+    names: [/^Docker/, /^Podman/, /^Apple Container/],
+  },
+])(
+  "$radio: a pick stored despite a 500 shows after the re-read and is what a rejected pick rolls back to",
+  async ({ step, section, field, picks, names }) => {
+    const [original, uncertain, rejected] = picks as [string, string, string];
+    const [originalName, uncertainName, rejectedName] = names as [RegExp, RegExp, RegExp];
+    let stored = original;
+    const reads = { count: 0 };
+    server.use(
+      http.get("*/api/agents", () => HttpResponse.json(["claude", "codex", "gemini"].map(agent))),
+      http.get("*/api/setup/runtimes", () =>
+        HttpResponse.json(
+          ["docker", "podman", "apple_container"].map((kind) => ({
+            kind,
+            installed: true,
+            running: true,
+            start_command: "",
+          })),
+        ),
+      ),
+      http.get("*/api/settings", () => {
+        reads.count++;
+        return HttpResponse.json({ [section]: { [field]: stored } });
+      }),
+      http.patch("*/api/settings", async ({ request }) => {
+        const value = ((await request.json()) as Record<string, Record<string, string>>)[section]![field]!;
+        if (value === rejected) return HttpResponse.json({ error: "invalid" }, { status: 400 });
+        stored = value;
+        return value === uncertain ? HttpResponse.json({ error: "boom" }, { status: 500 }) : new HttpResponse(null);
+      }),
+    );
+    renderPage(status(["agents"]), `/setup?step=${step}`);
+    const radio = (name: RegExp) => screen.getByRole("radio", { name }) as HTMLInputElement;
+    await waitFor(() => expect(radio(originalName).checked).toBe(true));
+
+    fireEvent.click(radio(uncertainName));
+    await waitFor(() => expect(reads.count).toBe(2));
+    await waitFor(() => expect(radio(uncertainName).checked).toBe(true));
+
+    fireEvent.click(radio(rejectedName));
+    await waitFor(() => expect(reads.count).toBe(3));
+    await waitFor(() => expect(radio(uncertainName).checked).toBe(true));
+    expect(radio(originalName).checked).toBe(false);
+  },
+);
