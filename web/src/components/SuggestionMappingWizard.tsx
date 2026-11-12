@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchSuggestionMappings, fetchSuggestionProjects, putSuggestionMapping } from "../lib/api";
 import { proposeMappings, type MappingProposal } from "../lib/mappingProposals";
 import { notifySuggestionsChanged } from "../lib/suggestionEvents";
 import type { SuggestionItem, SuggestionProject, SuggestionProvider } from "../lib/types";
 import { BRAND_BUTTON, CancelButton, Dialog } from "./Dialog";
-import { useConfirmKeys } from "./dialogHooks";
+import { useConfirmKeys, useDialogFocus } from "./dialogHooks";
 
 interface Props {
   items: SuggestionItem[];
@@ -75,6 +75,9 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
     if (!busy) onClose();
   };
   useConfirmKeys(dismiss, () => void save(), busy);
+  // The rows load after mount, so focus lands on the intro and returns to the opener on close.
+  const introRef = useRef<HTMLParagraphElement>(null);
+  useDialogFocus(introRef);
 
   const multi = providers.length > 1;
   const providerName = (id: string) => providers.find((p) => p.id === id)?.name ?? id;
@@ -143,7 +146,12 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
         </>
       }
     >
-      <p id="suggestion-mapping-wizard-intro" className="text-sm text-text-secondary">
+      <p
+        ref={introRef}
+        tabIndex={-1}
+        id="suggestion-mapping-wizard-intro"
+        className="text-sm text-text-secondary outline-none"
+      >
         Sources in the current suggestions without a Project. A Project whose git origin is the source is checked; one
         with the same name is proposed unchecked.
       </p>
