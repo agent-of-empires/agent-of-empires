@@ -517,8 +517,17 @@ impl HttpClient {
         let url = format!("{}/api/suggestions/prepare", self.endpoint.base_url);
         let body = serde_json::json!({ "provider_id": provider_id, "id": id });
         let res = self.execute(self.http.post(&url).json(&body)).await?;
-        let res = check_global_status(res)?;
-        Ok(crate::daemon::decode_json(res).await?)
+        if res.status().is_success() {
+            return Ok(crate::daemon::decode_json(res).await?);
+        }
+        // A refusal explains itself (for example an over-long prompt); keep that text.
+        Err(match status_error(&res, None, false) {
+            HttpError::Server { status, .. } => HttpError::Server {
+                status,
+                body: refusal_message(res).await,
+            },
+            other => other,
+        })
     }
 
     /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
@@ -1208,6 +1217,18 @@ async fn brief_server_error(error: HttpError, res: reqwest::Response) -> HttpErr
         None => body,
     };
     HttpError::Server { status, body }
+}
+
+/// The `message` of a daemon error body, bounded; empty when there is none.
+async fn refusal_message(res: reqwest::Response) -> String {
+    const MAX_BODY_BYTES: usize = 4096;
+    const MAX_MESSAGE_CHARS: usize = 200;
+    crate::daemon::decode_json_bounded::<serde_json::Value>(res, MAX_BODY_BYTES)
+        .await
+        .ok()
+        .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
+        .map(|message| message.chars().take(MAX_MESSAGE_CHARS).collect())
+        .unwrap_or_default()
 }
 
 fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
@@ -2500,5 +2521,33 @@ mod tests {
             body,
             &serde_json::json!({"config_id": "reasoning_effort", "value": "high"})
         );
+    }
+
+    #[tokio::test]
+    async fn a_prepare_refusal_keeps_the_daemons_explanation() {
+        use axum::{http::StatusCode as Code, routing::post, Json, Router};
+        let app = Router::new().route(
+            "/api/suggestions/prepare",
+            post(|| async {
+                (
+                    Code::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "validation_failed",
+                        "message": "The expanded prompt exceeds 10 bytes"
+                    })),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(endpoint(&base, None)).unwrap();
+        let error = client.prepare_suggestion("gh", "1").await.unwrap_err();
+        assert!(
+            matches!(&error, HttpError::Server { status, body }
+                if *status == StatusCode::BAD_REQUEST && body == "The expanded prompt exceeds 10 bytes"),
+            "{error:?}"
+        );
+        server.abort();
     }
 }
