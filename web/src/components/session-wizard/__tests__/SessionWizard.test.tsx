@@ -1578,6 +1578,107 @@ describe("SessionWizard Sandbox image status", () => {
   });
 });
 
+describe("SessionWizard Pull latest image first", () => {
+  const IMAGE = "ghcr.io/x/sb:1";
+  const UPDATE = {
+    image: IMAGE,
+    state: "available",
+    remote_digest: "sha256:b",
+    dismissed: false,
+    pull_blocked: null,
+    pull_command: `docker pull ${IMAGE}`,
+  };
+  afterEach(() => {
+    vi.mocked(fetchDockerStatus)
+      .mockReset()
+      .mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchSandboxImageStatus).mockReset().mockResolvedValue(null);
+  });
+  const open = (status: object) => {
+    vi.mocked(fetchDockerStatus).mockResolvedValue({ available: true, runtime: "docker", runtime_name: "Docker" });
+    vi.mocked(fetchVolumeIgnoresPreview).mockResolvedValue(null);
+    vi.mocked(fetchSandboxImageStatus).mockResolvedValue(status as never);
+    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true, sandboxImage: IMAGE });
+  };
+  const box = () => screen.findByRole("checkbox", { name: "Pull latest image first" }) as Promise<HTMLInputElement>;
+
+  it.each([
+    ["an update, checked by default", UPDATE, true],
+    ["a dismissed update, unchecked", { ...UPDATE, dismissed: true }, false],
+  ])("offers %s, and Launch sends what it says", async (_name, status, checked) => {
+    open(status);
+    expect((await box()).checked).toBe(checked);
+    expect(screen.getByTestId("wizard-pull-latest").textContent).toContain(
+      "Your image is out of date; Structured view Sessions may stop with an adapter error without it.",
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    expect(payload(0).pull_latest_image).toBe(checked || undefined);
+  });
+
+  it("unchecking it launches with the current image", async () => {
+    open(UPDATE);
+    fireEvent.click(await box());
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    expect(payload(0).pull_latest_image).toBeUndefined();
+  });
+
+  it("is not offered in Terminal view", async () => {
+    open(UPDATE);
+    await box();
+    fireEvent.click(screen.getByRole("radio", { name: "Terminal view" }));
+    expect(screen.queryByRole("checkbox", { name: "Pull latest image first" })).toBeNull();
+    expect(screen.getByTestId("wizard-sandbox-row").textContent).toContain("Update available");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    expect(payload(0).pull_latest_image).toBeUndefined();
+  });
+
+  it("when the Daemon won't pull, it is disabled and shows the command to run instead", async () => {
+    open({ ...UPDATE, pull_blocked: "disabled" });
+    const input = await box();
+    expect(input.disabled).toBe(true);
+    expect(input.checked).toBe(false);
+    const hint = screen.getByTestId("wizard-pull-latest");
+    expect(hint.textContent).toContain(`docker pull ${IMAGE}`);
+    expect(hint.textContent).toContain("Run this on the Daemon's machine, then reopen this dialog.");
+    expect(screen.getByRole("button", { name: `Copy docker pull ${IMAGE}` })).toBeTruthy();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
+    expect(payload(0).pull_latest_image).toBeUndefined();
+  });
+
+  it("a failed pull offers Launch with current image, which resends without the pull under a new key", async () => {
+    createSession.mockResolvedValueOnce({
+      ok: false,
+      error: "Couldn't pull the latest Sandbox image.",
+      failure: {
+        code: "sandbox_image_update_failed",
+        stage: "pulling_image",
+        message: `Couldn't pull the latest Sandbox image ${IMAGE}. manifest unknown`,
+        reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
+      },
+    });
+    open(UPDATE);
+    await box();
+    await launch();
+    const shown = await screen.findByTestId("create-failure");
+    expect(shown.textContent).toContain("Couldn't pull the latest image");
+    expect(shown.textContent).toContain("The session wasn't created.");
+    expect(shown.textContent).toContain("manifest unknown");
+    expect(payload(0).pull_latest_image).toBe(true);
+
+    fireEvent.click(screen.getByTestId("create-failure-launch_with_current_image"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(1).pull_latest_image).toBeUndefined();
+    expect(payload(1).sandbox).toBe(true);
+    expect(payload(1).idempotency_key).toBeTruthy();
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+    expect((await box()).checked).toBe(false);
+  });
+});
+
 describe("SessionWizard create failures", () => {
   const failure = (code: string, stage: string | null, message: string) => ({
     ok: false,

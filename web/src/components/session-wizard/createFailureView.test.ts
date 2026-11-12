@@ -35,6 +35,19 @@ describe("failureView", () => {
       { primary: "change_image", secondary: "launch_without_sandbox", row: "sandbox", cue: "image pull failed" },
     ],
     [
+      "latest image pull",
+      failure("sandbox_image_update_failed", "pulling_image", "Couldn't pull the latest Sandbox image sb:1. manifest unknown"),
+      {},
+      {
+        title: "Couldn't pull the latest image",
+        step: "The session wasn't created.",
+        detail: "Couldn't pull the latest Sandbox image sb:1. manifest unknown",
+        primary: "launch_with_current_image",
+        secondary: null,
+        row: "sandbox",
+      },
+    ],
+    [
       "hook",
       failure("hook_failed", "running_hooks"),
       {},

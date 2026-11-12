@@ -3,11 +3,11 @@ import type { WizardData } from "./wizardReducer";
 
 /** The create payload for the wizard state. Scratch omits every worktree field
  *  (the server rejects scratch plus a worktree branch); the server re-validates
- *  structured view capability. */
+ *  structured view capability. `pullLatest`: the "Pull latest image first" box is offered and checked. */
 export function buildCreateRequest(
   d: WizardData,
   acpCapable: boolean,
-  { skipOnCreate = false }: { skipOnCreate?: boolean } = {},
+  { skipOnCreate = false, pullLatest = false }: { skipOnCreate?: boolean; pullLatest?: boolean } = {},
 ): CreateSessionRequest {
   const worktree = !d.scratch && d.useWorktree;
   const newBranch = worktree && !d.attachExisting;
@@ -25,6 +25,7 @@ export function buildCreateRequest(
     base_branch: newBranch && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,
     sandbox: d.sandboxEnabled,
     sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
+    pull_latest_image: (d.sandboxEnabled && structured && pullLatest) || undefined,
     extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
     hook_env: d.sandboxEnabled && d.hookEnv.some(Boolean) ? d.hookEnv.filter(Boolean) : undefined,
     extra_repo_paths: !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
