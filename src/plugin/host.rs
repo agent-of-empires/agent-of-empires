@@ -174,6 +174,16 @@ impl PluginHost {
         self.api.with_suggestions_db(f)
     }
 
+    /// `with_suggestions_db` off the async executor: the store lock can wait
+    /// behind a busy database, which must not stall other tasks.
+    async fn with_suggestions_db_blocking<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection, &str) -> T + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let api = self.api.clone();
+        Ok(tokio::task::spawn_blocking(move || api.with_suggestions_db(f)).await?)
+    }
+
     /// Ask the worker of `provider_id`, or of every suggestions provider, to
     /// publish again, passing the user's `refresh_minutes` hint. Returns how
     /// many workers were notified.
@@ -191,7 +201,9 @@ impl PluginHost {
 
     async fn refresh_providers(&self, provider_id: Option<&str>, ids: Vec<String>) -> usize {
         let minutes = self
-            .with_suggestions_db(crate::plugin::suggestions::refresh_minutes)
+            .with_suggestions_db_blocking(crate::plugin::suggestions::refresh_minutes)
+            .await
+            .and_then(|minutes| Ok(minutes?))
             .unwrap_or_else(|error| {
                 tracing::warn!(target: "plugin.host", error = %error, "suggestions: refresh_minutes unreadable");
                 crate::plugin::suggestions::DEFAULT_REFRESH_MINUTES
@@ -209,9 +221,12 @@ impl PluginHost {
     /// worker. `None` when the provider has no fix; otherwise whether a live
     /// worker was notified.
     pub async fn run_suggestion_fix(&self, provider_id: &str) -> anyhow::Result<Option<bool>> {
-        let method = self.with_suggestions_db(|conn, profile| {
-            crate::plugin::suggestions::fix_method(conn, profile, provider_id)
-        })?;
+        let provider = provider_id.to_string();
+        let method = self
+            .with_suggestions_db_blocking(move |conn, profile| {
+                crate::plugin::suggestions::fix_method(conn, profile, &provider)
+            })
+            .await??;
         let Some(method) = method else {
             return Ok(None);
         };
@@ -246,16 +261,19 @@ impl PluginHost {
         ids: Vec<String>,
     ) -> usize {
         // An unreadable switch store notifies nobody rather than a provider the user turned off.
-        let disabled =
-            match self.with_suggestions_db(crate::plugin::suggestions::disabled_providers) {
-                Ok(disabled) => disabled,
-                Err(error) => {
-                    tracing::warn!(
-                        "suggestions: provider switches unreadable, skipping {method}: {error}"
-                    );
-                    return 0;
-                }
-            };
+        let disabled = match self
+            .with_suggestions_db_blocking(crate::plugin::suggestions::disabled_providers)
+            .await
+            .and_then(|disabled| Ok(disabled?))
+        {
+            Ok(disabled) => disabled,
+            Err(error) => {
+                tracing::warn!(
+                    "suggestions: provider switches unreadable, skipping {method}: {error}"
+                );
+                return 0;
+            }
+        };
         let mut sent = 0;
         for id in ids {
             if provider_id.is_some_and(|only| only != id) || disabled.contains(&id) {
@@ -1368,6 +1386,64 @@ mod tests {
             }),
             "a deleted session carries no summary"
         );
+    }
+
+    /// Counts how often the runtime keeps running timers while `f` is pending.
+    async fn runtime_ticks_during<F: std::future::Future>(f: F) -> usize {
+        let mut ticks = 0;
+        let ticker = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                ticks += 1;
+            }
+        };
+        tokio::select! {
+            _ = f => {}
+            _ = ticker => {}
+        }
+        ticks
+    }
+
+    #[tokio::test]
+    async fn suggestion_store_reads_do_not_block_the_async_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host = PluginHost::new(
+            tmp.path(),
+            "default",
+            None,
+            Arc::new(crate::server::runtime::RuntimeWork::default()),
+        )
+        .unwrap();
+        let hold_lock = || {
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let holder = host.clone();
+            let thread = std::thread::spawn(move || {
+                holder.with_suggestions_db(|_, _| {
+                    locked_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(300));
+                });
+            });
+            locked_rx.recv().unwrap();
+            thread
+        };
+
+        let thread = hold_lock();
+        let ticks = runtime_ticks_during(host.refresh_suggestions(None)).await;
+        assert!(ticks >= 5, "refresh stalled the executor: {ticks} ticks");
+        thread.join().unwrap();
+
+        let thread = hold_lock();
+        let ticks = runtime_ticks_during(host.run_suggestion_checks()).await;
+        assert!(ticks >= 5, "checks stalled the executor: {ticks} ticks");
+        thread.join().unwrap();
+
+        let thread = hold_lock();
+        let ticks = runtime_ticks_during(async {
+            host.run_suggestion_fix("acme.github").await.unwrap();
+        })
+        .await;
+        assert!(ticks >= 5, "fix stalled the executor: {ticks} ticks");
+        thread.join().unwrap();
     }
 
     #[tokio::test]
