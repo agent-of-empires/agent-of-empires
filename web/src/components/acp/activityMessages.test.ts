@@ -331,7 +331,8 @@ describe("subagents", () => {
   // outside the rows, must not become a row of whichever turn is streaming.
   it("drops a child whose card is outside the rows, with its result", () => {
     const done = row("done-ch-1", "tool_complete", "out", { toolCallId: "ch-1" });
-    const msgs = activityToThreadMessages([user(), child("ch-1", "elsewhere"), done, message("Next.")], true);
+    const cut = row("done-ch-0", "tool_complete", "out", { toolCallId: "ch-0" });
+    const msgs = activityToThreadMessages([user(), cut, child("ch-1", "elsewhere"), done, message("Next.")], true);
     expect(msgs.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual([
       [{ type: "text", text: "Next." }],
     ]);
