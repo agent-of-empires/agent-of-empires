@@ -82,6 +82,46 @@ describe("fromInline", () => {
   });
 });
 
+describe("fromInline activity rows", () => {
+  const launch: ToolCall = {
+    id: "task",
+    name: "Task",
+    kind: "other",
+    args_preview: "{}",
+    started_at: "2026-01-01T00:00:00Z",
+  };
+  const child = (id: string, name: string, args: Record<string, string>, kind = "other"): ToolCall => ({
+    id,
+    name,
+    kind,
+    args_preview: JSON.stringify(args),
+    started_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("names a call by its wire name, shows the command once, and labels MCP calls", () => {
+    const cmd = "cargo test --all --features web";
+    const rows = fromInline(launch, undefined, [
+      { tool: child("a", cmd, { command: cmd, _aoe_raw_tool_name: "Bash" }, "execute") },
+      { tool: child("b", cmd, { command: cmd }, "execute") },
+      { tool: child("c", "Navigate", { url: "https://x", _aoe_raw_tool_name: "mcp__playwright__browser_navigate" }) },
+    ]).tools;
+    expect(rows.map((t) => [t.name, t.target, t.kind])).toEqual([
+      ["Bash", cmd, "execute"],
+      [cmd, null, "execute"],
+      ["Playwright Browser navigate", "https://x", "mcp"],
+    ]);
+  });
+
+  it("ends a foreground card the turn stopped, at the stop time, with its open calls stopped", () => {
+    const stopped: ActivityRow = { id: "s", kind: "tool_stopped", text: "", at: "2026-01-01T00:02:00Z" };
+    const record = fromInline(launch, stopped, [{ tool: child("a", "Read", {}) }]);
+    expect(record.status).toBe("stopped");
+    expect(record.endedAt).toBe("2026-01-01T00:02:00Z");
+    expect(record.report).toBe("");
+    expect(record.tools[0]!.status).toBe("stopped");
+  });
+});
+
 describe("taskPrompt", () => {
   it("reads whole args and recovers the prompt from a preview cut at the cap", () => {
     expect(taskPrompt('{"prompt":"do it"}')).toBe("do it");

@@ -10,12 +10,13 @@ import { ActivityFilters, ActivityRows } from "./ActivitySection";
 import type { ActivityFilter } from "./activityFold";
 import { PreviewMarkdown, SteppedMarkdown } from "./LongMarkdown";
 import type { SubagentRecord, SubagentStatus } from "./model";
-import { StopSession } from "./StopSession";
+import { StopSession, StopSubagent } from "./StopSession";
 
 const STATUS: Record<SubagentStatus, { glyph: string; word: string; dot: string; tone: string }> = {
   running: { glyph: "●", word: "running", dot: "bg-status-waiting animate-pulse", tone: "text-text-dim" },
   waiting: { glyph: "●", word: "Waiting on you", dot: "bg-status-waiting animate-pulse", tone: "text-text-dim" },
   done: { glyph: "✓", word: "done", dot: "bg-status-running", tone: "text-text-dim" },
+  stopped: { glyph: "■", word: "stopped", dot: "bg-text-dim/60", tone: "text-text-dim" },
   failed: { glyph: "✕", word: "failed", dot: "bg-status-error", tone: "text-status-error" },
   stalled: { glyph: "!", word: "stalled", dot: "bg-text-dim/60", tone: "text-text-dim" },
   detached: { glyph: "○", word: "detached", dot: "bg-text-dim/60", tone: "text-text-dim" },
@@ -25,7 +26,7 @@ const STATUS: Record<SubagentStatus, { glyph: string; word: string; dot: string;
 const SECTION_HEAD = "sticky top-0 z-10 flex items-center gap-2 px-3 py-1 text-[10px] uppercase tracking-wider";
 
 function toCardStatus(s: SubagentStatus): Status {
-  return s === "running" || s === "waiting" ? "running" : s === "failed" ? "err" : "ok";
+  return s === "running" || s === "waiting" ? "running" : s === "failed" ? "err" : s === "stopped" ? "stopped" : "ok";
 }
 
 function useElapsed(record: SubagentRecord): string | null {
@@ -36,7 +37,7 @@ function useElapsed(record: SubagentRecord): string | null {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, [live]);
-  if (!record.startedAt) return null;
+  if (!record.startedAt || (!live && !record.endedAt)) return null;
   const start = Date.parse(record.startedAt);
   const end = record.endedAt ? Date.parse(record.endedAt) : now;
   if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
@@ -66,13 +67,15 @@ interface Props {
   alwaysOpen?: boolean;
   /** Header actions beside the toggle, such as "Open in side pane". */
   actions?: ReactNode;
+  /** The child session a Stop may cancel on its own. */
+  stopChildId?: string;
 }
 
-export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
+export function SubagentDetail({ record, alwaysOpen = false, actions, stopChildId }: Props) {
   const [toggled, setOpen] = useToolCardExpansion(toCardStatus(record.status));
   const open = alwaysOpen || toggled;
   const uid = useId();
-  const { sessionId, agents, readOnly } = useBackgroundAgentsContextValue();
+  const { sessionId, agents, readOnly, cancelSubagent } = useBackgroundAgentsContextValue();
   const elapsed = useElapsed(record);
   const st = STATUS[record.status];
   const errors = record.tools.filter((t) => t.status === "err").length;
@@ -104,12 +107,6 @@ export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
               background
             </span>
           )}
-          {record.toolCount > 0 && (
-            <span className="hidden shrink-0 text-[11px] tabular-nums text-text-dim min-[480px]:inline">
-              {record.toolCount} {record.toolCount === 1 ? "tool" : "tools"}
-            </span>
-          )}
-          {record.badge && <span className="shrink-0 text-[11px] text-text-dim">{record.badge}</span>}
           {elapsed && <span className="shrink-0 text-[11px] tabular-nums text-text-dim">{elapsed}</span>}
           <span className={`shrink-0 text-[11px] ${st.tone}`}>
             <span aria-hidden>{st.glyph} </span>
@@ -123,15 +120,22 @@ export function SubagentDetail({ record, alwaysOpen = false, actions }: Props) {
         </button>
         <div className="flex items-center gap-2 pr-2">
           {actions}
-          {record.background && record.status === "running" && sessionId && !readOnly && (
-            <StopSession sessionId={sessionId} running={running} />
+          {stopChildId && cancelSubagent ? (
+            <StopSubagent childId={stopChildId} cancel={cancelSubagent} />
+          ) : (
+            record.background &&
+            record.status === "running" &&
+            sessionId &&
+            !readOnly && <StopSession sessionId={sessionId} running={running} />
           )}
         </div>
       </div>
       <span className="sr-only" role="status" aria-live="polite">
         {record.description} {st.word}
       </span>
-      {summary && !open && <p className="truncate px-3 pb-1.5 pl-9 text-[11px] text-text-dim">{summary}</p>}
+      {summary && (!open || alwaysOpen) && (
+        <p className="truncate px-3 pb-1.5 pl-9 text-[11px] text-text-dim">{summary}</p>
+      )}
       {open && (
         <div id={`${uid}-body`} ref={bodyRef} className="border-t border-surface-800">
           {record.warning && <p className="px-3 py-1 text-[11px] text-status-error">{record.warning}</p>}
@@ -189,7 +193,7 @@ function ActivitySection({
   const summary = [
     `${toolCount} ${toolCount === 1 ? "call" : "calls"}`,
     tools.length < toolCount ? `first ${tools.length} shown` : null,
-    errors ? `${errors} errors` : null,
+    errors ? `${errors} ${errors === 1 ? "error" : "errors"}` : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -238,7 +242,7 @@ function ActivitySection({
         )}
       </div>
       {open && (
-        <div ref={followNewest} className="pb-1">
+        <div ref={followNewest} className="overflow-hidden pb-1">
           <ActivityRows tools={tools} filter={filter} following={running && following} running={running} />
         </div>
       )}
@@ -258,6 +262,8 @@ function OutputSection({ record }: { record: SubagentRecord }) {
         )}
       </>
     );
+  } else if (status === "stopped") {
+    body = <p className="text-text-dim">Stopped before it reported.</p>;
   } else if (status === "running") {
     body = latestNote ? (
       <>

@@ -718,6 +718,7 @@ export type BackgroundAgentStatus =
   | "running"
   | "stalled"
   | "completed"
+  | "stopped"
   | "detached"
   | "error"
   | "requires_action"
@@ -734,6 +735,8 @@ export interface SubagentRecord {
   description?: string | null;
   state: SubagentState;
   stop_reason?: string | null;
+  /** The message an `error` stop carried. */
+  error?: string | null;
   cancel_capable: boolean;
   model?: string | null;
   /** Launched in the background: its card stays open until it goes idle. */
@@ -1461,7 +1464,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       // a terminal Stalled record (the tailer's own abort timeout) carries
       // endedAt too, and the status check alone would let a late Progress
       // reopen it, contradicting hasActiveBackgroundAgent's endedAt-keyed read.
-      if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      if (a.endedAt || ["completed", "stopped", "detached", "error"].includes(a.status)) return a;
       return {
         ...a,
         status: e.status,
@@ -1550,7 +1553,7 @@ function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): 
 /** The agent status a child's session state stands for. */
 export function subagentStatus(child: SubagentRecord): BackgroundAgentStatus {
   if (child.state !== "idle") return child.state;
-  return child.stop_reason === "error" ? "error" : "completed";
+  return child.stop_reason === "error" ? "error" : child.stop_reason === "cancelled" ? "stopped" : "completed";
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */

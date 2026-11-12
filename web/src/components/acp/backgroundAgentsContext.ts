@@ -75,10 +75,6 @@ export function useSubagentFor(toolCallId: string | undefined): SubagentRecord |
   return findSubagent(useContext(BackgroundAgentsContext).subagents, toolCallId);
 }
 
-export function useCancelSubagent(): BackgroundAgentsContextValue["cancelSubagent"] {
-  return useContext(BackgroundAgentsContext).cancelSubagent;
-}
-
 /** Every agent a `Workflow` call launched, in launch order. */
 export function useBackgroundAgentsFor(toolCallId: string): BackgroundAgent[] {
   const { agents } = useContext(BackgroundAgentsContext);

@@ -366,6 +366,7 @@ function StatusDot({ status }: { status: BackgroundAgentStatus }) {
 
 const STATUS_LABELS: Record<Exclude<BackgroundAgentStatus, "running">, string> = {
   completed: "done",
+  stopped: "stopped",
   stalled: "stalled",
   detached: "detached",
   error: "error",
