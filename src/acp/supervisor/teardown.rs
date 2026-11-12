@@ -3920,6 +3920,7 @@ mod tests {
                             tool_call_id: None,
                             description: "activity".into(),
                             workflow: None,
+                            started_at: None,
                         },
                     )
                 })
