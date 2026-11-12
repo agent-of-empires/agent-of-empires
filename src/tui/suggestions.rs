@@ -1072,18 +1072,18 @@ impl SuggestionsFeed {
         self.profile = profile;
         if switched {
             // A snapshot that names no profile cannot be told apart, so it stays.
-            if self
+            let foreign = self
                 .snapshot
                 .as_ref()
-                .is_some_and(|s| s.profile.is_some() && s.profile != self.profile)
-            {
+                .is_some_and(|s| s.profile.is_some() && s.profile != self.profile);
+            if foreign {
                 self.snapshot = None;
             }
             self.foreign_profile = None;
             self.loaded_at = None;
             self.load_attempt_at = None;
-            // Adopting the first profile is not a switch: a prepare in flight stays valid.
-            if left_a_profile {
+            // Adopting the first profile keeps a prepare in flight unless its snapshot was foreign.
+            if left_a_profile || foreign {
                 self.prepare_key = None;
             }
         }
@@ -2218,6 +2218,18 @@ mod tests {
         rig.store.profile = Some("default".into());
         rig.store.set_profile(Some("work".into()));
         assert!(rig.store.snapshot.is_none());
+        assert!(rig.store.prepare_key.is_none());
+    }
+
+    #[test]
+    fn a_foreign_labelled_snapshot_cancels_a_prepare_on_first_profile_adoption() {
+        let mut rig = view_with(
+            vec![item("a", None, false)],
+            Worker::seeded_for_test("t", Res::Snapshot(Err("x".into()))),
+        );
+        rig.store.snapshot.as_mut().unwrap().profile = Some("default".into());
+        rig.store.prepare_key = Some(("t".into(), "a".into()));
+        rig.store.set_profile(Some("work".into()));
         assert!(rig.store.prepare_key.is_none());
     }
 }
