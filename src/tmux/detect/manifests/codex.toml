@@ -47,7 +47,7 @@ contains = [
   "1. trust and continue",
 ]
 not = [
-  { region = "whole_recent", line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*(?:[^\s1-9]|[1-9][^.\s])'] },
+  { region = "whole_recent", line_regex = ['(?i)^\s*[\x{276F}\x{203A}]\s*(?:[^\s1-9]|[1-9][^.\s]|$)'] },
 ]
 
 # Codex's Plan-mode radio prompt: a question, its cursored choice rows and the

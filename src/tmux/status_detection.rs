@@ -2208,6 +2208,8 @@ Tips for getting started:
 
   gpt-5.1-codex default \u{b7} ~/proj
 ";
+        let codex_quoting_bare =
+            codex_quoting.replace("\u{203a} Ask Codex to do anything", "\u{203a}");
         let gemini_quoting = "\
 \u{2726} The first-run dialog asks: Do you trust the files in this folder? It
   offers 1. Trust folder (proj), 2. Trust parent folder, 3. Don't trust.
@@ -2235,6 +2237,12 @@ Tips for getting started:
                 "codex",
                 codex_quoting,
                 "completed_turn_prompt",
+                Status::Idle,
+            ),
+            (
+                "codex",
+                codex_quoting_bare.as_str(),
+                "no_rule",
                 Status::Idle,
             ),
             (
