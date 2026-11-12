@@ -245,6 +245,10 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     worker_waits: tokio::sync::broadcast::Sender<String>,
+    #[cfg(test)]
+    installation_recovery: std::sync::Mutex<
+        Option<Box<dyn FnOnce(&Lease, &Arc<AcpClient>, tokio::time::Instant) + Send>>,
+    >,
     /// Build-stale sessions draining a turn before the reconciler respawns them.
     respawn_pending: SharedSet,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
@@ -662,6 +666,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             worker_notify: Arc::default(),
             #[cfg(test)]
             worker_waits: tokio::sync::broadcast::channel(64).0,
+            #[cfg(test)]
+            installation_recovery: Default::default(),
             respawn_pending: Arc::default(),
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),

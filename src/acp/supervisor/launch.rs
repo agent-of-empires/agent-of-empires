@@ -1440,6 +1440,16 @@ impl<S: BroadcastSink> Supervisor<S> {
                     // Read fences need the writer, whose earlier SDK items may need workers.
                     // Keep installation custody, then recheck the exact lease and registry.
                     drop(workers);
+                    #[cfg(test)]
+                    {
+                        let observe = lock_recover(&self.installation_recovery).take();
+                        if let Some(observe) = observe {
+                            let Some(Pending::Installation(installation)) = reservation.deferred.as_ref() else {
+                                unreachable!("original installation remains owned");
+                            };
+                            observe(&lease, &installation.client, deadline);
+                        }
+                    }
                     self.cancel_orphaned_requests(session_id);
                     let Some(Pending::Installation(installation)) = reservation.deferred.as_ref() else {
                         unreachable!("installation stays owned through recovery");
@@ -2832,6 +2842,130 @@ pub(super) mod tests {
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use crate::daemon::AcpWorkerState;
     use std::time::Duration;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn deferred_installation_reuses_the_exact_running_original_after_its_deadline() {
+        use axum::response::IntoResponse;
+        for mode in ["resume", "stop", "replacement"] {
+            super::super::test_support::managed::with_managed(|scope| Box::pin(async move {
+                let directory = scope.tempdir();
+                let (config, peer) = scope.native_peer(directory.path().into(), "gemini", "gemini", |request| {
+                    let result = match request["method"].as_str()? {
+                        "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true}}),
+                        "session/new" => serde_json::json!({"sessionId":"deadline-original-native"}),
+                        _ => return None,
+                    };
+                    Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                });
+                let supervisor = scope.state.acp_supervisor.clone();
+                let store = scope.state.acp_event_store.clone();
+                let sink = supervisor.sink.clone();
+                let (observed, recovery) = tokio::sync::oneshot::channel();
+                *lock_recover(&supervisor.installation_recovery) = Some(Box::new(move |lease, client, deadline| {
+                    let (entered, ready) = std::sync::mpsc::sync_channel(1);
+                    let (release, released) = tokio::sync::oneshot::channel();
+                    assert!(sink.publish_from_worker(super::super::WorkerPublication::new(async move {
+                        entered.send(()).unwrap();
+                        tokio::time::timeout(Duration::from_secs(20), released).await
+                            .expect("the controlled real writer is released").unwrap();
+                    })).is_ok());
+                    ready.recv_timeout(Duration::from_secs(10)).expect("the actual writer is held");
+                    assert!(observed.send((lease.clone(), client.clone(), deadline, release)).is_ok());
+                }));
+                let (id, mut frames) = scope.create_observed(config, "recovery-crosses-deadline").await;
+                let (lease, original, deadline, release) =
+                    tokio::time::timeout(Duration::from_secs(30), recovery).await.unwrap().unwrap();
+                let owner = lease.spawned_runner().expect("actual launched original");
+                assert_eq!(original.connected_runner(), Some(owner));
+                assert_eq!(lease.session_id(), id);
+                assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
+                let birth = crate::process::process_birth_identity(owner.pid).unwrap()
+                    .expect("the actual original is live");
+                assert_eq!(Some(birth.fingerprint()), owner.birth_fingerprint);
+                tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+                assert!(tokio::time::Instant::now() > deadline);
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !lease.retirement().has_deferred() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.expect("actual deadline failure retains its original installation");
+                assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
+                assert_eq!(crate::process::process_birth_identity(owner.pid).unwrap().unwrap().fingerprint(), birth.fingerprint());
+                let record = worker_registry::load_strict(&id).unwrap().unwrap();
+                assert!(owner.owns_record(&record));
+                if mode != "resume" {
+                    let stopped = crate::server::api::sessions::stop_session(
+                        axum::extract::State(scope.state.clone()),
+                        axum::extract::Path(id.clone()),
+                    ).await.into_response();
+                    assert_eq!(stopped.status(), axum::http::StatusCode::OK);
+                    assert!(!supervisor.resume_deferred(&id).await.unwrap());
+                    assert!(supervisor.running_lease(&id).is_none());
+                    assert!(!supervisor.process_control.is_alive(owner));
+                    if mode == "replacement" {
+                        let (config, replacement_peer) = scope.native_peer(directory.path().into(), "gemini", "gemini", |request| {
+                            let result = match request["method"].as_str()? {
+                                "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{"loadSession":true}}),
+                                "session/load" => {
+                                    assert_eq!(request["params"]["sessionId"], "deadline-original-native");
+                                    serde_json::json!({})
+                                }
+                                "session/new" => panic!("the retained replacement must Load the original"),
+                                _ => return None,
+                            };
+                            Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                        });
+                        let replacement = scope.resume_stopped(&id, config).await;
+                        replacement.ready().await;
+                        let replacement_client = replacement.actual();
+                        let replacement_owner = replacement_client.connected_runner().unwrap();
+                        assert_ne!(replacement_owner, owner);
+                        let replacement_lease = supervisor.running_lease(&id).unwrap();
+                        assert_ne!(replacement_lease, lease);
+                        let prefix = store.highest_seq(&id);
+                        let bytes = std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap();
+                        assert!(!supervisor.resume_deferred(&id).await.unwrap());
+                        supervisor.test_assert_installed_client(&id, &replacement_client).await;
+                        assert_eq!(supervisor.running_lease(&id), Some(replacement_lease));
+                        assert!(supervisor.process_control.is_alive(replacement_owner));
+                        assert_eq!(store.highest_seq(&id), prefix);
+                        assert_eq!(std::fs::read(worker_registry::record_path(&id).unwrap()).unwrap(), bytes);
+                        assert_eq!(replacement_peer.requests().iter().filter(|method| method.as_str() == "session/load").count(), 1);
+                    }
+                    return;
+                }
+                let resumed = tokio::time::timeout(Duration::from_secs(10), supervisor.resume_deferred(&id))
+                    .await.expect("bounded retry of retained installation");
+                assert!(matches!(resumed, Ok(true)), "the exact Running original must resume, not retire: {resumed:?}");
+                supervisor.test_assert_installed_client(&id, &original).await;
+                tokio::time::timeout(Duration::from_secs(10), supervisor.wait_until_ready(&id)).await.unwrap().unwrap();
+                assert_eq!(supervisor.running_lease(&id), Some(lease.clone()));
+                assert_eq!(original.connected_runner(), Some(owner));
+                assert_eq!(crate::process::process_birth_identity(owner.pid).unwrap().unwrap().fingerprint(), birth.fingerprint());
+                assert!(owner.owns_record(&worker_registry::load_strict(&id).unwrap().unwrap()));
+                let flush = supervisor.sink.clone();
+                tokio::task::spawn_blocking(move || flush.flush()).await.unwrap();
+                let rows = store.replay_from(&id, 0).unwrap();
+                let assigned = |event: &Event| matches!(event, Event::AcpSessionAssigned { acp_session_id, .. } if acp_session_id.as_str() == "deadline-original-native");
+                assert_eq!(rows.iter().filter(|row| assigned(&row.event)).count(), 1, "the original SDK assignment must commit exactly once");
+                let mut actual = Vec::new();
+                while let Ok(frame) = frames.try_recv() {
+                    if frame.session_id == id { actual.push(frame); }
+                }
+                assert_eq!(actual.iter().filter(|frame| assigned(&frame.event)).count(), 1, "the original SDK assignment must broadcast exactly once");
+                assert!(actual.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+                assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "session/new").count(), 1);
+                assert_eq!(peer.requests().iter().filter(|method| method.as_str() == "initialize").count(), 1);
+                assert!(!lease.retirement().has_deferred());
+                let stopped = crate::server::api::sessions::stop_session(
+                    axum::extract::State(scope.state.clone()), axum::extract::Path(id.clone()),
+                ).await.into_response();
+                assert_eq!(stopped.status(), axum::http::StatusCode::OK);
+            })).await;
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
