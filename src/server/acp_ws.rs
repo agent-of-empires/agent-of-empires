@@ -1887,6 +1887,7 @@ mod tests {
         state.acp_supervisor.test_observe_native_ready("s-1").await;
         let approval = crate::acp::permissions::build_approval(
             crate::acp::state::ToolCall {
+                prompt: None,
                 id: "pending".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
@@ -2049,6 +2050,7 @@ mod tests {
                 Some(commands)
             };
             let tool = ToolCall {
+                prompt: None,
                 id: "active-tool".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
