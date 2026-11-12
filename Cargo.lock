@@ -116,6 +116,7 @@ dependencies = [
  "glob",
  "granit-parser",
  "hkdf",
+ "hmac",
  "hyper",
  "hyper-util",
  "indexmap 2.14.2",
