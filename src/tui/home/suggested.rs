@@ -94,6 +94,7 @@ impl HomeView {
                 .and_then(|e| e.started_session)
             {
                 Some(id) => self.jump_to_session_id(&id),
+                None if self.mutations_blocked() => {}
                 None => self.suggestions_feed.prepare(key),
             }
             return true;
@@ -108,19 +109,40 @@ impl HomeView {
         false
     }
 
-    /// `z` on a suggestion row dismisses it. False when the cursor is elsewhere.
+    /// Flashes why the daemon refuses mutations; true when it does.
+    fn mutations_blocked(&mut self) -> bool {
+        if self.session_feed.mutations_available() {
+            return false;
+        }
+        self.flash_status("The daemon is read-only or unavailable");
+        true
+    }
+
+    /// `z` on a suggestion row dismisses it, or restores one still in its undo
+    /// window. False when the cursor is elsewhere.
     pub(super) fn dismiss_suggestion_row(&mut self) -> bool {
         let Some(key) = self.cursor_suggestion() else {
             return false;
         };
-        if self.session_feed.mutations_available() {
-            self.suggestions_feed.dismiss(&key, true);
-        } else {
-            self.flash_status("The daemon is read-only or unavailable");
+        if !self.mutations_blocked() {
+            let dismissed = self
+                .suggestions_feed
+                .entry(&key)
+                .is_some_and(|e| e.dismissed);
+            self.suggestions_feed.dismiss(&key, !dismissed);
         }
         true
     }
 
+    /// `n` on a suggestion row prepares a second session for the same item;
+    /// the new session does not claim the suggestion's link.
+    pub(super) fn start_another_from_suggestion(&mut self) {
+        if let Some(key) = self.cursor_suggestion() {
+            if !self.mutations_blocked() {
+                self.suggestions_feed.prepare_another(key);
+            }
+        }
+    }
     /// "Open in <provider>" for a suggestion, when its `source_url` is openable.
     pub(super) fn open_source_command(&self, key: &(String, String)) -> Option<PaletteCommand> {
         let entry = self.suggestions_feed.entry(key)?;
@@ -214,10 +236,23 @@ impl HomeView {
                     super::bindings::ActionId::ToggleArchive,
                     self.strict_hotkeys,
                 );
-                let keys = if frame.area().width >= WIDE_KEY_LINE_COLS {
-                    format!("↵ start  {dismiss} dismiss  ^K open in {}", entry.provider)
+                let enter = if entry.started_session.is_some() {
+                    "open"
                 } else {
-                    format!("↵ start  {dismiss} dismiss  ^K more")
+                    "start"
+                };
+                let dismiss_verb = if entry.dismissed {
+                    "restore"
+                } else {
+                    "dismiss"
+                };
+                let keys = if frame.area().width >= WIDE_KEY_LINE_COLS {
+                    format!(
+                        "↵ {enter}  {dismiss} {dismiss_verb}  ^K open in {}",
+                        entry.provider
+                    )
+                } else {
+                    format!("↵ {enter}  {dismiss} {dismiss_verb}  ^K more")
                 };
                 lines.push(Line::from(Span::styled(keys, dim)));
                 ("Suggestion".to_string(), lines)

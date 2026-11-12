@@ -4600,7 +4600,13 @@ impl HomeView {
                         (Some("Attach"), Some("Live"))
                     }
                 }
-                Some(Item::Suggestion { .. }) => (Some("Start"), None),
+                Some(Item::Suggestion { .. }) => {
+                    let started = self
+                        .cursor_suggestion()
+                        .and_then(|key| self.suggestions_feed.entry(&key))
+                        .is_some_and(|e| e.started_session.is_some());
+                    (Some(if started { "Open" } else { "Start" }), None)
+                }
                 Some(Item::SuggestionsViewAll { .. }) => (Some("View all"), None),
                 None => (None, None),
             };
@@ -4647,7 +4653,12 @@ impl HomeView {
             );
             if on_suggestion {
                 let (click, key) = bound(ActionId::ToggleArchive);
-                groups.push((1, click, mk(&key, "Dismiss")));
+                let restorable = self
+                    .cursor_suggestion()
+                    .and_then(|key| self.suggestions_feed.entry(&key))
+                    .is_some_and(|e| e.dismissed);
+                let label = if restorable { "Restore" } else { "Dismiss" };
+                groups.push((1, click, mk(&key, label)));
             } else {
                 let (click, key) = bound(ActionId::ToggleView);
                 groups.push((2, click, mk(&key, "View")));

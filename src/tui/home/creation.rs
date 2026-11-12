@@ -460,6 +460,40 @@ impl HomeView {
         self.creating_hook_progress.remove(stub_id);
     }
 
+    /// Tells the user once when a session was created but its first prompt
+    /// was not delivered, and puts the retained prompt on the clipboard.
+    pub(super) fn announce_prompt_failure(&mut self, row: &crate::daemon::SessionResponse) {
+        let Some(error) = &row.initial_prompt_error else {
+            self.prompt_failures_announced.remove(&row.id);
+            return;
+        };
+        if !self.prompt_failures_announced.insert(row.id.clone()) {
+            return;
+        }
+        let prompt = self
+            .get_instance(&row.id)
+            .and_then(|i| i.pending_initial_turn.as_ref())
+            .map(|turn| turn.text.clone());
+        let mut message = format!(
+            "{} was created, but its first prompt was not delivered: {error}",
+            row.title
+        );
+        match prompt {
+            Some(text) => {
+                crate::tui::clipboard::copy_to_clipboard(&text);
+                message.push_str(
+                    "\n\nThe prompt is copied to your clipboard. Attach the session and paste it.",
+                );
+            }
+            None => message.push_str("\n\nAttach the session and type the prompt again."),
+        }
+        if self.info_dialog.is_none() {
+            self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
+        } else {
+            self.flash_status("A session's first prompt was not delivered");
+        }
+    }
+
     fn commit_created_session(&mut self) -> Option<String> {
         // During the synchronous load the committed row must not be hidden as a reservation.
         let mut pending = self.pending_creation.take()?;
@@ -494,6 +528,13 @@ impl HomeView {
             return None;
         }
         crate::tui::app::record_session_create();
+        if let Some(origin) = self
+            .get_instance(&row.id)
+            .and_then(|i| i.suggestion.clone())
+        {
+            self.suggestions_feed
+                .link_started(&(origin.provider_id, origin.id), &row.id);
+        }
         self.clear_creation_tracking(&pending.request_key);
         self.rebuild_group_trees();
         self.rebuild_flat_items();

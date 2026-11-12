@@ -564,6 +564,8 @@ pub struct HomeView {
 
     pub(super) trashed_section_collapsed: bool,
     pub(super) suggested_section_collapsed: bool,
+    /// Sessions whose undelivered first prompt was already announced.
+    pub(super) prompt_failures_announced: std::collections::HashSet<String>,
     pub(super) suggestions_feed: super::suggestions::SuggestionsFeed,
 
     /// Non-web links handed to the system opener until their exit status arrives.

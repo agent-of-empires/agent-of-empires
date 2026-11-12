@@ -160,7 +160,9 @@ fn enter_on_a_suggestion_opens_the_prefilled_dialog() {
     terminal_view_config();
     env.view.cursor += 1;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
     assert_eq!(next_request(&requests), "prepare gh/i0");
     poll_until(&mut env, |env| env.view.new_dialog.is_some());
 
@@ -207,7 +209,9 @@ fn a_prepare_answered_after_the_cursor_moved_is_dropped() {
     let (mut env, requests) = expanded_env(2);
     env.view.cursor += 1;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter), None);
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+    });
     env.view.cursor -= 1;
     env.view.update_selected();
     assert_eq!(next_request(&requests), "prepare gh/i0");
@@ -244,12 +248,122 @@ fn z_dismisses_when_the_daemon_accepts_mutations_and_is_refused_otherwise() {
 
 #[test]
 #[serial]
-fn n_on_a_suggestion_opens_a_blank_new_session_dialog() {
-    let (mut env, _requests) = expanded_env(2);
+fn n_on_a_suggestion_prepares_another_session_that_does_not_claim_the_link() {
+    let (mut env, requests) = expanded_env(2);
+    terminal_view_config();
     env.view.cursor += 1;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Char('N')), None);
-    assert!(env.view.new_dialog.is_some());
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('N')), None);
+    });
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+    poll_until(&mut env, |env| env.view.new_dialog.is_some());
+    let crate::tui::dialogs::DialogResult::Submit(data) = env
+        .view
+        .new_dialog
+        .as_mut()
+        .unwrap()
+        .handle_key(key(KeyCode::Enter))
+    else {
+        panic!("expected Submit");
+    };
+    assert_eq!(data.initial_prompt.as_deref(), Some("Prepared prompt"));
+    assert!(data.suggestion.is_none(), "another does not link");
+}
+
+#[test]
+#[serial]
+fn enter_on_an_unstarted_suggestion_is_refused_while_mutations_are_unavailable() {
+    let (mut env, requests) = expanded_env(2);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.status_flash_text().unwrap().contains("read-only"));
+    assert!(requests.try_recv().is_err(), "no prepare was sent");
+}
+
+#[test]
+#[serial]
+fn a_second_enter_does_not_queue_a_second_prepare() {
+    let (mut env, requests) = expanded_env(2);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+        view.handle_key(key(KeyCode::Enter), None);
+    });
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+    poll_until(&mut env, |env| env.view.new_dialog.is_some());
+    env.view.new_dialog = None;
+    // A duplicate answer would reopen the dialog the user just cancelled.
+    std::thread::sleep(Duration::from_millis(100));
+    env.view.apply_suggestions_results();
+    assert!(env.view.new_dialog.is_none());
+    assert!(requests.try_recv().is_err(), "the duplicate was never sent");
+}
+
+#[test]
+#[serial]
+fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
+    let (mut env, requests) = expanded_env(2);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Enter), None);
+        view.open_suggestions_view();
+    });
+    assert_eq!(next_request(&requests), "prepare gh/i0");
+    std::thread::sleep(Duration::from_millis(100));
+    env.view.apply_suggestions_results();
+    assert!(env.view.new_dialog.is_none());
+    assert!(env.view.suggestions_view.is_some());
+}
+
+#[test]
+#[serial]
+fn z_on_home_dismisses_then_restores_within_the_undo_window() {
+    let mut env = create_test_env_with_sessions(1);
+    let (sink, requests) = mpsc::channel();
+    // The worker answers every request with i0 dismissed, as the daemon would after a dismiss.
+    env.view.suggestions_feed = SuggestionsFeed::recording_for_test(snapshot(2, &[0]), sink);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(2, &[]));
+    env.view.rebuild_flat_items();
+    select_suggested_header(&mut env);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    env.view.cursor += 1;
+    env.view.update_selected();
+
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('z')), None);
+    });
+    assert_eq!(next_request(&requests), "dismiss gh/i0 true");
+    let key_i0 = ("gh".to_string(), "i0".to_string());
+    poll_until(&mut env, |env| env.view.suggestions_feed.is_recent(&key_i0));
+    assert_eq!(
+        env.view.cursor_suggestion(),
+        Some(key_i0),
+        "the dismissed row stays under the cursor for the undo window"
+    );
+
+    with_authenticated_local_project_registry(&mut env.view, |view| {
+        view.handle_key(key(KeyCode::Char('z')), None);
+    });
+    assert_eq!(next_request(&requests), "dismiss gh/i0 false");
+}
+
+#[test]
+#[serial]
+fn status_grouping_keeps_the_suggested_section() {
+    use crate::session::config::GroupByMode;
+    let mut env = create_test_env_with_sessions(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(2, &[]));
+    env.view.group_by = GroupByMode::Status;
+    env.view.rebuild_flat_items();
+    assert_eq!(suggested_rows(&env).len(), 1);
 }
 
 #[test]
@@ -497,4 +611,28 @@ fn the_source_reference_shows_on_the_row_and_preview_unless_hidden() {
         let text = preview_text(&mut env, 100);
         assert!(text.contains(meta), "{meta:?}: {text}");
     }
+}
+
+#[test]
+#[serial]
+fn an_undelivered_first_prompt_is_announced_once_per_failure() {
+    let mut env = create_test_env_with_sessions(1);
+    let instance = env.view.instances().next().unwrap().clone();
+    let mut row = crate::server::api::sessions::session_response_from_instance(&instance, false);
+    row.initial_prompt_error = Some("the agent was not ready".into());
+
+    env.view.announce_prompt_failure(&row);
+    assert!(env.view.info_dialog.is_some());
+    env.view.info_dialog = None;
+    env.view.announce_prompt_failure(&row);
+    assert!(
+        env.view.info_dialog.is_none(),
+        "the same failure is not repeated"
+    );
+
+    row.initial_prompt_error = None;
+    env.view.announce_prompt_failure(&row);
+    row.initial_prompt_error = Some("the agent was not ready".into());
+    env.view.announce_prompt_failure(&row);
+    assert!(env.view.info_dialog.is_some(), "a new failure is announced");
 }

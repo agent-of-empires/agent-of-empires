@@ -838,6 +838,7 @@ impl HomeView {
                                 metadata_changed = true;
                                 for row in &snapshot.contents.sessions {
                                     self.apply_daemon_status_update(row);
+                                    self.announce_prompt_failure(row);
                                     if !row.unread
                                         && self.manual_unread_hold.as_deref() == Some(&row.id)
                                     {

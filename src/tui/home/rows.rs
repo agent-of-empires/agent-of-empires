@@ -459,6 +459,11 @@ impl HomeView {
         }
 
         append_archived_section(&mut items, &archived, self.archived_section_collapsed);
+        append_suggested_section(
+            &mut items,
+            &self.suggestions_feed.keys(),
+            self.suggested_section_collapsed,
+        );
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
         items
     }
