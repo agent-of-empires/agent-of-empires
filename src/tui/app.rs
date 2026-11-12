@@ -3524,12 +3524,71 @@ mod tests {
         use crate::tui::terminal_output::{install_test_output, tests::private_terminal};
         use std::io::{Read, Write};
         use std::os::unix::process::CommandExt;
+        fn input_snapshot() -> String {
+            let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+            // SAFETY: fd 0 belongs to this private controlling PTY; output storage is valid.
+            let result = unsafe { libc::tcgetattr(libc::STDIN_FILENO, modes.as_mut_ptr()) };
+            let modes = if result == 0 {
+                // SAFETY: tcgetattr initialized the structure above.
+                let modes = unsafe { modes.assume_init() };
+                Ok((
+                    modes.c_iflag,
+                    modes.c_oflag,
+                    modes.c_cflag,
+                    modes.c_lflag,
+                    modes.c_cc[libc::VMIN],
+                    modes.c_cc[libc::VTIME],
+                ))
+            } else {
+                Err(std::io::Error::last_os_error())
+            };
+            // SAFETY: these queries inspect the owned fd without changing flags or consuming input.
+            let flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
+            let flags = if flags < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(flags)
+            };
+            // SAFETY: querying the private controlling terminal changes no terminal state.
+            let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+            let foreground = if foreground < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(foreground)
+            };
+            // SAFETY: getpgrp has no pointers and only queries this private process.
+            let process_group = unsafe { libc::getpgrp() };
+            let mut unread = 0;
+            // SAFETY: FIONREAD writes an integer count and never consumes the queued test byte.
+            let result =
+                unsafe { libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD as _, &mut unread) };
+            let unread = if result < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(unread)
+            };
+            format!(
+                "fd0 termios(iflag,oflag,cflag,lflag,VMIN,VTIME)={modes:?}; F_GETFL={flags:?}; O_NONBLOCK={:?}; foreground_pgrp={foreground:?}; process_pgrp={process_group}; FIONREAD={unread:?}",
+                flags.as_ref().map(|flags| *flags & libc::O_NONBLOCK != 0)
+            )
+        }
         if let Some(directory) = std::env::var_os("AOE_TEST_CONTROL_RESTORE_CHILD") {
             use std::os::unix::fs::OpenOptionsExt;
             let directory = std::path::PathBuf::from(directory);
             let failure = directory.join("panic");
+            let mut diagnostics = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&failure)
+                .unwrap();
             std::panic::set_hook(Box::new(move |info| {
-                let _ = std::fs::write(&failure, info.to_string());
+                if let Ok(mut output) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&failure)
+                {
+                    let _ = writeln!(output, "panic: {info}");
+                }
             }));
             let _home = crate::session::test_support::isolate_app_dir_at(&directory.join("home"));
             crate::session::get_profile_dir("test").unwrap();
@@ -3591,9 +3650,12 @@ mod tests {
             app.draw(&mut terminal).unwrap();
             assert!(!app.home.presentation_ready);
             std::fs::write(directory.join("waiting-input"), b"ready").unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
+            writeln!(diagnostics, "before input wait: {}", input_snapshot()).unwrap();
+            let input_result = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    match app.event_stream.as_mut().unwrap().next().await {
+                    let event = app.event_stream.as_mut().unwrap().next().await;
+                    writeln!(diagnostics, "EventStream yielded: {event:?}").unwrap();
+                    match event {
                         Some(Ok(Event::Key(key))) if key.code == KeyCode::Char('x') => break,
                         Some(Ok(_)) => {}
                         Some(Err(error)) => panic!("private terminal input failed: {error}"),
@@ -3601,8 +3663,11 @@ mod tests {
                     }
                 }
             })
-            .await
-            .unwrap();
+            .await;
+            if input_result.is_err() {
+                writeln!(diagnostics, "input timeout: {}", input_snapshot()).unwrap();
+            }
+            input_result.unwrap();
             assert_eq!(std::fs::read(&marker).unwrap(), b"child");
             std::fs::write(directory.join("input-ack"), b"ready").unwrap();
             let mut refresh = tokio::time::interval(Duration::from_millis(10));
