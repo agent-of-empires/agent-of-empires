@@ -112,17 +112,30 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
         .into_response();
     };
     let profile = host.suggestions_profile();
-    let started = suggestions::started_sessions(&state.instances.read().await, &profile);
+    let started = {
+        let instances = state.instances.read().await;
+        // Same visibility as the CityHall session list: terminal sessions stay hidden.
+        suggestions::started_sessions(
+            instances
+                .iter()
+                .filter(|inst| !state.cityhall_mode || inst.is_structured()),
+            &profile,
+        )
+    };
     let refreshing = host.refreshing_suggestions();
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
         // Disk reads stay off the store lock.
         let registered = crate::session::projects::load_merged(&profile).unwrap_or_default();
-        host.with_suggestions_db(|conn, profile| {
-            let mut snapshot = suggestions::snapshot(conn, profile, &providers)?;
-            suggestions::attach_projects(conn, profile, &mut snapshot, &registered)?;
-            Ok::<_, anyhow::Error>(snapshot)
-        })
+        let (mut snapshot, mappings) = host.with_suggestions_db(|conn, profile| {
+            Ok::<_, anyhow::Error>((
+                suggestions::snapshot(conn, profile, &providers)?,
+                suggestions::load_mappings(conn, profile)?,
+            ))
+        })?;
+        // Canonicalizing paths hits the filesystem: keep it off the store lock.
+        suggestions::attach_projects(&mappings, &mut snapshot, &registered);
+        Ok::<_, anyhow::Error>(snapshot)
     })
     .await;
     match result {
