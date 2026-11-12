@@ -336,8 +336,16 @@ impl Instance {
     /// Whether a resume selector appended to this launch reaches the agent.
     /// Only a verified direct invocation or an explicit wrapper contract carries selectors.
     pub(crate) fn launch_can_carry_resume_selector(&self, agent: &crate::agents::AgentDef) -> bool {
-        self.execution_agent()
-            .is_ok_and(|actual| actual.name == agent.name)
+        self.launch_carries_selector(self.resolved_agent(), agent)
+    }
+
+    /// [`Self::launch_can_carry_resume_selector`] for a caller that already holds the execution identity.
+    pub(super) fn launch_carries_selector(
+        &self,
+        native: Option<&crate::agents::AgentDef>,
+        agent: &crate::agents::AgentDef,
+    ) -> bool {
+        native.is_some_and(|actual| actual.name == agent.name)
             && self.managed_user_argv(agent).is_ok()
     }
 
@@ -470,6 +478,16 @@ impl Instance {
 
     /// Bare wrappers can receive fresh-session selectors without attesting execution.
     pub(super) fn legacy_default_selector_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        let config = crate::session::config::profile_config::resolve_config_or_warn(
+            &self.effective_profile(),
+        );
+        self.legacy_default_selector_agent_in(&config.session)
+    }
+
+    pub(super) fn legacy_default_selector_agent_in(
+        &self,
+        config: &crate::session::config::SessionConfig,
+    ) -> Option<&'static crate::agents::AgentDef> {
         if matches!(
             self.resume_intent,
             ResumeIntent::Use(_) | ResumeIntent::Fork { .. }
@@ -477,11 +495,7 @@ impl Instance {
             return None;
         }
         let agent = resolved_agent_for(&self.effective_profile(), &self.tool, &self.detect_as)?;
-        if crate::session::config::profile_config::resolve_config_or_warn(&self.effective_profile())
-            .session
-            .agent_execution_as
-            .contains_key(&self.tool)
-        {
+        if config.agent_execution_as.contains_key(&self.tool) {
             return None;
         }
         let command = self.get_tool_command();
