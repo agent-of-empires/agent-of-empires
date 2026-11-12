@@ -4236,6 +4236,72 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     );
 }
 
+// Regression witness for #5610: sessions in linked worktrees of one repo read the
+// same repo config, so they must share one resolution instead of one per worktree.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_resolves_config_once_per_repo_across_linked_worktrees() {
+    use std::sync::atomic::Ordering;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    let main = repo.path().join("main");
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    std::fs::create_dir(&main).unwrap();
+    git(&main, &["init", "-q"]);
+    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let sessions: Vec<Instance> = (0..3)
+        .map(|i| {
+            let worktree = repo.path().join(format!("wt{i}"));
+            git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("b{i}"),
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            let mut inst = Instance::new("test-session", worktree.to_str().unwrap());
+            inst.tool = "custom-tool-5610".to_string();
+            inst.source_profile = "default".to_string();
+            inst
+        })
+        .collect();
+
+    let state = crate::server::test_support::build_test_app_state(sessions);
+    let _envelope = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
+    )
+    .await;
+    let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
+
+    assert_eq!(
+        misses, 1,
+        "linked worktrees of one repo must share one resolution; got {misses}",
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off() {

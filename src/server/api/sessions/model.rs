@@ -380,7 +380,7 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
-/// Per-request cache for `(profile, project_path)` config resolution, shared
+/// Per-request cache for `(profile, repo config source)` config resolution, shared
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
@@ -403,8 +403,12 @@ impl<'a> SessionCfgCache<'a> {
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
         let misses = self.misses;
+        // Linked worktrees read their repo config from the main repo, so they share an entry.
+        let source = crate::session::config::repo_config::repo_config_source_path(
+            std::path::Path::new(project_path),
+        );
         self.entries
-            .entry((profile.to_string(), project_path.to_string()))
+            .entry((profile.to_string(), source.to_string_lossy().into_owned()))
             .or_insert_with(|| {
                 misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
