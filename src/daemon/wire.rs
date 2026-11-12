@@ -136,6 +136,10 @@ pub struct CreateSessionBody {
     /// Require the reviewed configuration to remain unchanged before provisioning.
     #[serde(default)]
     pub trust_review: Option<CreationTrustFingerprint>,
+    /// Skip every `on_create` hook and tag the session `created_without_setup`. The trust
+    /// decision and the other hook types still apply.
+    #[serde(default)]
+    pub skip_on_create: bool,
     /// Resume a Claude conversation through ACP; path must be its original cwd.
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
@@ -983,6 +987,9 @@ pub struct SessionResponse {
     /// Whether the session uses an auto-provisioned scratch directory.
     #[serde(default)]
     pub scratch: bool,
+    /// Created with its `on_create` hooks skipped, so their setup never ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub created_without_setup: bool,
     /// True when the session is marked as a user favorite. Mirrors
     /// `Instance::is_favorited()`; surfaced so the web sidebar can pin
     /// favorited rows and render the `*` marker without re-implementing

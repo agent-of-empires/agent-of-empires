@@ -56,6 +56,7 @@ impl Instance {
             acp_mode_id: None,
             prior_tool_session_ids: HashMap::new(),
             scratch: false,
+            created_without_setup: false,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,

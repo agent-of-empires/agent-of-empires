@@ -10371,6 +10371,63 @@ async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
     );
 }
 
+/// A failing `on_create` costs the session unless the resubmit skips setup. The skip rides
+/// a fresh key: the failed key still replays its failure.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_create_without_setup_keeps_the_session_and_tags_it() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    let ran = tempfile::tempdir().unwrap();
+    let sentinel = ran.path().join("setup-ran");
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|c| {
+        c.hooks.on_create = vec![format!("touch '{}'; exit 4", sentinel.display())];
+    })
+    .unwrap();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let project = tempfile::tempdir().unwrap();
+    let body = |key: &str, skip: bool| {
+        serde_json::json!({
+            "title": "setup", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "idempotency_key": key,
+            "skip_on_create": skip,
+        })
+    };
+
+    let (failed, error) = post_create(&state, body("first", false)).await;
+    assert_eq!(failed, axum::http::StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"], "hook_failed", "{error}");
+    assert!(sentinel.exists(), "the control ran the hook");
+    std::fs::remove_file(&sentinel).unwrap();
+
+    let (replayed, error) = post_create(&state, body("first", true)).await;
+    assert_eq!(replayed, axum::http::StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"], "hook_failed", "{error}");
+
+    let (created, session) = post_create(&state, body("second", true)).await;
+    assert_eq!(created, axum::http::StatusCode::CREATED, "{session}");
+    assert_eq!(session["created_without_setup"], true, "{session}");
+    assert!(!sentinel.exists(), "a skipped on_create still ran");
+    let stored = crate::session::Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap();
+    assert!(
+        stored.iter().any(|row| row.created_without_setup),
+        "the tag is persisted"
+    );
+}
+
 /// A cancelled create is the refusal a user asked for, so its key stays live
 /// too. Each distinct cancelled key also occupies one of the registry's
 /// `MAX_FAILURES` slots for a whole `FAILURE_TTL`, and when those run out every
@@ -11183,22 +11240,44 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
     }
-    // A repository on_create hook may install the adapter before launch, so it isn't refused,
-    // unless the create skips the repository's hooks.
+    // An on_create hook may install the adapter before launch, so it isn't refused, unless
+    // the create skips the repository's hooks or skips on_create.
     let hooked = project_with_on_create_hooks(&["npm install"]);
     let hooked_path = hooked.path().display().to_string();
-    for (trust_hooks, refused) in [(None, false), (Some(true), false), (Some(false), true)] {
-        let mut extra = serde_json::json!({ "view": "structured", "path": hooked_path });
+    let refused_for = |extra: serde_json::Value| {
+        let (state, request) = (state.clone(), base(extra.clone()));
+        async move {
+            let (_, bytes) = post_create_bytes(&state, request).await;
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (
+                body["error"] == "acp_adapter_missing",
+                format!("{extra}: {body}"),
+            )
+        }
+    };
+    for (trust_hooks, skip, refused) in [
+        (None, false, false),
+        (Some(true), false, false),
+        (Some(false), false, true),
+        (None, true, true),
+    ] {
+        let mut extra = serde_json::json!({
+            "view": "structured", "path": hooked_path, "skip_on_create": skip,
+        });
         if let Some(trust) = trust_hooks {
             extra["trust_hooks"] = serde_json::json!(trust);
         }
-        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        assert_eq!(
-            body["error"] == "acp_adapter_missing",
-            refused,
-            "{extra}: {body}"
-        );
+        let (got, detail) = refused_for(extra).await;
+        assert_eq!(got, refused, "{detail}");
+    }
+    crate::session::config::update_config(|config| {
+        config.hooks.on_create = vec!["npm install".into()];
+    })
+    .unwrap();
+    for (skip, refused) in [(false, false), (true, true)] {
+        let extra = serde_json::json!({ "view": "structured", "skip_on_create": skip });
+        let (got, detail) = refused_for(extra).await;
+        assert_eq!(got, refused, "profile on_create: {detail}");
     }
 }
 

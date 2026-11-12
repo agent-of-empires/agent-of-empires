@@ -741,6 +741,7 @@ mod workspace_ordering_tests {
             sandbox_container_name: None,
             outside_repository: false,
             scratch: false,
+            created_without_setup: false,
             has_managed_worktree: false,
             has_cleanable_worktree: false,
             tie_workdir_to_name: false,
