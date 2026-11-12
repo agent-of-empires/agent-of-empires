@@ -103,6 +103,10 @@ pub enum Commands {
     Remove(RemoveArgs),
 
     /// Send a message to a running agent session
+    ///
+    /// Each delivered message appends a line to `sends.log` in the app data
+    /// dir with the time, the target and sender session IDs and the SHA-256
+    /// of the text; the text itself is not kept.
     Send(SendArgs),
 
     /// Show session status summary

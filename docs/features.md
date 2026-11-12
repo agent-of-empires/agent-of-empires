@@ -26,6 +26,8 @@ The web dashboard's default rendering: mobile-first native rendering of agent st
 
 Create, monitor, and control agents from the command line. Integrates with workflow tools like OpenClaw. Scriptable for batch operations and CI.
 
+Every message `aoe send` delivers appends one JSON line to `sends.log` in the app data dir: the delivery time (UTC, RFC 3339), the target session's ID, the sending session's ID (the aoe session whose tmux pane ran the command, or `null` outside one) and the SHA-256 of the message text as given. The message itself is never stored. A typed prompt in an agent's transcript whose hash has no matching line was typed by a person, not sent by another agent. A failed write leaves the send successful and logs a warning.
+
 [CLI Reference](cli/reference.md)
 
 ### HTTP API

@@ -1,7 +1,11 @@
 //! `agent-of-empires send` subcommand implementation
 
+use std::io::Write;
+use std::path::Path;
+
 use anyhow::{bail, Result};
 use clap::Args;
+use sha2::{Digest, Sha256};
 
 use crate::session::{EnsureReadyError, EnsureReadyOutcome, Storage};
 
@@ -114,6 +118,86 @@ pub async fn run(profile: &str, args: SendArgs) -> Result<()> {
         );
     }
 
+    // Like the status remap above, the send log is bookkeeping: the message
+    // already reached the agent, so a write failure must not report a failed send.
+    let sender = super::session::current_aoe_session()
+        .ok()
+        .map(|(_, inst)| inst.id);
+    let logged = crate::session::get_app_dir().and_then(|dir| {
+        append_send_record(
+            &dir.join(SEND_LOG_FILE),
+            chrono::Utc::now(),
+            &session_id,
+            sender.as_deref(),
+            &args.message,
+        )
+    });
+    if let Err(err) = logged {
+        tracing::warn!(?err, "send: failed to append to {SEND_LOG_FILE}");
+    }
+
     println!("Sent message to '{}'", session_title);
     Ok(())
+}
+
+const SEND_LOG_FILE: &str = "sends.log";
+
+/// Append one JSON line recording a delivered send. Only a hash of the message
+/// is kept, so the log can tell a person's typed prompt from an agent's send
+/// without holding any content.
+fn append_send_record(
+    log: &Path,
+    at: chrono::DateTime<chrono::Utc>,
+    target: &str,
+    sender: Option<&str>,
+    message: &str,
+) -> Result<()> {
+    let sha256: String = Sha256::digest(message.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let record = serde_json::json!({
+        "time": at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "target": target,
+        "sender": sender,
+        "sha256": sha256,
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)?;
+    writeln!(file, "{record}")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_log_keeps_time_target_sender_and_hash_but_never_the_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join(SEND_LOG_FILE);
+        let at = chrono::DateTime::parse_from_rfc3339("2026-11-12T00:19:28Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        append_send_record(&log, at, "target-id", Some("sender-id"), "hello world").unwrap();
+        append_send_record(&log, at, "target-id", None, "second secret").unwrap();
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "one appended line per send");
+        assert_eq!(lines[0]["time"], "2026-11-12T00:19:28Z");
+        assert_eq!(lines[0]["target"], "target-id");
+        assert_eq!(lines[0]["sender"], "sender-id");
+        assert_eq!(
+            lines[0]["sha256"],
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+        assert!(lines[1]["sender"].is_null(), "no aoe sender is null");
+        assert!(!text.contains("hello") && !text.contains("secret"));
+    }
 }

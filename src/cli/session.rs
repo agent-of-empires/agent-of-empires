@@ -2278,51 +2278,53 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     Ok(())
 }
 
-async fn current_session(args: CurrentArgs) -> Result<()> {
-    // Auto-detect profile and session from tmux
+/// The aoe session (and its profile) whose tmux pane this process runs in.
+pub(crate) fn current_aoe_session() -> Result<(String, Instance)> {
     let current_session = std::env::var("TMUX_PANE")
         .ok()
         .and_then(|_| crate::tmux::get_current_session_name());
 
     let session_name = current_session.ok_or_else(|| anyhow::anyhow!("Not in a tmux session"))?;
 
-    // Search all profiles for this session
-    let profiles = crate::session::list_profiles()?;
-
-    for profile_name in &profiles {
-        if let Ok(storage) = Storage::open_unwatched(profile_name) {
+    for profile_name in crate::session::list_profiles()? {
+        if let Ok(storage) = Storage::open_unwatched(&profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
                 if let Some(inst) = instances
-                    .iter()
+                    .into_iter()
                     .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
                 {
-                    if args.json {
-                        #[derive(Serialize)]
-                        struct CurrentInfo {
-                            session: String,
-                            profile: String,
-                            id: String,
-                        }
-                        let info = CurrentInfo {
-                            session: inst.title.clone(),
-                            profile: profile_name.clone(),
-                            id: inst.id.clone(),
-                        };
-                        super::output::print_json(&info)?;
-                    } else if args.quiet {
-                        println!("{}", inst.title);
-                    } else {
-                        println!("Session: {}", inst.title);
-                        println!("Profile: {}", profile_name);
-                        println!("ID:      {}", inst.id);
-                    }
-                    return Ok(());
+                    return Ok((profile_name, inst));
                 }
             }
         }
     }
 
     bail!("Current tmux session is not an Agent of Empires session")
+}
+
+async fn current_session(args: CurrentArgs) -> Result<()> {
+    let (profile_name, inst) = current_aoe_session()?;
+    if args.json {
+        #[derive(Serialize)]
+        struct CurrentInfo {
+            session: String,
+            profile: String,
+            id: String,
+        }
+        let info = CurrentInfo {
+            session: inst.title.clone(),
+            profile: profile_name,
+            id: inst.id.clone(),
+        };
+        super::output::print_json(&info)?;
+    } else if args.quiet {
+        println!("{}", inst.title);
+    } else {
+        println!("Session: {}", inst.title);
+        println!("Profile: {}", profile_name);
+        println!("ID:      {}", inst.id);
+    }
+    Ok(())
 }
 
 async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
