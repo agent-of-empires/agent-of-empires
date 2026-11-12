@@ -179,6 +179,7 @@ pub(crate) fn spawn_request_for(
         agent,
         tool: instance.tool.clone(),
         cwd: PathBuf::from(&instance.project_path),
+        config_path: instance.repo_config_path().to_path_buf(),
         additional_dirs: vec![],
         provider_env: vec![],
         provider: instance.agent_provider.clone(),
@@ -260,7 +261,7 @@ async fn pick_agent(
             &instance.tool,
             explicit,
             &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            instance.repo_config_path(),
         )
         .await
 }

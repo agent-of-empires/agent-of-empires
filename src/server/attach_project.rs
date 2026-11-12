@@ -269,6 +269,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             // The canonical instance, so this is the workspace directory when the
             // attach converted the session, not the path it started from.
             cwd: PathBuf::from(&inst.project_path),
+            config_path: inst.repo_config_path().to_path_buf(),
             additional_dirs: vec![],
             provider_env: vec![],
             provider: inst.agent_provider.clone(),

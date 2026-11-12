@@ -4,7 +4,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use tui_input::Input;
 
-use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
+use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH, WT_WORKSPACE_FIELD};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
     render_text_field_with_ghost, render_tool_config_overlay, set_prefixed_input_cursor_position,
@@ -325,12 +325,16 @@ impl NewSessionDialog {
                 } else {
                     "existing"
                 };
-                let repos_count = self.workspace_repos.len();
-                let summary = match (name.is_empty(), repos_count) {
-                    (true, 0) => None,
-                    (true, n) => Some(format!("  (auto, {}, {} repos)", branch_mode, n)),
-                    (false, 0) => Some(format!("  ({}, {})", name, branch_mode)),
-                    (false, n) => Some(format!("  ({}, {}, {} repos)", name, branch_mode, n)),
+                let layout = match self.workspace_repos.len() {
+                    0 if self.workspace_effective() => Some("workspace".to_string()),
+                    0 => None,
+                    n => Some(format!("{} repos", n)),
+                };
+                let summary = match (name.is_empty(), layout) {
+                    (true, None) => None,
+                    (true, Some(l)) => Some(format!("  (auto, {}, {})", branch_mode, l)),
+                    (false, None) => Some(format!("  ({}, {})", name, branch_mode)),
+                    (false, Some(l)) => Some(format!("  ({}, {}, {})", name, branch_mode, l)),
                 };
                 if let Some(summary) = summary {
                     spans.push(Span::styled(summary, Style::default().fg(theme.dimmed)));
@@ -871,6 +875,7 @@ impl NewSessionDialog {
             Constraint::Length(2),            // New Branch checkbox
             Constraint::Length(2),            // Base Branch
             Constraint::Length(repos_height), // Extra Repos
+            Constraint::Length(2),            // Workspace checkbox
             Constraint::Min(hint_height),     // Hints or error
         ];
 
@@ -991,26 +996,69 @@ impl NewSessionDialog {
         );
         self.worktree_config_rects.push((3, chunks[3]));
 
+        {
+            let is_focused = self.worktree_config_focused_field == WT_WORKSPACE_FIELD;
+            let label_style = if is_focused {
+                Style::default().fg(theme.accent).underlined()
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let on = self.workspace_effective();
+            let (checkbox_style, text_style) = if on {
+                (
+                    Style::default().fg(theme.accent).bold(),
+                    Style::default().fg(theme.accent),
+                )
+            } else {
+                (
+                    Style::default().fg(theme.dimmed),
+                    Style::default().fg(theme.dimmed),
+                )
+            };
+            let text = if self.workspace_forced() {
+                " Workspace directory (required by extra repos)"
+            } else if !self.create_new_branch {
+                " Workspace directory (new branches only)"
+            } else {
+                " Workspace directory"
+            };
+            let line = Line::from(vec![
+                Span::styled("Workspace:", label_style),
+                Span::raw(" "),
+                Span::styled(if on { "[x]" } else { "[ ]" }, checkbox_style),
+                Span::styled(text, text_style),
+            ]);
+            frame.render_widget(Paragraph::new(line), chunks[4]);
+            self.worktree_config_rects
+                .push((WT_WORKSPACE_FIELD, chunks[4]));
+        }
+
         // Hints, or the pending error (branch listing failures land here so
         // Ctrl+P always produces visible feedback). See #3166.
         if let Some(error) = &self.error_message {
             let error_paragraph = Paragraph::new(format!("✗ Error: {}", error))
                 .style(Style::default().fg(theme.error))
                 .wrap(Wrap { trim: true });
-            frame.render_widget(error_paragraph, chunks[4]);
+            frame.render_widget(error_paragraph, chunks[5]);
         } else {
             let mut hint_spans = vec![
                 Span::styled("Tab", Style::default().fg(theme.hint)),
                 Span::raw(" next  "),
                 Span::styled("Space", Style::default().fg(theme.hint)),
                 Span::raw(" toggle  "),
-                Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
-                Span::raw(" branches  "),
+            ];
+            if self.worktree_config_focused_field != WT_WORKSPACE_FIELD {
+                hint_spans.extend([
+                    Span::styled("Ctrl+P", Style::default().fg(theme.hint)),
+                    Span::raw(" branches  "),
+                ]);
+            }
+            hint_spans.extend([
                 Span::styled("Enter", Style::default().fg(theme.hint)),
                 Span::raw(" done  "),
                 Span::styled("Esc", Style::default().fg(theme.hint)),
                 Span::raw(" back"),
-            ];
+            ]);
             if self.worktree_config_focused_field == 3 && !self.workspace_repos_expanded {
                 hint_spans = vec![
                     Span::styled("Tab", Style::default().fg(theme.hint)),
@@ -1023,7 +1071,7 @@ impl NewSessionDialog {
                     Span::raw(" back"),
                 ];
             }
-            frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
+            frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[5]);
         }
 
         let rects = if self.workspace_repo_editing_input.is_some() {

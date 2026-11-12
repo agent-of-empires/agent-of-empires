@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "agent-of-empires"
-version = "1.22.3"
+version = "1.23.0"
 dependencies = [
  "aes-gcm",
  "agent-client-protocol",
@@ -307,7 +307,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "aoe-plugin-api"
-version = "1.22.3"
+version = "1.23.0"
 dependencies = [
  "semver",
  "serde",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "aoe-settings-derive"
-version = "1.22.3"
+version = "1.23.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -6363,7 +6363,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.22.3"
+version = "1.23.0"
 dependencies = [
  "agent-of-empires",
  "aoe-plugin-api",

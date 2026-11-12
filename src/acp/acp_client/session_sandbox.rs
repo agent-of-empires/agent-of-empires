@@ -25,9 +25,9 @@ pub struct SessionSandbox {
     /// Profile the session was created under. Required for
     /// `resolved_sandbox_config` to pick up per-profile env overrides.
     pub source_profile: Option<String>,
-    /// Host-side project path. `resolved_sandbox_config` walks up from
-    /// here to find any repo-local config overrides.
-    pub project_path: PathBuf,
+    /// Where `resolved_sandbox_config` reads repo-local overrides; see
+    /// `SpawnRequest::config_path`.
+    pub config_path: PathBuf,
 }
 
 impl SessionSandbox {
@@ -37,6 +37,7 @@ impl SessionSandbox {
     pub fn from_info(
         sandbox: &SandboxInfo,
         project_path: &Path,
+        config_path: &Path,
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
         let project_path_str = project_path.to_string_lossy().to_string();
@@ -68,7 +69,7 @@ impl SessionSandbox {
                 container_workdir: PathBuf::from(workdir),
                 sandbox_info: sandbox.clone(),
                 source_profile,
-                project_path: project_path.to_path_buf(),
+                config_path: config_path.to_path_buf(),
             },
             SandboxPathMap::new(mounts),
         ))
@@ -92,7 +93,7 @@ impl SessionSandbox {
             }
         };
         let sandbox_config =
-            crate::session::environment::resolved_sandbox_config(profile, &self.project_path);
+            crate::session::environment::resolved_sandbox_config(profile, &self.config_path);
         crate::session::environment::collect_environment(&sandbox_config, &self.sandbox_info)
     }
 }
@@ -122,10 +123,9 @@ pub(super) fn build_sandbox_docker_argv(
     let runtime = crate::containers::get_container_runtime();
     let docker_binary = runtime.base.binary.to_string();
 
-    let project_path = config.cwd.as_path();
     let profile_for_env = config.source_profile.as_deref().unwrap_or("");
     let sandbox_config =
-        crate::session::environment::resolved_sandbox_config(profile_for_env, project_path);
+        crate::session::environment::resolved_sandbox_config(profile_for_env, &config.config_path);
     let mut env_entries =
         crate::session::environment::collect_environment(&sandbox_config, sandbox);
     // Bind-mounted at the fixed container path by build_container_config;
@@ -270,7 +270,8 @@ mod tests {
             Some("/workspace/repo-worktrees/feature"),
         );
 
-        let (resources, _map) = SessionSandbox::from_info(&info, &worktree, None).unwrap();
+        let (resources, _map) =
+            SessionSandbox::from_info(&info, &worktree, &worktree, None).unwrap();
         assert_eq!(
             resources.container_workdir,
             PathBuf::from("/workspace/repo-worktrees/feature"),

@@ -22,6 +22,9 @@ export interface WizardData {
   /** Set only by a direct `useWorktree` edit, so an unrelated profile-field edit does not block
    *  a project override seed. */
   worktreeDirty: boolean;
+  /** Start in a workspace directory even with one repo. Attaching to an existing branch overrides it. */
+  useWorkspace: boolean;
+  workspaceDirty: boolean;
   /** Attach to an existing branch's worktree (`create_new_branch: false`). */
   attachExisting: boolean;
   /** Empty means the project's default branch. */
@@ -71,6 +74,8 @@ export interface WizardState {
   agentsStatus: "loading" | "ready" | "failed" | "missing";
   /** Which profile `agents` and `agentsStatus` describe; any other profile is still loading. */
   agentsFor: string | null;
+  /** The project `agents` was fetched for; its `acp_create_ready` holds only for that project. */
+  agentsProject: string | null;
   groups: GroupInfo[];
   /** Which profile `groups` was fetched for; any other profile sees no Groups. */
   groupsFor: string | null;
@@ -89,7 +94,7 @@ export type Action =
   | { type: "SUBMIT_FAILED"; failure: CreateFailure }
   | { type: "SUBMIT_SUCCESS" }
   | { type: "SUBMIT_CANCEL" }
-  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string }
+  | { type: "SET_AGENTS"; agents: AgentInfo[]; agentsFor: string; agentsProject: string }
   | { type: "AGENTS_FAILED"; agentsFor: string; missing: boolean }
   | { type: "SET_GROUPS"; groups: GroupInfo[]; groupsFor: string }
   | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
@@ -99,6 +104,7 @@ export type Action =
       yoloMode: boolean;
       sandboxEnabled: boolean;
       worktreeEnabled: boolean;
+      workspaceByDefault: boolean;
       tool: string;
       extraEnv: string[];
       agentModel?: string;
@@ -126,6 +132,8 @@ export const initialData: WizardData = {
   projectSandboxOverride: undefined,
   sandboxDirty: false,
   worktreeDirty: false,
+  useWorkspace: false,
+  workspaceDirty: false,
   attachExisting: false,
   baseBranch: "",
   group: "",
@@ -153,7 +161,16 @@ export const initialData: WizardData = {
 };
 
 // Tracked even without a profile so mount-time seeding does not stomp early edits.
-const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"];
+const PROFILE_FIELDS = [
+  "yoloMode",
+  "sandboxEnabled",
+  "useWorktree",
+  "useWorkspace",
+  "tool",
+  "extraEnv",
+  "agentModel",
+  "agentEffort",
+];
 
 function setField(data: WizardData, field: string, value: unknown): WizardData {
   const next = { ...data, [field]: value };
@@ -212,6 +229,7 @@ function setField(data: WizardData, field: string, value: unknown): WizardData {
   if (field === "pathIsGitRepo" && value === false) next.useWorktree = false;
   if (PROFILE_FIELDS.includes(field)) next.profileDirty = true;
   if (field === "useWorktree") next.worktreeDirty = true;
+  if (field === "useWorkspace") next.workspaceDirty = true;
   if (field === "sandboxEnabled") next.sandboxDirty = true;
   if (field === "useStructuredView") next.structuredViewDirty = true;
   // An import is the one thing that outranks `off`, so the choice it forced ends with it.
@@ -231,14 +249,17 @@ function seededStructuredView(data: WizardData, action: { useStructuredView?: bo
 
 const NO_AGENTS: AgentInfo[] = [];
 
-/** The agent list for `profile`: one loaded for another profile reads as still loading. */
+/** The agent list for `profile`: one loaded for another profile reads as still loading. One loaded
+ *  for another `project` keeps its agents but not their `acp_create_ready`, which may differ there. */
 export function agentsView(
-  state: Pick<WizardState, "agents" | "agentsStatus" | "agentsFor">,
+  state: Pick<WizardState, "agents" | "agentsStatus" | "agentsFor" | "agentsProject">,
   profile: string,
+  project: string,
 ): { agents: AgentInfo[]; agentsStatus: WizardState["agentsStatus"] } {
-  return state.agentsFor === profile
-    ? { agents: state.agents, agentsStatus: state.agentsStatus }
-    : { agents: NO_AGENTS, agentsStatus: "loading" };
+  if (state.agentsFor !== profile) return { agents: NO_AGENTS, agentsStatus: "loading" };
+  const agents =
+    state.agentsProject === project ? state.agents : state.agents.map(({ acp_create_ready: _, ...a }) => a);
+  return { agents, agentsStatus: state.agentsStatus };
 }
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -291,8 +312,16 @@ function reduce(state: WizardState, action: Action): WizardState {
     case "SUBMIT_CANCEL":
       return { ...state, isSubmitting: false, error: null, failure: null };
     case "SET_AGENTS":
-      return { ...state, agents: action.agents, agentsStatus: "ready", agentsFor: action.agentsFor };
+      return {
+        ...state,
+        agents: action.agents,
+        agentsStatus: "ready",
+        agentsFor: action.agentsFor,
+        agentsProject: action.agentsProject,
+      };
     case "AGENTS_FAILED":
+      // Another project's list for this Profile stays usable; only its readiness is dropped.
+      if (action.agentsFor === state.agentsFor && state.agentsStatus === "ready" && !action.missing) return state;
       return {
         ...state,
         // A retry for the same Profile keeps its list; another Profile's list must not be read for it.
@@ -335,6 +364,7 @@ function reduce(state: WizardState, action: Action): WizardState {
             profileWorktreeDefault: action.worktreeEnabled,
             profileSandboxDefault: action.sandboxEnabled,
             useWorktree: state.data.worktreeDirty ? state.data.useWorktree : resolvedUseWorktree(),
+            useWorkspace: state.data.workspaceDirty ? state.data.useWorkspace : action.workspaceByDefault,
             sandboxEnabled: state.data.sandboxDirty ? state.data.sandboxEnabled : resolvedSandbox,
           },
         };
@@ -348,6 +378,8 @@ function reduce(state: WizardState, action: Action): WizardState {
           profileSandboxDefault: action.sandboxEnabled,
           useWorktree: resolvedUseWorktree(),
           profileWorktreeDefault: action.worktreeEnabled,
+          useWorkspace: action.workspaceByDefault,
+          workspaceDirty: false,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",
