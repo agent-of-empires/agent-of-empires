@@ -42,6 +42,7 @@ mod tests {
 
     fn tool_call(name: &str, kind: &str, args_preview: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: "tc".into(),
             name: name.into(),
             kind: kind.into(),

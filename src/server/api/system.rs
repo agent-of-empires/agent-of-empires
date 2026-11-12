@@ -367,8 +367,10 @@ pub async fn list_agents(
         });
         // Without a project only the profile's hooks can run, as for scratch.
         let hooks_apply = || match project.as_deref() {
-            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None),
-            None => preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None),
+            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None, false),
+            None => {
+                preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None, false)
+            }
         };
         for agent in agents.iter_mut() {
             if agent.acp_capable {

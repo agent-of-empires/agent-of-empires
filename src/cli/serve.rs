@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, ValueEnum};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -557,15 +558,19 @@ pub async fn lock_for_startup(profile: &str, args: &mut ServeArgs) -> Result<Opt
         LaunchMode::Tcp
     };
     args.resolve_launch(Some(requested))?;
-    match daemon_status() {
+    match tokio::task::spawn_blocking(daemon_status).await? {
         DaemonStatus::Verified(pid) if pid != std::process::id() => {
             transaction = migrate_managed_launch(transaction, false).await?;
-            let launch = managed_launch(pid)?;
+            let launch = tokio::task::spawn_blocking(move || managed_launch(pid)).await??;
             if !launch.core_only || args.core_only || args.daemon_child {
                 return Err(daemon_running_error(pid));
             }
             validate_launch_args(profile, args).await?;
-            let passphrase = recall_serve_passphrase(&launch)?;
+            let (launch, passphrase) = tokio::task::spawn_blocking(move || {
+                let passphrase = recall_serve_passphrase(&launch)?;
+                Ok::<_, anyhow::Error>((launch, passphrase))
+            })
+            .await??;
             retain_rollback_launch(&transaction, &launch, passphrase.as_deref())?;
             tracing::info!(
                 target: "serve.lifecycle",
@@ -926,12 +931,16 @@ fn live_daemon_instance_matches(pid: u32, instance_id: &str) -> bool {
             .is_some_and(|environment| environment_has_daemon_instance(&environment, instance_id));
     }
 
-    std::process::Command::new("ps")
-        .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
+    crate::process::run_with_timeout_process_group(
+        std::process::Command::new("ps")
+            .args(["-ww", "-E", "-o", "command=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(3),
+    )
+    .ok()
+    .flatten()
+    .filter(|output| output.status.success())
+    .is_some_and(|output| environment_has_daemon_instance(&output.stdout, instance_id))
 }
 
 fn recall_serve_passphrase(launch: &ServeLaunch) -> Result<Option<String>> {
@@ -979,10 +988,10 @@ pub struct ServeUrl {
 /// empty. The primary URL gets `label: None` for rendering; alternates
 /// carry their label.
 pub fn read_serve_urls() -> Vec<ServeUrl> {
-    let Ok(dir) = crate::session::get_app_dir() else {
-        return Vec::new();
-    };
-    let Ok(raw) = std::fs::read_to_string(dir.join("serve.url")) else {
+    let Some(raw) = launch_file("serve.url")
+        .ok()
+        .and_then(|file| file.read().ok().flatten())
+    else {
         return Vec::new();
     };
     let mut out: Vec<ServeUrl> = Vec::new();
@@ -1098,17 +1107,19 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
     // macOS / other: shell out to `ps`. `-o command=` prints the full
     // command (path + args) with no header, and `-ww` stops it being clipped
     // at the terminal width before `serve` shows up.
-    match std::process::Command::new("ps")
-        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-    {
-        Ok(out) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
-        Ok(out) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
-        Ok(out) if command_mentions_aoe_executable(&out.stdout) => {
+    match crate::process::run_with_timeout_process_group(
+        std::process::Command::new("ps")
+            .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null()),
+        std::time::Duration::from_secs(3),
+    ) {
+        Ok(Some(out)) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
+        Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
             DaemonProcessIdentity::Indeterminate
         }
-        Ok(_) => DaemonProcessIdentity::Foreign,
-        Err(_) => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(_)) => DaemonProcessIdentity::Foreign,
+        Ok(None) | Err(_) => DaemonProcessIdentity::Indeterminate,
     }
 }
 
@@ -1179,8 +1190,10 @@ fn clear_serve_state(expected_pid: i32) -> bool {
     ) else {
         return false;
     };
-    let recorded = std::fs::read_to_string(&pid_path)
+    let recorded = crate::session::ResolvedDataFile::open(&pid_path)
+        .and_then(|file| file.read())
         .ok()
+        .flatten()
         .and_then(|raw| parse_positive_pid(&raw));
     if recorded != Some(expected_pid) {
         return false;
@@ -1215,12 +1228,9 @@ fn daemon_status_with(
     probe: impl FnOnce(i32) -> DaemonProbeDisposition,
     inspect: impl FnOnce(i32) -> DaemonProcessIdentity,
 ) -> DaemonStatus {
-    let Ok(path) = pid_file_path() else {
-        return DaemonStatus::Unverified;
-    };
-    let pid_str = match std::fs::read_to_string(&path) {
-        Ok(pid) => pid,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return DaemonStatus::Absent,
+    let pid_str = match launch_file("serve.pid").and_then(|file| file.read()) {
+        Ok(Some(pid)) => pid,
+        Ok(None) => return DaemonStatus::Absent,
         Err(_) => return DaemonStatus::Unverified,
     };
     let Some(pid) = parse_positive_pid(&pid_str) else {
@@ -1373,7 +1383,12 @@ async fn validate_launch_args(profile: &str, args: &ServeArgs) -> Result<AuthMod
             tailscale_probe().await.use_funnel()?
         };
         if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
-            tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared).await??;
+            tokio::task::spawn_blocking(|| {
+                crate::server::tunnel::check_cloudflared(
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+            })
+            .await??;
         }
     }
     Ok(auth_mode)
@@ -1546,19 +1561,20 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
     result
 }
 
-/// Path the daemon's stdout/stderr are redirected to. Resolved from the
-/// configured `[logging].file_path` so panic backtraces interleave with
-/// the structured tracing stream. Used by `start_daemon()` for the stdio
-/// redirect, by the TUI serve dialog for the tail pane, and by `aoe logs`
-/// for the viewer target.
+/// Configured log shared by tracing and the Daemon's redirected stdout/stderr.
 pub fn stdio_redirect_path() -> Result<PathBuf> {
+    stdio_redirect_logging().map(|(path, _)| path)
+}
+
+pub(crate) fn stdio_redirect_logging() -> Result<(PathBuf, crate::session::config::LoggingConfig)> {
     let dir = crate::session::get_app_dir()?;
     let log_cfg = crate::session::load_config()
         .ok()
         .flatten()
         .map(|c| c.logging)
         .unwrap_or_default();
-    Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
+    let path = crate::logging::resolve_log_path(&log_cfg, &dir);
+    Ok((path, log_cfg))
 }
 
 /// URL a CityHall-hosted workspace fetches its config bundle from. Unset means
@@ -1741,54 +1757,120 @@ pub(crate) async fn ensure_local_daemon(
     }
     Ok((endpoint, started))
 }
+pub(crate) struct TuiDashboardLaunch {
+    pub(crate) runtime: (
+        crate::daemon::RuntimeConnection,
+        crate::daemon::DaemonClient,
+    ),
+    pub(crate) target: TuiControlTarget,
+}
+
+#[derive(Debug)]
+pub(crate) struct TuiDashboardLaunchFailure {
+    pub(crate) error: anyhow::Error,
+    pub(crate) target: Option<TuiControlTarget>,
+}
+
 pub(crate) async fn start_dashboard_for_tui(
     profile: &str,
     mut args: ServeArgs,
     predecessor_epoch: Option<&str>,
-    restart: bool,
-) -> Result<(
-    crate::daemon::RuntimeConnection,
-    crate::daemon::DaemonClient,
-)> {
-    let launch = if restart {
-        restart_daemon_with_receipt(Some(args), false).await?
-    } else {
-        let startup = lock_for_startup(profile, &mut args)
-            .await?
-            .context("Dashboard startup guard is unavailable")?;
-        let startup = tokio::task::spawn_blocking(move || {
-            startup.run_migrations(None)?;
-            Ok::<_, anyhow::Error>(startup)
-        })
-        .await??;
-        let ServeStartup { lock, transaction } = startup;
-        validate_launch_args(profile, &args).await?;
-        drop(lock);
-        start_daemon(profile, &args, &transaction, false).await?;
-        managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)?
-    };
-    anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
-    let instance = launch
-        .instance_id
-        .context("Successor instance proof is missing")?;
-    let endpoint = crate::acp::client::discovery::local_unix_endpoint(
-        crate::daemon::transport::local_socket_path()?,
-    );
-    let connection = crate::daemon::RuntimeConnection::connect(
-        &endpoint,
-        (!profile.is_empty()).then_some(profile),
-    )
-    .await?;
-    anyhow::ensure!(
-        connection.info().owner_instance_id.as_deref() == Some(instance.as_str()),
-        "Dashboard successor identity changed before reconnect"
-    );
-    anyhow::ensure!(
-        predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
-        "Dashboard successor reused the predecessor epoch"
-    );
-    let client = endpoint.daemon_client()?;
-    Ok((connection, client))
+    restart: Option<TuiControlLease>,
+) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
+    let launch = async {
+        let launch = if let Some(lease) = restart {
+            lease.restart(args).await?
+        } else {
+            let startup = lock_for_startup(profile, &mut args)
+                .await?
+                .context("Dashboard startup guard is unavailable")?;
+            let startup = tokio::task::spawn_blocking(move || {
+                startup.run_migrations(None)?;
+                Ok::<_, anyhow::Error>(startup)
+            })
+            .await??;
+            let ServeStartup { lock, transaction } = startup;
+            validate_launch_args(profile, &args).await?;
+            drop(lock);
+            start_daemon(profile, &args, &transaction, false).await?;
+            tokio::task::spawn_blocking(|| {
+                managed_launch(daemon_pid().context("Dashboard successor is unavailable")?)
+            })
+            .await??
+        };
+        Ok::<_, anyhow::Error>(launch)
+    }
+    .await
+    .map_err(|error| TuiDashboardLaunchFailure {
+        error,
+        target: None,
+    })?;
+    connect_owned_dashboard(profile, predecessor_epoch, launch).await
+}
+
+async fn connect_owned_dashboard(
+    profile: &str,
+    predecessor_epoch: Option<&str>,
+    launch: ServeLaunch,
+) -> std::result::Result<TuiDashboardLaunch, TuiDashboardLaunchFailure> {
+    let target = async {
+        anyhow::ensure!(!launch.core_only, "Successor did not enable the dashboard");
+        let instance = launch
+            .instance_id
+            .as_deref()
+            .context("Successor instance proof is missing")?;
+        let target = tokio::task::spawn_blocking(tui_control_target).await??;
+        anyhow::ensure!(
+            target.process.as_ref().is_some_and(|(pid, _, owner)| {
+                *pid == launch.pid && owner.as_deref() == Some(instance)
+            }),
+            "Dashboard successor identity changed before reconnect"
+        );
+        Ok::<_, anyhow::Error>(target)
+    }
+    .await
+    .map_err(|error| TuiDashboardLaunchFailure {
+        error,
+        target: None,
+    })?;
+    drop(launch);
+    let runtime = async {
+        let instance = target
+            .process
+            .as_ref()
+            .and_then(|(_, _, owner)| owner.as_deref())
+            .context("Successor instance proof is missing")?;
+        let endpoint = crate::acp::client::discovery::local_unix_endpoint(
+            crate::daemon::transport::local_socket_path()?,
+        );
+        let connection = crate::daemon::RuntimeConnection::connect(
+            &endpoint,
+            (!profile.is_empty()).then_some(profile),
+        )
+        .await?;
+        anyhow::ensure!(
+            connection.info().owner_instance_id.as_deref() == Some(instance),
+            "Dashboard successor identity changed before reconnect"
+        );
+        anyhow::ensure!(
+            predecessor_epoch.is_none_or(|epoch| epoch != connection.info().epoch),
+            "Dashboard successor reused the predecessor epoch"
+        );
+        let client = endpoint.daemon_client()?;
+        anyhow::ensure!(
+            tokio::task::spawn_blocking(tui_control_target).await?? == target,
+            "Dashboard successor identity changed before observation"
+        );
+        Ok::<_, anyhow::Error>((connection, client))
+    }
+    .await;
+    match runtime {
+        Ok(runtime) => Ok(TuiDashboardLaunch { runtime, target }),
+        Err(error) => Err(TuiDashboardLaunchFailure {
+            error,
+            target: Some(target),
+        }),
+    }
 }
 
 async fn start_daemon(
@@ -1805,7 +1887,7 @@ async fn start_daemon(
     let profile = resolved_profile.as_deref().unwrap_or(profile);
 
     let _state_lock = lock_serve_state()?;
-    if let Some(existing) = daemon_pid() {
+    if let Some(existing) = tokio::task::spawn_blocking(daemon_pid).await? {
         bail!("aoe serve daemon already running (PID {existing}); not starting another");
     }
     let exe = std::env::current_exe()?;
@@ -1983,21 +2065,30 @@ async fn start_daemon(
     let log = stdio_redirect_path()
         .map(|p| format!(" See {}.", p.display()))
         .unwrap_or_default();
+    let owner = std::sync::Arc::new((launch.instance_id, birth));
     let ready = await_daemon_ready(
         pid,
         &log,
         tokio::time::Instant::now() + readiness,
         || Ok(child.try_wait()?),
         || {
-            Box::pin(async {
-                client.local_daemon_ready(pid).await.unwrap_or(false)
-                    && daemon_pid() == Some(pid)
-                    && launch
-                        .instance_id
-                        .as_deref()
-                        .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
-                    && crate::process::process_birth_identity(pid)
-                        .is_ok_and(|current| current.as_ref() == Some(&birth))
+            let owner = std::sync::Arc::clone(&owner);
+            let client = &client;
+            Box::pin(async move {
+                if !client.local_daemon_ready(pid).await.unwrap_or(false) {
+                    return Ok(false);
+                }
+                tokio::task::spawn_blocking(move || {
+                    let (instance_id, birth) = owner.as_ref();
+                    daemon_pid() == Some(pid)
+                        && instance_id
+                            .as_deref()
+                            .is_some_and(|instance| live_daemon_instance_matches(pid, instance))
+                        && crate::process::process_birth_identity(pid)
+                            .is_ok_and(|current| current.as_ref() == Some(birth))
+                })
+                .await
+                .map_err(Into::into)
             })
         },
     )
@@ -2014,14 +2105,13 @@ async fn start_daemon(
     Ok(())
 }
 
-/// Polls until `ready`, the child exits, or `deadline`. The deadline error is
-/// "unconfirmed" because the daemon may still have been starting.
+/// Propagates probe failures; deadline expiry alone leaves startup unconfirmed.
 async fn await_daemon_ready<'a>(
     pid: u32,
     log: &str,
     deadline: tokio::time::Instant,
     mut exited: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
-    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>,
+    mut ready: impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>>,
 ) -> Result<()> {
     let started = tokio::time::Instant::now();
     let wait = tokio::time::timeout_at(deadline, async {
@@ -2029,7 +2119,10 @@ async fn await_daemon_ready<'a>(
             if let Some(status) = exited()? {
                 anyhow::bail!("Daemon exited before readiness ({status}).{log}");
             }
-            if ready().await {
+            if ready()
+                .await
+                .with_context(|| format!("Failed to check Daemon readiness (PID {pid}).{log}"))?
+            {
                 return Ok(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2161,7 +2254,7 @@ async fn replay_managed_launch(
             progress(crate::migrations::progress::Event::Step(message.to_owned()));
         }
     };
-    let Some(pid) = daemon_pid() else {
+    let Some(pid) = tokio::task::spawn_blocking(daemon_pid).await? else {
         bail!(
             "No running aoe serve daemon to restart.\n\
              Start one with: aoe serve --daemon"
@@ -2169,8 +2262,12 @@ async fn replay_managed_launch(
     };
     let transaction = migrate_managed_launch(transaction, false).await?;
 
-    let launch = managed_launch(pid)?;
-    let predecessor_passphrase = recall_serve_passphrase(&launch)?;
+    let (launch, predecessor_passphrase) = tokio::task::spawn_blocking(move || {
+        let launch = managed_launch(pid)?;
+        let passphrase = recall_serve_passphrase(&launch)?;
+        Ok::<_, anyhow::Error>((launch, passphrase))
+    })
+    .await??;
     let mut args = match override_args {
         Some(requested) => launch.overlay_tui_args(requested),
         None => launch.to_serve_args(None),
@@ -2196,9 +2293,12 @@ async fn replay_managed_launch(
     let transaction = migrate_managed_launch_reporting(transaction, true, reporter).await?;
     stage("Starting the new Daemon");
     complete_rollback_after(start_daemon(&launch.profile, &args, &transaction, announce).await)?;
-    let new_pid = daemon_pid().context("Restart successor is unavailable")?;
-    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid, "daemon restarted");
-    managed_launch(new_pid)
+    let successor = tokio::task::spawn_blocking(|| {
+        managed_launch(daemon_pid().context("Restart successor is unavailable")?)
+    })
+    .await??;
+    tracing::info!(target: "serve.lifecycle", old_pid = pid, new_pid = successor.pid, "daemon restarted");
+    Ok(successor)
 }
 
 fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
@@ -2208,6 +2308,255 @@ fn stale_cleanup_notice(pid: i32, announce: bool) -> Option<&'static str> {
     } else {
         "Daemon was not running; serve state changed meanwhile and was preserved"
     })
+}
+/// Opaque Daemon incarnation observed before a TUI control request is queued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TuiControlTarget {
+    process: Option<(u32, crate::process::ProcessBirthIdentity, Option<String>)>,
+}
+
+impl TuiControlTarget {
+    pub(crate) fn is_running(&self) -> bool {
+        self.process.is_some()
+    }
+}
+
+struct TuiObservedDaemon {
+    target: TuiControlTarget,
+    dashboard: bool,
+    passphrase: bool,
+}
+
+pub(crate) fn tui_control_target() -> Result<TuiControlTarget> {
+    Ok(tui_observed_daemon()?.target)
+}
+
+fn tui_observed_daemon() -> Result<TuiObservedDaemon> {
+    let mut dashboard = false;
+    let mut passphrase = false;
+    let process = match daemon_status() {
+        DaemonStatus::Absent => None,
+        DaemonStatus::Unverified => bail!("Cannot verify the Daemon; inspect `aoe serve --status`"),
+        DaemonStatus::Verified(pid) => {
+            let birth = crate::process::process_birth_identity(pid)?
+                .context("Daemon exited while its identity was being observed")?;
+            let launch = launch_file("serve.launch")?
+                .read()?
+                .map(|raw| serde_json::from_str::<ServeLaunch>(&raw))
+                .transpose()?;
+            let instance = match launch {
+                Some(launch) if launch.pid == pid => {
+                    anyhow::ensure!(
+                        !launch_contradicts(&launch, pid, instance_is_live(&launch, pid)),
+                        "Daemon launch identity contradicts its process; preserving serve state"
+                    );
+                    dashboard = !launch.core_only;
+                    passphrase = launch.has_passphrase;
+                    launch.instance_id
+                }
+                _ => {
+                    dashboard = true;
+                    passphrase = true;
+                    None
+                }
+            };
+            Some((pid, birth, instance))
+        }
+    };
+    Ok(TuiObservedDaemon {
+        target: TuiControlTarget { process },
+        dashboard,
+        passphrase,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_test_daemon(child: &mut std::process::Child) -> TuiControlTarget {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let status = child.try_wait().expect("fixture process status");
+        assert!(status.is_none(), "Daemon fixture exited: {status:?}");
+        match tui_control_target() {
+            Ok(target)
+                if target
+                    .process
+                    .as_ref()
+                    .is_some_and(|(pid, ..)| *pid == child.id()) =>
+            {
+                return target;
+            }
+            observed => assert!(
+                std::time::Instant::now() < deadline,
+                "Daemon fixture identity did not become observable: {observed:?}"
+            ),
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Holds lifecycle exclusion through a strictly incarnation-bound mutation.
+pub(crate) struct TuiControlLease {
+    transaction: crate::daemon::lifecycle::Transaction,
+    target: TuiControlTarget,
+}
+
+impl TuiControlLease {
+    pub(crate) async fn prepare(
+        target: TuiControlTarget,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        let transaction = tui_lifecycle_transaction(cancel).await?;
+        anyhow::ensure!(
+            !cancel.is_cancelled()
+                && tokio::task::spawn_blocking(tui_control_target).await?? == target
+                && !cancel.is_cancelled(),
+            "Daemon identity changed before control admission; preserving its successor"
+        );
+        Ok(Self {
+            transaction,
+            target,
+        })
+    }
+
+    pub(crate) async fn stop(&self) -> Result<()> {
+        if self.target.process.is_none() {
+            return Ok(());
+        }
+        stop_daemon_locked(&self.transaction, false).await
+    }
+
+    async fn restart(self, args: ServeArgs) -> Result<ServeLaunch> {
+        replay_managed_launch(self.transaction, Some(args), false, None).await
+    }
+}
+
+async fn tui_lifecycle_transaction(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<crate::daemon::lifecycle::Transaction> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => bail!("Serve operation cancelled before admission"),
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            crate::daemon::lifecycle::Transaction::acquire(),
+        ) => result.context("Daemon lifecycle is busy; inspect status before retrying")?,
+    }
+}
+
+/// Read-only observation can diagnose an exited owner, never adopt its replacement.
+pub(crate) struct TuiObservationLease {
+    _transaction: crate::daemon::lifecycle::Transaction,
+    observed: TuiObservedDaemon,
+    exited_process: Option<(u32, crate::process::ProcessBirthIdentity)>,
+}
+
+impl TuiObservationLease {
+    pub(crate) async fn prepare(
+        expected: Option<TuiControlTarget>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Self> {
+        let transaction = tui_lifecycle_transaction(cancel).await?;
+        anyhow::ensure!(!cancel.is_cancelled(), "Serve observation cancelled");
+        let observed = tui_observed_daemon()?;
+        let exited_process = match expected {
+            Some(expected) if tui_observed_exit(&expected, &observed.target)?.is_some() => {
+                expected.process.map(|(pid, birth, _)| (pid, birth))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            _transaction: transaction,
+            observed,
+            exited_process,
+        })
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.observed.target.is_running()
+    }
+
+    pub(crate) fn has_dashboard(&self) -> bool {
+        self.observed.dashboard
+    }
+
+    pub(crate) fn has_passphrase(&self) -> bool {
+        self.observed.passphrase
+    }
+
+    pub(crate) fn recheck(&mut self) -> Result<()> {
+        let current = tui_control_target()?;
+        if tui_observed_exit(&self.observed.target, &current)?.is_some() {
+            self.exited_process = self
+                .observed
+                .target
+                .process
+                .take()
+                .map(|(pid, birth, _)| (pid, birth));
+            self.observed.dashboard = false;
+            self.observed.passphrase = false;
+        }
+        self.observed.target = current;
+        Ok(())
+    }
+
+    pub(crate) fn into_target_and_tail(
+        self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> (TuiControlTarget, crate::acp::client::autostart::LogContext) {
+        let Self {
+            _transaction,
+            observed,
+            exited_process,
+        } = self;
+        // Diagnostic scans must not retain lifecycle exclusion after the identity recheck.
+        drop(_transaction);
+        let tail = exited_process
+            .as_ref()
+            .map(|(pid, birth)| {
+                crate::acp::client::autostart::startup_log_tail(*pid, birth, cancel)
+            })
+            .unwrap_or_default();
+        (observed.target, tail)
+    }
+
+    pub(crate) fn into_target(self) -> TuiControlTarget {
+        self.observed.target
+    }
+}
+
+fn tui_observed_exit(
+    expected: &TuiControlTarget,
+    current: &TuiControlTarget,
+) -> Result<Option<u32>> {
+    if expected == current {
+        return Ok(None);
+    }
+    let changed = "Daemon identity changed during observation; preserving its successor";
+    anyhow::ensure!(!current.is_running(), "{changed}");
+    let Some((pid, birth, instance)) = &expected.process else {
+        bail!("{changed}");
+    };
+    anyhow::ensure!(
+        !crate::process::process_birth_is_live(*pid, birth)?,
+        "{changed}"
+    );
+    anyhow::ensure!(
+        crate::process::process_birth_identity(*pid)?
+            .as_ref()
+            .is_none_or(|now| now == birth),
+        "{changed}"
+    );
+    if let Some(raw) = launch_file("serve.pid")?.read()? {
+        anyhow::ensure!(parse_positive_pid(&raw) == Some(*pid as i32), "{changed}");
+    }
+    if let Some(raw) = launch_file("serve.launch")?.read()? {
+        let launch: ServeLaunch = serde_json::from_str(&raw)?;
+        anyhow::ensure!(
+            launch.pid == *pid && launch.instance_id == *instance,
+            "{changed}"
+        );
+    }
+    Ok(Some(*pid))
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
@@ -2230,7 +2579,9 @@ async fn stop_daemon_locked(
         );
     }
 
-    let pid_str = tokio::fs::read_to_string(&path).await?;
+    let pid_str = crate::session::ResolvedDataFile::open(&path)?
+        .read()?
+        .with_context(|| format!("PID file disappeared at {}", path.display()))?;
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
     if matches!(
@@ -2252,9 +2603,16 @@ async fn stop_daemon_locked(
         .context("Daemon exited before its physical identity could be captured; retry stop")?;
     let process = crate::process::CapturedProcess::capture(pid as u32, &birth)?
         .context("Daemon incarnation changed before shutdown; preserving serve state")?;
-    match inspect_daemon_process(pid) {
+    let (identity, contradicts) = tokio::task::spawn_blocking(move || {
+        let identity = inspect_daemon_process(pid);
+        let contradicts = matches!(identity, DaemonProcessIdentity::Verified)
+            && serve_launch_contradicts(pid as u32);
+        (identity, contradicts)
+    })
+    .await?;
+    match identity {
         DaemonProcessIdentity::Verified => {
-            if serve_launch_contradicts(pid as u32) {
+            if contradicts {
                 bail!(
                     "PID {} is an aoe serve process, but not the daemon recorded in \
                      serve.launch (recycled PID); preserving serve state.",
@@ -2400,51 +2758,86 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn daemon_readiness_outcomes() {
         use std::os::unix::process::ExitStatusExt;
+        let pid = 42_424_242;
+        let log_path = "/private/readiness-fixture-e7f9.log";
+        let log = format!("\nLog: {log_path}");
         let far = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let mut polls = 0;
+        let mut observed_ready = false;
         await_daemon_ready(
-            7,
-            "",
+            pid,
+            &log,
             far,
             || Ok(None),
             || {
                 polls += 1;
-                Box::pin(std::future::ready(polls == 3))
+                observed_ready = polls >= 3;
+                Box::pin(std::future::ready(Ok(observed_ready)))
             },
         )
         .await
         .unwrap();
+        assert!(observed_ready);
+        assert!(tokio::time::Instant::now() < far);
 
+        let started = tokio::time::Instant::now();
         let err = await_daemon_ready(
-            7,
-            " See /log.",
+            pid,
+            &log,
             far,
             || Ok(Some(std::process::ExitStatus::from_raw(1 << 8))),
-            || Box::pin(async { false }),
+            || panic!("readiness must not be probed after child exit"),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("exited before readiness") && err.ends_with("See /log."),
-            "{err}"
-        );
+        .unwrap_err();
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert_eq!(tokio::time::Instant::now(), started);
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
         let err = await_daemon_ready(
-            7,
-            " See /log.",
+            pid,
+            &log,
             deadline,
             || Ok(None),
-            || Box::pin(async { false }),
+            || Box::pin(async { Ok(false) }),
         )
         .await
-        .unwrap_err()
-        .to_string();
-        assert_eq!(
-            err,
-            "Daemon startup remains unconfirmed after 105s (PID 7); stopping it. See /log."
+        .unwrap_err();
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert!(err.to_string().contains(&pid.to_string()), "{err:#}");
+        assert_eq!(tokio::time::Instant::now(), deadline);
+
+        const PROBE_FAILURE: &str = "readiness fixture failure";
+        let mut probe = Some(tokio::task::spawn_blocking(|| -> bool {
+            panic!("{PROBE_FAILURE}");
+        }));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(105);
+        let err = await_daemon_ready(
+            pid,
+            &log,
+            deadline,
+            || Ok(None),
+            || {
+                let probe = probe.take();
+                Box::pin(async move {
+                    match probe {
+                        Some(probe) => Ok(probe.await?),
+                        None => Ok(false),
+                    }
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<tokio::task::JoinError>()
+                .is_some_and(|error| error.is_panic()),
+            "{err:#}"
         );
+        assert!(err.to_string().contains(log_path), "{err:#}");
+        assert!(err.to_string().contains(&pid.to_string()), "{err:#}");
+        assert!(format!("{err:#}").contains(PROBE_FAILURE), "{err:#}");
+        assert!(tokio::time::Instant::now() < deadline);
     }
 
     use super::*;
@@ -2854,6 +3247,102 @@ mod tests {
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_dashboard_reconnect_retains_only_the_receipt_owner() {
+        use std::os::unix::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        crate::session::get_profile_dir("work").unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let spawn = |instance: &str| {
+            ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .env(SERVE_INSTANCE_ENV, instance)
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let publish = |child: &mut ChildGuard, instance: &str| {
+            let mut launch = sample_launch();
+            launch.pid = child.0.id();
+            launch.instance_id = Some(instance.to_owned());
+            write_serve_launch(&launch).unwrap();
+            std::fs::write(
+                crate::session::get_app_dir().unwrap().join("serve.pid"),
+                child.0.id().to_string(),
+            )
+            .unwrap();
+            let target = wait_for_test_daemon(&mut child.0);
+            (launch, target)
+        };
+        let mut original = spawn("receipt-owner");
+        let (receipt, original_target) = publish(&mut original, "receipt-owner");
+        let socket = crate::daemon::transport::local_socket_path().unwrap();
+        assert!(socket.starts_with(
+            crate::session::get_app_dir()
+                .unwrap()
+                .canonicalize()
+                .unwrap()
+        ));
+        assert!(
+            !socket.exists(),
+            "Reconnect must hit the isolated missing socket"
+        );
+        let failure = match connect_owned_dashboard("work", None, receipt).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("A missing runtime socket cannot establish a Client"),
+        };
+        let owned_target = failure
+            .target
+            .expect("Client reconnect failure must retain the verified launch owner");
+        assert_eq!(owned_target, original_target);
+
+        original.0.kill().unwrap();
+        original.0.wait().unwrap();
+        let mut successor = spawn("unrelated-successor");
+        let (_, successor_target) = publish(&mut successor, "unrelated-successor");
+        assert_ne!(owned_target, successor_target);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert!(TuiControlLease::prepare(owned_target, &cancel)
+            .await
+            .is_err());
+        let mut stale_receipt = sample_launch();
+        stale_receipt.pid = original.0.id();
+        stale_receipt.instance_id = Some("receipt-owner".to_owned());
+        let rejected = match connect_owned_dashboard("work", None, stale_receipt).await {
+            Err(failure) => failure,
+            Ok(_) => panic!("An unrelated Daemon cannot satisfy the launch receipt"),
+        };
+        assert!(
+            rejected.target.is_none(),
+            "A receipt mismatch cannot grant authority over the successor"
+        );
+        assert!(successor.0.try_wait().unwrap().is_none());
+        assert_eq!(tui_control_target().unwrap(), successor_target);
     }
 
     #[test]
@@ -3665,6 +4154,360 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(app.join(".schema_version"))?,
             version
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_control_refuses_a_successor_before_stop_or_reset_admission() -> Result<()> {
+        use std::future::Future;
+        use std::os::unix::process::CommandExt;
+        use std::task::Poll;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::tempdir()?;
+        nix::unistd::mkfifo(
+            &fixture.path().join("serve"),
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let spawn = || -> Result<ChildGuard> {
+            Ok(ChildGuard(
+                std::process::Command::new("cat")
+                    .arg0("aoe")
+                    .arg("serve")
+                    .current_dir(fixture.path())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?,
+            ))
+        };
+        let pid_path = pid_file_path()?;
+        for had_predecessor in [false, true] {
+            let mut predecessor = if had_predecessor {
+                Some(spawn()?)
+            } else {
+                None
+            };
+            if let Some(child) = &predecessor {
+                std::fs::write(&pid_path, child.0.id().to_string())?;
+            }
+            let target = tui_control_target()?;
+            let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let mut waiting = Box::pin(TuiControlLease::prepare(target, &cancel));
+            std::future::poll_fn(|cx| {
+                assert!(matches!(waiting.as_mut().poll(cx), Poll::Pending));
+                Poll::Ready(())
+            })
+            .await;
+            if let Some(child) = &mut predecessor {
+                child.0.kill()?;
+                child.0.wait()?;
+            }
+            let mut successor = spawn()?;
+            std::fs::write(&pid_path, successor.0.id().to_string())?;
+            drop(transaction);
+            assert!(waiting.await.is_err());
+            assert!(
+                successor.0.try_wait()?.is_none(),
+                "stale admission affected the successor"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&pid_path)?,
+                successor.0.id().to_string(),
+            );
+            let lease = TuiControlLease::prepare(tui_control_target()?, &cancel).await?;
+            lease.stop().await?;
+            successor.0.wait()?;
+            assert!(
+                !pid_path.exists(),
+                "the freshly authorized stop must finish cleanup"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tui_control_cancellation_releases_a_queued_lifecycle_request() -> Result<()> {
+        use std::future::Future;
+        use std::task::Poll;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let target = tui_control_target()?;
+        let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut waiting = Box::pin(TuiControlLease::prepare(target, &cancel));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(waiting.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        cancel.cancel();
+        assert!(waiting.await.is_err());
+        drop(transaction);
+        let lease = TuiControlLease::prepare(
+            tui_control_target()?,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await?;
+        lease.stop().await?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "linux",
+        ignore = "requires private user, mount and PID namespaces; run with --ignored"
+    )]
+    #[serial_test::serial]
+    fn tui_control_inspection_keeps_the_async_executor_reactive() -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixDatagram;
+        use std::os::unix::process::CommandExt;
+
+        let python = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import os,sys; print(os.path.realpath(sys.executable))",
+            ])
+            .output()
+            .context("process-inspection fixture requires python3")?;
+        anyhow::ensure!(
+            python.status.success(),
+            "python3 fixture interpreter failed"
+        );
+        let python = String::from_utf8(python.stdout)?.trim().to_owned();
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("AOE_TUI_PS_TEST_CHILD").is_none() {
+            let name = format!(
+                "{}::tui_control_inspection_keeps_the_async_executor_reactive",
+                module_path!().split_once("::").unwrap().1
+            );
+            let output = std::process::Command::new("unshare")
+                .args([
+                    "--user",
+                    "--map-root-user",
+                    "--mount",
+                    "--pid",
+                    "--fork",
+                    "--mount-proc",
+                ])
+                .arg(std::env::current_exe()?)
+                .args(["--exact", &name, "--ignored", "--nocapture"])
+                .env("AOE_TUI_PS_TEST_CHILD", "1")
+                .env("TMPDIR", "/tmp")
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "private process-inspection fixture failed:\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::io::stdout().write_all(&output.stdout)?;
+            std::io::stderr().write_all(&output.stderr)?;
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let map = std::fs::read_to_string("/proc/self/uid_map")?;
+            anyhow::ensure!(
+                std::process::id() == 1
+                    && map
+                        .lines()
+                        .all(|line| line.split_whitespace().last() == Some("1")),
+                "process-inspection fixture requires its private namespaces"
+            );
+            anyhow::ensure!(
+                std::process::Command::new("mount")
+                    .args(["-t", "tmpfs", "-o", "mode=0700", "tmpfs", "/tmp"])
+                    .status()?
+                    .success(),
+                "could not create a trusted private runtime directory"
+            );
+            let jail = std::path::Path::new("/tmp/process-inspection-root");
+            std::fs::create_dir(jail)?;
+            let interpreter_root = std::path::Path::new(&python)
+                .components()
+                .nth(1)
+                .context("fixture interpreter has no absolute root")?
+                .as_os_str();
+            for name in ["usr", "bin", "lib", "lib64", "etc", "dev", "proc", "home"]
+                .into_iter()
+                .map(std::ffi::OsStr::new)
+                .chain(std::iter::once(interpreter_root))
+            {
+                let destination = jail.join(name);
+                if destination.exists() {
+                    continue;
+                }
+                std::fs::create_dir(&destination)?;
+                anyhow::ensure!(
+                    std::process::Command::new("mount")
+                        .arg("--rbind")
+                        .arg(std::path::Path::new("/").join(name))
+                        .arg(&destination)
+                        .status()?
+                        .success(),
+                    "could not bind private fixture dependency {name:?}"
+                );
+            }
+            std::fs::create_dir(jail.join("tmp"))?;
+            std::fs::create_dir(jail.join("run"))?;
+            nix::unistd::chroot(jail)?;
+            std::env::set_current_dir("/")?;
+        }
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        struct ProcMask(std::path::PathBuf);
+        #[cfg(target_os = "linux")]
+        impl Drop for ProcMask {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("umount").arg(&self.0).status();
+            }
+        }
+
+        let _home = crate::session::test_support::isolate_app_dir();
+        let fixture = tempfile::TempDir::new_in("/tmp")?;
+        let fifo = fixture.path().join("serve");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let child = ChildGuard(
+            std::process::Command::new("cat")
+                .arg0("aoe")
+                .arg("serve")
+                .current_dir(fixture.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()?,
+        );
+        let birth = crate::process::process_birth_identity(child.0.id())?
+            .context("fixture has no kernel birth identity")?;
+        let target = TuiControlTarget {
+            process: Some((child.0.id(), birth, None)),
+        };
+        std::fs::write(pid_file_path()?, child.0.id().to_string())?;
+        #[cfg(target_os = "linux")]
+        let _mask = {
+            let proc = std::path::PathBuf::from(format!("/proc/{}", child.0.id()));
+            let shadow = fixture.path().join("proc");
+            std::fs::create_dir(&shadow)?;
+            std::fs::copy(proc.join("stat"), shadow.join("stat"))?;
+            anyhow::ensure!(
+                std::process::Command::new("mount")
+                    .args(["--bind"])
+                    .arg(&shadow)
+                    .arg(&proc)
+                    .status()?
+                    .success(),
+                "could not isolate the fixture's process-inspection fallback"
+            );
+            ProcMask(proc)
+        };
+        let started_path = fixture.path().join("started.sock");
+        let started = UnixDatagram::bind(&started_path)?;
+        started.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let release_path = fixture.path().join("release");
+        nix::unistd::mkfifo(
+            &release_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )?;
+        let release = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&release_path)?;
+        let program = fixture.path().join("ps");
+        std::fs::write(&program, format!(
+            "#!{python}\nimport os,socket\ns=socket.socket(socket.AF_UNIX,socket.SOCK_DGRAM)\ns.sendto(str(os.getpid()).encode(),{started_path:?})\nwith open({release_path:?}) as gate: gate.readline()\nprint('aoe serve')\n",
+        ))?;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))?;
+        let mut path = vec![fixture.path().to_path_buf()];
+        path.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let _path =
+            crate::session::test_support::EnvGuard::set(&[("PATH", std::env::join_paths(path)?)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        for cancel_during_inspection in [false, true] {
+            let started = started.try_clone()?;
+            let mut release = release.try_clone()?;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_worker = cancel.clone();
+            let (wake, entered) = tokio::sync::oneshot::channel();
+            let (ticked, tick) = std::sync::mpsc::channel();
+            let observer = std::thread::spawn(move || -> Result<(bool, bool)> {
+                let mut bytes = [0; 32];
+                let observed = started.recv(&mut bytes).ok().and_then(|length| {
+                    std::str::from_utf8(&bytes[..length])
+                        .ok()?
+                        .parse::<i32>()
+                        .ok()
+                });
+                let _ = wake.send(());
+                let progressed = tick
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+                let alive = observed.is_some_and(|pid| {
+                    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                });
+                if cancel_during_inspection {
+                    cancel_worker.cancel();
+                }
+                release.write_all(b"continue\n")?;
+                Ok((observed.is_some(), progressed && alive))
+            });
+            let result = runtime.block_on(async {
+                let ticker = tokio::spawn(async move {
+                    let _ = entered.await;
+                    let _ = ticked.send(());
+                });
+                let result = TuiControlLease::prepare(target.clone(), &cancel).await;
+                ticker.await.unwrap();
+                result
+            });
+            let (entered, responsive) = observer.join().unwrap()?;
+            assert!(
+                entered,
+                "retained ps fixture was not entered: {:?}",
+                result.as_ref().err().map(|error| format!("{error:#}"))
+            );
+            assert!(
+                responsive,
+                "executor progressed only after the retained ps exited"
+            );
+            match result {
+                Ok(lease) => {
+                    assert!(!cancel_during_inspection);
+                    assert_eq!(lease.target, target);
+                }
+                Err(error) => assert!(cancel_during_inspection, "{error:#}"),
+            }
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child.0.id() as i32), None).is_ok()
         );
         Ok(())
     }

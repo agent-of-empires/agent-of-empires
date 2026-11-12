@@ -605,13 +605,15 @@ impl HomeView {
         true
     }
 
-    fn trash_confirmation_is_current(&self, target: &super::SessionDialogTarget) -> bool {
-        self.get_instance(&target.session_id)
-            .is_some_and(|instance| {
-                instance.source_profile == target.source_profile
-                    && instance.lifecycle_generation == target.lifecycle_generation
-                    && !instance.is_trashed()
-            })
+    fn trash_confirmation_is_current(&self, target: &super::TrashDialogTarget) -> bool {
+        self.session_feed.applied_epoch() == Some(target.epoch.as_str())
+            && self
+                .get_instance(&target.session_id)
+                .is_some_and(|instance| {
+                    instance.source_profile == target.source_profile
+                        && instance.lifecycle_generation == target.lifecycle_generation
+                        && !instance.is_trashed()
+                })
             && self
                 .session_feed
                 .applied_session(&target.session_id)
@@ -1519,7 +1521,7 @@ impl HomeView {
                 self.reconcile_trash_confirmation();
                 if let Some(target) = self.pending_trash_session.take() {
                     if self.trash_confirmation_is_current(&target) {
-                        self.trash_session_by_id(&target.session_id);
+                        self.trash_session_by_id_at_epoch(&target.session_id, target.epoch);
                     }
                 }
                 None
@@ -2267,10 +2269,25 @@ impl HomeView {
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
-                ServeAction::Stop => return Some(Action::StopDashboard),
-                ServeAction::Launch(request) => {
-                    self.pending_dashboard_launch = Some(request);
-                    return Some(Action::StartDashboard);
+                ServeAction::Stop(request) => {
+                    if self.pending_dashboard_stop.is_none() {
+                        self.pending_dashboard_stop =
+                            Some(crate::tui::app::DashboardStopRequest::Operation(request));
+                        return Some(Action::StopDashboard);
+                    }
+                    return None;
+                }
+                ServeAction::StopOwnedLaunch => {
+                    if !matches!(self.dashboard_launch, Some(DashboardLaunch::Running { .. })) {
+                        serve.refuse_stop();
+                        return None;
+                    }
+                    if self.pending_dashboard_stop.is_none() {
+                        self.pending_dashboard_stop =
+                            Some(crate::tui::app::DashboardStopRequest::OwnedLaunch);
+                        return Some(Action::StopDashboard);
+                    }
+                    return None;
                 }
                 ServeAction::Close => {
                     self.serve_view = None;
@@ -3431,6 +3448,8 @@ impl HomeView {
                     | ActionId::NextWaiting
                     | ActionId::Tips
                     | ActionId::EmptyTrash
+                    | ActionId::RestoreTrash
+                    | ActionId::RetryTrash
                     | ActionId::OpenCommandPalette
                     | ActionId::PreviewScrollUp
                     | ActionId::PreviewScrollDown
@@ -3587,6 +3606,8 @@ impl HomeView {
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
+            ActionId::RestoreTrash => self.restore_selected_from_trash(),
+            ActionId::RetryTrash => self.retry_selected_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
@@ -4286,6 +4307,10 @@ impl HomeView {
     }
 
     pub(crate) fn open_serve(&mut self) {
+        if let Some(stop) = &self.dashboard_stop {
+            self.serve_view = Some(ServeView::for_stop(stop.clone(), &mut self.serve_jobs));
+            return;
+        }
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",
@@ -4300,7 +4325,10 @@ impl HomeView {
         self.dashboard_launch = launch
             .clone()
             .filter(|launch| matches!(launch, DashboardLaunch::Running { .. }));
-        self.serve_view = Some(launch.map_or_else(ServeView::new, ServeView::for_launch));
+        self.serve_view = Some(match launch {
+            Some(launch) => ServeView::for_launch(launch, &mut self.serve_jobs),
+            None => ServeView::new(&mut self.serve_jobs),
+        });
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -4892,6 +4920,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.vt_yield = None;
                 self.retained_preview = None;
                 self.retained_focus = None;
                 self.retained_scroll_offset = 0;
@@ -5514,11 +5543,13 @@ impl HomeView {
             if let super::Item::Session { id, .. } = &self.flat_items[idx] {
                 if let Some(inst) = self.get_instance(id).filter(|inst| inst.is_trashed()) {
                     self.context_menu = Some(
-                        ContextMenuDialog::for_trashed_session(anchor).with_session_target(
-                            &inst.id,
-                            &inst.source_profile,
-                            inst.lifecycle_generation,
-                        ),
+                        ContextMenuDialog::for_trashed_session(anchor, inst.has_pending_trash())
+                            .with_session_target(
+                                &inst.id,
+                                &inst.source_profile,
+                                inst.lifecycle_generation,
+                                self.session_feed.applied_epoch(),
+                            ),
                     );
                     return true;
                 }
@@ -5639,20 +5670,25 @@ impl HomeView {
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
         let menu = self.context_menu.take();
-        if let Some((id, profile, generation)) =
-            menu.as_ref().and_then(ContextMenuDialog::session_target)
-        {
-            let valid = self.selected_session.as_ref() == Some(id)
-                && self.get_instance(id).is_some_and(|inst| {
-                    inst.source_profile == *profile
-                        && inst.lifecycle_generation == *generation
+        if let Some(target) = menu.as_ref().and_then(ContextMenuDialog::session_target) {
+            let valid = target
+                .epoch
+                .as_deref()
+                .is_some_and(|epoch| self.session_feed.applied_epoch() == Some(epoch))
+                && self.selected_session.as_ref() == Some(&target.id)
+                && self.get_instance(&target.id).is_some_and(|inst| {
+                    inst.source_profile == target.profile
+                        && inst.lifecycle_generation == target.generation
                         && inst.is_trashed()
                 })
-                && self.session_feed.applied_session(id).is_some_and(|row| {
-                    row.profile == *profile
-                        && row.lifecycle_generation == *generation
-                        && row.trashed_at.is_some()
-                });
+                && self
+                    .session_feed
+                    .applied_session(&target.id)
+                    .is_some_and(|row| {
+                        row.profile == target.profile
+                            && row.lifecycle_generation == target.generation
+                            && row.trashed_at.is_some()
+                    });
             if !valid {
                 self.flash_status("Session changed; reopen the context menu");
                 return;
@@ -5663,6 +5699,7 @@ impl HomeView {
                 action,
                 ContextMenuAction::Restore
                     | ContextMenuAction::Delete
+                    | ContextMenuAction::RetryTrash
                     | ContextMenuAction::NewSession
                     | ContextMenuAction::OpenSortPicker
                     | ContextMenuAction::OpenGroupPicker
@@ -5733,6 +5770,7 @@ impl HomeView {
                 None => {}
             },
             ContextMenuAction::Restore => self.restore_selected_from_trash(),
+            ContextMenuAction::RetryTrash => self.retry_selected_trash(),
             ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
                 Some(SidebarSection::Trash) => self.toggle_trashed_section(),
                 Some(SidebarSection::Archived) => self.toggle_archived_section(),
@@ -6199,11 +6237,17 @@ impl HomeView {
                     // while a stray keystroke is harmless; the accept path runs the same
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
+                        let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned)
+                        else {
+                            self.flash_status("Runtime unavailable; reopen Trash controls");
+                            return;
+                        };
                         let message = format!("Move '{}' to the trash?", inst.title);
-                        self.pending_trash_session = Some(super::SessionDialogTarget {
+                        self.pending_trash_session = Some(super::TrashDialogTarget {
                             session_id: sid,
                             source_profile: inst.source_profile.clone(),
                             lifecycle_generation: inst.lifecycle_generation,
+                            epoch,
                         });
                         let dialog = self
                             .confirm_by_repeating(
@@ -7265,6 +7309,7 @@ impl HomeView {
             _ => "Another surface took over this session's live view.",
         };
         self.teardown_live_send();
+        self.vt_yield = Some(state.tmux_name);
         self.info_dialog = Some(InfoDialog::new("Live send ended", message));
         true
     }

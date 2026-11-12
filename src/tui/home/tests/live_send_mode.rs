@@ -145,6 +145,73 @@ fn poll_live_send_takeover_exits_live_mode_with_dialog() {
     );
 }
 
+/// A takeover leaves the taken pane on capture-pane, so the new owner can arm the VT
+/// pipe this process's preview would otherwise keep leased. Moving to another session or
+/// entering live mode again lifts the yield.
+#[test]
+#[serial]
+fn a_takeover_yields_the_previewed_panes_vt_pipe_until_live_or_reselect() {
+    use crate::tui::home::live_send::LiveSendWorker;
+    for lifts_by in ["reselect", "live"] {
+        let mut env = create_test_env_with_sessions(2);
+        let _native_driver = env.view.session_feed.terminal_driver_for_test();
+        env.view.vt_live_enabled = true;
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let id = install_live_for_first_session(&mut env);
+        let tmux_name = env.view.live_send.as_ref().unwrap().tmux_name.clone();
+        assert!(env.view.preview_vt_enabled(Some(&tmux_name)), "{lifts_by}");
+        env.view.live_send_worker = Some(LiveSendWorker::spawn(
+            "fake".to_string(),
+            None,
+            crate::tui::session_feed::NativeLease::valid_for_test(),
+        ));
+        env.view
+            .live_send_worker
+            .as_ref()
+            .unwrap()
+            .force_lock_lost_for_test();
+        assert!(env.view.poll_live_send_takeover());
+
+        assert!(!env.view.preview_vt_enabled(Some(&tmux_name)), "{lifts_by}");
+        assert!(
+            env.view.preview_vt_enabled(Some("aoe_other_pane")),
+            "{lifts_by}"
+        );
+        match lifts_by {
+            "reselect" => {
+                let other = env
+                    .view
+                    .flat_items
+                    .iter()
+                    .position(|item| {
+                        matches!(item, crate::session::Item::Session { id: sid, .. } if *sid != id)
+                    })
+                    .unwrap();
+                env.view.cursor = other;
+                env.view.update_selected();
+            }
+            _ => {
+                env.view
+                    .session_feed
+                    .publish_for_test(super::session_feed_tests::daemon_snapshot(
+                        &env.view, &id, "Running",
+                    ));
+                env.view.apply_session_feed();
+                env.view
+                    .enter_live_send_with(
+                        &id,
+                        &tmux_name,
+                        crate::tui::home::live_send::LiveSendTarget::Agent,
+                        crate::tui::session_feed::NativeLease::valid_for_test(),
+                    )
+                    .expect("live entry");
+            }
+        }
+        assert!(env.view.preview_vt_enabled(Some(&tmux_name)), "{lifts_by}");
+    }
+}
+
 /// Ctrl+q is the safety chord: it exits cleanly even when the session vanished, so a stuck
 /// live mode is recoverable without a dialog. Any other key is swallowed without bubbling an
 /// Action (which would race the live state), and on a vanished session auto-exits with an

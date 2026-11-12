@@ -662,12 +662,17 @@ fn write_raw_startup_marker(writer: &mut dyn Write) {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+    let pid = std::process::id();
+    let birth = crate::process::process_birth_identity(pid).ok().flatten();
+    let (boot_id, start_id) = birth
+        .as_ref()
+        .map_or(("unavailable", "unavailable"), |birth| {
+            (birth.boot_id.as_str(), birth.start_id.as_str())
+        });
     let line = format!(
-        "{} INFO log.runtime [AOE_START_MARKER] version={} pid={} exe={}\n",
+        "{} INFO log.runtime [AOE_START_MARKER] version={} pid={pid} boot_id={boot_id} start_id={start_id} exe={exe}\n",
         chrono::Utc::now().to_rfc3339(),
         env!("CARGO_PKG_VERSION"),
-        std::process::id(),
-        exe,
     );
     let _ = writer.write_all(line.as_bytes());
     let _ = writer.flush();
@@ -851,7 +856,7 @@ impl Drop for SizeRotatingWriter {
     }
 }
 
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(suffix);
     PathBuf::from(s)

@@ -100,7 +100,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
   if (!prefill) return base;
   return {
     ...base,
-    path: prefill.scratch ? "" : prefill.path || "",
+    // A prefill without a path (group-only) keeps the remembered project; a tab-only one opens the picker.
+    path: prefill.scratch ? "" : prefill.path || (prefill.initialTab ? "" : base.path),
     tool: prefill.tool || base.tool,
     yoloMode: prefill.yoloMode ?? false,
     sandboxEnabled: prefill.sandboxEnabled ?? false,

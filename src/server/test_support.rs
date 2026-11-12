@@ -685,3 +685,16 @@ pub(crate) async fn serve_local_plugin_fixture(
     ));
     serve_owner_router_for_test(path, app).await
 }
+
+/// A launcher whose agent rejects `initialize` for want of a login, as the connection task
+/// reports it before the handshake completes.
+#[cfg(test)]
+pub(crate) fn unauthenticated_launcher() -> crate::acp::supervisor::Launcher {
+    Arc::new(|_config, _id| {
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "ACP connection failed: Authentication required".into(),
+            ))
+        })
+    })
+}

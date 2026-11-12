@@ -652,6 +652,31 @@ pub struct AcpConfig {
         summary = "When an Agent hits its usage limit, pick up again on its own once the limit resets. It stops trying after a few attempts in a row."
     )]
     pub rate_limit_auto_resume: bool,
+    /// Opt-in account failover. When a host structured session parks on a
+    /// rate limit and another account in `rate_limit_failover_accounts` has
+    /// headroom, the session continues there instead of waiting for the reset:
+    /// the conversation is carried to that account and the interrupted prompt
+    /// is re-sent once. Needs the same agent behind both accounts and a
+    /// carryable conversation, otherwise the normal banner stays. You are
+    /// responsible for complying with the agent provider's terms for the
+    /// accounts you configure.
+    #[serde(default)]
+    #[setting(
+        label = "Fail over to another account on rate limit",
+        widget = "toggle",
+        web = "local_only:moves a session's transcript between configured accounts"
+    )]
+    pub rate_limit_failover: bool,
+    /// Ordered failover pool: tool names, each an account declared under
+    /// `[session.agent_config_dir]`. Only names running the same built-in agent
+    /// as the session are used; others are ignored with a warning.
+    #[serde(default)]
+    #[setting(
+        label = "Failover accounts",
+        widget = "list",
+        web = "local_only:names accounts whose config directories hold credentials"
+    )]
+    pub rate_limit_failover_accounts: Vec<String>,
     /// Allow the web dashboard's "Update & restart" control to run the
     /// agent's `npm install -g <pkg>` on the host and respawn the worker.
     /// Off by default: the daemon executing a global package install is a
@@ -731,6 +756,8 @@ impl Default for AcpConfig {
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
+            rate_limit_failover: false,
+            rate_limit_failover_accounts: Vec::new(),
             allow_agent_install: false,
             acp_defaults: HashMap::new(),
         }

@@ -5,6 +5,7 @@ import { test, expect } from "./helpers/mockedTest";
 import type { Locator, Page, Route } from "@playwright/test";
 import { installSidebarMocks, type MockSessionInput } from "./helpers/sidebarMocks";
 import { sessionResponse } from "./helpers/sessions";
+import { launch, mockWizardApis, sessionStub, wizard } from "./helpers/wizard";
 
 const HEADER = "[data-testid='sidebar-group-header']";
 const ROW = "[data-testid='sidebar-session-row']";
@@ -210,6 +211,31 @@ test.describe("sidebar user-group axis (#1234)", () => {
     // Collapse maps are per axis; the picker switches straight back to repo.
     await pickAxis(page, axisToggle, "repo");
     await expect(page.locator(`${HEADER} button[aria-expanded]`)).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
+test.describe("sidebar group header + (#5498)", () => {
+  test("opens the wizard on the remembered project with that group, and creates the session in it", async ({
+    page,
+  }) => {
+    const created = await mockWizardApis(page, {
+      projects: [],
+      sessions: [sessionStub({ id: "s-f1", title: "feat-one", group_path: "feature" })],
+    });
+    await page.addInitScript(() => localStorage.setItem("aoe-new-session-last-project", "/tmp/remembered"));
+    await gotoDesktop(page);
+    await pickAxis(page, page.locator(AXIS_TOGGLE), "group");
+
+    await page
+      .locator(`${HEADER}[data-group-id='feature']`)
+      .getByRole("button", { name: "New session in feature" })
+      .click();
+
+    const w = wizard(page);
+    await expect(w.getByTestId("wizard-project-row")).toContainText("/tmp/remembered");
+    await launch(page);
+    await expect.poll(() => created.length).toBe(1);
+    expect(created[0]).toMatchObject({ path: "/tmp/remembered", group: "feature" });
   });
 });
 

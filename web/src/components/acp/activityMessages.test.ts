@@ -402,6 +402,7 @@ describe("subagents", () => {
       { memory_recall: { mode: "synthesize" as const, synthesized_text: "remembered" } },
       { mode: "synthesize", synthesized_text: "remembered" },
     ],
+    ["_aoe_prompt", { prompt: "the full prompt" }, "the full prompt"],
     [
       "_aoe_diffs",
       { diffs: [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }] },

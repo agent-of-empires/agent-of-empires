@@ -46,6 +46,9 @@ pub struct Todo {
     pub completed: bool,
 }
 
+/// Ends an `args_preview` that was cut at the ingest cap.
+pub(crate) const ARGS_CUT_MARKER: &str = "\u{2026}[truncated]";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -55,6 +58,9 @@ pub struct ToolCall {
     pub kind: String,
     /// Capped at 16 KB at ingest, control chars stripped.
     pub args_preview: String,
+    /// The `prompt` argument in full, set only when `args_preview` was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub started_at: DateTime<Utc>,
     /// The sub-agent `Task` call this call runs under, from `_meta.claudeCode.parentToolUseId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -512,6 +518,9 @@ pub struct SubagentRecord {
 /// One tool call a background sub-agent made, parsed from its transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundAgentTool {
+    /// The transcript's `tool_use` id, a stable key while the list grows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     /// Short label from the tool input (command, file path, pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -519,6 +528,12 @@ pub struct BackgroundAgentTool {
     /// `None` while running, then whether it succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// Transcript timestamp of the call; `None` when the line carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Transcript timestamp of the matching result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// One async background sub-agent, built up from `BackgroundAgent*` events.
@@ -722,6 +737,9 @@ pub enum Event {
         title: Option<String>,
         #[serde(default)]
         args_preview: Option<String>,
+        /// The `prompt` argument in full when `args_preview` was cut.
+        #[serde(default)]
+        prompt: Option<String>,
         #[serde(default)]
         started_at: Option<DateTime<Utc>>,
         /// Replaces the call's diffs when present (Codex sends them on updates).
@@ -1049,10 +1067,16 @@ impl AcpState {
         match self.sidebar_phase {
             SidebarPhase::Error => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
+            // Subagent and late parent events re-arm `Active` while a question is open.
+            SidebarPhase::Active if self.has_pending_request() => Status::Waiting,
             SidebarPhase::Active => Status::Running,
             SidebarPhase::Idle if self.has_active_background_agent() => Status::Running,
             SidebarPhase::Idle => Status::Idle,
         }
+    }
+
+    fn has_pending_request(&self) -> bool {
+        !self.pending_approvals.is_empty() || !self.pending_elicitations.is_empty()
     }
 
     pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
@@ -1080,6 +1104,7 @@ impl AcpState {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => {
@@ -1092,6 +1117,11 @@ impl AcpState {
                         tool.name = title;
                     }
                     if let Some(args_preview) = args_preview {
+                        // An uncut preview means the prompt is no longer oversized; a cut
+                        // one with no prompt is a deduplicated repeat of the stored prompt.
+                        if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
+                            tool.prompt = prompt;
+                        }
                         tool.args_preview = args_preview;
                     }
                     if let Some(started_at) = started_at {
@@ -1609,6 +1639,7 @@ mod tests {
         use super::test_support::chunk;
         use crate::acp::permissions::build_approval;
         let tool = || ToolCall {
+            prompt: None,
             id: "t".into(),
             name: "shell".into(),
             kind: "execute".into(),
@@ -1703,6 +1734,44 @@ mod tests {
                     prompt("go"),
                     Event::ElicitationRequested {
                         elicitation: elicitation.clone(),
+                    },
+                ],
+                Status::Waiting,
+            ),
+            (
+                "question open while a subagent runs tools",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                    Event::ToolCallStarted {
+                        tool_call: ToolCall {
+                            parent_tool_call_id: Some("task-1".into()),
+                            ..tool()
+                        },
+                    },
+                    chunk("x"),
+                ],
+                Status::Waiting,
+            ),
+            (
+                "one of two questions answered",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                    Event::ElicitationRequested {
+                        elicitation: Elicitation {
+                            nonce: Nonce("e-2".into()),
+                            ..elicitation.clone()
+                        },
+                    },
+                    Event::ElicitationResolved {
+                        nonce: Nonce("e-1".into()),
+                        outcome: ElicitationOutcome::Cancelled,
+                        answers: Vec::new(),
                     },
                 ],
                 Status::Waiting,
@@ -1959,6 +2028,7 @@ mod tests {
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: "Read".into(),
             kind: "read".into(),
@@ -1981,6 +2051,7 @@ mod tests {
 
     fn tool_update(title: Option<&str>, diffs: Option<Vec<DiffPreview>>) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-1".into(),
             title: title.map(Into::into),
             args_preview: None,
@@ -2119,6 +2190,7 @@ mod tests {
             "another tool's completion leaves it set"
         );
         let retitle = Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-compact".into(),
             title: Some("Compacting context".into()),
             args_preview: None,
@@ -2244,6 +2316,45 @@ mod tests {
         assert_eq!(tool.name, "Edit src/foo.rs");
         assert_eq!(tool.diffs.len(), 1, "a text-only update keeps the diffs");
 
+        let mut restated = s.clone();
+        restated.in_flight_tool.as_mut().unwrap().prompt = Some("full prompt".into());
+        restated
+            .apply_event(
+                restated.last_seq.saturating_add(1),
+                Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"cut\u{2026}[truncated]".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.as_ref().unwrap().prompt.as_deref(),
+            Some("full prompt"),
+            "a cut preview without its own prompt keeps the stored one"
+        );
+        restated
+            .apply_event(
+                restated.last_seq.saturating_add(1),
+                Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"B\"}".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.unwrap().prompt,
+            None,
+            "an uncut preview means the prompt was replaced by a short one"
+        );
+
         let mut richer = tool_call("tc-1");
         richer.name = "Write src/foo.rs".into();
         s.apply_event(
@@ -2312,9 +2423,12 @@ mod tests {
             progress(
                 3,
                 vec![BackgroundAgentTool {
+                    id: None,
                     name: "Read".into(),
                     title: Some("x.rs".into()),
                     ok: Some(true),
+                    started_at: None,
+                    ended_at: None,
                 }],
             ),
         ]);

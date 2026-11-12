@@ -11,7 +11,7 @@ use agent_client_protocol::v1::schema::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::debug;
 
 use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
@@ -32,6 +32,8 @@ use crate::acp::acp_client::update_events::{
     CompactionFold, CompactionTracker,
 };
 use crate::acp::acp_client::watchdog::classify_watchdog_notification_signals;
+use crate::acp::acp_client::SessionState;
+use crate::acp::control_protocol::PromptOutcome;
 
 pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
@@ -75,7 +77,11 @@ pub(super) struct Shared {
     /// Reset epochs (unix seconds) per rejected quota window. Cleared at each
     /// prompt and drained when a turn parks; a window that later reports a
     /// non-rejected status is removed (#3028, #3152).
-    pub(super) rate_limit_rejections: std::sync::Mutex<HashMap<String, i64>>,
+    pub(super) rate_limit_rejections: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    pub(super) cancel_deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    #[cfg(test)]
+    pub(super) cancel_send_gate: Arc<tokio::sync::RwLock<()>>,
+    pub(super) adopted_completion_tx: watch::Sender<Option<PromptOutcome>>,
     /// A stored-session rejection already emitted its context reset.
     pub(super) context_reset_emitted: AtomicBool,
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
@@ -97,7 +103,7 @@ impl Shared {
         session_label: String,
         profile: &'static AgentProfile,
         lifecycle_tx: mpsc::Sender<LifecycleEnvelope>,
-        terminal_claim: Arc<TerminalClaim>,
+        state: Arc<SessionState>,
         prompt_in_flight: Arc<AtomicBool>,
         sandbox: Option<&SessionSandbox>,
         ingress: Arc<SessionIngress>,
@@ -122,13 +128,17 @@ impl Shared {
             last_event_at: AtomicI64::new(now_ms()),
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
-            terminal_claim,
+            terminal_claim: state.terminal_claim.clone(),
             adopted_turn_active: AtomicBool::new(false),
             prompt_in_flight,
             prompt_epoch: AtomicU64::new(0),
             lifecycle_tx,
             between_prompt: BetweenPromptTracker::default(),
-            rate_limit_rejections: Default::default(),
+            rate_limit_rejections: state.rate_limit_rejections.clone(),
+            cancel_deadline: state.cancel_deadline.clone(),
+            #[cfg(test)]
+            cancel_send_gate: state.cancel_send_gate.clone(),
+            adopted_completion_tx: watch::channel(None).0,
             context_reset_emitted: AtomicBool::new(false),
             agent_msg_dedup: Default::default(),
             compaction: Default::default(),
@@ -143,6 +153,18 @@ impl Shared {
 
     pub(super) async fn emit(&self, event: Event) {
         let _ = self.event_tx.send(event).await;
+    }
+
+    /// A claimed terminal must reach the drain even if SDK teardown cancels its caller.
+    pub(super) async fn publish_terminal(&self, reason: String, preceding: Vec<Event>) {
+        let event_tx = self.event_tx.clone();
+        let publication = tokio::spawn(async move {
+            for event in preceding {
+                let _ = event_tx.send(event).await;
+            }
+            let _ = event_tx.send(Event::Stopped { reason }).await;
+        });
+        let _ = publication.await;
     }
 
     /// Publish the native session the lifecycle selected and apply the
@@ -457,7 +479,11 @@ impl Shared {
                 self.bg_tasks.stop(task_id);
                 continue;
             }
-            update_tool_context_cache(&self.tool_context_cache, &event, &update_for_tool_context);
+            update_tool_context_cache(
+                &self.tool_context_cache,
+                &mut event,
+                &update_for_tool_context,
+            );
             if self.event_tx.send(event).await.is_err() {
                 break;
             }
@@ -522,7 +548,7 @@ mod tests {
             "s-echo".to_string(),
             &crate::acp::agent_profiles::CLAUDE,
             lifecycle_tx,
-            Arc::new(TerminalClaim::new()),
+            Arc::new(SessionState::default()),
             Arc::new(AtomicBool::new(prompt_in_flight)),
             None,
             Arc::new(SessionIngress::new(Some(SessionId::from("native")))),

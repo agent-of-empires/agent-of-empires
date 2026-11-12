@@ -1,10 +1,12 @@
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ArrowUpRight, RotateCcw, Trash2, X } from "lucide-react";
 import type { Workspace } from "../../lib/types";
 import { isSessionActive } from "../../lib/session";
 import { useIdleDecayWindowMs } from "../../lib/idleDecay";
 import { workspaceTrashedAtMs } from "../../lib/sidebarSort";
+import { hasPendingTrash, trashRecoveryTarget } from "../../lib/trashActions";
+import type { TrashRecoveryTarget } from "../../lib/trashActions";
 import { ContextMenu, MenuItem } from "../ContextMenu";
 import { EmptyTrashConfirm } from "../EmptyTrashConfirm";
 import { useContextMenu } from "../useContextMenu";
@@ -22,6 +24,8 @@ export function TrashMenu({
   loaded,
   onLoad,
   readOnly,
+  runtimeEpoch,
+  onRetryTrash,
   onOpen,
   onRestore,
   onDelete,
@@ -34,6 +38,8 @@ export function TrashMenu({
   /** Asks for the trash rows, which the session list omits. */
   onLoad: () => void;
   readOnly?: boolean;
+  runtimeEpoch: string | null;
+  onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
   onOpen: RowActivate;
   onRestore: (sessionIds: string[]) => void;
   onDelete: (sessionIds: string[]) => void;
@@ -55,7 +61,12 @@ export function TrashMenu({
   }, []);
 
   const idleDecayWindowMs = useIdleDecayWindowMs();
-  const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{ x: number; y: number; ws: Workspace }>();
+  const { menu, menuRef, openMenu, closeMenu } = useContextMenu<{
+    x: number;
+    y: number;
+    ws: Workspace;
+    epoch: string | null;
+  }>();
 
   // The Empty Trash confirm portals outside both refs and owns dismissal while it is up; the
   // row menu also portals, so it counts as inside.
@@ -90,6 +101,12 @@ export function TrashMenu({
   // Sessions, the unit the daemon reports before the rows load, so the badge does not change meaning when Trash opens.
   const loadedCount = trashedWorkspaces.reduce((sum, ws) => sum + ws.sessions.length, 0);
   const count = loaded ? loadedCount : loadedCount || trashedCount;
+  const pendingMenu = menu?.ws.sessions.some(hasPendingTrash) ?? false;
+  const menuTargets = menu
+    ? menu.ws.sessions
+        .map((session) => trashRecoveryTarget(session, menu.epoch))
+        .filter((target): target is TrashRecoveryTarget => target !== null)
+    : [];
 
   return (
     <div ref={ref} className="relative min-w-0 flex-1">
@@ -174,10 +191,12 @@ export function TrashMenu({
                       key={ws.id}
                       ws={ws}
                       readOnly={readOnly}
+                      runtimeEpoch={runtimeEpoch}
+                      onRetryTrash={onRetryTrash}
                       onOpen={() => openWorkspace(ws)}
                       onRestore={() => restoreWorkspace(ws)}
                       onDelete={() => deleteWorkspace(ws)}
-                      onContextMenu={(x, y) => openMenu({ x, y, ws })}
+                      onContextMenu={(x, y) => openMenu({ x, y, ws, epoch: runtimeEpoch })}
                     />
                   ))}
               </div>
@@ -197,31 +216,53 @@ export function TrashMenu({
           >
             Open
           </MenuItem>
-          {!readOnly && (
-            <>
-              <MenuItem
-                onClick={() => {
-                  closeMenu();
-                  restoreWorkspace(menu.ws);
-                }}
-                testId="sidebar-trash-context-menu-restore"
-                icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
-              >
-                Restore
-              </MenuItem>
-              <MenuItem
-                onClick={() => {
-                  closeMenu();
-                  deleteWorkspace(menu.ws);
-                }}
-                testId="sidebar-trash-context-menu-delete"
-                icon={<X className="h-3.5 w-3.5 shrink-0" />}
-                className="text-status-error hover:bg-status-error/10"
-              >
-                Delete permanently
-              </MenuItem>
-            </>
-          )}
+          {!readOnly &&
+            (pendingMenu ? (
+              <>
+                {menuTargets.map((target) => (
+                  <Fragment key={target.id}>
+                    <MenuItem
+                      onClick={() => {
+                        closeMenu();
+                        void onRetryTrash(target);
+                      }}
+                      detail={target.title}
+                      testId="sidebar-trash-context-menu-retry"
+                      icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
+                    >
+                      Retry Trash
+                    </MenuItem>
+                  </Fragment>
+                ))}
+                {menuTargets.length === 0 && (
+                  <p className="px-3 py-2 text-xs text-text-secondary">Recovery needs a current session identity.</p>
+                )}
+              </>
+            ) : (
+              <>
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    restoreWorkspace(menu.ws);
+                  }}
+                  testId="sidebar-trash-context-menu-restore"
+                  icon={<RotateCcw className="h-3.5 w-3.5 shrink-0" />}
+                >
+                  Restore
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    closeMenu();
+                    deleteWorkspace(menu.ws);
+                  }}
+                  testId="sidebar-trash-context-menu-delete"
+                  icon={<X className="h-3.5 w-3.5 shrink-0" />}
+                  className="text-status-error hover:bg-status-error/10"
+                >
+                  Delete permanently
+                </MenuItem>
+              </>
+            ))}
         </ContextMenu>
       )}
       {confirmEmpty &&
@@ -244,6 +285,8 @@ export function TrashMenu({
 function TrashRow({
   ws,
   readOnly,
+  runtimeEpoch,
+  onRetryTrash,
   onOpen,
   onRestore,
   onDelete,
@@ -251,12 +294,15 @@ function TrashRow({
 }: {
   ws: Workspace;
   readOnly?: boolean;
+  runtimeEpoch: string | null;
+  onRetryTrash: (target: TrashRecoveryTarget) => Promise<void>;
   onOpen: () => void;
   onRestore: () => void;
   onDelete: () => void;
   onContextMenu: (x: number, y: number) => void;
 }) {
   const sessionCount = ws.sessions.length;
+  const pendingSessions = ws.sessions.filter(hasPendingTrash);
   return (
     <div
       data-testid="sidebar-trash-row"
@@ -293,7 +339,7 @@ function TrashRow({
         >
           Open
         </button>
-        {!readOnly && (
+        {!readOnly && pendingSessions.length === 0 && (
           <>
             <button
               type="button"
@@ -319,6 +365,66 @@ function TrashRow({
             </button>
           </>
         )}
+      </div>
+      {!readOnly &&
+        pendingSessions.map((session) => {
+          const target = trashRecoveryTarget(session, runtimeEpoch);
+          return target ? (
+            <TrashRecoveryRow
+              key={`${session.id}:${target.epoch}:${target.expected_generation}`}
+              target={target}
+              onRetry={onRetryTrash}
+            />
+          ) : (
+            <p key={session.id} className="mt-2 text-xs text-text-secondary">
+              Recovery of {session.title} needs a current session identity.
+            </p>
+          );
+        })}
+    </div>
+  );
+}
+
+function TrashRecoveryRow({
+  target,
+  onRetry,
+}: {
+  target: TrashRecoveryTarget;
+  onRetry: (target: TrashRecoveryTarget) => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const pointerTarget = useRef<TrashRecoveryTarget | null>(null);
+  const retry = async (event: React.MouseEvent<HTMLButtonElement>) => {
+    const captured = event.detail === 0 ? target : pointerTarget.current;
+    pointerTarget.current = null;
+    if (!captured || captured.epoch !== target.epoch || captured.expected_generation !== target.expected_generation)
+      return;
+    setBusy(true);
+    try {
+      await onRetry(captured);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mt-2">
+      <p className="truncate text-xs text-text-secondary">{target.title}: Trash unfinished</p>
+      <div className="mt-1 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onPointerDown={() => {
+            pointerTarget.current = target;
+          }}
+          onPointerCancel={() => {
+            pointerTarget.current = null;
+          }}
+          onClick={retry}
+          disabled={busy}
+          className={`${ACTION} border-surface-700/50 text-text-secondary hover:bg-surface-700/40 disabled:opacity-50`}
+          data-testid="sidebar-trash-retry"
+        >
+          Retry Trash
+        </button>
       </div>
     </div>
   );

@@ -137,6 +137,8 @@ Per-agent structured view defaults live under `[acp]`, not `[session]`:
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Read from the global config only, so a profile cannot widen it; changing it from the web needs the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | Registry keys allowed while the restriction is on, e.g. `["claude", "codex"]`. Each alias counts separately, and an empty list denies every agent. A worker on a now-disallowed agent is terminated at its next respawn. |
 | `acp.rate_limit_auto_resume` | `false` | Respawn a worker parked on a provider rate limit once the reported reset passes. See [Rate-limit recovery](../structured-view/troubleshooting.md#rate-limits-and-agent-hand-off). |
+| `acp.rate_limit_failover` | `false` | Continue a session parked on a rate limit on another account from `acp.rate_limit_failover_accounts` instead of waiting for the reset. Host Claude sessions only; local-only. See [Automatic account failover](../structured-view/troubleshooting.md#automatic-account-failover). You are responsible for complying with the agent provider's terms for the accounts you configure. |
+| `acp.rate_limit_failover_accounts` | `[]` | Ordered failover pool: tool names declared under `agent_config_dir` that run the same agent as the session. Others are ignored with a warning. |
 
 Agent status overrides use `[agents.<name>]`:
 
