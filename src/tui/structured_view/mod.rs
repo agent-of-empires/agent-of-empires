@@ -2369,6 +2369,7 @@ mod tests {
                 .pending_approvals
                 .push(crate::acp::permissions::build_approval(
                     ToolCall {
+                        prompt: None,
                         id: "pending".into(),
                         name: "read".into(),
                         kind: "read".into(),
@@ -3096,6 +3097,7 @@ mod tests {
             .pending_approvals
             .push(crate::acp::permissions::build_approval(
                 crate::acp::state::ToolCall {
+                    prompt: None,
                     id: "hover-pending".into(),
                     name: "read".into(),
                     kind: "read".into(),
