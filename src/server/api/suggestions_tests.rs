@@ -149,6 +149,12 @@ impl Fixture {
         if let Some(key) = mapping_key {
             item["mapping_key"] = json!(key);
         }
+        let hash = crate::plugin::suggestions::spec_hash(
+            &crate::plugin::registry()
+                .get(PROVIDER)
+                .and_then(|p| p.manifest.suggestions.clone())
+                .expect("fixture plugin declares suggestions"),
+        );
         self.host.with_suggestions_db(|conn, profile| {
             conn.execute(
                 "INSERT OR REPLACE INTO suggestion_providers (profile, provider_id, updated_at)
@@ -157,9 +163,9 @@ impl Fixture {
             )
             .unwrap();
             conn.execute(
-                "INSERT OR REPLACE INTO suggestion_items (profile, provider_id, item_id, item_json)
-                 VALUES (?1, ?2, ?3, ?4)",
-                [profile, PROVIDER, id, &item.to_string()],
+                "INSERT OR REPLACE INTO suggestion_items (profile, provider_id, item_id, item_json, spec_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                [profile, PROVIDER, id, &item.to_string(), &hash],
             )
             .unwrap();
         });
