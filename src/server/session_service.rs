@@ -1139,11 +1139,24 @@ impl SessionService {
         id: &str,
         ready_budget: std::time::Duration,
     ) {
+        while self
+            .drain_terminal_initial_turn_once(id, ready_budget)
+            .await
+        {}
+    }
+
+    /// One drain attempt; `true` when the launch was replaced during the wait
+    /// and the new launch's turn needs its own attempt, now the claim is free.
+    async fn drain_terminal_initial_turn_once(
+        self: &Arc<Self>,
+        id: &str,
+        ready_budget: std::time::Duration,
+    ) -> bool {
         let Some(_claim) = self.claim_pending_drain(id) else {
-            return;
+            return false;
         };
         let Some((instance, text)) = self.undelivered_terminal_turn(id).await else {
-            return;
+            return false;
         };
         let probe = instance.clone();
         let ready =
@@ -1152,27 +1165,32 @@ impl SessionService {
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result);
         if let Err(error) = ready {
-            self.report_undelivered_turn(id, &text, &error).await;
-            return;
+            return match self.undelivered_terminal_turn(id).await {
+                Some((current, current_text))
+                    if same_terminal_turn(&current, &current_text, &instance, &text) =>
+                {
+                    self.report_undelivered_turn(id, &text, &error).await;
+                    false
+                }
+                Some(_) => true,
+                None => false,
+            };
         }
 
         let Some(_submission) = self.prompt_submission_for_session(id).await else {
-            return;
+            return false;
         };
         let lock = self.instance_lock(id).await;
         let _guard = lock.lock().await;
         // The wait released every guard; type only into the same turn of the
         // same launch.
         let Some((current, current_text)) = self.undelivered_terminal_turn(id).await else {
-            return;
+            return false;
         };
-        if current.lifecycle_generation != instance.lifecycle_generation
-            || current.title != instance.title
-            || current.tool != instance.tool
-            || current.lifecycle_reservation.is_some()
-            || current_text != text
+        if current.lifecycle_reservation.is_some()
+            || !same_terminal_turn(&current, &current_text, &instance, &text)
         {
-            return;
+            return false;
         }
         let typed = text.clone();
         let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
@@ -1191,6 +1209,7 @@ impl SessionService {
             Ok(()) => self.clear_pending_initial_turn(id).await,
             Err(error) => self.report_undelivered_turn(id, &text, &error).await,
         }
+        false
     }
 
     /// The row and text of a terminal session's pending turn that has not
@@ -1204,6 +1223,8 @@ impl SessionService {
                     && !i.is_structured()
                     && i.launch_is_finalized()
                     && i.terminal_handoff.is_none()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
             })
             .and_then(|i| {
                 let turn = i.pending_initial_turn.as_ref()?;
@@ -2521,6 +2542,19 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         budget.as_secs()
     );
     Ok(())
+}
+
+/// Whether `current` is the same turn of the same launch as `waited`.
+fn same_terminal_turn(
+    current: &Instance,
+    current_text: &str,
+    waited: &Instance,
+    waited_text: &str,
+) -> bool {
+    current.lifecycle_generation == waited.lifecycle_generation
+        && current.title == waited.title
+        && current.tool == waited.tool
+        && current_text == waited_text
 }
 
 /// Releases a session's `pending_drains` claim on every exit path of
@@ -4011,6 +4045,28 @@ mod tests {
                     .is_some_and(|t| t.error.is_some()),
                 "{case}"
             );
+        }
+    }
+
+    /// An archived or snoozed session is set aside: its pending turn is
+    /// neither typed nor marked failed.
+    #[tokio::test]
+    async fn terminal_initial_turn_skips_archived_and_snoozed_sessions() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut archived = terminal_turn_instance("sess-term-arch", "term-arch", "later");
+        archived.archive();
+        let mut snoozed = terminal_turn_instance("sess-term-snz", "term-snz", "later");
+        snoozed.snooze(60);
+        for inst in [archived, snoozed] {
+            let id = inst.id.clone();
+            let service = crate::server::test_support::build_test_app_state(vec![inst])
+                .session_service
+                .clone();
+            service
+                .drain_terminal_initial_turn_within(&id, std::time::Duration::from_millis(200))
+                .await;
+            let turn = pending_turn(&service, &id).await.expect("turn is kept");
+            assert!(turn.error.is_none(), "{id}");
         }
     }
 
