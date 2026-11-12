@@ -37,6 +37,7 @@ describe("isSyncedKey", () => {
       "aoe-acp-last-tool",
       "aoe-last-browse-dir",
       "aoe-web-settings",
+      "aoe-suggestions-hint-dismissed",
       "aoe-repo-collapsed-/home/me/repo",
       "aoe-group-collapsed-feature",
       "aoe-nested-group-collapsed-x",
