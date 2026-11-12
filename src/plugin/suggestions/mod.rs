@@ -62,6 +62,17 @@ pub(crate) fn providers() -> Vec<Provider> {
 
 const SCHEMA_VERSION: i64 = 2;
 
+/// Identifies the manifest spec a publication was validated against. Reads show
+/// only items stamped with the provider's current spec, so a worker that
+/// publishes late under an older manifest never surfaces under a newer one.
+pub(crate) fn spec_hash(spec: &SuggestionsSpec) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(spec).unwrap_or_default();
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::new(), |acc, b| acc + &format!("{b:02x}"))
+}
+
 /// Every suggestion table, including the legacy `suggestion_policy`, dropped
 /// when the recorded schema version differs.
 const TABLES: [&str; 12] = [
@@ -116,6 +127,7 @@ pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
              item_id     TEXT NOT NULL,
              item_json   TEXT NOT NULL,
              position    INTEGER NOT NULL DEFAULT 0,
+             spec_hash   TEXT NOT NULL DEFAULT '',
              PRIMARY KEY (profile, provider_id, item_id)
          );
          CREATE TABLE IF NOT EXISTS suggestion_sources (
