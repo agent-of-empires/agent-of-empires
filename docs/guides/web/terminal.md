@@ -65,6 +65,8 @@ With `aoe serve --read-only`, existing agent and paired terminals keep streaming
 
 Compose drafts remain editable, but Send is disabled. Unsent input and unfinished clipboard gestures do not replay when writing becomes available again. An upload or terminal creation accepted before the policy changed remains accepted.
 
+Pending **Take control** requests are discarded when write access is revoked or the terminal target changes; taking control afterward requires a fresh gesture.
+
 ## On mobile
 
 The phone renders the same live view, tuned for touch:

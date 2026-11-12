@@ -40,7 +40,11 @@ type ServerMessage =
   | AcpFrame
   | { kind: "lagged"; skipped?: number }
   | { kind: "heartbeat" }
-  | { kind: "reduced_state"; seq?: number; state?: ReducedState; unchanged?: string[] }
+  | {
+      kind: "reduced_state"; seq?: number;
+      state?: ReducedState;
+      unchanged?: string[];
+    }
   | { kind: "transcript_snapshot"; rows?: TranscriptRow[] }
   | { kind: "transcript_delta"; delta?: TranscriptDelta };
 
@@ -251,7 +255,11 @@ export function useAcpConnection(
       }, delayMs);
     };
 
-    const startReplay = (): { done: Promise<void>; abort: () => void; delivered: () => boolean } => {
+    const startReplay = (): {
+      done: Promise<void>;
+      abort: () => void;
+      delivered: () => boolean;
+    } => {
       replayAbortRef.current?.abort();
       const controller = new AbortController();
       replayAbortRef.current = controller;
@@ -276,7 +284,10 @@ export function useAcpConnection(
         case "heartbeat":
           return;
         case "lagged":
-          dispatch({ kind: "lagged", skipped: (data as { skipped?: number }).skipped ?? 0 });
+          dispatch({
+            kind: "lagged",
+            skipped: (data as { skipped?: number }).skipped ?? 0,
+          });
           void startReplay();
           return;
         case "reduced_state": {
@@ -284,10 +295,15 @@ export function useAcpConnection(
             state: reduced,
             unchanged,
             seq,
-          } = data as { seq?: number; state?: ReducedState; unchanged?: string[] };
+          } = data as { seq?: number; state?: ReducedState;
+            unchanged?: string[];
+          };
           if (!reduced) return;
           lastActivityRef.current = Date.now();
-          dispatch({ kind: "reduced_state", state: reduced, unchanged: unchanged ?? [], seq });
+          dispatch({
+            kind: "reduced_state",
+            state: reduced,
+            unchanged: unchanged ?? [], seq, });
           return;
         }
         case "transcript_snapshot": {

@@ -513,6 +513,7 @@ async fn admit_and_create(
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,
+        workspace: false,
         // A plugin cannot request a worktree, so there is no branch to fork and
         // no per-repo base to honor.
         repo_base_branches: Vec::new(),

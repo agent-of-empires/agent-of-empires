@@ -22,6 +22,7 @@ import { openai } from "@ai-sdk/openai";
 import { google } from "@ai-sdk/google";
 import { z } from "zod";
 import { appendTurn, createTranscript, loadTranscript } from "./transcript.ts";
+import { toolCallMeta } from "./aoeMeta.ts";
 import { classifyKind } from "./toolKind.ts";
 import { createAgentStream } from "./transport.ts";
 
@@ -103,6 +104,7 @@ async function handlePrompt(
             kind: classifyKind(name),
             status: "pending",
             rawInput: part.input as Record<string, unknown>,
+            _meta: toolCallMeta(part.toolCallId, name),
           });
           break;
         }
