@@ -8,6 +8,8 @@ set -euo pipefail
 #
 #   --self-test   Checks the decision logic against a throwaway repo.
 
+TOML="$(cd "$(dirname "$0")/../.." && pwd)/release-plz.toml"
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 
@@ -17,6 +19,19 @@ pr_number() {
   pr="${pr%%-*}"
   [[ $pr =~ ^[0-9]+$ ]] || { echo "::error::Cannot parse PR from $1" >&2; return 1; }
   echo "$pr"
+}
+
+# Keeps the `<sha> <subject>` lines release-plz would put in the changelog: the
+# first matching commit_parsers entry decides, as in release-plz.
+changelog_commits() {
+  python3 -c '
+import re, sys, tomllib
+parsers = tomllib.load(open(sys.argv[1], "rb"))["changelog"]["commit_parsers"]
+for line in sys.stdin:
+    subject = line.split(" ", 1)[1]
+    if not next((p for p in parsers if re.search(p["message"], subject)), {}).get("skip"):
+        print(line, end="")
+' "$TOML"
 }
 
 # gate <branch> <same repo> <pr head> <group head>
@@ -31,7 +46,7 @@ gate() {
   fi
   local missed count
   # Explicit: callers in `||` context run this with errexit off.
-  missed="$(git log --oneline "$3..$4~1")" || return 2
+  missed="$(git log --format='%h %s' "$3..$4~1" | changelog_commits)" || return 2
   if [ -z "$missed" ]; then
     echo "Release PR is up to date."
     return 0
@@ -46,7 +61,7 @@ gate() {
 run() {
   local pr branch same_repo head
   pr="$(pr_number "$HEAD_REF")"
-  IFS=$'\t' read -r branch release head < <(
+  IFS=$'\t' read -r branch same_repo head < <(
     gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid,isCrossRepository \
       --jq '[.headRefName, (.isCrossRepository | not | tostring), .headRefOid] | @tsv'
   )
@@ -54,7 +69,7 @@ run() {
 }
 
 self_test() {
-  local dir base main_tip tree rel fresh stale out
+  local dir base main_tip skip_tip tree rel rel_main fresh stale skipped_only out
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
   dir="$(mktemp -d)"
   trap 'rm -rf "$dir"' EXIT
@@ -65,11 +80,16 @@ self_test() {
   git commit -q --allow-empty -m 'fix: one'
   git commit -q --allow-empty -m 'fix: ```two```'
   main_tip="$(git rev-parse HEAD)"
+  git commit -q --allow-empty -m 'docs: three'
+  git commit -q --allow-empty -m 'ci: four'
+  skip_tip="$(git rev-parse HEAD)"
   tree="$(git rev-parse 'HEAD^{tree}')"
-  # A release PR refreshed at base, and queue squashes on top of base / main.
+  # Release PRs refreshed at base and at main_tip, and queue squashes on top.
   rel="$(git commit-tree "$tree" -p "$base" -m 'chore: release')"
+  rel_main="$(git commit-tree "$tree" -p "$main_tip" -m 'chore: release')"
   fresh="$(git commit-tree "$tree" -p "$base" -m squash)"
-  stale="$(git commit-tree "$tree" -p "$main_tip" -m squash)"
+  stale="$(git commit-tree "$tree" -p "$skip_tip" -m squash)"
+  skipped_only="$stale"
   export GITHUB_STEP_SUMMARY="$dir/summary.md"
 
   [ "$(pr_number refs/heads/gh-readonly-queue/main/pr-5570-abc123)" = 5570 ] ||
@@ -84,7 +104,12 @@ self_test() {
   out="$(gate release-plz-x true "$rel" "$stale")" && fail "passed a stale release PR"
   [[ $out == *"2 commit(s)"* ]] || fail "wrong count: $out"
   grep -q '^    [0-9a-f]* fix: ```two```$' summary.md || fail "summary lines not indented"
-  ok "fails a stale release PR and lists its missed commits"
+  grep -q 'docs: three' summary.md && fail "listed a commit release-plz skips"
+  ok "fails a stale release PR and lists only changelog commits"
+
+  gate release-plz-x true "$rel_main" "$skipped_only" >/dev/null ||
+    fail "failed a release PR behind only docs: and ci: commits"
+  ok "passes a release PR behind only skipped commit types"
 
   gate feature/x true "$rel" "$stale" >/dev/null || fail "gated a non-release branch"
   gate release-plz-x false "$rel" "$stale" >/dev/null || fail "gated a fork PR"
