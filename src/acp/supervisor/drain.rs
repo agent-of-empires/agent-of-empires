@@ -322,7 +322,9 @@ impl<S: BroadcastSink> Drain<S> {
                 self.drop_handle(&lease).await;
                 return;
             }
-            let Some(config) = self.approve_respawn(&lease).await else {
+            let (returned, config) = self.approve_respawn(&lease).await;
+            self = returned;
+            let Some(config) = config else {
                 return;
             };
             match self.respawn(&lease, config).await {
@@ -928,15 +930,21 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     async fn pump(
-        mut self,
+        self,
         inbound: &mut mpsc::Receiver<SdkEvent>,
         lease: &Lease,
     ) -> (Self, StreamEnd) {
-        let sink = Arc::clone(&self.sink);
         #[cfg(test)]
-        let receive_owner = self.receive_owner.take();
+        let (self_owned, receive_owner) = {
+            let mut drain = self;
+            let receive_owner = drain.receive_owner.take();
+            (drain, receive_owner)
+        };
+        #[cfg(not(test))]
+        let self_owned = self;
+        let sink = Arc::clone(&self_owned.sink);
         let completion = Arc::new(tokio::sync::Mutex::new(DrainCompletion {
-            drain: Some(self),
+            drain: Some(self_owned),
             end: StreamEnd::default(),
             established: false,
         }));
@@ -1269,7 +1277,7 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
-    async fn approve_respawn(&self, lease: &Lease) -> Option<SpawnConfig> {
+    async fn approve_respawn(self, lease: &Lease) -> (Self, Option<SpawnConfig>) {
         let session_id = &self.session_id;
         match restart_decision(&self.workers, &self.lifecycle, session_id, lease).await {
             RestartDecision::Respawn(config) => {
@@ -1281,7 +1289,7 @@ impl<S: BroadcastSink> Drain<S> {
                     "respawn approved; sleeping {}ms before restart",
                     RESPAWN_BACKOFF.as_millis()
                 );
-                return Some(*config);
+                return (self, Some(*config));
             }
             RestartDecision::BudgetBurned => {
                 warn!(
@@ -1300,12 +1308,24 @@ impl<S: BroadcastSink> Drain<S> {
                         MAX_RESPAWNS_IN_WINDOW, RESTART_WINDOW.as_secs(),
                     )),
                 });
-                if !matches!(
-                    self.publish_owned(lease, &mut error, None).await,
-                    OwnedPublication::Published { .. }
-                ) {
-                    return None;
+                let sink = Arc::clone(&self.sink);
+                let original = lease.clone();
+                let (done, finished) = tokio::sync::oneshot::channel();
+                let publication = super::WorkerPublication::new(async move {
+                    let published = matches!(
+                        self.publish_owned(&original, &mut error, None).await,
+                        OwnedPublication::Published { .. }
+                    );
+                    let _ = done.send((self, published));
+                });
+                if let Err(publication) = sink.publish_from_worker(publication) {
+                    publication.complete().await;
                 }
+                let (drain, published) = finished.await.expect("ordered budget publication completed");
+                if published {
+                    drain.drop_handle(lease).await;
+                }
+                return (drain, None);
             }
             RestartDecision::LeaveToReconciler => {
                 info!(
@@ -1320,16 +1340,18 @@ impl<S: BroadcastSink> Drain<S> {
                         .get(session_id)
                         .is_some_and(|handle| handle.lease == *lease)
                 {
-                    return None;
+                    drop(lifecycle);
+                    drop(workers);
+                    return (self, None);
                 }
                 lock_recover(&self.startup_requeues).insert(session_id.clone());
             }
-            RestartDecision::Gone => return None,
+            RestartDecision::Gone => return (self, None),
             RestartDecision::Fenced => {
                 // Kernel-qualified exit can retire its own custody, not grant
                 // the unreadable or missing file authority over a live runner.
                 self.drop_handle(lease).await;
-                return None;
+                return (self, None);
             }
             RestartDecision::UserStopped => {
                 info!(
@@ -1338,11 +1360,11 @@ impl<S: BroadcastSink> Drain<S> {
                     "worker stop requested; settling its handle without respawn"
                 );
                 self.drop_handle(lease).await;
-                return None;
+                return (self, None);
             }
         }
         self.drop_handle(lease).await;
-        None
+        (self, None)
     }
 
     /// Relaunch the worker under a fresh respawn epoch; returns the new lease
@@ -2062,7 +2084,7 @@ mod tests {
         }));
         let approval = {
             let original = original.clone();
-            tokio::spawn(async move { drain.approve_respawn(&original).await })
+            tokio::spawn(async move { drain.approve_respawn(&original).await.1 })
         };
         let reached = tokio::time::timeout(Duration::from_secs(10),
             tokio::task::spawn_blocking(move || position.recv_timeout(Duration::from_secs(10))))

@@ -239,9 +239,6 @@ pub(crate) fn build_test_app_state_with_event_capacity(
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
     let (event_store, event_capacity) = events;
-    let app_dir = event_store
-        .is_none()
-        .then(|| tempfile::tempdir().expect("tempdir"));
     let event_store = event_store.unwrap_or_else(|| {
         Arc::new(crate::acp::event_store::EventStore::temporary_for_test(100).expect("event store"))
     });

@@ -369,7 +369,7 @@ pub(crate) async fn spawn_structured_session(
                     return Err(CliDuplicateSession(crate::session::duplicate_session_error(&instance.title)).into());
                 }
                 crate::acp::establishment::insert_created_instance(
-                    rows, instance, native.storage(), crate::acp::establishment::CreationAdmission::Now,
+                    rows, instance, native.storage(),
                 )?;
                 *groups = crate::session::GroupTree::new_with_groups(std::slice::from_ref(instance), groups).get_all_groups();
                 Ok(())

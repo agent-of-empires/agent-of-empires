@@ -593,18 +593,18 @@ impl TranscriptModel {
                 self.turn_active = false;
                 self.sweep_open_tools(seq)
             }
-            Event::IncompatibleAgent { .. } => Vec::new(),
             Event::AgentSwitched { from, to, reason } => {
                 if current {
                     self.active_operation = None;
                 }
                 let mut deltas = self.sweep_open_tools(seq);
                 // Clients render the handoff with the session_cleared divider.
-                vec![self.push(
+                deltas.push(self.push(
                     format!("agent-switched-{seq}"),
                     TranscriptRowKind::SessionCleared,
                     format!("Switched structured view agent from {from} to {to} ({reason})."),
-                )]
+                ));
+                deltas
             }
             Event::SessionCleared => {
                 let mut row = self.grouped_row(

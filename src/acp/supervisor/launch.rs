@@ -1385,6 +1385,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             Pending::Installation(installation) => installation.identity,
             _ => unreachable!("connection phase completed before installation"),
         };
+        let mut recovery = None;
         let mut workers = loop {
             let workers = tokio::time::timeout_at(deadline, self.workers.lock())
                 .await
@@ -1413,7 +1414,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     .into())
                                 }
                             }
-                            Some(lifecycle.install(&lease, identity))
+                            Some(if recovery.is_none() {
+                                lifecycle.install(&lease, identity)
+                            } else if lifecycle.running(session_id).is_some_and(|(current, owner)| {
+                                current == lease && owner == identity
+                            }) {
+                                Ok(())
+                            } else {
+                                Err(InstallError::Stale)
+                            })
                         }
                         Ok(None) => None,
                         Err(_) => {
@@ -1426,7 +1435,29 @@ impl<S: BroadcastSink> Supervisor<S> {
                 }
             };
             match outcome {
-                Some(Ok(())) => break workers,
+                Some(Ok(())) if recovery.is_some() => break workers,
+                Some(Ok(())) => {
+                    // Read fences need the writer, whose earlier SDK items may need workers.
+                    // Keep installation custody, then recheck the exact lease and registry.
+                    drop(workers);
+                    self.cancel_orphaned_requests(session_id);
+                    let Some(Pending::Installation(installation)) = reservation.deferred.as_ref() else {
+                        unreachable!("installation stays owned through recovery");
+                    };
+                    recovery = Some(if matches!(installation.finish.kind, WorkerKind::Attached) {
+                        (|| {
+                            Ok((
+                                collect_resumable_background_agent_launches(
+                                    &*self.sink, &self.next_seqs, session_id,
+                                )?,
+                                self.sink.unresolved_background_task_launches(session_id)?,
+                            ))
+                        })()
+                    } else {
+                        self.detach_orphaned_background_agents(session_id);
+                        Ok((Vec::new(), Vec::new()))
+                    });
+                }
                 Some(Err(refusal)) => {
                     drop(workers);
                     reservation.yield_to_retirement();
@@ -1470,22 +1501,6 @@ impl<S: BroadcastSink> Supervisor<S> {
             .and_then(|_| client.establishment_projection());
         let mode_waits_for_native = mode_projection.is_some();
         let mode_attempt = mode_projection.and_then(|projection| projection.attempt());
-        self.cancel_orphaned_requests(session_id);
-        let recovery: anyhow::Result<_> = if matches!(kind, WorkerKind::Attached) {
-            (|| {
-                Ok((
-                    collect_resumable_background_agent_launches(
-                        &*self.sink,
-                        &self.next_seqs,
-                        session_id,
-                    )?,
-                    self.sink.unresolved_background_task_launches(session_id)?,
-                ))
-            })()
-        } else {
-            self.detach_orphaned_background_agents(session_id);
-            Ok((Vec::new(), Vec::new()))
-        };
         if context_reset.is_some() {
             lock_recover(&self.pending_context_resets).insert(session_id.to_string());
         }
@@ -1520,6 +1535,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             },
         );
         drop(workers);
+        let recovery: anyhow::Result<_> = recovery.expect("installation recovery completed");
         if respawn {
             lock_recover(&self.respawned_in_place).insert(session_id.to_owned());
         }

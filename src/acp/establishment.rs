@@ -2289,17 +2289,12 @@ impl EstablishmentAttempt {
     }
 }
 
-pub(crate) enum CreationAdmission {
-    Later,
-    Now,
-}
 
 /// Insert a genuinely absent app session and its initial native permission together.
 pub(crate) fn insert_created_instance(
     rows: &mut Vec<Instance>,
     row: &mut Instance,
     storage: &Storage,
-    admission: CreationAdmission,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         !rows.iter().any(|existing| existing.id == row.id),
@@ -2310,18 +2305,11 @@ pub(crate) fn insert_created_instance(
         EstablishmentRefusal::Superseded
     );
     if row.is_structured() {
-        let stage = match admission {
-            CreationAdmission::Later => {
-                anyhow::ensure!(row.launch_is_finalized(), EstablishmentRefusal::Unresolved);
-                CreationStage::Ready
-            }
-            CreationAdmission::Now => CreationStage::PreparingAdmitted,
-        };
         row.arm_establishment(storage, true, None)?;
         let Some(AcpEstablishment::Pending { attempt }) = row.acp_establishment.as_mut() else {
             unreachable!("absent-row creation was armed");
         };
-        attempt.origin = EstablishmentOrigin::Creation { stage };
+        attempt.origin = EstablishmentOrigin::Creation { stage: CreationStage::PreparingAdmitted };
     }
     rows.push(row.clone());
     Ok(())
@@ -2859,7 +2847,7 @@ mod tests {
     #[serial_test::serial]
     fn deferred_creation_admits_its_first_original_once_without_replacing_consent() {
         use super::{
-            insert_created_instance, AcpEstablishment, CreationAdmission, CreationStage,
+            insert_created_instance, AcpEstablishment, CreationStage,
             EstablishmentBlockReason, EstablishmentOrigin,
         };
         use crate::session::{Instance, ResumeIntent, Status, Storage, View};
@@ -2869,16 +2857,17 @@ mod tests {
         let mut row = Instance::new("deferred-creation", home.path().to_str().unwrap());
         row.view = View::Structured;
         let mut rows = Vec::new();
-        row.status = Status::Creating;
-        assert!(
-            insert_created_instance(&mut rows, &mut row, &storage, CreationAdmission::Later,)
-                .is_err()
-        );
-        assert!(rows.is_empty());
-        assert!(row.acp_establishment.is_none());
-
         row.status = Status::Idle;
-        insert_created_instance(&mut rows, &mut row, &storage, CreationAdmission::Later).unwrap();
+        insert_created_instance(&mut rows, &mut row, &storage).unwrap();
+        let Some(AcpEstablishment::Pending { attempt }) = row.acp_establishment.as_mut() else {
+            unreachable!("absent-row creation owns its initial permission");
+        };
+        attempt.origin = EstablishmentOrigin::Creation { stage: CreationStage::Ready };
+        let mut unfinished = row.clone();
+        unfinished.status = Status::Creating;
+        let before = unfinished.acp_establishment.clone();
+        assert!(unfinished.arm_acp_establishment(&storage, None).is_err());
+        assert_eq!(unfinished.acp_establishment, before);
         let original = row
             .acp_establishment
             .as_ref()
