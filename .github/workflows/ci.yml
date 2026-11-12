@@ -480,7 +480,7 @@ jobs:
           git fetch -q --no-tags origin "refs/pull/$PR/head"
           MISSED="$(git log --oneline "$PR_HEAD..$GROUP_HEAD~1")"
           if [ -n "$MISSED" ]; then
-            { echo '### Would ship without CHANGELOG.md entries'; echo '```'; echo "$MISSED"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            { echo '### Would ship without CHANGELOG.md entries'; echo; echo "$MISSED" | sed 's/^/    /'; } >> "$GITHUB_STEP_SUMMARY"
             echo "::error title=Release PR is stale::$(echo "$MISSED" | wc -l) commit(s) landed after the release PR's last refresh and would ship without CHANGELOG.md entries. Dispatch release-plz.yml to refresh the PR, then queue it again. See the job summary."
             exit 1
           fi
