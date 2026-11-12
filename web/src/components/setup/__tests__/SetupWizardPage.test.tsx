@@ -277,3 +277,71 @@ it("stays on setup when the reload after Go to dashboard fails", async () => {
   expect(patches).toEqual([{ deferred: true }]);
   expect(onLeave).not.toHaveBeenCalled();
 });
+
+const agent = (name: string) => ({
+  name,
+  display_name: name,
+  kind: "builtin",
+  installed: true,
+  acp_capable: true,
+  acp_installed: true,
+  acp_allowed: false,
+  install_hint: "",
+});
+
+/** Agents step with claude, codex and gemini; saving gemini is rejected. */
+function agentPicks() {
+  const committed: unknown[] = [];
+  const current = status(["agents"]);
+  const refresh = { hold: false, release: undefined as (() => void) | undefined };
+  server.use(
+    http.get("*/api/agents", () => HttpResponse.json(["claude", "codex", "gemini"].map(agent))),
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = (await request.json()) as { session: { default_tool: string } };
+      if (body.session.default_tool === "gemini") return HttpResponse.json({ error: "invalid" }, { status: 400 });
+      committed.push(body);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  render(
+    <MemoryRouter initialEntries={["/setup?step=agents"]}>
+      <SetupWizardPage
+        status={current}
+        about={null}
+        profile=""
+        refresh={async () => {
+          if (refresh.hold) {
+            refresh.hold = false;
+            await new Promise<void>((resolve) => (refresh.release = resolve));
+          }
+          return current;
+        }}
+        onLeave={() => {}}
+      />
+    </MemoryRouter>,
+  );
+  const radio = (name: string) => screen.getByRole("radio", { name: new RegExp(`^${name}`) }) as HTMLInputElement;
+  return { committed, refresh, radio };
+}
+
+it("a slow status read after an older save doesn't make a failed pick roll back to it", async () => {
+  const { committed, refresh, radio } = agentPicks();
+  await screen.findByRole("radio", { name: /^claude/ });
+  refresh.hold = true;
+  fireEvent.click(radio("claude"));
+  await waitFor(() => expect(refresh.release).toBeDefined());
+  fireEvent.click(radio("codex"));
+  await waitFor(() => expect(committed).toHaveLength(2));
+  await act(async () => refresh.release!());
+
+  fireEvent.click(radio("gemini"));
+  await waitFor(() => expect(radio("codex").checked).toBe(true));
+});
+
+it("a failed pick rolls back to the older pick that saved", async () => {
+  const { committed, radio } = agentPicks();
+  fireEvent.click(await screen.findByRole("radio", { name: /^claude/ }));
+  await waitFor(() => expect(committed).toHaveLength(1));
+  fireEvent.click(radio("gemini"));
+  await waitFor(() => expect(radio("claude").checked).toBe(true));
+});

@@ -149,7 +149,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
     const ok = await save({ [section]: { [field]: value } });
     if (ok) {
       setMachine((m) => ({ ...m, [section]: { ...m?.[section], [field]: value } }));
-      await markConfigured(step.key);
+      // Not awaited: a slow status read must not reorder this save's success behind a newer one.
+      void markConfigured(step.key);
     } else {
       // The write may still have landed; show what the Daemon holds.
       void fetchMachineSettings().then((s) => s && setMachine(s as MachineValues));
