@@ -187,6 +187,12 @@ impl Shared {
                 _ => return,
             }
         };
+        // Any other stop keeps the report for a later end_turn or error.
+        let is_error = match stop_reason.as_deref() {
+            Some("end_turn") => false,
+            Some("error") => true,
+            _ => return,
+        };
         let Some(report) = self
             .background_reports
             .lock()
@@ -195,10 +201,9 @@ impl Shared {
         else {
             return;
         };
-        let (text, is_error) = match stop_reason.as_deref() {
-            Some("end_turn") => (report.text, false),
-            Some("error") => (error.unwrap_or(report.text), true),
-            _ => return,
+        let text = match error {
+            Some(error) if is_error => error,
+            _ => report.text,
         };
         self.emit_card_completion(report.tool_call_id, text, is_error)
             .await;
@@ -603,6 +608,12 @@ mod tests {
                 }),
                 chunk("m2", "The answer"),
                 chunk("m2", " is 42."),
+                // An idle snapshot with no reason is not the outcome yet.
+                serde_json::json!({
+                    "sessionId": "root",
+                    "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
+                                "state": { "state": "idle" } },
+                }),
                 serde_json::json!({
                     "sessionId": "root",
                     "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
