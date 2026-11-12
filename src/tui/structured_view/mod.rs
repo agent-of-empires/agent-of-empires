@@ -2062,6 +2062,7 @@ pub(crate) fn approval_update_for_test(nonce: &str, seq: u64) -> WsMessage {
                     name: nonce.into(),
                     kind: "read".into(),
                     args_preview: "{}".into(),
+                    prompt: None,
                     started_at: at,
                     parent_tool_call_id: None,
                     memory_recall: None,

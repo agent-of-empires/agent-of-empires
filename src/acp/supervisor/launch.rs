@@ -2787,6 +2787,7 @@ time.sleep(60)
         let approval = |nonce: &str| Approval {
             nonce: Nonce(nonce.into()),
             tool_call: ToolCall {
+                prompt: None,
                 id: nonce.into(),
                 name: "Bash".into(),
                 kind: "execute".into(),

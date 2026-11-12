@@ -408,6 +408,7 @@ mod tests {
     fn tool(name: &str, args: &str) -> Event {
         Event::ToolCallStarted {
             tool_call: ToolCall {
+                prompt: None,
                 id: "t1".into(),
                 name: name.into(),
                 kind: "execute".into(),
