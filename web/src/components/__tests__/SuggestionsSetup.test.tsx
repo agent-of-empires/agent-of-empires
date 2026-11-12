@@ -298,6 +298,19 @@ describe("setup sheet", () => {
     expect(onFinished).toHaveBeenCalled();
   });
 
+  it("reports a failed Check again request", async () => {
+    await openSheet();
+    await approveInstall();
+    api.fetchSuggestions.mockResolvedValue(
+      snapshot([provider({ status: "pending", checks: [check("auth", "fail", { fix: "Log in." })] })]),
+    );
+    fireEvent.click(await screen.findByText("close-job"));
+    await screen.findByTestId("suggestions-setup-check-auth");
+    api.runSuggestionChecks.mockResolvedValue({ ok: false, error: "daemon busy", stale: false });
+    fireEvent.click(screen.getByTestId("suggestions-setup-recheck"));
+    expect((await screen.findByTestId("suggestions-setup-recheck-error")).textContent).toContain("daemon busy");
+  });
+
   it("stops polling with an error and a Retry when the snapshot cannot be loaded", async () => {
     await openSheet();
     await approveInstall();
