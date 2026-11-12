@@ -1195,7 +1195,8 @@ impl SessionService {
         let typed = text.clone();
         let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             anyhow::ensure!(
-                crate::server::api::sessions::ready_agent_session(&current)?.is_some(),
+                crate::server::api::sessions::ready_agent_session_for_automatic_input(&current)?
+                    .is_some(),
                 "the agent is no longer running"
             );
             current
@@ -2523,7 +2524,8 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         "initial prompts are only typed into a known agent"
     );
     let deadline = std::time::Instant::now() + budget;
-    while crate::server::api::sessions::ready_agent_session(instance)?.is_none() {
+    while crate::server::api::sessions::ready_agent_session_for_automatic_input(instance)?.is_none()
+    {
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
             "the agent was not running within {}s",
@@ -4046,6 +4048,38 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    /// An agent that exited to a live shell leaves its hook status file
+    /// behind; that must not make the pane look ready for typed input.
+    #[tokio::test]
+    #[serial_test::serial(hook_base)]
+    async fn terminal_initial_turn_is_not_typed_into_a_shell_with_a_stale_hook_status() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let (_hooks, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let inst = terminal_turn_instance("sess-term-stale", "term-stale", "must-not-be-typed");
+        let dir = crate::hooks::ensure_instance_dir_path(&inst.id).expect("hook dir");
+        std::fs::write(dir.join("status"), "idle").unwrap();
+        let pane = start_terminal_pane(&inst, "echo 'agent exited'; exec sh", false);
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        service
+            .drain_terminal_initial_turn_within(
+                "sess-term-stale",
+                std::time::Duration::from_millis(600),
+            )
+            .await;
+
+        assert!(!pane_text(&pane).contains("must-not-be-typed"));
+        assert!(pending_turn(&service, "sess-term-stale")
+            .await
+            .is_some_and(|t| t.error.is_some()));
+        crate::hooks::cleanup_hook_status_dir("sess-term-stale");
     }
 
     /// An archived or snoozed session is set aside: its pending turn is
