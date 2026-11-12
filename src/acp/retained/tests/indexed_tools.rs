@@ -152,7 +152,8 @@ fn retained_indexed_tool_lifecycle_matches_memory_across_replay_boundaries() {
     }
     let mut input_short = tool("input");
     if let Event::ToolCallStarted { tool_call } = &mut input_short {
-        tool_call.args_preview = "{\"prompt\":\"short start\"}".into();
+        // Restate the key across a disk text search chunk boundary.
+        tool_call.args_preview = format!("{{{}\"prompt\":\"short start\"}}", " ".repeat(4092));
     }
     let input_update = |id: &str, args: &str, prompt: Option<&str>| Event::ToolCallUpdated {
         tool_call_id: id.into(),
