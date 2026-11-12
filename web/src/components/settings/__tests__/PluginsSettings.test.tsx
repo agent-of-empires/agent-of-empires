@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import type {
   PluginInstallPreviewResult,
@@ -667,8 +667,10 @@ describe("marketplace suggestions badge and filter", () => {
     await waitFor(() => expect(api.discoverPlugins).toHaveBeenCalledTimes(1));
     fireEvent.keyDown(await screen.findByTestId("plugins-discover-query"), { key: "Enter" });
     await screen.findByTestId("plugins-discover-result-gh:acme/tracker");
-    resolveFirst({ kind: "ok", results: [WIDGET] });
-    await waitFor(() => expect(screen.queryByTestId("plugins-discover-result-gh:acme/widget")).toBeNull());
+    await act(async () => {
+      resolveFirst({ kind: "ok", results: [WIDGET] });
+    });
+    expect(screen.queryByTestId("plugins-discover-result-gh:acme/widget")).toBeNull();
     expect(screen.getByTestId("plugins-discover-result-gh:acme/tracker")).toBeTruthy();
   });
 
