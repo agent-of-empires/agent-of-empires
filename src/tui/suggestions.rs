@@ -1068,13 +1068,24 @@ impl SuggestionsFeed {
     /// prepare and reloads at once.
     pub(super) fn set_profile(&mut self, profile: Option<String>) {
         let switched = self.profile != profile;
+        let left_a_profile = self.profile.is_some();
         self.profile = profile;
         if switched {
-            self.snapshot = None;
+            // A snapshot that names no profile cannot be told apart, so it stays.
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.profile.is_some() && s.profile != self.profile)
+            {
+                self.snapshot = None;
+            }
             self.foreign_profile = None;
             self.loaded_at = None;
             self.load_attempt_at = None;
-            self.prepare_key = None;
+            // Adopting the first profile is not a switch: a prepare in flight stays valid.
+            if left_a_profile {
+                self.prepare_key = None;
+            }
         }
     }
 
@@ -2203,7 +2214,8 @@ mod tests {
             Worker::seeded_for_test("t", Res::Snapshot(Err("x".into()))),
         );
         rig.store.prepare_key = Some(("t".into(), "a".into()));
-        assert!(rig.store.snapshot.is_some());
+        rig.store.snapshot.as_mut().unwrap().profile = Some("default".into());
+        rig.store.profile = Some("default".into());
         rig.store.set_profile(Some("work".into()));
         assert!(rig.store.snapshot.is_none());
         assert!(rig.store.prepare_key.is_none());
