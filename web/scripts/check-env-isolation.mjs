@@ -70,6 +70,7 @@ const INHERITED_BY_CONTRACT = new Set([
   "VISUAL",
 ]);
 
+// Private re-exec controls must remain test-only; production reachability is an error.
 const TEST_BINARY_READS = new Set([
   "AOE_AGENT_PROBE_TEST_CHILD",
   "AOE_FISH_BIN",
@@ -78,6 +79,7 @@ const TEST_BINARY_READS = new Set([
   "AOE_NAMING_PROBE_TEST_CHILD",
   "AOE_PRIME_REWIND_TEST_CHILD",
   "AOE_RECHECK_TEST_CHILD",
+  "AOE_STANDALONE_STARTUP_TEST",
   "AOE_TEST_APP_DIR_UMASK_CHILD",
   "AOE_TEST_CONTROL_RESTORE_CHILD",
   "AOE_TEST_KILL_LAST_PANE_CHILD",
