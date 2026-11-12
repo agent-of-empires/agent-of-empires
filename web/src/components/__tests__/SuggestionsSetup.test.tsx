@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSetupHint } from "../SuggestionsSetupHint";
 import { SuggestionsSetupSheet } from "../SuggestionsSetupSheet";
 import { safeGetItem } from "../../lib/safeStorage";
@@ -237,6 +237,24 @@ describe("setup sheet", () => {
     await waitFor(() => expect(screen.getByTestId("suggestions-setup-install")).toHaveProperty("disabled", false));
     expect(api.previewPluginInstall).toHaveBeenCalledTimes(1);
     expect(screen.queryByTestId("suggestions-setup-checks")).toBeNull();
+  });
+
+  it("does not install a plugin again on retry after a later one failed", async () => {
+    api.discoverPlugins.mockResolvedValue({ kind: "ok", results: [github, linear] });
+    await openSheet();
+    await approveInstall();
+    fireEvent.click(await screen.findByText("close-job"));
+    fireEvent.click(await screen.findByText("approve-consent"));
+    fireEvent.click(await screen.findByText("fail-job"));
+    await waitFor(() => expect(screen.getByTestId("suggestions-setup-install")).toHaveProperty("disabled", false));
+    const box = (slug: string) =>
+      within(screen.getByTestId(`suggestions-setup-option-${slug}`)).getByRole("checkbox") as HTMLInputElement;
+    expect(box(github.slug).checked).toBe(false);
+    expect(box(linear.slug).checked).toBe(true);
+    api.previewPluginInstall.mockClear();
+    fireEvent.click(screen.getByTestId("suggestions-setup-install"));
+    await waitFor(() => expect(api.previewPluginInstall).toHaveBeenCalledTimes(1));
+    expect(api.previewPluginInstall).toHaveBeenCalledWith("gh:agent-of-empires/plugin-linear");
   });
 
   it("unlocks the sheet when an install preview fails", async () => {

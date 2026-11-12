@@ -61,6 +61,14 @@ export function SuggestionsSetupSheet({ sources, onClose, onFinished, onOpenMark
       setQueue([]);
       return;
     }
+    // Installed sources leave the selection, so a retry does not install them again.
+    const installed = sources.find((s) => sourceFromCommand(s.install_command) === queue[0]);
+    if (installed)
+      setChecked((current) => {
+        const rest = new Set(current);
+        rest.delete(installed.slug);
+        return rest;
+      });
     setQueue(next ? [next, ...after] : []);
     if (next) void market.install(next).then((ok) => ok || setQueue([]));
     else setStep("checks");
