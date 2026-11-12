@@ -17,7 +17,7 @@ use tracing::debug;
 use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
+    forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
@@ -90,6 +90,9 @@ pub(super) struct Shared {
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
+    /// Bumped on validated child traffic, so a turn's end can tell whether
+    /// any arrived while it was publishing `Stopped`.
+    pub(super) subagent_activity: AtomicU64,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
@@ -144,11 +147,44 @@ impl Shared {
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
+            subagent_activity: AtomicU64::new(0),
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
             claude_home,
         }
+    }
+
+    /// Validated child traffic keeps whichever watchdog owns the turn from
+    /// reading a parent that waits on its subagents as silent.
+    async fn note_subagent_activity(&self, accepted: bool, local_prompt_signals: bool, epoch: u64) {
+        if !accepted {
+            return;
+        }
+        self.subagent_activity.fetch_add(1, Ordering::Relaxed);
+        if self.prompt_in_flight.load(Ordering::Relaxed) {
+            forward_lifecycle_signals(
+                local_prompt_signals && epoch != 0,
+                &self.lifecycle_tx,
+                epoch,
+                Some(LifecycleSignal::SubagentActivity),
+                None,
+                &self.session_label,
+            )
+            .await;
+        } else {
+            self.arm_for_subagent_activity();
+        }
+    }
+
+    pub(super) fn arm_for_subagent_activity(&self) {
+        self.between_prompt.observe(
+            Some(&LifecycleSignal::SubagentActivity),
+            None,
+            now_ms(),
+            self.adopted_turn_active.load(Ordering::Relaxed),
+            &self.terminal_claim,
+        );
     }
 
     pub(super) async fn emit(&self, event: Event) {
@@ -286,24 +322,32 @@ impl Shared {
         local_prompt_signals: bool,
         epoch: u64,
     ) {
-        // Subagent traffic never feeds the root session's dedup, compaction
-        // or watchdog state: a busy child would hold its parent's turn open.
+        // Subagent traffic never feeds the root session's dedup or compaction
+        // state; it only proves the parent's turn is still live.
         let from_child = self.ingress.child_route(&notification.session_id).is_some();
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
-                return self
+                let accepted = self
                     .handle_subagent_update(notification.session_id, update)
+                    .await;
+                return self
+                    .note_subagent_activity(accepted, local_prompt_signals, epoch)
                     .await;
             }
             SessionUpdate::SessionMessage(message) => {
-                return self
+                let accepted = self
                     .handle_session_message(notification.session_id, message)
+                    .await;
+                return self
+                    .note_subagent_activity(accepted, local_prompt_signals, epoch)
                     .await;
             }
             SessionUpdate::SessionMessageChunk(_) => return,
             update if from_child => {
+                self.handle_child_notification(notification.session_id, update)
+                    .await;
                 return self
-                    .handle_child_notification(notification.session_id, update)
+                    .note_subagent_activity(true, local_prompt_signals, epoch)
                     .await;
             }
             update => notification.update = update,

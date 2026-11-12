@@ -36,6 +36,9 @@ pub(crate) enum LifecycleSignal {
     WakeupPending {
         at: chrono::DateTime<chrono::Utc>,
     },
+    /// Validated traffic from a subagent session: liveness only, so it keeps
+    /// any end-of-turn accounting already seen.
+    SubagentActivity,
     CompactionStarted,
     CompactionCompleted,
     /// The adapter emits this after the turn's own terminal on a cancel, so

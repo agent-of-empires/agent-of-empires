@@ -96,8 +96,13 @@ impl Shared {
         .await;
     }
 
-    /// `parent` is the session the announcement arrived on.
-    pub(super) async fn handle_subagent_update(&self, parent: SessionId, update: SubagentUpdate) {
+    /// `parent` is the session the announcement arrived on. Returns whether
+    /// it was accepted.
+    pub(super) async fn handle_subagent_update(
+        &self,
+        parent: SessionId,
+        update: SubagentUpdate,
+    ) -> bool {
         let child = update.session_id.clone();
         // Ingress registers only announcements that name a valid child of the
         // session they arrived on; anything else is dropped here.
@@ -106,7 +111,7 @@ impl Shared {
             .child_route(&child)
             .is_none_or(|route| route.parent != parent)
         {
-            return;
+            return false;
         }
         self.publish_subagent(&parent, &child, |record| {
             record.parent_session_id = parent.0.to_string();
@@ -115,17 +120,23 @@ impl Shared {
             apply_state(record, update.state);
         })
         .await;
+        true
     }
 
     /// `session` is the session the message arrived on. The adapter hides the
     /// Agent call, so the delegation prompt (parent to child) becomes the card
     /// that nests the child's tool calls, and the child's reply or hand-back
-    /// report (child to parent) completes it. Other messages are dropped.
-    pub(super) async fn handle_session_message(&self, session: SessionId, message: SessionMessage) {
+    /// report (child to parent) completes it. Other messages are dropped;
+    /// returns whether this one was accepted.
+    pub(super) async fn handle_session_message(
+        &self,
+        session: SessionId,
+        message: SessionMessage,
+    ) -> bool {
         let (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient)) =
             (&message.sender_session_id, &message.recipient_session_id)
         else {
-            return;
+            return false;
         };
         let child_of_session = |id: &SessionId| {
             self.ingress
@@ -147,7 +158,10 @@ impl Shared {
                 .await;
         } else if *recipient == session && child_of_session(sender) {
             self.complete_delegation_card(sender, text).await;
+        } else {
+            return false;
         }
+        true
     }
 
     /// The first parent-to-child message links the child to its launch. Later
@@ -225,7 +239,7 @@ impl Shared {
     pub(super) async fn handle_child_notification(&self, child: SessionId, update: SessionUpdate) {
         match update {
             SessionUpdate::SubagentUpdate(nested) => {
-                self.handle_subagent_update(child, nested).await
+                self.handle_subagent_update(child, nested).await;
             }
             tool @ (SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_)) => {
                 let link = self
@@ -283,11 +297,14 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::acp_client::session_identity::SessionIngress;
+    use crate::acp::acp_client::connection::notifications::now_ms;
+    use crate::acp::acp_client::lifecycle::LifecycleSignal;
     use crate::acp::acp_client::SessionState;
+    use crate::acp::acp_client::session_identity::SessionIngress;
+    use crate::acp::acp_client::watchdog::OFF_PROTOCOL_WORK_GRACE_FLOOR;
     use crate::acp::agent_profiles::CLAUDE;
     use agent_client_protocol::v1::schema::SessionNotification;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -583,100 +600,125 @@ mod tests {
 
     /// A child's tool calls nest under the Agent card that spawned it, while
     /// its messages and lifecycle never reach the root session's transcript.
+    /// Accepted child traffic keeps the parent's turn live for whichever
+    /// watchdog owns it (#5611).
     #[tokio::test]
-    async fn child_traffic_nests_tool_calls_and_stays_out_of_the_root_turn() {
-        let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
-        let (event_tx, mut events) = mpsc::channel(16);
-        let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
-        let shared = Shared::new(
-            event_tx,
-            "test".into(),
-            &CLAUDE,
-            lifecycle_tx,
-            Arc::new(SessionState::default()),
-            Arc::new(AtomicBool::new(false)),
-            None,
-            ingress.clone(),
-            None,
-        );
-        feed(
-            &ingress,
-            &shared,
-            serde_json::to_value(announce("root", "running")).unwrap(),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            delegation("tool-1", "child", "look around"),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::json!({
-                "sessionId": "child",
-                "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
-                            "title": "Read", "kind": "read", "status": "pending" },
-            }),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::json!({
-                "sessionId": "child",
-                "update": { "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": "child prose" } },
-            }),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::json!({
-                "sessionId": "stranger",
-                "update": { "sessionUpdate": "tool_call", "toolCallId": "x",
-                            "title": "Read", "kind": "read", "status": "pending" },
-            }),
-        )
-        .await;
-        feed(
-            &ingress,
-            &shared,
-            serde_json::to_value(announce("child", "idle")).unwrap(),
-        )
-        .await;
-        drop(shared);
+    async fn child_traffic_nests_tool_calls_and_keeps_the_parent_turn_live() {
+        for in_flight in [false, true] {
+            let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+            let (event_tx, mut events) = mpsc::channel(16);
+            let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
+            let shared = Shared::new(
+                event_tx,
+                "test".into(),
+                &CLAUDE,
+                lifecycle_tx,
+                Arc::new(SessionState::default()),
+                Arc::new(AtomicBool::new(in_flight)),
+                None,
+                ingress.clone(),
+                None,
+            );
+            shared.prompt_epoch.store(1, Ordering::Relaxed);
+            feed(
+                &ingress,
+                &shared,
+                serde_json::to_value(announce("root", "running")).unwrap(),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                delegation("tool-1", "child", "look around"),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                                "title": "Read", "kind": "read", "status": "pending" },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "child",
+                    "update": { "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "child prose" } },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::json!({
+                    "sessionId": "stranger",
+                    "update": { "sessionUpdate": "tool_call", "toolCallId": "x",
+                                "title": "Read", "kind": "read", "status": "pending" },
+                }),
+            )
+            .await;
+            feed(
+                &ingress,
+                &shared,
+                serde_json::to_value(announce("child", "idle")).unwrap(),
+            )
+            .await;
+            let fed = now_ms();
+            if in_flight {
+                // Announcement, delegation, tool call and prose; the stranger and
+                // the self-announcement are rejected.
+                for _ in 0..4 {
+                    let env = lifecycle.try_recv().expect("child activity signal");
+                    assert_eq!(env.epoch, 1);
+                    assert!(matches!(env.signal, LifecycleSignal::SubagentActivity));
+                }
+            } else {
+                let active = shared.has_active_subagent();
+                assert!(active);
+                let between = &shared.between_prompt;
+                assert_eq!(between.take_idle_fire(fed + 120_000, false, active), None);
+                let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+                assert_eq!(
+                    between.take_idle_fire(fed + floor, false, active),
+                    Some(false)
+                );
+            }
+            assert!(lifecycle.try_recv().is_err());
+            drop(shared);
 
-        let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
-            panic!("expected the announcement first");
-        };
-        assert_eq!(subagent.session_id, "child");
-        assert_eq!(subagent.parent_session_id, "root");
-        assert_eq!(subagent.parent_tool_call_id, None);
-        assert_eq!(subagent.title.as_deref(), Some("Explore"));
-        assert_eq!(subagent.state, SubagentState::Running);
-        assert!(subagent.cancel_capable);
+            let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
+                panic!("expected the announcement first");
+            };
+            assert_eq!(subagent.session_id, "child");
+            assert_eq!(subagent.parent_session_id, "root");
+            assert_eq!(subagent.parent_tool_call_id, None);
+            assert_eq!(subagent.title.as_deref(), Some("Explore"));
+            assert_eq!(subagent.state, SubagentState::Running);
+            assert!(subagent.cancel_capable);
 
-        let Some(Event::ToolCallStarted { tool_call: card }) = events.recv().await else {
-            panic!("expected the delegation card");
-        };
-        assert_eq!(card.id, "tool-1");
-        let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
-            panic!("expected the linked snapshot");
-        };
-        assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
+            let Some(Event::ToolCallStarted { tool_call: card }) = events.recv().await else {
+                panic!("expected the delegation card");
+            };
+            assert_eq!(card.id, "tool-1");
+            let Some(Event::SubagentUpdated { subagent, .. }) = events.recv().await else {
+                panic!("expected the linked snapshot");
+            };
+            assert_eq!(subagent.parent_tool_call_id.as_deref(), Some("tool-1"));
 
-        let Some(Event::ToolCallStarted { tool_call }) = events.recv().await else {
-            panic!("expected the child's tool call");
-        };
-        assert_eq!(tool_call.id, "child-tool");
-        assert_eq!(tool_call.parent_tool_call_id.as_deref(), Some("tool-1"));
+            let Some(Event::ToolCallStarted { tool_call }) = events.recv().await else {
+                panic!("expected the child's tool call");
+            };
+            assert_eq!(tool_call.id, "child-tool");
+            assert_eq!(tool_call.parent_tool_call_id.as_deref(), Some("tool-1"));
 
-        // The child's own announcement of itself is rejected (self-parenting),
-        // so nothing else was published: no message, no stranger, no signal.
-        assert!(events.recv().await.is_none());
-        assert!(lifecycle.try_recv().is_err());
+            // The child's own announcement of itself is rejected (self-parenting),
+            // so nothing else was published: no message, no stranger, no signal.
+            assert!(events.recv().await.is_none());
+        }
     }
 }
