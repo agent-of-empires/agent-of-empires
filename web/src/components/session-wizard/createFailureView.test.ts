@@ -36,7 +36,11 @@ describe("failureView", () => {
     ],
     [
       "latest image pull",
-      failure("sandbox_image_update_failed", "pulling_image", "Couldn't pull the latest Sandbox image sb:1. manifest unknown"),
+      failure(
+        "sandbox_image_update_failed",
+        "pulling_image",
+        "Couldn't pull the latest Sandbox image sb:1. manifest unknown",
+      ),
       {},
       {
         title: "Couldn't pull the latest image",

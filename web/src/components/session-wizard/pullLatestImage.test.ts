@@ -18,7 +18,12 @@ describe("pullLatestOffer", () => {
   it.each<[string, Parameters<typeof pullLatestOffer>[0], typeof ON, ReturnType<typeof pullLatestOffer>]>([
     ["an update", status({}), ON, { checkedByDefault: true, command: null }],
     ["a dismissed update", status({ dismissed: true }), ON, { checkedByDefault: false, command: null }],
-    ["pulls turned off", status({ pull_blocked: "disabled" }), ON, { checkedByDefault: true, command: "docker pull sb:1" }],
+    [
+      "pulls turned off",
+      status({ pull_blocked: "disabled" }),
+      ON,
+      { checkedByDefault: true, command: "docker pull sb:1" },
+    ],
     ["CityHall", status({ pull_blocked: "cityhall" }), ON, { checkedByDefault: true, command: "docker pull sb:1" }],
     ["Terminal view", status({}), { sandbox: true, structured: false }, null],
     ["the Sandbox off", status({}), { sandbox: false, structured: true }, null],
