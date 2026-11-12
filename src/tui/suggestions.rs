@@ -919,6 +919,8 @@ pub(super) struct SuggestionsFeed {
     busy: bool,
     /// User requests that arrived while another request was in flight.
     queued: std::collections::VecDeque<Req>,
+    /// The dismiss or restore request in flight, to clear only its own pending entry on failure.
+    in_flight_dismiss: Option<(ItemKey, bool)>,
     /// Dismiss requests not yet answered by a snapshot showing them.
     dismissing: Vec<ItemKey>,
     /// Restore requests not yet answered by a snapshot showing them.
@@ -951,6 +953,7 @@ impl SuggestionsFeed {
             in_flight_user: false,
             busy: false,
             queued: std::collections::VecDeque::new(),
+            in_flight_dismiss: None,
             dismissing: Vec::new(),
             restoring: Vec::new(),
             recent: Vec::new(),
@@ -973,6 +976,11 @@ impl SuggestionsFeed {
                 self.prepare_key = Some((provider_id.clone(), id.clone()));
                 self.prepare_target = *target;
             }
+            Req::Dismiss {
+                provider_id,
+                id,
+                dismissed,
+            } => self.in_flight_dismiss = Some(((provider_id.clone(), id.clone()), *dismissed)),
             _ => {}
         }
         self.worker.request(req);
@@ -1262,6 +1270,7 @@ impl SuggestionsFeed {
         };
         self.busy = false;
         let user = std::mem::take(&mut self.in_flight_user);
+        let in_flight_dismiss = self.in_flight_dismiss.take();
         let req_kind = match &res {
             Res::Snapshot(_) => ResKind::Snapshot,
             _ => ResKind::Other,
@@ -1281,10 +1290,14 @@ impl SuggestionsFeed {
             }
             Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => {
                 self.prepare_key = None;
-                if matches!(req_kind, ResKind::Snapshot) {
+                if let (ResKind::Snapshot, Some((key, dismissed))) = (req_kind, in_flight_dismiss) {
                     // A failed dismiss or restore leaves the undo window as it was.
-                    self.dismissing.clear();
-                    self.restoring.clear();
+                    let pending = if dismissed {
+                        &mut self.dismissing
+                    } else {
+                        &mut self.restoring
+                    };
+                    pending.retain(|k| *k != key);
                 }
                 if user {
                     out.error = Some(e);
@@ -1695,6 +1708,7 @@ mod tests {
         rig.store.restoring.push(key.clone());
         rig.store.busy = true;
         rig.store.in_flight_user = true;
+        rig.store.in_flight_dismiss = Some((key.clone(), false));
         let mut failed = FeedPoll {
             changed: false,
             refreshed: false,
