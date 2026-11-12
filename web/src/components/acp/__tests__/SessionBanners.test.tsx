@@ -729,6 +729,8 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     const state = snapshot(emptyAcpState(), reason, 20);
     render(banners(state));
     expect(screen.getByText(`Agent integration lost: ${detail}`)).toBeTruthy();
+    expect(screen.queryByTestId("startup-error-banner")).toBeNull();
+    expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
     expect(state).toMatchObject({
       connectionReady: false,
       connectionUnavailable: null,
@@ -793,13 +795,26 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     view.rerender(banners(state));
     expectDiagnostic();
     expect(snapshot(state, { kind: "lease_overflow" }, 19)).toEqual(state);
-    state = applyEvent(state, {
-      session_id: "snapshot-diagnostic",
-      seq: 21,
-      event: { AcpSessionAssigned: { acp_session_id: "new-current-native" } },
-    });
+    for (const [index, connectionReady] of [undefined, false, true].entries()) {
+      state = applyEvent(state, {
+        session_id: "snapshot-diagnostic",
+        seq: 21 + index,
+        event: {
+          AcpSessionAssigned: {
+            acp_session_id: "new-current-native",
+            ...(connectionReady === undefined ? {} : { connection_ready: connectionReady }),
+            native_subject: null,
+          },
+        },
+      });
+      view.rerender(banners(state));
+      expectDiagnostic();
+      expect(state.integrationLost).toEqual(reason);
+    }
+    state = snapshot(state, null, 24);
     view.rerender(banners(state));
     expect(screen.queryByText(/Agent integration lost:/)).toBeNull();
+    expect(state.integrationLost).toBeNull();
     expect(nativeInputAvailable(state)).toBe(false);
   });
 
@@ -831,6 +846,10 @@ describe("accepted integration-loss snapshot diagnostics", () => {
     initial = reducer(initial, { kind: "error", message: "Retained callback failure" });
     const lost = snapshot(initial, { kind: "hold_overflow" }, 20);
     const view = render(banners(lost));
+    expect(screen.getByText(message)).toBeTruthy();
+    fireEvent.click(screen.getByTestId("startup-error-banner-details"));
+    expect(screen.getByText("Unrelated startup diagnostic")).toBeTruthy();
+    expect(screen.getByText("Retained callback failure")).toBeTruthy();
     expect(screen.getByText(message)).toBeTruthy();
     const cleared = snapshot(lost, null, 21);
     view.rerender(banners(cleared));

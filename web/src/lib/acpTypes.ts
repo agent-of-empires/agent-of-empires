@@ -1560,9 +1560,6 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
   if ("AcpSessionAssigned" in event) {
     // Session ids and replayed availability are history. Only a current daemon
     // projection may restore native controls or physical-worker chrome.
-    if (state.integrationLostSnapshotSeq == null || frame.seq > state.integrationLostSnapshotSeq) {
-      next.integrationLost = null;
-    }
     return next;
   }
   if ("RateLimitAutoResumed" in event) {
