@@ -13,7 +13,7 @@ pub const MAX_CONCURRENT: usize = 1;
 /// Hard cap on the transcript text handed to the one-shot.
 // ponytail: argv transport with a 48 KiB cap; switch to piping the prompt via
 // stdin only if a future change needs a materially larger single call.
-const MAX_INPUT_BYTES: usize = 48_000;
+pub(crate) const MAX_INPUT_BYTES: usize = 48_000;
 
 /// Per-tool-call cap so a single noisy `args_preview` (a pasted file, a long
 /// shell line) cannot dominate the summary input.
@@ -92,8 +92,29 @@ pub fn last_summary(events: &[(u64, Event)]) -> (Option<String>, u64) {
 }
 
 /// Reconstruct the transcript for events with seq greater than `since_seq` into a compact,
-/// agent-readable form.
+/// agent-readable form, keeping the last `MAX_INPUT_BYTES`.
 pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (String, u64, usize) {
+    let (mut out, snapshot_seq, new_turns) = render_transcript_delta(events, since_seq);
+    if out.len() > MAX_INPUT_BYTES {
+        // Keep the tail on a char boundary and flag the drop honestly.
+        let start = out.len() - MAX_INPUT_BYTES;
+        let mut boundary = start;
+        while boundary < out.len() && !out.is_char_boundary(boundary) {
+            boundary += 1;
+        }
+        out = format!(
+            "[... earlier turns in this segment truncated ...]\n{}",
+            &out[boundary..]
+        );
+    }
+    (out, snapshot_seq, new_turns)
+}
+
+/// [`extract_transcript_delta`] without the size cap.
+pub(crate) fn render_transcript_delta(
+    events: &[(u64, Event)],
+    since_seq: u64,
+) -> (String, u64, usize) {
     let mut out = String::new();
     let mut snapshot_seq = since_seq;
     let mut new_turns = 0usize;
@@ -144,19 +165,6 @@ pub fn extract_transcript_delta(events: &[(u64, Event)], since_seq: u64) -> (Str
             // prior summaries) is intentionally excluded from the summary input.
             _ => {}
         }
-    }
-
-    if out.len() > MAX_INPUT_BYTES {
-        // Keep the tail on a char boundary and flag the drop honestly.
-        let start = out.len() - MAX_INPUT_BYTES;
-        let mut boundary = start;
-        while boundary < out.len() && !out.is_char_boundary(boundary) {
-            boundary += 1;
-        }
-        out = format!(
-            "[... earlier turns in this segment truncated ...]\n{}",
-            &out[boundary..]
-        );
     }
 
     (out, snapshot_seq, new_turns)
