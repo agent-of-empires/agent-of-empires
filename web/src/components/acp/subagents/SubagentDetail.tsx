@@ -120,7 +120,7 @@ export function SubagentDetail({ record, alwaysOpen = false, actions, stopChildI
         </button>
         <div className="flex items-center gap-2 pr-2">
           {actions}
-          {stopChildId && cancelSubagent ? (
+          {stopChildId && cancelSubagent && !readOnly ? (
             <StopSubagent childId={stopChildId} cancel={cancelSubagent} />
           ) : (
             record.background &&

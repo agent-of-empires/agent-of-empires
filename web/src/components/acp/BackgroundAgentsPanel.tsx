@@ -140,8 +140,10 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
 
   // A stalled agent is no longer writing, so cancel would be a no-op.
   const running = agents.filter((a) => a.status === "running").length;
-  const showShells = kind !== "agents";
-  const showAgents = kind !== "shells";
+  // The chips show only while both kinds exist; without them every kind shows.
+  const filter = agents.length > 0 && shells.length > 0 ? kind : "all";
+  const showShells = filter !== "agents";
+  const showAgents = filter !== "shells";
   const live = (entry: Entry) =>
     entry.kind === "agent"
       ? isActiveAgent(entry.agent)

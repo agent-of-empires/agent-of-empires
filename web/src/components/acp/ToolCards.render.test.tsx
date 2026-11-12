@@ -912,9 +912,17 @@ describe("delegation card from the session identity", () => {
     expect(cancelSubagent).toHaveBeenCalledWith("child-1");
   });
 
-  it("offers no Stop when the child cannot be cancelled", () => {
+  it("offers no Stop when the child cannot be cancelled, or the session is read-only", () => {
     const { queryByRole } = render(view({ ...child, cancel_capable: false }));
     expect(queryByRole("button", { name: "Stop" })).toBeNull();
+    const readOnly = render(
+      <BackgroundAgentsContext.Provider
+        value={{ agents: [], subagents: [child], cancelSubagent: vi.fn(), readOnly: true }}
+      >
+        {wrap(<ToolCard tool={card} />)}
+      </BackgroundAgentsContext.Provider>,
+    );
+    expect(readOnly.queryByRole("button", { name: "Stop" })).toBeNull();
   });
 
   it.each([
@@ -952,6 +960,9 @@ describe("delegation card from the session identity", () => {
     expect(container.textContent).toContain("running");
     expect(container.textContent).not.toMatch(/done|stopped/);
     expect(container.querySelector(".animate-pulse")).not.toBeNull();
+    // A child whose state the agent cannot report never resolves, so the stop ends it.
+    const unknown = render(view({ ...child, background: true, state: "unknown" }, stopped));
+    expect(unknown.container.textContent).toContain("Explore repo stopped");
   });
 
   it.each([

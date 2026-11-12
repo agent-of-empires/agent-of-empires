@@ -84,7 +84,7 @@ describe("BackgroundAgentsPanel shells", () => {
       shell(),
       shell({ taskId: "bx0", command: "make build", finished: true, endedAt: new Date().toISOString() }),
     ]);
-    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const { container, getByRole, rerender } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const text = () => container.textContent ?? "";
     expect(text()).toContain("Background · 4");
     const [running, recent] = [text().indexOf("Running · 2"), text().indexOf("Recent · 2")];
@@ -97,7 +97,14 @@ describe("BackgroundAgentsPanel shells", () => {
     fireEvent.click(getByRole("button", { name: "Agents 2" }));
     expect(text()).not.toContain("npm run dev");
     expect(text()).toContain("Old agent");
+    // With one kind left the chips go, and so does their filter.
+    fireEvent.click(getByRole("button", { name: "Shells 2" }));
+    agentsMock.mockReturnValue([]);
+    rerender(<BackgroundAgentsPanel sessionId="s-1" />);
     shellsMock.mockReturnValue([]);
+    agentsMock.mockReturnValue([agent()]);
+    rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+    expect(text()).toContain("Map backend lifecycle");
   });
 
   it("shows the empty state with no agents and no shells", () => {

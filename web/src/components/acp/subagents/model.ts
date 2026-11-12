@@ -158,7 +158,8 @@ export function fromInline(
   roster?: RosterEntry,
 ): SubagentRecord {
   const args = parseJsonObject(tool.args_preview);
-  const result = roster?.background && toolResult?.kind === "tool_stopped" ? undefined : toolResult;
+  const following = roster?.background && roster.state !== "unknown";
+  const result = following && toolResult?.kind === "tool_stopped" ? undefined : toolResult;
   const running = !result && roster?.state !== "idle";
   const status: SubagentStatus = running
     ? roster?.state === "requires_action"
