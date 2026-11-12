@@ -478,6 +478,10 @@ impl HomeView {
             "{} was created, but its first prompt was not delivered: {error}",
             row.title
         );
+        if self.info_dialog.is_some() {
+            self.flash_status("A session's first prompt was not delivered");
+            return;
+        }
         match prompt {
             Some(text) => {
                 crate::tui::clipboard::copy_to_clipboard(&text);
@@ -487,11 +491,7 @@ impl HomeView {
             }
             None => message.push_str("\n\nAttach the session and type the prompt again."),
         }
-        if self.info_dialog.is_none() {
-            self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
-        } else {
-            self.flash_status("A session's first prompt was not delivered");
-        }
+        self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
     }
 
     fn commit_created_session(&mut self) -> Option<String> {
