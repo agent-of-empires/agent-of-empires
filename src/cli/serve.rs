@@ -237,12 +237,7 @@ impl ServeArgs {
             self.passphrase = resolve_launch_passphrase(self.passphrase.take(), None, || {
                 std::env::var("AOE_SERVE_PASSPHRASE").ok()
             });
-            if self.port.is_none() {
-                self.port = Some(resolve_serve_port(
-                    std::env::var_os("AOE_SERVE_PORT"),
-                    || Ok(crate::session::config::Config::load()?.serve.port),
-                )?);
-            }
+            self.resolve_port()?;
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
         Ok(())
@@ -254,6 +249,24 @@ impl ServeArgs {
     pub fn resolved_port(&self) -> u16 {
         self.port
             .unwrap_or(crate::session::config::DEFAULT_SERVE_PORT)
+    }
+
+    /// Fill a missing TCP port from `AOE_SERVE_PORT`, then `[serve] port`.
+    fn resolve_port(&mut self) -> Result<()> {
+        self.fill_port(std::env::var_os("AOE_SERVE_PORT"), || {
+            Ok(crate::session::config::Config::load()?.serve.port)
+        })
+    }
+
+    fn fill_port(
+        &mut self,
+        env: Option<std::ffi::OsString>,
+        configured: impl FnOnce() -> Result<u16>,
+    ) -> Result<()> {
+        if !self.core_only && self.port.is_none() {
+            self.port = Some(resolve_serve_port(env, configured)?);
+        }
+        Ok(())
     }
 }
 
@@ -2311,6 +2324,8 @@ async fn replay_managed_launch(
         Some(predecessor_passphrase.as_deref()),
         || None,
     );
+    // A core-only record has no port to replay when the request enables the dashboard.
+    args.resolve_port()?;
     validate_launch_args(&launch.profile, &args).await?;
     retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
@@ -3457,6 +3472,40 @@ mod tests {
         ]));
         assert!(!dashboard.core_only);
         assert_eq!((dashboard.port, dashboard.auth), (Some(8080), None));
+    }
+
+    #[test]
+    fn replay_into_dashboard_resolves_a_missing_port() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Commands::Serve(args)) = parsed.command else {
+                unreachable!();
+            };
+            args
+        };
+        let mut core = sample_launch();
+        core.core_only = true;
+        let env = |value: &str| Some(std::ffi::OsString::from(value));
+
+        let mut dashboard = core.overlay_tui_args(parse(&["aoe", "serve", "--daemon"]));
+        assert_eq!(dashboard.port, None);
+        dashboard.fill_port(env("9100"), || Ok(9000)).unwrap();
+        assert_eq!(dashboard.port, Some(9100));
+
+        let mut explicit =
+            core.overlay_tui_args(parse(&["aoe", "serve", "--daemon", "--port", "8095"]));
+        explicit.fill_port(env("9100"), || Ok(9000)).unwrap();
+        assert_eq!(explicit.port, Some(8095));
+
+        let mut config = core.overlay_tui_args(parse(&["aoe", "serve", "--daemon"]));
+        config.fill_port(None, || Ok(9000)).unwrap();
+        assert_eq!(config.port, Some(9000));
+
+        let mut still_core =
+            core.overlay_tui_args(parse(&["aoe", "serve", "--daemon", "--core-only"]));
+        still_core.fill_port(env("9100"), || Ok(9000)).unwrap();
+        assert_eq!(still_core.port, None);
     }
 
     #[test]

@@ -928,7 +928,8 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start."
     },
     {
       "id": "settings.global-migration-and-persistence",
