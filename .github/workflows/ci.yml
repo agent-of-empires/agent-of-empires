@@ -226,8 +226,8 @@ jobs:
   script-selftests:
     # Toolchain-free self-tests for the scripts other workflows rely on:
     # verify-shared-target.sh (kache verify), select-internal-pr.py
-    # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml)
-    # and classify-cachix-failure.py (cachix-push.yml).
+    # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml),
+    # classify-cachix-failure.py (cachix-push.yml) and release-pr-fresh.sh.
     name: Script Self-Tests
     runs-on: ubuntu-latest
     steps:
@@ -239,6 +239,7 @@ jobs:
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
       - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+      - run: .github/scripts/release-pr-fresh.sh --self-test
       - run: python3 scripts/check-no-claude-in-core.py --self-test
       # Disabled until C25 to C29 remove Claude from core on
       # integration/claude-removal; enable there by dropping the `if`.
@@ -439,51 +440,24 @@ jobs:
           nix build --no-link .#packages.x86_64-linux.aoe-web-frontend
 
   release-pr-fresh:
-    # A release PR queued after main moved would tag commits that its CHANGELOG.md
-    # section lacks. Passes on other events so it can be a required check.
+    # Fails a stale release PR in the merge queue; see release-pr-fresh.sh.
+    # Passes on other events so it can be a required check.
     name: Release PR Up To Date
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
     steps:
-      - name: Look up the queued PR
-        id: pr
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'merge_group'
+        with:
+          persist-credentials: false
+      - if: github.event_name == 'merge_group'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.event.merge_group.head_ref }}
-        run: |
-          set -euo pipefail
-          # refs/heads/gh-readonly-queue/main/pr-<N>-<sha>
-          PR="${HEAD_REF##*/pr-}"
-          PR="${PR%%-*}"
-          [[ $PR =~ ^[0-9]+$ ]] || { echo "::error::Cannot parse PR from $HEAD_REF"; exit 1; }
-          echo "number=$PR" >> "$GITHUB_OUTPUT"
-          gh pr view "$PR" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid,labels \
-            --jq '"ref=\(.headRefName)\noid=\(.headRefOid)\nrelease=\(any(.labels[]; .name == "release"))"' >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.pr.outputs.release == 'true' && startsWith(steps.pr.outputs.ref, 'release-plz-')
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Fail if main moved past the release PR
-        if: steps.pr.outputs.release == 'true' && startsWith(steps.pr.outputs.ref, 'release-plz-')
-        env:
-          PR: ${{ steps.pr.outputs.number }}
-          PR_HEAD: ${{ steps.pr.outputs.oid }}
           GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
-        run: |
-          set -euo pipefail
-          git fetch -q --no-tags origin "refs/pull/$PR/head"
-          MISSED="$(git log --oneline "$PR_HEAD..$GROUP_HEAD~1")"
-          if [ -n "$MISSED" ]; then
-            { echo '### Would ship without CHANGELOG.md entries'; echo; echo "$MISSED" | sed 's/^/    /'; } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error title=Release PR is stale::$(echo "$MISSED" | wc -l) commit(s) landed after the release PR's last refresh and would ship without CHANGELOG.md entries. Dispatch release-plz.yml to refresh the PR, then queue it again. See the job summary."
-            exit 1
-          fi
+        run: .github/scripts/release-pr-fresh.sh
 
   website:
     name: Website Build
