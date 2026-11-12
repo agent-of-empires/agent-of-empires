@@ -197,6 +197,8 @@ Clearing a selection or invalidating its painted geometry cancels unadmitted
 preparation, not an admitted output receipt. The reader retains the matching
 ticket and result until completion, failure, or supersession, so successful
 desktop output cannot leave a permanent admission-only caption.
+Terminal success, failure, and closed replies retire their ticket. A later history
+refresh cannot relabel a confirmed output result as cancelled.
 Published source updates are reconciled before prepared copy results. Replacement
 cancels stale preparation while retaining the last readable window. Clipboard
 admission holds the publication read guard through ticket submission, so a source

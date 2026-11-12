@@ -264,6 +264,7 @@ impl RetainedView {
                             self.copy_message = Some("Writing clipboard content…".into());
                         }
                         Err(error) => {
+                            self.copy_ticket = None;
                             self.copy_message =
                                 Some(if error.kind() == std::io::ErrorKind::Interrupted {
                                     "Copy cancelled before output admission.".into()
@@ -275,11 +276,13 @@ impl RetainedView {
                     changed = true;
                 }
                 Ok(Err(error)) => {
+                    self.copy_ticket = None;
                     self.copy_message = Some(format!("Copy failed: {error}"));
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => self.copy_result = Some(receiver),
                 Err(TryRecvError::Closed) => {
+                    self.copy_ticket = None;
                     self.copy_message = Some("Copy cancelled.".into());
                     changed = true;
                 }
@@ -288,22 +291,25 @@ impl RetainedView {
         if let Some(mut receiver) = self.clipboard_result.take() {
             match receiver.try_recv() {
                 Ok(Ok(report)) => {
-                    if self
+                    let current = self
                         .copy_ticket
-                        .as_ref()
-                        .is_none_or(|ticket| !ticket.current())
-                    {
-                        return true;
-                    }
-                    self.copy_message = Some(report.message());
+                        .take()
+                        .is_some_and(|ticket| ticket.current());
+                    self.copy_message = Some(if current {
+                        report.message()
+                    } else {
+                        "Copy superseded by a newer request.".into()
+                    });
                     changed = true;
                 }
                 Ok(Err(error)) => {
+                    self.copy_ticket = None;
                     self.copy_message = Some(format!("Copy failed: {error}"));
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => self.clipboard_result = Some(receiver),
                 Err(TryRecvError::Closed) => {
+                    self.copy_ticket = None;
                     self.copy_message = Some("Clipboard output ended unexpectedly.".into());
                     changed = true;
                 }
@@ -320,6 +326,7 @@ impl RetainedView {
                     self.copy_result = Some(worker.copy(identity, range));
                     self.copy_message = Some("Preparing clipboard content…".into());
                 } else {
+                    self.copy_ticket = None;
                     self.copy_message = Some("Copy cancelled: retained history changed.".into());
                 }
                 changed = true;
@@ -377,7 +384,11 @@ impl RetainedView {
             Ok(new) => old.identity != new.identity || old.highest_seq != new.highest_seq,
             Err(_) => true,
         });
-        if projection_changed && self.copy_ticket.is_some() {
+        if projection_changed
+            && (self.pending_copy.is_some()
+                || self.copy_result.is_some()
+                || self.clipboard_result.is_some())
+        {
             self.cancel_copy();
             self.copy_message = Some("Copy cancelled: retained history changed.".into());
         }

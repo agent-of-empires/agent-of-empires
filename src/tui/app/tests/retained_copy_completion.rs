@@ -76,6 +76,8 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     let (started, mut observed) = tokio::sync::oneshot::channel();
     let mut started = Some(started);
     let (release, released) = std::sync::mpsc::sync_channel(1);
+    let (feedback_tx, feedback) = tokio::sync::oneshot::channel();
+    let mut feedback_tx = Some(feedback_tx);
     app._clipboard = crate::tui::clipboard::Executor::start(move |mut file, _, _| {
         file.rewind()?;
         let mut output = std::fs::File::create(&output_path)?;
@@ -84,13 +86,19 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         released
             .recv_timeout(Duration::from_secs(5))
             .map_err(std::io::Error::other)?;
-        Ok(crate::tui::clipboard::CopyReport {
+        let report = crate::tui::clipboard::CopyReport {
             bytes,
             desktop: Some("private output file"),
             osc52: crate::tui::clipboard::Osc52Outcome::Failed(
                 std::io::ErrorKind::Unsupported.into(),
             ),
-        })
+        };
+        feedback_tx
+            .take()
+            .expect("one actual copy report")
+            .send(report.message())
+            .unwrap();
+        Ok(report)
     })
     .unwrap();
     app._clipboard.activate_for_test();
@@ -205,6 +213,46 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         .screen()
         .contents()
         .contains("Writing clipboard content"));
+    assert_eq!(std::fs::read(&sink).unwrap(), CONTENT.as_bytes());
+    let completed_feedback = feedback
+        .await
+        .expect("the actual executor produced its report");
+    assert!(
+        screen.screen().contents().contains(&completed_feedback),
+        "the actual completed report must first be visible"
+    );
+    const UPDATED: &str = "RETAINED-SOURCE-AFTER-COPY";
+    state
+        .acp_event_store
+        .record(
+            &row.id,
+            2,
+            &crate::acp::state::Event::AgentMessageChunk {
+                text: UPDATED.into(),
+                message_id: Some("post-copy-source-update".into()),
+            },
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            ticker.tick().await;
+            app.reconcile_structured_preview().await;
+            drain_terminal(&mut master, &mut bytes);
+            app.draw(&mut terminal).unwrap();
+            drain_terminal(&mut master, &mut bytes);
+            screen.process(&bytes[parsed..]);
+            parsed = bytes.len();
+            if app.home.presentation_ready && screen.screen().contents().contains(UPDATED) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the real changed retained source must be repainted before comparing copy feedback");
+    assert!(
+        screen.screen().contents().contains(&completed_feedback),
+        "a later source update must not relabel the actual confirmed copy result"
+    );
     assert_eq!(std::fs::read(&sink).unwrap(), CONTENT.as_bytes());
     drop(app);
     server.abort();
