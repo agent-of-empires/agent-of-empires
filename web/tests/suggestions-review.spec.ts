@@ -285,8 +285,8 @@ test("a started suggestion offers Open, and Start another sends no suggestion re
   );
   await page.goto("/suggestions");
 
-  await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(0);
   await expect(page.getByText(/Session running · Review RFC 4562 · started 3 min ago/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start", exact: true })).toHaveCount(0);
 
   await page.getByRole("button", { name: "More", exact: true }).click();
   const menuItems = page.getByRole("menuitem");
