@@ -479,6 +479,7 @@ mod tests {
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: name.into(),
             kind: "execute".into(),

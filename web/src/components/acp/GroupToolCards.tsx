@@ -1,11 +1,10 @@
 /* eslint-disable react-refresh/only-export-components */
 // Cards that fold several tool calls: action runs and sub-agent tasks.
 
-import { useState } from "react";
-import { Layers, Sparkles, Square } from "lucide-react";
+import { useMemo, useState } from "react";
+import { Layers, Square } from "lucide-react";
 
-import { pickStr } from "../../lib/acpArgs";
-import type { BackgroundAgentStatus, SubagentRecord, ToolCall } from "../../lib/acpTypes";
+import type { ToolCall } from "../../lib/acpTypes";
 import {
   isActiveAgent,
   isStoppable,
@@ -14,21 +13,15 @@ import {
   useOpenBackgroundAgentsPane,
   useSubagentFor,
 } from "./backgroundAgentsContext";
-import {
-  CardChrome,
-  HighlightedBlock,
-  PlaceholderLine,
-  spanTimes,
-  useToolArgs,
-  useToolCardExpansion,
-  type Status,
-  type ToolCardProps,
-} from "./ToolCardChrome";
+import { CardChrome, spanTimes, useToolCardExpansion, type Status, type ToolCardProps } from "./ToolCardChrome";
 import { useToolDisplayMode } from "./ToolDisplayMode";
 import { useToolExpansionStore } from "./ToolExpansion";
 import { ToolCard } from "./ToolCards";
-import { ToolErrorBody } from "./ToolErrorBody";
 import { ToolOutputMedia } from "./ToolOutputMedia";
+import { fromBackground, fromInline, taskPrompt } from "./subagents/model";
+import { SubagentDetail } from "./subagents/SubagentDetail";
+
+export { extractTaskResult } from "./subagents/model";
 
 const ICON = "h-3.5 w-3.5";
 
@@ -107,34 +100,6 @@ export function ToolGroupCard({ items }: { items: (ToolCardProps & { kind: strin
   );
 }
 
-function useTaskDescription(tool: ToolCall) {
-  const args = useToolArgs(tool);
-  return { args, description: pickStr(args, "description", "_aoe_title") ?? tool.name ?? "Subagent task" };
-}
-
-const ASYNC_STATUS: Record<BackgroundAgentStatus, [Status, string]> = {
-  running: ["running", "running in background"],
-  completed: ["ok", "finished in background"],
-  error: ["err", "background agent error"],
-  stalled: ["stopped", "stalled in background"],
-  detached: ["stopped", "detached"],
-  requires_action: ["running", "Waiting on you"],
-  unknown: ["stopped", "Unknown"],
-};
-
-function subagentBadge(record: SubagentRecord): string {
-  switch (record.state) {
-    case "running":
-      return "running";
-    case "requires_action":
-      return "waiting on you";
-    case "idle":
-      return record.stop_reason ? `idle · ${record.stop_reason}` : "idle";
-    default:
-      return "unknown";
-  }
-}
-
 /** Stops one child. The header is a button, so a nested one would be invalid markup. */
 function StopSubagentButton({ sessionId }: { sessionId: string }) {
   const cancel = useCancelSubagent();
@@ -155,7 +120,7 @@ function StopSubagentButton({ sessionId }: { sessionId: string }) {
         e.stopPropagation();
         void cancel(sessionId);
       }}
-      className="ml-2 inline-flex items-center text-text-dim hover:text-rose-300"
+      className="inline-flex items-center text-text-dim hover:text-rose-300"
     >
       <Square className="h-3 w-3 fill-current" strokeWidth={0} />
     </span>
@@ -163,114 +128,54 @@ function StopSubagentButton({ sessionId }: { sessionId: string }) {
 }
 
 /** Async sub-agent launch, linked to its live Background agents record by
- *  tool-call id. Neutral until the first tailer event arrives. */
+ *  tool-call id. Running until the first tailer event arrives. */
 export function AsyncSubagentCard({ tool }: { tool: ToolCall }) {
-  const { description } = useTaskDescription(tool);
   const agent = useBackgroundAgentFor(tool.id);
-  const record = useSubagentFor(tool.id);
+  const roster = useSubagentFor(tool.id);
   const openPane = useOpenBackgroundAgentsPane();
-  const stoppable = !!agent && isActiveAgent(agent) && isStoppable(record);
-
-  const [status, fallbackMeta] = agent ? ASYNC_STATUS[agent.status] : (["ok", "runs in background"] as const);
-  let metaText = fallbackMeta;
-  if (agent?.status === "running") {
-    const tools = agent.toolCount > 0 ? `${agent.toolCount} ${agent.toolCount === 1 ? "tool" : "tools"}` : null;
-    metaText = [tools, agent.lastTool].filter(Boolean).join(" · ") || fallbackMeta;
-  } else if (agent?.status === "error") {
-    metaText = agent.warning ?? fallbackMeta;
-  }
-
+  const stoppable = !!agent && isActiveAgent(agent) && isStoppable(roster);
+  const record = useMemo(
+    () =>
+      agent
+        ? fromBackground(agent)
+        : {
+            ...fromInline(tool, undefined, []),
+            background: true,
+            prompt: tool.prompt ?? taskPrompt(tool.args_preview),
+          },
+    [agent, tool],
+  );
   return (
-    <CardChrome
-      status={status}
-      neutralOnDone={!agent || agent.status === "stalled" || agent.status === "detached"}
-      icon={<Sparkles className={ICON} />}
-      label="subagent"
-      startedAt={agent?.startedAt ?? tool.started_at}
-      endedAt={agent?.endedAt ?? undefined}
-      primary={<span className="truncate">{description}</span>}
-      meta={
+    <SubagentDetail
+      record={record}
+      actions={
         <>
-          <span className="text-[11px] text-text-dim">{metaText}</span>
-          {stoppable && <StopSubagentButton sessionId={record.session_id} />}
+          {openPane && (
+            <button
+              type="button"
+              onClick={() => openPane(agent?.agentId)}
+              className="text-[11px] text-text-dim hover:text-text-secondary"
+            >
+              Open in side pane
+            </button>
+          )}
+          {stoppable && <StopSubagentButton sessionId={roster.session_id} />}
         </>
       }
-      expanded={false}
-      onToggle={openPane}
-      navigate={openPane !== undefined}
     />
   );
 }
 
-/** Unwrap opencode's `<task><task_result>…</task_result></task>` report; anything else is returned verbatim. */
-export function extractTaskResult(text: string): string {
-  const match = text.trim().match(/^<task\b[^>]*>\s*<task_result\b[^>]*>([\s\S]*?)<\/task_result>\s*<\/task>$/);
-  return match ? match[1]!.trim() : text;
-}
-
 /** A sub-agent Task or delegation. With children it nests their calls; childless it
  *  only reports a final result (opencode, or a delegation with no calls yet). */
-export function SubagentCard({ tool, result: toolResult, children }: ToolCardProps & { children: ToolCardProps[] }) {
-  const { args, description: toolDescription } = useTaskDescription(tool);
-  const record = useSubagentFor(tool.id);
-  // A background child outlives the turn that stopped its launch call, so the
-  // roster, not that stop, says whether the card is still active.
-  const result = record && record.state !== "unknown" && toolResult?.kind === "tool_stopped" ? undefined : toolResult;
-  const description = record?.title || toolDescription;
-  const hasChildren = children.length > 0;
-  const prompt = pickStr(args, "prompt");
-  const report = result ? extractTaskResult(result.text ?? "") : "";
-  // Only the parent's own error fails the header. An idle child ends the card
-  // even when no reply ever completed it.
-  const idle = record?.state === "idle";
-  const pending = result === undefined || children.some((c) => !c.result);
-  const failed = result ? result.kind === "tool_error" : record?.stop_reason === "error";
-  const status: Status = pending && !idle ? "running" : failed ? "err" : "ok";
-  const [open, setOpen] = useToolCardExpansion(status);
-
+export function SubagentCard({ tool, result, children }: ToolCardProps & { children: ToolCardProps[] }) {
+  const roster = useSubagentFor(tool.id);
+  const record = useMemo(() => fromInline(tool, result, children, roster), [tool, result, children, roster]);
   return (
     <>
-      <CardChrome
-        status={status}
-        // The roster has no end time, so a child settled without a reply shows no duration.
-        {...(idle && !result ? {} : spanTimes([{ tool, result }, ...children]))}
-        icon={<Sparkles className={ICON} />}
-        label="subagent"
-        meta={
-          record && (
-            <>
-              <span className="text-[11px] text-text-dim">{subagentBadge(record)}</span>
-              {isStoppable(record) && <StopSubagentButton sessionId={record.session_id} />}
-            </>
-          )
-        }
-        primary={
-          <>
-            <span className="truncate">{description}</span>
-            {hasChildren && (
-              <span className="ml-2 text-text-dim">
-                · {children.length} {children.length === 1 ? "tool" : "tools"}
-              </span>
-            )}
-          </>
-        }
-        expanded={open}
-        onToggle={() => setOpen((v) => !v)}
-        body={
-          open &&
-          (hasChildren ? (
-            <ChildCards items={children} nested />
-          ) : (
-            <ToolErrorBody status={status} errorText={result?.text}>
-              {prompt && <HighlightedBlock text={prompt} language="markdown" maxLines={8} />}
-              {status === "err" ? null : report ? (
-                <HighlightedBlock text={report} language="markdown" maxLines={20} />
-              ) : (
-                <PlaceholderLine>{status === "running" ? "Running…" : "(no result)"}</PlaceholderLine>
-              )}
-            </ToolErrorBody>
-          ))
-        }
+      <SubagentDetail
+        record={record}
+        actions={isStoppable(roster) && <StopSubagentButton sessionId={roster.session_id} />}
       />
       {result?.output?.length ? <ToolOutputMedia blocks={result.output} /> : null}
     </>

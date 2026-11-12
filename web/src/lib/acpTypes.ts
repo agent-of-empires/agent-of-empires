@@ -29,6 +29,8 @@ export interface ToolCall {
   /** ACP ToolKind, lowercased. */
   kind: string;
   args_preview: string;
+  /** The `prompt` argument in full, present only when `args_preview` was cut at the ingest cap. */
+  prompt?: string;
   started_at: string; // ISO-8601 from chrono
   /** Parent `Task` call for sub-agent tool calls. */
   parent_tool_call_id?: string;
@@ -335,6 +337,8 @@ export type AcpEvent =
         tool_call_id: string;
         title: string | null;
         args_preview: string | null;
+        /** The `prompt` argument in full when `args_preview` was cut. */
+        prompt?: string | null;
         /** Re-stamped when the tool actually starts running, so durations exclude scheduling time. */
         started_at?: string | null;
         /** A non-empty list replaces the card's diffs; null leaves them untouched. */
@@ -735,10 +739,15 @@ export interface SubagentRecord {
 }
 
 export interface BackgroundAgentTool {
+  /** The transcript's tool_use id; absent on events from before it was recorded. */
+  id?: string;
   name: string;
   title?: string | null;
   /** Undefined while running. */
   ok?: boolean | null;
+  /** Transcript timestamps; absent when the transcript line carried none. */
+  started_at?: string | null;
+  ended_at?: string | null;
 }
 
 /** The workflow run and phase a background sub-agent belongs to. */

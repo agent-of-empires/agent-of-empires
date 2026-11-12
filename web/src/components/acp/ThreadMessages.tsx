@@ -219,6 +219,13 @@ function pickStartedAt(args: Record<string, unknown> | undefined, argsText: stri
   return null;
 }
 
+function pickPrompt(args: Record<string, unknown> | undefined, argsText: string | undefined): string | undefined {
+  for (const o of [args, argsText ? parseJsonObject(argsText) : null]) {
+    if (typeof o?._aoe_prompt === "string") return o._aoe_prompt;
+  }
+  return undefined;
+}
+
 function prettifyToolName(kind: string, args?: Record<string, unknown>): string {
   for (const key of ["_aoe_title", "path", "file_path", "filePath", "command", "cmd", "query", "url"]) {
     const v = args?.[key];
@@ -251,6 +258,7 @@ function toToolItem(part: ToolPart): { tool: ToolCall; result?: ActivityRow; kin
     started_at: pickStartedAt(part.args, part.argsText) ?? fallbackAt,
     memory_recall: pickMemoryRecall(part.args, part.argsText),
     diffs: pickDiffs(part.args, part.argsText),
+    prompt: pickPrompt(part.args, part.argsText),
   };
   const result =
     part.result !== undefined
