@@ -223,6 +223,7 @@ test("request refusal preserves the real Native owner, retained diagnostic, and 
   type Frame = { event?: Record<string, unknown> };
   const events = async () =>
     ((await replayFrames(serve.baseUrl, sessionId)) as Frame[]).map((frame) => frame.event ?? {});
+  await waitForReplayContains(serve.baseUrl, sessionId, '"AcpSessionAssigned"');
   const originalOwner = owner();
   const assigned = (await events()).flatMap((event) =>
     event.AcpSessionAssigned === undefined ? [] : [event.AcpSessionAssigned],
