@@ -79,4 +79,29 @@ describe("SettingsView schema load", () => {
     // The non-schema selector is still there alongside the schema-slot error.
     expect(screen.getByText("Default profile")).toBeTruthy();
   });
+
+  describe("Suggestions tab", () => {
+    const SNAPSHOT = {
+      prefs: {
+        homepage: true,
+        sidebar: false,
+        refresh_minutes: 15,
+        start_without_review: false,
+        show_source_ref: true,
+        provider_order: ["gh"],
+      },
+      providers: [{ id: "gh", name: "GitHub", status: "ok", enabled: true, sources: [] }],
+      items: [],
+    };
+    beforeEach(() => {
+      vi.mocked(api.fetchSuggestions).mockResolvedValue(SNAPSHOT as never);
+    });
+
+    it("renders when general settings fail to load", async () => {
+      vi.mocked(api.fetchSettings).mockResolvedValue(null);
+      renderView("suggestions");
+      expect(await screen.findByText("Show in sidebar")).toBeTruthy();
+      expect(screen.queryByText("Loading settings...")).toBeNull();
+    });
+  });
 });
