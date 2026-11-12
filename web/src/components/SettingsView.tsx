@@ -283,7 +283,8 @@ export function SettingsView({
 }: Props) {
   const offline = useServerDown();
   const suggestions = useSuggestionsSnapshot();
-  const hasSuggestionProviders = (suggestions.snapshot?.providers.length ?? 0) > 0;
+  // A failed load keeps the tab, so its error and Retry stay reachable.
+  const hasSuggestionProviders = (suggestions.snapshot?.providers.length ?? 0) > 0 || suggestions.failed;
   // Seed empty rather than "default" so the initial
   // useEffect-gated loadSettings doesn't fire a wasted
   // fetchSettings("default") against a profile that may not exist.
