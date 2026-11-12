@@ -53,12 +53,17 @@ fn expand(template: &str, variables: &BTreeMap<String, String>) -> Result<String
     Ok(out)
 }
 
-/// The registered project `wanted` names, by exact name or path. Zero or
+/// The registered project `wanted` names, by exact path or name. An absolute
+/// path that matches a project beats a project merely named like it. Zero or
 /// several matches resolve to nothing: a project is never guessed.
 fn resolve_hint(projects: &[Project], wanted: &str) -> Option<Project> {
-    let mut hits: Vec<&Project> = projects.iter().filter(|p| p.name == wanted).collect();
+    let mut hits = if std::path::Path::new(wanted).is_absolute() {
+        by_path(projects, wanted)
+    } else {
+        Vec::new()
+    };
     if hits.is_empty() {
-        hits = by_path(projects, wanted);
+        hits = projects.iter().filter(|p| p.name == wanted).collect();
     }
     match hits[..] {
         [only] => Some(only.clone()),
@@ -398,6 +403,29 @@ mod tests {
         assert_eq!(
             prepare("default", &stale, None, None),
             Err(PrepareRefusal::Stale)
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_hint_beats_a_project_named_like_it() {
+        let scope = projects::ProjectScope::Global;
+        let registered = [
+            Project::new("/tmp/aoe-by-path", "/tmp/aoe-decoy", scope),
+            Project::new("target", "/tmp/aoe-by-path", scope),
+        ];
+        assert_eq!(
+            resolve_hint(&registered, "/tmp/aoe-by-path").unwrap().name,
+            "target"
+        );
+        assert_eq!(
+            resolve_hint(&registered, "target").unwrap().path,
+            "/tmp/aoe-by-path"
+        );
+        let named_only = [Project::new("/tmp/aoe-by-name", "/tmp/aoe-x", scope)];
+        assert_eq!(
+            resolve_hint(&named_only, "/tmp/aoe-by-name").unwrap().path,
+            "/tmp/aoe-x",
+            "a path that names no project still falls back to the name"
         );
     }
 
