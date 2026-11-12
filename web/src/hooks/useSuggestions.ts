@@ -144,11 +144,6 @@ export function useSuggestions(
         draft.templated &&
         draft.initial_prompt
       ) {
-        if (peekPendingCreate()) {
-          setNotice(PENDING_NOTICE);
-          setBusy(null);
-          return;
-        }
         const body = {
           title: draft.title || undefined,
           path: draft.project.path,
@@ -163,6 +158,14 @@ export function useSuggestions(
           idempotency_key: newIdempotencyKey(),
         };
         const origin = await fetchCreateBootId();
+        // Checked after the await and just before registering, so no other start slips in between.
+        if (peekPendingCreate()) {
+          if (mounted.current) {
+            setNotice(PENDING_NOTICE);
+            setBusy(null);
+          }
+          return;
+        }
         registerPendingCreate({ body, tool: draft.tool, since: Date.now(), origin }, { claimed: true });
         const created = await createSession(body);
         // No definite answer: the app-level owner keeps reconciling under this key, and a

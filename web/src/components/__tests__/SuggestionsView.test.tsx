@@ -282,6 +282,20 @@ describe("SuggestionsView", () => {
     }
   });
 
+  it("Start without review refuses when another create registers while the boot id is being fetched", async () => {
+    let bootId: (id: string) => void = () => {};
+    fetchCreateBootId.mockReturnValue(new Promise((resolve) => (bootId = resolve)));
+    pending.peek.mockReturnValue(null);
+    const { onPrepare } = await startWithoutReview({});
+    await waitFor(() => expect(fetchCreateBootId).toHaveBeenCalled());
+    pending.peek.mockReturnValue({ body: { idempotency_key: "other" } });
+    bootId("boot-1");
+    expect((await screen.findByRole("alert")).textContent).toContain("still being created");
+    expect(createSession).not.toHaveBeenCalled();
+    expect(pending.register).not.toHaveBeenCalled();
+    expect(onPrepare).not.toHaveBeenCalled();
+  });
+
   it("Start without review refuses a re-click while an earlier create is unresolved", async () => {
     pending.peek.mockReturnValue({ body: { idempotency_key: "old" } });
     const { onPrepare } = await startWithoutReview({});
