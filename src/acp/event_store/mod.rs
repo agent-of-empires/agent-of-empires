@@ -18,6 +18,7 @@ macro_rules! native_channel_loss_sql {
 mod attachments;
 pub(crate) mod control;
 mod establishment;
+pub(crate) mod identity;
 mod rate_limit;
 mod replay;
 mod search;
@@ -57,15 +58,29 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AuthStatusUpdated",
 ];
 
-/// Background work as its (start, end, id field) events. Teardown and cold
-/// folds find open work by pairing them, so the retention prune pins both
-/// halves, and [`prune_completed_background_work`] drops a pair once it ends.
-const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str)] = &[
-    ("BackgroundTaskStarted", "BackgroundTaskFinished", "task_id"),
+/// Selects the shell starts among task starts (`recent` is the start row).
+const SHELL_START: &str =
+    "json_extract(recent.event_json, '$.BackgroundTaskStarted.workflow') IS NULL";
+const WORKFLOW_START: &str =
+    "json_extract(recent.event_json, '$.BackgroundTaskStarted.workflow') IS NOT NULL";
+
+/// Background work as its (start, end, id field, kept groups) events. Teardown
+/// and cold folds find open work by pairing them, so the retention prune pins
+/// both halves, and [`prune_completed_background_work`] drops a pair once it
+/// ends, except the newest ended starts of each kept group, so the shell panel
+/// survives a reload and workflows cannot displace shells.
+const BACKGROUND_WORK_EVENTS: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "BackgroundTaskStarted",
+        "BackgroundTaskFinished",
+        "task_id",
+        &[SHELL_START, WORKFLOW_START],
+    ),
     (
         "BackgroundAgentLaunched",
         "BackgroundAgentCompleted",
         "agent_id",
+        &[],
     ),
 ];
 
@@ -89,16 +104,26 @@ const RETENTION_PINNED_EVENT_DISCRIMINANTS: &[&str] = &[
     "BackgroundAgentCompleted",
     "BackgroundTaskStarted",
     "BackgroundTaskFinished",
+    "SubagentUpdated",
 ];
+
+/// Idle read connections kept open; concurrent reads beyond this open more.
+const MAX_IDLE_READERS: usize = 4;
 
 /// SQLite-backed structured view event log.
 pub struct EventStore {
     conn: Mutex<Connection>,
-    /// Read-only connection used exclusively by `search_content`.
-    search_conn: Mutex<Connection>,
+    /// Independent file-backed reader; private databases share `conn`.
+    read_conn: Option<Mutex<Connection>>,
+    readers: Mutex<Vec<Connection>>,
+    db_path: std::path::PathBuf,
     schema: events::Schema,
     max_events_per_session: usize,
     control_cache: Arc<super::control_cache::ControlStateCache>,
+    #[cfg(test)]
+    retained_read_gate: Mutex<Option<test_support::RetainedReadGate>>,
+    #[cfg(any(test, debug_assertions))]
+    _temp_directory: Option<tempfile::TempDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +144,47 @@ pub(crate) enum EventTableShape {
     Absent,
     Legacy { discriminant: bool },
     Scoped,
+}
+
+fn open_reader(db_path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("open read-only handle at {}", db_path.display()))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .context("set query_only=ON on read handle")?;
+    conn.busy_timeout(std::time::Duration::from_millis(1000))
+        .context("set busy_timeout on read handle")?;
+    Ok(conn)
+}
+
+/// A pooled read connection, or the writer's when none could be opened.
+enum ReadConn<'a> {
+    Pooled(&'a EventStore, Option<Connection>),
+    Writer(MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReadConn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Pooled(_, conn) => conn.as_ref().expect("held until drop"),
+            Self::Writer(guard) => guard,
+        }
+    }
+}
+
+impl Drop for ReadConn<'_> {
+    fn drop(&mut self) {
+        if let Self::Pooled(store, conn) = self {
+            let mut idle = store.readers.lock().unwrap_or_else(|p| p.into_inner());
+            if idle.len() < MAX_IDLE_READERS {
+                idle.extend(conn.take());
+            }
+        }
+    }
 }
 
 impl EventStore {
@@ -309,8 +375,12 @@ impl EventStore {
         rate_limit::preserve_legacy_budgets(tx, schema)
     }
 
-    /// Open or create the database at `db_path`.
-    pub fn open(db_path: &Path, max_events_per_session: usize) -> Result<Self> {
+    /// Open or create the database using its sole control-state cache.
+    pub fn open(
+        db_path: &Path,
+        max_events_per_session: usize,
+        control_cache: Arc<super::control_cache::ControlStateCache>,
+    ) -> Result<Self> {
         // Prefix "acp" maps to the existing acp_events / acp_attachments tables.
         let schema = events::Schema::new("acp")?;
         let mut conn = events::connect(db_path)?;
@@ -333,20 +403,20 @@ impl EventStore {
                 events::initialize_schema(&conn, &schema)?;
             }
             EventTableShape::Legacy { .. } => {
-                anyhow::bail!("ACP event database requires migration55 before opening")
+                anyhow::bail!("ACP event database requires migration59 before opening")
             }
         }
-        let search_conn = Connection::open_with_flags(
-            db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("open read-only search handle at {}", db_path.display()))?;
-        search_conn
-            .pragma_update(None, "query_only", "ON")
-            .context("set query_only=ON on search handle")?;
-        search_conn
-            .busy_timeout(std::time::Duration::from_millis(1000))
-            .context("set busy_timeout on search handle")?;
+        identity::install(&mut conn)?;
+        let private_database: bool = conn.query_row(
+            "SELECT file = '' FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get(0),
+        )?;
+        let read_conn = if private_database {
+            None
+        } else {
+            Some(Mutex::new(open_reader(db_path)?))
+        };
         debug!(
             target: "acp.event_store",
             path = %db_path.display(),
@@ -355,15 +425,33 @@ impl EventStore {
         );
         Ok(Self {
             conn: Mutex::new(conn),
-            search_conn: Mutex::new(search_conn),
+            read_conn,
+            readers: Mutex::new(Vec::new()),
+            db_path: db_path.to_path_buf(),
             schema,
             max_events_per_session,
-            control_cache: Arc::new(super::control_cache::ControlStateCache::new()),
+            control_cache,
+            #[cfg(test)]
+            retained_read_gate: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            _temp_directory: None,
         })
     }
 
     pub fn control_cache(&self) -> &Arc<super::control_cache::ControlStateCache> {
         &self.control_cache
+    }
+
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn temporary_for_test(max_events_per_session: usize) -> Result<Self> {
+        let directory = tempfile::tempdir()?;
+        let mut store = Self::open(
+            &directory.path().join("acp_events.db"),
+            max_events_per_session,
+            Default::default(),
+        )?;
+        store._temp_directory = Some(directory);
+        Ok(store)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -373,6 +461,41 @@ impl EventStore {
     #[cfg(test)]
     pub(crate) fn test_conn(&self) -> MutexGuard<'_, Connection> {
         self.conn()
+    }
+
+    fn read_conn(&self) -> MutexGuard<'_, Connection> {
+        self.read_conn
+            .as_ref()
+            .unwrap_or(&self.conn)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+    /// A connection for read-only queries that does not wait on writes.
+    fn reader(&self) -> ReadConn<'_> {
+        if self.read_conn.is_none() {
+            return ReadConn::Writer(self.conn());
+        }
+        let idle = self.readers.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        match idle.map_or_else(|| open_reader(&self.db_path), Ok) {
+            Ok(conn) => ReadConn::Pooled(self, Some(conn)),
+            Err(e) => {
+                warn!(target: "acp.event_store", "read handle unavailable; reading on the writer: {e:#}");
+                ReadConn::Writer(self.conn())
+            }
+        }
+    }
+
+    /// Make every query on the event table fail, or restore it.
+    #[cfg(test)]
+    pub(crate) fn test_set_unavailable(&self, unavailable: bool) {
+        let (from, to) = if unavailable {
+            ("acp_events", "acp_events_offline")
+        } else {
+            ("acp_events_offline", "acp_events")
+        };
+        self.conn()
+            .execute_batch(&format!("ALTER TABLE {from} RENAME TO {to}"))
+            .unwrap();
     }
 
     /// Public serde omits the subject; only the private journal adds it back.
@@ -473,6 +596,12 @@ impl EventStore {
     }
 
     /// Record with an explicit `created_at` (ms epoch) for recency-sensitive tests.
+    /// Hold the writer connection, as a slow save does.
+    #[cfg(test)]
+    pub(crate) fn hold_writer(&self) -> MutexGuard<'_, Connection> {
+        self.conn()
+    }
+
     #[cfg(test)]
     pub(crate) fn record_at(
         &self,
@@ -501,7 +630,7 @@ impl EventStore {
 
     /// Highest seq stored for `session_id`, or 0.
     pub fn highest_seq(&self, session_id: &str) -> u64 {
-        let max = events::highest_seq(&self.conn(), &self.schema, session_id);
+        let max = events::highest_seq(&self.reader(), &self.schema, session_id);
         trace!(
             target: "acp.event_store",
             session = %session_id,
@@ -513,7 +642,7 @@ impl EventStore {
 
     /// Lowest seq still stored for `session_id`, or `None` when nothing is.
     pub fn lowest_seq(&self, session_id: &str) -> Option<u64> {
-        let min = events::lowest_seq(&self.conn(), &self.schema, session_id);
+        let min = events::lowest_seq(&self.reader(), &self.schema, session_id);
         trace!(
             target: "acp.event_store",
             session = %session_id,
@@ -658,24 +787,54 @@ fn prune_completed_background_work(
     let Some(cutoff) = cutoff else {
         return;
     };
-    for (start, end, id) in BACKGROUND_WORK_EVENTS {
+    for (start, end, id, kept_groups) in BACKGROUND_WORK_EVENTS {
         // Reused ids and different tracking allocations cannot close each other.
+        let closed = |started: &str| {
+            format!(
+                "EXISTS (
+                   SELECT 1 FROM {events} AS ended
+                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
+                     AND ended.seq > {started}.seq
+                     AND json_extract(ended.qualification_json, '$.resource_ref')
+                         IS json_extract({started}.qualification_json, '$.resource_ref')
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract({started}.event_json, '$.{start}.{id}'))"
+            )
+        };
+        // Open starts are pinned, so they do not count toward the kept ones.
+        let keep = crate::acp::state::MAX_FINISHED_BACKGROUND_SHELLS;
+        let kept: String = kept_groups
+            .iter()
+            .map(|group| {
+                format!(
+                    "AND started.seq NOT IN (
+                       SELECT recent.seq FROM {events} AS recent
+                       WHERE recent.session_id = ?1 AND recent.discriminant = '{start}'
+                         AND {group} AND {}
+                       ORDER BY recent.seq DESC LIMIT {keep})",
+                    closed("recent")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n               ");
         let delete_started = format!(
             "DELETE FROM {events} AS started
              WHERE started.session_id = ?1 AND started.seq <= ?2
                AND started.discriminant = '{start}'
-               AND EXISTS (
-                   SELECT 1 FROM {events} AS ended
-                   WHERE ended.session_id = ?1 AND ended.discriminant = '{end}'
-                     AND ended.seq > started.seq
-                     AND json_extract(ended.qualification_json, '$.resource_ref')
-                         IS json_extract(started.qualification_json, '$.resource_ref')
-                     AND json_extract(ended.event_json, '$.{end}.{id}') =
-                         json_extract(started.event_json, '$.{start}.{id}'))"
+               {kept}
+               AND {}",
+            closed("started")
         );
         let delete_ended = format!(
-            "DELETE FROM {events}
-             WHERE session_id = ?1 AND seq <= ?2 AND discriminant = '{end}'"
+            "DELETE FROM {events} AS ended
+             WHERE ended.session_id = ?1 AND ended.seq <= ?2
+               AND ended.discriminant = '{end}'
+               AND NOT EXISTS (
+                   SELECT 1 FROM {events} AS started
+                   WHERE started.session_id = ?1 AND started.discriminant = '{start}'
+                     AND started.seq < ended.seq
+                     AND json_extract(ended.event_json, '$.{end}.{id}') =
+                         json_extract(started.event_json, '$.{start}.{id}'))"
         );
         for sql in [delete_started, delete_ended] {
             if let Err(e) = conn.execute(&sql, rusqlite::params![session_id, cutoff]) {
@@ -734,9 +893,64 @@ pub(super) mod test_support {
     use super::*;
     use tempfile::TempDir;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::acp::event_store) enum RetainedReadStage {
+        Snapshot,
+        BeforeDecode,
+    }
+
+    pub(in crate::acp::event_store) struct RetainedReadGate {
+        session: String,
+        stage: RetainedReadStage,
+        reached: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    pub(in crate::acp::event_store) fn gate_retained_read(
+        store: &EventStore,
+        session: &str,
+        stage: RetainedReadStage,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, entered) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let mut slot = store.retained_read_gate.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some(RetainedReadGate {
+            session: session.into(),
+            stage,
+            reached,
+            release: resume,
+        });
+        (entered, release)
+    }
+
+    impl EventStore {
+        pub(in crate::acp::event_store) fn pause_retained_read(
+            &self,
+            session: &str,
+            stage: RetainedReadStage,
+        ) {
+            let gate = {
+                let mut slot = self.retained_read_gate.lock().unwrap();
+                if slot
+                    .as_ref()
+                    .is_some_and(|gate| gate.session == session && gate.stage == stage)
+                {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.reached.send(()).unwrap();
+                let _ = gate.release.recv();
+            }
+        }
+    }
+
     pub(in crate::acp::event_store) fn open_store(max: usize) -> (TempDir, EventStore) {
         let tmp = TempDir::new().unwrap();
-        let store = EventStore::open(&tmp.path().join("acp.db"), max).unwrap();
+        let store = EventStore::open(&tmp.path().join("acp.db"), max, Default::default()).unwrap();
         (tmp, store)
     }
 
@@ -830,6 +1044,7 @@ pub(super) mod test_support {
 
     pub(in crate::acp::event_store) fn tool_call(id: &str) -> crate::acp::state::ToolCall {
         crate::acp::state::ToolCall {
+            prompt: None,
             id: id.into(),
             name: "Bash".into(),
             kind: "execute".into(),
@@ -903,7 +1118,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let store = EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap();
+        let store = EventStore::open(&tmp.path().join("acp.db"), 1000, Default::default()).unwrap();
         let replay = store.replay_from("s-1", 0).unwrap();
         assert_eq!(seqs(&replay), [1, 2]);
         assert!(

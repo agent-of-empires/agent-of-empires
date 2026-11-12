@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 import { useCommandActions, buildConversationActions } from "../useCommandActions";
 import type { SessionResponse } from "../../lib/types";
+import { publishLivePane, type LivePaneControl } from "../../lib/liveControl";
 
 type Args = Parameters<typeof useCommandActions>[0];
 
@@ -219,5 +220,37 @@ describe("useCommandActions: active-session triage toggles", () => {
 
   it("omits the toggles in read-only mode", () => {
     expect(stateIds({}, { readOnly: true })).toEqual([]);
+  });
+});
+
+describe("useCommandActions Take control", () => {
+  const pane = (over: Partial<LivePaneControl>): LivePaneControl => ({
+    sessionId: "a",
+    surface: "agent",
+    terminalIndex: 0,
+    viewOnly: true,
+    claim: vi.fn(),
+    slow: null,
+    ...over,
+  });
+  afterEach(() => {
+    for (const key of ["a:agent:0", "a:paired-host:0", "b:agent:0"]) publishLivePane(key, null);
+  });
+
+  it("is offered only while the active Session has a view-only pane, and claims the agent pane first", () => {
+    expect(find(actionsFor({ activeSessionId: "a" }), "action:take-control")).toBeUndefined();
+
+    const paired = pane({ surface: "paired-host" });
+    const agent = pane({});
+    publishLivePane("a:paired-host:0", paired);
+    publishLivePane("a:agent:0", agent);
+    publishLivePane("b:agent:0", pane({ sessionId: "b" }));
+    find(actionsFor({ activeSessionId: "a" }), "action:take-control")!.perform();
+    expect(agent.claim).toHaveBeenCalledTimes(1);
+    expect(paired.claim).not.toHaveBeenCalled();
+
+    publishLivePane("a:agent:0", pane({ viewOnly: false }));
+    publishLivePane("a:paired-host:0", pane({ surface: "paired-host", viewOnly: false }));
+    expect(find(actionsFor({ activeSessionId: "a" }), "action:take-control")).toBeUndefined();
   });
 });

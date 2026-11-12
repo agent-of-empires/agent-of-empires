@@ -550,7 +550,7 @@ pub(crate) async fn start_server(
         let app_dir = crate::session::get_app_dir().context("acp event store: resolve app dir")?;
         let db_path = app_dir.join("acp_events.db");
         Arc::new(
-            crate::acp::event_store::EventStore::open(&db_path, config.acp.replay_events as usize)
+            crate::acp::event_store::EventStore::open(&db_path, config.acp.replay_events as usize, Default::default())
                 .context("acp event store: open")?,
         )
     };
@@ -559,10 +559,9 @@ pub(crate) async fn start_server(
         // Approval pushes are dispatched from `acp_event_listener`, which subscribes to the
         // broadcast that ChannelSink::publish feeds and has `Arc<AppState>` in scope
         // without a closure dance through the supervisor.
-        let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
-            tx: acp_events_tx.clone(),
-            event_store: acp_event_store.clone(),
-        });
+        let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink::new(
+            acp_events_tx.clone(), acp_event_store.clone(),
+        ));
         let supervisor = std::sync::Arc::new(
             crate::acp::supervisor::Supervisor::with_capacity(
                 sink,

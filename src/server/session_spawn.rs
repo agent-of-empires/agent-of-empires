@@ -29,6 +29,7 @@ pub(crate) struct StructuredSessionSpec {
     pub extra_args: String,
     pub command_override: String,
     pub extra_repo_paths: Vec<String>,
+    pub workspace: bool,
     /// Per-repo creation bases as `(selector, base)` pairs. See #3329.
     pub repo_base_branches: Vec<(String, String)>,
     pub scratch: bool,
@@ -143,6 +144,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            workspace,
             repo_base_branches,
             scratch,
             trust_hooks,
@@ -238,6 +240,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            workspace,
             repo_base_branches: if create_new_branch {
                 repo_base_branches
             } else {
@@ -392,40 +395,21 @@ pub(crate) async fn spawn_structured_session(
         let mut adapter_refusal = None;
         let agent_effort = if provision_error.is_none() {
         let resolved_config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(
-            &instance.source_profile,
-            std::path::Path::new(&instance.project_path),
+            &instance.source_profile, instance.repo_config_path(),
         );
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
-        // The defaults, and the pin, are keyed by the agent the spawn
-        // runs, resolved the way the supervisor resolves it.
         let agent_key = crate::acp::pick_acp_agent_name(
-            &acp_registry,
-            &resolved_config.session,
-            &resolved_config.acp,
-            &instance.tool,
-            instance.agent_name.as_deref(),
+            &acp_registry, &resolved_config.session, &resolved_config.acp,
+            &instance.tool, instance.agent_name.as_deref(),
         );
         let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-        // Preserve the explicit request model separately (trimmed to match the
-        // resolver's normalization) so a terminal fallback below can keep it while
-        // dropping any ACP-derived default; agent_model is ACP-only.
-        let explicit_model = agent_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        // A profile pin wins, else the explicit request, else the per-agent default;
-        // effort is keyed on the resolved model.
-        let explicit_effort = agent_effort
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
+        let explicit_model = agent_model.as_deref().map(str::trim)
+            .filter(|model| !model.is_empty()).map(str::to_string);
+        let explicit_effort = agent_effort.as_deref().map(str::trim)
+            .filter(|effort| !effort.is_empty()).map(str::to_string);
         let (resolved_model, mut agent_effort) =
             crate::session::config::resolve_spawn_model_effort(
-                defaults,
-                explicit_model.clone(),
-                agent_effort,
+                defaults, explicit_model.clone(), agent_effort,
             );
         instance.agent_model = resolved_model;
         instance.acp_effort = explicit_effort;
@@ -441,17 +425,12 @@ pub(crate) async fn spawn_structured_session(
                 sandboxed: instance.is_sandboxed(),
                 project_path: Some(std::path::Path::new(&instance.project_path)),
                 preparation_hooks: &|| preparation_hooks_apply(
-                    &config.hooks,
-                    std::path::Path::new(&original_path),
-                    scratch,
-                    trust_hooks,
+                    &config.hooks, std::path::Path::new(&original_path), scratch, trust_hooks,
                 ),
             };
             if let Err(error) = validate_structured_choice(&choice, &resolved_config) {
                 if matches!(error, StructuredChoiceError::NotCapable(_))
-                    || instance.agent_name.is_some()
-                    || instance.acp_effort.is_some()
-                {
+                    || instance.agent_name.is_some() || instance.acp_effort.is_some() {
                     validation_error = Some(anyhow::Error::new(error));
                 } else {
                     build_warnings.push(format!("{error}; using terminal view"));
@@ -515,6 +494,7 @@ pub(crate) async fn spawn_structured_session(
             instance.agent_model = explicit_model;
             // acp_effort is ACP-only too: nothing applies it in tmux mode.
             instance.acp_effort = None;
+            instance.acp_model_config.clear();
         }
 
         agent_effort
@@ -890,6 +870,7 @@ pub(crate) async fn spawn_structured_session(
                     agent_effort,
                     instance.acp_effort.is_some(),
                     instance.project_path.clone(),
+                    instance.repo_config_path().to_path_buf(),
                     instance.acp_session_id.clone(),
                     instance.source_profile.clone(),
                     instance.yolo_mode,
@@ -916,6 +897,7 @@ pub(crate) async fn spawn_structured_session(
                 effort,
                 effort_explicit,
                 project_path,
+                config_path,
                 stored_acp_session_id,
                 source_profile,
                 yolo_mode,
@@ -932,7 +914,7 @@ pub(crate) async fn spawn_structured_session(
                         &tool,
                         agent_override.as_deref(),
                         &source_profile,
-                        std::path::Path::new(&project_path),
+                        &config_path,
                     )
                     .await;
                 let command_override =
@@ -970,6 +952,7 @@ pub(crate) async fn spawn_structured_session(
                         return;
                     };
                     let check_id = id.clone();
+                    let check_config_path = config_path.clone();
                     let checked = tokio::task::spawn_blocking(move || {
                         use crate::session::SessionStore;
                         let validation = (|| -> anyhow::Result<()> {
@@ -977,7 +960,8 @@ pub(crate) async fn spawn_structured_session(
                             let _lifecycle = native
                                 .storage()
                                 .acquire_instance_lifecycle_lock(&check_id)?;
-                            (native.as_ref() as &dyn SessionStore).launch_configuration(&cwd)?;
+                            (native.as_ref() as &dyn SessionStore)
+                                .launch_configuration(&check_config_path)?;
                             let rows = native.load()?;
                             let row = rows
                                 .iter()
@@ -1034,12 +1018,14 @@ pub(crate) async fn spawn_structured_session(
                                     agent: agent.clone(),
                                     tool,
                                     cwd,
+                                    config_path,
                                     additional_dirs: vec![],
                                     provider_env: vec![],
                                     provider: None,
                                     model,
                                     effort,
                                     effort_explicit,
+                                    model_config: Default::default(),
                                     stored_acp_session_id,
                                     fork_from,
                                     sandbox_continuation:
@@ -1245,6 +1231,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            workspace: false,
             repo_base_branches: Vec::new(),
             scratch: true,
             trust_hooks: None,
@@ -1400,6 +1387,7 @@ mod tests {
                 extra_args: String::new(),
                 command_override: String::new(),
                 extra_repo_paths: Vec::new(),
+                workspace: false,
                 repo_base_branches: Vec::new(),
                 scratch: false,
                 trust_hooks: None,
@@ -1428,6 +1416,7 @@ mod tests {
                     fork_source: None,
                     generated_name: false,
                     no_submodules: false,
+                    workspace: None,
                     worktree_path_id: None,
                 }),
             };

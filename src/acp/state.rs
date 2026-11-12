@@ -48,6 +48,9 @@ pub struct Todo {
     pub completed: bool,
 }
 
+/// Ends an `args_preview` that was cut at the ingest cap.
+pub(crate) const ARGS_CUT_MARKER: &str = "\u{2026}[truncated]";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
@@ -57,6 +60,9 @@ pub struct ToolCall {
     pub kind: String,
     /// Capped at 16 KB at ingest, control chars stripped.
     pub args_preview: String,
+    /// The `prompt` argument in full, set only when `args_preview` was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     pub started_at: DateTime<Utc>,
     /// The sub-agent `Task` call this call runs under, from `_meta.claudeCode.parentToolUseId`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,7 +270,13 @@ pub struct AvailableCommand {
     pub description: String,
     #[serde(default)]
     pub accepts_input: bool,
+    /// Argument hint the agent advertises, e.g. `[reconnect|enable|disable]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
 }
+
+/// The `Other` category claude-agent-acp uses for Fast mode and Ultracode.
+pub const MODEL_CONFIG_CATEGORY: &str = "model_config";
 
 /// Semantic category of an ACP `SessionConfigOption`; unknown values round-trip as `Other`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -295,6 +307,16 @@ pub struct ConfigOptionDescriptor {
     pub category: ConfigOptionCategory,
     pub current_value: String,
     pub options: Vec<ConfigOptionChoice>,
+}
+
+impl ConfigOptionDescriptor {
+    /// A `model_config` option whose only choices are `on` and `off`.
+    pub fn is_model_config_toggle(&self) -> bool {
+        let mut values: Vec<&str> = self.options.iter().map(|o| o.value.as_str()).collect();
+        values.sort_unstable();
+        self.category == ConfigOptionCategory::Other(MODEL_CONFIG_CATEGORY.into())
+            && values == ["off", "on"]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -342,6 +364,22 @@ pub enum StartupErrorDetail {
         expected: String,
         received: String,
     },
+    /// The adapter's proxy sent a `_meta.aoe.proxy` hello core cannot accept.
+    InvalidProxyHello {
+        reason: String,
+    },
+}
+
+/// Why a proxied session's integration was lost mid-session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IntegrationLostReason {
+    /// A `_meta.aoe` frame broke the contract.
+    ContractViolation { detail: String },
+    /// Too many frames waited on an adapter sequence that never arrived.
+    HoldOverflow,
+    /// The proxy held more leases than any real agent does.
+    LeaseOverflow,
 }
 
 /// This daemon's local setup/initialize, assignment, and established-command phases.
@@ -957,6 +995,10 @@ pub enum BackgroundAgentStatus {
     Running,
     /// No transcript growth for the idle window.
     Stalled,
+    /// A subagent session is blocked on the user (RFD `requires_action`).
+    RequiresAction,
+    /// The agent cannot say what the subagent is doing (RFD `unknown`).
+    Unknown,
     Completed,
     /// The parent session ended before the agent finished.
     Detached,
@@ -1019,6 +1061,22 @@ pub struct WorkflowRunRecord {
     pub ended_at: Option<DateTime<Utc>>,
 }
 
+/// Finished shells kept for the Background panel's Recent group.
+pub const MAX_FINISHED_BACKGROUND_SHELLS: usize = 20;
+
+/// A Bash `run_in_background` task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundShellRecord {
+    pub task_id: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub finished: bool,
+}
+
 /// The workflow run and phase a background sub-agent belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRef {
@@ -1027,9 +1085,52 @@ pub struct WorkflowRef {
     pub phase: String,
 }
 
+/// Work state of a subagent session, from the ACP subagents RFD snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentState {
+    Running,
+    RequiresAction,
+    /// Ready for another prompt; `SubagentRecord::stop_reason` says why.
+    Idle,
+    /// Also the state before the agent has reported one.
+    #[default]
+    Unknown,
+}
+
+/// One subagent session announced by its parent. The event carries the whole
+/// merged snapshot, so replay is last-write-wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRecord {
+    pub session_id: String,
+    pub parent_session_id: String,
+    /// The card for the delegation message that launched it (its message id).
+    /// Unset renders the child in a flat roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub state: SubagentState,
+    /// Open string: the RFD reserves values for future stop reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    /// Whether `session/cancel` may target this child.
+    #[serde(default)]
+    pub cancel_capable: bool,
+    /// Read-only: the child's own model selector, never set by aoe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 /// One tool call a background sub-agent made, parsed from its transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundAgentTool {
+    /// The transcript's `tool_use` id, a stable key while the list grows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     /// Short label from the tool input (command, file path, pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1037,6 +1138,12 @@ pub struct BackgroundAgentTool {
     /// `None` while running, then whether it succeeded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ok: Option<bool>,
+    /// Transcript timestamp of the call; `None` when the line carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// Transcript timestamp of the matching result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
 }
 
 /// One async background sub-agent, built up from `BackgroundAgent*` events.
@@ -1152,6 +1259,8 @@ pub struct AcpState {
     pub(crate) native_availability: Option<(u64, NativeEventSubject)>,
     #[serde(skip)]
     pub(crate) native_control_seq: u64,
+    #[serde(default)]
+    pub integration_lost: Option<IntegrationLostReason>,
     /// Full snapshot of the adapter's per-session selectors.
     #[serde(default)]
     pub config_options: Vec<ConfigOptionDescriptor>,
@@ -1163,9 +1272,14 @@ pub struct AcpState {
     pub session_notices: Vec<SessionNotice>,
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SubagentRecord>,
     /// Ids of running background tasks that are not sub-agents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_tasks: Vec<BackgroundTaskRecord>,
+    /// Background shells, running and recently finished, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_shells: Vec<BackgroundShellRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflow_runs: Vec<WorkflowRunRecord>,
 
@@ -1274,6 +1388,9 @@ pub enum Event {
         title: Option<String>,
         #[serde(default)]
         args_preview: Option<String>,
+        /// The `prompt` argument in full when `args_preview` was cut.
+        #[serde(default)]
+        prompt: Option<String>,
         #[serde(default)]
         started_at: Option<DateTime<Utc>>,
         /// Replaces the call's diffs when present (Codex sends them on updates).
@@ -1403,6 +1520,11 @@ pub enum Event {
         warning: Option<String>,
         ended_at: DateTime<Utc>,
     },
+    /// A subagent session was announced or its snapshot changed.
+    SubagentUpdated {
+        subagent: SubagentRecord,
+        at: DateTime<Utc>,
+    },
     /// A background task that is not a sub-agent (Bash `run_in_background`, or
     /// a `Workflow` run) started, from the tool result's `toolResponse`. Its
     /// end is read from the session transcript (`acp::task_transcript`).
@@ -1410,9 +1532,12 @@ pub enum Event {
         task_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
+        /// The Bash command, or the workflow's name.
         description: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow: Option<WorkflowLaunch>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at: Option<DateTime<Utc>>,
     },
     /// A background task reached a terminal state.
     BackgroundTaskFinished {
@@ -1467,6 +1592,11 @@ pub enum Event {
     IncompatibleAgent {
         detail: StartupErrorDetail,
     },
+    /// A proxied agent broke the `_meta.aoe` contract mid-session; core stops
+    /// interpreting its frames.
+    IntegrationLost {
+        reason: IntegrationLostReason,
+    },
     UserPromptSent {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1474,6 +1604,10 @@ pub enum Event {
         /// Client-minted id so a web client reconciles its optimistic row.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
+        /// Ids of the other queued rows folded into this turn (queue drain or
+        /// send-now), so a web client settles each of their optimistic rows.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merged_prompt_ids: Vec<String>,
         /// True when the daemon queued this turn itself (a rate-limit resume
         /// continuation) rather than the user typing it just now. The
         /// transcript model skips rendering a row for it: the user already
@@ -1870,6 +2004,7 @@ impl AcpState {
                 tool_call_id,
                 title,
                 args_preview,
+                prompt,
                 started_at,
                 diffs,
             } => {
@@ -1882,6 +2017,11 @@ impl AcpState {
                         tool.name = title.clone();
                     }
                     if let Some(args_preview) = args_preview {
+                        // An uncut preview means the prompt is no longer oversized; a cut
+                        // one with no prompt is a deduplicated repeat of the stored prompt.
+                        if prompt.is_some() || !args_preview.ends_with(ARGS_CUT_MARKER) {
+                            tool.prompt = prompt;
+                        }
                         tool.args_preview = args_preview.clone();
                     }
                     if let Some(started_at) = started_at {
@@ -2090,6 +2230,12 @@ impl AcpState {
                 self.startup_error = Some(detail.clone());
                 self.sidebar_phase = SidebarPhase::Error;
             }
+            Event::IntegrationLost { reason } => {
+                self.integration_lost = Some(reason);
+                self.turn_active = false;
+                self.cancelling = false;
+                self.sidebar_phase = SidebarPhase::Error;
+            }
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => self.open_turn(),
             Event::PromptCapabilities { steering, .. } => self.steering = *steering,
             Event::AcpSessionAssigned {
@@ -2104,6 +2250,7 @@ impl AcpState {
                     self.connection_unavailable = None;
                     self.native_availability = native_subject.map(|subject| (seq, subject));
                     self.startup_error = None;
+                    self.integration_lost = None;
                     self.rate_limit = None;
                     self.heal_sidebar_phase();
                 }
@@ -2150,24 +2297,33 @@ impl AcpState {
                 output_file: _,
                 workflow,
                 started_at,
-            } => self.launch_background_agent(BackgroundAgentRecord {
-                agent_id: agent_id.clone(),
-                resource_ref: None,
-                tool_call_id: tool_call_id.clone(),
-                description: description.clone(),
-                prompt: prompt.clone(),
-                model: model.clone(),
-                workflow: workflow.clone(),
-                status: BackgroundAgentStatus::Running,
-                started_at: *started_at,
-                ended_at: None,
-                tool_count: 0,
-                tools: Vec::new(),
-                last_tool: None,
-                last_text: None,
-                result: None,
-                warning: None,
-            }),
+            } => {
+                let mut record = BackgroundAgentRecord {
+                    agent_id: agent_id.clone(),
+                    resource_ref: None,
+                    tool_call_id: tool_call_id.clone(),
+                    description: description.clone(),
+                    prompt: prompt.clone(),
+                    model: model.clone(),
+                    workflow: workflow.clone(),
+                    status: BackgroundAgentStatus::Running,
+                    started_at: *started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                };
+                // A child's snapshot may predate the launch event.
+                if let Some(child) = self.subagents.iter().find(|s| {
+                    s.parent_tool_call_id.as_deref() == Some(record.tool_call_id.as_str())
+                }) {
+                    record.reconcile(child, started_at);
+                }
+                self.launch_background_agent(record);
+            }
             Event::BackgroundAgentProgress {
                 agent_id,
                 status,
@@ -2209,14 +2365,26 @@ impl AcpState {
                     }
                 }
             }
+            Event::SubagentUpdated { subagent, at } => self.apply_subagent(subagent, at),
             Event::BackgroundTaskStarted {
                 task_id,
                 tool_call_id,
+                description,
                 workflow,
-                ..
+                started_at,
             } => {
                 // A reused task id replaces whatever run held it.
                 self.close_workflow_run(task_id, None);
+                self.background_shells.retain(|s| s.task_id != task_id);
+                if workflow.is_none() {
+                    self.background_shells.push(BackgroundShellRecord {
+                        task_id: task_id.clone(),
+                        command: description,
+                        started_at,
+                        ended_at: None,
+                        finished: false,
+                    });
+                }
                 if let (Some(workflow), Some(tool_call_id)) = (workflow, tool_call_id) {
                     self.workflow_runs.push(WorkflowRunRecord {
                         task_id: task_id.clone(),
@@ -2242,6 +2410,20 @@ impl AcpState {
                 self.close_workflow_run(task_id, *ended_at);
                 self.background_tasks
                     .retain(|task| task.task_id != *task_id);
+                if let Some(shell) = self
+                    .background_shells
+                    .iter_mut()
+                    .find(|s| s.task_id == task_id)
+                {
+                    shell.finished = true;
+                    shell.ended_at = ended_at;
+                }
+                let finished = self.background_shells.iter().filter(|s| s.finished).count();
+                for _ in MAX_FINISHED_BACKGROUND_SHELLS..finished {
+                    if let Some(i) = self.background_shells.iter().position(|s| s.finished) {
+                        self.background_shells.remove(i);
+                    }
+                }
             }
             // Titles live on `Instance`; wakeups and monitors are read from the log.
             Event::AgentMessageChunk { .. } => {
@@ -2351,13 +2533,16 @@ impl AcpState {
     /// The turn is over however it ended, so every in-turn phase clears.
     fn end_turn(&mut self, reason: &str) {
         self.turn_active = false;
-        self.sidebar_phase = if reason == "prompt_failed" || reason == "aborted" {
-            SidebarPhase::PromptFailed
-        } else if reason == "session_reset_failed" {
-            SidebarPhase::Error
-        } else {
-            SidebarPhase::Idle
-        };
+        // A lost integration is an error until a new connection restores it.
+        if self.integration_lost.is_none() {
+            self.sidebar_phase = if reason == "prompt_failed" || reason == "aborted" {
+                SidebarPhase::PromptFailed
+            } else if reason == "session_reset_failed" {
+                SidebarPhase::Error
+            } else {
+                SidebarPhase::Idle
+            };
+        }
         self.cancelling = false;
         self.compacting = false;
         self.compaction_tool_id = None;
@@ -2392,6 +2577,7 @@ impl AcpState {
         self.mode = SessionMode::Default;
         self.config_options = Vec::new();
         self.config_option_switch_failed = None;
+        self.subagents = Vec::new();
         self.last_agent_switch = Some(AgentSwitchInfo {
             from,
             to,
@@ -2408,10 +2594,50 @@ impl AcpState {
         }
     }
 
+    /// The RFD snapshot is authoritative for the async agent that child
+    /// belongs to, so it replaces the transcript tailer's heuristics and,
+    /// unlike them, may reopen an idle agent that was messaged again.
+    fn apply_subagent(&mut self, subagent: SubagentRecord, at: DateTime<Utc>) {
+        if let Some(tool_call_id) = subagent.parent_tool_call_id.as_deref() {
+            if let Some(agent) = self
+                .background_agents
+                .iter_mut()
+                .find(|a| a.tool_call_id == tool_call_id)
+            {
+                agent.reconcile(&subagent, at);
+            }
+        }
+        match self
+            .subagents
+            .iter_mut()
+            .find(|s| s.session_id == subagent.session_id)
+        {
+            Some(existing) => *existing = subagent,
+            None => self.subagents.push(subagent),
+        }
+    }
+
     fn background_agent(&mut self, agent_id: &str) -> Option<&mut BackgroundAgentRecord> {
         self.background_agents
             .iter_mut()
             .find(|a| a.agent_id == agent_id)
+    }
+}
+
+impl BackgroundAgentRecord {
+    /// Folds a child's RFD snapshot in; `at` stamps a newly ended agent.
+    fn reconcile(&mut self, child: &SubagentRecord, at: DateTime<Utc>) {
+        let (status, ended) = match child.state {
+            SubagentState::Running => (BackgroundAgentStatus::Running, false),
+            SubagentState::RequiresAction => (BackgroundAgentStatus::RequiresAction, false),
+            SubagentState::Unknown => (BackgroundAgentStatus::Unknown, false),
+            SubagentState::Idle if child.stop_reason.as_deref() == Some("error") => {
+                (BackgroundAgentStatus::Error, true)
+            }
+            SubagentState::Idle => (BackgroundAgentStatus::Completed, true),
+        };
+        self.status = status;
+        self.ended_at = ended.then(|| self.ended_at.unwrap_or(at));
     }
 }
 
@@ -2428,6 +2654,7 @@ pub(crate) mod test_support {
 
     pub(crate) fn prompt(text: &str) -> Event {
         Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             prompt_id: None,
             text: text.into(),
             attachments: Vec::new(),
@@ -2589,6 +2816,7 @@ mod tests {
         });
         let approval = crate::acp::permissions::build_approval(
             ToolCall {
+                prompt: None,
                 id: "pending".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
@@ -2657,6 +2885,7 @@ mod tests {
                         tool_call_id: Some("background-tool".into()),
                         description: "background activity remains observed".into(),
                         workflow: None,
+                        started_at: None,
                     },
                     &crate::acp::event_sender::EventMetadata::history(),
                 )
@@ -3027,6 +3256,7 @@ mod tests {
         use super::test_support::chunk;
         use crate::acp::permissions::build_approval;
         let tool = || ToolCall {
+            prompt: None,
             id: "t".into(),
             name: "shell".into(),
             kind: "execute".into(),
@@ -3179,6 +3409,7 @@ mod tests {
                         tool_call_id: None,
                         description: "sleep".into(),
                         workflow: None,
+                        started_at: None,
                     },
                     stopped("end_turn"),
                     launched(),
@@ -3406,6 +3637,7 @@ mod tests {
 
     fn tool_call(id: &str) -> ToolCall {
         ToolCall {
+            prompt: None,
             id: id.into(),
             name: "Read".into(),
             kind: "read".into(),
@@ -3428,6 +3660,7 @@ mod tests {
 
     fn tool_update(title: Option<&str>, diffs: Option<Vec<DiffPreview>>) -> Event {
         Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-1".into(),
             title: title.map(Into::into),
             args_preview: None,
@@ -3582,6 +3815,7 @@ mod tests {
             "another tool's completion leaves it set"
         );
         let retitle = Event::ToolCallUpdated {
+            prompt: None,
             tool_call_id: "tc-compact".into(),
             title: Some("Compacting context".into()),
             args_preview: None,
@@ -3734,6 +3968,45 @@ mod tests {
         assert_eq!(tool.name, "Edit src/foo.rs");
         assert_eq!(tool.diffs.len(), 1, "a text-only update keeps the diffs");
 
+        let mut restated = s.clone();
+        restated.in_flight_tool.as_mut().unwrap().prompt = Some("full prompt".into());
+        restated
+            .apply_event(
+                restated.last_seq.saturating_add(1),
+                Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"cut\u{2026}[truncated]".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.as_ref().unwrap().prompt.as_deref(),
+            Some("full prompt"),
+            "a cut preview without its own prompt keeps the stored one"
+        );
+        restated
+            .apply_event(
+                restated.last_seq.saturating_add(1),
+                Event::ToolCallUpdated {
+                    prompt: None,
+                    tool_call_id: "tc-1".into(),
+                    title: None,
+                    args_preview: Some("{\"prompt\":\"B\"}".into()),
+                    started_at: None,
+                    diffs: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            restated.in_flight_tool.unwrap().prompt,
+            None,
+            "an uncut preview means the prompt was replaced by a short one"
+        );
+
         let mut richer = tool_call("tc-1");
         richer.name = "Write src/foo.rs".into();
         s.apply_scoped_event(
@@ -3803,9 +4076,12 @@ mod tests {
             progress(
                 3,
                 vec![BackgroundAgentTool {
+                    id: None,
                     name: "Read".into(),
                     title: Some("x.rs".into()),
                     ok: Some(true),
+                    started_at: None,
+                    ended_at: None,
                 }],
             ),
         ]);
@@ -3879,6 +4155,106 @@ mod tests {
         }
     }
 
+    fn subagent(state: SubagentState, stop_reason: Option<&str>) -> Event {
+        Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: "child".into(),
+                parent_session_id: "root".into(),
+                parent_tool_call_id: Some("tc1".into()),
+                title: Some("map backend".into()),
+                description: None,
+                state,
+                stop_reason: stop_reason.map(str::to_owned),
+                cancel_capable: true,
+                model: None,
+            },
+            at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn launch_reconciles_a_child_snapshot_that_arrived_first() {
+        let cases = [
+            (
+                SubagentState::Idle,
+                Some("end_turn"),
+                BackgroundAgentStatus::Completed,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("error"),
+                BackgroundAgentStatus::Error,
+                true,
+            ),
+            (
+                SubagentState::RequiresAction,
+                None,
+                BackgroundAgentStatus::RequiresAction,
+                false,
+            ),
+        ];
+        for (state, stop, expected, ended) in cases {
+            let s = applied([subagent(state, stop), launched()]);
+            let agent = &s.background_agents[0];
+            assert_eq!(agent.status, expected);
+            assert_eq!(agent.ended_at.is_some(), ended);
+        }
+    }
+
+    /// The RFD snapshot replaces the tailer's heuristics, and an idle child that
+    /// is messaged again runs again, which no tailer status could express.
+    #[test]
+    fn subagent_state_drives_the_async_agent_it_belongs_to() {
+        let mut s = applied([launched()]);
+        let steps = [
+            (
+                SubagentState::Running,
+                None,
+                BackgroundAgentStatus::Running,
+                true,
+            ),
+            (
+                SubagentState::RequiresAction,
+                None,
+                BackgroundAgentStatus::RequiresAction,
+                true,
+            ),
+            (
+                SubagentState::Unknown,
+                None,
+                BackgroundAgentStatus::Unknown,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("end_turn"),
+                BackgroundAgentStatus::Completed,
+                false,
+            ),
+            (
+                SubagentState::Running,
+                None,
+                BackgroundAgentStatus::Running,
+                true,
+            ),
+            (
+                SubagentState::Idle,
+                Some("error"),
+                BackgroundAgentStatus::Error,
+                false,
+            ),
+        ];
+        for (state, reason, status, active) in steps {
+            s.apply_event(s.last_seq + 1, subagent(state, reason))
+                .unwrap();
+            assert_eq!(s.background_agents[0].status, status, "{state:?}");
+            assert_eq!(s.has_active_background_agent(), active, "{state:?}");
+        }
+        assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
+        assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+    }
+
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {
         Event::BackgroundAgentProgress {
             agent_id: "a1".into(),
@@ -3945,6 +4321,7 @@ mod tests {
             tool_call_id: None,
             description: "sleep".into(),
             workflow: None,
+            started_at: None,
         };
         let finished = |id: &str| Event::BackgroundTaskFinished {
             task_id: id.into(),
@@ -3971,6 +4348,49 @@ mod tests {
     }
 
     #[test]
+    fn background_shells_keep_command_and_outlive_their_task() {
+        let started = |id: &str, workflow: Option<WorkflowLaunch>| Event::BackgroundTaskStarted {
+            task_id: id.into(),
+            tool_call_id: None,
+            description: format!("cmd {id}"),
+            workflow,
+            started_at: None,
+        };
+        let finished = |id: &str| Event::BackgroundTaskFinished {
+            task_id: id.into(),
+            ended_at: None,
+        };
+        let wf = WorkflowLaunch {
+            run_id: "wf_1".into(),
+            name: "drafts".into(),
+            summary: None,
+            transcript_dir: String::new(),
+        };
+        let mut s = applied([started("a", None), started("wf", Some(wf))]);
+        assert_eq!(s.background_shells.len(), 1, "workflows are not shells");
+        assert_eq!(s.background_shells[0].command, "cmd a");
+        assert!(!s.background_shells[0].finished);
+
+        s.apply_event(s.last_seq + 1, finished("a")).unwrap();
+        assert!(s.background_tasks.iter().all(|id| id != "a"));
+        assert!(
+            s.background_shells[0].finished,
+            "finished shell stays listed"
+        );
+
+        for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 3 {
+            let id = format!("t{i}");
+            s.apply_event(s.last_seq + 1, started(&id, None)).unwrap();
+            s.apply_event(s.last_seq + 1, finished(&id)).unwrap();
+        }
+        assert_eq!(s.background_shells.len(), MAX_FINISHED_BACKGROUND_SHELLS);
+        assert_eq!(
+            s.background_shells[0].task_id, "t3",
+            "oldest finished dropped first"
+        );
+    }
+
+    #[test]
     fn workflow_runs_keep_their_end_after_their_task() {
         let workflow = |id: &str, call: &str| Event::BackgroundTaskStarted {
             task_id: id.into(),
@@ -3982,6 +4402,7 @@ mod tests {
                 summary: None,
                 transcript_dir: "/home/u/.claude/wf".into(),
             }),
+            started_at: None,
         };
         let runs = |s: &AcpState| {
             s.workflow_runs
@@ -4010,6 +4431,7 @@ mod tests {
                 tool_call_id: Some("toolu_bash".into()),
                 description: "sleep".into(),
                 workflow: None,
+                started_at: None,
             },
             Event::BackgroundTaskFinished {
                 task_id: "wfy".into(),
@@ -4157,6 +4579,7 @@ mod tests {
                         name: "review".into(),
                         description: "Review".into(),
                         accepts_input: true,
+                        input_hint: None,
                     }],
                 },
                 Event::ModesAvailable {
@@ -4214,6 +4637,12 @@ mod tests {
             &current_session_metadata(),
         )
         .unwrap();
+        s.apply_event(
+            s.last_seq.saturating_add(1),
+            subagent(SubagentState::Running, None),
+        )
+        .unwrap();
+        assert_eq!(s.subagents.len(), 1);
         s.apply_scoped_event(
             s.last_seq.saturating_add(1),
             &switch_agent(),
@@ -4224,6 +4653,7 @@ mod tests {
         assert!(s.available_commands.is_empty() && s.available_modes.is_empty());
         assert_eq!(s.current_mode_id, None);
         assert_eq!(s.agent.0, "codex");
+        assert!(s.subagents.is_empty());
     }
 
     #[test]
@@ -4304,5 +4734,44 @@ mod tests {
                 "{case}: later clear removes prior plan"
             );
         }
+    }
+    /// The turn that ends after an integration loss must not heal the Error
+    /// phase; a new connection (`AcpSessionAssigned`) does.
+    #[test]
+    fn integration_loss_keeps_the_error_phase_until_a_new_session() {
+        let mut state = AcpState::new(AcpSessionId("s".into()), AgentName("claude".into()), None);
+        let lost = Event::IntegrationLost {
+            reason: IntegrationLostReason::HoldOverflow,
+        };
+        let stopped = Event::Stopped {
+            reason: "end_turn".into(),
+        };
+        let unqualified = Event::AcpSessionAssigned {
+            acp_session_id: "s2".into(),
+            connection_ready: true,
+            native_subject: None,
+        };
+        for (seq, event) in [lost, stopped].into_iter().enumerate() {
+            state.apply_event(seq as u64 + 1, event).unwrap();
+        }
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        assert_eq!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("integration_lost"),
+            Some(&serde_json::json!({"kind": "hold_overflow"}))
+        );
+        state.apply_event(3, unqualified).unwrap();
+        assert!(state.integration_lost.is_some());
+        assert_eq!(state.sidebar_phase, SidebarPhase::Error);
+        state.apply_event(4, observed_channel_ready("s2")).unwrap();
+        assert!(state.integration_lost.is_none());
+        assert_ne!(state.sidebar_phase, SidebarPhase::Error);
+        assert_eq!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("integration_lost"),
+            Some(&serde_json::Value::Null)
+        );
     }
 }

@@ -66,6 +66,9 @@ mod v054_acp_establishment;
 mod v055_acp_event_scope;
 mod v056_native_prompt_publication;
 mod v057_acp_budget_knowledge;
+mod v054_retained_history_identity;
+mod v055_global_max_concurrent_workers;
+mod v059_reconcile_acp_lineages;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -106,7 +109,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 57;
+const CURRENT_VERSION: u32 = 59;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -282,14 +285,21 @@ const MIGRATIONS: &[Migration] = &[
         v052_runtime_filter_acp_target::run,
     ),
     (53, "runtime_filter_reset", v053_runtime_filter_reset::run),
-    (54, "acp_establishment", v054_acp_establishment::run),
-    (55, "acp_event_scope", v055_acp_event_scope::run),
     (
-        56,
-        "native_prompt_publication",
-        v056_native_prompt_publication::run,
+        54,
+        "retained_history_identity",
+        v054_retained_history_identity::run,
     ),
-    (57, "acp_budget_knowledge", v057_acp_budget_knowledge::run),
+    (
+        55,
+        "global_max_concurrent_workers",
+        v055_global_max_concurrent_workers::run,
+    ),
+    (
+        59,
+        "reconcile_acp_lineages",
+        v059_reconcile_acp_lineages::run,
+    ),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install
@@ -391,6 +401,13 @@ pub(crate) fn reconcile_serve_launch_under_transaction(
     transaction: &crate::daemon::lifecycle::Transaction,
 ) -> Result<()> {
     v044_reconcile_serve_passphrase_policy::run_with_transaction(transaction)
+}
+
+/// Whether reconciliation accepts this `serve.launch` schema and shape.
+pub(crate) fn validate_serve_launch_schema(
+    record: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    v044_reconcile_serve_passphrase_policy::validate_record_schema(record)
 }
 
 pub(crate) fn run_migrations_under_exclusion(

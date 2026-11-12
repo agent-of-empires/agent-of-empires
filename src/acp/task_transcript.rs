@@ -10,7 +10,7 @@
 //! The transcript is followed through the shared file watcher, so nothing
 //! polls while it is quiet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
@@ -159,25 +159,6 @@ fn shared_watch() -> Arc<FileWatchService> {
     watch
 }
 
-#[cfg(test)]
-fn shared_watch() -> Arc<FileWatchService> {
-    static WATCHES: OnceLock<
-        Mutex<HashMap<tokio::runtime::Id, std::sync::Weak<FileWatchService>>>,
-    > = OnceLock::new();
-    let runtime = tokio::runtime::Handle::current().id();
-    let mut watches = WATCHES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    watches.retain(|_, watch| watch.strong_count() != 0);
-    if let Some(watch) = watches.get(&runtime).and_then(std::sync::Weak::upgrade) {
-        return watch;
-    }
-    let watch = FileWatchService::new().unwrap_or_else(|_| FileWatchService::noop());
-    watches.insert(runtime, Arc::downgrade(&watch));
-    watch
-}
-
 #[derive(Default)]
 pub(crate) struct ActiveTasks {
     owners: Mutex<HashMap<String, Arc<TaskOwner>>>,
@@ -211,14 +192,6 @@ impl ActiveTasks {
         }
         owners.clear();
     }
-}
-#[derive(Clone)]
-pub(crate) struct TaskReadOwner {
-    active: Arc<ActiveTasks>,
-    task_id: Arc<str>,
-    owner: Arc<TaskOwner>,
-}
-
     /// Ends `task_id` because `TaskStop` killed it. A following tailer
     /// publishes the end itself; with none, the stop is kept for the resumed
     /// tailer that registers next.
@@ -239,13 +212,6 @@ pub(crate) struct TaskReadOwner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(task_id)
-    }
-    pub(crate) fn clear(&self) {
-        let mut owners = self.lock();
-        for owner in owners.values() {
-            owner.cancellation.cancel();
-        }
-        owners.clear();
     }
 }
 #[derive(Clone)]

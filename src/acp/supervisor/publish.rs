@@ -1,9 +1,10 @@
 //! Supervisor-authored events, each allocated the session's next seq.
 
+use std::sync::Arc;
 use tracing::info;
 
 use super::{
-    with_publication_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor,
+    publish_next_persisted, with_publication_seq, BroadcastSink, PromptDisposition, PublishedPrompt, SeqMap, Supervisor,
     WorkerKind,
 };
 use crate::acp::approvals::ApprovalDecision;
@@ -14,11 +15,7 @@ use crate::acp::state::{BackgroundAgentStatus, Event};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: Event) -> u64 {
-        with_publication_seq(&self.next_seqs, session_id, |seq| {
-            self.sink
-                .publish(session_id, seq, &AcpEventData::from_host(event));
-            seq
-        })
+        publish_next_persisted(self.sink.as_ref(), &self.next_seqs, session_id, AcpEventData::from_host(event)).0
     }
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
@@ -41,35 +38,49 @@ impl<S: BroadcastSink> Supervisor<S> {
         refusal: crate::process::worker_registry::ControlAdmissionRefusal,
         originating_epoch: Option<u64>,
     ) -> bool {
-        loop {
-            if let Some(published) = self
-                .try_publish_control_refusal(session_id, scope, refusal, originating_epoch)
-                .await
-            {
-                return published;
-            }
-            let fence = std::sync::Arc::clone(&scope.fence);
-            if !matches!(
-                tokio::task::spawn_blocking(move || fence.lock_observation().map(drop)).await,
-                Ok(Ok(()))
-            ) {
-                return false;
-            }
+        let workers = Arc::clone(&self.workers);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let next_seqs = Arc::clone(&self.next_seqs);
+        let sink = Arc::clone(&self.sink);
+        let session_id = session_id.to_owned();
+        let scope = scope.clone();
+        let (done, published) = tokio::sync::oneshot::channel();
+        let publication = super::WorkerPublication::new(async move {
+            let result = loop {
+                if let Some(published) = Self::try_publish_control_refusal(
+                    &workers, &lifecycle, sink.as_ref(), &next_seqs,
+                    &session_id, &scope, refusal, originating_epoch,
+                ).await {
+                    break published;
+                }
+                let fence = Arc::clone(&scope.fence);
+                if !matches!(tokio::task::spawn_blocking(move || fence.lock_observation().map(drop)).await, Ok(Ok(()))) {
+                    break false;
+                }
+            };
+            let _ = done.send(result);
+        });
+        if let Err(publication) = self.sink.publish_from_worker(publication) {
+            publication.complete().await;
         }
+        published.await.unwrap_or(false)
     }
 
     async fn try_publish_control_refusal(
-        &self,
+        workers: &super::Workers,
+        lifecycles: &Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
+        sink: &S,
+        next_seqs: &Arc<SeqMap>,
         session_id: &str,
         scope: &crate::acp::state::NativeObservationScope,
         refusal: crate::process::worker_registry::ControlAdmissionRefusal,
         originating_epoch: Option<u64>,
     ) -> Option<bool> {
-        let workers = self.workers.lock().await;
+        let workers = workers.lock().await;
         if workers.contains_key(session_id) {
             return Some(false);
         }
-        let lifecycle = super::lock_recover(&self.lifecycle);
+        let lifecycle = super::lock_recover(lifecycles);
         let current = lifecycle.current_lease(session_id);
         let epoch = match lifecycle.phase(session_id) {
             crate::acp::runner_lifecycle::WorkerPhase::Absent => None,
@@ -112,13 +123,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut data = AcpEventData::from_history(event);
         data.metadata.scope = EventScope::SessionCurrent;
         data.metadata.availability_denial = true;
-        let persisted = with_publication_seq(&self.next_seqs, session_id, |seq| match epoch {
-            Some(epoch) => {
-                self.sink
-                    .publish_from_worker(session_id, seq, &data, epoch, Some(subject))
-            }
-            None => self.sink.publish_persisted(session_id, seq, &data),
-        });
+        let seq = with_publication_seq(next_seqs, session_id, |seq| seq);
+        drop(lifecycle);
+        drop(workers);
+        let persisted = match epoch {
+            Some(epoch) => sink.publish_replay_from_worker(session_id, seq, &data, epoch, Some(subject), None),
+            None => sink.publish_persisted(session_id, seq, &data),
+        };
         Some(persisted)
     }
 
@@ -131,20 +142,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
-        super::with_session_sequence(&self.next_seqs, session_id, |current| {
-            if *current != expected_seq {
-                return false;
-            }
-            *current = current.saturating_add(1);
-            self.sink.publish(
-                session_id,
-                *current,
-                &AcpEventData::from_host(Event::Stopped {
-                    reason: reason.to_string(),
-                }),
-            );
-            true
-        })
+        self.sink.queue_persisted(
+            session_id, Arc::clone(&self.next_seqs),
+            AcpEventData::from_host(Event::Stopped { reason: reason.to_owned() }), Some(expected_seq),
+        ).wait().is_some_and(|(_, stored)| stored)
     }
 
     pub fn publish_agent_switched(
@@ -179,16 +180,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         resets_at: chrono::DateTime<chrono::Utc>,
         manual: bool,
     ) -> Result<u64, super::SupervisorError> {
-        with_publication_seq(&self.next_seqs, session_id, |seq| {
-            self.sink
-                .publish_persisted(
-                    session_id,
-                    seq,
-                    &AcpEventData::from_host(Event::RateLimitAutoResumed { resets_at, manual }),
-                )
-                .then_some(seq)
-                .ok_or(super::SupervisorError::NativeStoreUnavailable)
-        })
+        let (seq, stored) = publish_next_persisted(self.sink.as_ref(), &self.next_seqs, session_id,
+            AcpEventData::from_host(Event::RateLimitAutoResumed { resets_at, manual }));
+        stored.then_some(seq).ok_or(super::SupervisorError::NativeStoreUnavailable)
     }
 
     /// Close a turn that was in flight when the previous daemon died.
@@ -209,7 +203,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[], None, false, None)
+        self.publish_user_prompt_with_attachments(session_id, text, &[], Vec::new(), false, None)
             .await
             .disposition
     }
@@ -223,7 +217,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[AttachmentBlob],
-        prompt_id: Option<String>,
+        prompt_ids: Vec<String>,
         synthesized: bool,
         origin_plugin: Option<String>,
     ) -> PublishedPrompt {
@@ -241,40 +235,24 @@ impl<S: BroadcastSink> Supervisor<S> {
             disposition,
             seq: None,
         };
-        let recorded_seq = with_publication_seq(&self.next_seqs, session_id, |seq| {
-            let mut refs = Vec::with_capacity(attachments.len());
-            for blob in attachments {
-                if !self.sink.record_attachment(session_id, seq, blob) {
-                    self.sink.delete_attachments_for_seq(session_id, seq);
-                    return None;
-                }
-                refs.push(crate::daemon::PromptAttachmentRef {
-                    id: blob.id.clone(),
-                    kind: blob.kind,
-                    mime_type: blob.mime_type.clone(),
-                    name: blob.name.clone(),
-                    size: blob.data.len() as u64,
-                });
-            }
-            let event = Event::UserPromptSent {
-                text,
-                attachments: refs,
-                prompt_id,
-                synthesized,
-                origin_plugin,
-            };
-            if !self
-                .sink
-                .publish_persisted(session_id, seq, &AcpEventData::from_host(event))
-            {
-                self.sink.delete_attachments_for_seq(session_id, seq);
-                return None;
-            }
-            Some(seq)
-        });
-        let Some(seq) = recorded_seq else {
-            return unrecorded;
+        // The first id owns the row; queue drains preserve every folded submission id.
+        let mut prompt_ids = prompt_ids.into_iter();
+        let event = Event::UserPromptSent {
+            text,
+            attachments: attachments.iter().map(|blob| crate::daemon::PromptAttachmentRef {
+                id: blob.id.clone(), kind: blob.kind, mime_type: blob.mime_type.clone(),
+                name: blob.name.clone(), size: blob.data.len() as u64,
+            }).collect(),
+            prompt_id: prompt_ids.next(), merged_prompt_ids: prompt_ids.collect(),
+            synthesized, origin_plugin,
         };
+        let Some((seq, persisted)) = self.sink.queue_prompt(
+            session_id, Arc::clone(&self.next_seqs), attachments, AcpEventData::from_host(event),
+        ).wait() else { return unrecorded; };
+        if !persisted {
+            self.sink.delete_attachments_for_seq(session_id, seq);
+            return unrecorded;
+        }
         if is_clear && disposition == PromptDisposition::Forward {
             self.publish_next(session_id, Event::SessionCleared);
         }
@@ -349,71 +327,44 @@ pub(super) const WORKER_REPLACED_DETACH_WARNING: &str =
 /// see [`collect_resumable_background_agent_launches`].
 pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
     warning: &str,
 ) {
     complete_stopped_worker_work(sink, next_seqs, session_id, Some(warning));
 }
 
-/// End tracking with the recorded allocation, without claiming a Native outcome.
+/// End tracking with the original allocation, without claiming a Native outcome.
 pub(super) fn complete_stopped_worker_work<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
     warning: Option<&str>,
 ) -> bool {
     let finish_task = |task_id, allocation| {
-        publish_tracking_end(
-            sink,
-            next_seqs,
-            session_id,
-            Event::BackgroundTaskFinished {
-                task_id,
-                ended_at: Some(chrono::Utc::now()),
-            },
-            allocation,
-        )
+        publish_tracking_end(sink, next_seqs, session_id,
+            Event::BackgroundTaskFinished { task_id, ended_at: Some(chrono::Utc::now()) }, allocation)
     };
     let finish_agent = |agent_id, allocation| {
-        publish_background_agent_detached(
-            sink, next_seqs, session_id, agent_id, warning, allocation,
-        )
+        publish_background_agent_detached(sink, next_seqs, session_id, agent_id, warning, allocation)
     };
     if let Some(store) = sink.establishment_store() {
         let (Ok(tasks), Ok(agents)) = (
             store.unresolved_background_task_launches(session_id),
             store.unresolved_background_agent_tracking_launches(session_id),
-        ) else {
-            return false;
-        };
+        ) else { return false; };
         for task in tasks {
-            if !finish_task(
-                task.task_id,
-                task.witness.as_ref().map(|witness| witness.allocation),
-            ) {
-                return false;
-            }
+            if !finish_task(task.task_id, task.witness.as_ref().map(|witness| witness.allocation)) { return false; }
         }
         for agent in agents {
-            if !finish_agent(
-                agent.agent_id,
-                agent.witness.as_ref().map(|witness| witness.allocation),
-            ) {
-                return false;
-            }
+            if !finish_agent(agent.agent_id, agent.witness.as_ref().map(|witness| witness.allocation)) { return false; }
         }
     } else {
-        // In-memory observation sinks have no qualified allocations to retire.
         for task_id in sink.unresolved_background_task_ids(session_id) {
-            if !finish_task(task_id, None) {
-                return false;
-            }
+            if !finish_task(task_id, None) { return false; }
         }
         for agent_id in sink.unresolved_background_agent_ids(session_id) {
-            if !finish_agent(agent_id, None) {
-                return false;
-            }
+            if !finish_agent(agent_id, None) { return false; }
         }
     }
     true
@@ -421,46 +372,35 @@ pub(super) fn complete_stopped_worker_work<S: BroadcastSink>(
 
 fn publish_background_agent_detached<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
     agent_id: String,
     warning: Option<&str>,
     allocation: Option<uuid::Uuid>,
 ) -> bool {
-    publish_tracking_end(
-        sink,
-        next_seqs,
-        session_id,
+    publish_tracking_end(sink, next_seqs, session_id,
         Event::BackgroundAgentCompleted {
-            agent_id,
-            status: BackgroundAgentStatus::Detached,
-            tools: Vec::new(),
-            result: None,
-            warning: warning.map(str::to_owned),
-            ended_at: chrono::Utc::now(),
-        },
-        allocation,
-    )
+            agent_id, status: BackgroundAgentStatus::Detached, tools: Vec::new(), result: None,
+            warning: warning.map(str::to_owned), ended_at: chrono::Utc::now(),
+        }, allocation)
 }
 
 fn publish_tracking_end<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
     event: Event,
     allocation: Option<uuid::Uuid>,
 ) -> bool {
     let mut data = AcpEventData::from_host(event);
     data.metadata.resource_ref = allocation;
-    with_publication_seq(next_seqs, session_id, |seq| {
-        sink.publish_persisted(session_id, seq, &data)
-    })
+    publish_next_persisted(sink, next_seqs, session_id, data).1
 }
 
 /// Missing paths are untrackable; usable paths still require their real witness at adoption.
 pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
 ) -> anyhow::Result<Vec<UnresolvedBackgroundAgentLaunch>> {
     let (resumable, untrackable): (Vec<_>, Vec<_>) = sink
@@ -487,13 +427,11 @@ pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
 /// their responders died with it, so the cards would fail on submit.
 pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     sink: &S,
-    next_seqs: &SeqMap,
+    next_seqs: &Arc<SeqMap>,
     session_id: &str,
 ) {
     let publish = |event: Event| {
-        with_publication_seq(next_seqs, session_id, |seq| {
-            sink.publish(session_id, seq, &AcpEventData::from_host(event));
-        })
+        publish_next_persisted(sink, next_seqs, session_id, AcpEventData::from_host(event));
     };
     let approvals = sink.unresolved_approval_nonces(session_id);
     if !approvals.is_empty() {
@@ -809,7 +747,7 @@ mod tests {
             "s-1",
             "resent after rate limit".into(),
             &[],
-            None,
+            Vec::new(),
             true,
             None,
         )
@@ -826,6 +764,43 @@ mod tests {
             })
             .collect();
         assert_eq!(flags, [false, true]);
+    }
+
+    /// A queue drain folds several rows into one turn: the first id names the
+    /// event and the rest ride in `merged_prompt_ids` so a client settles all of them (#5401).
+    #[tokio::test]
+    async fn publish_user_prompt_splits_leading_id_from_merged_ids() {
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        for ids in [vec![], vec!["a"], vec!["a", "b", "c"]] {
+            let ids: Vec<String> = ids.into_iter().map(String::from).collect();
+            sup.publish_user_prompt_with_attachments("s-1", "t".into(), &[], ids, false, None)
+                .await;
+        }
+
+        let got: Vec<(Option<String>, Vec<String>)> = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, event)| match event {
+                Event::UserPromptSent {
+                    prompt_id,
+                    merged_prompt_ids,
+                    ..
+                } => (prompt_id.clone(), merged_prompt_ids.clone()),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            got,
+            [
+                (None, vec![]),
+                (Some("a".into()), vec![]),
+                (Some("a".into()), s(&["b", "c"])),
+            ]
+        );
     }
 
     /// The published seq is the `UserPromptSent` event's, and there is none when the
@@ -849,7 +824,14 @@ mod tests {
         let sup = Supervisor::new(sink.clone());
         sup.publish_user_prompt("s-1", "first".into()).await;
         let published = sup
-            .publish_user_prompt_with_attachments("s-1", "second".into(), &[], None, false, None)
+            .publish_user_prompt_with_attachments(
+                "s-1",
+                "second".into(),
+                &[],
+                Vec::new(),
+                false,
+                None,
+            )
             .await;
         let recorded = sink.frames.lock().unwrap().last().unwrap().1;
         assert_eq!(
@@ -862,7 +844,14 @@ mod tests {
 
         let sup = Supervisor::new(std::sync::Arc::new(RefusesToPersist));
         let published = sup
-            .publish_user_prompt_with_attachments("s-1", "lost".into(), &[], None, false, None)
+            .publish_user_prompt_with_attachments(
+                "s-1",
+                "lost".into(),
+                &[],
+                Vec::new(),
+                false,
+                None,
+            )
             .await;
         assert_eq!(
             published,

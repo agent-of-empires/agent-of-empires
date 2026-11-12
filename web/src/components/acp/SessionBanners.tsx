@@ -42,35 +42,44 @@ export function SessionBanners({
   const nativeReady = nativeInputAvailable(state);
   // A prior current input receipt changes the diagnostic, never today's control authority.
   const startupDiagnosticOnly = nativeReady || state.sessionAssigned;
-  const variant = pickWorkerStoppedVariant({
-    workerStopped: state.workerStopped,
-    startupError: state.startupError,
-    trashedAt,
-    archivedAt,
-    snoozedUntil,
-    workerStopping: acpWorkerState === "stopping",
-  });
+  const reason = state.integrationLost;
+  const integrationError = reason
+    ? `Agent integration lost: ${reason.kind === "contract_violation" ? reason.detail : reason.kind.replace("_", " ")}`
+    : null;
+  const startupError = state.startupError;
+  const variant = reason
+    ? "none"
+    : pickWorkerStoppedVariant({
+        workerStopped: state.workerStopped,
+        startupError,
+        trashedAt,
+        archivedAt,
+        snoozedUntil,
+        workerStopping: acpWorkerState === "stopping",
+      });
   const healthy =
+    !reason &&
     !state.workerStopped &&
     !state.workerRestarting &&
     !state.connectionUnavailable &&
-    (!state.startupError || nativeReady);
+    (!startupError || nativeReady);
   const idle = healthy && !state.turnActive;
   const errorMessage = state.interactionError?.message ?? state.lastError;
   return (
     <>
-      {state.startupError && !startupDiagnosticOnly && (
+      {integrationError && <InteractionErrorBanner title="Structured view diagnostic" message={integrationError} />}
+      {startupError && !startupDiagnosticOnly && (
         <StartupErrorBanner
           sessionId={sessionId}
-          message={state.startupError}
+          message={startupError}
           acpWorkerState={acpWorkerState}
           canRecover={canRestart && state.connectionUnavailable === null}
           sentStopped={state.restartStoppedSent}
           onSwitchToTerminal={onSwitchToTerminal}
         />
       )}
-      {state.startupError && startupDiagnosticOnly && (
-        <InteractionErrorBanner message={state.startupError} onDismiss={dismissError} />
+      {startupError && startupDiagnosticOnly && (
+        <InteractionErrorBanner message={startupError} onDismiss={dismissError} />
       )}
       {state.connectionUnavailable ? (
         <NativeChannelNotice observation={state.connectionUnavailable} current />
@@ -101,10 +110,10 @@ export function SessionBanners({
           sentStopped={state.restartStoppedSent}
         />
       )}
-      {state.workerRestarting && !state.startupError && !state.workerStopped && (
+      {state.workerRestarting && !startupError && !reason && !state.workerStopped && (
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
-      {startingAgent ? (
+      {!reason && startingAgent ? (
         <StartupWaitLine
           sessionId={sessionId}
           agent={startingAgent}
@@ -126,7 +135,7 @@ export function SessionBanners({
           </PulseBanner>
         )
       )}
-      {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
+      {!reason && showWorkerStoppingBanner({ acpWorkerState, startupError }) && <WorkerStoppingBanner />}
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}
@@ -328,20 +337,30 @@ function ChipBanner({
   );
 }
 
-function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
+function InteractionErrorBanner({
+  title = "Action did not complete",
+  message,
+  onDismiss,
+}: {
+  title?: string;
+  message: string;
+  onDismiss?: () => void;
+}) {
   return (
     <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
       <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium">Action did not complete</div>
+        <div className="text-xs font-medium">{title}</div>
         <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
       </div>
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
-      >
-        Dismiss
-      </button>
+      {onDismiss && (
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
+        >
+          Dismiss
+        </button>
+      )}
     </div>
   );
 }

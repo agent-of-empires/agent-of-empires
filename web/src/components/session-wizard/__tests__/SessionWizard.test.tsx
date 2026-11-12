@@ -14,6 +14,7 @@ import {
   fetchIsGitRepo,
   fetchProfiles,
   fetchProjects,
+  fetchRecentProjects,
   fetchSettings,
   fetchVolumeIgnoresPreview,
   type SettingsResponse,
@@ -40,6 +41,7 @@ vi.mock("../../../lib/api", () => ({
   fetchProfileAgents: vi.fn().mockResolvedValue([]),
   fetchAgents: vi.fn().mockResolvedValue([]),
   fetchIsGitRepo: vi.fn().mockResolvedValue(true),
+  fetchBranches: vi.fn().mockResolvedValue([]),
   fetchGroups: vi.fn().mockResolvedValue([]),
   fetchDockerStatus: vi.fn().mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" }),
   fetchProfiles: vi.fn().mockResolvedValue([]),
@@ -429,14 +431,45 @@ describe("SessionWizard rows", () => {
   });
   const viewSwitch = () => screen.getByRole("radio", { name: "Structured view" }) as HTMLButtonElement;
 
-  it.each([
-    ["claude", undefined, false, /plan, tool calls and diffs as cards/],
-    ["aider", [agent("aider", { acp_capable: false })], true, /no ACP adapter/],
-    ["helper", [agent("helper", { kind: "custom", acp_capable: false })], true, /needs agent_acp_cmd/],
-    ["claude", [agent("claude", { acp_allowed: false })], true, /not on the allowed agents list/],
-  ])("gates the structured view for %s", async (tool, agents, disabled, summary) => {
+  const noAdapter = [agent("claude", { acp_create_ready: false })];
+  const cards = /plan, tool calls and diffs as cards/;
+  const viewGates: [
+    string,
+    string,
+    AgentInfo[] | undefined,
+    WizardPrefill & { commandOverride?: string },
+    boolean,
+    RegExp,
+  ][] = [
+    ["claude", "claude", undefined, {}, false, cards],
+    ["aider", "aider", [agent("aider", { acp_capable: false })], {}, true, /no ACP adapter/],
+    ["custom", "helper", [agent("helper", { kind: "custom", acp_capable: false })], {}, true, /needs agent_acp_cmd/],
+    ["not allowed", "claude", [agent("claude", { acp_allowed: false })], {}, true, /not on the allowed agents list/],
+    ["adapter missing", "claude", noAdapter, {}, true, /ACP adapter not installed/],
+    ["adapter missing, Sandbox on", "claude", noAdapter, { sandboxEnabled: true }, false, cards],
+    ["adapter missing, command override", "claude", noAdapter, { commandOverride: "my-wrapper acp" }, false, cards],
+    // The list is loaded for the selected Profile, so its flag answers for that Profile.
+    ["adapter missing, other Profile", "claude", noAdapter, { profile: "other" }, true, /ACP adapter not installed/],
+    // A Profile hook that installs the adapter makes the create ready though it isn't installed yet.
+    [
+      "installed by a Profile hook",
+      "claude",
+      [agent("claude", { acp_installed: false, acp_create_ready: true })],
+      {},
+      false,
+      cards,
+    ],
+  ];
+  it.each(viewGates)("gates the structured view: %s", async (_label, tool, agents, setup, disabled, summary) => {
     if (agents) vi.mocked(fetchProfileAgents).mockResolvedValueOnce(agents);
-    renderWizard({ path: "/tmp/proj", tool });
+    const { commandOverride, ...prefill } = setup;
+    renderWizard({ path: "/tmp/proj", tool, ...prefill });
+    if (agents) await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
+    if (commandOverride) {
+      fireEvent.click(screen.getByTestId("wizard-agent-row"));
+      fireEvent.change(screen.getByLabelText("Command override"), { target: { value: commandOverride } });
+      fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    }
     await waitFor(() => expect(viewSwitch().disabled).toBe(disabled));
     expect(screen.getByTestId("wizard-view-row").textContent).toMatch(summary);
     // A reason cut off at md stays readable on hover.
@@ -447,6 +480,71 @@ describe("SessionWizard rows", () => {
     // Terminal view is what an agent without Structured view gets.
     const terminal = screen.getByRole("radio", { name: "Terminal view" });
     expect(terminal.getAttribute("aria-checked")).toBe(String(disabled));
+  });
+
+  it("asks for the selected project's readiness, which counts its repository hooks", async () => {
+    // Only an answer for the project counts the repository hook that installs the adapter.
+    vi.mocked(fetchProfileAgents).mockImplementation(async (_profile, project) => [
+      agent("claude", { acp_installed: false, acp_create_ready: project?.path === "/tmp/proj" }),
+    ]);
+    renderWizard();
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(fetchProfileAgents).toHaveBeenCalledWith("default", { path: "/tmp/proj", scratch: false });
+    expect(payload()).toMatchObject({ view: "structured" });
+    expect(screen.getByTestId("wizard-view-row").textContent).not.toMatch(/ACP adapter not installed/);
+  });
+
+  it("keeps Structured view selectable while the new project's readiness is pending", async () => {
+    vi.mocked(fetchRecentProjects).mockResolvedValueOnce({
+      projects: [
+        { path: "/tmp/proj", display_name: "proj", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" },
+        { path: "/tmp/other", display_name: "other", tool: "claude", last_used_at: "2026-01-01T00:00:00Z" },
+      ],
+    });
+    let answerOther!: (agents: AgentInfo[]) => void;
+    vi.mocked(fetchProfileAgents).mockImplementation((_profile, project) =>
+      project?.path === "/tmp/other" ? new Promise((resolve) => (answerOther = resolve)) : Promise.resolve(noAdapter),
+    );
+    renderWizard();
+    await waitFor(() => expect(viewSwitch().disabled).toBe(true));
+    fireEvent.click(screen.getByTestId("wizard-project-row"));
+    fireEvent.click((await screen.findByText("/tmp/other")).closest("button")!);
+    // /tmp/proj's answer isn't /tmp/other's, before the fetch starts and while it is held.
+    expect(fetchProfileAgents).not.toHaveBeenCalledWith("default", { path: "/tmp/other", scratch: false });
+    expect(viewSwitch().disabled).toBe(false);
+    await waitFor(() =>
+      expect(fetchProfileAgents).toHaveBeenCalledWith("default", { path: "/tmp/other", scratch: false }),
+    );
+    expect(viewSwitch().disabled).toBe(false);
+    await act(async () => answerOther(noAdapter));
+    expect(viewSwitch().disabled).toBe(true);
+  });
+
+  it("asks a scratch create's readiness without a project path", async () => {
+    renderWizard({ scratch: true, tool: "claude" });
+    await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalledWith("default", { path: "", scratch: true }));
+  });
+
+  it("creates a terminal session when the adapter is missing", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce(noAdapter);
+    renderWizard();
+    await waitFor(() => expect(viewSwitch().disabled).toBe(true));
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalled());
+    expect(payload()).toMatchObject({ view: "terminal" });
+  });
+
+  it("shows the Daemon's message when it refuses a missing adapter", async () => {
+    const message = "ACP adapter `claude-agent-acp` is not installed or not on $PATH. Install: npm install -g x";
+    createSession.mockResolvedValueOnce({
+      ok: false,
+      error: message,
+      failure: { code: "acp_adapter_missing", message, stage: null, reference: null },
+    });
+    renderWizard();
+    await launch();
+    expect(await screen.findByText(message)).toBeTruthy();
   });
 
   it.each([
@@ -522,6 +620,29 @@ describe("SessionWizard rows", () => {
       await waitFor(() => expect(createSession).toHaveBeenCalled());
       expect(view().getAttribute("aria-checked")).toBe("true");
       expect(payload()).toMatchObject({ profile: "work", view: "structured" });
+    });
+
+    it("keeps a workspace choice made while the profile response is pending", async () => {
+      vi.mocked(fetchProfiles).mockResolvedValue(PROFILES);
+      const worktrees = { worktree: { enabled: true } } as never;
+      let release!: (v: never) => void;
+      vi.mocked(fetchSettings)
+        .mockResolvedValueOnce(worktrees)
+        .mockReturnValueOnce(new Promise((r) => (release = r)));
+      renderWizard();
+      await waitFor(() =>
+        expect(screen.getByRole("switch", { name: "Create a worktree" }).getAttribute("aria-checked")).toBe("true"),
+      );
+      fireEvent.click(screen.getByText("Profile"));
+      fireEvent.click(screen.getByRole("radio", { name: /work/ }));
+      await waitFor(() => expect(fetchSettings).toHaveBeenCalledWith("work"));
+      fireEvent.click(screen.getByRole("button", { name: "Configure worktree" }));
+      fireEvent.click(await screen.findByRole("switch", { name: "Workspace directory" }));
+      fireEvent.click(screen.getByRole("button", { name: "Back" }));
+      await act(async () => release(worktrees));
+      await launch();
+      await waitFor(() => expect(createSession).toHaveBeenCalled());
+      expect(payload()).toMatchObject({ profile: "work", workspace: true });
     });
 
     it("resets a view set before the profile was picked", async () => {
@@ -1529,6 +1650,25 @@ describe("SessionWizard create failures", () => {
     expect(payload(1).sandbox).toBeFalsy();
     expect(payload(1).idempotency_key).toBeTruthy();
     expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+  });
+
+  it("Launch without Sandbox turns the Sandbox off without sending when the host has no adapter for Structured view", async () => {
+    vi.mocked(fetchProfileAgents).mockResolvedValueOnce([agent("claude", { acp_create_ready: false })]);
+    createSession.mockResolvedValueOnce(
+      failure("sandbox_image_pull_failed", "starting_container", "Couldn't pull the Sandbox image ghcr.io/x/y:1."),
+    );
+    sandboxed();
+    await waitFor(() => expect(fetchProfileAgents).toHaveBeenCalled());
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(payload(0).view).toBe("structured");
+    fireEvent.click(screen.getByTestId("create-failure-launch_without_sandbox"));
+    await act(async () => {});
+    expect(createSession).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId("create-failure")).toBeNull();
+    expect(screen.getByRole("switch", { name: "Run in a safe container" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByTestId("wizard-view-row").textContent).toContain("ACP adapter not installed");
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("radio", { name: "Terminal view" })));
   });
 
   it("a failed hook shows the message as sent and its last output, with no Sandbox action", async () => {

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Current wire generation.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
 
 /// Maximum NDJSON frame accepted from the ACP agent.
 pub const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -378,6 +378,13 @@ pub enum ControlBody {
     },
     /// Cancel the in-flight turn (maps to a `session/cancel` notification).
     Cancel {
+        scope: crate::acp::establishment::NativeRequestScope,
+    },
+    /// Cancel one subagent session's work (`session/cancel` addressed to the
+    /// child id). The turn of the root session keeps running.
+    CancelSession {
+        parent_session_id: String,
+        session_id: String,
         scope: crate::acp::establishment::NativeRequestScope,
     },
     /// A non-establishing client-to-agent request. `session/new`, load and fork

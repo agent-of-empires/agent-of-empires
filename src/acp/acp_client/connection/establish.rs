@@ -2,6 +2,7 @@
 //! session and apply configured defaults.
 
 use crate::acp::agent_compat::{self, ExpectedAgent};
+use crate::acp::aoe_meta;
 use crate::acp::mcp_config;
 use crate::acp::state::{Event, StartupErrorDetail};
 use agent_client_protocol::v1::schema::{
@@ -11,7 +12,7 @@ use agent_client_protocol::v1::schema::{
 };
 use agent_client_protocol::v1::ConnectionTo;
 use agent_client_protocol::Agent;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -24,8 +25,8 @@ use super::notifications::{now_ms, Shared};
 use super::ReadyTx;
 use crate::acp::acp_client::commands::{ConnectMode, QueuedClientCmd};
 use crate::acp::acp_client::config_options::{
-    apply_config_default, config_option_failure_event, config_options_event, modes_available_event,
-    thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
+    apply_config_default, config_option_failure_event, config_options_event, model_config_values,
+    modes_available_event, thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::{
     establish_session, DaemonControlClient, EstablishmentApplication,
@@ -70,6 +71,7 @@ pub(super) struct EstablishCtx {
     pub(super) expected_agent: ExpectedAgent,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) default_effort: Option<String>,
+    pub(super) default_model_config: BTreeMap<String, String>,
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
@@ -101,36 +103,28 @@ pub(super) async fn establish(
     let initialized = async {
         let init: InitializeResponse = match ctx.control.as_ref() {
             Some(control) => {
-                let params = serde_json::to_value(build_initialize_request())
+                let params = serde_json::to_value(build_initialize_request(shared.profile))
                     .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
                 serde_json::from_value(control.initialize(params).await?).map_err(|e| {
                     acp_internal_error(format!("deserialize initialize result: {e}"))
                 })?
             }
             None => ordered_native_request(
-                &connection,
-                &shared.connection_state,
-                None,
-                build_initialize_request(),
+                &connection, &shared.connection_state, None,
+                build_initialize_request(shared.profile),
             )
             .map_err(|_| acp_internal_error("ACP connection unavailable".into()))?
-            .wait()
-            .await
-            .into_result()?,
+            .wait().await.into_result()?,
         };
         Ok::<_, agent_client_protocol::Error>(init)
-    }
-    .await;
+    }.await;
     let init = match initialized {
         Ok(init) => init,
         Err(error) => {
             if matches!(ctx.mode, ConnectMode::Fresh) {
-                shared
-                    .event_tx
-                    .close_establishment(Some(
-                        crate::acp::establishment::EstablishmentBlockReason::NotIssued,
-                    ))
-                    .await;
+                shared.event_tx.close_establishment(Some(
+                    crate::acp::establishment::EstablishmentBlockReason::NotIssued,
+                )).await;
             }
             return Err(error);
         }
@@ -180,6 +174,36 @@ pub(super) async fn establish(
             }
         }
     }
+
+    // A proxy announces itself on the initialize response; any other agent
+    // has no hello and is not held to the `_meta.aoe` contract.
+    let proxied = match init
+        .meta
+        .as_ref()
+        .map(aoe_meta::ProxyHello::from_meta)
+        .transpose()
+    {
+        Ok(hello) => hello.flatten().is_some(),
+        Err(err) => {
+            warn!(
+                target: "acp.protocol",
+                session = %label,
+                error = %err,
+                "proxy hello rejected; refusing to enter session"
+            );
+            let detail = StartupErrorDetail::InvalidProxyHello {
+                reason: err.to_string(),
+            };
+            let message = detail.user_message();
+            if let Some(tx) = ctx.ready_tx.lock().await.take() {
+                let _ = tx.send(Err(AcpError::IncompatibleAgent(Box::new(
+                    IncompatibleAgentError { detail, message },
+                ))));
+            }
+            return Ok(None);
+        }
+    };
+    shared.aoe.begin_connection(proxied);
 
     // Return initialized ownership before any bootstrap replay can fill the
     // public queue. Session establishment still owns its own readiness gate.
@@ -247,6 +271,7 @@ pub(super) async fn establish(
         close_capable: init.agent_capabilities.session_capabilities.close.is_some(),
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
+        default_model_config: ctx.default_model_config,
         default_mode: ctx.default_mode,
         default_model: ctx.default_model,
         agent_cwd: ctx.agent_cwd,
@@ -281,11 +306,22 @@ pub(super) async fn establish(
         .await;
     session.apply_default_model().await;
     session.apply_default_effort().await;
-    if session.control.is_none() && arm_resume_watchdog && shared.connection_state.loss().is_none()
-    {
+    session.apply_default_model_config().await;
+    if session.control.is_none() && arm_resume_watchdog && shared.connection_state.loss().is_none() {
         spawn_resume_idle_watchdog(shared, &session.connection);
     }
     Ok(Some(session))
+}
+
+/// A live busy or task lease holds the turn open however long the agent is
+/// silent; the grace counts again once it expires.
+fn resume_idle_expired(
+    idle_ms: i64,
+    grace_ms: i64,
+    leases: &aoe_meta::lease::LeaseTable,
+    now: i64,
+) -> bool {
+    idle_ms >= grace_ms && !leases.working(now)
 }
 
 /// Fallback when an adopted turn neither completes nor shows activity, so the
@@ -308,8 +344,9 @@ fn spawn_resume_idle_watchdog(shared: Arc<Shared>, connection: &ConnectionTo<Age
             {
                 return Ok(());
             }
-            let idle_ms = now_ms() - shared.last_event_at.load(Ordering::Relaxed);
-            if idle_ms >= grace_ms {
+            let now = now_ms();
+            let idle_ms = now - shared.last_event_at.load(Ordering::Relaxed);
+            if resume_idle_expired(idle_ms, grace_ms, &shared.aoe.leases, now) {
                 let Ok(permit) = shared.event_tx.reserve().await else {
                     return Ok(());
                 };
@@ -407,9 +444,10 @@ impl Session {
                     .await?;
                 let req = LoadSessionRequest::new(session_id.clone(), self.agent_cwd.clone())
                     .mcp_servers(mcp_servers);
-                establish_session::<LoadSessionResponse>(control, "session/load", &req)
-                    .await
-                    .map(|response| {
+                self.shared.aoe.set_loading_history(true);
+                let loaded = establish_session::<LoadSessionResponse>(control, "session/load", &req).await;
+                self.shared.aoe.set_loading_history(false);
+                loaded.map(|response| {
                         (
                             SessionId::from(session_id.clone()),
                             response.modes,
@@ -593,12 +631,7 @@ impl Session {
                     && postimage.choice.acp_session_id.as_deref() == Some(id.0.as_ref()) =>
             {
                 #[cfg(test)]
-                let gate = shared
-                    .connection_state
-                    .test_establishment_usable
-                    .lock()
-                    .unwrap()
-                    .take();
+                let gate = shared.connection_state.test_establishment_usable.lock().unwrap().take();
                 #[cfg(test)]
                 if let Some((entered, release)) = gate {
                     let _ = entered.send(());
@@ -608,9 +641,7 @@ impl Session {
                     && control.projection.applied().is_some()
                     && !shared.connection_state.is_stopping();
                 if publish_assignment {
-                    if ready {
-                        shared.connection_state.record_usable();
-                    }
+                    if ready { shared.connection_state.record_usable(); }
                     shared
                         .emit(Event::AcpSessionAssigned {
                             acp_session_id: id.0.to_string(),
@@ -682,6 +713,7 @@ impl Session {
             Ok(options) => {
                 self.channels.thought_level_config_option_id =
                     thought_level_config_id(&options).map(|id| id.0.to_string());
+                self.channels.model_config = model_config_values(&options);
             }
             Err(reason) if self.shared.connection_state.loss().is_none() => {
                 let event = config_option_failure_event(
@@ -703,13 +735,13 @@ impl Session {
 
     /// Effort is a pin carried across respawns, which resume via load or fork,
     /// so it applies after any establish path. Resume captures no option id.
-    async fn apply_default_effort(&self) {
+    async fn apply_default_effort(&mut self) {
         let Some(effort) = self.default_effort.as_deref() else {
             return;
         };
         match self.channels.thought_level_config_option_id.as_deref() {
             Some(config_id) => {
-                let _ = apply_config_default(
+                let result = apply_config_default(
                     &self.connection,
                     &self.shared.connection_state,
                     &self.shared.event_tx,
@@ -724,6 +756,9 @@ impl Session {
                         .and_then(|control| control.original_request_context()),
                 )
                 .await;
+                if let Ok(options) = result {
+                    self.channels.model_config = model_config_values(&options);
+                }
             }
             None => debug!(
                 target: "acp.protocol",
@@ -731,5 +766,53 @@ impl Session {
                 "structured view effort skipped; no thought_level option"
             ),
         }
+    }
+}
+
+impl Session {
+    /// Run last, because changing model rebuilds the advertised option set.
+    async fn apply_default_model_config(&mut self) {
+        let label = &self.shared.session_label;
+        for (id, value) in &self.default_model_config {
+            match self.channels.model_config.get(id) {
+                None => debug!(target: "acp.protocol", session = %label, config_id = %id,
+                    "structured view model_config skipped; option not advertised"),
+                Some(current) if current == value => debug!(target: "acp.protocol", session = %label,
+                    config_id = %id, "structured view model_config already current"),
+                Some(_) => {
+                    let result = apply_config_default(
+                        &self.connection, &self.shared.connection_state, &self.shared.event_tx,
+                        agent_client_protocol::v1::schema::SetSessionConfigOptionRequest::new(
+                            self.acp_session_id.clone(), SessionConfigId::new(id.as_str()),
+                            agent_client_protocol::v1::schema::SessionConfigValueId::new(value.as_str()),
+                        ),
+                        label,
+                        self.control.as_ref().and_then(|control| control.original_request_context()),
+                    ).await;
+                    if let Ok(options) = result {
+                        self.channels.model_config = model_config_values(&options);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_lease_holds_the_resume_idle_stop_until_it_expires() {
+        use aoe_meta::{LeaseKind, LeaseOp, LeaseVerb};
+        let leases = aoe_meta::lease::LeaseTable::default();
+        let acquire = LeaseOp {
+            id: "bg".into(), kind: LeaseKind::Busy, op: LeaseVerb::Acquire, ttl_ms: Some(60_000),
+        };
+        leases.apply(&acquire, 0).unwrap();
+        for (now, idle, stop) in [(31_000,31_000,false),(59_999,59_999,false),(60_000,60_000,true)] {
+            assert_eq!(resume_idle_expired(idle,30_000,&leases,now),stop,"{now}");
+        }
+        assert!(resume_idle_expired(30_000,30_000,&Default::default(),30_000));
     }
 }

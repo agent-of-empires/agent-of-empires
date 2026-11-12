@@ -893,6 +893,8 @@ impl RunnerShared {
             .or_else(|| request.as_ref().map(|(_, _, params)| params))
             .and_then(|params| params.get("sessionId").or_else(|| params.get(0)))
             .and_then(serde_json::Value::as_str);
+        let decision_request = request.as_ref().is_some_and(|(_, method, _)|
+            matches!(method.as_str(), "session/request_permission" | "elicitation/create"));
         let source = if needs_session || resource_start {
             let native = self.native_channel.lock().expect("native channel lock");
             native
@@ -901,7 +903,8 @@ impl RunnerShared {
                 .filter(|receipt| {
                     receipt
                         .session_id()
-                        .is_some_and(|sid| reported_session.is_none_or(|reported| reported == sid))
+                        .is_some_and(|sid| decision_request
+                            || reported_session.is_none_or(|reported| reported == sid))
                         || (request.is_some()
                             && receipt.session_id().is_none()
                             && native.calls.values().any(|call| {
@@ -971,7 +974,11 @@ impl RunnerShared {
                                 receipt,
                                 row,
                                 storage,
-                                reported_session,
+                                if decision_request && receipt.session_id().is_some() {
+                                    receipt.session_id()
+                                } else {
+                                    reported_session
+                                },
                             )
                             .map(|stamp| (None, Some(stamp)))
                         } else {
@@ -1103,6 +1110,8 @@ impl RunnerShared {
             .is_some_and(|(_, call, _)| call.write != NativeWriteProgress::Complete);
         drop(native);
         drop(held);
+        let observed_parent = source.as_ref().and_then(|(receipt, _, _)|
+            receipt.session_id().map(Arc::from));
         let callback_authority = request
             .as_ref()
             .filter(|(_, method, _)| {
@@ -1117,6 +1126,7 @@ impl RunnerShared {
                     callback_original?,
                     session_stamp,
                     original_request_stamp,
+                    observed_parent,
                     reported_session.map(Arc::from),
                 )
                 .ok()?;
@@ -2475,11 +2485,12 @@ impl RunnerShared {
         &self,
         agent_stdin: &Mutex<tokio::process::ChildStdin>,
         attachment_id: u64,
+        parent_session_id: &str,
         acp_session_id: &str,
         scope: crate::acp::establishment::NativeRequestScope,
     ) {
         let Ok(authority) = self
-            .user_authority(Some(acp_session_id), scope, attachment_id)
+            .user_authority(Some(parent_session_id), scope, attachment_id)
             .await
         else {
             return;

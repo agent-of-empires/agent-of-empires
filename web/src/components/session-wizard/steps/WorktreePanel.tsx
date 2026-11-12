@@ -42,6 +42,22 @@ export function WorktreePanel({ data, onChange }: Props) {
       />
 
       {!data.attachExisting && <BaseBranchPicker data={data} onChange={onChange} />}
+
+      <ToggleRow
+        className="mt-4 cursor-pointer"
+        title="Workspace directory"
+        switchLabel="Workspace directory"
+        description={
+          data.attachExisting
+            ? "Not available when attaching to an existing branch."
+            : hasExtraRepos
+              ? "Always on with extra repositories."
+              : "Start in a workspace folder so projects added later don't move the session."
+        }
+        disabled={data.attachExisting || hasExtraRepos}
+        checked={!data.attachExisting && (data.useWorkspace || hasExtraRepos)}
+        onChange={(v) => onChange("useWorkspace", v)}
+      />
     </div>
   );
 }

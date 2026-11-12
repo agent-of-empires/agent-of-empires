@@ -521,6 +521,7 @@ async fn admit_and_create(
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,
+        workspace: false,
         // A plugin cannot request a worktree, so there is no branch to fork and
         // no per-repo base to honor.
         repo_base_branches: Vec::new(),
@@ -815,7 +816,7 @@ async fn sessions_turn_send(
                 SendTurnRequest { resume_reservation, resume_authority: crate::process::worker_registry::ResumeAuthority::Explicit, text: &req.text,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false, },
             )
@@ -1063,7 +1064,7 @@ async fn deliver_structured(
                 text: &req.message,
                 attachments: &[],
                 woke_idle_dormant,
-                prompt_id: None,
+                prompt_ids: Vec::new(),
                 synthesized: false,
                 no_revive: false,
             },
@@ -2384,6 +2385,7 @@ mod tests {
         foreign.view = crate::session::View::Structured;
         foreign.created_by_plugin = Some("other-plugin".into());
         let (deps, state, _dir) = test_deps(vec![foreign]);
+
         let ctx = ctx_with(&["session.prompt"]);
         for sql_failure in [false, true] {
             if sql_failure {

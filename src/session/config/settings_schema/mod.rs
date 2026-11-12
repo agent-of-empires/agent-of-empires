@@ -251,6 +251,9 @@ pub struct FieldDescriptor {
     pub category: String,
     pub label: String,
     pub description: String,
+    /// One user-facing line for the row; the doc-comment `description` stays for developers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     pub widget: WidgetKind,
     pub web_write: WebWritePolicy,
     #[serde(skip)]

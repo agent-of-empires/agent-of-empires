@@ -6,6 +6,8 @@ import {
   effectivePinnedOf,
   effectiveSnoozedUntilOf,
   effectiveUnreadOf,
+  optimisticForRow,
+  optimisticKey,
   reconcileOptimistic,
   serverTriageOf,
   withOverride,
@@ -64,7 +66,7 @@ it("withOverride merges a patch, applying explicit null and undefined", () => {
   expect(withOverride(override({ pinned: true }), { archived: true })).toEqual({
     pinned: true,
     archived: true,
-    archivedSessionId: null,
+    sessionId: null,
     snoozedUntil: undefined,
     unread: null,
   });
@@ -76,11 +78,13 @@ describe("reconcileOptimistic", () => {
   it("returns the same reference when nothing changes", () => {
     const empty = new Map<string, OptimisticTriage>();
     expect(reconcileOptimistic(empty, [])).toBe(empty);
-    const pending = new Map([["w", override({ pinned: true })]]);
+    const key = optimisticKey("w", null);
+    const pending = new Map([[key, override({ pinned: true })]]);
     expect(reconcileOptimistic(pending, [ws("w", [{ pinned_at: null }])])).toBe(pending);
   });
 
   it("drops an override once the server catches up, and keeps it until then", () => {
+    const key = optimisticKey("w", null);
     const cases: [string, Partial<OptimisticTriage>, Workspace, boolean][] = [
       ["pin caught up", { pinned: true }, ws("w", [{ pinned_at: "t" }]), false],
       ["pin pending", { pinned: true }, ws("w", [{ pinned_at: null }]), true],
@@ -98,33 +102,119 @@ describe("reconcileOptimistic", () => {
       ["mark-unread caught up", { unread: true }, ws("w", [{ unread: true }]), false],
     ];
     for (const [name, over, tree, kept] of cases) {
-      expect(reconcileOptimistic(new Map([["w", override(over)]]), [tree]).has("w"), name).toBe(kept);
+      expect(reconcileOptimistic(new Map([[key, override(over)]]), [tree]).has(key), name).toBe(kept);
     }
   });
 
   it("clears only the caught-up field, keeping the rest of the entry", () => {
-    const map = new Map([["w", override({ pinned: true, archived: false })]]);
+    const key = optimisticKey("w", null);
+    const map = new Map([[key, override({ pinned: true, archived: false })]]);
     const next = reconcileOptimistic(map, [ws("w", [{ pinned_at: null, archived_at: null }])]);
-    expect(next.get("w")).toEqual({
+    expect(next.get(key)).toEqual({
       pinned: true,
       archived: null,
-      archivedSessionId: null,
+      sessionId: null,
       snoozedUntil: undefined,
       unread: null,
     });
   });
 
   it("clears an archive override when its own session catches up, even if a sibling stays archived", () => {
-    const pending = new Map([["w", override({ archived: false, archivedSessionId: "a" })]]);
+    const key = optimisticKey("w", "a");
+    const pending = new Map([[key, override({ archived: false, sessionId: "a" })]]);
     const stillArchived = ws("w", [
       { id: "a", archived_at: "t" },
       { id: "b", archived_at: "t" },
     ]);
-    expect(reconcileOptimistic(pending, [stillArchived]).get("w")?.archived).toBe(false);
+    expect(reconcileOptimistic(pending, [stillArchived]).get(key)?.archived).toBe(false);
     const unarchivedA = ws("w", [
       { id: "a", archived_at: null },
       { id: "b", archived_at: "t" },
     ]);
-    expect(reconcileOptimistic(pending, [unarchivedA]).has("w")).toBe(false);
+    expect(reconcileOptimistic(pending, [unarchivedA]).has(key)).toBe(false);
   });
+
+  it("reconciles against its target session across a workspace's slices", () => {
+    const key = optimisticKey("w", "b");
+    const pending = new Map([[key, override({ archived: false, sessionId: "b" })]]);
+    const waiting = ws("w", [{ id: "a", archived_at: "t" }]);
+    const running = ws("w", [{ id: "b", archived_at: null }]);
+    expect(reconcileOptimistic(pending, [waiting, running]).has(key)).toBe(false);
+  });
+
+  it("keeps a snooze pending until its own session catches up, even if a sibling is snoozed", () => {
+    const key = optimisticKey("w", "b");
+    const pending = new Map([[key, override({ snoozedUntil: "2099-01-01T00:00:00Z", sessionId: "b" })]]);
+    const siblingSnoozed = ws("w", [
+      { id: "a", snoozed_until: "2098-01-01T00:00:00Z" },
+      { id: "b", snoozed_until: null },
+    ]);
+    expect(reconcileOptimistic(pending, [siblingSnoozed]).has(key)).toBe(true);
+    const caught = ws("w", [
+      { id: "a", snoozed_until: "2098-01-01T00:00:00Z" },
+      { id: "b", snoozed_until: "2099-01-01T00:00:00.000Z" },
+    ]);
+    expect(reconcileOptimistic(pending, [caught]).has(key)).toBe(false);
+  });
+
+  it("drops an override whose target session is gone", () => {
+    const key = optimisticKey("w", "gone");
+    const pending = new Map([[key, override({ pinned: true, sessionId: "gone" })]]);
+    expect(reconcileOptimistic(pending, [ws("w", [{ id: "a" }])]).has(key)).toBe(false);
+  });
+
+  it("keeps two pending actions on one workspace apart, per row and after reconcile", () => {
+    const archiveKey = optimisticKey("w", "a");
+    const unreadKey = optimisticKey("w", "b");
+    const overlay = new Map([
+      [archiveKey, override({ archived: true, sessionId: "a" })],
+      [unreadKey, override({ unread: true, sessionId: "b" })],
+    ]);
+    const rowA = ws("w", [{ id: "a", archived_at: null }]);
+    const rowB = ws("w", [{ id: "b", unread: false }]);
+    expect(optimisticForRow(overlay, rowA).archived).toBe(true);
+    expect(optimisticForRow(overlay, rowA).unread).toBeNull();
+    expect(optimisticForRow(overlay, rowB).unread).toBe(true);
+    expect(optimisticForRow(overlay, rowB).archived).toBeNull();
+
+    // The server catches up on the archive, leaving the unread action pending with its own fields.
+    const next = reconcileOptimistic(overlay, [
+      ws("w", [
+        { id: "a", archived_at: "2026-01-01T00:00:00Z" },
+        { id: "b", unread: false },
+      ]),
+    ]);
+    expect(next.has(archiveKey)).toBe(false);
+    expect(next.get(unreadKey)?.unread).toBe(true);
+    expect(next.get(unreadKey)?.archived).toBeNull();
+    expect(optimisticForRow(next, rowB).unread).toBe(true);
+  });
+});
+
+it("rolls every pending target of a recombined row into one aggregate and keeps each entry", () => {
+  const archiveKey = optimisticKey("w", "b");
+  const unreadKey = optimisticKey("w", "a");
+  const overlay = new Map([
+    [archiveKey, override({ archived: true, sessionId: "b" })],
+    [unreadKey, override({ unread: true, sessionId: "a" })],
+  ]);
+  const combined = ws("w", [
+    { id: "a", archived_at: null, unread: false },
+    { id: "b", status: "Stopped", archived_at: null },
+  ]);
+  const row = optimisticForRow(overlay, combined);
+  expect(row).toMatchObject({ archived: true, unread: true });
+  expect(row.bySession?.get("b")).toBe(overlay.get(archiveKey));
+  expect(row.bySession?.get("a")).toBe(overlay.get(unreadKey));
+});
+
+it("applies an override only to the rows that show its target session", () => {
+  const key = optimisticKey("w", "a");
+  const map = new Map([[key, override({ snoozedUntil: "2099-01-01T00:00:00Z", sessionId: "a" })]]);
+  expect(optimisticForRow(map, ws("w", [{ id: "a" }]))).toBe(map.get(key));
+  expect(optimisticForRow(map, ws("w", [{ id: "b" }]))).toBe(EMPTY_OPTIMISTIC);
+  // An entry without a target keeps the old workspace-wide behavior.
+  const untargetedKey = optimisticKey("w", null);
+  const untargeted = new Map([[untargetedKey, override({ pinned: true })]]);
+  expect(optimisticForRow(untargeted, ws("w", [{ id: "b" }]))).toBe(untargeted.get(untargetedKey));
 });

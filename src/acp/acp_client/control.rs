@@ -228,6 +228,7 @@ enum ForwardTicket {
 struct ReverseTicket {
     call_id: u64,
     _publication: Option<super::connection::CallbackDuration>,
+    _parked: Option<super::session_identity::ParkedRequest>,
     admitted: bool,
     reply_started: bool,
     callback: Option<Arc<super::session_identity::CapturedCallback>>,
@@ -1046,6 +1047,17 @@ impl DaemonControlClient {
     ) -> Result<(), AcpError> {
         self.send(ControlBody::Cancel { scope }).await
     }
+
+    pub(super) async fn cancel_session(
+        &self,
+        parent_session_id: String,
+        session_id: String,
+        scope: crate::acp::establishment::NativeRequestScope,
+    ) -> bool {
+        self.send(ControlBody::CancelSession { parent_session_id, session_id, scope })
+            .await
+            .is_ok()
+    }
 }
 
 /// A newborn must publish its own declaration; never retrofit a retained record.
@@ -1646,6 +1658,10 @@ pub(super) async fn connect_runner_control(
                             c.reverse.insert(id, ReverseTicket {
                                 call_id,
                                 _publication: publication,
+                                _parked: (admitted && (method == "session/request_permission"
+                                    || (method == "elicitation/create"
+                                        && control_protocol::session_scoped_callback(&method, &params))))
+                                    .then(|| reader_ingress.park()),
                                 admitted,
                                 reply_started: false,
                                 callback,
@@ -3076,21 +3092,14 @@ mod tests {
         LaterWriteFails,
         ControlEofBeforeResult,
     }
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn managed_prompt_relays_preserve_results_and_fence_eof() {
+    async fn run_managed_prompt_relay(name: &'static str, timing: RealRelayTiming) {
         use crate::acp::supervisor::test_support::managed::with_managed;
         use tokio::io::AsyncWriteExt as _;
-        const NAME: &str =
-            "acp::acp_client::control::tests::managed_prompt_relays_preserve_results_and_fence_eof";
-        if crate::process::runner::test_support::managed_runner::child_if_requested(NAME).await {
+        if crate::process::runner::test_support::managed_runner::child_if_requested(name).await {
             return;
         }
         with_managed(|scope| Box::pin(async move {
-            for timing in [RealRelayTiming::MarkerWriteFails, RealRelayTiming::ControlEofAfterMarker,
-                RealRelayTiming::LaterWriteFails, RealRelayTiming::ControlEofBeforeResult]
-            {
-                let inspection = scope.inspect_next_runner(NAME);
+                let inspection = scope.inspect_next_runner(name);
                 let mut fixture = ManagedControlFixture::new(scope).await;
                 let before = fixture.store.highest_seq(&fixture.client.id);
                 let request = fixture.start_prompt("real local original held for relay timing").await;
@@ -3228,8 +3237,43 @@ mod tests {
                 assert_eq!(fixture.native.requests(), native_requests,
                     "physical cleanup cannot send native input after observed loss");
                 assert_eq!(state.loss(), Some(loss));
-            }
         })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn managed_prompt_relays_preserve_results_and_fence_eof() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::managed_prompt_relays_preserve_results_and_fence_eof",
+            RealRelayTiming::ControlEofBeforeResult,
+        ).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_marker_relay_preserves_completed_result_without_further_native_controls() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::failed_marker_relay_preserves_completed_result_without_further_native_controls",
+            RealRelayTiming::MarkerWriteFails,
+        ).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runner_hangup_still_delivers_a_relayed_outcome() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::runner_hangup_still_delivers_a_relayed_outcome",
+            RealRelayTiming::ControlEofAfterMarker,
+        ).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_relay_after_a_relayed_marker_preserves_completed_result() {
+        run_managed_prompt_relay(
+            "acp::acp_client::control::tests::failed_relay_after_a_relayed_marker_preserves_completed_result",
+            RealRelayTiming::LaterWriteFails,
+        ).await;
     }
 
     #[tokio::test]
@@ -3530,6 +3574,7 @@ mod tests {
     async fn released_unbound_waiter_start_and_completion_never_settle_the_next_waiter() {
         release_real_prompt_and_keep_the_next_owner(true).await;
     }
+
     #[tokio::test]
     async fn oversized_reverse_reply_becomes_error_without_poisoning_connection() {
         use tokio::io::AsyncWriteExt;
@@ -4723,4 +4768,31 @@ mod tests {
         })
         .await;
     }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_runner_on_another_protocol_version_fails_with_a_mismatch_error() {
+        use crate::process::worker_registry::ControlRefusalReason;
+        for version in [5, 6, control_protocol::CONTROL_PROTOCOL_VERSION + 1] {
+            let tmp = tempfile::Builder::new().prefix("aoe-protocol-refusal-").tempdir_in("/tmp").unwrap();
+            let (socket, listener) = bind(&tmp);
+            let peer = tokio::spawn(async move {
+                let mut stream = accept_hello(&listener, "s", version).await;
+                assert!(matches!(control_protocol::read_frame(&mut stream).await, Ok(None)),
+                    "an incompatible Hello cannot receive Attach or a Native mutation");
+            });
+            let terminal = Arc::new(TerminalClaim::new());
+            let error = match connect(&socket, "s", terminal.clone(), false).await {
+                Err(error) => error,
+                Ok(_) => panic!("protocol {version} must be refused before attachment"),
+            };
+            let AcpError::RetainedRuntimeUnavailable(refusal) = error else {
+                panic!("protocol mismatch must preserve typed non-destructive refusal");
+            };
+            assert_eq!(refusal.reason, ControlRefusalReason::ProtocolIncompatible);
+            assert_eq!(refusal.owner, Some(fixture_owner()));
+            assert!(!terminal.claimed());
+            peer.await.unwrap();
+        }
+    }
+
 }

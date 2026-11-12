@@ -71,7 +71,7 @@ pub(crate) async fn resolve_blocked_migration(
     retry()
 }
 
-fn offer_allowed(interactive: bool, managed: bool) -> bool {
+pub(crate) fn offer_allowed(interactive: bool, managed: bool) -> bool {
     let autostart_disabled = crate::acp::client::daemon_manager::autostart_disabled();
     let remote = crate::acp::client::discovery::discover_env().is_some();
     should_offer_restart(interactive, autostart_disabled, remote, managed)

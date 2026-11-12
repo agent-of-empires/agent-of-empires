@@ -748,6 +748,7 @@ mod tests {
         }
     }
 
+
     #[test]
     fn only_a_row_minted_after_the_limit_supersedes() {
         let limit = Utc.timestamp_opt(1_700_000_000, 0).unwrap();

@@ -58,19 +58,24 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     let mut found_items: Vec<FoundItem> = Vec::new();
 
-    let homebrew_installed = Command::new("brew")
-        .args(["list", "aoe"])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false);
-
-    if homebrew_installed {
+    let running = std::env::current_exe()
+        .and_then(|exe| exe.canonicalize())
+        .ok();
+    let homebrew_prefixes = crate::update::install::homebrew_aoe_prefixes(running.as_deref());
+    for prefix in &homebrew_prefixes {
         found_items.push(FoundItem {
             item_type: "homebrew".to_string(),
-            path: PathBuf::new(),
+            path: prefix.clone(),
         });
-        println!("Found: Homebrew installation");
+        println!("Found: Homebrew installation in {}", prefix.display());
     }
+    // `brew uninstall` removes these (the Cellar binary and its `bin/aoe` link) itself.
+    let brew_owned = |loc: &PathBuf| {
+        let target = loc.canonicalize().unwrap_or_else(|_| loc.clone());
+        homebrew_prefixes
+            .iter()
+            .any(|prefix| target.starts_with(prefix.join("Cellar").join("aoe")))
+    };
 
     let mut binary_locations = vec![
         home_dir.join(".local/bin/aoe"),
@@ -81,16 +86,14 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
         home_dir.join("bin/agent-of-empires"),
     ];
 
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Ok(canonical) = current_exe.canonicalize() {
-            if !binary_locations.contains(&canonical) {
-                binary_locations.push(canonical);
-            }
+    if let Some(canonical) = running {
+        if !binary_locations.contains(&canonical) {
+            binary_locations.push(canonical);
         }
     }
 
     for loc in &binary_locations {
-        if loc.exists() && !found_items.iter().any(|i| i.path == *loc) {
+        if loc.exists() && !brew_owned(loc) && !found_items.iter().any(|i| i.path == *loc) {
             found_items.push(FoundItem {
                 item_type: "binary".to_string(),
                 path: loc.clone(),
@@ -153,7 +156,7 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     for item in &found_items {
         match item.item_type.as_str() {
-            "homebrew" => println!("  • Homebrew package: aoe"),
+            "homebrew" => println!("  • Homebrew package: aoe ({})", item.path.display()),
             "binary" => println!("  • Binary: {}", item.path.display()),
             "data" => {
                 if args.keep_data {
@@ -200,12 +203,19 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
 
     crate::hooks::uninstall_all_hooks();
 
+    let mut failures: Vec<String> = Vec::new();
     for item in &found_items {
         match item.item_type.as_str() {
             "homebrew" => {
-                println!("Removing Homebrew package...");
-                let _ = Command::new("brew").args(["uninstall", "aoe"]).status();
-                println!("✓ Homebrew package removed");
+                println!("Removing Homebrew package from {}...", item.path.display());
+                let brew = crate::update::install::homebrew_brew(&item.path);
+                match crate::update::install::uninstall_via_brew(&brew) {
+                    Ok(()) => println!("✓ Homebrew package removed from {}", item.path.display()),
+                    Err(error) => {
+                        eprintln!("✗ Homebrew package not removed: {error:#}");
+                        failures.push(format!("{error:#}"));
+                    }
+                }
             }
             "binary" => {
                 println!("Removing binary at {}...", item.path.display());
@@ -249,6 +259,11 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
             }
             _ => {}
         }
+    }
+
+    if !failures.is_empty() {
+        println!();
+        anyhow::bail!("Uninstall incomplete: {}", failures.join("; "));
     }
 
     println!();

@@ -12,6 +12,7 @@ import { useNestedSidebarGroups } from "../useNestedSidebarGroups";
 import { useOrgGroups } from "../useOrgGroups";
 import { useRepoGroups } from "../useRepoGroups";
 import { useSessionGroups } from "../useSessionGroups";
+import { useStatusGroups } from "../useStatusGroups";
 import { useSidebarAxis, useSidebarSortMode } from "../useSidebarPrefs";
 
 interface Options {
@@ -56,13 +57,15 @@ export function useSidebarModel({
 
   const repo = useRepoGroups(workspaces, workspaceOrdering, sortMode, projects, pluginSort, pluginAttention);
   const session = useSessionGroups(workspaces, sortMode, pluginSort, pluginAttention);
+  const status = useStatusGroups(workspaces, sortMode, pluginSort, pluginAttention);
   const nested = useNestedSidebarGroups(repo.groups, sortMode, pluginSort, pluginAttention);
   const org = useOrgGroups(repo.groups);
 
-  const groups = useMemo(
-    () => (axis === "group" ? session.groups : repo.groups.map(repoGroupToSidebarGroup)),
-    [axis, session.groups, repo.groups],
-  );
+  const groups = useMemo(() => {
+    if (axis === "status") return status.groups;
+    if (axis === "group") return session.groups;
+    return repo.groups.map(repoGroupToSidebarGroup);
+  }, [axis, status.groups, session.groups, repo.groups]);
 
   const reorderWorkspaces = useCallback(
     (newOrder: string[]) => {
@@ -84,7 +87,12 @@ export function useSidebarModel({
     pluginSortRef,
     setPluginSortRef,
     groups,
-    toggleGroup: axis === "group" ? session.toggleGroupCollapsed : repo.toggleRepoCollapsed,
+    toggleGroup:
+      axis === "status"
+        ? status.toggleGroupCollapsed
+        : axis === "group"
+          ? session.toggleGroupCollapsed
+          : repo.toggleRepoCollapsed,
     nestedGroups: nested.groups,
     toggleSubgroupCollapsed: nested.toggleSubgroupCollapsed,
     orgGroups: org.groups,

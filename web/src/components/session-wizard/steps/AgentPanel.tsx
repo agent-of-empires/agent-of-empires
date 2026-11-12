@@ -1,5 +1,5 @@
 import type { AgentInfo } from "../../../lib/types";
-import { isAcpEligible } from "../../../lib/acpCapableTools";
+import { structuredAvailable } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import { EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 import { AgentPickerEssentials } from "./AgentPickerEssentials";
@@ -17,7 +17,7 @@ interface Props {
 /** Agent choice, instructions and launch-command knobs behind the wizard's Agent row. */
 export function AgentPanel({ data, onChange, agents, commandMaps = EMPTY_COMMAND_MAPS }: Props) {
   const selectedAgent = agents.find((a) => a.name === data.tool);
-  const willUseStructuredView = isAcpEligible(data.tool, selectedAgent) && data.useStructuredView;
+  const willUseStructuredView = structuredAvailable(data.tool, selectedAgent, data) && data.useStructuredView;
   const resolvedCommand = resolveLaunchCommand({
     tool: data.tool,
     useStructuredView: willUseStructuredView,

@@ -219,7 +219,7 @@ mod tests {
             (6, Known(Some(true)))
         );
         drop(store);
-        let cold = EventStore::open(&tmp.path().join("acp.db"), 0).unwrap();
+        let cold = EventStore::open(&tmp.path().join("acp.db"), 0, Default::default()).unwrap();
         assert_eq!(
             cold.rate_limit_park_snapshot("s").unwrap(),
             (6, Known(Some(true)))
@@ -324,6 +324,7 @@ mod tests {
             (user_prompt("plain"), "plain", vec![]),
             (
                 Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     prompt_id: None,
                     text: "image".into(),
                     attachments: vec![attachment.clone()],
@@ -478,7 +479,7 @@ mod tests {
                 };
                 assert_eq!(store.rate_limit_redelivery_streak("s").unwrap(), expected);
                 drop(store);
-                let cold = EventStore::open(&tmp.path().join("acp.db"), cap).unwrap();
+                let cold = EventStore::open(&tmp.path().join("acp.db"), cap, Default::default()).unwrap();
                 assert_eq!(cold.rate_limit_redelivery_streak("s").unwrap(), expected);
                 // An explicit input neither seeds a lost budget nor spends a historical resume.
                 let input = user_prompt("new explicit input");

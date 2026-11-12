@@ -268,6 +268,13 @@ impl Session {
                     .prompt_sent_since_attach
                     .store(true, Ordering::Relaxed);
                 shared.adopted_turn_active.store(false, Ordering::Relaxed);
+                *shared.last_prompt.lock().expect("last prompt mutex poisoned") = (
+                    blocks.iter().filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    }).collect::<Vec<_>>().join("\n").trim().to_owned(),
+                    0,
+                );
                 let terminal_epoch = shared.terminal_claim.begin_turn();
                 shared.prompt_in_flight.store(true, Ordering::Release);
                 if !native {
@@ -768,6 +775,17 @@ impl Session {
         let native = self.control.is_some();
 
         match command {
+            ClientCmd::CancelChild {
+                session_id,
+                respond_to,
+            } => {
+                let sent = if require_operation(&scope, correlation, native).is_ok() {
+                    self.cancel_child(session_id, scope).await
+                } else {
+                    false
+                };
+                let _ = respond_to.send(sent);
+            }
             ClientCmd::Cancel => {
                 if let Err(error) = require_operation(&scope, correlation, native) {
                     debug!(target: "acp.protocol", %error, "cancel not issued");
@@ -815,8 +833,8 @@ impl Session {
                 turn.flags.shutdown = true;
                 return Ok(Flow::Break);
             }
-            ClientCmd::SetConfigOption { config_id, value } => {
-                self.dispatch_config_option(config_id, value, scope).await;
+            ClientCmd::SetConfigOption { config_id, value, remember } => {
+                self.dispatch_config_option(config_id, value, remember, scope).await;
             }
             ClientCmd::SetMode(mode_id) => self.dispatch_mode(mode_id, true, scope),
             ClientCmd::DeleteSession {
@@ -966,7 +984,8 @@ impl Session {
             return Flow::Continue;
         }
 
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
+        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+            && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
             // The turn finished but the PromptResponse never came: end cleanly
@@ -1141,6 +1160,7 @@ impl Session {
                                 shared.between_prompt.deactivate();
                             }
                             shared.reset_message_dedup();
+                            shared.last_prompt.lock().expect("last prompt mutex poisoned").1 = now_ms();
                         });
                 });
             }
@@ -1160,7 +1180,6 @@ impl Session {
                 return false;
             }
         }
-
         info!(
             target: "acp.protocol",
             session = %shared.session_label,

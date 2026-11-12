@@ -36,6 +36,23 @@ describe("WorktreePanel", () => {
     expect(onChange).toHaveBeenCalledWith("baseBranch", "release");
   });
 
+  it("locks the workspace toggle off when attaching and on with extra repos", () => {
+    const row = () => screen.getByRole("switch", { name: "Workspace directory" });
+    const { onChange } = renderPanel();
+    fireEvent.click(row());
+    expect(onChange).toHaveBeenCalledWith("useWorkspace", true);
+    cleanup();
+    for (const [over, checked] of [
+      [{ attachExisting: true, useWorkspace: true }, "false"],
+      [{ extraRepoPaths: ["/repo/beta"] }, "true"],
+    ] as const) {
+      renderPanel(over);
+      expect(row().getAttribute("aria-checked")).toBe(checked);
+      expect((row() as HTMLButtonElement).disabled).toBe(true);
+      cleanup();
+    }
+  });
+
   it("hides the base branch picker when attaching to an existing branch", () => {
     renderPanel({ attachExisting: true });
     expect(screen.queryByLabelText("Base branch")).toBeNull();

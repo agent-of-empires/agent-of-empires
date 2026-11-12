@@ -58,6 +58,10 @@ Stopping mid-tool settles that card into a muted **stopped** state: the timer fr
 
 If the agent finished but the spinner keeps rattling, a **Force end turn** button appears beneath it; clicking it clears the spinner and cancels the agent. It only appears for a silent model with no tool running, and the view auto-recovers on its own if you do nothing. It stays hidden while a tool is in flight, while a question or approval card awaits you, and during a `/compact` (where the spinner reads "Compaction in progress" instead), because compaction runs for a minute or more with no output and force-ending it would discard the summarization.
 
+### A `/compact` ran while the session was idle
+
+`claude-agent-acp` 0.101.0+ compacts a session on its own 54 minutes after the last request, when that request used the 1h prompt cache, the context holds at least 200k tokens, and nothing is running. The transcript shows it as a normal compaction that ends without a prompt from you. To turn it off, set `idleCompaction: false` in Claude settings (`autoCompactEnabled: false` also stops it).
+
 ### "Restarting worker" after a turn looked done
 
 Some adapters finish a turn, stream the final message and end-of-turn usage, but never send the protocol's turn-complete acknowledgement. When the usage arrived and no background or scheduled task was running, the daemon ends the turn cleanly. A genuine stall still restarts the worker and shows the banner; the transcript is preserved either way.

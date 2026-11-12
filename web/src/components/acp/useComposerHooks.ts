@@ -161,7 +161,7 @@ export function useTriggerAdapters(sessionId: string, availableCommands: AcpStat
       id: c.name,
       type: "command",
       label: `/${c.name}`,
-      description: c.description,
+      description: [c.input_hint, c.description].filter(Boolean).join(" · "),
       acceptsInput: c.accepts_input,
     }));
     for (const alias of clearAliases) {

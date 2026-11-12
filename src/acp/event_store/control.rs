@@ -40,6 +40,10 @@ enum ControlPayload<'a> {
         #[serde(rename = "text")]
         _text: IgnoredAny,
     },
+    AgentThoughtChunk {
+        #[serde(rename = "text")]
+        _text: IgnoredAny,
+    },
     ToolCallStarted {
         #[serde(rename = "tool_call")]
         _tool_call: IgnoredAny,
@@ -82,6 +86,7 @@ impl ControlPayload<'_> {
             Self::UserPromptSent { .. } => "UserPromptSent",
             Self::UserDiffCommentsPrompt { .. } => "UserDiffCommentsPrompt",
             Self::AgentMessageChunk { .. } => "AgentMessageChunk",
+            Self::AgentThoughtChunk { .. } => "AgentThoughtChunk",
             Self::ToolCallStarted { .. } => "ToolCallStarted",
             Self::AgentSwitched { .. } => "AgentSwitched",
             Self::SessionCleared => "SessionCleared",
@@ -125,7 +130,7 @@ impl ControlPayload<'_> {
             Self::RateLimit { .. } => ControlKind::Quota,
             Self::UserPromptSent { .. } => ControlKind::Prompt,
             Self::UserDiffCommentsPrompt { .. } => ControlKind::DiffPrompt,
-            Self::AgentMessageChunk { .. } | Self::ToolCallStarted { .. } => ControlKind::AgentWork,
+            Self::AgentMessageChunk { .. } | Self::AgentThoughtChunk { .. } | Self::ToolCallStarted { .. } => ControlKind::AgentWork,
             Self::AgentSwitched { .. } => ControlKind::Switched,
             Self::SessionCleared => ControlKind::Cleared,
             Self::SessionContextReset { .. } => ControlKind::ContextReset,
@@ -174,7 +179,7 @@ fn scan_controls(
          FROM acp_events WHERE session_id = ?1 AND seq >= ?2
            AND discriminant IN (
                'ThinkingStarted', 'PromptRuntimeError', 'Stopped', 'RateLimit',
-               'UserPromptSent', 'UserDiffCommentsPrompt', 'AgentMessageChunk', 'ToolCallStarted',
+               'UserPromptSent', 'UserDiffCommentsPrompt', 'AgentMessageChunk', 'AgentThoughtChunk', 'ToolCallStarted',
                'AgentSwitched', 'SessionCleared', 'SessionContextReset',
                'AcpConnectionUnavailable', 'AgentStartupError', 'RateLimitAutoResumed',
                'AvailableCommandsUpdated', 'ModesAvailable', 'CurrentModeChanged',
@@ -268,6 +273,8 @@ pub(super) struct ControlProjection {
     pub interrupted_prompt: ControlKnowledge<Option<u64>>,
     pub interrupted_agent: ControlKnowledge<bool>,
     pub main_open: ControlKnowledge<bool>,
+    pub agent_open: ControlKnowledge<bool>,
+    pub stopped_through: ControlKnowledge<u64>,
     pub unsuccessful_main: ControlKnowledge<bool>,
     pub budget: ControlKnowledge<Budget>,
     latest_prompt: ControlKnowledge<Option<u64>>,
@@ -284,6 +291,8 @@ impl ControlProjection {
             interrupted_prompt: if empty { Known(None) } else { Indeterminate },
             interrupted_agent: if empty { Known(false) } else { Indeterminate },
             main_open: if empty { Known(false) } else { Indeterminate },
+            agent_open: if empty { Known(false) } else { Indeterminate },
+            stopped_through: if empty { Known(0) } else { Indeterminate },
             unsuccessful_main: if empty { Known(false) } else { Indeterminate },
             budget: Indeterminate,
             latest_prompt: if empty { Known(None) } else { Indeterminate },
@@ -336,6 +345,8 @@ impl ControlProjection {
                 ControlKind::Diagnostic | ControlKind::Stopped(_) => {
                     self.park = Indeterminate;
                     self.main_open = Indeterminate;
+                    self.agent_open = Indeterminate;
+                    self.stopped_through = Indeterminate;
                     self.unsuccessful_main = Indeterminate;
                     self.interrupted_prompt = Indeterminate;
                     self.interrupted_agent = Indeterminate;
@@ -347,6 +358,7 @@ impl ControlProjection {
                     self.unknown_budget();
                     if row.startup_channel_loss {
                         self.main_open = Indeterminate;
+                        self.agent_open = Indeterminate;
                     }
                 }
                 _ => {}
@@ -369,6 +381,7 @@ impl ControlProjection {
                 }
             }
             ControlKind::Admission => {
+                self.agent_open = Known(true);
                 if metadata.operation.is_none() {
                     return Ok(());
                 }
@@ -379,6 +392,7 @@ impl ControlProjection {
                 self.agent_work = false;
             }
             ControlKind::AgentWork => {
+                self.agent_open = Known(true);
                 if row.owner_before.is_some()
                     && metadata.operation.map(|operation| operation.correlation) == row.owner_before
                 {
@@ -446,6 +460,8 @@ impl ControlProjection {
                     self.interrupted_agent = Known(false);
                 }
                 self.main_open = Known(false);
+                self.agent_open = Known(false);
+                self.stopped_through = Known(row.seq);
                 self.unsuccessful_main =
                     Known(matches!(reason, "prompt_failed" | "rate_limited") || cap);
                 if reason != "rate_limited" && row.effect != ControlEffect::Companion {
@@ -460,6 +476,8 @@ impl ControlProjection {
                 self.interrupted_prompt = Known(None);
                 self.interrupted_agent = Known(false);
                 self.main_open = Known(false);
+                self.agent_open = Known(false);
+                self.stopped_through = Known(row.seq);
                 self.unsuccessful_main = Known(false);
                 if matches!(row.kind, ControlKind::Switched) {
                     self.advance_budget(BudgetStep::Reset)?;
@@ -468,11 +486,13 @@ impl ControlProjection {
             ControlKind::Unavailable { channel_loss: true } => {
                 self.advance_budget(BudgetStep::Disarm)?;
                 self.main_open = Known(false);
+                self.agent_open = Indeterminate;
             }
             ControlKind::StartupError => {
                 self.advance_budget(BudgetStep::Disarm)?;
                 if row.startup_channel_loss {
                     self.main_open = Known(false);
+                    self.agent_open = Indeterminate;
                 }
             }
             ControlKind::Resumed { manual } => match self.park {
@@ -659,10 +679,21 @@ impl super::EventStore {
         read: impl FnOnce(&Connection, &ControlCursor) -> Result<T>,
     ) -> Result<T> {
         self.control_cache.with_control(session_id, |cached| {
-            let mut conn = self.conn();
-            let tx = conn.transaction()?;
+            let conn = self.reader();
+            let tx = conn.unchecked_transaction()?;
             let cursor = match *cached {
-                Some(cursor) => cursor,
+                Some(cursor) => {
+                    let latest: Option<i64> = tx.query_row(
+                        "SELECT MAX(seq) FROM acp_events WHERE session_id = ?1",
+                        [session_id], |row| row.get(0),
+                    )?;
+                    let latest = latest.map(u64::try_from).transpose()?.unwrap_or(0);
+                    if latest == cursor.seq {
+                        cursor
+                    } else {
+                        ControlCursor::load(&tx, &self.schema, session_id)?
+                    }
+                }
                 None => ControlCursor::load(&tx, &self.schema, session_id)?,
             };
             let result = read(&tx, &cursor)?;
@@ -882,7 +913,7 @@ mod tests {
                 store.record("s", seq + 1, &stopped, &metadata).unwrap();
                 assert_state(&store);
                 drop(store);
-                let cold = EventStore::open(&tmp.path().join("acp.db"), 0).unwrap();
+                let cold = EventStore::open(&tmp.path().join("acp.db"), 0, Default::default()).unwrap();
                 assert_state(&cold);
             }
         }
@@ -933,7 +964,7 @@ mod tests {
                 assert!(matches!(store.rate_limit_park("s").unwrap(), Indeterminate));
             }
             drop(store);
-            let cold = EventStore::open(&tmp.path().join("acp.db"), 0).unwrap();
+            let cold = EventStore::open(&tmp.path().join("acp.db"), 0, Default::default()).unwrap();
             match (known_absence, cold.rate_limit_park("s").unwrap()) {
                 (true, Known(None)) | (false, Indeterminate) => {}
                 (_, actual) => panic!("removed={removed:?}, new_input={new_input}: {actual:?}"),

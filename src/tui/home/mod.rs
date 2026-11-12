@@ -260,6 +260,7 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     pub(super) project_group_collapsed: HashMap<String, bool>,
     pub(super) org_group_collapsed: HashMap<String, bool>,
+    pub(super) status_group_collapsed: HashMap<String, bool>,
     pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<(String, String)>>>,
     pub(super) registered_projects: Vec<crate::session::Project>,
 
@@ -267,6 +268,8 @@ pub struct HomeView {
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
+    /// Prompt membership, cleared on confirmation or cancellation.
+    pub(super) pending_archive_group_ids: Option<Vec<String>>,
     pub(super) unified_delete_dialog: Option<SessionDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
@@ -399,6 +402,8 @@ pub struct HomeView {
     pub(super) sidebar_source: super::session_feed::SidebarSource,
     /// Why the Daemon couldn't be reached, shown on the offline takeover.
     runtime_failure_reason: Option<String>,
+    /// What the offline takeover says and offers while disconnected.
+    pub(super) offline_attention: super::dialogs::DaemonAttention,
     pub(super) session_feed: super::session_feed::SessionFeed,
     pending_namespace_intent: Option<NamespaceIntent>,
     namespace_unknown_message: Option<String>,

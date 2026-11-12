@@ -129,6 +129,7 @@ pub(crate) fn background_resource_from_parts<'a>(
         "Bash" => Some(BackgroundResourceCue::Bash {
             task_id: field("backgroundTaskId")?,
             tool_call_id,
+            started_at: Some(chrono::Utc::now()),
         }),
         "Workflow" if nonempty("status") == Some("async_launched") => {
             Some(BackgroundResourceCue::Workflow {
@@ -218,6 +219,7 @@ impl BackgroundResourceCue<'_> {
             tool_call_id,
             description,
             workflow,
+            started_at: Some(chrono::Utc::now()),
         })
     }
 }
@@ -360,6 +362,7 @@ mod tests {
                 tool_call_id,
                 description,
                 workflow,
+                ..
             }) => {
                 assert_eq!(task_id, "wfgxmundi");
                 assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));

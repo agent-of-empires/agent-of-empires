@@ -6,6 +6,7 @@ import {
   resolveAgentLifecycle,
   resolveAgentProfile,
 } from "./agentProfiles";
+import { HARNESS_TOOLS } from "../components/acp/NamedToolCards";
 
 describe("resolveAgentProfile", () => {
   it.each(["claude", "aoe-agent"])("resolves %s", (key) => {
@@ -38,6 +39,10 @@ describe("resolveAgentProfile", () => {
     });
     expect(p.parentMetaNamespaces).toEqual([]);
     expect(p.specialTitles).toEqual({ skillNames: [], scheduleNames: [], harnessNames: [], workflowNames: [] });
+  });
+
+  it("claude harnessNames match the harness cards NamedToolCards renders", () => {
+    expect([...resolveAgentProfile("claude").specialTitles.harnessNames].sort()).toEqual([...HARNESS_TOOLS].sort());
   });
 
   it("maps agent tool names to canonical cards", () => {

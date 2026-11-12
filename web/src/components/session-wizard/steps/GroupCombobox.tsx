@@ -177,7 +177,7 @@ export function GroupCombobox({
             ) : (
               <>
                 A named heading in the sidebar for sessions you want together, across Projects. Use / to nest, e.g.
-                client/api. The sidebar shows Groups when its Layers button is set to group by user group.
+                client/api. Select Group in the sidebar's grouping menu to show them.
               </>
             )}
           </p>

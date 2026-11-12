@@ -66,6 +66,8 @@ export async function mockTerminalApis(
     sessionFields?: Record<string, unknown>;
     pendingPaste?: boolean;
     onLiveMessage?: (url: string, message: Buffer) => void;
+    /** Another window holds control until an explicit `claim`; `owner` is #5543's kind, absent when unknown. */
+    viewOnly?: { owner?: "tui" | "web"; transportReason?: "pipe_owned" };
   } = {},
 ): Promise<MockHandle> {
   await page.addInitScript(() => {
@@ -177,6 +179,13 @@ export async function mockTerminalApis(
     const send = (message: LiveServerMessage) => ws.send(JSON.stringify(message));
     const socket = { send, frames: 0 };
     liveSockets.push(socket);
+    let owned = !opts.viewOnly;
+    // `owner` arrives with #5543, ahead of the generated wire type.
+    const sendOwner = () =>
+      ws.send(
+        JSON.stringify({ type: "size_owner", is_owner: owned, ...(owned ? {} : { owner: opts.viewOnly?.owner }) }),
+      );
+    if (opts.viewOnly?.transportReason) send({ type: "transport", grid: false, reason: opts.viewOnly.transportReason });
     let rows = 24;
     let window = 24;
     const history = opts.liveHistory ?? 120;
@@ -205,11 +214,17 @@ export async function mockTerminalApis(
       try {
         const control = JSON.parse(String(msg)) as LiveClientMessage;
         if (control.type === "claim_if_vacant") {
-          send({ type: "size_owner", is_owner: true });
+          sendOwner();
+        } else if (control.type === "claim") {
+          owned = true;
+          sendOwner();
         } else if (control.type === "resize" && control.rows) {
-          rows = control.rows;
-          window = Math.max(window, rows);
-          send({ type: "size_owner", is_owner: true });
+          // A view-only socket draws the owner's grid; only the owner's resize takes.
+          if (owned) {
+            rows = control.rows;
+            window = Math.max(window, rows);
+          }
+          sendOwner();
           reply();
         } else if (control.type === "window" && control.lines) {
           const shrinking = control.lines < window;

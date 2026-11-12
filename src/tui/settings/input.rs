@@ -919,7 +919,7 @@ fn validate_custom_agent_entry(text: &str) -> Result<(), String> {
     }
     if crate::agents::get_agent(key).is_some() {
         return Err(format!(
-            "'{}' is a built-in agent. Use Agent Command Override to override built-in agents.",
+            "'{}' is a built-in agent. Use Replace start command to change how a built-in agent starts.",
             key
         ));
     }
@@ -1011,7 +1011,7 @@ mod tests {
             (
                 custom,
                 "claude=my-wrapper",
-                &["built-in agent", "Agent Command Override"],
+                &["built-in agent", "Replace start command"],
             ),
             (detect_as, "lenovo-claude=claude", &[]),
             (detect_as, "just-a-name", &["name=builtin"]),
@@ -1071,17 +1071,17 @@ mod tests {
             }
             type_text(&mut view, "live");
             assert!(view.search_hits.len() < unfiltered, "a query narrows hits");
-            assert!(view.search_hits.iter().any(|h| h
-                .field_label
-                .to_lowercase()
-                .contains("live-send exit chord")));
+            assert!(view
+                .search_hits
+                .iter()
+                .any(|h| h.field_label.to_lowercase().contains("exit live-send with")));
             press(&mut view, KeyCode::Esc);
             assert!(view.search_input.is_none());
             assert_eq!(view.selected_category, cat_before);
             assert_eq!(view.selected_field, field_before);
         }
 
-        /// Default Tool lives on the Agents tab, so the jump also has to
+        /// Default Agent lives on the Agents tab, so the jump also has to
         /// cross categories cleanly.
         #[test]
         #[serial]
@@ -1099,13 +1099,13 @@ mod tests {
             );
             press(&mut view, KeyCode::Esc);
             press(&mut view, KeyCode::Char('/'));
-            type_text(&mut view, "default tool");
-            assert!(!view.search_hits.is_empty(), "no hits for 'default tool'");
+            type_text(&mut view, "default agent");
+            assert!(!view.search_hits.is_empty(), "no hits for 'default agent'");
             let target_idx = view
                 .search_hits
                 .iter()
-                .position(|h| h.field_label == "Default Tool")
-                .expect("Default Tool should appear in hits");
+                .position(|h| h.field_label == "Default Agent")
+                .expect("Default Agent should appear in hits");
             view.search_selected = target_idx;
             press(&mut view, KeyCode::Enter);
 
@@ -1116,12 +1116,12 @@ mod tests {
             assert_eq!(
                 view.current_category(),
                 crate::tui::settings::SettingsCategory::Agents,
-                "must jump to the Agents tab (where Default Tool lives)"
+                "must jump to the Agents tab (where Default Agent lives)"
             );
             assert_eq!(
                 view.fields[view.selected_field].ident(),
                 "session.default_tool",
-                "must position the field cursor on Default Tool"
+                "must position the field cursor on Default Agent"
             );
         }
 

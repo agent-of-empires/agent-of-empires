@@ -25,9 +25,9 @@ pub struct SessionSandbox {
     /// Profile the session was created under. Required for
     /// `resolved_sandbox_config` to pick up per-profile env overrides.
     pub source_profile: Option<String>,
-    /// Host-side project path. `resolved_sandbox_config` walks up from
-    /// here to find any repo-local config overrides.
-    pub project_path: PathBuf,
+    /// Where `resolved_sandbox_config` reads repo-local overrides; see
+    /// `SpawnRequest::config_path`.
+    pub config_path: PathBuf,
 }
 
 impl SessionSandbox {
@@ -37,6 +37,7 @@ impl SessionSandbox {
     pub fn from_info(
         sandbox: &SandboxInfo,
         project_path: &Path,
+        config_path: &Path,
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
         let project_path_str = project_path.to_string_lossy().to_string();
@@ -68,7 +69,7 @@ impl SessionSandbox {
                 container_workdir: PathBuf::from(workdir),
                 sandbox_info: sandbox.clone(),
                 source_profile,
-                project_path: project_path.to_path_buf(),
+                config_path: config_path.to_path_buf(),
             },
             SandboxPathMap::new(mounts),
         ))
@@ -92,7 +93,7 @@ impl SessionSandbox {
             }
         };
         let sandbox_config =
-            crate::session::environment::resolved_sandbox_config(profile, &self.project_path);
+            crate::session::environment::resolved_sandbox_config(profile, &self.config_path);
         crate::session::environment::collect_environment(&sandbox_config, &self.sandbox_info)
     }
 }
@@ -104,6 +105,8 @@ pub(super) struct SandboxArgv {
     pub(super) docker_args: Vec<String>,
     pub(super) exec_prefix_len: usize,
     pub(super) inherit_env: Vec<(String, String)>,
+    /// Attach to whatever launches `docker_args`, which name it as an env-file.
+    pub(super) target_env: Option<crate::containers::container_interface::TargetEnvFile>,
 }
 
 /// Docker proxies the agent's stdio across the container boundary. Mirrors the
@@ -115,15 +118,14 @@ pub(super) fn build_sandbox_docker_argv(
     sandbox: &SandboxInfo,
     container_workdir: &str,
 ) -> Result<SandboxArgv, AcpError> {
-    use crate::containers::container_interface::docker_env_args;
+    use crate::containers::container_interface::{docker_env_args, TargetEnvFile};
 
     let runtime = crate::containers::get_container_runtime();
     let docker_binary = runtime.base.binary.to_string();
 
-    let project_path = config.cwd.as_path();
     let profile_for_env = config.source_profile.as_deref().unwrap_or("");
     let sandbox_config =
-        crate::session::environment::resolved_sandbox_config(profile_for_env, project_path);
+        crate::session::environment::resolved_sandbox_config(profile_for_env, &config.config_path);
     let mut env_entries =
         crate::session::environment::collect_environment(&sandbox_config, sandbox);
     // Bind-mounted at the fixed container path by build_container_config;
@@ -142,9 +144,11 @@ pub(super) fn build_sandbox_docker_argv(
     // First claim wins, so the sandbox config below outranks both auth sources.
     let mut seen_keys: std::collections::HashSet<String> =
         env_entries.iter().map(|e| e.key().to_string()).collect();
-    let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
-    docker_args.extend(env_argv);
-    let mut inherit_env: Vec<(String, String)> = inherit_pairs;
+    let environment = docker_env_args(&env_entries);
+    docker_args.extend(environment.argv);
+    let target_env = TargetEnvFile::create(&environment.target_env)
+        .map_err(|error| AcpError::Spawn(error.to_string()))?;
+    let mut inherit_env: Vec<(String, String)> = environment.inherit;
 
     // The request's auth payload (`provider_env`) is claimed ahead of the
     // per-adapter allowlist (#3238), mirroring the non-sandboxed paths where
@@ -171,8 +175,7 @@ pub(super) fn build_sandbox_docker_argv(
             }
         } else if seen_keys.insert(key.clone()) {
             // Only a key the sandbox env did not already claim is really
-            // dropped: one `docker_env_args` inlined keeps its value in argv,
-            // so logging here would cry over a variable that crossed.
+            // dropped: `docker_env_args` already forwarded a claimed one.
             tracing::warn!(
                 target: "acp",
                 key = %key,
@@ -200,6 +203,7 @@ pub(super) fn build_sandbox_docker_argv(
         docker_args,
         exec_prefix_len,
         inherit_env,
+        target_env,
     })
 }
 
@@ -266,7 +270,8 @@ mod tests {
             Some("/workspace/repo-worktrees/feature"),
         );
 
-        let (resources, _map) = SessionSandbox::from_info(&info, &worktree, None).unwrap();
+        let (resources, _map) =
+            SessionSandbox::from_info(&info, &worktree, &worktree, None).unwrap();
         assert_eq!(
             resources.container_workdir,
             PathBuf::from("/workspace/repo-worktrees/feature"),
@@ -294,8 +299,7 @@ mod tests {
     }
 
     /// The agent command is wrapped as `docker exec -i -w <workdir> ... <container>
-    /// <argv>`, with literal env entries inlined as `-e KEY=VALUE` and never
-    /// duplicated into `inherit_env` (which is for parent-process values).
+    /// <argv>`, with a literal env entry delivered only through the env-file.
     #[test]
     fn build_sandbox_docker_argv_wraps_agent_in_docker_exec() {
         let tmp = tempfile::tempdir().unwrap();
@@ -321,8 +325,7 @@ mod tests {
             argv.docker_args[container + 1..],
             ["claude-agent-acp", "--stdio"]
         );
-        assert!(argv.docker_args.iter().any(|a| a == "MY_LITERAL=hello"));
-        assert!(!argv.inherit_env.iter().any(|(k, _)| k == "MY_LITERAL"));
+        assert_delivered_by_env_file(&argv, "MY_LITERAL", "hello");
     }
 
     /// `-e KEY` names the credential, the value rides `inherit_env`, and the
@@ -349,6 +352,47 @@ mod tests {
                 .map(|(_, v)| v.as_str()),
             Some(value),
         );
+    }
+
+    /// The value is read back through the descriptor a real launch inherits.
+    fn assert_delivered_by_env_file(argv: &SandboxArgv, key: &str, value: &str) {
+        let env_file = argv
+            .docker_args
+            .iter()
+            .position(|a| a == "--env-file")
+            .expect("env-file named in argv");
+        assert_eq!(argv.docker_args[env_file + 1], "/dev/fd/9");
+        assert!(env_file + 1 < argv.exec_prefix_len);
+        assert!(!argv.docker_args.iter().any(|a| a.contains(key)), "{key}");
+        assert!(!argv.inherit_env.iter().any(|(k, _)| k == key), "{key}");
+
+        let mut reader = std::process::Command::new("cat");
+        reader.arg("/dev/fd/9");
+        argv.target_env
+            .as_ref()
+            .expect("env-file attached")
+            .attach(&mut reader)
+            .unwrap();
+        let output = String::from_utf8(reader.output().unwrap().stdout).unwrap();
+        assert!(
+            output.lines().any(|l| l == format!("{key}={value}")),
+            "{output}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_sandbox_docker_argv_delivers_target_proxy_through_the_env_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = "http://proxy.container.internal:3128";
+        let mut info = sandbox("aoe-sandbox-abc12345", None);
+        info.extra_env = Some(vec![format!("HTTP_PROXY={target}")]);
+
+        let argv =
+            build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
+                .unwrap();
+
+        assert_delivered_by_env_file(&argv, "HTTP_PROXY", target);
     }
 
     fn assert_absent(argv: &SandboxArgv, key: &str) {
@@ -459,13 +503,7 @@ mod tests {
         let argv =
             build_sandbox_docker_argv(&sandbox_config(tmp.path(), &info), &info, "/workspace/proj")
                 .unwrap();
-        let named: Vec<&String> = argv
-            .docker_args
-            .iter()
-            .filter(|a| a.starts_with(KEY))
-            .collect();
-        assert_eq!(named, [&format!("{KEY}=omitted")]);
-        assert!(!argv.inherit_env.iter().any(|(k, _)| k == KEY));
+        assert_delivered_by_env_file(&argv, KEY, "omitted");
     }
 
     #[test]
@@ -486,16 +524,15 @@ mod tests {
         assert_named_without_value(&argv, "ANTHROPIC_API_KEY", "sk-request");
     }
 
-    /// A host-only key the sandbox env already inlined keeps its value in argv;
-    /// only the adapter allowlist declined to re-send it. Logging at the filter
-    /// cried over a variable that did cross, hiding the genuinely dropped ones.
+    /// A host-only key the sandbox env already forwarded still crosses; only the
+    /// adapter allowlist declined to re-send it, so the filter must not log a drop.
     #[test]
     #[serial_test::serial]
-    fn host_only_key_inlined_by_sandbox_env_logs_nothing() {
+    fn host_only_key_forwarded_by_sandbox_env_logs_nothing() {
         let _env =
             crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/host/claude")]);
         let tmp = tempfile::tempdir().unwrap();
-        let mut info = sandbox("aoe-sandbox-inlined-host-only", None);
+        let mut info = sandbox("aoe-sandbox-forwarded-host-only", None);
         info.extra_env = Some(vec!["CLAUDE_CONFIG_DIR=/host/claude".into()]);
         let mut config = sandbox_config(tmp.path(), &info);
         config.spec.env_allowlist = Some(vec!["CLAUDE_CONFIG_DIR".into()]);
@@ -503,13 +540,7 @@ mod tests {
         let logs = crate::session::test_support::LogCapture::start();
         let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
 
-        assert!(
-            argv.docker_args
-                .iter()
-                .any(|a| a == "CLAUDE_CONFIG_DIR=/host/claude"),
-            "the inlined value must stay in argv, got {:?}",
-            argv.docker_args
-        );
+        assert_delivered_by_env_file(&argv, "CLAUDE_CONFIG_DIR", "/host/claude");
         assert!(
             !logs.contents().contains("dropping host-only path variable"),
             "a key that crossed must not be reported as dropped"

@@ -72,7 +72,9 @@ fn malformed_records(root: &crate::session::AnchoredDir) -> Result<Vec<(&'static
 #[error("Unsupported daemon launch schema: {0:?}")]
 struct UnsupportedLaunchSchema(Option<u64>);
 
-fn validate_record_schema(object: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+pub(super) fn validate_record_schema(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     let schema = object.get("schema").and_then(serde_json::Value::as_u64);
     let supported = u64::from(crate::cli::serve::SERVE_LAUNCH_SCHEMA);
     anyhow::ensure!(

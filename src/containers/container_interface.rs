@@ -73,8 +73,8 @@ pub struct NamedVolumeMount {
     pub container_path: String,
 }
 
-/// `Inherit` passes the value through the process environment (`-e KEY`) so secrets stay
-/// out of `ps`; `Literal` emits `-e KEY=VALUE`.
+/// `Inherit` holds a value read from the host and `Literal` one set by configuration; see
+/// [`docker_env_args`] for how each reaches the runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EnvEntry {
     Inherit { key: String, value: String },
@@ -95,29 +95,78 @@ impl EnvEntry {
     }
 }
 
-/// The caller must set the returned inherit pairs on the spawning `Command`. Dedupes by
-/// key, first wins.
-pub fn docker_env_args(entries: &[EnvEntry]) -> (Vec<String>, Vec<(String, String)>) {
+/// Read by the runtime CLI's own HTTP transport, so a container's value on the
+/// client's environment would redirect its connection to a TCP engine.
+const RUNTIME_PROXY_KEYS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY"];
+
+pub struct RuntimeEnvArgs {
+    pub argv: Vec<String>,
+    /// Set these on the spawning `Command`; `-e KEY` reads them from there.
+    pub inherit: Vec<(String, String)>,
+    /// Deliver these through `TargetEnvFile`, which argv names as an env-file.
+    pub target_env: Vec<(String, String)>,
+}
+
+/// Argv carries only names. Configured literals target the container, so they never
+/// touch the client's environment, where `HOME`, `LD_PRELOAD` or `SSL_CERT_FILE`
+/// would change the runtime CLI itself. Dedupes by key, first wins.
+pub fn docker_env_args(entries: &[EnvEntry]) -> RuntimeEnvArgs {
     let mut argv = Vec::with_capacity(entries.len() * 2);
     let mut inherit = Vec::new();
+    let mut target_env = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for entry in entries {
         let key = entry.key();
         if !seen.insert(key) {
             continue;
         }
-        argv.push("-e".to_string());
-        match entry {
-            EnvEntry::Inherit { key, value } => {
-                argv.push(key.clone());
-                inherit.push((key.clone(), value.clone()));
-            }
-            EnvEntry::Literal { key, value } => {
-                argv.push(format!("{}={}", key, value));
-            }
+        let is_proxy = RUNTIME_PROXY_KEYS
+            .iter()
+            .any(|proxy| key.eq_ignore_ascii_case(proxy));
+        if matches!(entry, EnvEntry::Inherit { .. }) && !is_proxy {
+            argv.push("-e".to_string());
+            argv.push(key.to_string());
+            inherit.push((key.to_string(), entry.value().to_string()));
+        } else {
+            target_env.push((key.to_string(), entry.value().to_string()));
         }
     }
-    (argv, inherit)
+    if !target_env.is_empty() {
+        argv.push("--env-file".to_string());
+        argv.push(crate::session::environment::CONTAINER_EXEC_ENV_PATH.to_string());
+    }
+    RuntimeEnvArgs {
+        argv,
+        inherit,
+        target_env,
+    }
+}
+
+/// An unlinked mode-0600 env-file, so nothing remains to clean up after the runtime
+/// reads it from the inherited descriptor.
+pub(crate) struct TargetEnvFile(std::fs::File);
+
+impl TargetEnvFile {
+    pub(crate) fn create(entries: &[(String, String)]) -> std::io::Result<Option<Self>> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let file = crate::session::environment::container_env_file(
+            entries
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(Some(Self(file.into_file())))
+    }
+
+    pub(crate) fn attach(&self, command: &mut std::process::Command) -> std::io::Result<()> {
+        crate::process::inherit_file_at_fd(
+            command,
+            self.0.try_clone()?,
+            crate::session::environment::CONTAINER_EXEC_ENV_FD.into(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,25 +319,36 @@ mod tests {
             key: key.to_string(),
             value: value.to_string(),
         };
-        // (entries, expected argv, expected inherited pairs, values that must not reach argv)
+        // (entries, expected argv, expected inherited pairs, expected env-file pairs,
+        // values that must not reach argv)
         type EnvCase = (
             Vec<EnvEntry>,
             &'static [&'static str],
             &'static [(&'static str, &'static str)],
+            &'static [(&'static str, &'static str)],
             &'static [&'static str],
         );
-        let cases: [EnvCase; 5] = [
+        let cases: [EnvCase; 6] = [
             (
                 vec![inherit("GH_TOKEN", "ghp_secret")],
                 &["-e", "GH_TOKEN"],
                 &[("GH_TOKEN", "ghp_secret")],
+                &[],
                 &["ghp_secret"],
             ),
             (
-                vec![literal("TERM", "xterm-256color")],
-                &["-e", "TERM=xterm-256color"],
+                vec![literal("API_KEY", "sk-literal")],
+                &["--env-file", "/dev/fd/9"],
                 &[],
+                &[("API_KEY", "sk-literal")],
+                &["API_KEY", "sk-literal"],
+            ),
+            (
+                vec![literal("HOME", "/root")],
+                &["--env-file", "/dev/fd/9"],
                 &[],
+                &[("HOME", "/root")],
+                &["/root"],
             ),
             (
                 vec![
@@ -296,11 +356,12 @@ mod tests {
                     literal("TERM", "xterm"),
                     inherit("TOKEN", "tok"),
                 ],
-                &["-e", "SECRET", "-e", "TERM=xterm", "-e", "TOKEN"],
+                &["-e", "SECRET", "-e", "TOKEN", "--env-file", "/dev/fd/9"],
                 &[("SECRET", "s3cr3t"), ("TOKEN", "tok")],
-                &["s3cr3t"],
+                &[("TERM", "xterm")],
+                &["s3cr3t", "xterm"],
             ),
-            (vec![], &[], &[], &[]),
+            (vec![], &[], &[], &[], &[]),
             (
                 vec![
                     inherit("GH_TOKEN", "ghp_first"),
@@ -309,17 +370,25 @@ mod tests {
                 ],
                 &["-e", "GH_TOKEN", "-e", "OTHER"],
                 &[("GH_TOKEN", "ghp_first"), ("OTHER", "kept")],
+                &[],
                 &["literal_should_be_skipped"],
             ),
         ];
-        for (entries, expected_argv, expected_inherit, secrets) in cases {
-            let (argv, inherited) = docker_env_args(&entries);
-            assert_eq!(argv, expected_argv);
-            let expected_inherit: Vec<(String, String)> = expected_inherit
+        let owned = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            assert_eq!(inherited, expected_inherit);
+                .collect()
+        };
+        for (entries, expected_argv, expected_inherit, expected_target, secrets) in cases {
+            let RuntimeEnvArgs {
+                argv,
+                inherit: inherited,
+                target_env,
+            } = docker_env_args(&entries);
+            assert_eq!(argv, expected_argv);
+            assert_eq!(inherited, owned(expected_inherit));
+            assert_eq!(target_env, owned(expected_target));
             for secret in secrets {
                 assert!(
                     !argv.iter().any(|a| a.contains(secret)),
@@ -327,6 +396,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn docker_env_args_moves_target_proxies_off_the_client() {
+        let target = "http://user:pass@proxy.container.internal:3128";
+        let entries = [
+            EnvEntry::Literal {
+                key: "HTTP_PROXY".to_string(),
+                value: target.to_string(),
+            },
+            EnvEntry::Inherit {
+                key: "https_proxy".to_string(),
+                value: target.to_string(),
+            },
+            EnvEntry::Literal {
+                key: "NO_PROXY".to_string(),
+                value: "container.internal".to_string(),
+            },
+            EnvEntry::Inherit {
+                key: "GH_TOKEN".to_string(),
+                value: "ghp_secret".to_string(),
+            },
+        ];
+
+        let env = docker_env_args(&entries);
+
+        assert_eq!(
+            env.argv,
+            ["-e", "GH_TOKEN", "--env-file", "/dev/fd/9"].map(str::to_string)
+        );
+        assert_eq!(
+            env.inherit,
+            [("GH_TOKEN".to_string(), "ghp_secret".to_string())]
+        );
+        assert_eq!(
+            env.target_env,
+            [
+                ("HTTP_PROXY".to_string(), target.to_string()),
+                ("https_proxy".to_string(), target.to_string()),
+                ("NO_PROXY".to_string(), "container.internal".to_string()),
+            ]
+        );
     }
 
     #[test]

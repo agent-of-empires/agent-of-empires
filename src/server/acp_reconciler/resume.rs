@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::time::timeout_at;
 
-use super::{is_resumable, AppState, ResumeOutcome};
+use super::{is_resumable, query_flushed, query_store, AppState, ResumeOutcome};
 use crate::acp::supervisor::{
     command_override_for_spawn, BroadcastSink, ResumeKind, ResumeReservation, SpawnRequest,
     Supervisor, SupervisorError,
@@ -30,6 +30,10 @@ pub(super) struct ResumeTarget {
     pub(super) source_profile: String,
     pub(super) in_flight_turn: bool,
     pub(super) historical_control_known: bool,
+    /// Agent-started work must not adopt the runner's cached user completion.
+    pub(super) agent_turn_open: bool,
+    /// Actual work or a recent background finish awaiting the agent's answer.
+    pub(super) holds_live_work: bool,
     yolo_mode: bool,
     /// The resolved launch command, honored like tmux does (#1766).
     command: String,
@@ -49,6 +53,8 @@ impl ResumeTarget {
             source_profile: inst.source_profile.clone(),
             in_flight_turn: false,
             historical_control_known: true,
+            agent_turn_open: false,
+            holds_live_work: false,
             yolo_mode: inst.yolo_mode,
             command: inst.command.clone(),
         }
@@ -140,9 +146,9 @@ fn adopt_decision(
     live: bool,
     build_current: bool,
     runner_current: bool,
-    in_flight_turn: bool,
+    holds_live_work: bool,
 ) -> AdoptDecision {
-    match (live, runner_current, build_current, in_flight_turn) {
+    match (live, runner_current, build_current, holds_live_work) {
         (false, ..) => AdoptDecision::FreshSpawn,
         (true, false, ..) => AdoptDecision::ReplaceIncompatibleRunner,
         (true, true, true, _) => AdoptDecision::Attach,
@@ -259,7 +265,7 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
             worker_registry::is_record_live(r),
             worker_registry::is_build_current(r),
             worker_registry::is_runner_current(r),
-            in_flight_turn,
+            target.holds_live_work,
         )
     });
     if !target.historical_control_known {
@@ -469,7 +475,12 @@ pub(super) async fn resume_one(state: Arc<AppState>, mut target: ResumeTarget) -
         }
     }
 
-    publish_orphaned_turn_stop(&state.acp_supervisor, &id, decision, in_flight_turn);
+    publish_orphaned_turn_stop(
+        &state.acp_supervisor,
+        &id,
+        decision,
+        in_flight_turn || target.agent_turn_open,
+    );
     requeue_interrupted_monitor(&state, &id).await;
     let req = match build_spawn_request(&state.session_service, &target).await {
         Ok(req) => req,
@@ -571,6 +582,7 @@ async fn build_spawn_request(
         fork_from,
         acp_mode_id,
         acp_effort,
+        acp_model_config,
         agent_model,
         agent_provider,
         claude_store_pin,
@@ -594,6 +606,7 @@ async fn build_spawn_request(
             inst.fork_pending.clone(),
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
+            inst.acp_model_config.clone(),
             inst.agent_model.clone(),
             inst.agent_provider.clone(),
             inst.selected_claude_store_pin(),
@@ -602,12 +615,13 @@ async fn build_spawn_request(
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
         )
     };
+    let config_path = instance.repo_config_path().to_path_buf();
     let agent = supervisor
         .pick_agent_for_tool(
             &target.tool,
             target.agent_override.as_deref(),
             &target.source_profile,
-            &cwd,
+            &config_path,
         )
         .await;
     let (native, exclusion) = crate::server::session_store::NativeSessionStore::open_for_launch(
@@ -657,6 +671,7 @@ async fn build_spawn_request(
         agent,
         tool: target.tool.clone(),
         cwd,
+        config_path,
         additional_dirs: vec![],
         provider_env: vec![],
         provider: agent_provider,
@@ -664,6 +679,7 @@ async fn build_spawn_request(
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,
+        model_config: acp_model_config,
         stored_acp_session_id: target.stored_acp_session_id.clone(),
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
@@ -695,7 +711,8 @@ async fn attach_retained_target(
                     && row.lifecycle_generation == target.lifecycle_generation
             })
             .ok_or_else(|| SupervisorError::SpawnCancelled(target.id.clone()))?;
-        row.sandbox_info.clone()
+        let config_path = row.repo_config_path().to_path_buf();
+        row.sandbox_info.clone().map(|info| (info, config_path))
     };
     // Attached workers resume their background tailers independently in
     // install_worker. Only an actual main turn owns a cached prompt completion.
@@ -917,6 +934,19 @@ pub(crate) async fn trigger_resume_background(
     {
         return Ok(ResumeTrigger::NotFound);
     }
+    // Unknown turn state defers the wake: replacing the worker without closing an
+    // orphaned turn would leave the session Running.
+    let Some(Ok(crate::acp::event_store::ControlKnowledge::Known(orphaned_turn))) = query_flushed(
+        &service.acp_supervisor,
+        &service.acp_event_store,
+        id,
+        "open turn",
+        |s, id| s.has_open_turn(id),
+    )
+    .await
+    else {
+        return Err(SupervisorError::EventStoreUnavailable(id.to_string()));
+    };
     let has_stored_id = service
         .instances
         .read()
@@ -988,18 +1018,7 @@ pub(crate) async fn trigger_resume_background(
                 return;
             }
             // Close a turn a dead worker left open before a new prompt lands (#3686).
-            let in_flight = match super::query_control(
-                &service.acp_event_store,
-                &target.id,
-                "in-flight turn",
-                |s, id| s.has_in_flight_turn(id),
-            )
-            .await
-            {
-                Ok(crate::acp::event_store::ControlKnowledge::Known(value)) => value,
-                Ok(crate::acp::event_store::ControlKnowledge::Indeterminate) | Err(_) => return,
-            };
-            if in_flight {
+            if orphaned_turn {
                 service
                     .acp_supervisor
                     .synthesize_stopped_for_orphan(&target.id, "orphaned_at_restart");
@@ -1035,17 +1054,15 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         // A failed probe counts as busy so a live turn is never killed.
-        let in_flight = super::query_control(
+        let busy = query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
-            "draining stale worker in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "draining stale worker live work",
+            |s, id| s.holds_live_work(id),
         )
         .await;
-        if !matches!(
-            in_flight,
-            Ok(crate::acp::event_store::ControlKnowledge::Known(false))
-        ) {
+        if !matches!(busy, Some(Ok(crate::acp::event_store::ControlKnowledge::Known(false)))) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
@@ -1227,11 +1244,11 @@ mod tests {
             ((true, false, false, false), ReplaceIncompatibleRunner),
             ((true, false, false, true), ReplaceIncompatibleRunner),
         ];
-        for ((live, build, runner, in_flight), expected) in cases {
+        for ((live, build, runner, holds_live_work), expected) in cases {
             assert_eq!(
-                adopt_decision(live, build, runner, in_flight),
+                adopt_decision(live, build, runner, holds_live_work),
                 expected,
-                "live={live} build={build} runner={runner} in_flight={in_flight}"
+                "live={live} build={build} runner={runner} holds_live_work={holds_live_work}"
             );
         }
     }
@@ -1289,6 +1306,105 @@ mod tests {
             assert_eq!(worker_registry::peek_restart_marker(id), Some(4), "{id}");
         }
         assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_wake_closes_an_orphaned_turn_before_resuming() {
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        for agent_initiated in [false, true] {
+            with_managed(|scope| Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(scope, "orphaned-real-turn").await;
+                if agent_initiated {
+                live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
+                }})).await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(live.client.next_event().await, Some(crate::acp::Event::AgentMessageChunk { text, .. }) if text == "woken") { break; }
+                    }
+                }).await.expect("the actual Native's autonomous turn reaches its durable projection");
+                } else {
+                    let _request = live.start_prompt("keep going").await;
+                }
+                let id = live.id().to_owned();
+                let owner = live.state.acp_supervisor.current_native_availability(&id)
+                    .await.unwrap().owner.unwrap();
+                let paused = live.client.pause_drain().await;
+                let guard = crate::process::RunnerProcessGuard::capture(owner.pid, owner.birth_fingerprint).unwrap();
+                guard.signal(libc::SIGKILL).expect("retire only this fixture's captured private Native owner");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while guard.executing().unwrap() { tokio::task::yield_now().await; }
+                }).await.expect("the original captured owner is conclusively dead");
+                live.state.acp_supervisor.test_remove_worker(&id).await;
+                drop(paused);
+                live.client.actual().shutdown().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while live.client.next_event().await.is_some() {}
+                }).await.expect("the old SDK and its ordered drain have actually retired");
+                assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
+                let trigger = trigger_resume_background(&live.state.session_service, &id,
+                    crate::process::worker_registry::ResumeAuthority::Explicit, None).await.unwrap();
+                assert!(matches!(trigger, ResumeTrigger::Started));
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let events = live.state.acp_event_store.replay_from(&id, 0).unwrap();
+                        if events.iter().any(|stored| matches!(stored.event.as_ref(),
+                            crate::acp::Event::Stopped { reason } if reason == "orphaned_at_restart")) { break; }
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("the admitted wake closes the genuine orphan before replacement");
+                assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(false));
+            })).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prompt_wake_defers_while_the_open_turn_is_unknown() {
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        with_managed(|scope| Box::pin(async move {
+                let mut live = crate::server::test_support::managed_control_session(scope, "unknown-orphaned-real-turn").await;
+                live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
+                }})).await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(live.client.next_event().await, Some(crate::acp::Event::AgentMessageChunk { text, .. }) if text == "woken") { break; }
+                    }
+                }).await.expect("the actual Native's autonomous turn reaches its durable projection");
+                let id = live.id().to_owned();
+                let owner = live.state.acp_supervisor.current_native_availability(&id)
+                    .await.unwrap().owner.unwrap();
+                let paused = live.client.pause_drain().await;
+                let guard = crate::process::RunnerProcessGuard::capture(owner.pid, owner.birth_fingerprint).unwrap();
+                guard.signal(libc::SIGKILL).expect("retire only this fixture's captured private Native owner");
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while guard.executing().unwrap() { tokio::task::yield_now().await; }
+                }).await.expect("the original captured owner is conclusively dead");
+                live.state.acp_supervisor.test_remove_worker(&id).await;
+                drop(paused);
+                live.client.actual().shutdown().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while live.client.next_event().await.is_some() {}
+                }).await.expect("the old SDK and its ordered drain have actually retired");
+                assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
+                let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
+                live.state.acp_event_store.test_set_unavailable(true);
+                let deferred = trigger_resume_background(&live.state.session_service, &id, authority, None).await;
+                assert!(matches!(deferred, Err(SupervisorError::EventStoreUnavailable(_))));
+                assert!(!live.state.acp_supervisor.is_running(&id).await, "nothing spawned");
+                live.state.acp_event_store.test_set_unavailable(false);
+                let trigger = trigger_resume_background(&live.state.session_service, &id, authority, None).await.unwrap();
+                assert!(matches!(trigger, ResumeTrigger::Started));
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while live.state.acp_event_store.has_open_turn(&id).unwrap() != Known(false) {
+                        tokio::task::yield_now().await;
+                    }
+                }).await.expect("recovery closes the actual orphan rather than losing its history");
+        })).await;
     }
 
     /// A session that left the live set after the snapshot is never spawned.
@@ -1469,4 +1585,60 @@ mod tests {
         })
         .await;
     }
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_retained_prompt_completion_does_not_close_an_agent_turn_on_reattach() {
+        use super::super::test_fixtures::Tick;
+        use crate::acp::event_store::ControlKnowledge::Known;
+        use crate::acp::supervisor::test_support::managed::with_managed;
+        use crate::acp::Event;
+        with_managed(|scope| Box::pin(async move {
+            let mut live = crate::server::test_support::managed_control_session(scope, "retained-agent-work").await;
+            let id = live.id().to_owned();
+            let request = live.start_prompt("go").await;
+            live.finish_prompt(&request, None).await;
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
+            }})).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(live.client.next_event().await, Some(Event::AgentMessageChunk { text, .. }) if text == "woken") { break; }
+                }
+            }).await.expect("the original Native opens autonomous work after its prompt completes");
+            assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(true));
+            let owner = live.client.actual().connected_runner();
+            let methods = live.native.requests();
+            live.client = scope.reconcile_after(live.client, |state, id| async move {
+                let mut tick = Tick::default();
+                tick.run(&state).await;
+                assert!(state.acp_supervisor.current_lease(&id).is_some());
+            }).await;
+            live.state = live.client.app_state();
+            assert_eq!(live.client.actual().connected_runner(), owner);
+            assert_eq!(live.native.requests(), methods);
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after the retained completion"}}
+            }})).await;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if matches!(live.client.next_event().await, Some(Event::AgentMessageChunk { text, .. }) if text == "after the retained completion") { break; }
+                }
+            }).await.expect("the same actual stream progresses beyond its retained prompt completion");
+            let stops = live.state.acp_event_store.replay_from(&id, 0).unwrap().into_iter()
+                .filter(|stored| matches!(stored.event.as_ref(), Event::Stopped { .. })).count();
+            assert_eq!(stops, 1, "the retained completion cannot publish another turn's Stopped");
+            assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(true));
+            live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                "sessionId":live.sid,"update":{"sessionUpdate":"usage_update","used":10,"size":100,
+                    "cost":{"amount":0.1,"currency":"USD"}}
+            }})).await;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if matches!(live.client.next_event().await, Some(Event::Stopped { reason }) if reason == "agent_idle") { break; }
+                }
+            }).await.expect("only this autonomous turn's real accounting boundary releases its live-work hold");
+            assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(false));
+        })).await;
+    }
+
 }

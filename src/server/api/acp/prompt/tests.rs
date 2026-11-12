@@ -1404,6 +1404,7 @@ async fn a_failed_repost_keeps_the_rows_attachment_bytes() {
         assert_eq!(stored[0].data, b"stored".to_vec());
     }
 }
+
 /// Send now delivers the bytes the daemon stored for the row. Request attachments, even a
 /// valid different one of the same count, never replace them.
 #[tokio::test]
@@ -2387,4 +2388,64 @@ async fn a_prompt_reports_its_dispatch_and_the_seq_it_was_recorded_at() {
             }
         })
     }).await;
+}
+
+/// #5401: a queue drain publishes the first row's id as `prompt_id` and the
+/// rest as `merged_prompt_ids`, so the web client settles every optimistic row.
+#[tokio::test]
+async fn queue_drain_publishes_row_ids_as_prompt_and_merged_ids() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-5401-drain";
+    let state = structured_state(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+    for (row, text) in [("q1", "first"), ("q2", "second")] {
+        state
+            .session_service
+            .enqueue_prompt(id, row.into(), text.into(), vec![], None, None)
+            .await
+            .expect("session exists");
+    }
+
+    state.session_service.drain_queued_prompts_once(id).await;
+
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
+            if p == "q1" && merged_prompt_ids == &["q2".to_string()]
+    )));
+}
+
+/// Another tab's optimistic row carries the queued row id, so it must settle too.
+#[tokio::test]
+async fn send_now_publishes_the_request_id_then_the_queued_row_id() {
+    let _app_dir = crate::session::test_support::isolate_app_dir();
+    let id = "sess-send-now-ids";
+    let state = state_with_queued_plugin_row(id, true).await;
+    let _cmds = state
+        .acp_supervisor
+        .test_insert_worker_cmd_recording(id)
+        .await;
+
+    let response = acp_prompt(
+        State(Arc::clone(&state)),
+        Path(id.to_string()),
+        Ok(Json(PromptRequest {
+            text: "PR #7 was merged".to_string(),
+            attachments: Vec::new(),
+            prompt_id: Some("req-1".to_string()),
+            no_revive: false,
+            queued_prompt_id: Some("q1".to_string()),
+        })),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert!(published(&state, id, |e| matches!(
+        e,
+        Event::UserPromptSent { prompt_id: Some(p), merged_prompt_ids, .. }
+            if p == "req-1" && merged_prompt_ids == &["q1".to_string()]
+    )));
 }

@@ -147,6 +147,7 @@ function Row({
       readOnly={readOnly}
     >
       <SessionRow
+        rowKey={ws.id}
         workspace={canonical.workspace}
         observedById={canonical.observedById}
         runtimeEpoch="boot"
@@ -162,7 +163,7 @@ function Row({
         onRestartForUpdate={onRestartForUpdate}
         onSwitchView={onSwitchView}
         readOnly={readOnly}
-        optimistic={triage.optimisticFor(ws.id)}
+        optimistic={triage.optimisticFor(ws)}
         onPinToggle={triage.pinToggle}
         onArchiveToggle={triage.archiveToggle}
         onSnooze={triage.snooze}

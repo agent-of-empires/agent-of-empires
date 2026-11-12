@@ -23,7 +23,7 @@ use crate::acp::acp_client::between_prompt::{
 use crate::acp::acp_client::commands::{ClientCmd, QueuedClientCmd, QueuedPrompt};
 use crate::acp::acp_client::config_options::{
     config_option_failure_event, config_options_event, dispatch_set_config_option,
-    dispatch_set_mode, mode_config_id, model_option, modes_available_event,
+    dispatch_set_mode, mode_config_id, model_config_values, model_option, modes_available_event,
     thought_level_config_id, ConfigOptionDispatchPurpose, SessionChannels,
 };
 use crate::acp::acp_client::control::DaemonControlClient;
@@ -52,6 +52,7 @@ pub(super) struct Session {
     pub(super) close_capable: bool,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
+    pub(super) default_model_config: std::collections::BTreeMap<String, String>,
     pub(super) default_mode: Option<String>,
     pub(super) default_model: Option<String>,
     pub(super) agent_cwd: PathBuf,
@@ -268,10 +269,67 @@ impl Session {
         }
     }
 
+    /// A subagent session only honours `session/cancel` when it announced the
+    /// capability; the root turn is unaffected either way.
+    pub(super) async fn cancel_child(
+        &self,
+        session_id: String,
+        scope: Option<NativeRequestContext>,
+    ) -> bool {
+        let Ok(_ingress) = self.shared.ingress.fence.try_read() else {
+            return false;
+        };
+        let Some(parent) = self.shared.ingress.current() else {
+            return false;
+        };
+        if parent != self.acp_session_id {
+            return false;
+        }
+        let child = SessionId::from(session_id.clone());
+        let Some(route) = self.shared.ingress.child_route(&child) else {
+            return false;
+        };
+        if !route.cancel_capable || (self.control.is_some()
+            && route.source != scope.as_ref().and_then(NativeRequestContext::origin)) {
+            return false;
+        }
+        let source = route.source;
+        let mut ancestor = route.parent;
+        while ancestor != parent {
+            let Some(route) = self.shared.ingress.child_route(&ancestor) else {
+                return false;
+            };
+            if route.source != source { return false; }
+            ancestor = route.parent;
+        }
+        match self.control.as_ref() {
+            Some(control) => {
+                if current_effect(&scope, true, || ()).is_err() {
+                    return false;
+                }
+                let Some(context) = scope else {
+                    return false;
+                };
+                control
+                    .cancel_session(parent.0.to_string(), session_id, context.scope)
+                    .await
+            }
+            None => self
+                .shared
+                .connection_state
+                .admit(|| {
+                    self.connection
+                        .send_notification(CancelNotification::new(child))
+                })
+                .is_ok_and(|result| result.is_ok()),
+        }
+    }
+
     pub(super) async fn dispatch_config_option(
         &mut self,
         config_id: String,
         value: String,
+        remember: bool,
         scope: Option<NativeRequestContext>,
     ) {
         let shared = Arc::clone(&self.shared);
@@ -286,6 +344,10 @@ impl Session {
                 .is_some_and(|option| option.id == config_id)
             {
                 self.default_model = Some(value.clone());
+            }
+            if remember {
+                self.default_model_config
+                    .insert(config_id.clone(), value.clone());
             }
         });
 
@@ -373,6 +435,9 @@ impl Session {
                         "ACP connection unavailable".into(),
                     ),
                 );
+            }
+            ClientCmd::CancelChild { respond_to, .. } => {
+                let _ = respond_to.send(false);
             }
             ClientCmd::Prompt(_)
             | ClientCmd::Cancel
@@ -493,6 +558,17 @@ impl Session {
                         break;
                     }
                 }
+                ClientCmd::CancelChild {
+                    session_id,
+                    respond_to,
+                } => {
+                    let sent = if require_operation(&scope, correlation, self.control.is_some()).is_ok() {
+                        self.cancel_child(session_id, scope).await
+                    } else {
+                        false
+                    };
+                    let _ = respond_to.send(sent);
+                }
                 ClientCmd::Cancel => {
                     if let Err(error) =
                         require_operation(&scope, correlation, self.control.is_some())
@@ -533,8 +609,8 @@ impl Session {
                 ClientCmd::SetMode(mode_id) => {
                     self.dispatch_mode(mode_id, false, scope);
                 }
-                ClientCmd::SetConfigOption { config_id, value } => {
-                    self.dispatch_config_option(config_id, value, scope).await;
+                ClientCmd::SetConfigOption { config_id, value, remember } => {
+                    self.dispatch_config_option(config_id, value, remember, scope).await;
                 }
                 ClientCmd::DeleteSession {
                     acp_session_id,
@@ -617,7 +693,10 @@ impl Session {
         if shared.connection_state.loss().is_some() {
             return;
         }
-        let Some(cost_seen) = shared.between_prompt.take_idle_fire(now_ms()) else {
+        let Some(cost_seen) = shared
+            .between_prompt
+            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
+        else {
             return;
         };
         let adopted = shared.adopted_turn_active.swap(false, Ordering::Relaxed);
@@ -640,7 +719,7 @@ impl Session {
                 .await;
             return;
         }
-        if adopted && !shared.terminal_claim.claim() {
+        if !shared.terminal_claim.claim() {
             return;
         }
         let reason = between_prompt_stop_reason(adopted, cost_seen);
@@ -687,6 +766,41 @@ impl Session {
             });
             return Ok(());
         };
+        if self.shared.ingress.has_parked() {
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "an approval is waiting for an answer; resolve it before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
+        if self.shared.has_active_subagent() {
+            let sender = scoped_sender(&self.shared, true, &original_scope);
+            publish_scoped(
+                &self.shared, true, &original_scope, &sender,
+                Event::PromptRejected { reason: "agent_busy".into(), text }, false,
+            ).await;
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "a subagent is still running; wait for it to finish before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
+        let work = self.shared.between_prompt.work_state();
+        if work.is_busy() || !self.shared.bg_tasks.is_empty() || self.shared.aoe.leases.any_live(now_ms()) {
+            warn!(
+                target: "acp.protocol",
+                tool_calls_in_flight = work.tool_calls,
+                background_agents_in_flight = work.background_agents,
+                "conversation reset requested while between-prompt work is in flight; refusing"
+            );
+            let sender = scoped_sender(&self.shared, true, &original_scope);
+            publish_scoped(
+                &self.shared, true, &original_scope, &sender,
+                Event::PromptRejected { reason: "agent_busy".into(), text }, false,
+            ).await;
+            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                message: "agent work is still in flight; wait for it to finish before clearing the conversation".into(),
+            });
+            return Ok(());
+        }
         let Some(correlation) = correlation else {
             let _ = respond_to.send(ResetSessionOutcome::Failed {
                 message: "NotIssued: native reset operation correlation is missing".into(),
@@ -790,6 +904,9 @@ impl Session {
         if shared.between_prompt.work_state().is_busy()
             || !shared.bg_tasks.is_empty()
             || shared.native_compacting()
+            || shared.ingress.has_parked()
+            || shared.has_active_subagent()
+            || shared.aoe.leases.any_live(now_ms())
         {
             return Err(ResetFailure::Busy);
         }
@@ -1179,9 +1296,9 @@ impl Session {
     }
 
     /// The fresh session starts on adapter defaults, so the model, effort and
-    /// mode are re-sent, best-effort, within the reset deadline. The model
-    /// goes first because a switch rebuilds the option set the effort is
-    /// resolved from.
+    /// mode and model_config picks are re-sent, best-effort, within the reset
+    /// deadline. The model goes first because a switch rebuilds the option
+    /// set the effort and the toggles are resolved from.
     async fn reapply_defaults(
         &self,
         new_id: &SessionId,
@@ -1190,6 +1307,7 @@ impl Session {
         scope: Option<NativeRequestContext>,
     ) {
         let mut effort_id = options.and_then(thought_level_config_id);
+        let mut toggles = options.map(model_config_values).unwrap_or_default();
         if let (Some(model), Some(option)) = (
             self.default_model.as_deref(),
             options.and_then(model_option),
@@ -1206,7 +1324,10 @@ impl Session {
                     )
                     .await
                 {
-                    Some(Ok(options)) => effort_id = thought_level_config_id(&options),
+                    Some(Ok(options)) => {
+                        effort_id = thought_level_config_id(&options);
+                        toggles = model_config_values(&options);
+                    }
                     Some(Err(_)) => {}
                     None => return,
                 }
@@ -1229,6 +1350,21 @@ impl Session {
                 .is_none()
             {
                 return;
+            }
+        }
+        for (id, value) in &self.default_model_config {
+            if toggles.get(id).is_none_or(|current| current == value) {
+                continue;
+            }
+            match self
+                .reset_set_option(new_id, SessionConfigId::new(id.clone()), value, deadline, false, scope.clone())
+                .await
+            {
+                Some(Ok(options)) => toggles = model_config_values(&options),
+                Some(Err(reason)) => {
+                    debug!(target: "acp.protocol", "post-reset {id} rejected: {reason}")
+                }
+                None => return,
             }
         }
     }
@@ -1375,6 +1511,126 @@ impl Session {
                 );
                 None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acp::acp_client::session_identity::RequestPolicy;
+    use crate::acp::supervisor::test_support::managed::with_managed;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reset_write_fence_releases_or_expires_with_an_actual_read_admission() {
+        for expire in [false, true] {
+            with_managed(|scope| Box::pin(async move {
+                let directory = scope.tempdir();
+                let received = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+                let observed = Arc::clone(&received);
+                let mut new_sessions = 0;
+                let (config, native) = scope.native_peer(directory.path().into(), "gemini", "gemini", move |request| {
+                    observed.lock().unwrap().push(request.clone());
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialize" => serde_json::json!({"protocolVersion":1,"agentCapabilities":{}}),
+                        "session/new" => {
+                            let id = if new_sessions == 0 { "s-fence-reset" } else { "s-fence-reset-reset-1" };
+                            new_sessions += 1;
+                            serde_json::json!({"sessionId":id})
+                        }
+                        other => panic!("unexpected Native request while testing the read fence: {other}"),
+                    };
+                    Some(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":result}))
+                });
+                let mut client = scope.spawn(config, "actual-reset-read-admission").await.unwrap();
+                client.ready().await;
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if matches!(client.next_event().await, Some(Event::AcpSessionAssigned {
+                            acp_session_id, connection_ready: true, native_subject: Some(_),
+                        }) if acp_session_id == "s-fence-reset") { break; }
+                    }
+                }).await.expect("the initial real assignment precedes the measured reset interval");
+                let actual = client.actual();
+                let ingress = Arc::clone(&actual.test_control().ingress);
+                let old = SessionId::new("s-fence-reset");
+                assert_eq!(ingress.current(), Some(old.clone()));
+                let original = ingress.capture_request();
+                drop(ingress.request(&original, &old, RequestPolicy::ParentOnly).await.unwrap());
+                let bound = if expire { Duration::from_millis(100) } else { Duration::from_secs(10) };
+                let deadline = tokio::time::Instant::now() + bound;
+                let proposal = client.prepare_reset(deadline).await;
+                let mut held = Some(actual.connection_state.reserve_native_duration().unwrap());
+                assert!(!ingress.has_parked());
+                let (waiting, entered) = oneshot::channel();
+                assert!(actual.connection_state.test_fresh_write_pending.lock().unwrap().replace(waiting).is_none());
+                let reset = actual.reset_session("/clear", proposal, deadline, deadline + Duration::from_secs(5));
+                tokio::pin!(reset);
+                assert!(futures_util::poll!(reset.as_mut()).is_pending());
+                tokio::time::timeout(Duration::from_secs(10), entered).await.unwrap().unwrap();
+                assert_eq!(ingress.current(), Some(old.clone()));
+                assert_eq!(received.lock().unwrap().iter().filter(|request| request["method"] == "session/new").count(), 1);
+                let later = Arc::clone(&actual.connection_state.callback_duration).read_owned();
+                tokio::pin!(later);
+                assert!(futures_util::poll!(later.as_mut()).is_pending());
+                if expire {
+                    assert!(matches!(reset.as_mut().await.unwrap(), ResetSessionOutcome::Failed { message }
+                        if message == "reset deadline expired while agent callbacks were in flight"));
+                    assert!(held.is_some());
+                    drop(later.as_mut().await);
+                    native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":"s-fence-reset","update":{"sessionUpdate":"agent_message_chunk",
+                        "content":{"type":"text","text":"non-parked progress after expiry"}}
+                    }})).await;
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        loop {
+                            if matches!(client.next_event().await, Some(Event::AgentMessageChunk { text, .. })
+                                if text == "non-parked progress after expiry") { break; }
+                        }
+                    }).await.expect("expiry releases original SDK progress while its non-parked admission remains held");
+                    assert_eq!(ingress.current(), Some(old.clone()));
+                    assert_eq!(received.lock().unwrap().iter().filter(|request| request["method"] == "session/new").count(), 1);
+                    drop(held.take());
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    let proposal = client.prepare_reset(deadline).await;
+                    assert!(matches!(actual.reset_session("/clear", proposal, deadline, deadline + Duration::from_secs(5)).await.unwrap(),
+                        ResetSessionOutcome::Reset { new_acp_session_id } if new_acp_session_id == "s-fence-reset-reset-1"));
+                } else {
+                    drop(held.take());
+                    let (outcome, later_guard) = futures_util::join!(reset.as_mut(), later.as_mut());
+                    assert!(matches!(outcome.unwrap(), ResetSessionOutcome::Reset { new_acp_session_id }
+                        if new_acp_session_id == "s-fence-reset-reset-1"));
+                    drop(later_guard);
+                }
+                let fresh = SessionId::new("s-fence-reset-reset-1");
+                assert_eq!(ingress.current(), Some(fresh.clone()));
+                assert!(ingress.request(&original, &old, RequestPolicy::ParentOnly).await.is_err());
+                let current = ingress.capture_request();
+                drop(ingress.request(&current, &fresh, RequestPolicy::ParentOnly).await.unwrap());
+                let mut interval = Vec::new();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let event = client.next_event().await.expect("the actual reset's event stream remains live");
+                        let complete = matches!(&event, Event::Stopped { reason } if reason == "session_reset");
+                        assert!(!matches!(event, Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. }));
+                        interval.push(event);
+                        if complete { break; }
+                    }
+                }).await.expect("actual Fresh completion reaches its durable session_reset boundary");
+                let transitions: Vec<_> = interval.iter().filter(|event| matches!(event,
+                    Event::SessionCleared | Event::SessionContextReset { .. }
+                    | Event::AcpSessionAssigned { connection_ready: true, native_subject: Some(_), .. }
+                    | Event::Stopped { .. })).collect();
+                assert!(matches!(transitions.as_slice(), [Event::SessionCleared,
+                    Event::SessionContextReset { .. }, Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. },
+                    Event::Stopped { reason }] if acp_session_id == "s-fence-reset-reset-1" && reason == "session_reset"), "{interval:?}");
+                let received = received.lock().unwrap();
+                let new: Vec<_> = received.iter().filter(|request| request["method"] == "session/new").collect();
+                assert_eq!(new.len(), 2);
+                assert_ne!(new[0]["id"], new[1]["id"]);
+                assert!(received.iter().all(|request| matches!(request["method"].as_str(), Some("initialize" | "session/new"))));
+            })).await;
         }
     }
 }

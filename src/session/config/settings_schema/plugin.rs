@@ -173,6 +173,7 @@ pub fn plugin_field_descriptors(
                     s.label.clone()
                 },
                 description: s.description.clone(),
+                summary: None,
                 widget,
                 // Plugin settings are not host-execution surfaces; the settings
                 // PATCH endpoint is already elevation-gated by the auth layer.

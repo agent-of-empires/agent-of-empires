@@ -733,6 +733,48 @@ test.describe("create failure", () => {
     });
   }
 
+  test("at 375px, Launch without Sandbox with no host adapter stops on the View row, focused and in view", async ({
+    page,
+  }) => {
+    await page.route("**/api/sandbox/volume-ignores-preview**", (r) =>
+      r.fulfill({ json: { acknowledged: true, globs: [] } }),
+    );
+    // The gate reads `acp_create_ready` only once the debounced fetch for the selected project answers.
+    const projectAgents = page.waitForResponse((r) => {
+      const url = new URL(r.url());
+      return url.pathname === "/api/agents" && url.searchParams.get("path") === "/tmp/example";
+    });
+    const created = await startWizard(page, {
+      docker: true,
+      settings: { sandbox: { enabled_by_default: true } },
+      agents: [{ ...CLAUDE_AGENT, acp_create_ready: false }],
+      onCreate: (_body, route) =>
+        route
+          .fulfill({
+            status: 400,
+            json: {
+              error: "sandbox_unavailable",
+              message: "Docker isn't running, so the Sandbox can't start. Start Docker, then try again.",
+              stage: "starting_container",
+            },
+          })
+          .then(() => true),
+    });
+    await projectAgents;
+    await page.setViewportSize({ width: 375, height: 600 });
+    const w = wizard(page);
+    await launch(page);
+    await w.getByRole("button", { name: "Launch without Sandbox" }).click();
+
+    const terminal = w.getByRole("radiogroup", { name: "View" }).getByRole("radio", { name: "Terminal view" });
+    await expect(terminal).toBeFocused();
+    await expect(terminal).toBeInViewport();
+    await expect(w.getByTestId("wizard-view-row")).toContainText("ACP adapter not installed");
+    await expect(switchNamed(page, "Run in a safe container")).toHaveAttribute("aria-checked", "false");
+    expect(created).toHaveLength(1);
+    expect(created[0]!.view).toBe("structured");
+  });
+
   test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => (release = resolve));

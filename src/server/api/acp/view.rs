@@ -180,7 +180,7 @@ pub async fn acp_enable(
     // default fallback, which would accept every tool.
     let resolvable = {
         let profile = instance.source_profile.clone();
-        let project_path = PathBuf::from(&instance.project_path);
+        let project_path = instance.repo_config_path().to_path_buf();
         let tool = instance.tool.clone();
         let agent_name = instance.agent_name.clone();
         tokio::task::spawn_blocking(move || {
@@ -1074,7 +1074,7 @@ fn record_retired_handoff_in(
                     let config =
                         crate::session::config::repo_config::resolve_config_with_repo_or_warn(
                             &row.source_profile,
-                            std::path::Path::new(&row.project_path),
+                            row.repo_config_path(),
                         );
                     let yolo = row.yolo_mode;
                     crate::session::builder::apply_agent_launch_config(
@@ -1854,7 +1854,7 @@ mod tests {
         let db_path = crate::session::get_app_dir()
             .expect("isolated app directory")
             .join(format!("acp-events-{session_id}.db"));
-        Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100).expect("event store"))
+        Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100, Default::default()).expect("event store"))
     }
 
     fn handoff_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
@@ -3102,10 +3102,7 @@ mod tests {
         let peer_pid =
             crate::tmux::test_helpers::pane_field(&peer_pane, "#{pane_pid}").parse::<u32>()?;
         let peer_birth = crate::process::process_birth_identity(peer_pid)?.unwrap();
-        let events = Arc::new(crate::acp::event_store::EventStore::open(
-            &root.path().join("events.db"),
-            100,
-        )?);
+        let events = Arc::new(crate::acp::event_store::EventStore::open(&root.path().join("events.db"), 100, Default::default())?);
         let state = retired_native_handoff_with_event_store(&source, events.clone()).await?;
         let sentinel = events.highest_seq_checked(&source.id)? + 1;
         events.record(
@@ -3444,7 +3441,7 @@ mod tests {
         ] {
             let project = tempfile::tempdir()?;
             let db_path = project.path().join("original-events.db");
-            let events = Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100)?);
+            let events = Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100, Default::default())?);
             let entered = project.path().join("hook-entered");
             let release = project.path().join("hook-release");
             let hooks = project.path().join("hook-count");
@@ -3638,7 +3635,7 @@ mod tests {
             for row in &mut rows {
                 row.source_profile = "default".into();
             }
-            let new_events = Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100)?);
+            let new_events = Arc::new(crate::acp::event_store::EventStore::open(&db_path, 100, Default::default())?);
             let structured_launches = Arc::new(AtomicUsize::new(0));
             let launches = structured_launches.clone();
             let launcher: crate::acp::supervisor::Launcher = Arc::new(move |_, _| {

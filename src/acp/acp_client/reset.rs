@@ -1253,155 +1253,156 @@ done
         Box::pin(crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     for (name, stored, load_capable, load_fails, new_fails, fork) in [
-        ("unavailable", true, false, false, false, false),
-        ("initial", false, false, false, false, false),
-        ("loaded", true, true, false, false, false),
-        ("load_failed", true, true, true, false, false),
-        ("initial_new_failed", false, false, false, true, false),
-        ("unavailable_new_failed", true, false, false, true, false),
-        ("load_and_new_failed", true, true, true, true, false),
-        ("fork_unsupported", true, false, false, false, true),
-        ("fork_unsupported_load_failed", true, true, true, false, true),
-    ] {
-        let tmp = scope.tempdir();
-        let script = tmp.path().join("resume-agent.sh");
-        let capture = tmp.path().join("resume-capture.ndjson");
-        let error = r#""error":{"code":-32603,"message":"fixture refused establishment"}"#;
-        let new_ok = r#""result":{"sessionId":"replacement-session"}"#;
-        let script_body = r#"#!/bin/sh
+            ("unavailable", true, false, false, false, false),
+            ("initial", false, false, false, false, false),
+            ("loaded", true, true, false, false, false),
+            ("load_failed", true, true, true, false, false),
+            ("initial_new_failed", false, false, false, true, false),
+            ("unavailable_new_failed", true, false, false, true, false),
+            ("load_and_new_failed", true, true, true, true, false),
+            ("fork_unsupported", true, false, false, false, true),
+            ("fork_unsupported_load_failed", true, true, true, false, true),
+        ] {
+            let tmp = scope.tempdir();
+            let script = tmp.path().join("resume-agent.sh");
+            let capture = tmp.path().join("resume-capture.ndjson");
+            let error = r#""error":{"code":-32603,"message":"fixture refused establishment"}"#;
+            let new_ok = r#""result":{"sessionId":"replacement-session"}"#;
+            let script_body = r#"#!/bin/sh
     while IFS= read -r line; do
       printf '%s\n' "$line" >> '__CAPTURE__'
       id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
       case $line in
-        *'"method":"initialize"'*)
-          printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":__LOAD_CAPABLE__}}}\n' "$id" ;;
-        *'"method":"session/load"'*)
-          printf '{"jsonrpc":"2.0","id":%s,__LOAD_REPLY__}\n' "$id" ;;
-        *'"method":"session/new"'*)
-          printf '{"jsonrpc":"2.0","id":%s,__NEW_REPLY__}\n' "$id" ;;
-        *'"method":"session/prompt"'*)
-          printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+            *'"method":"initialize"'*)
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":__LOAD_CAPABLE__}}}\n' "$id" ;;
+            *'"method":"session/load"'*)
+              printf '{"jsonrpc":"2.0","id":%s,__LOAD_REPLY__}\n' "$id" ;;
+            *'"method":"session/new"'*)
+              printf '{"jsonrpc":"2.0","id":%s,__NEW_REPLY__}\n' "$id" ;;
+            *'"method":"session/prompt"'*)
+              printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
       esac
     done
     "#
-        .replace("__CAPTURE__", capture.to_str().unwrap())
-        .replace("__LOAD_CAPABLE__", &load_capable.to_string())
-        .replace("__LOAD_REPLY__", if load_fails { error } else { r#""result":{}"# })
-        .replace("__NEW_REPLY__", if new_fails { error } else { new_ok });
-        std::fs::write(&script, script_body).unwrap();
-        let mut config = reset_fake_spawn_config(&script, tmp.path());
-        if fork {
-            config.agent_key = "claude".into();
-            config.tool = "claude".into();
-        }
-        let mut selected_source = None;
-        let mut client = if stored || fork {
-            let (original_script, _) = FakeAgent::default().write(tmp.path());
-            let mut original_config = reset_fake_spawn_config(&original_script, tmp.path());
-            original_config.agent_key = config.agent_key.clone();
-            original_config.tool = config.tool.clone();
-            let mut original = scope.spawn(original_config, format!("{name}-original")).await.unwrap();
-            original.ready().await;
-            use axum::response::IntoResponse;
-            let response = crate::server::api::acp_prompt(
-                axum::extract::State(original.app_state()),
-                axum::extract::Path(original.id.clone()),
-                Ok(axum::Json(crate::acp::protocol::PromptRequest {
-                    text: "prior user turn".into(),
-                    attachments: Vec::new(),
-                    prompt_id: None,
-                    no_revive: false,
-                    queued_prompt_id: None,
-                })),
-            )
-            .await
-            .into_response();
-            assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
-            identity_events_until_stop(&mut original).await;
-            selected_source = Some(original.selected_native_session());
+            .replace("__CAPTURE__", capture.to_str().unwrap())
+            .replace("__LOAD_CAPABLE__", &load_capable.to_string())
+            .replace("__LOAD_REPLY__", if load_fails { error } else { r#""result":{}"# })
+            .replace("__NEW_REPLY__", if new_fails { error } else { new_ok });
+            std::fs::write(&script, script_body).unwrap();
+            let mut config = reset_fake_spawn_config(&script, tmp.path());
             if fork {
-                Box::pin(scope.fork_after(original, config, name)).await
+                config.agent_key = "claude".into();
+                config.tool = "claude".into();
+            }
+            let mut selected_source = None;
+            let mut client = if stored || fork {
+                let (original_script, _) = FakeAgent::default().write(tmp.path());
+                let mut original_config = reset_fake_spawn_config(&original_script, tmp.path());
+                original_config.agent_key = config.agent_key.clone();
+                original_config.tool = config.tool.clone();
+                let mut original = scope.spawn(original_config, format!("{name}-original")).await.unwrap();
+                original.ready().await;
+                use axum::response::IntoResponse;
+                let response = crate::server::api::acp_prompt(
+                    axum::extract::State(original.app_state()),
+                    axum::extract::Path(original.id.clone()),
+                    Ok(axum::Json(crate::acp::protocol::PromptRequest {
+                        text: "prior user turn".into(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                        merged_prompt_ids: Vec::new(),
+                        no_revive: false,
+                        queued_prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response();
+                assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+                identity_events_until_stop(&mut original).await;
+                selected_source = Some(original.selected_native_session());
+                if fork {
+                    Box::pin(scope.fork_after(original, config, name)).await
+                } else {
+                    Box::pin(scope.retained_after(original, config, name)).await
+                }
             } else {
-                Box::pin(scope.retained_after(original, config, name)).await
+                scope.spawn(config, name).await.unwrap()
+            };
+            let succeeds = !new_fails && !fork && (!stored || (load_capable && !load_fails));
+            let mut events = events_until(&mut client, |event| matches!(
+                event, Event::AcpSessionAssigned { .. } | Event::AgentStartupError { .. }
+            )).await;
+            if succeeds {
+                client.ready().await;
+                client.send_prompt("continue", &[]).await.unwrap();
+                events.extend(identity_events_until_stop(&mut client).await);
+            } else {
+                assert!(client.send_prompt("do not replace a blocked conversation", &[]).await.is_err());
+                let rows = crate::session::Storage::open_unwatched("test").unwrap()
+                    .load_instances_complete().unwrap();
+                let row = rows.iter().find(|row| row.id == client.id).unwrap();
+                assert!(matches!(&row.acp_establishment,
+                    Some(crate::acp::establishment::AcpEstablishment::Blocked { .. })),
+                    "{name}: the actual durable postimage is {:?}", row.acp_establishment);
+                if stored && !fork {
+                    assert_eq!(
+                        row.selected_acp_target().unwrap(),
+                        crate::acp::establishment::EstablishmentTarget::Load {
+                            session_id: selected_source.clone().unwrap(),
+                            import: false,
+                        },
+                        "{name}: failed resume must retain the exact durable Load target"
+                    );
+                }
             }
-        } else {
-            scope.spawn(config, name).await.unwrap()
-        };
-        let succeeds = !new_fails && !fork && (!stored || (load_capable && !load_fails));
-        let mut events = events_until(&mut client, |event| matches!(
-            event, Event::AcpSessionAssigned { .. } | Event::AgentStartupError { .. }
-        )).await;
-        if succeeds {
-            client.ready().await;
-            client.send_prompt("continue", &[]).await.unwrap();
-            events.extend(identity_events_until_stop(&mut client).await);
-        } else {
-            assert!(client.send_prompt("do not replace a blocked conversation", &[]).await.is_err());
-            let rows = crate::session::Storage::open_unwatched("test").unwrap()
-                .load_instances_complete().unwrap();
-            let row = rows.iter().find(|row| row.id == client.id).unwrap();
-            assert!(matches!(&row.acp_establishment,
-                Some(crate::acp::establishment::AcpEstablishment::Blocked { .. })),
-                "{name}: the actual durable postimage is {:?}", row.acp_establishment);
+            let position = |pred: fn(&Event) -> bool| events.iter().position(pred);
+            let assignment = position(|e| matches!(e, Event::AcpSessionAssigned { .. }));
+            assert_eq!(assignment.is_some(), succeeds, "{name}");
+            assert_eq!(
+                position(|event| matches!(event, Event::AgentStartupError { .. })).is_some(),
+                !succeeds, "{name}"
+            );
+            assert_eq!(position(|event| matches!(event, Event::Stopped { .. })).is_some(), succeeds, "{name}");
+            assert!(!events.iter().any(|event| matches!(event, Event::SessionContextReset { .. } | Event::SessionCleared)), "{name}");
+
+            let mut transcript = TranscriptModel::new();
+            for stored in scope.state.acp_event_store.replay_from(&client.id, 0).unwrap() {
+                transcript.apply_scoped_event(stored.seq, stored.event.as_ref(), &stored.metadata);
+            }
+            let rows = transcript.rows();
+            let dividers = rows
+                .iter()
+                .filter(|row| row.kind == TranscriptRowKind::ContextReset)
+                .count();
+            assert_eq!(dividers, 0, "{name}");
             if stored && !fork {
-                assert_eq!(
-                    row.selected_acp_target().unwrap(),
-                    crate::acp::establishment::EstablishmentTarget::Load {
-                        session_id: selected_source.clone().unwrap(),
-                        import: false,
-                    },
-                    "{name}: failed resume must retain the exact durable Load target"
-                );
+                for text in ["prior user turn", "working"] {
+                    assert!(rows.iter().any(|row| row.text.contains(text)), "{name}: {text}");
+                }
             }
-        }
-        let position = |pred: fn(&Event) -> bool| events.iter().position(pred);
-        let assignment = position(|e| matches!(e, Event::AcpSessionAssigned { .. }));
-        assert_eq!(assignment.is_some(), succeeds, "{name}");
-        assert_eq!(
-            position(|event| matches!(event, Event::AgentStartupError { .. })).is_some(),
-            !succeeds, "{name}"
-        );
-        assert_eq!(position(|event| matches!(event, Event::Stopped { .. })).is_some(), succeeds, "{name}");
-        assert!(!events.iter().any(|event| matches!(event, Event::SessionContextReset { .. } | Event::SessionCleared)), "{name}");
 
-        let mut transcript = TranscriptModel::new();
-        for stored in scope.state.acp_event_store.replay_from(&client.id, 0).unwrap() {
-            transcript.apply_scoped_event(stored.seq, stored.event.as_ref(), &stored.metadata);
-        }
-        let rows = transcript.rows();
-        let dividers = rows
-            .iter()
-            .filter(|row| row.kind == TranscriptRowKind::ContextReset)
-            .count();
-        assert_eq!(dividers, 0, "{name}");
-        if stored && !fork {
-            for text in ["prior user turn", "working"] {
-                assert!(rows.iter().any(|row| row.text.contains(text)), "{name}: {text}");
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let loads: Vec<_> = requests
+                .iter()
+                .filter(|r| r["method"] == "session/load")
+                .collect();
+            assert_eq!(loads.len(), usize::from(stored && !fork && load_capable), "{name}");
+            if let Some(load) = loads.first() {
+                assert_eq!(load["params"]["sessionId"].as_str(), selected_source.as_deref(), "{name}");
             }
-        }
-
-        let requests: Vec<serde_json::Value> = std::fs::read_to_string(capture)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let loads: Vec<_> = requests
-            .iter()
-            .filter(|r| r["method"] == "session/load")
-            .collect();
-        assert_eq!(loads.len(), usize::from(stored && !fork && load_capable), "{name}");
-        if let Some(load) = loads.first() {
-            assert_eq!(load["params"]["sessionId"].as_str(), selected_source.as_deref(), "{name}");
-        }
-        let news = requests
-            .iter()
-            .filter(|r| r["method"] == "session/new")
-            .count();
-        assert_eq!(news, usize::from(!stored && !fork), "{name}");
-        assert!(!requests.iter().any(|request| request["method"] == "session/fork"), "{name}");
-        client.shutdown().await.unwrap();
-        scope.finish_conversation_case().await;
-    } }))).await;
+            let news = requests
+                .iter()
+                .filter(|r| r["method"] == "session/new")
+                .count();
+            assert_eq!(news, usize::from(!stored && !fork), "{name}");
+            assert!(!requests.iter().any(|request| request["method"] == "session/fork"), "{name}");
+            client.shutdown().await.unwrap();
+            scope.finish_conversation_case().await;
+        } }))).await;
     }
 
     /// The deadline starts before enqueueing, so an expired command never

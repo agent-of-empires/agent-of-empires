@@ -239,23 +239,15 @@ pub(crate) fn build_test_app_state_with_event_capacity(
         -> crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
 ) -> Arc<AppState> {
     let (event_store, event_capacity) = events;
-    let app_dir = event_store
-        .is_none()
-        .then(|| tempfile::tempdir().expect("tempdir"));
+    let app_dir = event_store.is_none().then(|| tempfile::tempdir().expect("tempdir"));
     let event_store = event_store.unwrap_or_else(|| {
-        let acp_db = app_dir
-            .as_ref()
-            .expect("default store directory")
-            .path()
-            .join("acp_events.db");
-        Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"))
+        Arc::new(crate::acp::event_store::EventStore::temporary_for_test(100).expect("event store"))
     });
     let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(event_capacity).0;
     let acp_control_cache = Arc::clone(event_store.control_cache());
-    let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
-        tx: acp_events_tx.clone(),
-        event_store: event_store.clone(),
-    });
+    let sink = Arc::new(crate::acp::supervisor::ChannelSink::new(
+        acp_events_tx.clone(), Arc::clone(&event_store),
+    ));
     let supervisor = std::sync::Arc::new(
         customize(crate::acp::supervisor::Supervisor::with_capacity(sink, 1))
             .with_native_admission(),

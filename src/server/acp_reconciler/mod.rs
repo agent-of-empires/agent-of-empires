@@ -217,6 +217,32 @@ pub(super) fn is_resumable(i: &Instance) -> bool {
     is_untriaged_structured(i) && !i.is_idle_dormant() && i.launch_is_finalized()
 }
 
+/// Scoped `(user-prompt turn, agent-initiated turn)` knowledge in the log.
+/// Only the first goes to attach: cached prompt completion cannot close an agent turn.
+fn open_turn_kinds(store: &EventStore, id: &str) -> anyhow::Result<ControlKnowledge<(bool, bool)>> {
+    match (store.has_in_flight_turn(id)?, store.has_open_agent_turn(id)?) {
+        (Known(prompt), Known(agent)) => Ok(Known((prompt, agent))),
+        _ => Ok(Indeterminate),
+    }
+}
+
+/// `query_store` after the writer has stored every queued worker event: a probe that
+/// gates a stop or replacement must not miss work still in the write queue.
+async fn query_flushed<T: Send + 'static>(
+    supervisor: &Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    store: &Arc<EventStore>,
+    id: &str,
+    what: &str,
+    f: impl FnOnce(&EventStore, &str) -> T + Send + 'static,
+) -> Option<T> {
+    let supervisor = Arc::clone(supervisor);
+    query_store(store, id, what, move |s, id| {
+        supervisor.flush_events();
+        f(s, id)
+    })
+    .await
+}
+
 /// Runs a blocking event-store query for `id` off the runtime; `None` (logged) if the task panicked.
 async fn query_store<T: Send + 'static>(
     store: &Arc<EventStore>,
@@ -506,41 +532,55 @@ pub async fn reconcile_acp_workers(
             attempted.insert(id);
             continue;
         }
-        match query_control(
-            &state.acp_event_store,
-            &id,
-            "in-flight turn",
-            |store, id| store.has_in_flight_turn(id),
-        )
-        .await
-        {
-            Ok(Known(in_flight)) => target.in_flight_turn = in_flight,
-            Ok(Indeterminate) => target.historical_control_known = false,
-            Err(_) => continue,
+        match query_flushed(&state.acp_supervisor, &state.acp_event_store, &id,
+            "open turn", open_turn_kinds).await {
+            Some(Ok(Known((prompt, agent)))) => {
+                target.in_flight_turn = prompt;
+                target.agent_turn_open = agent;
+            }
+            Some(Ok(Indeterminate)) => target.historical_control_known = false,
+            Some(Err(error)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "open turn query refused");
+                continue;
+            }
+            None => continue,
+        }
+        match query_flushed(&state.acp_supervisor, &state.acp_event_store, &id,
+            "live work", |store, id| store.holds_live_work(id)).await {
+            Some(Ok(Known(live))) => target.holds_live_work = live,
+            Some(Ok(Indeterminate)) => {
+                target.historical_control_known = false;
+                target.holds_live_work = true;
+            }
+            Some(Err(error)) => {
+                tracing::warn!(target: "acp.supervisor", session = %id, %error, "live work query refused");
+                continue;
+            }
+            None => continue,
         }
         if target.historical_control_known
-            && record_and_check_respawn_budget(respawn_history, &id, Instant::now())
-        {
-            tracing::warn!(
-                target: "acp.supervisor",
-                session = %id,
-                max_respawns = RECONCILER_MAX_RESPAWNS_IN_WINDOW,
-                window_secs = RECONCILER_RESPAWN_WINDOW.as_secs(),
-                "structured-view worker respawn budget exhausted; parking session"
-            );
-            if parked.insert(id.clone()) {
-                crate::server::api::publish_startup_error_if_current(
-                    state,
-                    &id,
-                    &target.source_profile,
-                    target.lifecycle_generation,
-                    park_message(&target.project_path),
-                )
-                .await;
-            }
-            attempted.insert(id);
-            continue;
+        && record_and_check_respawn_budget(respawn_history, &id, Instant::now())
+    {
+        tracing::warn!(
+            target: "acp.supervisor",
+            session = %id,
+            max_respawns = RECONCILER_MAX_RESPAWNS_IN_WINDOW,
+            window_secs = RECONCILER_RESPAWN_WINDOW.as_secs(),
+            "structured-view worker respawn budget exhausted; parking session"
+        );
+        if parked.insert(id.clone()) {
+            crate::server::api::publish_startup_error_if_current(
+                state,
+                &id,
+                &target.source_profile,
+                target.lifecycle_generation,
+                park_message(&target.project_path),
+            )
+            .await;
         }
+        attempted.insert(id);
+        continue;
+    }
         attempted.insert(id);
         tasks.push(target);
     }
@@ -548,18 +588,9 @@ pub async fn reconcile_acp_workers(
         return;
     }
 
-    // Live served-profile config bounds cold resumes; the supervisor owns the total cap.
-    let namespace = state.profile_namespace.read().await;
-    let served = state.served_profile().to_string();
-    let live_max_workers = tokio::task::spawn_blocking(move || {
-        crate::session::config::profile_config::resolve_config_or_warn(&served)
-            .acp
-            .max_concurrent_workers
-    })
-    .await
-    .unwrap_or_else(|_| state.acp_supervisor.max_concurrent_workers());
-    drop(namespace);
-    let resume_limit = MAX_CONCURRENT_RESUMES.min(live_max_workers).max(1);
+    let resume_limit = MAX_CONCURRENT_RESUMES
+        .min(state.acp_supervisor.max_concurrent_workers())
+        .max(1);
     let semaphore = Arc::new(Semaphore::new(resume_limit as usize));
     let mut set: JoinSet<(String, ResumeOutcome)> = JoinSet::new();
     #[cfg(test)]
@@ -1808,6 +1839,76 @@ mod tests {
                 "with_marker={with_marker}"
             );
         }
+    }
+
+    /// An unreadable event log neither spawns nor pins the session: it stays
+    /// eligible, uncharged, and resumes on the first pass after the log recovers.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_open_turn_probe_retries_after_recovery() {
+        let id = "s-probe-fails";
+        let (_home, state, _project) = test_state(id);
+        let mut tick = Tick::default();
+
+        state.acp_event_store.test_set_unavailable(true);
+        tick.run(&state).await;
+        assert!(
+            !tick.attempted.contains(id),
+            "a failed probe is not an attempt"
+        );
+        assert!(
+            !tick.respawn_history.contains_key(id),
+            "and charges no budget"
+        );
+
+        state.acp_event_store.test_set_unavailable(false);
+        tick.run(&state).await;
+        assert!(tick.attempted.contains(id), "the next pass resumes it");
+    }
+
+    /// A runner retains the completion of its last user prompt and replays it on attach. An
+    /// agent-initiated turn after that prompt must not be classified as a prompt in flight
+    /// (which would let the replay close it), and only its own terminal releases the hold.
+    #[test]
+    fn an_agent_turn_after_a_completed_prompt_is_not_a_prompt_in_flight() {
+        use crate::acp::Event;
+        let (_home, state, _project) = test_state("s-reattach");
+        let id = "s-reattach";
+        let store = &state.acp_event_store;
+        let events = [
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+                merged_prompt_ids: Vec::new(),
+                synthesized: false,
+                origin_plugin: None,
+            },
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+            Event::AgentMessageChunk {
+                text: "woken".into(),
+                message_id: None,
+            },
+        ];
+        for (i, event) in events.iter().enumerate() {
+            let metadata = if matches!(event, Event::AgentMessageChunk { .. }) {
+                crate::server::test_support::sql_projection_metadata()
+            } else {
+                crate::acp::event_sender::EventMetadata::host(event)
+            };
+            store.record(id, i as u64 + 1, event, &metadata).unwrap();
+        }
+        assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, true)));
+        assert_eq!(store.holds_live_work(id).unwrap(), Known(true));
+
+        let stop = Event::Stopped {
+            reason: "agent_idle".into(),
+        };
+        store.record(id, 4, &stop, &crate::acp::event_sender::EventMetadata::host(&stop)).unwrap();
+        assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, false)));
+        assert_eq!(store.holds_live_work(id).unwrap(), Known(false));
     }
 
     #[tokio::test]

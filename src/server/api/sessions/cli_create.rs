@@ -153,6 +153,15 @@ fn resolve_host_creation(
                 .map(|project| project.path),
         );
     }
+    body.workspace = wants_workspace(
+        options.workspace,
+        options.generated_name,
+        body.worktree_branch
+            .as_deref()
+            .is_some_and(|b| !b.trim().is_empty()),
+        body.create_new_branch,
+        config.worktree.workspace_by_default,
+    );
     if !original_repos.is_empty() {
         original_repos.extend(body.extra_repo_paths.iter().map(std::path::PathBuf::from));
         let mut pairs: Vec<_> = std::mem::take(&mut body.repo_bases)
@@ -181,7 +190,10 @@ fn resolve_host_creation(
             crate::session::builder::resolve_repo_base_selectors(&original_repos, &pairs)?
                 .into_iter()
                 .map(|(path, base_branch)| {
-                    let path = if mono_repo {
+                    // A workspace plans from the launch path, which may be a linked worktree.
+                    let path = if mono_repo && body.workspace {
+                        std::path::PathBuf::from(&body.path)
+                    } else if mono_repo {
                         path
                     } else {
                         path.canonicalize().context(
@@ -213,6 +225,10 @@ fn resolve_host_creation(
     anyhow::ensure!(
         !options.generated_name || body.extra_repo_paths.is_empty(),
         "--generated-name does not apply to multi-repo workspaces"
+    );
+    anyhow::ensure!(
+        !options.generated_name || options.workspace != Some(true),
+        "--generated-name does not apply to a workspace"
     );
     let unknown_tool = |description: &str| {
         let mut names = crate::agents::agent_names();
@@ -431,4 +447,44 @@ fn resolve_host_creation(
     }
     body.cli = Some(options);
     Ok((body, warnings))
+}
+
+/// An explicit flag wins over the setting. The setting only applies to a
+/// worktree session creating its branch: attaching reuses the branch's existing
+/// checkout, which a workspace cannot. `--generated-name` opts out because a
+/// workspace directory ignores the title.
+fn wants_workspace(
+    flag: Option<bool>,
+    generated_name: bool,
+    has_worktree: bool,
+    create_new_branch: bool,
+    workspace_by_default: bool,
+) -> bool {
+    flag.unwrap_or(workspace_by_default && has_worktree && create_new_branch && !generated_name)
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::wants_workspace;
+
+    #[test]
+    fn workspace_flag_overrides_the_setting() {
+        let cases = [
+            (None, false, true, true, false, false),
+            (None, false, true, true, true, true),
+            (None, false, true, false, true, false),
+            (None, false, false, true, true, false),
+            (None, true, true, true, true, false),
+            (Some(true), false, true, true, false, true),
+            (Some(true), false, true, false, false, true),
+            (Some(false), false, true, true, true, false),
+        ];
+        for (flag, generated, worktree, new_branch, default, want) in cases {
+            assert_eq!(
+                wants_workspace(flag, generated, worktree, new_branch, default),
+                want,
+                "{flag:?} generated={generated} worktree={worktree} new_branch={new_branch} default={default}"
+            );
+        }
+    }
 }

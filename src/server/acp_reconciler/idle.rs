@@ -159,16 +159,10 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             let _ = entered.send(());
             let _ = release.await;
         }
-        if !matches!(
-            query_store(
-                &state.acp_event_store,
-                &id,
-                "idle-reap quota hold",
-                |store, id| store.rate_limit_park(id),
-            )
-            .await,
-            Some(Ok(Known(None)))
-        ) {
+        if !matches!(super::query_flushed(
+            &state.acp_supervisor, &state.acp_event_store, &id,
+            "idle-reap quota hold", |store, id| store.rate_limit_park(id),
+        ).await, Some(Ok(Known(None)))) {
             continue;
         }
         let Some((lease, activity_seq)) = state.acp_supervisor.idle_observation(&id) else {
@@ -178,7 +172,9 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         let Some(scope) = lease.native_scope().ok().flatten() else {
             continue;
         };
-        let probe = query_store(
+        // Re-check after queued events reach the store; a failed probe is busy.
+        let probe = super::query_flushed(
+            &state.acp_supervisor,
             &state.acp_event_store,
             &id,
             "idle-reap eligibility",
@@ -187,7 +183,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                     store
                         .last_event_at_for_sessions(&[id.to_owned()])
                         .remove(id),
-                    store.has_in_flight_turn(id),
+                    store.holds_live_work(id),
                     store.has_open_tool_call_in_epoch(id),
                     !store.unresolved_approval_nonces(id).is_empty()
                         || !store.unresolved_elicitation_nonces(id).is_empty(),
@@ -195,7 +191,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             },
         )
         .await;
-        let Some((latest, in_flight, open_tool, awaiting_user)) = probe else {
+        let Some((latest, holds_live_work, open_tool, awaiting_user)) = probe else {
             continue;
         };
         let last_ms = latest.map(|last| last.max(lease.idle_baseline_ms()));
@@ -205,7 +201,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
                 chrono::Utc::now().timestamp_millis(),
                 last_ms,
                 idle_secs,
-                !matches!(in_flight, Ok(Known(false))),
+                !matches!(holds_live_work, Ok(Known(false))),
             )
         {
             continue;

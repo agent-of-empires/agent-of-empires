@@ -809,7 +809,8 @@ struct NativeCallbackContext {
     original: std::sync::Arc<NativeCallbackOriginal>,
     stamp: Option<NativeSessionStamp>,
     original_stamp: Option<OriginalRequestStamp>,
-    session_id: Option<std::sync::Arc<str>>,
+    parent_session_id: Option<std::sync::Arc<str>>,
+    target_session_id: Option<std::sync::Arc<str>>,
     fence: std::sync::Arc<crate::session::NativeInputFence>,
 }
 
@@ -853,26 +854,32 @@ impl NativeCallbackContext {
                         ),
                     EstablishmentRefusal::Superseded
                 );
-                // A New callback does not select an id. Load must match its
-                // already-known id; global forms remain bound to this peer.
+                // A New callback does not select an id. A Load decision remains
+                // bound to its observed parent, including a registered child target.
                 if let (EstablishmentTarget::Load { session_id, .. }, Some(reported)) =
-                    (&self.original.attempt.target, self.session_id.as_deref())
+                    (&self.original.attempt.target, self.parent_session_id.as_deref())
                 {
                     anyhow::ensure!(session_id == reported, EstablishmentRefusal::Superseded);
                 }
             }
             if new_io {
                 anyhow::ensure!(
-                    self.session_id
+                    self.target_session_id
                         .as_deref()
                         .is_some_and(|sid| !sid.is_empty()),
                     EstablishmentRefusal::Unconfirmed
+                );
+                anyhow::ensure!(
+                    self.parent_session_id.as_ref().is_none_or(|parent|
+                        self.target_session_id.as_ref() == Some(parent)),
+                    EstablishmentRefusal::Superseded
                 );
             }
             if let (true, Some(postimage), Some(session_id)) = (
                 current || new_io,
                 self.original.postimage.get(),
-                self.session_id.as_deref(),
+                if new_io { self.target_session_id.as_deref() }
+                else { self.parent_session_id.as_deref() },
             ) {
                 anyhow::ensure!(
                     postimage.choice.acp_session_id.as_deref() == Some(session_id),
@@ -1013,7 +1020,8 @@ impl NativeRequestContext {
         original: std::sync::Arc<NativeCallbackOriginal>,
         stamp: Option<NativeSessionStamp>,
         original_stamp: Option<OriginalRequestStamp>,
-        session_id: Option<std::sync::Arc<str>>,
+        parent_session_id: Option<std::sync::Arc<str>>,
+        target_session_id: Option<std::sync::Arc<str>>,
     ) -> anyhow::Result<Self> {
         let fence = crate::session::NativeInputFence::capture_route(
             &original.attempt.profile,
@@ -1041,7 +1049,8 @@ impl NativeRequestContext {
                 original,
                 stamp,
                 original_stamp,
-                session_id,
+                parent_session_id,
+                target_session_id,
                 fence,
             }),
         })
@@ -1133,7 +1142,8 @@ impl NativeRequestContext {
                             .store
                             .as_ref()
                             .and_then(|binding| binding.exported_default_store.as_ref())
-                    && left.session_id == right.session_id
+                    && left.parent_session_id == right.parent_session_id
+                    && left.target_session_id == right.target_session_id
             }
             _ => false,
         }

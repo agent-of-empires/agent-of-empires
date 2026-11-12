@@ -870,7 +870,7 @@ pub(crate) async fn with_managed_capacity<F>(
         })
     };
     let store = Arc::new(
-        EventStore::open(&home.path().join("managed-events.db"), retained_events).unwrap(),
+        EventStore::open(&home.path().join("managed-events.db"), retained_events, Default::default()).unwrap(),
     );
     let state = crate::server::test_support::build_test_app_state_with_event_capacity(
         Vec::new(),
