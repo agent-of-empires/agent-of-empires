@@ -314,7 +314,19 @@ fn is_http_url(url: &str) -> bool {
         return false;
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    !authority.is_empty() && !authority.contains(['@', '%']) && !authority.starts_with(':')
+    if authority.is_empty() || authority.contains(['@', '%']) || authority.starts_with(':') {
+        return false;
+    }
+    // A bracketed IPv6 host keeps its colons; otherwise the last colon starts the port.
+    let port = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((_, "")) => None,
+            Some((_, tail)) => tail.strip_prefix(':'),
+            None => return false,
+        },
+        None => authority.rsplit_once(':').map(|(_, port)| port),
+    };
+    port.is_none_or(|port| port.is_empty() || port.parse::<u16>().is_ok())
 }
 
 #[cfg(test)]
@@ -387,10 +399,28 @@ mod tests {
             let err = validate_items(&spec(), &HashMap::new(), vec![bad]).unwrap_err();
             assert!(err.contains(expected), "{expected:?} not in {err:?}");
         }
-        for url in ["HTTPS://example.com/x", "http://host:8080/p?q#f"] {
+        for url in [
+            "HTTPS://example.com/x",
+            "http://host:8080/p?q#f",
+            "http://[::1]:8080/",
+            "http://[::1]/",
+        ] {
             let mut ok = item("a", "assigned");
             ok.source_url = url.into();
             assert!(validate_items(&spec(), &HashMap::new(), vec![ok]).is_ok());
+        }
+        for url in [
+            "https://example.com:7z/",
+            "https://example.com:70000/",
+            "http://[::1]:x/",
+            "http://[::1/",
+        ] {
+            let mut bad = item("a", "assigned");
+            bad.source_url = url.into();
+            assert!(
+                validate_items(&spec(), &HashMap::new(), vec![bad]).is_err(),
+                "{url} accepted"
+            );
         }
         let dup = validate_items(
             &spec(),
