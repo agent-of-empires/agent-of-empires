@@ -705,12 +705,20 @@ describe("BackgroundAgentsPanel", () => {
         agentId: "a1",
         toolCallId: "t1",
         status: "completed",
-        endedAt: new Date().toISOString(),
+        startedAt: "2026-01-01T00:00:10Z",
+        endedAt: "2026-01-01T00:00:15Z",
         prompt: "a very long prompt that the narrow panel would clamp",
         result: "the complete final result text",
         tools: [{ name: "Bash", title: "ls", ok: true }],
       }),
-      agent({ agentId: "a2", toolCallId: "t2", description: "Second one", status: "completed", endedAt: "2020-01-01" }),
+      agent({
+        agentId: "a2",
+        toolCallId: "t2",
+        description: "Second one",
+        status: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        endedAt: "2026-01-01T00:00:05Z",
+      }),
     ]);
     const { getByRole, container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     fireEvent.click(getByRole("button", { name: /Map backend lifecycle/ }));
