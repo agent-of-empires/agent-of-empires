@@ -1733,10 +1733,10 @@ impl ToolBlocks<'_> {
                     }
                     SubagentState::Idle if card.completed.is_none() || stopped => {
                         card.completed = Some(ToolCompletion {
-                            outcome: if record.stop_reason.as_deref() == Some("error") {
-                                ToolOutcome::Error
-                            } else {
-                                ToolOutcome::Ok
+                            outcome: match record.stop_reason.as_deref() {
+                                Some("error") => ToolOutcome::Error,
+                                Some("cancelled") => ToolOutcome::Stopped,
+                                _ => ToolOutcome::Ok,
                             },
                             content: String::new(),
                         });
@@ -3130,6 +3130,14 @@ mod tests {
                 vec![
                     "tool ✗ · Explore repo · idle",
                     "  (tool failed; press `o` for details)",
+                ],
+            ),
+            (
+                Idle,
+                Some("cancelled"),
+                vec![
+                    "tool ◼ · Explore repo · idle",
+                    "  (stopped when the turn ended)",
                 ],
             ),
             (Unknown, None, vec!["tool ▶ · Explore repo · unknown"]),
