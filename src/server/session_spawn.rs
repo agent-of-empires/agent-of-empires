@@ -1282,10 +1282,25 @@ mod tests {
             ("hook", Some("echo created"), false, None),
             ("slow hook", Some("echo slow"), false, None),
             ("failing hook", Some("exit 7"), false, None),
-            ("failing hook created without setup", Some("exit 7"), true, None),
+            (
+                "failing hook created without setup",
+                Some("exit 7"),
+                true,
+                None,
+            ),
             ("no hook created without setup", None, true, None),
-            ("pull, then hook", Some("echo created"), false, Some("exit 0")),
-            ("pull, created without setup", Some("echo created"), true, Some("exit 0")),
+            (
+                "pull, then hook",
+                Some("echo created"),
+                false,
+                Some("exit 0"),
+            ),
+            (
+                "pull, created without setup",
+                Some("echo created"),
+                true,
+                Some("exit 0"),
+            ),
             ("pull without hooks", None, false, Some("exit 0")),
             (
                 "failed pull",
