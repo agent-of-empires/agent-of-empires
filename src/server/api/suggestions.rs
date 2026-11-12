@@ -126,7 +126,7 @@ pub async fn get_suggestions(State(state): State<Arc<AppState>>) -> impl IntoRes
     let result = tokio::task::spawn_blocking(move || {
         let providers = suggestions::providers();
         // Disk reads stay off the store lock.
-        let registered = crate::session::projects::load_merged(&profile).unwrap_or_default();
+        let registered = crate::session::projects::load_merged(&profile)?;
         let (mut snapshot, mappings) = host.with_suggestions_db(|conn, profile| {
             Ok::<_, anyhow::Error>((
                 suggestions::snapshot(conn, profile, &providers)?,
