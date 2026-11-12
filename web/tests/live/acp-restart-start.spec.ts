@@ -44,9 +44,12 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const restart = line.getByRole("button", { name: "Restart Claude Code" });
   await expect(restart).toHaveCount(0);
 
-  // The line says the composer is open; a prompt the daemon accepts now is stopped by a restart.
+  // Wait for current governed prompt-intent admission, not Native readiness.
   const composer = page.locator('textarea[name="input"]');
   await composer.fill(PROMPT);
+  await expect(page.getByRole("button", { name: "Pending until Claude Code is ready", exact: true })).toBeEnabled({
+    timeout: 15_000,
+  });
   // Stop and the caption are optimistic; the response proves the daemon took the prompt before Restart.
   const admitted = page.waitForResponse(
     (r) => r.url().endsWith("/acp/prompt") && r.request().postDataJSON()?.text === PROMPT,
