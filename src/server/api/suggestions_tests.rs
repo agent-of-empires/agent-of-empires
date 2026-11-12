@@ -202,6 +202,10 @@ async fn snapshot_and_refresh() {
     assert_eq!(body["items"][0]["id"], "a");
     assert_eq!(body["items"][0]["dismissed"], false);
     assert_eq!(body["prefs"]["refresh_minutes"], 15);
+    assert!(
+        body["profile"].is_string(),
+        "clients check it against their own"
+    );
 
     for uri in ["/api/suggestions/refresh", "/api/suggestions/checks/run"] {
         let (status, _, body) = f.call(Method::POST, uri, json!({})).await;

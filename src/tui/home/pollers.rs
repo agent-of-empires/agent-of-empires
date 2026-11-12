@@ -51,6 +51,7 @@ impl HomeView {
 
     /// Drains the suggestions worker. True when state changed.
     pub fn apply_suggestions_results(&mut self) -> bool {
+        self.suggestions_feed.set_profile(self.config_profile());
         self.suggestions_feed
             .tick(self.session_feed.latest_snapshot().is_some());
         let mut polled = self.suggestions_feed.poll();
