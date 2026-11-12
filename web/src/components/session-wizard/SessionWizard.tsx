@@ -765,7 +765,6 @@ export function SessionWizard({
     // Setup restores foreground ownership: StrictMode runs setup, cleanup, setup on one mount.
     backgroundRef.current = false;
     unmountedRef.current = false;
-    stopBackgroundPoll();
     const adopted = unknownOutcomeRef.current;
     if (adopted) claimPendingCreate(adopted.body.idempotency_key);
     return () => {
