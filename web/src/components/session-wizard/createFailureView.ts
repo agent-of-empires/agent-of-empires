@@ -110,7 +110,7 @@ export function failureView(
         primary: "launch_with_current_image",
         secondary: null,
         row: "sandbox",
-        cue: "latest image pull failed",
+        cue: "pull failed",
       };
     case "hook_failed":
       // In a Sandbox the Repo hooks run inside the container, so turning it off is no fix.
