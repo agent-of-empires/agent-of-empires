@@ -71,6 +71,17 @@ fn resolved_yolo<'a>(
     }
 }
 
+/// Whether appending the agent's YOLO flag would land it on a shell operator
+/// rather than the agent, because the command is not a plain invocation. An
+/// environment-variable mode prefixes the command and stays inside it.
+fn yolo_flag_needs_direct_launch(
+    command: &str,
+    yolo: Option<&crate::agents::YoloMode<'_>>,
+) -> bool {
+    matches!(yolo, Some(crate::agents::YoloMode::CliFlag(_)))
+        && aoe_plugin_api::agent_integration::direct_launch_words(command).is_none()
+}
+
 fn prime_runtime_for_capture(
     capture: Option<&CaptureContext>,
 ) -> Option<&crate::process::prime::PrimeRuntime> {
@@ -1222,6 +1233,19 @@ impl Instance {
                 if let Some(declared) = declared.filter(|agent| {
                     agent.contribution().command.as_deref() == Some(self.get_tool_command())
                 }) {
+                    let command = self.get_tool_command();
+                    let appends_flag = self.is_yolo_mode()
+                        && declared
+                            .with_definition(|agent| {
+                                yolo_flag_needs_direct_launch(command, agent.yolo.as_ref())
+                            })
+                            .unwrap_or(false);
+                    anyhow::ensure!(
+                        !appends_flag,
+                        "declared agent {} declares shell syntax in its command `{}`, so appending its YOLO flag would reach the shell instead of the agent; declare the bare agent invocation",
+                        self.tool,
+                        command
+                    );
                     return declared
                         .with_definition(|agent| {
                             self.build_launch_command_for_agent_in(
@@ -1808,6 +1832,29 @@ mod tests {
     use super::*;
     use crate::agents::AgentGeneration;
     use crate::session::instance::test_helpers::*;
+
+    #[test]
+    fn yolo_flag_requires_a_direct_agent_invocation() {
+        let flag = crate::agents::YoloMode::CliFlag("--yolo");
+        let env = crate::agents::YoloMode::EnvVar("AOE_TEST_PERMISSION", "allow");
+        for (command, yolo, needs) in [
+            ("helper --verbose", &flag, false),
+            ("TOKEN=local helper", &flag, false),
+            ("helper | tee /tmp/helper.log", &flag, true),
+            ("helper; echo done", &flag, true),
+            ("helper > /tmp/helper.log", &flag, true),
+            ("helper # trailing", &flag, true),
+            // A prefix stays inside the pipeline's first command.
+            ("helper | tee /tmp/helper.log", &env, false),
+        ] {
+            assert_eq!(
+                yolo_flag_needs_direct_launch(command, Some(yolo)),
+                needs,
+                "{command}"
+            );
+        }
+        assert!(!yolo_flag_needs_direct_launch("helper | tee", None));
+    }
 
     #[test]
     fn parses_assignments_and_quoted_executable_for_resume() {
