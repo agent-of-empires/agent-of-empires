@@ -1294,6 +1294,13 @@ mod tests {
                 Some("echo 'manifest unknown' >&2; exit 1"),
             ),
             ("cancelled pull", Some("echo created"), false, Some("block")),
+            // Exits 0 inside the cancel's grace, so the pull itself reports success.
+            (
+                "pull finishes as it is cancelled",
+                Some("echo created"),
+                false,
+                Some("finish"),
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let _app = crate::session::test_support::isolate_app_dir_at(root.path());
@@ -1318,7 +1325,18 @@ mod tests {
             let started = root.path().join("hook-started");
             let release = root.path().join("hook-release");
             let pulling = root.path().join("pull-pid");
+            let pull_gate = root.path().join("pull-gate");
+            let pull_exited = root.path().join("pull-exited");
             let pull_answer = match pull {
+                Some("finish") => {
+                    nix::unistd::mkfifo(&pull_gate, nix::sys::stat::Mode::S_IRWXU).unwrap();
+                    format!(
+                        "echo $$ > '{}'; read _ < '{}'; touch '{}'; exit 0",
+                        pulling.display(),
+                        pull_gate.display(),
+                        pull_exited.display()
+                    )
+                }
                 Some("block") => format!(
                     "echo $$ > '{}'; i=0; until [ $i -ge 1200 ]; do sleep 0.05; i=$((i+1)); done",
                     pulling.display()
@@ -1474,7 +1492,7 @@ mod tests {
                 std::fs::write(&release, "").unwrap();
             }
             let mut pull_pid = None;
-            if label == "cancelled pull" {
+            if matches!(label, "cancelled pull" | "pull finishes as it is cancelled") {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while !pulling.exists() {
                     assert!(
@@ -1496,6 +1514,9 @@ mod tests {
                     .expect("the creation published its row before the pull")
                     .id;
                 assert!(state.session_service.cancel_creation(&id));
+                if pull == Some("finish") {
+                    std::fs::write(&pull_gate, "\n").unwrap();
+                }
                 pull_pid = Some(
                     std::fs::read_to_string(&pulling)
                         .unwrap()
@@ -1530,10 +1551,16 @@ mod tests {
             assert_eq!(pulled_at.is_some(), pull.is_some(), "{label}: {log}");
             assert_eq!(
                 invalidated() - generation,
-                u64::from(pull == Some("exit 0")),
+                u64::from(matches!(pull, Some("exit 0" | "finish"))),
                 "{label}: only a successful pull invalidates the image status"
             );
-            if matches!(label, "failing hook" | "failed pull" | "cancelled pull") {
+            if matches!(
+                label,
+                "failing hook"
+                    | "failed pull"
+                    | "cancelled pull"
+                    | "pull finishes as it is cancelled"
+            ) {
                 let error = result.expect_err("the create failed");
                 match label {
                     "failing hook" => {
@@ -1546,6 +1573,16 @@ mod tests {
                         assert_eq!(
                             (failed.image.as_str(), failed.detail.as_str()),
                             ("test-image", "manifest unknown")
+                        );
+                    }
+                    "pull finishes as it is cancelled" => {
+                        assert!(
+                            error.is::<crate::server::session_service::CreationCancelled>(),
+                            "{error:#}"
+                        );
+                        assert!(
+                            pull_exited.exists(),
+                            "the pull was killed, so the post-pull window went untested"
                         );
                     }
                     _ => {
