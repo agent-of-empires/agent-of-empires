@@ -1,13 +1,14 @@
 // @vitest-environment jsdom
 
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { useLayoutEffect } from "react";
+import { act, fireEvent, render as renderView, renderHook, waitFor, within } from "@testing-library/react";
+import { createElement, useLayoutEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, nativeInputAvailable } from "../lib/acpTypes";
+import { emptyAcpState, nativeInputAvailable, type SubagentRecord } from "../lib/acpTypes";
 import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { useCancelEscalation } from "../components/acp/useCancelEscalation";
+import { BackgroundAgentsPanel } from "../components/acp/BackgroundAgentsPanel";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -1256,4 +1257,193 @@ describe("current native admission", () => {
     expect(result.current.state.queuedPrompts.map((row) => row.text)).toEqual(["initial explicit intent"]);
     expect(result.current.state.connectionReady).toBe(false);
   });
+});
+
+describe("live panel cancellation authority", () => {
+  const childId = "panel-child";
+  const startedAt = "2026-01-01T00:00:00Z";
+  const panelElements = (sessionId: string) => createElement("div", null,
+    ...["desktop background work", "mobile background work"].map((name) =>
+      createElement("section", { key: name, "aria-label": name },
+        createElement(BackgroundAgentsPanel, { sessionId }),
+      ),
+    ),
+  );
+  const seedChild = (socket: FakeWebSocket, sessionId: string, seq = 0) => {
+    const child: SubagentRecord = {
+      session_id: childId,
+      parent_session_id: sessionId,
+      parent_tool_call_id: "panel-tool",
+      state: "running",
+      cancel_capable: true,
+    };
+    socket.message({
+      session_id: sessionId, seq: seq + 1, event: { BackgroundAgentLaunched: {
+        agent_id: "panel-agent", tool_call_id: "panel-tool", description: "Linked panel child",
+        prompt: "Retained child instructions", model: "test-model", started_at: startedAt,
+      } },
+    });
+    socket.message({
+      session_id: sessionId, seq: seq + 2, event: { SubagentUpdated: { subagent: child, at: startedAt } },
+    });
+  };
+
+  it.each(["unknown", "disconnected"] as const)(
+    "refuses child and whole-turn gestures from both cached panels while %s",
+    async (phase) => {
+      const id = "sess-panel-refused";
+      const hook = await openSessionWithReceipt({ ready: phase !== "unknown" }, id);
+      seedChild(lastSocket(), id);
+      await flushAsync();
+      if (phase === "disconnected") lastSocket().drop();
+      expect(nativeInputAvailable(hook.result.current.state)).toBe(false);
+      const view = renderView(panelElements(id), { wrapper: profileWrapper });
+      const regions = view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ });
+      expect(regions).toHaveLength(2);
+      for (const region of regions) {
+        fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+        fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+      }
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([]);
+      for (const region of regions) {
+        await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
+      }
+      expect(sockets).toHaveLength(1);
+      view.unmount();
+      hook.unmount();
+    },
+  );
+
+  it("checks the committed runtime before cached panel publication and permits a fresh Available gesture", async () => {
+    const id = "sess-panel-layout";
+    let clickAtCommit: (() => void) | undefined;
+    const hook = renderHook(() => {
+      const session = useAcpSession(id);
+      useLayoutEffect(() => {
+        if (!clickAtCommit || nativeInputAvailable(session.state)) return;
+        const click = clickAtCommit;
+        clickAtCommit = undefined;
+        click();
+      }, [session.state, session.status]);
+      return session;
+    }, { wrapper: profileWrapper });
+    await flushAsync();
+    lastSocket().open();
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }));
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    const region = view.getByRole("region", { name: "desktop background work" });
+    const stop = within(region).getByRole("button", { name: "Stop sub-agent" });
+    clickAtCommit = () => fireEvent.click(stop);
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: false }, 20));
+    expect(clickAtCommit).toBeUndefined();
+    await flushAsync();
+    expect(posts("/cancel")).toEqual([]);
+    await waitFor(() => expect(region.textContent).toContain("Native input is not currently confirmed"));
+
+    lastSocket().message(currentControlSnapshot(hook.result.current.state, { ready: true }, 20));
+    fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+    await flushAsync();
+    expect(posts("/cancel")).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+    ]);
+    await waitFor(() => expect(region.textContent).not.toContain("Native input is not currently confirmed"));
+    expect(sockets).toHaveLength(1);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it("uses exactly the selected child and root routes from both Available panels without a second socket", async () => {
+    const id = "sess-panel-available";
+    const hook = await openSession(id);
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+    }
+    await flushAsync();
+    expect(posts(`/acp/subagents/${childId}/cancel`)).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/subagents/${childId}/cancel`, body: null },
+    ]);
+    expect(posts("/acp/cancel")).toEqual([
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+      { method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: null },
+    ]);
+    expect(sockets).toHaveLength(1);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it("keeps a refused current child cancellation visible in each sibling panel", async () => {
+    calls = installAcpFakes(({ method, url }) =>
+      method === "POST" && url.endsWith(`/subagents/${childId}/cancel`)
+        ? new Response("subagent cannot be cancelled", { status: 409 }) : undefined,
+    );
+    const id = "sess-panel-error";
+    const hook = await openSession(id);
+    seedChild(lastSocket(), id);
+    await flushAsync();
+    const view = renderView(panelElements(id), { wrapper: profileWrapper });
+    for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      expect(await within(region).findByText(/Could not stop subagent \(409\)/)).toBeTruthy();
+    }
+    expect(posts(`/subagents/${childId}/cancel`)).toHaveLength(2);
+    view.unmount();
+    hook.unmount();
+  });
+
+  it.each(["target replacement", "runtime unmount"] as const)(
+    "invalidates saved child and whole-turn callbacks after %s without redirecting them",
+    async (transition) => {
+      const oldId = "sess-panel-old";
+      const nextId = transition === "target replacement" ? "sess-panel-new" : oldId;
+      const previous = renderHook(({ id }) => useAcpSession(id), {
+        initialProps: { id: oldId }, wrapper: profileWrapper,
+      });
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(previous.result.current.state, { ready: true }));
+      seedChild(lastSocket(), oldId);
+      await flushAsync();
+      const savedChild = previous.result.current.cancelSubagent;
+      const savedRoot = previous.result.current.cancelPrompt;
+      const view = renderView(panelElements(oldId), { wrapper: profileWrapper });
+      let current = previous;
+      if (transition === "target replacement") {
+        previous.rerender({ id: nextId });
+      } else {
+        previous.unmount();
+        current = renderHook(({ id }) => useAcpSession(id), {
+          initialProps: { id: nextId }, wrapper: profileWrapper,
+        });
+      }
+      await flushAsync();
+      lastSocket().open();
+      lastSocket().message(currentControlSnapshot(current.result.current.state, { ready: true }));
+      seedChild(lastSocket(), nextId, current.result.current.state.lastSeq);
+      await flushAsync();
+      expect(nativeInputAvailable(current.result.current.state)).toBe(true);
+      await act(async () => {
+        await savedChild(childId);
+        await savedRoot();
+      });
+      expect(posts("/cancel")).toEqual([]);
+
+      view.rerender(panelElements(nextId));
+      const region = view.getByRole("region", { name: "mobile background work" });
+      fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      await flushAsync();
+      expect(posts("/cancel")).toEqual([
+        { method: "POST", url: `/api/sessions/${nextId}/acp/subagents/${childId}/cancel`, body: null },
+      ]);
+      view.unmount();
+      current.unmount();
+    },
+  );
 });

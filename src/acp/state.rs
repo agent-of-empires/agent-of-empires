@@ -3900,6 +3900,8 @@ mod tests {
         };
         let assigned = Event::AcpSessionAssigned {
             acp_session_id: "s2".into(),
+            connection_ready: true,
+            native_subject: None,
         };
         for (seq, event) in [lost, stopped].into_iter().enumerate() {
             state.apply_event(seq as u64 + 1, event).unwrap();

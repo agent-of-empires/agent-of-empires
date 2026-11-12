@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
 import { applyEvent, applyReducedState, emptyAcpState } from "../../../lib/acpTypes";
@@ -555,6 +555,68 @@ describe("BackgroundAgentsPanel", () => {
       expect(container.textContent).toContain("Unknown");
       expect(getAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(1);
       subagentsMock.mockReturnValue([]);
+    });
+
+    describe("accepted subagent snapshot cards", () => {
+      afterEach(() => {
+        agentsMock.mockReturnValue([]);
+        subagentsMock.mockReturnValue([]);
+        tasksMock.mockReturnValue([]);
+        runsMock.mockReturnValue({});
+      });
+
+      it.each([
+        ["idle", "end_turn", "completed", "done", null],
+        ["idle", "end_turn", "completed", "done", "2026-01-01T00:00:05Z"],
+        ["idle", "error", "error", "error", null],
+        ["idle", "error", "error", "error", "2026-01-01T00:00:05Z"],
+        ["requires_action", null, "requires_action", "Waiting on you", null],
+        ["requires_action", null, "requires_action", "Waiting on you", "2026-01-01T00:00:05Z"],
+      ] as const)(
+        "restores %s/%s as %s (%s) without inventing clock evidence %s",
+        (state, stopReason, status, label, endedAt) => {
+          const startedAt = "2026-01-01T00:00:00Z";
+          const linked = agent({ startedAt, endedAt, status: endedAt === null ? "running" : "completed" });
+          const local = agent({ agentId: "local-card", toolCallId: "local-tool", description: "Local-only card" });
+          const localChild = record({
+            session_id: "local-child", parent_tool_call_id: null, title: "Local-only child", cancel_capable: false,
+          });
+          const held = {
+            ...emptyAcpState(), lastSeq: 7, backgroundAgents: [linked, local], subagents: [record(), localChild],
+          };
+          const header = currentControlSnapshot(held, { ready: true }, 8);
+          const wire = {
+            ...header.state, subagents: [record({ state, stop_reason: stopReason })],
+          };
+          const restored = applyReducedState(held, wire, header.unchanged, header.seq);
+          expect(restored.backgroundAgents.find((item) => item.agentId === linked.agentId)).toMatchObject({
+            status, startedAt, endedAt,
+          });
+          expect(restored.backgroundAgents.find((item) => item.agentId === local.agentId)).toEqual(local);
+          expect(restored.subagents).toContainEqual(localChild);
+          agentsMock.mockReturnValue(restored.backgroundAgents);
+          subagentsMock.mockReturnValue(restored.subagents);
+          tasksMock.mockReturnValue([]);
+          runsMock.mockReturnValue({});
+          const view = render(<BackgroundAgentsPanel sessionId="s-1" />);
+          expect(view.getByText(label)).toBeTruthy();
+          expect(view.queryAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(state === "idle" ? 0 : 1);
+          expect(view.getByText("Local-only card")).toBeTruthy();
+          expect(view.getByText("Local-only child")).toBeTruthy();
+
+          const older = applyReducedState(restored, {
+            ...wire, subagents: [record({ state: "running", stop_reason: null })],
+          }, [], 7);
+          expect(older.backgroundAgents).toEqual(restored.backgroundAgents);
+          expect(older.subagents).toEqual(restored.subagents);
+          agentsMock.mockReturnValue(older.backgroundAgents);
+          subagentsMock.mockReturnValue(older.subagents);
+          view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
+          expect(view.getByText(label)).toBeTruthy();
+          expect(view.queryAllByRole("button", { name: "Stop sub-agent" })).toHaveLength(state === "idle" ? 0 : 1);
+          view.unmount();
+        },
+      );
     });
   });
 
