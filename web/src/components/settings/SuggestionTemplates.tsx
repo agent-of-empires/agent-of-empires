@@ -67,19 +67,23 @@ function TemplateBlock({
   const value = edited ?? override ?? "";
   const effective = edited ?? override;
 
+  // Writes run one at a time, so the last one sent is the last one stored.
+  const tail = useRef<Promise<void>>(Promise.resolve());
   // Clears the draft only if it is still what the request submitted; a newer edit survives.
-  const run = async (request: Promise<SuggestionResult<unknown>>, submitted: string | null) => {
-    const result = await request;
-    if (!result.ok) {
-      onError(result.error);
-      return;
-    }
-    setEdited((current) => (current === submitted ? null : current));
-    await onSaved();
+  const run = (send: () => Promise<SuggestionResult<unknown>>, submitted: string | null) => {
+    tail.current = tail.current.then(async () => {
+      const result = await send();
+      if (!result.ok) {
+        onError(result.error);
+        return;
+      }
+      setEdited((current) => (current === submitted ? null : current));
+      await onSaved();
+    });
   };
   const commit = () => {
     if (edited !== null && edited !== override)
-      void run(putSuggestionTemplate(provider.id, source.criterion, edited), edited);
+      run(() => putSuggestionTemplate(provider.id, source.criterion, edited), edited);
     else setEdited(null);
   };
 
@@ -117,7 +121,7 @@ function TemplateBlock({
           className={GHOST}
           disabled={disabled || override === null}
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() => void run(resetSuggestionTemplate(provider.id, source.criterion), edited)}
+          onClick={() => run(() => resetSuggestionTemplate(provider.id, source.criterion), edited)}
         >
           Reset to the plugin&apos;s default
         </button>

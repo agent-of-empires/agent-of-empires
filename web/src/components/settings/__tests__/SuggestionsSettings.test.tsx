@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsSettings } from "../SuggestionsSettings";
 import type { TemplateFocus } from "../SuggestionTemplates";
 import { useSuggestionsSnapshot } from "../useSuggestionsSnapshot";
@@ -273,6 +273,24 @@ describe("SuggestionsSettings", () => {
     api.fetchSuggestions.mockResolvedValue(snapshot());
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("sends template saves one at a time, in the order they were made", async () => {
+    open();
+    let finishA: (v: typeof ok) => void = () => {};
+    api.putSuggestionTemplate.mockReturnValueOnce(new Promise((resolve) => (finishA = resolve)));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    fireEvent.change(field, { target: { value: "A" } });
+    fireEvent.blur(field);
+    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenCalledTimes(1));
+    fireEvent.change(field, { target: { value: "B" } });
+    fireEvent.blur(field);
+    await act(async () => {});
+    expect(api.putSuggestionTemplate).toHaveBeenCalledTimes(1);
+    finishA(ok);
+    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenCalledTimes(2));
+    expect(api.putSuggestionTemplate).toHaveBeenLastCalledWith("gh", "review-requested", "B");
   });
 
   it("opens straight on a focused template and returns to the suggestions view", async () => {
