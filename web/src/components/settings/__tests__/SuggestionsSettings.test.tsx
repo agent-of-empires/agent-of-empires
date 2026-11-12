@@ -330,6 +330,28 @@ describe("SuggestionsSettings", () => {
     await waitFor(() => expect(select.disabled).toBe(false));
   });
 
+  it("keeps the mapping controls locked while a newer load supersedes the mapping reload", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const select = (await screen.findByLabelText("Map github.com/o/r")) as HTMLSelectElement;
+    await waitFor(() => expect(select.disabled).toBe(false));
+    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    let first: (v: unknown[]) => void = () => {};
+    let second: (v: unknown[]) => void = () => {};
+    api.fetchSuggestionMappings
+      .mockReturnValueOnce(new Promise((resolve) => (first = resolve)))
+      .mockReturnValueOnce(new Promise((resolve) => (second = resolve)));
+    fireEvent.change(select, { target: { value: "/p/aoe" } });
+    await waitFor(() => expect(api.fetchSuggestionMappings).toHaveBeenCalledTimes(2));
+    fireEvent.change(field, { target: { value: "t" } });
+    fireEvent.blur(field);
+    await waitFor(() => expect(api.fetchSuggestionMappings).toHaveBeenCalledTimes(3));
+    await act(async () => first([]));
+    expect(select.disabled).toBe(true);
+    await act(async () => second([]));
+    await waitFor(() => expect(select.disabled).toBe(false));
+  });
+
   it("keeps the mapping controls locked after a failed reload until Retry succeeds", async () => {
     open();
     fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
