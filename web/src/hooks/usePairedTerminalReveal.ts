@@ -1,5 +1,6 @@
 import { useCallback } from "react";
 
+import { confirmFileEditPanes } from "../lib/fileEditGuard";
 import { dockOf, dockTabs, isActiveTab, isDockCollapsed, type DockLayout, type PaneLayoutApi } from "../lib/paneLayout";
 import { isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "../lib/panes";
 import type { ShellMode } from "../components/PairedTerminal";
@@ -7,10 +8,11 @@ import type { RightPanelView } from "../lib/rightPanelView";
 import { dispatchFocusTerminal, setPendingTerminalFocus } from "../lib/terminalFocus";
 
 /**
- * Shows and focuses the paired shell, never toggling back to the Agent; returns the terminal it shows.
- * `prepare` runs first with that terminal's index and returns whether it will remount the shell.
+ * Shows and focuses the paired shell, never toggling back to the Agent; returns the terminal it shows,
+ * or null when the user keeps an unsaved file edit. `prepare` runs first with that terminal's index and
+ * returns whether it will remount the shell.
  */
-export type RevealPairedTerminal = (prepare?: (terminalIndex: number) => boolean) => number;
+export type RevealPairedTerminal = (prepare?: (terminalIndex: number) => boolean) => number | null;
 
 export function usePairedTerminalReveal({
   singlePane,
@@ -28,6 +30,7 @@ export function usePairedTerminalReveal({
   return useCallback(
     (prepare) => {
       if (singlePane) {
+        if (!confirmFileEditPanes([null])) return null;
         prepare?.(0);
         // Below md there is one full-viewport pane. Promote the paired view, then
         // dispatch focus on the next frame: the inactive layer is inert until React
