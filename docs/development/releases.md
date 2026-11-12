@@ -133,6 +133,12 @@ and one generated release archive before approval.
 Crane dependency-only builds must restore real vendored patch sources and original
 manifests after generating workspace stubs: registry dependencies call their APIs.
 Keep that restore hook's input vendor-only so application edits retain the dependency cache.
+Dependency derivations also take metadata and Cargo vendoring from the original
+manifest and lockfile, never from generated dummy sources. Before release, evaluate
+both configured packages and the development shell for every system advertised by
+the [Nix CI matrix](../../.github/workflows/ci.yml) with
+`--option allow-import-from-derivation false`; cross-system evaluation must not
+try to realize foreign generated sources.
 
 Supported source installation uses this repository's Git checkout and lockfile
 (`cargo install --path . --locked`, or the project's Git-based installer).

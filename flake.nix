@@ -70,6 +70,15 @@
             inherit nativeBuildInputs buildInputs;
           };
 
+          # Explicit dummy sources must not supply evaluation-time metadata or Cargo config.
+          dependencyMetadata = craneLib.crateNameFromCargoToml {
+            cargoToml = ./Cargo.toml;
+          };
+          dependencyVendorDir = craneLib.vendorCargoDeps {
+            src = commonArgs.src;
+            cargoLock = ./Cargo.lock;
+          };
+
           # Registry dependencies call these path patches even while workspace crates are stubs.
           # Keep the copy hook independent of application edits: this source contains only vendor.
           # The flake's Git snapshot supplies only tracked fork files.
@@ -86,9 +95,12 @@
           };
 
           # Build only workspace dependencies first (for caching).
-          cargoArtifacts = craneLib.buildDepsOnly ((builtins.removeAttrs commonArgs [ "src" ]) // {
-            dummySrc = dependencyDummySrc;
-          });
+          cargoArtifacts = craneLib.buildDepsOnly (
+            (builtins.removeAttrs commonArgs [ "src" ]) // dependencyMetadata // {
+              dummySrc = dependencyDummySrc;
+              cargoVendorDir = dependencyVendorDir;
+            }
+          );
 
           aoe = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -148,9 +160,12 @@
           };
 
           # Rust dep cache compiled with --features web (no npm involved).
-          cargoArtifactsWithWeb = craneLib.buildDepsOnly ((builtins.removeAttrs commonArgsWithWeb [ "src" ]) // {
-            dummySrc = dependencyDummySrc;
-          });
+          cargoArtifactsWithWeb = craneLib.buildDepsOnly (
+            (builtins.removeAttrs commonArgsWithWeb [ "src" ]) // dependencyMetadata // {
+              dummySrc = dependencyDummySrc;
+              cargoVendorDir = dependencyVendorDir;
+            }
+          );
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
             cargoArtifacts = cargoArtifactsWithWeb;
