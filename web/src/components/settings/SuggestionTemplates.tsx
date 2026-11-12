@@ -261,11 +261,11 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
   const loadSeq = useRef(0);
   // The first load that may release the mapping lock: one started after the write has finished.
   const releaseFrom = useRef(Infinity);
-  // Resolves true when every resource loaded; only the latest call applies its result.
+  // Resolves true when the templates loaded, which is all a template save needs to confirm; only the latest call applies its result.
   const load = useCallback(async (): Promise<boolean> => {
     const seq = ++loadSeq.current;
     const [t, m, p] = await Promise.all([fetchSuggestionTemplates(), fetchSuggestionMappings(), fetchProjects({})]);
-    if (!mounted.current || seq !== loadSeq.current) return !!(t && m && p);
+    if (!mounted.current || seq !== loadSeq.current) return !!t;
     if (t) setTemplates(t);
     if (m) setMappings(m);
     setMappingsStale(!m);
@@ -276,7 +276,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
     if (p) setProjects(p);
     const failed = [!t && "templates", !m && "mappings", !p && "Projects"].filter(Boolean);
     setLoadError(failed.length > 0 ? `Could not load ${failed.join(", ")}.` : null);
-    return failed.length === 0;
+    return !!t;
   }, []);
 
   useEffect(() => {
