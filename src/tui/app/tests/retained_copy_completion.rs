@@ -1,7 +1,7 @@
 use super::*;
 use crate::tui::terminal_output::{
     install_test_output,
-    tests::{block_terminal, drain_terminal, private_terminal, resume_terminal},
+    tests::{block_terminal, drain_terminal, private_terminal, resume_terminal, TerminalDrainer},
 };
 use std::io::Seek;
 
@@ -204,26 +204,43 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
     assert!(app.home.handle_drag_start(x, y));
     assert!(app.home.handle_drag_move(x + CONTENT.len() as u16 - 1, y));
     assert!(app.home.handle_drag_end());
+    let drainer = TerminalDrainer::start(&master, std::mem::take(&mut bytes));
     // The production release path redraws before polling; that render admits the selection copy.
     app.draw(&mut terminal).unwrap();
     assert!(
         !app.home.preview_copy_pending,
         "the finalized selection must be consumed by its repaint"
     );
+    assert!(
+        app.home.presentation_ready,
+        "the release repaint must be presented before waiting for copy admission"
+    );
+    assert!(
+        app.pending_presentation.is_none(),
+        "the release repaint must not leave an unacknowledged frame"
+    );
+    assert!(
+        app.home.preview_selection.is_some(),
+        "the real selection must survive its release repaint"
+    );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            ticker.reset();
+            ticker.tick().await;
             app.reconcile_structured_preview().await;
             match observed.try_recv() {
                 Ok(()) => break,
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
-                    tokio::task::yield_now().await;
-                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 Err(error) => panic!("actual clipboard executor ended before writing: {error}"),
             }
         }
     })
     .await
     .expect("clipboard admission precondition: the real executor must write the sink before invalidation");
+    bytes = drainer.finish();
+    drain_terminal(&mut master, &mut bytes);
+    screen.process(&bytes[parsed..]);
+    parsed = bytes.len();
     assert_eq!(std::fs::read(&sink).unwrap(), CONTENT.as_bytes());
     block_terminal(&mut control);
     crate::tui::terminal_output::request_redraw();

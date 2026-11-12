@@ -178,7 +178,7 @@ pub(crate) fn drain_terminal(master: &mut File, bytes: &mut Vec<u8>) {
 }
 
 #[cfg(unix)]
-struct TerminalDrainer {
+pub(crate) struct TerminalDrainer {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     bytes: std::sync::Arc<Mutex<Vec<u8>>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -186,7 +186,7 @@ struct TerminalDrainer {
 
 #[cfg(unix)]
 impl TerminalDrainer {
-    fn start(master: &File, initial: Vec<u8>) -> Self {
+    pub(crate) fn start(master: &File, initial: Vec<u8>) -> Self {
         use std::io::Read;
         let mut master = master.try_clone().unwrap();
         let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -217,7 +217,7 @@ impl TerminalDrainer {
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    pub(crate) fn finish(mut self) -> Vec<u8> {
         self.stop();
         std::mem::take(&mut *self.bytes.lock().unwrap())
     }

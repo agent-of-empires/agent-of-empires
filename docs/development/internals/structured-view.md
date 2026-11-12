@@ -279,6 +279,8 @@ with a kernel-read baseline while the child holds terminal custody, before relea
 and normal reaping.
 Current-thread frame-pump regressions await a future timer deadline so the HTTP
 producer can progress; readiness still requires a real window and emitted frame.
+Private emulator readers consume release-frame output concurrently and are stopped
+and joined before the terminal is deliberately blocked.
 
 If a terminated process leaves input unusable, run `stty sane` from the shell.
 Input repair does not reset display modes. For supported xterm-compatible terminals,
