@@ -137,7 +137,7 @@ export function useAcpSession(
     inputStateRef.current = state;
     connectionStatusRef.current = status;
   }, [state, status]);
-  const actionOwner = useMemo(() => Symbol(), [sessionId]);
+  const actionOwner = useMemo(() => Symbol(sessionId ?? undefined), [sessionId]);
   const requireNativeInput = useCallback(
     (
       target?: NonNullable<AcpState["interactionError"]>["target"],
