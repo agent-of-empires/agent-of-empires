@@ -515,7 +515,9 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
 /** The machine-wide layer alone, for editors that show or set the value a
  *  profile inherits. Anything honoring a setting reads `fetchSettings`. */
 export function fetchMachineSettings(): Promise<SettingsResponse | null> {
-  return fetchJson<SettingsResponse>("/api/settings?layer=machine");
+  return fetchJson<SettingsResponse>("/api/settings?layer=machine", {
+    signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+  });
 }
 
 async function announceSave(save: Promise<boolean>): Promise<boolean> {
@@ -1532,7 +1534,9 @@ export interface TelemetryStatus {
 }
 
 export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
-  return fetchJson<TelemetryStatus>("/api/telemetry/status");
+  return fetchJson<TelemetryStatus>("/api/telemetry/status", {
+    signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+  });
 }
 
 /// Set the opt-in state. The daemon owns the anonymous install id; the
