@@ -313,7 +313,8 @@ impl Shared {
     }
 
     /// Only a child's tool calls and model reach the transcript; its own
-    /// messages and lifecycle must never read as the root session's.
+    /// lifecycle must never read as the root session's. A background child's
+    /// latest message is kept as its answer.
     pub(super) async fn handle_child_notification(&self, child: SessionId, update: SessionUpdate) {
         match update {
             SessionUpdate::SubagentUpdate(nested) => {
