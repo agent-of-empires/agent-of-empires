@@ -4238,7 +4238,9 @@ mod tests {
             "capture was actually emitted before opening Serve"
         );
         emitted.clear();
-        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new());
+        app.home.serve_view = Some(crate::tui::dialogs::ServeView::new(
+            &mut app.home.serve_jobs,
+        ));
         assert!(app.home.wants_text_selection());
         block_terminal(&mut control);
         app.draw(&mut terminal).unwrap();
