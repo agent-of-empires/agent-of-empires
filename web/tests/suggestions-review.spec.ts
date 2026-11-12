@@ -349,5 +349,13 @@ test("the suggestions page stays read-only while /api/about is unavailable", asy
   );
   await page.route("**/api/about", (route) => route.fulfill({ status: 503, json: { message: "down" } }));
   await page.goto("/suggestions");
+  // Start is also disabled while /api/about is pending, so wait for the 503 before checking it.
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as typeof window & { __mockedFailures: string[] }).__mockedFailures.includes("/api/about"),
+      ),
+    )
+    .toBe(true);
   await expect(page.getByRole("button", { name: "Start", exact: true })).toBeDisabled();
 });
