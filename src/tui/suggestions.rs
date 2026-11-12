@@ -1064,16 +1064,17 @@ impl SuggestionsFeed {
     }
 
     /// Sets the profile the TUI shows, `None` while it shows every profile
-    /// (nothing to compare). A change reloads at once, so the list follows a
-    /// profile switch.
+    /// (nothing to compare). Any change drops the snapshot and a pending
+    /// prepare and reloads at once.
     pub(super) fn set_profile(&mut self, profile: Option<String>) {
-        let switched = self.profile.is_some() && self.profile != profile;
+        let switched = self.profile != profile;
         self.profile = profile;
         if switched {
             self.snapshot = None;
             self.foreign_profile = None;
             self.loaded_at = None;
             self.load_attempt_at = None;
+            self.prepare_key = None;
         }
     }
 
@@ -2193,5 +2194,18 @@ mod tests {
         rig.store.busy = false;
         rig.store.set_profile(Some("default".into()));
         assert!(rig.store.foreign_profile.is_none());
+    }
+
+    #[test]
+    fn any_profile_change_drops_the_snapshot_and_a_pending_prepare() {
+        let mut rig = view_with(
+            vec![item("a", None, false)],
+            Worker::seeded_for_test("t", Res::Snapshot(Err("x".into()))),
+        );
+        rig.store.prepare_key = Some(("t".into(), "a".into()));
+        assert!(rig.store.snapshot.is_some());
+        rig.store.set_profile(Some("work".into()));
+        assert!(rig.store.snapshot.is_none());
+        assert!(rig.store.prepare_key.is_none());
     }
 }
