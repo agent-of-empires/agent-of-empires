@@ -384,9 +384,9 @@ pub(super) fn custom_agent_acp_capable(
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
-    entries: HashMap<(String, String), (SessionConfig, StructuredView)>,
+    entries: HashMap<(String, std::path::PathBuf), (SessionConfig, StructuredView)>,
     /// `project_path` to its repo config source; discovery can open the repo through libgit2.
-    sources: HashMap<String, String>,
+    sources: HashMap<String, std::path::PathBuf>,
     #[cfg(test)]
     pub(super) discoveries: usize,
     /// Where this cache reports its disk reads. The counter belongs to the
@@ -408,7 +408,7 @@ impl<'a> SessionCfgCache<'a> {
         }
     }
 
-    fn source(&mut self, project_path: &str) -> String {
+    fn source(&mut self, project_path: &str) -> std::path::PathBuf {
         if let Some(source) = self.sources.get(project_path) {
             return source.clone();
         }
@@ -418,9 +418,7 @@ impl<'a> SessionCfgCache<'a> {
         }
         let source = crate::session::config::repo_config::repo_config_source_path(
             std::path::Path::new(project_path),
-        )
-        .to_string_lossy()
-        .into_owned();
+        );
         self.sources
             .insert(project_path.to_string(), source.clone());
         source

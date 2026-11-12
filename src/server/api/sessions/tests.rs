@@ -4277,6 +4277,50 @@ fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
     assert_eq!(misses.load(Ordering::Relaxed), 1);
 }
 
+// Repo roots that differ only in non-UTF-8 bytes must not share a config. APFS rejects such names.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial_test::serial]
+fn session_cfg_cache_keeps_non_utf8_repo_roots_apart() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let tmp = tempfile::tempdir().expect("tempdir repos");
+    let paths: Vec<String> = [b"r\xff".as_slice(), b"r\xfe".as_slice()]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let main = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+            std::fs::create_dir(&main).unwrap();
+            run_git(&main, &["init", "-q"]);
+            run_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            let worktree = tmp.path().join(format!("wt{i}"));
+            run_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "b",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            worktree.to_str().unwrap().to_owned()
+        })
+        .collect();
+
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&misses);
+    for path in &paths {
+        cache.resolve("default", path);
+    }
+
+    assert_eq!(misses.load(Ordering::Relaxed), 2);
+}
+
 // Regression witness for #5610: sessions in linked worktrees of one repo read the
 // same repo config, so they must share one resolution instead of one per worktree.
 #[tokio::test]
