@@ -167,12 +167,20 @@ function waitUntilVisible(): Promise<void> {
   });
 }
 
-/** The status stays whole and only the image truncates, so a narrow row still says whether to update. */
+/** The status stays whole and only the image truncates, so a narrow row still says whether to update.
+ *  Under 14rem of summary width (a phone, not the md+ modal) the status takes its own line. */
 function SandboxImageSummary({ status, image }: { status: string | null; image: string }) {
   return (
-    <span className="flex min-w-0">
-      {status && <span className="shrink-0 whitespace-pre">{status} · </span>}
-      <span className="min-w-0 truncate">{image || "default image"}</span>
+    <span className="@container block min-w-0">
+      <span className="flex min-w-0 @max-[14rem]:flex-col">
+        {status && (
+          <span data-testid="sandbox-image-status" className="shrink-0 whitespace-pre @max-[14rem]:whitespace-normal">
+            {status}
+            <span className="@max-[14rem]:hidden"> · </span>
+          </span>
+        )}
+        <span className="min-w-0 truncate">{image || "default image"}</span>
+      </span>
     </span>
   );
 }
