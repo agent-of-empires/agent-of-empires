@@ -289,6 +289,15 @@ test("a started suggestion offers Open, and Start another sends no suggestion re
   await expect(page.getByText(/Session running · Review RFC 4562 · started 3 min ago/)).toBeVisible();
 
   await page.getByRole("button", { name: "More", exact: true }).click();
+  const menuItems = page.getByRole("menuitem");
+  await expect(menuItems).toHaveCount(3);
+  for (const name of ["Start another Session…", "Open in", "Dismiss"]) {
+    const reachable = await menuItems.filter({ hasText: name }).evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      return el.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2));
+    });
+    expect(reachable, `${name} is clipped`).toBe(true);
+  }
   await page.getByRole("menuitem", { name: "Start another Session…" }).click();
   await expect(page.getByLabel("Prompt", { exact: true })).toHaveValue(item.draft.prompt);
   const create = page.waitForRequest((r) => r.url().endsWith("/api/sessions") && r.method() === "POST");

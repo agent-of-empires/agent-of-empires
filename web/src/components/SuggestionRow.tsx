@@ -85,7 +85,7 @@ export function SuggestionRow({
 }: RowProps) {
   return (
     <li
-      className={`flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:border-t-0 ${
+      className={`flex items-center gap-3 border-t border-surface-700/40 px-3 py-2.5 first:rounded-t-lg first:border-t-0 last:rounded-b-lg ${
         failure ? "bg-status-error/[0.07]" : ""
       }`}
     >

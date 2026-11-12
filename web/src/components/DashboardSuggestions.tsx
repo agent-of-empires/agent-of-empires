@@ -61,7 +61,7 @@ export function DashboardSuggestions({ readOnly = false, onPrepare, onStarted, o
           View all ({active.length})
         </a>
       </div>
-      <ul className="overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900">
+      <ul className="rounded-lg border border-surface-700/40 bg-surface-900">
         {rows.map((item) => (
           <SuggestionRow
             key={suggestionKey(item)}

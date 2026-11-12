@@ -316,9 +316,7 @@ export function SuggestionsView({
                     {group.name} <span className="text-text-dim">{group.items.length}</span>
                   </h2>
                 )}
-                <ul
-                  className={`overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900 ${headed ? "" : "mt-4"}`}
-                >
+                <ul className={`rounded-lg border border-surface-700/40 bg-surface-900 ${headed ? "" : "mt-4"}`}>
                   {group.items.map((item) => {
                     const key = suggestionKey(item);
                     const providerName =
@@ -360,7 +358,7 @@ export function SuggestionsView({
                 </ul>
               </section>
             ))}
-            <ul className="mt-4 overflow-hidden rounded-lg border border-surface-700/40 bg-surface-900 empty:hidden">
+            <ul className="mt-4 rounded-lg border border-surface-700/40 bg-surface-900 empty:hidden">
               {visible.length === 0 && (
                 <li className={SUGGESTION_NOTE_CLASS}>
                   {narrowed && listed.length > 0
