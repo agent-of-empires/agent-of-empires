@@ -587,11 +587,52 @@ fn publish_session_cache(
 /// `None` when the tmux server could not be reached, which is not evidence
 /// that anything is absent.
 pub(crate) fn probe_live_sessions() -> Option<HashMap<String, LiveSession>> {
-    let output = run_tmux_command_with_timeout(&mut session_scan_command()).ok()?;
-    output
-        .status
-        .success()
-        .then(|| parse_session_scan(&String::from_utf8_lossy(&output.stdout)))
+    match scan_live_sessions() {
+        LiveScan::Sessions(sessions) => Some(sessions),
+        LiveScan::NoServer | LiveScan::Unknown => None,
+    }
+}
+
+/// [`probe_live_sessions`] keeping "no tmux server" (nothing is live) apart
+/// from a failed scan (unknown).
+pub(crate) enum LiveScan {
+    Sessions(HashMap<String, LiveSession>),
+    NoServer,
+    Unknown,
+}
+
+pub(crate) fn scan_live_sessions() -> LiveScan {
+    let Ok(output) = run_tmux_command_with_timeout(&mut session_scan_command()) else {
+        return LiveScan::Unknown;
+    };
+    if output.status.success() {
+        LiveScan::Sessions(parse_session_scan(&String::from_utf8_lossy(&output.stdout)))
+    } else if tmux_no_server_running(&output.stderr) {
+        LiveScan::NoServer
+    } else {
+        LiveScan::Unknown
+    }
+}
+
+/// Whether any live pane belongs to `session_id`: the agent, paired and
+/// container terminals including `_t<N>` extras, and tool sub-sessions.
+/// Matches on the `_<id8>` tail alone so an unverifiable tool still counts.
+pub(crate) fn any_owned_live_pane<'a>(
+    live: impl IntoIterator<Item = &'a str>,
+    session_id: &str,
+    pane_dead: impl Fn(&str) -> bool,
+) -> bool {
+    let suffix = id_suffix(session_id);
+    live.into_iter().any(|name| {
+        name.starts_with(SESSION_PREFIX)
+            && name.rsplit_once(&suffix).is_some_and(|(_, tail)| {
+                tail.is_empty()
+                    || tail.strip_prefix("_t").is_some_and(|index| {
+                        !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            && !pane_dead(name)
+    })
 }
 
 /// Every live session as `(name, kind marker)` pairs, the shape the id
@@ -3663,6 +3704,67 @@ mod tests {
 
     use super::test_helpers::TmuxTestSession;
     use super::*;
+
+    #[test]
+    fn any_owned_live_pane_covers_every_kind_trash_stops() {
+        let id = "abcdef1234567890";
+        let suffix = id_suffix(id);
+        let agent = format!("{SESSION_PREFIX}title{suffix}");
+        let terminal = format!("{TERMINAL_PREFIX}title{suffix}");
+        let extra = format!("{TERMINAL_PREFIX}title{suffix}_t2");
+        let container_extra = format!("{CONTAINER_TERMINAL_PREFIX}title{suffix}_t1");
+        let tool = format!("{TOOL_PREFIX}lazygit{suffix}");
+        let foreign = format!("{TOOL_PREFIX}lazygit_zzzzzzzz");
+        let lookalike = format!("{TERMINAL_PREFIX}title{suffix}_tx");
+        let cases: [(&str, &[&str], &[&str], bool); 9] = [
+            ("agent", &[&agent], &[], true),
+            ("paired terminal", &[&terminal], &[], true),
+            ("indexed terminal sole survivor", &[&extra], &[], true),
+            ("indexed container terminal", &[&container_extra], &[], true),
+            ("tool sole survivor", &[&tool], &[], true),
+            ("dead tool", &[&tool], &[&tool], false),
+            ("other id's tool", &[&foreign], &[], false),
+            ("non-index tail", &[&lookalike], &[], false),
+            ("nothing", &[], &[], false),
+        ];
+        for (case, live, dead, expected) in cases {
+            assert_eq!(
+                any_owned_live_pane(live.iter().copied(), id, |name| dead.contains(&name)),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    /// A failed scan is unknown, never "nothing live"; only the recognized
+    /// no-server answer is absence.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn scan_live_sessions_tells_failure_from_no_server() {
+        if run_probe_test_in_subprocess() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let tmux = home.path().join("tmux");
+        let _env = crate::session::test_support::EnvGuard::set(&[("PATH", home.path())]);
+        for (stderr, expect_no_server) in [
+            ("no server running on /tmp/fixture", true),
+            (
+                "error connecting to /tmp/fixture (Permission denied)",
+                false,
+            ),
+        ] {
+            std::fs::write(&tmux, format!("#!/bin/sh\necho '{stderr}' >&2\nexit 1\n")).unwrap();
+            std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+            match scan_live_sessions() {
+                LiveScan::NoServer => assert!(expect_no_server, "{stderr}"),
+                LiveScan::Unknown => assert!(!expect_no_server, "{stderr}"),
+                LiveScan::Sessions(_) => panic!("{stderr}: failed scan reported sessions"),
+            }
+        }
+    }
 
     #[test]
     #[cfg(unix)]

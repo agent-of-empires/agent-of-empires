@@ -1457,6 +1457,145 @@ async fn trash_teardown_failure_allows_explicit_restore_and_purge() -> anyhow::R
     Ok(())
 }
 
+/// A failed Trash teardown leaves the pane alive; the startup sweep must not
+/// move the checkout out from under it.
+#[tokio::test]
+#[serial_test::serial]
+async fn startup_reconcile_keeps_worktree_after_failed_trash_teardown() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    let root = tempfile::tempdir()?;
+    let main = root.path().join("main");
+    let worktree = root.path().join("worktree");
+    let repo = git2::Repository::init(&main)?;
+    let signature = git2::Signature::now("Test", "test@example.com")?;
+    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+    crate::git::GitWorktree::new(main.clone())?.create_worktree(
+        "failed-teardown",
+        &worktree,
+        true,
+        None,
+    )?;
+    let mut row = Instance::new("failed teardown", worktree.to_str().unwrap());
+    row.source_profile = "receipt".into();
+    row.view = crate::session::View::Terminal;
+    row.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "failed-teardown".into(),
+        main_repo_path: main.to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row.clone());
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let name = crate::server::pane::respawn_paired_if_dead(&state, &id, &row, 0).await?;
+    let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+    // Keep the pane's process alive so it counts as a live pane.
+    assert!(crate::tmux::tmux_command()
+        .args(["respawn-pane", "-k", "-t", pane.name(), "sleep", "600"])
+        .output()?
+        .status
+        .success());
+    assert!(!crate::tmux::utils::is_pane_dead(pane.name()));
+    // Real Trash with the teardown fault: kill-session fails, the pane survives.
+    let tmux = which::which("tmux")?;
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = kill-session ]; then echo teardown-fault >&2; exit 1; fi\ndone\nexec {} \"$@\"\n",
+        shell_words::quote(tmux.to_str().unwrap()),
+    );
+    let fault =
+        crate::session::test_support::install_login_shell_path_command(&main, "tmux", &script);
+    let response = trash_session(State(state.clone()), Path(id.clone()), None)
+        .await
+        .into_response();
+    drop(fault);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body["outcome"]["relocation"]["status"], "teardown_failed",
+        "{body}"
+    );
+    assert!(crate::tmux::session_exists(pane.name()));
+    // Trash SIGKILLs the pane process and the fault only blocks kill-session, so the pane is
+    // dead but its session remains. Only a user-made secondary window is alive.
+    assert!(crate::tmux::utils::is_pane_dead(pane.name()));
+    let target = format!("={}:", pane.name());
+    assert!(crate::tmux::tmux_command()
+        .args([
+            "new-window",
+            "-d",
+            "-t",
+            &target,
+            "-n",
+            "secondary",
+            "sleep",
+            "600"
+        ])
+        .output()?
+        .status
+        .success());
+    assert!(crate::tmux::utils::is_pane_dead(pane.name()));
+    let trashed = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(trashed.is_trashed());
+    assert_eq!(trashed.project_path, worktree.to_str().unwrap(), "{body}");
+    drop(state);
+
+    // Fresh daemon-equivalent state rebuilt from disk, as after a restart.
+    let state = crate::server::test_support::build_test_app_state(storage.load()?);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let failed = super::delete::reconcile_trashed_worktrees(&state).await;
+    assert!(failed.is_empty(), "{failed:?}");
+
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(stored.is_trashed());
+    assert_eq!(stored.project_path, worktree.to_str().unwrap());
+    assert!(stored.pre_trash_project_path.is_none());
+    assert!(worktree.exists(), "checkout must stay under the live pane");
+
+    // Once the last surviving pane exits the same row relocates as before.
+    assert!(crate::tmux::tmux_command()
+        .args(["kill-window", "-t", &format!("={}:secondary", pane.name())])
+        .output()?
+        .status
+        .success());
+    let state = crate::server::test_support::build_test_app_state(storage.load()?);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let failed = super::delete::reconcile_trashed_worktrees(&state).await;
+    assert!(failed.is_empty(), "{failed:?}");
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    let holding = crate::session::trash::trash_holding_path(&worktree, &id).unwrap();
+    assert_eq!(stored.project_path, holding.to_str().unwrap());
+    assert!(holding.exists() && !worktree.exists());
+    Ok(())
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn trash_retry_releases_missing_worktree_for_direct_purge() -> anyhow::Result<()> {
