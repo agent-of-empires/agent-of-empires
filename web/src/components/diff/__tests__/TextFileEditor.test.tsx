@@ -215,6 +215,34 @@ describe("TextFileEditor", () => {
     expect(confirmFileEditNavigation()).toBe(false);
   });
 
+  it.each([
+    { name: "a download", attrs: { download: "out.png", href: "data:image/png;base64,AA==" }, asks: false },
+    { name: "a new tab", attrs: { target: "_blank", href: "/session/s2" }, asks: false },
+    { name: "a page link", attrs: { href: "/session/s2" }, asks: true },
+  ])("asks about unsaved edits on $name only when it leaves the page", ({ attrs, asks }) => {
+    const { editor, onCancel } = setup();
+    fireEvent.change(editor, { target: { value: "dirty" } });
+    const link = Object.assign(document.body.appendChild(document.createElement("a")), attrs);
+    let followed = false;
+    // jsdom cannot navigate, so record whether the click got past the guard and stop it here.
+    const settle = (event: Event) => {
+      followed = !event.defaultPrevented;
+      event.preventDefault();
+    };
+    document.addEventListener("click", settle);
+    try {
+      const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+      fireEvent.click(link);
+      expect(confirm).toHaveBeenCalledTimes(asks ? 1 : 0);
+      expect(followed).toBe(!asks);
+      expect(onCancel).not.toHaveBeenCalled();
+      expect(hasUnsavedFileEdits()).toBe(true);
+    } finally {
+      document.removeEventListener("click", settle);
+      link.remove();
+    }
+  });
+
   it("transfers draft ownership between panes without unregistering the new owner", () => {
     const key = fileDraftKey("s1", "notes.txt");
     const first = vi.fn();

@@ -14,7 +14,6 @@ import {
   confirmFileEditNavigation,
   confirmFileEditPanes,
   confirmFileEditRemoval,
-  hasUnsavedFileEdits,
   isFileEditorOpen,
   rememberFileEditLocation,
 } from "./lib/fileEditGuard";
@@ -386,21 +385,7 @@ function AppContent({
     },
     [rawNavigate],
   );
-  useEffect(() => {
-    const guardLink = (event: MouseEvent) => {
-      const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
-      if (!link || !hasUnsavedFileEdits() || event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0)
-        return;
-      if (link.getAttribute("target") === "_blank" || (link as HTMLAnchorElement).href === window.location.href) return;
-      if (!confirmFileEditNavigation()) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-    };
-    rememberFileEditLocation();
-    document.addEventListener("click", guardLink, true);
-    return () => document.removeEventListener("click", guardLink, true);
-  }, [location]);
+  useEffect(rememberFileEditLocation, [location]);
   const [searchParams, setSearchParams] = useSearchParams();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");

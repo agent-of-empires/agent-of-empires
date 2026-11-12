@@ -167,6 +167,29 @@ export function installFileEditGuards(): void {
     },
     true,
   );
+  document.addEventListener(
+    "click",
+    (event) => {
+      const link = event.target instanceof Element ? event.target.closest("a[href]") : null;
+      if (!(link instanceof HTMLAnchorElement) || !leavesPage(link, event) || confirmFileEditNavigation()) return;
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    true,
+  );
+}
+
+/** Downloads and new tabs keep this page, and its editors, in place. */
+function leavesPage(link: HTMLAnchorElement, event: MouseEvent): boolean {
+  return (
+    event.button === 0 &&
+    !event.metaKey &&
+    !event.ctrlKey &&
+    !event.shiftKey &&
+    !link.hasAttribute("download") &&
+    link.target !== "_blank" &&
+    link.href !== window.location.href
+  );
 }
 
 /** A textarea normalizes CRLF and CR. Keep each original line ending where it exists. */
