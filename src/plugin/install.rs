@@ -761,10 +761,13 @@ fn apply_prepared(
         &prepared.manifest_hash,
         trust_label(prepared.featured_verified, prepared.dev),
     )?;
-    if suggestions_changed {
-        forget_suggestion_publication(id);
-    }
+    let cleared = if suggestions_changed {
+        forget_suggestion_publication(id)
+    } else {
+        Ok(())
+    };
     super::reload_registry();
+    cleared?;
     tracing::info!(target: "plugin.install", plugin = %id, version = %prepared.fetched.manifest.version, "plugin updated");
 
     if prepared.caps_changed && !granted {
@@ -1149,9 +1152,9 @@ fn remove_external(id: &str) -> Result<()> {
     if lock.remove(id) {
         lock.save()?;
     }
-    forget_suggestion_publication(id);
+    let cleared = forget_suggestion_publication(id);
     super::reload_registry();
-    Ok(())
+    cleared
 }
 
 /// Whether an update replaces the installed `[suggestions]` block; an
@@ -1160,32 +1163,22 @@ fn suggestions_spec_changed(current: Option<&LoadedPlugin>, next: &PluginManifes
     current.is_none_or(|p| p.manifest.suggestions != next.suggestions)
 }
 
-/// Best effort, for when no daemon is involved: it waits on the daemon's write
-/// lock, and a failure only leaves stale rows until the next publish. A running
-/// daemon clears them again itself once it stops the worker of a plugin
-/// that is gone from the registry.
-fn forget_suggestion_publication(plugin_id: &str) {
-    let result = (|| -> Result<()> {
-        let path = crate::session::get_app_dir()?.join(super::host_api::EVENTS_DB);
-        if !path.exists() {
-            return Ok(());
-        }
-        let conn = rusqlite::Connection::open_with_flags(
-            &path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )
-        .with_context(|| format!("opening {}", path.display()))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        super::suggestions::forget_publication(&conn, plugin_id)?;
-        Ok(())
-    })();
-    if let Err(e) = result {
-        tracing::warn!(
-            target: "plugin.install",
-            plugin = %plugin_id,
-            "could not clear published suggestions: {e:#}"
-        );
+/// Clears the plugin's published rows through the database file, for when no
+/// daemon is involved: it waits on the daemon's write lock. A failure is
+/// returned so an update or uninstall is not reported as complete while stale
+/// rows remain. A running daemon clears them again itself once it stops the
+/// worker of a plugin that is gone from the registry.
+fn forget_suggestion_publication(plugin_id: &str) -> Result<()> {
+    let path = crate::session::get_app_dir()?.join(super::host_api::EVENTS_DB);
+    if !path.exists() {
+        return Ok(());
     }
+    let conn =
+        rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("opening {}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    super::suggestions::forget_publication(&conn, plugin_id)
+        .with_context(|| format!("could not clear the published suggestions of {plugin_id}"))
 }
 
 pub fn uninstall_logged(id: &str, log: &OperationLog) -> Result<()> {
@@ -1940,7 +1933,7 @@ mod tests {
         let db = crate::session::get_app_dir()
             .unwrap()
             .join(super::super::host_api::EVENTS_DB);
-        forget_suggestion_publication("acme.thing");
+        forget_suggestion_publication("acme.thing").unwrap();
         assert!(!db.exists());
 
         let host = super::super::host_api::HostApiState::open(&db, "default", 100).unwrap();
@@ -1973,12 +1966,27 @@ mod tests {
             }
         });
 
-        forget_suggestion_publication("acme.thing");
+        forget_suggestion_publication("acme.thing").unwrap();
 
         assert_eq!(count("suggestion_providers"), 0);
         assert_eq!(count("suggestion_items"), 0);
         assert_eq!(count("suggestion_sources"), 1);
         assert_eq!(count("suggestion_dismissals"), 1);
+    }
+
+    /// A failed cleanup is an error, not a logged warning: the plugin is still
+    /// removed, but the caller is told stale rows may remain.
+    #[test]
+    #[serial]
+    fn a_failed_publication_cleanup_is_reported() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        std::fs::write(&db, b"not a sqlite database, long enough to be read as one").unwrap();
+        let err = forget_suggestion_publication("acme.thing").unwrap_err();
+        assert!(format!("{err:#}").contains("acme.thing"), "{err:#}");
+        assert!(remove_external("acme.thing").is_err());
     }
 
     /// Uninstall removes only a configured external plugin's directory: a
