@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 
 import type { SandboxImageStatus } from "../../lib/api";
 import { useSandboxImageBanner } from "../../hooks/useSandboxImageBanner";
+import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
 import { SandboxImageBanner } from "../SandboxImageBanner";
 
 const fetchSandboxImageStatus = vi.fn();
@@ -481,6 +482,15 @@ describe("SandboxImageBanner", () => {
     expect(banner()).not.toBeNull();
     fetchSandboxImageStatus.mockResolvedValue({ ...status(), state: "check_failed", error: "registry timed out" });
     await pollAfter(60 * 60_000);
+    expect(banner()).toBeNull();
+  });
+
+  it("asks again as soon as a create pulled the image, not at the next hourly poll", async () => {
+    await mount(status());
+    expect(banner()).not.toBeNull();
+    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current" } as Partial<SandboxImageStatus>));
+    act(() => notifySandboxImagePulled());
+    await pollAfter(0);
     expect(banner()).toBeNull();
   });
 

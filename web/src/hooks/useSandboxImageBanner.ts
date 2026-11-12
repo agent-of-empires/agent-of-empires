@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { dismissSandboxImage, fetchSandboxImageStatus, pullSandboxImage, type SandboxImageStatus } from "../lib/api";
 import { onServerDownChange } from "../lib/connectionState";
+import { onSandboxImagePulled } from "../lib/sandboxImageEvents";
 
 const POLL_MINUTES = 60;
 // Often enough that "updated" follows a pull closely; the Daemon answers from memory.
@@ -105,6 +106,7 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
     const offServerDown = onServerDownChange((down) => {
       if (!down) pollNow.current();
     });
+    const offPulled = onSandboxImagePulled(() => pollNow.current());
 
     return () => {
       cancelled = true;
@@ -112,6 +114,7 @@ export function useSandboxImageBanner(): SandboxImageBannerView | null {
       clearTimeout(initialTimer);
       document.removeEventListener("visibilitychange", onVisibility);
       offServerDown();
+      offPulled();
     };
   }, []);
 

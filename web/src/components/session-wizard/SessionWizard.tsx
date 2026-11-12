@@ -66,6 +66,7 @@ import { useSandboxImageRowStatus } from "./useSandboxImageRowStatus";
 import { useLatestRef } from "../../hooks/useLatestRef";
 import { PULL_GATED_HINT, PULL_LATEST_HINT, pullLatestChecked, pullLatestOffer } from "./pullLatestImage";
 import { CopyCommand } from "../SandboxImageBanner";
+import { notifySandboxImagePulled } from "../../lib/sandboxImageEvents";
 
 // Validated against ACP_CAPABLE_TOOLS on read, since another install may have written it.
 const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
@@ -722,6 +723,7 @@ export function SessionWizard({
         safeSetItem(LAST_USED_INSTRUCTION_KEY, body.custom_instruction ?? "");
         if (body.path.startsWith("/")) safeSetItem(LAST_USED_PROJECT_KEY, body.path);
         for (const w of result.session?.warnings ?? []) toastBus.handler?.error(w);
+        if (body.pull_latest_image) notifySandboxImagePulled();
         if (background) onCreatedInBackground?.(result.session);
         else onCreated(result.session);
       } else if (background) {

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { StrictMode, useState } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 
 import { SessionWizard, type WizardPrefill } from "../SessionWizard";
@@ -25,6 +25,7 @@ import { toastBus } from "../../../lib/toastBus";
 import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
+import { SANDBOX_IMAGE_PULLED_EVENT } from "../../../lib/sandboxImageEvents";
 
 const createSession = vi.fn();
 const reviewCreationTrust = vi.fn();
@@ -1601,11 +1602,18 @@ describe("SessionWizard Pull latest image first", () => {
     renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true, sandboxImage: IMAGE });
   };
   const box = () => screen.findByRole("checkbox", { name: "Pull latest image first" }) as Promise<HTMLInputElement>;
+  const pulledSignals = () => {
+    const seen = vi.fn();
+    window.addEventListener(SANDBOX_IMAGE_PULLED_EVENT, seen);
+    onTestFinished(() => window.removeEventListener(SANDBOX_IMAGE_PULLED_EVENT, seen));
+    return seen;
+  };
 
   it.each([
     ["an update, checked by default", UPDATE, true],
     ["a dismissed update, unchecked", { ...UPDATE, dismissed: true }, false],
   ])("offers %s, and Launch sends what it says", async (_name, status, checked) => {
+    const pulled = pulledSignals();
     open(status);
     expect((await box()).checked).toBe(checked);
     expect(screen.getByTestId("wizard-pull-latest").textContent).toContain(
@@ -1614,6 +1622,8 @@ describe("SessionWizard Pull latest image first", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledOnce());
     expect(payload(0).pull_latest_image).toBe(checked || undefined);
+    // Only a create that pulled tells the update banner to ask again.
+    await waitFor(() => expect(pulled).toHaveBeenCalledTimes(checked ? 1 : 0));
   });
 
   it("unchecking it launches with the current image", async () => {
@@ -1660,6 +1670,7 @@ describe("SessionWizard Pull latest image first", () => {
         reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
       },
     });
+    const pulled = pulledSignals();
     open(UPDATE);
     await box();
     await launch();
@@ -1676,6 +1687,7 @@ describe("SessionWizard Pull latest image first", () => {
     expect(payload(1).idempotency_key).toBeTruthy();
     expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
     expect((await box()).checked).toBe(false);
+    expect(pulled).not.toHaveBeenCalled();
   });
 });
 
