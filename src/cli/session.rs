@@ -2868,7 +2868,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 if stage == crate::session::TerminalHandoffStage::ProjectionCleanupOwed {
                     pending.stage = crate::session::TerminalHandoffStage::TerminalLaunchOwed;
                 }
-                // Retain the prior attempt as evidence, never as proof of an unrecorded birth.
+                // Keep pending.launch as prior-attempt evidence, not proof of an unrecorded birth.
             }
             Ok(inst.title.clone())
         })
