@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ActivityRow, BackgroundAgent, ToolCall } from "../../../lib/acpTypes";
+import type { ActivityRow, BackgroundAgent, SubagentRecord, ToolCall } from "../../../lib/acpTypes";
 import { fromBackground, fromInline, taskPrompt } from "./model";
 
 const agent = (over: Partial<BackgroundAgent>): BackgroundAgent => ({
@@ -57,6 +57,28 @@ describe("fromInline", () => {
     expect(record.status).toBe("done");
     expect(record.report).toBe("report");
     expect(record.tools[0]!.status).toBe("stopped");
+  });
+
+  it("shows a background child as background and running until it reports", () => {
+    const tool: ToolCall = {
+      id: "launch",
+      name: "Explore",
+      kind: "think",
+      args_preview: "{}",
+      started_at: "2026-01-01T00:00:00Z",
+    };
+    const roster: SubagentRecord = {
+      session_id: "child",
+      parent_session_id: "root",
+      parent_tool_call_id: "launch",
+      state: "running",
+      cancel_capable: true,
+      background: true,
+    };
+    const record = fromInline(tool, undefined, [], roster);
+    expect(record.background).toBe(true);
+    expect(record.status).toBe("running");
+    expect(record.report).toBe("");
   });
 });
 

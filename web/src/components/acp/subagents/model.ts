@@ -174,7 +174,7 @@ export function fromInline(
     id: tool.id,
     description:
       roster?.title || ((args && pickStr(args, "description", "_aoe_title")) ?? tool.name ?? "Subagent task"),
-    background: false,
+    background: roster?.background ?? false,
     status: running ? "running" : failed ? "failed" : "done",
     badge: roster && rosterBadge(roster),
     startedAt: tool.started_at,

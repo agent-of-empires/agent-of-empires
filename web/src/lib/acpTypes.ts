@@ -736,6 +736,8 @@ export interface SubagentRecord {
   stop_reason?: string | null;
   cancel_capable: boolean;
   model?: string | null;
+  /** Launched in the background: its card stays open until it goes idle. */
+  background?: boolean;
 }
 
 export interface BackgroundAgentTool {
