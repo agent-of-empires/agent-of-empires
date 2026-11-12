@@ -340,6 +340,24 @@ impl Shared {
         // Subagent traffic never feeds the root session's dedup or compaction
         // state; it only proves the parent's turn is still live.
         let from_child = self.ingress.child_route(&notification.session_id).is_some();
+        let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
+        // Replayed children died with the old adapter; ingress already routed them.
+        if suppressing
+            && (from_child
+                || matches!(
+                    notification.update,
+                    SessionUpdate::SubagentUpdate(_)
+                        | SessionUpdate::SessionMessage(_)
+                        | SessionUpdate::SessionMessageChunk(_)
+                ))
+        {
+            tracing::trace!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                "dropping post-load subagent replay frame"
+            );
+            return;
+        }
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
                 return self
@@ -375,7 +393,6 @@ impl Shared {
             update => notification.update = update,
         }
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
-        let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {

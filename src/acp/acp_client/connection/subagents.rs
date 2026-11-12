@@ -610,6 +610,53 @@ mod tests {
         assert_eq!(linked.state, SubagentState::Running);
     }
 
+    /// A `session/load` replays every past child. Its children died with the
+    /// old adapter, so the replay publishes nothing and arms nothing, but
+    /// still routes.
+    #[tokio::test]
+    async fn load_replay_publishes_no_subagent_traffic() {
+        let ingress = Arc::new(SessionIngress::new(Some("root".to_string().into())));
+        let (event_tx, events) = mpsc::channel(16);
+        let (lifecycle_tx, mut lifecycle) = mpsc::channel(16);
+        let shared = Shared::new(
+            event_tx,
+            "test".into(),
+            &CLAUDE,
+            lifecycle_tx,
+            Arc::new(SessionState::default()),
+            Arc::new(AtomicBool::new(true)),
+            None,
+            ingress.clone(),
+            None,
+        );
+        shared.prompt_epoch.store(1, Ordering::Relaxed);
+        shared
+            .suppress_history_replay
+            .store(true, Ordering::Relaxed);
+        for frame in [
+            serde_json::to_value(announce("root", "running")).unwrap(),
+            delegation("tool-1", "child", "find the bug"),
+            serde_json::json!({
+                "sessionId": "child",
+                "update": { "sessionUpdate": "tool_call", "toolCallId": "child-tool",
+                            "title": "Read", "kind": "read", "status": "completed" },
+            }),
+            serde_json::json!({
+                "sessionId": "root",
+                "update": { "sessionUpdate": "subagent_update", "sessionId": "child",
+                            "state": { "state": "idle", "stopReason": "end_turn" } },
+            }),
+        ] {
+            feed(&ingress, &shared, frame).await;
+        }
+
+        assert!(ingress.child_route(&"child".to_string().into()).is_some());
+        assert!(!shared.has_active_subagent());
+        assert!(lifecycle.try_recv().is_err());
+        let events = drain(shared, events).await;
+        assert!(events.is_empty(), "{events:?}");
+    }
+
     /// A background launch's acknowledgement is not the child's answer: the
     /// card stays open, marked background, and completes with the child's
     /// last message once it ends. A cancelled child leaves it open (#5612).
