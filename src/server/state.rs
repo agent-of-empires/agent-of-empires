@@ -155,6 +155,10 @@ pub struct AppState {
     pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
+    /// Signs session-scoped `/mcp` and plugin endpoint credentials (`X-AoE-Session` + HMAC
+    /// bearer). `None` when neither `mcp_enabled` nor an installed `mcp.serve` plugin needs it,
+    /// or the secret failed to load. Present does not mean `/mcp` is mounted.
+    pub mcp_session_secret: Option<Arc<super::session_credential::McpSessionSecret>>,
     pub passkey_manager: Arc<super::passkeys::PasskeyManager>,
     pub rate_limiter: Arc<RateLimiter>,
     pub behind_tunnel: bool,

@@ -121,6 +121,35 @@ fn append_to_log(path: &std::path::Path) -> std::process::Stdio {
     }
 }
 
+/// What the runner hands the adapter as `ACP_AGENT_ENV`. The minted MCP credentials ride
+/// it last; a sandbox forwards them through `docker exec -e` instead, so the carrier never
+/// holds them there.
+fn carrier_environment(config: &SpawnConfig, sandboxed: bool) -> Vec<(String, String)> {
+    let credentials = (!sandboxed)
+        .then_some(&config.mcp_credentials)
+        .into_iter()
+        .flatten();
+    config
+        .host_environment
+        .iter()
+        .chain(&config.provider_routing)
+        .chain(credentials)
+        .filter(|(key, _)| match host_environment_denyreason(key) {
+            Some(reason) => {
+                warn!(
+                    target: "acp",
+                    key = %key,
+                    reason,
+                    "rejecting configured host environment key",
+                );
+                false
+            }
+            None => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// A Worker started for a bare adapter name that resolved nowhere can only exit
 /// before its Hello, which loses the cause (#4576). `unresolved` is `None` when
 /// the name resolved or a sandbox resolves it inside its container; paths and
@@ -262,24 +291,7 @@ pub(super) async fn spawn_runner_detached(
     // the adapter only: they ride a carrier key the runner strips and applies to
     // its child, because HOME, PATH or XDG_CONFIG_HOME set on the runner itself
     // would move its worker registry (#1383) or change which binary it loads.
-    let host_environment: Vec<(String, String)> = config
-        .host_environment
-        .iter()
-        .chain(&config.provider_routing)
-        .filter(|(key, _)| match host_environment_denyreason(key) {
-            Some(reason) => {
-                warn!(
-                    target: "acp",
-                    key = %key,
-                    reason,
-                    "rejecting configured host environment key",
-                );
-                false
-            }
-            None => true,
-        })
-        .cloned()
-        .collect();
+    let host_environment = carrier_environment(config, sandbox_argv.is_some());
     refuse_unresolved_adapter(
         config,
         resolution.as_ref().and_then(|r| r.as_ref().err()),
@@ -562,6 +574,36 @@ pub(super) async fn spawn_runner_detached(
 mod tests {
     use super::*;
     use crate::process::systemd::ScopePrefix;
+
+    /// Minted MCP credentials reach a host agent through the owner-only carrier, after the
+    /// configured environment, and never through the carrier of a sandboxed one.
+    #[test]
+    fn carrier_holds_mcp_credentials_for_host_agents_only() {
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config =
+            super::super::test_helpers::env_test_spawn_config(cwd.path().to_path_buf());
+        config.host_environment = vec![("HOOK_VALUE".into(), "kept".into())];
+        config.mcp_credentials = vec![(
+            "AOE_PLUGIN_MCP_CRED_01".to_string(),
+            "fake-credential".to_string(),
+        )]
+        .into();
+        assert_eq!(
+            carrier_environment(&config, false),
+            [
+                ("HOOK_VALUE".to_string(), "kept".to_string()),
+                (
+                    "AOE_PLUGIN_MCP_CRED_01".to_string(),
+                    "fake-credential".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            carrier_environment(&config, true),
+            [("HOOK_VALUE".to_string(), "kept".to_string())]
+        );
+    }
+
     use crate::session::test_support::EnvGuard;
     use std::ffi::{OsStr, OsString};
 

@@ -525,6 +525,15 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
     } else {
         app
     };
+    // Served without `/mcp` whenever the secret exists, which a serving plugin implies.
+    let app = if state.web_config.mcp_enabled || state.mcp_session_secret.is_some() {
+        app.route_service(
+            "/mcp/plugins/{plugin}/{server}",
+            super::mcp_plugins::service(state.clone()),
+        )
+    } else {
+        app
+    };
 
     // Dashboard bundle (Vite build output) plus the SPA fallback.
     #[cfg(feature = "web")]

@@ -42,6 +42,10 @@ Workers are tied to the daemon lifetime, with no reattach socket or durable runn
 
 The host exposes capability-checked RPCs for the plugin event bus, private session metadata, plugin settings, session listing, UI state, ACP capability discovery, and plugin-created sessions; the methods and payloads are in the [Plugin API reference](../../plugin-api.md). The event bus uses the protocol-neutral store in `src/events/` with its own schema and replay cursor. Session writes take the storage lock and become visible to other processes on their next reload. Each caller's plugin id comes from its host context, never from request parameters.
 
+## Plugin-served MCP servers
+
+`mcp.serve` plugins add MCP servers without a process per server. At launch and respawn, `src/plugin/mcp_serve.rs` asks each serving worker which servers the session gets, and the launch code in `src/acp/supervisor/launch.rs` injects entries pointing at the daemon's `/mcp/plugins/<plugin id>/<server>` route. `src/server/mcp_plugins.rs` authenticates the caller with a credential derived per session and server (`src/server/session_credential.rs`), takes the plugin and server only from that authenticated identity, and forwards `tools/list` and `tools/call` to the worker through `WorkerCall`. The daemon address comes from `src/server/daemon_endpoint.rs`, recorded at startup. `DaemonEndpoint::base_url` returns none for sandboxed sessions. The wire contract and failure mapping are in the [Plugin API reference](../../plugin-api.md#serving-mcp-servers-api_version--22).
+
 ## Unattended plugin sessions
 
 Workers may create structured-view sessions and send turns, but the host keeps the security decisions:

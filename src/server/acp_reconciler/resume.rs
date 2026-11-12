@@ -442,6 +442,7 @@ async fn build_spawn_request(
         claude_store_pin,
         instance,
         prior_conversation,
+        workspace_info,
     ) = {
         let instances = service.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
@@ -467,6 +468,7 @@ async fn build_spawn_request(
             inst.clone(),
             target.stored_acp_session_id.is_none()
                 && (inst.agent_session_id.is_some() || inst.pi_session_path.is_some()),
+            inst.workspace_info.clone(),
         )
     };
     let config_path = instance.repo_config_path().to_path_buf();
@@ -536,6 +538,7 @@ async fn build_spawn_request(
         fork_from,
         sandbox_continuation: crate::acp::supervisor::SandboxContinuation::Persisted,
         sandbox_info,
+        workspace_info,
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         acp_mode_id,
@@ -748,6 +751,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(req.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn build_spawn_request_carries_the_workspace_layout() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut ws = crate::server::test_support::workspace_instance(
+            "ws-resume",
+            std::path::Path::new("/tmp/aoe-ws-resume"),
+        );
+        ws.id = "sess-ws-resume".to_string();
+        ws.source_profile = "default".into();
+        ws.view = crate::session::View::Structured;
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![ws.clone()]);
+        let state = crate::server::test_support::build_test_app_state(vec![ws.clone()]);
+
+        // The target snapshot carries no workspace; the request must read the live row.
+        let mut target = ResumeTarget::from_instance(&ws);
+        target.project_path = "/tmp/aoe-ws-resume-stale".to_string();
+        let req = build_spawn_request(&state.session_service, &target)
+            .await
+            .unwrap();
+        crate::server::test_support::assert_carries_workspace(
+            req.workspace_info.as_ref(),
+            &ws,
+            "build_spawn_request",
+        );
     }
 
     /// #4127: a request is not an observation. Building one derives the route

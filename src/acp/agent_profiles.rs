@@ -31,6 +31,10 @@ pub struct AgentProfile {
     /// When true, the agent implements the ACP subagents RFD, so aoe declares
     /// the client capability and each subagent arrives as a child session.
     pub supports_subagents: bool,
+    /// The agent expands `${VAR}` in MCP entries from its own environment, so aoe can pass
+    /// plugin credentials as references and keep the values off the command line. Verified
+    /// for `claude-agent-acp` only; every other agent receives the literal credential.
+    pub expands_mcp_env_refs: bool,
 }
 
 fn matches_alias(aliases: &[&str], text: &str) -> bool {
@@ -104,6 +108,7 @@ pub const DEFAULT: AgentProfile = AgentProfile {
     yolo_mode_id: None,
     native_config_agent: None,
     supports_subagents: false,
+    expands_mcp_env_refs: false,
 };
 
 /// Claude via `claude-agent-acp`.
@@ -119,6 +124,7 @@ pub const CLAUDE: AgentProfile = AgentProfile {
     yolo_mode_id: Some("bypassPermissions"),
     native_config_agent: Some("claude"),
     supports_subagents: true,
+    expands_mcp_env_refs: true,
 };
 
 /// Legacy alias key carried by older session records (`agent_name="claude-code"`).

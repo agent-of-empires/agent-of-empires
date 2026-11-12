@@ -43,6 +43,16 @@ agent-native  <  mcp.json (global)  <  profile mcp.json  <  project-local .mcp.j
 
 Each override is logged.
 
+## Rewriting the forwarded set
+
+A plugin holding the `mcp.rewrite` capability can drop and replace servers per session, usually to route host credentials through a gateway instead of handing them to a sandbox. The hook is documented in [Plugin API](../plugin-api.md#hooks). AoE does not copy host MCP definitions into a Claude sandbox's agent store (`.mcp.json` files inside the copied Claude `plugins/` directory are copied as they are), but other agents' MCP-bearing config files are still copied into their sandbox stores verbatim, so the hook alone does not keep host MCP secrets out of those sandboxes.
+
+## Plugin-served servers
+
+A plugin holding the `mcp.serve` capability can offer MCP servers to your sessions. They appear in the agent as `<plugin id with . as _>__<server>`, for example `acme_tools__docs`, or under the bare server name if the plugin chooses, and their provenance is `plugin:<plugin id>`. A plugin entry replaces any entry of the same key from your own files; AoE notifies you when an offered entry does, but not when a rewrite hook replaces one. AoE forwards the agent's calls to the plugin and gives the agent a credential that opens only that server for that session.
+
+They are not shown by `aoe mcp list` or the dashboard, and terminal-view sessions get none. They do not need `web.mcp_enabled`. Sandboxed sessions on Linux reach them through a socket AoE mounts into the container, with no setup. When a sandbox cannot use that socket (not Linux, a VM-backed runtime such as Docker Desktop, a container created before the mount, or a container AoE could not check, which it treats as unable), AoE notifies you instead of dropping them silently. Limits, covered runtimes and the protocol are in the [Plugin API](../plugin-api.md#serving-mcp-servers-api_version--22). A rewrite hook sees these entries with credential references, not values. For Claude Code the credential value lives in the agent's environment (inherited by its child processes), not on its command line, and AoE does not forward it in any entry it did not create (a config file Claude Code loads itself is not covered, see the Plugin API); other agents receive the literal credential in their entries and it can show on their command line. Details are in the Plugin API.
+
 ## Project-local servers need repo trust
 
 A project stdio server would launch its `command` the moment a session starts, so opening a cloned, untrusted repo would be a zero-click way to run its code. It therefore sits behind the same trust gate as repository hooks.

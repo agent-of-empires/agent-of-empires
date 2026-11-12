@@ -751,6 +751,30 @@ mod tests {
             "super::mcp::service(state.clone())",
             "Read-only tools pinned by server::mcp::tests::tools_list_advertises_both_tools; revisit this exemption when adding a tool.",
         ),
+        (
+            "POST",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
+        (
+            "PUT",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
+        (
+            "PATCH",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
+        (
+            "DELETE",
+            "/mcp/plugins/{plugin}/{server}",
+            "super::mcp_plugins::service(state.clone())",
+            "Read-only daemons run no plugin host, so the endpoint forwards nothing there.",
+        ),
     ];
 
     fn audited_handler(identity: &str, audited: &[&str]) -> bool {

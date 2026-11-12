@@ -2,7 +2,8 @@
 //! agent command is wrapped in.
 
 use crate::acp::fs_handler::SandboxPathMap;
-use crate::session::SandboxInfo;
+use crate::containers::container_interface::VolumeMount;
+use crate::session::{SandboxInfo, WorkspaceInfo};
 use std::path::{Path, PathBuf};
 
 use super::errors::AcpError;
@@ -40,33 +41,16 @@ impl SessionSandbox {
         config_path: &Path,
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
-        let project_path_str = project_path.to_string_lossy().to_string();
-        let (volumes, computed_workdir) =
-            crate::session::config::container_config::compute_volume_paths(
-                project_path,
-                &project_path_str,
-            )
-            .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
-        // Must be what the container was created with. `compute_volume_paths`
-        // collapses to `/workspace/<basename>` once the worktree's git linkage
-        // breaks, naming a path the container never mounted (#2414), so prefer
-        // the create-time pin, then the live container, then the recompute.
-        let workdir = sandbox
-            .container_workdir
-            .clone()
-            .or_else(|| {
-                crate::containers::get_container_runtime()
-                    .container_working_dir(&sandbox.container_name)
-            })
-            .unwrap_or(computed_workdir);
-        let mounts: Vec<(PathBuf, PathBuf)> = volumes
+        let layout = SandboxLayout::resolve(sandbox, project_path, None)?;
+        let mounts: Vec<(PathBuf, PathBuf)> = layout
+            .volumes
             .into_iter()
             .map(|v| (PathBuf::from(v.container_path), PathBuf::from(v.host_path)))
             .collect();
         Ok((
             Self {
                 container_name: sandbox.container_name.clone(),
-                container_workdir: PathBuf::from(workdir),
+                container_workdir: PathBuf::from(layout.container_workdir),
                 sandbox_info: sandbox.clone(),
                 source_profile,
                 config_path: config_path.to_path_buf(),
@@ -96,6 +80,46 @@ impl SessionSandbox {
             crate::session::environment::resolved_sandbox_config(profile, &self.config_path);
         crate::session::environment::collect_environment(&sandbox_config, &self.sandbox_info)
     }
+}
+
+/// The workspace volumes a session's container was built with and the workdir it runs in.
+pub(crate) struct SandboxLayout {
+    pub(crate) volumes: Vec<VolumeMount>,
+    pub(crate) container_workdir: String,
+}
+
+impl SandboxLayout {
+    /// Blocking: without a pinned workdir it asks the container runtime. Pass the
+    /// session's `workspace_info` so the volumes match the ones its container was created with.
+    pub(crate) fn resolve(
+        sandbox: &SandboxInfo,
+        project_path: &Path,
+        workspace: Option<&WorkspaceInfo>,
+    ) -> Result<Self, AcpError> {
+        use crate::session::config::container_config::{
+            compute_volume_paths, compute_workspace_volume_paths,
+        };
+        let (volumes, computed_workdir) = match workspace {
+            Some(workspace) => compute_workspace_volume_paths(project_path, workspace),
+            None => compute_volume_paths(project_path, &project_path.to_string_lossy()),
+        }
+        .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+        let container_workdir = known_container_workdir(sandbox).unwrap_or(computed_workdir);
+        Ok(Self {
+            volumes,
+            container_workdir,
+        })
+    }
+}
+
+/// The workdir the container was created with. `compute_volume_paths` collapses to
+/// `/workspace/<basename>` once a worktree's git linkage breaks, naming a path the
+/// container never mounted (#2414), so the create-time pin, then the live container,
+/// outrank a recompute.
+pub(crate) fn known_container_workdir(sandbox: &SandboxInfo) -> Option<String> {
+    sandbox.container_workdir.clone().or_else(|| {
+        crate::containers::get_container_runtime().container_working_dir(&sandbox.container_name)
+    })
 }
 
 /// `docker_binary` is `argv[0]` (docker/podman). Export `inherit_env` so the
@@ -183,6 +207,14 @@ pub(super) fn build_sandbox_docker_argv(
                 "dropping host-only path variable from a sandboxed launch"
             );
         }
+    }
+
+    // Minted MCP credentials: the key alone goes in the argv, which other local users can
+    // read, and the value reaches docker through the runner's environment.
+    for (key, value) in &config.mcp_credentials {
+        docker_args.push("-e".into());
+        docker_args.push(key.clone());
+        inherit_env.push((key.clone(), value.clone()));
     }
 
     docker_args.push(
@@ -406,6 +438,42 @@ mod tests {
             "{key} must not cross the container boundary, got {:?}",
             argv.docker_args
         );
+    }
+
+    /// Minted MCP credentials cross as `-e KEY` with the value on the runner's environment,
+    /// never in the `docker exec` argv, which other local users can read.
+    #[test]
+    fn build_sandbox_docker_argv_keeps_mcp_credentials_off_the_argv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let info = sandbox("aoe-sandbox-mcpcred", None);
+        let mut config = sandbox_config(tmp.path(), &info);
+        config.agent_key = "claude-code".into();
+        config.mcp_credentials = vec![
+            (
+                "AOE_PLUGIN_MCP_CRED_0a".to_string(),
+                "fake-credential-a".to_string(),
+            ),
+            (
+                "AOE_PLUGIN_MCP_CRED_0b".to_string(),
+                "fake-credential-b".to_string(),
+            ),
+        ]
+        .into();
+
+        let argv = build_sandbox_docker_argv(&config, &info, "/workspace/proj").unwrap();
+
+        for (key, value) in &config.mcp_credentials {
+            assert_named_without_value(&argv, key, value);
+            assert!(
+                argv.inherit_env.contains(&(key.clone(), value.clone())),
+                "{key}"
+            );
+            assert!(
+                argv.docker_args.iter().all(|a| !a.contains(value.as_str())),
+                "the value must not appear anywhere in argv: {:?}",
+                argv.docker_args
+            );
+        }
     }
 
     /// #3238: the per-adapter `env_allowlist` must cross the boundary, but a

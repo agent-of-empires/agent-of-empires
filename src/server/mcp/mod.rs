@@ -11,6 +11,7 @@ use rmcp::{
         wrapper::{Json, Parameters},
     },
     model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
         session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     },
@@ -19,7 +20,10 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::api::sessions::{list_sessions_envelope, SessionFilter, SessionsView};
+use super::api::sessions::{
+    list_sessions_envelope, session_response_from_instance, SessionFilter, SessionsView,
+};
+use super::auth::AuthenticatedCallerSession;
 use super::state::AppState;
 use crate::daemon::SessionResponse;
 use crate::session::SessionScope;
@@ -84,8 +88,20 @@ impl McpServer {
     #[rmcp::tool(
         description = "The calling session, or null when the caller is not a session AoE launched."
     )]
-    async fn whoami(&self) -> Json<Option<SessionResponse>> {
-        Json(None)
+    async fn whoami(&self, context: RequestContext<RoleServer>) -> Json<Option<SessionResponse>> {
+        let caller_session_id = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.extensions.get::<AuthenticatedCallerSession>())
+            .map(|AuthenticatedCallerSession(id)| id.clone());
+        let Some(id) = caller_session_id else {
+            return Json(None);
+        };
+        let instances = self.state.instances.read().await;
+        let response = instances.iter().find(|inst| inst.id == id).map(|inst| {
+            session_response_from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        });
+        Json(response)
     }
 }
 
@@ -119,13 +135,18 @@ pub(super) fn service(
     StreamableHttpService::new(
         move || Ok(McpServer::new(state.clone())),
         Arc::default(),
-        // `rmcp` reads the body itself, so the router's `DefaultBodyLimit` does not apply.
-        StreamableHttpServerConfig::default()
-            .with_legacy_session_mode(false)
-            .with_json_response(true)
-            .disable_allowed_hosts()
-            .with_max_request_body_bytes(1024 * 1024),
+        stateless_config(),
     )
+}
+
+/// Stateless JSON replies; host and origin checks belong to the router's middleware.
+pub(super) fn stateless_config() -> StreamableHttpServerConfig {
+    // `rmcp` reads the body itself, so the router's `DefaultBodyLimit` does not apply.
+    StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true)
+        .disable_allowed_hosts()
+        .with_max_request_body_bytes(1024 * 1024)
 }
 
 #[cfg(test)]
