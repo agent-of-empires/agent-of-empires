@@ -392,6 +392,21 @@ describe("applyEvent / subagent roster", () => {
     }
   });
 
+  it("counts a running or waiting child without a legacy record as background work, not the main turn", () => {
+    const child = (state: string) =>
+      run(update(state, "t1", { parent_tool_call_id: "msg-1" }), { Stopped: { reason: "end_turn" } });
+    for (const [state, busy] of [
+      ["running", true],
+      ["requires_action", true],
+      ["idle", false],
+      ["unknown", false],
+    ] as const) {
+      const s = child(state);
+      expect(s.turnActive, state).toBe(false);
+      expect(isVisiblyBusy(s), state).toBe(busy);
+    }
+  });
+
   it("only updates the roster when no agent matches or the parent call is absent", () => {
     const state = run(launched, update("idle", "t1", { parent_tool_call_id: null }));
     expect(state.backgroundAgents[0]).toMatchObject({ status: "running", endedAt: null });

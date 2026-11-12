@@ -1772,17 +1772,24 @@ export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inf
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
-/** Outstanding background sub-agent (async Task) or task, mirroring
- *  `AcpState::has_active_background_agent`: agents are keyed on `endedAt`
- *  rather than status, since a stalled agent's own terminal completion counts
- *  as done. */
-export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents" | "backgroundTasks">): boolean {
-  return state.backgroundTasks.length > 0 || state.backgroundAgents.some((a) => a.endedAt === null);
+/** Outstanding background sub-agent (async Task), task, or running RFD child.
+ *  Agents are keyed on `endedAt` rather than status, since a stalled agent's own
+ *  terminal completion counts as done. */
+export function hasActiveBackgroundAgent(
+  state: Pick<AcpState, "backgroundAgents" | "backgroundTasks" | "subagents">,
+): boolean {
+  return (
+    state.backgroundTasks.length > 0 ||
+    state.backgroundAgents.some((a) => a.endedAt === null) ||
+    state.subagents.some((s) => s.state === "running" || s.state === "requires_action")
+  );
 }
 
 /** Display-only busy signal for the runtime spinner. Distinct from `turnActive`,
  *  which tracks only the main turn because send-vs-queue composer gating reads it. */
-export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks">): boolean {
+export function isVisiblyBusy(
+  state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks" | "subagents">,
+): boolean {
   return state.turnActive || hasActiveBackgroundAgent(state);
 }
 
