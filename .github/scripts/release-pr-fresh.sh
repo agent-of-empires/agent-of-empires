@@ -21,16 +21,22 @@ pr_number() {
   echo "$pr"
 }
 
-# Keeps the `<sha> <subject>` lines release-plz would put in the changelog: the
-# first matching commit_parsers entry decides, as in release-plz.
+# Reads `git log --format='%h %s%x1f%b%x1e'` and prints the `<sha> <subject>`
+# lines release-plz would put in the changelog: the first matching
+# commit_parsers entry decides, and protect_breaking_commits keeps breaking
+# commits even when their type is skipped.
 changelog_commits() {
   python3 -c '
 import re, sys, tomllib
 parsers = tomllib.load(open(sys.argv[1], "rb"))["changelog"]["commit_parsers"]
-for line in sys.stdin:
+for record in sys.stdin.read().split("\x1e"):
+    if not record.strip():
+        continue
+    line, body = record.strip("\n").split("\x1f", 1)
     subject = line.split(" ", 1)[1]
-    if not next((p for p in parsers if re.search(p["message"], subject)), {}).get("skip"):
-        print(line, end="")
+    breaking = re.match(r"\w+(\([^)]*\))?!:", subject) or re.search(r"^BREAKING[ -]CHANGE:", body, re.M)
+    if breaking or not next((p for p in parsers if re.search(p["message"], subject)), {}).get("skip"):
+        print(line)
 ' "$TOML"
 }
 
@@ -46,7 +52,7 @@ gate() {
   fi
   local missed count
   # Explicit: callers in `||` context run this with errexit off.
-  missed="$(git log --format='%h %s' "$3..$4~1" | changelog_commits)" || return 2
+  missed="$(git log --format='%h %s%x1f%b%x1e' "$3..$4~1" | changelog_commits)" || return 2
   if [ -z "$missed" ]; then
     echo "Release PR is up to date."
     return 0
@@ -69,7 +75,7 @@ run() {
 }
 
 self_test() {
-  local dir base main_tip skip_tip tree rel rel_main fresh stale skipped_only out
+  local dir base main_tip skip_tip breaking_tip tree rel rel_main rel_skip fresh stale skipped_only breaking out
   export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
   dir="$(mktemp -d)"
   trap 'rm -rf "$dir"' EXIT
@@ -83,6 +89,9 @@ self_test() {
   git commit -q --allow-empty -m 'docs: three'
   git commit -q --allow-empty -m 'ci: four'
   skip_tip="$(git rev-parse HEAD)"
+  git commit -q --allow-empty -m 'refactor!: five'
+  git commit -q --allow-empty -m 'chore: six' -m 'BREAKING CHANGE: drops X'
+  breaking_tip="$(git rev-parse HEAD)"
   tree="$(git rev-parse 'HEAD^{tree}')"
   # Release PRs refreshed at base and at main_tip, and queue squashes on top.
   rel="$(git commit-tree "$tree" -p "$base" -m 'chore: release')"
@@ -90,6 +99,8 @@ self_test() {
   fresh="$(git commit-tree "$tree" -p "$base" -m squash)"
   stale="$(git commit-tree "$tree" -p "$skip_tip" -m squash)"
   skipped_only="$stale"
+  rel_skip="$(git commit-tree "$tree" -p "$skip_tip" -m 'chore: release')"
+  breaking="$(git commit-tree "$tree" -p "$breaking_tip" -m squash)"
   export GITHUB_STEP_SUMMARY="$dir/summary.md"
 
   [ "$(pr_number refs/heads/gh-readonly-queue/main/pr-5570-abc123)" = 5570 ] ||
@@ -110,6 +121,10 @@ self_test() {
   gate release-plz-x true "$rel_main" "$skipped_only" >/dev/null ||
     fail "failed a release PR behind only docs: and ci: commits"
   ok "passes a release PR behind only skipped commit types"
+
+  out="$(gate release-plz-x true "$rel_skip" "$breaking")" && fail "passed a release PR behind breaking commits"
+  [[ $out == *"2 commit(s)"* ]] || fail "breaking commits not both counted: $out"
+  ok "counts breaking commits of skipped types"
 
   gate feature/x true "$rel" "$stale" >/dev/null || fail "gated a non-release branch"
   gate release-plz-x false "$rel" "$stale" >/dev/null || fail "gated a fork PR"
