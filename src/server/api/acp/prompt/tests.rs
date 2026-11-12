@@ -802,6 +802,7 @@ async fn queued_explicit_work_follows_a_failed_prompt_but_not_a_failed_runtime()
             Some("approval") => {
                 let approval = crate::acp::permissions::build_approval(
                     crate::acp::state::ToolCall {
+                        prompt: None,
                         id: "pending-tool".into(),
                         name: "shell".into(),
                         kind: "execute".into(),
