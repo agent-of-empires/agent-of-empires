@@ -23,7 +23,7 @@ fn memory_row(row: &TranscriptRow) -> RowSignature {
     (
         row.id.clone(),
         row.group_id.clone(),
-        row.kind.clone(),
+        row.kind,
         row.text.clone(),
         row.tool_call_id.clone(),
         row.tool.as_ref().map(|tool| {
@@ -55,7 +55,7 @@ fn disk_delta(context: &Context, delta: &DeltaOf<Disk>) -> DeltaSignature {
     let signature = (
         text(context, row.id),
         text(context, row.group_id),
-        row.kind.clone(),
+        row.kind,
         text(context, row.text),
         row.tool_call_id.map(|id| text(context, id)),
         row.tool.as_ref().map(|tool| {
