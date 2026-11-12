@@ -229,6 +229,41 @@ describe("SuggestionsSettings", () => {
     expect(field.value).toBe("typed");
   });
 
+  it("keeps an edit typed while a save or reset is in flight", async () => {
+    open();
+    let finish: (v: typeof ok) => void = () => {};
+    api.putSuggestionTemplate.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    fireEvent.change(field, { target: { value: "A" } });
+    fireEvent.blur(field);
+    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenCalledWith("gh", "review-requested", "A"));
+    fireEvent.change(field, { target: { value: "B" } });
+    const loads = api.fetchSuggestionTemplates.mock.calls.length;
+    finish(ok);
+    await waitFor(() => expect(api.fetchSuggestionTemplates.mock.calls.length).toBeGreaterThan(loads));
+    expect(field.value).toBe("B");
+    fireEvent.blur(field);
+    await waitFor(() => expect(api.putSuggestionTemplate).toHaveBeenLastCalledWith("gh", "review-requested", "B"));
+    cleanup();
+
+    open();
+    api.fetchSuggestionTemplates.mockResolvedValue([
+      { provider_id: "gh", criterion: "review-requested", template: "saved" },
+    ]);
+    api.resetSuggestionTemplate.mockReturnValueOnce(new Promise((resolve) => (finish = resolve)));
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const again = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    await waitFor(() => expect(again.value).toBe("saved"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Reset to the plugin's default" })[0]!);
+    await waitFor(() => expect(api.resetSuggestionTemplate).toHaveBeenCalledTimes(1));
+    fireEvent.change(again, { target: { value: "typed during reset" } });
+    const resetLoads = api.fetchSuggestionTemplates.mock.calls.length;
+    finish(ok);
+    await waitFor(() => expect(api.fetchSuggestionTemplates.mock.calls.length).toBeGreaterThan(resetLoads));
+    expect(again.value).toBe("typed during reset");
+  });
+
   it("opens straight on a focused template and returns to the suggestions view", async () => {
     const openFull = open({
       templateFocus: { providerId: "gh", criterion: "review-requested", returnToSuggestions: true },
