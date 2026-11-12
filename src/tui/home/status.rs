@@ -845,6 +845,7 @@ impl HomeView {
                                 metadata_changed |=
                                     self.session_feed.mark_snapshot_applied(snapshot);
                                 snapshot_applied = true;
+                                self.enforce_trash_read_only();
                             }
                         }
                         metadata_changed |= self.set_sidebar_source(SidebarSource::Daemon, None);

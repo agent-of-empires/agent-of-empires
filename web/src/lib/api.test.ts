@@ -457,7 +457,11 @@ const requestCases: RequestCase[] = [
     () => api.trashSession("../plugins/x/uninstall#"),
     { body: { kill_pane: true } },
   ],
-  ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
+  [
+    "POST /api/sessions/s1/restore",
+    () => api.restoreSession("s1"),
+    { respond: runtimeJson(session), result: { session, cursor } },
+  ],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
   [
     "POST /api/sessions/s1/start",
@@ -1461,11 +1465,11 @@ describe("login", () => {
 describe("session mutation messages", () => {
   it.each([
     ["trashSession", () => api.trashSession("s1"), { relocation: { status: "relocated", warning: "w" } }],
-    ["restoreSession", () => api.restoreSession("s1"), { status: "restored", warning: "w" }],
+    ["restoreSession", async () => (await api.restoreSession("s1"))?.session, { status: "restored", warning: "w" }],
   ])("%s folds a degraded move warning into warnings", async (_name, call, outcome) => {
-    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome }));
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome }));
     expect((await call())?.warnings).toEqual(["w"]);
-    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome: { status: "restored" } }));
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { status: "restored" } }));
     expect((await call())?.warnings).toBeUndefined();
   });
 

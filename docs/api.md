@@ -586,6 +586,12 @@ reservation returns `409`, and a missing conversation or incompatible provider
 returns `400`. CityHall mode refuses canonical forks with `403`. An idempotent
 replay still succeeds when the parent row has since been removed.
 
+At creation admission, an `import_acp_session_id` found already owned is refused
+with `400 create_failed` and the safe message “Import source is already owned by
+an AoE session”. Frozen cleanup ownership covers all tools' current and parked
+ACP IDs, even after an ordinary purge removes the visible row. Unrelated failures
+remain sanitized rather than exposing their internal causes.
+
 **Worktree fields**
 
 | Field | Notes |
@@ -872,6 +878,7 @@ Move a session to Trash. Optional JSON fields:
 | --- | --- | --- |
 | `kill_pane` | `true` | Stop the session's terminal panes during the transition. |
 | `expected_generation` | omitted | Require the selected session's `lifecycle_generation`; a mismatch returns `409 lifecycle_superseded` without mutation. |
+| `expected_profile` | omitted | Require the selected profile as well as the generation; a mismatch returns `409 lifecycle_superseded` without mutation. |
 
 Repeating a completed request for an already-trashed session succeeds without
 repeating teardown or relocation. A fresh lifecycle reservation returns
@@ -886,6 +893,13 @@ A terminal teardown or relocation failure leaves the session in Trash without
 preventing explicit Restore or Purge. A retry also settles the transition when
 all known worktree paths are proven absent. Unverified existing paths, unknown
 original locations, and filesystem lookup errors keep the transition protected.
+
+Unfinished Trash exposes Retry and read-only inspection, not record-only removal.
+Retry retains existing lifecycle, native ownership, and filesystem checks. An
+unverified checkout stays visible in Trash until those checks can settle it.
+UI requests capture their original profile, generation, and runtime epoch;
+replacement state requires fresh consent.
+
 
 ## Explicit structured worker stop
 

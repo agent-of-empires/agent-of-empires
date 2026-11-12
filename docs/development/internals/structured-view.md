@@ -90,6 +90,19 @@ Per-ID mutation exclusion stays shared with every held or queued operation. Reus
 
 Live owner references include missing descendants and symlink traversal dependencies. Permission errors, symlink loops and non-directory traversal refuse cleanup instead of being treated as absent owners.
 
+### Unfinished Trash recovery
+
+Retry uses the existing Trash lifecycle, not a second cleanup authority.
+An expired reservation can be retried, but a fresh owner remains busy.
+Unknown or unverified checkout ownership remains protected and visible in Trash;
+neither Retry nor read-only inspection authorizes purge or deletes the record.
+Record-only removal is outside this change's scope.
+
+TUI confirmation and palette requests retain original targets and runtime epochs.
+Tests dequeue the actual captured command before dispatching it through the real
+router; expected fixtures are assertions, never substitute operations. Web Restore
+receipts use per-row revisions so an older Retry cannot overwrite restored state.
+
 ## Who owns the state
 
 The daemon folds the event stream once per WebSocket connection into two projections, so clients do not re-derive them:

@@ -752,6 +752,9 @@ pub async fn trash_session(
             if worker_state.cityhall_mode && !row.is_structured() {
                 return Err(LifecycleTargetError::CityHall.into());
             }
+            if body.expected_profile.as_deref().is_some_and(|profile| profile != store.storage().profile()) {
+                return Err(crate::session::LifecycleReservationError::Superseded.into());
+            }
             if body.expected_generation.is_some_and(|generation| generation != row.lifecycle_generation) {
                 return Err(crate::session::LifecycleReservationError::Superseded.into());
             }

@@ -41,7 +41,7 @@ import { PluginUiProvider, usePluginAttention, usePluginPages, usePluginUiEntrie
 import { buildPluginPageActions } from "./lib/pluginPages";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { axisDrawsRepoHeaders } from "./lib/sidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -76,6 +76,9 @@ import {
   trashSessions,
   sessionsSharingWorktree,
   workspaceCleanupDefaults,
+  hasPendingTrash,
+  trashRecoveryTargetIsCurrent,
+  type TrashRecoveryTarget,
 } from "./lib/trashActions";
 import {
   loginStatus,
@@ -102,7 +105,7 @@ import {
   setSessionArchive,
   setSessionSnooze,
   trashSession,
-  restoreSession,
+  retryTrashSession,
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
@@ -448,12 +451,17 @@ function AppContent({
         ),
     });
   }, [injectSession, focusMode]);
-  // Trash is a whole-workspace concern, so it is derived here from the
-  // authoritative unsliced workspace list rather than reconstructed from the
-  // sidebar's per-`group_path` slice views. A workspace is in Trash only when
-  // every one of its sessions is trashed, and Restore/Delete then cover all of
-  // them. See #2533.
-  const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+  // A mixed workspace exposes only its trashed sessions in recovery controls.
+  const trashedWorkspaces = useMemo(
+    () =>
+      workspaces
+        .map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.filter((session) => session.trashed_at != null),
+        }))
+        .filter((workspace) => workspace.sessions.length > 0),
+    [workspaces],
+  );
   // The list omits the trash, so a link to a trashed session finds no row until the trash is loaded.
   const openedSessionId = focusSessionId ?? activeSessionId;
   useEffect(() => {
@@ -1403,12 +1411,41 @@ function AppContent({
     });
   };
 
-  // Restore a trashed workspace from the sidebar Trash section (#2489).
-  // Restores every session in the workspace (a workspace only lands in Trash
-  // when all of its sessions are trashed), not just the first.
+  // Restore only the trashed sessions supplied by the recovery surface.
   const handleRestoreSession = useCallback(
-    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
-    [applySession],
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySessionMutation, notify: toastBus.handler }),
+    [applySessionMutation],
+  );
+
+  const handleRetryTrash = useCallback(
+    async (target: TrashRecoveryTarget) => {
+      if (
+        caps.readOnly ||
+        !trashRecoveryTargetIsCurrent(
+          sessions.find((session) => session.id === target.id),
+          target,
+          runtimeEpoch,
+        )
+      ) {
+        toastBus.handler?.error("The Trash session changed. Reopen its recovery actions.");
+        return;
+      }
+      const result = await retryTrashSession(target.id, target, target.epoch);
+      if (result.outcome !== "committed") {
+        toastBus.handler?.error(result.message ?? "Trash retry was not confirmed. Refresh before retrying.");
+        refreshSessions();
+        return;
+      }
+      applySessionMutation(result.mutation);
+      if (hasPendingTrash(result.mutation.session)) {
+        toastBus.handler?.error(
+          result.message ?? "Trash remains unfinished. Its files and cleanup ownership are preserved.",
+        );
+      } else if (result.message) {
+        toastBus.handler?.info(result.message);
+      }
+    },
+    [caps.readOnly, sessions, runtimeEpoch, applySessionMutation, refreshSessions],
   );
 
   const stoppingSession = stoppingSessionId ? (sessions.find((s) => s.id === stoppingSessionId) ?? null) : null;
@@ -1937,30 +1974,29 @@ function AppContent({
     serverAboutLoaded,
   );
 
-  // Palette triage toggles for the active session. "snooze" needs a duration,
-  // so it opens the shared modal; the rest are argless server toggles that
-  // apply the returned snapshot immediately (re-bucketing without waiting for
-  // the poll) and surface a toast on failure.
   const handleSessionStateAction = useCallback(
     async (id: string, action: SessionStateAction) => {
       if (action === "snooze") {
         setSnoozeTargetId(id);
         return;
       }
-      const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
+      if (action === "untrash") {
+        await handleRestoreSession([id]);
+        return;
+      }
+      const run: Record<Exclude<SessionStateAction, "snooze" | "untrash">, () => Promise<SessionResponse | null>> = {
         pin: () => setSessionPin(id, true),
         unpin: () => setSessionPin(id, false),
         archive: () => setSessionArchive(id, true),
         unarchive: () => setSessionArchive(id, false),
         unsnooze: () => setSessionSnooze(id, null),
         trash: () => trashSession(id),
-        untrash: () => restoreSession(id),
       };
       const result = await run[action]();
       if (result) applySession(result);
       else reportError(`Failed to ${action} session`);
     },
-    [applySession],
+    [applySession, handleRestoreSession],
   );
 
   const commandActions = useCommandActions({
@@ -2693,6 +2729,7 @@ function AppContent({
                 onDeleteSession={handleDeleteSession}
                 onRestoreSession={handleRestoreSession}
                 onEmptyTrash={handleEmptyTrash}
+                onRetryTrash={handleRetryTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
                 onRestartForUpdate={restartForUpdate}

@@ -1621,95 +1621,52 @@ fn publish_canonical_snapshot(
 
 #[test]
 #[serial]
-fn canonical_peer_addition_preserves_live_send_and_drafts_when_active_row_is_hidden() {
-    let mut env = create_test_env_empty();
-    let active = local_row(&mut env, "active-live", "/tmp/active-live");
-    let active_id = active.id.clone();
-    seed_profile("test", std::slice::from_ref(&active));
-    let _native_driver = env.view.session_feed.terminal_driver_for_test();
-    publish_canonical_snapshot(
-        &mut env,
-        vec![canonical_row(&active, serde_json::json!({}))],
-        vec![],
-        1,
-    );
-    let native_lease = env.view.session_feed.native_lease_for_test();
-    assert!(native_lease.is_valid());
-    env.view.select_session_by_id(&active_id);
-    let tmux_name = crate::tmux::Session::resolve_name(&active_id, "active-live");
-    env.view.live_send = Some(live_send_state(&active_id, "active-live", &tmux_name));
-    env.view.pending_paste = Some("queued paste".into());
-    env.view.preview_capture_target = Some(tmux_name.clone());
-    env.view.live_send_last_resize = Some((100, 30));
-    env.view.trashed_section_collapsed = true;
-    env.view.search_active = true;
-    env.view.search_query = Input::new("peer-added".into());
+fn canonical_trash_disarms_live_input_without_revoking_peer_authority() {
+    for trashed in [false, true] {
+        let mut env = create_test_env_empty();
+        let mut row = local_row(&mut env, "live", "/tmp/live");
+        let id = row.id.clone();
+        seed_profile("test", std::slice::from_ref(&row));
+        let _native_driver = env.view.session_feed.terminal_driver_for_test();
+        publish_canonical_snapshot(
+            &mut env,
+            vec![canonical_row(&row, serde_json::json!({}))],
+            vec![],
+            1,
+        );
+        let native_lease = env.view.session_feed.native_lease_for_test();
+        env.view.select_session_by_id(&id);
+        let tmux_name = crate::tmux::Session::resolve_name(&id, "live");
+        env.view.live_send = Some(live_send_state(&id, "live", &tmux_name));
+        env.view.pending_paste = Some("queued paste".into());
+        env.view.preview_capture_target = Some(tmux_name);
+        env.view.trashed_section_collapsed = false;
+        if trashed {
+            row.trash();
+        }
+        let mut peer = Instance::new("peer", "/tmp/peer");
+        peer.source_profile = "test".into();
+        seed_profile("test", &[row.clone(), peer.clone()]);
+        publish_canonical_snapshot(
+            &mut env,
+            vec![
+                canonical_row(&row, serde_json::json!({})),
+                canonical_row(&peer, serde_json::json!({})),
+            ],
+            vec![],
+            2,
+        );
 
-    let mut hidden = active.clone();
-    hidden.trash();
-    let mut peer = Instance::new("peer-added", "/tmp/peer-added");
-    peer.source_profile = "test".into();
-    seed_profile("test", &[hidden.clone(), peer.clone()]);
-    publish_canonical_snapshot(
-        &mut env,
-        vec![
-            canonical_row(&hidden, serde_json::json!({})),
-            canonical_row(&peer, serde_json::json!({})),
-        ],
-        vec![],
-        2,
-    );
-
-    let view = &env.view;
-    assert!(
-        native_lease.is_valid(),
-        "unchanged native authority remains live"
-    );
-    assert!(view
-        .get_instance(&active_id)
-        .is_some_and(Instance::is_trashed));
-    assert!(
-        !view
-            .flat_items
-            .iter()
-            .any(|item| matches!(item, Item::Session { id, .. } if id == &active_id)),
-        "precondition: the active row moved under the collapsed trash shelf"
-    );
-    assert_eq!(view.selected_session.as_deref(), Some(active_id.as_str()));
-    assert_eq!(view.pending_paste.as_deref(), Some("queued paste"));
-    assert_eq!(
-        view.preview_capture_target.as_deref(),
-        Some(tmux_name.as_str())
-    );
-    assert_eq!(view.live_send_last_resize, Some((100, 30)));
-    assert_eq!(
-        view.displayed_pane_tmux_name().as_deref(),
-        Some(tmux_name.as_str()),
-        "preview capture must stay pinned to the live-send pane"
-    );
-    let peer_index = view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Session { id, .. } if id == &peer.id))
-        .expect("peer row remains visible");
-    assert!(view.search_matches.contains(&peer_index));
-    assert!(
-        !view.is_sidebar_item_selected(&view.flat_items[peer_index], peer_index),
-        "cursor fallback must not visibly retarget selection during live-send"
-    );
-    let live = view.live_send.as_ref().expect("live-send remains active");
-    assert_eq!(
-        (
-            live.session_id.as_str(),
-            live.title.as_str(),
-            live.tmux_name.as_str()
-        ),
-        (active_id.as_str(), "active-live", tmux_name.as_str())
-    );
-    assert_eq!(
-        live.target,
-        crate::tui::home::live_send::LiveSendTarget::Agent
-    );
+        assert!(native_lease.is_valid(), "peer authority stays available");
+        assert_eq!(env.view.live_send.is_some(), !trashed);
+        if trashed {
+            assert!(env.view.preview_capture_target.is_none());
+            assert!(env.view.take_native_attachment().is_none());
+        } else {
+            assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+            assert_eq!(env.view.pending_paste.as_deref(), Some("queued paste"));
+        }
+    }
 }
 
 #[test]
@@ -2960,7 +2917,7 @@ fn trash_transition_cancels_auxiliary_stop_confirmation_and_late_submit() {
 #[test]
 #[serial]
 fn trash_confirmation_rejects_a_changed_original_target() {
-    for change in ["trash", "generation", "purge", "selection"] {
+    for change in ["trash", "generation", "purge", "selection", "epoch"] {
         for late_submit in [false, true] {
             let mut env = create_test_env_with_sessions(2);
             let id = env.view.selected_session.clone().unwrap();
@@ -2986,6 +2943,7 @@ fn trash_confirmation_rejects_a_changed_original_target() {
                 "generation" => next.contents.sessions[0].lifecycle_generation += 1,
                 "purge" => next.contents.sessions.retain(|row| row.id != id),
                 "selection" => {}
+                "epoch" => next.cursor.epoch = "replacement".into(),
                 _ => unreachable!(),
             }
             env.view
@@ -3017,7 +2975,7 @@ fn trash_confirmation_rejects_a_changed_original_target() {
             let request = requests(Err("trash request observed".into()));
             if change == "selection" {
                 assert!(
-                    matches!(request, Some((target, crate::tui::session_feed::SessionRequest::Trash(_))) if target == id)
+                    matches!(request, Some((target, crate::tui::session_feed::SessionRequest::Trash { .. })) if target == id)
                 );
             } else {
                 assert!(request.is_none(), "{change}");
@@ -3648,5 +3606,190 @@ fn purge_dialog_rejects_stale_target_on_keyboard_and_mouse() {
                 "{change}, mouse={mouse}"
             );
         }
+    }
+}
+
+#[test]
+#[serial]
+fn retained_trash_context_menu_keeps_opening_epoch() {
+    use crate::session::{LifecycleOperation, LifecycleReservation};
+    use crate::tui::dialogs::{ContextMenuAction, ContextMenuDialog};
+    for replacement in [false, true] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.mutate_instance(&id, |row| {
+            row.trash();
+            row.lifecycle_generation = 4;
+            row.lifecycle_reservation = Some(LifecycleReservation {
+                op: LifecycleOperation::Trash,
+                generation: 4,
+                at: chrono::Utc::now() - chrono::Duration::hours(1),
+            });
+        });
+        env.view.trashed_section_collapsed = false;
+        env.view.rebuild_flat_items();
+        env.view.select_session_by_id(&id);
+        env.view
+            .session_feed
+            .publish_for_test(daemon_snapshot(&env.view, &id, "Stopped"));
+        env.view.apply_session_feed();
+        let row = env.view.get_instance(&id).unwrap();
+        env.view.context_menu = Some(
+            ContextMenuDialog::for_trashed_session((1, 1), true).with_session_target(
+                &id,
+                &row.source_profile,
+                row.lifecycle_generation,
+                env.view.session_feed.applied_epoch(),
+            ),
+        );
+        if replacement {
+            let SessionFeedResult::Snapshot(mut next) = daemon_snapshot(&env.view, &id, "Stopped")
+            else {
+                unreachable!()
+            };
+            Arc::make_mut(&mut next).cursor.epoch = "replacement".into();
+            env.view
+                .session_feed
+                .publish_for_test(SessionFeedResult::Snapshot(next));
+            env.view.apply_session_feed();
+        }
+        let mut commands = env.view.session_feed.request_driver_for_test();
+        assert!(env.view.session_feed.native_interaction_available());
+        env.view
+            .dispatch_context_menu_action(ContextMenuAction::RetryTrash);
+        let submitted = commands(Err("test completion".into()));
+        assert_eq!(
+            submitted.is_some(),
+            !replacement,
+            "an old menu cannot use a replacement runtime's writer"
+        );
+        assert!(env.view.get_instance(&id).unwrap().has_pending_trash());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn keyboard_palette_recovery_executes_captured_commands_and_preserves_files() {
+    use super::pickers_groups_sort::receipt_cursor;
+    use crate::tui::session_feed::{SessionCommandOutcome, SessionRequest};
+    for (action, fresh) in [
+        ("Restore selected Trash", false),
+        ("Retry selected unfinished", false),
+        ("Retry selected unfinished", true),
+    ] {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        let path = env._temp.path().join("recovery-project");
+        std::fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("recovery-sentinel");
+        std::fs::write(&sentinel, b"keep recovery files").unwrap();
+        let restore = action.starts_with("Restore");
+        let scopes = Vec::new();
+        env.view.mutate_instance(&id, |row| {
+            row.terminal_scopes = Some(scopes.clone());
+            row.project_path = path.to_string_lossy().into_owned();
+            if !restore {
+                row.try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    if fresh {
+                        chrono::Utc::now()
+                    } else {
+                        chrono::Utc::now() - chrono::Duration::hours(1)
+                    },
+                )
+                .unwrap();
+            }
+            row.trash();
+        });
+        seed_profile("test", &env.view.cloned_instances());
+        let state = native_state(&["test"]).await;
+        apply_published(&mut env.view, &state).await;
+        env.view.trashed_section_collapsed = false;
+        env.view.rebuild_flat_items();
+        env.view.select_session_by_id(&id);
+        let epoch = env.view.session_feed.applied_epoch().unwrap().to_owned();
+        let storage = Storage::open_unwatched("test").unwrap();
+        let registry_before = std::fs::read(storage.sessions_path()).unwrap();
+        let journal_path = crate::session::get_app_dir()
+            .unwrap()
+            .join(crate::session::purge_owners::FILE_NAME);
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let mut capture = env.view.session_feed.capture_request_driver_for_test();
+        env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            None,
+        );
+        assert!(env.view.command_palette.is_some());
+        for ch in action.chars() {
+            env.view.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+        let captured = capture().expect("palette recovery submitted");
+        assert_eq!(captured.id, id);
+        let (suffix, body, request_epoch) = match &captured.request {
+            SessionRequest::Restore => ("restore", serde_json::json!({}), epoch.as_str()),
+            SessionRequest::Trash {
+                body,
+                expected_epoch,
+            } => (
+                "trash",
+                serde_json::to_value(body).unwrap(),
+                expected_epoch.as_str(),
+            ),
+            _ => panic!("palette selected a different operation"),
+        };
+        let (status, headers, value) = request_at_epoch_with_headers(
+            &state,
+            "POST",
+            &format!("/api/sessions/{}/{suffix}", captured.id),
+            body,
+            request_epoch,
+        )
+        .await;
+        if fresh {
+            assert_eq!(status, axum::http::StatusCode::CONFLICT);
+            assert_eq!(
+                headers[crate::daemon::ERROR_CODE_HEADER],
+                crate::daemon::ApiErrorCode::LifecycleLocked.as_str()
+            );
+            captured.finish(Err(value.to_string()));
+            env.view.apply_session_feed();
+            apply_published(&mut env.view, &state).await;
+            assert!(env.view.session_feed.can_submit(&id));
+            assert_eq!(
+                std::fs::read(storage.sessions_path()).unwrap(),
+                registry_before
+            );
+            assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+            assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
+            continue;
+        }
+        assert!(status.is_success(), "{action}: {status} {value}");
+        let cursor = receipt_cursor(&headers);
+        assert_eq!(cursor.epoch, epoch);
+        assert!(cursor.revision > 0);
+        match &captured.request {
+            SessionRequest::Restore => captured.finish(Ok(SessionCommandOutcome::Restored(
+                crate::daemon::MutationReceipt {
+                    cursor,
+                    outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+                },
+            ))),
+            SessionRequest::Trash { .. } => captured.finish(Ok(SessionCommandOutcome::Trashed(
+                crate::daemon::MutationReceipt {
+                    cursor,
+                    outcome: serde_json::from_value(value["outcome"].clone()).unwrap(),
+                },
+            ))),
+            _ => unreachable!(),
+        }
+        env.view.apply_session_feed();
+        apply_published(&mut env.view, &state).await;
+        let rows = Storage::open_unwatched("test").unwrap().load().unwrap();
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.is_trashed(), !restore);
+        assert!(!row.has_pending_trash());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"keep recovery files");
     }
 }
