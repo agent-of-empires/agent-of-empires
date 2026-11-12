@@ -278,6 +278,26 @@ describe("SuggestionsSettings", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   });
 
+  it("keeps a saved template's text visible when its reload fails", async () => {
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    const field = (await screen.findByLabelText("GitHub review-requested template")) as HTMLTextAreaElement;
+    api.fetchSuggestionTemplates.mockResolvedValueOnce(null);
+    fireEvent.change(field, { target: { value: "new prompt" } });
+    fireEvent.blur(field);
+    await screen.findByText(/Could not load templates/);
+    expect(field.value).toBe("new prompt");
+  });
+
+  it("clears the load error once Retry loads everything", async () => {
+    api.fetchSuggestionMappings.mockResolvedValueOnce(null);
+    open();
+    fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+    await screen.findByText(/Could not load mappings/);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByText(/Could not load mappings/)).toBeNull());
+  });
+
   it("sends template saves one at a time, in the order they were made", async () => {
     open();
     let finishA: (v: typeof ok) => void = () => {};
