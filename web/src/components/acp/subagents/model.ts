@@ -196,7 +196,7 @@ export function fromInline(
 export function launchFromRows(
   rows: readonly ActivityRow[],
   id: string,
-): { tool: ToolCall; result?: ActivityRow; children: ToolCardProps[] } | undefined {
+): { tool?: ToolCall; result?: ActivityRow; children: ToolCardProps[] } | undefined {
   let tool: ToolCall | undefined;
   let result: ActivityRow | undefined;
   const children = new Map<string, ToolCardProps>();
@@ -211,7 +211,7 @@ export function launchFromRows(
       else if (child) child.result = row;
     }
   }
-  return tool && { tool, result, children: [...children.values()] };
+  return tool || children.size ? { tool, result, children: [...children.values()] } : undefined;
 }
 
 /** A tailed background agent. Its tools carry no inline card. */

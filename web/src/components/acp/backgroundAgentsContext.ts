@@ -73,7 +73,7 @@ const AGENT_STATUS: Record<SubagentStatus, BackgroundAgentStatus> = {
 };
 
 /** The pane's rows: legacy launch records, plus every child no record covers, built
- *  from the same activity rows as its thread card. Before that card's row loads,
+ *  from the same activity rows as its thread card. With none of its rows loaded,
  *  a child shows only its roster title and state. */
 export function paneAgents(
   agents: BackgroundAgent[],
@@ -86,7 +86,15 @@ export function paneAgents(
     .map((s): PaneAgent => {
       const key = subagentKey(s);
       const launch = launchFromRows(rows, key);
-      const record = launch && fromInline(launch.tool, launch.result, launch.children, s);
+      // A page can hold a child's calls without its launch row.
+      const tool = launch?.tool ?? {
+        id: key,
+        name: s.description ?? "",
+        kind: "other",
+        args_preview: "{}",
+        started_at: "",
+      };
+      const record = launch && fromInline(tool, launch.result, launch.children, s);
       return {
         agentId: s.session_id,
         toolCallId: key,

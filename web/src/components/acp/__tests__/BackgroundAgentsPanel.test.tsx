@@ -572,12 +572,22 @@ describe("BackgroundAgentsPanel", () => {
       agentsMock.mockReturnValue([]);
       subagentsMock.mockReturnValue([record({ parent_tool_call_id: "msg-1", title: "Explore repo" })]);
       activityMock.mockReturnValue([launch, call]);
-      const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      const { container, getByRole, unmount } = render(<BackgroundAgentsPanel sessionId="s-1" />);
       fireEvent.click(getByRole("button", { name: /Explore repo/ }));
       expect(container.textContent).toContain("find the flaky test");
       expect(container.textContent).toContain("1 call");
       expect(container.textContent).toContain("cargo test");
       expect(container.textContent).not.toContain("no prompt recorded");
+
+      unmount();
+
+      // A reload can page in the child's calls without its launch row.
+      activityMock.mockReturnValue([call]);
+      const paged = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(paged.getByRole("button", { name: /Explore repo/ }));
+      expect(paged.container.textContent).toContain("1 call");
+      expect(paged.container.textContent).toContain("cargo test");
+      paged.unmount();
 
       // Before its card's row loads, the child shows its roster title and state only.
       activityMock.mockReturnValue([]);
