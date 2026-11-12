@@ -62,6 +62,8 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const [busy, setBusy] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const sheetRef = useRef<HTMLDialogElement>(null);
+  // Latest save per `section.field`, so a reconciliation read can't undo a newer save of that field.
+  const saves = useRef<Record<string, number>>({});
   const { save, elevation } = useInlineMachineSave();
 
   useEffect(() => {
@@ -144,14 +146,20 @@ export function SetupWizardPage({ status, about, profile, refresh, onLeave }: Pr
   const last = index === steps.length - 1;
 
   const saveField = async (section: string, field: string, value: unknown): Promise<boolean> => {
+    const key = `${section}.${field}`;
+    const id = (saves.current[key] = (saves.current[key] ?? 0) + 1);
     const ok = await save({ [section]: { [field]: value } });
     if (ok) {
       setMachine((m) => ({ ...m, [section]: { ...m?.[section], [field]: value } }));
       // Not awaited: a slow status read must not reorder this save's success behind a newer one.
       void markConfigured(step.key);
     } else {
-      // The write may still have landed; show what the Daemon holds.
-      void fetchMachineSettings().then((s) => s && setMachine(s as MachineValues));
+      // The write may still have landed; show what the Daemon holds for this field.
+      void fetchMachineSettings().then((s) => {
+        if (!s || saves.current[key] !== id) return;
+        const held = (s as MachineValues)[section]?.[field];
+        setMachine((m) => ({ ...m, [section]: { ...m?.[section], [field]: held } }));
+      });
     }
     return ok;
   };

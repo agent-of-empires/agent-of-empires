@@ -393,3 +393,85 @@ it("a failed pick rolls back to the older pick that saved", async () => {
   fireEvent.click(radio("gemini"));
   await waitFor(() => expect(radio("claude").checked).toBe(true));
 });
+
+/**
+ * Worktrees step with `enabled` and `auto_cleanup` toggles. Saving `enabled` gets `enabledReply`; the
+ * re-read that follows is held and answers `reread`. `read` resolves once that answer is parsed and
+ * every microtask after it, including the wizard's, has run.
+ */
+function heldReread(enabledReply: () => Response, reread: Record<string, unknown>) {
+  const committed: unknown[] = [];
+  const reads = { count: 0, release: undefined as (() => void) | undefined };
+  server.use(
+    http.get("*/api/settings/schema", () =>
+      HttpResponse.json([FIELD, { ...FIELD, field: "auto_cleanup", label: "Clean up worktrees" }]),
+    ),
+    http.get("*/api/settings", async () => {
+      if (++reads.count !== 2) return HttpResponse.json({ worktree: { enabled: false, auto_cleanup: false } });
+      await new Promise<void>((resolve) => (reads.release = resolve));
+      return HttpResponse.json({ worktree: reread });
+    }),
+    http.patch("*/api/settings", async ({ request }) => {
+      const body = (await request.json()) as { worktree: Record<string, unknown> };
+      if ("enabled" in body.worktree) return enabledReply();
+      committed.push(body);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  let parsed!: () => void;
+  const read = new Promise<void>((resolve) => (parsed = resolve));
+  const realFetch = globalThis.fetch;
+  const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async (...args) => {
+    const res = await realFetch(...args);
+    if (reads.count !== 2 || (args[1]?.method ?? "GET") !== "GET") return res;
+    const json = res.json.bind(res);
+    res.json = () => json().finally(() => setTimeout(parsed));
+    return res;
+  });
+
+  /** Saves `enabled`, then commits `auto_cleanup` while the re-read is held, then releases it. */
+  const race = async () => {
+    renderPage(status(["agents"]), "/setup?step=worktrees");
+    await enabled("Next");
+    const [enabledSwitch, cleanup] = screen.getAllByRole("switch");
+    fireEvent.click(enabledSwitch!);
+    await waitFor(() => expect(reads.release).toBeDefined());
+    fireEvent.click(cleanup!);
+    await waitFor(() => expect(committed).toEqual([{ worktree: { auto_cleanup: true } }]));
+    await waitFor(() => expect(cleanup!.getAttribute("aria-checked")).toBe("true"));
+    await act(async () => {
+      reads.release!();
+      await read;
+    });
+    return { enabledSwitch: enabledSwitch!, cleanup: cleanup! };
+  };
+  return { race, restore: () => fetchSpy.mockRestore() };
+}
+
+it("a stale read after a rejected save doesn't undo a newer save that committed", async () => {
+  const { race, restore } = heldReread(() => HttpResponse.json({ error: "invalid" }, { status: 400 }), {
+    enabled: false,
+    auto_cleanup: false,
+  });
+  try {
+    const { cleanup } = await race();
+    expect(cleanup.getAttribute("aria-checked")).toBe("true");
+  } finally {
+    restore();
+  }
+});
+
+it("an uncertain save that landed shows its value even after another field saves", async () => {
+  const { race, restore } = heldReread(() => HttpResponse.json({ error: "boom" }, { status: 500 }), {
+    enabled: true,
+    auto_cleanup: true,
+  });
+  try {
+    const { enabledSwitch } = await race();
+    // No passphrase prompt replaced the footer.
+    expect(screen.getByRole("button", { name: "Next" })).toBeTruthy();
+    expect(enabledSwitch.getAttribute("aria-checked")).toBe("true");
+  } finally {
+    restore();
+  }
+});
