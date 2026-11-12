@@ -54,7 +54,7 @@ gate() {
   count="$(echo "$missed" | wc -l | tr -d ' ')"
   # Indented, not fenced: a subject with backticks cannot break the block.
   { echo '### Would ship without CHANGELOG.md entries'; echo; echo "$missed" | sed 's/^/    /'; } >>"${GITHUB_STEP_SUMMARY:-/dev/null}"
-  echo "::error title=Release PR is stale::$count commit(s) landed after the release PR's last refresh and would ship without CHANGELOG.md entries. Dispatch release-plz.yml to refresh the PR, then queue it again. See the job summary."
+  echo "::error title=Release PR is stale::$count commit(s) landed after the release PR's last refresh and would ship without CHANGELOG.md entries. Dispatch release-plz.yml, re-approve the refreshed PR, then queue it again. See the job summary."
   return 1
 }
 
