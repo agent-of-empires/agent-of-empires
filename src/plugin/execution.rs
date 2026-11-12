@@ -361,7 +361,6 @@ mod tests {
             .unwrap()
         }
         let (_, leader) = captured(&root.join("leader")).await;
-        let (late_pid, late) = captured(&root.join("late")).await;
         std::fs::write(root.join("release"), b"").unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !leader.exited().unwrap() {
@@ -370,22 +369,14 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(!late.exited().unwrap(), "{}", {
-            let identity = crate::process::process_birth_identity(late_pid).unwrap();
-            let recapture = identity
-                .as_ref()
-                .map(|birth| {
-                    crate::process::CapturedProcess::capture(late_pid, birth)
-                        .unwrap()
-                        .is_some()
-                })
-                .unwrap_or(false);
-            format!(
-                "late child pid={late_pid} identity={identity:?} recapture={recapture} \
-                 file={:?}",
-                std::fs::read_to_string(root.join("late")).ok()
-            )
-        });
+        // The leader publishes the background job's pid between fork and exec, and the
+        // macOS process identity changes on exec, so capture only once the leader is
+        // gone: the run is still parked at the gate and has not settled the group yet.
+        let (late_pid, late) = captured(&root.join("late")).await;
+        assert!(
+            !late.exited().unwrap(),
+            "late group child pid={late_pid} must survive until the settle pass"
+        );
         observe.release();
         let output = tokio::time::timeout(Duration::from_secs(10), task)
             .await
