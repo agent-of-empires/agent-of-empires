@@ -631,7 +631,7 @@ mod tests {
         transcript.apply_reduced_state(1, full, &[]);
         assert_eq!(transcript.available_commands.len(), 1);
         assert_eq!(transcript.available_modes.len(), 1);
-        t.config_options = vec![crate::acp::state::ConfigOptionDescriptor {
+        transcript.config_options = vec![crate::acp::state::ConfigOptionDescriptor {
             id: "fast".into(),
             name: "Fast mode".into(),
             description: None,
@@ -649,7 +649,7 @@ mod tests {
                 "config_options".to_string(),
             ],
         );
-        assert_eq!(t.config_options.len(), 1, "config options survived");
+        assert_eq!(transcript.config_options.len(), 1, "config options survived");
         assert_eq!(transcript.available_commands.len(), 1, "commands survived");
         assert_eq!(transcript.available_modes.len(), 1, "modes survived");
 
@@ -720,6 +720,7 @@ mod tests {
             tool_call_id: None,
             description: "background task".into(),
             workflow: None,
+            started_at: None,
         }]);
         transcript.apply_reduced_state(2, busy.clone(), &["background_agents".into()]);
         assert!(transcript.background_agent_active);

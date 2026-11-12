@@ -2944,22 +2944,12 @@ mod tests {
     /// arrives on a later frame: one error toast, value display untouched.
     #[tokio::test]
     async fn a_rejected_toggle_pick_toasts_once_and_keeps_the_confirmed_value() {
-        use crate::acp::state::{AcpSessionId, AcpState, AgentName, Event};
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
         let model_config = ConfigOptionCategory::Other("model_config".into());
         let mut acp = AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
-        acp.apply_event(
-            1,
-            Event::ConfigOptionsUpdated {
-                options: vec![config_option(
-                    "ultracode",
-                    "Ultracode",
-                    model_config,
-                    "off",
-                    &["on", "off"],
-                )],
-            },
-        )
-        .unwrap();
+        acp.config_options = vec![config_option(
+            "ultracode", "Ultracode", model_config, "off", &["on", "off"],
+        )];
         let frame = |acp: &AcpState, seq| {
             Ok(WsMessage::ReducedState {
                 seq,
@@ -2972,15 +2962,11 @@ mod tests {
         apply_ws_message(&mut state, &mut deadline, frame(&acp, 1)).await;
         assert!(state.toast.is_none());
 
-        acp.apply_event(
-            2,
-            Event::ConfigOptionSwitchFailed {
-                config_id: "ultracode".into(),
-                value: "on".into(),
-                reason: "not on this model".into(),
-            },
-        )
-        .unwrap();
+        acp.config_option_switch_failed = Some(crate::acp::state::ConfigOptionSwitchFailure {
+            config_id: "ultracode".into(),
+            value: "on".into(),
+            reason: "not on this model".into(),
+        });
         apply_ws_message(&mut state, &mut deadline, frame(&acp, 2)).await;
         let toast = state.toast.take().expect("rejection toasted");
         assert!(matches!(toast.kind, ToastKind::Error));

@@ -59,11 +59,15 @@ pub(crate) struct NativeChildProvenance {
 impl NativeChildProvenance {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.origin.owner.is_some_and(|owner| owner.birth_fingerprint.is_some())
+            self.origin
+                .owner
+                .is_some_and(|owner| owner.birth_fingerprint.is_some())
                 && (2..=257).contains(&self.ancestry.len())
-                && self.ancestry.iter().enumerate().all(|(index, id)| {
-                    !self.ancestry[..index].contains(id)
-                }),
+                && self
+                    .ancestry
+                    .iter()
+                    .enumerate()
+                    .all(|(index, id)| { !self.ancestry[..index].contains(id) }),
             "invalid persisted Native child ancestry"
         );
         Ok(())
@@ -431,9 +435,12 @@ impl EventMetadata {
             child.validate()?;
             anyhow::ensure!(
                 metadata.native_origin == Some(child.origin)
-                    && metadata.reported_session_id.as_ref().is_some_and(|reported| {
-                        reported == child.parent() || reported == child.child()
-                    })
+                    && metadata
+                        .reported_session_id
+                        .as_ref()
+                        .is_some_and(|reported| {
+                            reported == child.parent() || reported == child.child()
+                        })
                     && (scope == EventScope::HistoryOnly
                         || metadata.reported_session_id.as_ref() == Some(child.root())),
                 "Native child provenance differs from its original frame"
@@ -1971,6 +1978,7 @@ mod metadata_tests {
     fn host_resource_reference_cannot_claim_native_success_or_prompt_authority() {
         let allocation = uuid::Uuid::new_v4();
         let prompt = Event::UserPromptSent {
+            merged_prompt_ids: Vec::new(),
             text: "input".into(),
             attachments: Vec::new(),
             prompt_id: None,

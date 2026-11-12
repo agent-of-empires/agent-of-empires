@@ -916,13 +916,15 @@ impl SessionIngress {
             PendingIngress::Update(update) => {
                 let captured_source = update.original_source;
                 let source_admitted = match update.evidence.physical_source {
-                    Some(physical) => captured_source == Some(physical.witness)
-                        && state.original.as_ref().is_some_and(|original| {
-                        crate::acp::state::NativeEventOrigin::owned_attempt(
-                            &original.attempt,
-                            Some(original.owner),
-                        ) == Some(physical.witness)
-                    }),
+                    Some(physical) => {
+                        captured_source == Some(physical.witness)
+                            && state.original.as_ref().is_some_and(|original| {
+                                crate::acp::state::NativeEventOrigin::owned_attempt(
+                                    &original.attempt,
+                                    Some(original.owner),
+                                ) == Some(physical.witness)
+                            })
+                    }
                     None => unmanaged,
                 };
                 let routed = source_admitted
@@ -1021,7 +1023,10 @@ impl SessionIngress {
     ) -> IngressUpdate {
         update.history = {
             let mut state = self.state.lock().expect("ingress identity");
-            let source = update.evidence.physical_source.map(|physical| physical.witness);
+            let source = update
+                .evidence
+                .physical_source
+                .map(|physical| physical.witness);
             update.original_source = state.original.as_ref().and_then(|original| {
                 crate::acp::state::NativeEventOrigin::owned_attempt(
                     &original.attempt,
@@ -1030,7 +1035,9 @@ impl SessionIngress {
                 .filter(|original| Some(*original) == source)
             });
             if update.original_source.is_some() && state.pending.is_none() {
-                let IdentityState { current, children, .. } = &mut *state;
+                let IdentityState {
+                    current, children, ..
+                } = &mut *state;
                 register_child(children, current.as_ref(), &update.notification, source);
                 update.child_route = freeze_child_route(children, &update.notification, source);
             }
@@ -1223,13 +1230,15 @@ impl SessionIngress {
             return Ok(None);
         }
         let source_admitted = match notification.evidence.physical_source {
-            Some(physical) => notification.original_source == Some(physical.witness)
-                && state.original.as_ref().is_some_and(|original| {
-                crate::acp::state::NativeEventOrigin::owned_attempt(
-                    &original.attempt,
-                    Some(original.owner),
-                ) == Some(physical.witness)
-            }),
+            Some(physical) => {
+                notification.original_source == Some(physical.witness)
+                    && state.original.as_ref().is_some_and(|original| {
+                        crate::acp::state::NativeEventOrigin::owned_attempt(
+                            &original.attempt,
+                            Some(original.owner),
+                        ) == Some(physical.witness)
+                    })
+            }
             None => unmanaged,
         };
         let routed = source_admitted
@@ -1261,7 +1270,10 @@ impl SessionIngress {
                 notification.child_route = freeze_child_route(
                     children,
                     &notification.notification,
-                    notification.evidence.physical_source.map(|source| source.witness),
+                    notification
+                        .evidence
+                        .physical_source
+                        .map(|source| source.witness),
                 );
             }
         }
@@ -1846,7 +1858,7 @@ mod tests {
         let anchored =
             serde_json::json!({"aoe": {"v": 1, "key": "t", "after_adapter_sequence": 2}});
         if let agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk) =
-            &mut tailer.update
+            &mut tailer.notification.update
         {
             chunk.meta = anchored.as_object().cloned();
         }

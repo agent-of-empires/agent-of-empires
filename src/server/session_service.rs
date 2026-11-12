@@ -324,14 +324,6 @@ pub struct SessionService {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
-    /// Single-use gate for loss between final admission/publication and native delivery.
-    #[cfg(test)]
-    native_prompt_send_gate: std::sync::Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
     #[cfg(test)]
     creation_commit_barrier: std::sync::Mutex<
         Option<tokio::sync::mpsc::UnboundedSender<(String, tokio::sync::oneshot::Sender<()>)>>,
@@ -2899,22 +2891,6 @@ impl SessionService {
         if tx.send((id.to_string(), ack)).is_ok() {
             let _ = released.await;
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn arm_native_prompt_send_gate(
-        &self,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        let (arrived, arrival) = tokio::sync::oneshot::channel();
-        let (release, released) = tokio::sync::oneshot::channel();
-        *self
-            .native_prompt_send_gate
-            .lock()
-            .expect("prompt send gate poisoned") = Some((arrived, released));
-        (arrival, release)
     }
 
     #[cfg(test)]

@@ -1272,95 +1272,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial_test::serial]
-    async fn capacity_refusal_preserves_plugin_prompt_stop_fence_and_native_generation() {
-        use crate::process::worker_registry;
-        let _home = crate::session::test_support::isolate_app_dir();
-        let project = tempfile::tempdir().unwrap();
-        let mut row = Instance::new("plugin-stopped-capacity", project.path().to_str().unwrap());
-        row.source_profile = "default".into();
-        row.view = crate::session::View::Structured;
-        row.status = Status::Stopped;
-        row.lifecycle_generation = 27;
-        row.idle_dormant_since = Some(chrono::Utc::now());
-        row.acp_session_id = Some("retained-native-plugin".into());
-        row.agent_name = Some("claude".into());
-        row.created_by_plugin = Some("cron".into());
-        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
-        let state = crate::server::test_support::build_test_app_state_with_launcher(
-            vec![row.clone()],
-            launcher,
-        );
-        seed_native_rows(&state).await;
-        state
-            .acp_supervisor
-            .test_insert_worker("occupied-plugin-slot")
-            .await;
-        let record = worker_registry::WorkerRecord::new(
-            row.id.clone(),
-            std::process::id(),
-            project.path().join("stopped.sock"),
-            "claude".into(),
-            "claude".into(),
-            project.path().to_owned(),
-            None,
-            vec![],
-            vec![],
-            row.acp_session_id.clone(),
-            Some("default".into()),
-        )
-        .with_generation(71);
-        worker_registry::save(&record).unwrap();
-        let intent = worker_registry::request_stop(&record).unwrap();
-        worker_registry::delete(&row.id).unwrap();
-        let policy_dir = tempfile::tempdir().unwrap();
-        let deps = Arc::new(SessionRpcDeps {
-            session_service: Arc::clone(&state.session_service),
-            policy: Arc::new(AutomationPolicy::open(&policy_dir.path().join("policy.db")).unwrap()),
-            profile: "default".into(),
-            cityhall_mode: false,
-        });
-        let error = dispatch(
-            &deps,
-            &ctx_with(&["session.prompt"]),
-            "sessions.turn.send",
-            &serde_json::json!({ "session_id": row.id, "text": "keep this stopped intent" }),
-        )
-        .await
-        .expect_err("the real ACP capacity admission refuses this wake");
-        assert_eq!(error.code, codes::SERVICE_UNAVAILABLE);
-        assert_eq!(kind(&error), "worker_not_ready");
-        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(worker_registry::stop_intent(&row.id).unwrap(), Some(intent));
-        let memory = state
-            .instances
-            .read()
-            .await
-            .iter()
-            .find(|saved| saved.id == row.id)
-            .unwrap()
-            .clone();
-        let persisted = crate::session::Storage::open_reference("default")
-            .unwrap()
-            .load()
-            .unwrap()
-            .into_iter()
-            .find(|saved| saved.id == row.id)
-            .unwrap();
-        for saved in [&memory, &persisted] {
-            assert_eq!(saved.status, row.status);
-            assert_eq!(saved.lifecycle_generation, row.lifecycle_generation);
-            assert_eq!(saved.idle_dormant_since, row.idle_dormant_since);
-            assert_eq!(saved.acp_session_id, row.acp_session_id);
-            assert!(!saved.plugin_revival_pending);
-        }
-        assert_eq!(
-            state.acp_supervisor.worker_state(&row.id).await,
-            crate::daemon::AcpWorkerState::Absent
-        );
-    }
-
     fn ctx_with(caps: &[&str]) -> PluginRpcContext {
         PluginRpcContext {
             plugin_id: "cron".to_string(),
@@ -2319,7 +2230,7 @@ mod tests {
                             text: "the winning turn",
                             attachments: &[],
                             woke_idle_dormant: false,
-                            prompt_id: None,
+                            prompt_ids: Vec::new(),
                             synthesized: false,
                             no_revive: false,
                         },

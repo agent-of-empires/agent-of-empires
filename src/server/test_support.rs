@@ -725,7 +725,7 @@ impl ManagedControlSession {
                     text,
                     attachments: &[],
                     woke_idle_dormant: false,
-                    prompt_id: None,
+                    prompt_ids: Vec::new(),
                     synthesized: false,
                     no_revive: false,
                 },

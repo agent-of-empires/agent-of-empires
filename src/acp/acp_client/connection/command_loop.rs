@@ -1556,6 +1556,7 @@ mod tests {
     use super::*;
     use crate::acp::acp_client::session_identity::RequestPolicy;
     use crate::acp::supervisor::test_support::managed::with_managed;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial_test::serial]

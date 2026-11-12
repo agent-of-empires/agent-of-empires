@@ -1218,6 +1218,7 @@ mod tests {
                 tool_call_id: None,
                 description: "tracked work".into(),
                 workflow: None,
+                started_at: None,
             };
             let end = Event::BackgroundTaskFinished {
                 task_id: "reused".into(),

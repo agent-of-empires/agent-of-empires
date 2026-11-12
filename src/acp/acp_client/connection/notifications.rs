@@ -499,9 +499,10 @@ impl Shared {
         let child_route = child_route.filter(|(_, route)| {
             route.source == original_source
                 && route.source == evidence.physical_source.map(|physical| physical.witness)
-                && route.provenance.as_ref().is_some_and(|proof| {
-                    Some(proof.origin) == original_source
-                })
+                && route
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|proof| Some(proof.origin) == original_source)
         });
         if let Some(route) = &child_route {
             metadata.child_provenance = route.1.provenance.clone();
@@ -509,26 +510,27 @@ impl Shared {
                 Some(context) => {
                     let mut metadata = metadata.clone();
                     metadata.scope = EventScope::SessionCurrent;
-                    self.event_tx.with_scoped_metadata(metadata, Some(Arc::clone(context)))
+                    self.event_tx
+                        .with_scoped_metadata(metadata, Some(Arc::clone(context)))
                 }
                 None => self.event_tx.with_metadata(metadata.clone()),
             };
             match notification.update {
                 SessionUpdate::SubagentUpdate(update) => {
-                    return self.handle_subagent_update(
-                        &sender, route, notification.session_id, update,
-                    ).await;
+                    return self
+                        .handle_subagent_update(&sender, route, notification.session_id, update)
+                        .await;
                 }
                 SessionUpdate::SessionMessage(message) => {
-                    return self.handle_session_message(
-                        &sender, route, notification.session_id, message,
-                    ).await;
+                    return self
+                        .handle_session_message(&sender, route, notification.session_id, message)
+                        .await;
                 }
                 SessionUpdate::SessionMessageChunk(_) => return,
                 update if route.0 == notification.session_id => {
-                    return self.handle_child_notification(
-                        &sender, route, notification.session_id, update,
-                    ).await;
+                    return self
+                        .handle_child_notification(&sender, route, notification.session_id, update)
+                        .await;
                 }
                 update => notification.update = update,
             }
@@ -878,12 +880,17 @@ impl Shared {
     ) {
         // Subagent traffic never feeds the root session's dedup, compaction
         // or watchdog state: a busy child would hold its parent's turn open.
-        let from_child = self.ingress.child_route(&notification.session_id)
+        let from_child = self
+            .ingress
+            .child_route(&notification.session_id)
             .map(|route| (notification.session_id.clone(), route));
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
-                let Some(route) = self.ingress.child_route(&update.session_id)
-                    .map(|route| (update.session_id.clone(), route)) else {
+                let Some(route) = self
+                    .ingress
+                    .child_route(&update.session_id)
+                    .map(|route| (update.session_id.clone(), route))
+                else {
                     return;
                 };
                 return self
@@ -893,23 +900,42 @@ impl Shared {
             SessionUpdate::SessionMessage(message) => {
                 let child = match (&message.sender_session_id, &message.recipient_session_id) {
                     (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient))
-                        if sender == &notification.session_id => recipient,
+                        if sender == &notification.session_id =>
+                    {
+                        recipient
+                    }
                     (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient))
-                        if recipient == &notification.session_id => sender,
+                        if recipient == &notification.session_id =>
+                    {
+                        sender
+                    }
                     _ => return,
                 };
-                let Some(route) = self.ingress.child_route(child)
-                    .map(|route| (child.clone(), route)) else {
+                let Some(route) = self
+                    .ingress
+                    .child_route(child)
+                    .map(|route| (child.clone(), route))
+                else {
                     return;
                 };
                 return self
-                    .handle_session_message(&self.event_tx, &route, notification.session_id, message)
+                    .handle_session_message(
+                        &self.event_tx,
+                        &route,
+                        notification.session_id,
+                        message,
+                    )
                     .await;
             }
             SessionUpdate::SessionMessageChunk(_) => return,
             update if from_child.is_some() => {
                 return self
-                    .handle_child_notification(&self.event_tx, from_child.as_ref().expect("matched child route"), notification.session_id, update)
+                    .handle_child_notification(
+                        &self.event_tx,
+                        from_child.as_ref().expect("matched child route"),
+                        notification.session_id,
+                        update,
+                    )
                     .await;
             }
             update => notification.update = update,
@@ -1120,7 +1146,7 @@ mod tests {
     use super::*;
     use agent_client_protocol::v1::schema::{ContentChunk, TextContent};
 
-    fn echo_shared(prompt_in_flight: bool) -> (Shared, mpsc::Receiver<Event>) {
+    fn echo_shared(prompt_in_flight: bool) -> (Shared, mpsc::Receiver<crate::acp::event_sender::SdkEvent>) {
         let (event_tx, event_rx) = mpsc::channel(8);
         let (lifecycle_tx, _lifecycle_rx) = mpsc::channel(8);
         let shared = Shared::new(
@@ -1142,7 +1168,7 @@ mod tests {
 
     async fn user_chunk_events(
         shared: Shared,
-        mut event_rx: mpsc::Receiver<Event>,
+        mut event_rx: mpsc::Receiver<crate::acp::event_sender::SdkEvent>,
         local_prompt_signals: bool,
     ) -> Vec<Event> {
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello")));

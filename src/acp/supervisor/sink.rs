@@ -865,12 +865,9 @@ mod tests {
             queued
                 .recv_timeout(Duration::from_secs(5))
                 .expect("the real host publication is enqueued before its receipt wait");
-            let counter = super::super::session_seq(&sup.next_seqs, "stalled");
             assert_eq!(
-                counter
-                    .try_lock()
-                    .expect("a durable waiter must leave seq custody free")
-                    .seq,
+                super::super::try_activity_seq(&sup.next_seqs, "stalled")
+                    .expect("a durable waiter must leave seq custody free"),
                 0
             );
             let persister = Arc::clone(&sink.persister);

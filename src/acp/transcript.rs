@@ -1824,7 +1824,7 @@ mod tests {
         }
 
         let mut m = TranscriptModel::new();
-        m.apply_event(
+        m.apply_scoped_event(
             8,
             &Event::UserPromptSent {
                 merged_prompt_ids: vec!["q2".into()],
@@ -1834,6 +1834,7 @@ mod tests {
                 synthesized: false,
                 origin_plugin: None,
             },
+            &crate::acp::event_sender::EventMetadata::history(),
         );
         assert_eq!(m.rows()[0].id, "q1");
         assert_eq!(m.rows()[0].merged_prompt_ids, ["q2"]);
@@ -1847,7 +1848,7 @@ mod tests {
             synthesized: false,
             origin_plugin: None,
         };
-        let deltas = m.apply_event(9, &retry);
+        let deltas = m.apply_scoped_event(9, &retry, &crate::acp::event_sender::EventMetadata::history());
         assert!(matches!(deltas.as_slice(), [TranscriptDelta::Patch { id, .. }] if id == "q1"));
         assert_eq!(m.rows().len(), 1);
 

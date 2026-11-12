@@ -967,7 +967,7 @@ async fn diff_comments_refuse_to_open_a_turn_another_submission_started() {
                         text: "the winning turn",
                         attachments: &[],
                         woke_idle_dormant: false,
-                        prompt_id: None,
+                        prompt_ids: Vec::new(),
                         synthesized: false,
                         no_revive: false,
                     },

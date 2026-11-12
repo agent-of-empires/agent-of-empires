@@ -213,7 +213,7 @@ fn wheel_over_preview_forwards_only_for_alternate_screen() {
         let (mut env, _native_driver) = if passive {
             passive_env_with_cursor(cursor)
         } else {
-            (live_env_with_cursor(cursor), None)
+            live_env_with_cursor(cursor)
         };
         assert_eq!(env.view.live_send.is_none(), passive, "{label}");
         assert!(env.view.handle_scroll_up(50, 10), "{label}");
@@ -243,7 +243,7 @@ fn forward_mouse_to_preview_tracks_press_through_release() {
         let (mut env, _native_driver) = if passive {
             passive_env_with_cursor(cursor)
         } else {
-            (live_env_with_cursor(cursor), None)
+            live_env_with_cursor(cursor)
         };
         let steps = [
             (MouseEventKind::Down(MouseButton::Left), (50, 10), Some(0)),

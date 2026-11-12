@@ -1310,7 +1310,6 @@ done
                         text: "prior user turn".into(),
                         attachments: Vec::new(),
                         prompt_id: None,
-                        merged_prompt_ids: Vec::new(),
                         no_revive: false,
                         queued_prompt_id: None,
                     })),

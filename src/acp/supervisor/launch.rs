@@ -2817,6 +2817,96 @@ pub(super) mod tests {
     use crate::daemon::AcpWorkerState;
     use std::time::Duration;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn installation_flush_does_not_exclude_another_queued_sdk_completion() {
+        let (_home, _tmp) = isolate_home();
+        let sink = VecSink::new();
+        let supervisor = Arc::new(Supervisor::new(Arc::clone(&sink)));
+        let original = supervisor.test_install_stdio("queued-original").await;
+        let mut publications = sink.completed.lock().unwrap().resubscribe();
+        let reservation = supervisor.reserve_spawn(
+            "installing-other", ResumeKind::Spawn, worker_registry::ResumeAuthority::Explicit,
+        ).await.unwrap();
+        let installing = reservation.lease().clone();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (completed, completion) = tokio::sync::oneshot::channel();
+        *sink.wrap_worker.lock().unwrap() = Some(Box::new(move |publication| {
+            super::super::WorkerPublication::new(async move {
+                let _ = entered.send(());
+                released.await.expect("installation releases the original SDK item");
+                let result = tokio::time::timeout(Duration::from_secs(5), publication.complete()).await;
+                let _ = completed.send(result.is_ok());
+            })
+        }));
+        let (query, querying) = tokio::sync::oneshot::channel();
+        *sink.before_orphan_query.lock().unwrap() = Some(Box::new(move || {
+            let _ = query.send(());
+            release.send(()).expect("the queued SDK item remains owned");
+        }));
+        let (events, inbound) = mpsc::channel(4);
+        let events = crate::acp::event_sender::EventSender::from(events);
+        let drain = supervisor.start_drain_task(
+            "queued-original".into(), original.clone(), inbound, None,
+        );
+        events.send(Event::ThinkingStarted).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), entered_rx).await.unwrap().unwrap();
+        let (client, _commands) = AcpClient::fake_for_test(AcpSessionId("installing-other".into()));
+        let (keep_open, inbound) = mpsc::channel(4);
+        let installer = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                supervisor.install_worker(
+                    "installing-other", reservation, Arc::new(client), inbound, None,
+                    super::super::ConstructionFinish::new(WorkerKind::Stdio, None, None, false),
+                ).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), querying).await.unwrap().unwrap();
+        let installed = tokio::time::timeout(Duration::from_secs(10), installer)
+            .await.expect("installation must finish").expect("installation task").is_ok();
+        let completed = tokio::time::timeout(Duration::from_secs(10), completion)
+            .await.unwrap().unwrap();
+        supervisor.publish_next("installing-other", Event::SessionNotice {
+            key: None, severity: "info".into(), title: "installed actor remains publishable".into(),
+            description: None,
+        });
+        let flush_sink = Arc::clone(&sink);
+        tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
+            flush_sink.durable.flush();
+        })).await.unwrap().unwrap();
+        let store = sink.establishment_store().unwrap();
+        let queued = store.replay_from("queued-original", 0).unwrap();
+        let other = store.replay_from("installing-other", 0).unwrap();
+        let leases = (
+            supervisor.running_lease("queued-original"),
+            supervisor.running_lease("installing-other"),
+        );
+        let mut broadcast = Vec::new();
+        while let Ok(frame) = publications.try_recv() {
+            broadcast.push((frame.session_id, frame.seq));
+        }
+        supervisor.workers.lock().await.get("installing-other").unwrap().drain_task.abort();
+        supervisor.test_remove_worker("queued-original").await;
+        supervisor.test_remove_worker("installing-other").await;
+        drain.abort();
+        let _ = drain.await;
+        drop(events);
+        drop(keep_open);
+        assert!(installed, "the installing actor must preserve its original reservation");
+        assert!(completed, "an installation read fence must not hold workers against real queued SDK completion");
+        assert_eq!(leases, (Some(original), Some(installing)));
+        assert_eq!(queued.len(), 1, "the actual SDK publication must commit");
+        assert_eq!(queued[0].seq, 1);
+        assert!(matches!(queued[0].event.as_ref(), Event::ThinkingStarted));
+        assert_eq!(other.len(), 1, "the independently installed actor must still publish");
+        assert_eq!(other[0].seq, 1);
+        assert_eq!(broadcast.len(), 2, "both actors must reach real live delivery");
+        assert!(broadcast.contains(&("queued-original".to_owned(), 1)));
+        assert!(broadcast.contains(&("installing-other".to_owned(), 1)));
+    }
+
     async fn managed_attach_original(
         scope: &mut super::super::test_support::managed::ManagedScope,
         label: &str,

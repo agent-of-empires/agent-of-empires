@@ -275,6 +275,10 @@ pub(super) struct VecSink {
     pub(super) stale_background_agent_ids: std::sync::Mutex<Vec<String>>,
     pub(super) durable: ChannelSink,
     pub(super) completed: std::sync::Mutex<broadcast::Receiver<crate::server::AcpBroadcastFrame>>,
+    pub(super) before_orphan_query: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(super) wrap_worker: std::sync::Mutex<Option<Box<dyn FnOnce(super::WorkerPublication) -> super::WorkerPublication + Send>>>,
+    pub(super) worker_queued: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    pub(super) before_replay: std::sync::Mutex<Option<Arc<dyn Fn(&Event) + Send + Sync>>>,
 }
 
 impl Default for VecSink {
@@ -288,6 +292,10 @@ impl Default for VecSink {
             stale_background_agent_ids: Default::default(),
             durable: ChannelSink::new(tx, store),
             completed: std::sync::Mutex::new(completed),
+            before_orphan_query: Default::default(),
+            wrap_worker: Default::default(),
+            worker_queued: Default::default(),
+            before_replay: Default::default(),
         }
     }
 }
@@ -359,7 +367,19 @@ impl BroadcastSink for VecSink {
         &self,
         publication: super::WorkerPublication,
     ) -> Result<(), super::WorkerPublication> {
-        self.durable.publish_from_worker(publication)
+        let wrap = self.wrap_worker.lock().unwrap().take();
+        let publication = match wrap {
+            Some(wrap) => wrap(publication),
+            None => publication,
+        };
+        let result = self.durable.publish_from_worker(publication);
+        if result.is_ok() {
+            let queued = self.worker_queued.lock().unwrap().take();
+            if let Some(queued) = queued {
+                queued();
+            }
+        }
+        result
     }
     fn publish_replay_from_worker(
         &self,
@@ -370,6 +390,10 @@ impl BroadcastSink for VecSink {
         subject: Option<crate::acp::state::NativeEventSubject>,
         replay: Option<(u64, &mut crate::acp::event_store::ReplayCommit)>,
     ) -> bool {
+        let probe = self.before_replay.lock().unwrap().clone();
+        if let Some(probe) = probe {
+            probe(data.event.as_ref());
+        }
         let stored = self
             .durable
             .publish_replay_from_worker(session_id, seq, data, generation, subject, replay);
@@ -420,6 +444,10 @@ impl BroadcastSink for VecSink {
         self.durable.delete_attachments_for_seq(session_id, seq);
     }
     fn unresolved_approval_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        let probe = self.before_orphan_query.lock().unwrap().take();
+        if let Some(probe) = probe {
+            probe();
+        }
         let mut unresolved = self.durable.unresolved_approval_nonces(session_id);
         for nonce in self.stale_nonces.lock().unwrap().iter() {
             if !unresolved.contains(nonce) {
@@ -1035,6 +1063,7 @@ with s:
             peer,
             child,
             _retirement_input: retirement_input,
+            trailer: false,
             _socket_dir: socket_dir,
         };
         use futures_util::FutureExt as _;

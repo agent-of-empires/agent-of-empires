@@ -2677,6 +2677,7 @@ mod tests {
                 tool_call_id: None,
                 description: "retained task".into(),
                 workflow: None,
+                started_at: None,
             },
         ]
         .iter()
@@ -3032,6 +3033,7 @@ mod tests {
     #[serial_test::serial]
     async fn acp_event_listener_keeps_the_running_to_idle_edge_across_a_folded_burst() {
         use crate::acp::supervisor::test_support::managed::with_managed;
+        use std::time::Duration;
         with_managed(|scope| {
             Box::pin(async move {
                 crate::session::set_unread_enabled(true);

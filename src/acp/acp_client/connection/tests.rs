@@ -1,6 +1,5 @@
 //! Actual owned runner and SDK task, with original unit-test peers over the native bridge.
 
-use super::super::pending::{ApprovalResolutionMessage, PendingResolver, PendingResponder};
 use super::*;
 use crate::acp::acp_client::commands::ClientCmd;
 use crate::acp::acp_client::reset::ResetSessionOutcome;
@@ -8,10 +7,8 @@ use crate::acp::acp_client::{SdkTaskObservation, SdkTestOptions};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::approvals::Nonce;
 use crate::acp::event_sender::WeakEventSender;
-use crate::acp::fs_handler::FsPolicy;
 use crate::acp::state::{IntegrationLostReason, StartupErrorDetail, SubagentState};
 use crate::acp::supervisor::test_support::managed::{ManagedClient, ManagedScope, ManagedTask};
-use crate::acp::terminal_handler::TerminalManager;
 use agent_client_protocol::v1::schema::{ContentBlock, TextContent};
 use futures_util::FutureExt;
 use std::future::Future;
@@ -605,6 +602,7 @@ async fn correlated_config_result_survives_eof_while_public_queue_is_full() {
                 .send(ClientCmd::SetConfigOption {
                     config_id: "model".into(),
                     value: "selected".into(),
+                    remember: false,
                 })
                 .await
                 .unwrap();
@@ -1178,6 +1176,7 @@ let _ = fake.agent.await; })).await;
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn request_failure_keeps_the_pending_permission_responder_usable() {
     crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
 use crate::acp::state::{AcpSessionId, AcpState, AgentName};
@@ -1305,7 +1304,7 @@ for kind in ["permission", "elicitation"] {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = fake.event_rx.recv().await.unwrap();
-            assert!(!matches!(event, Event::ThinkingStarted), "post-failure interaction output cannot reopen the failed main turn");
+            assert!(!matches!(event, Event::ThinkingStarted | Event::Stopped { .. }), "post-failure interaction output cannot reopen the failed main turn or own another terminal");
             let echoed = matches!(&event, Event::AgentMessageChunk { text, .. } if text == "interaction reply echoed");
             events.push(event);
             if echoed { break; }
@@ -1354,6 +1353,7 @@ for kind in ["permission", "elicitation"] {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn request_error_then_eof_survives_public_event_backpressure() {
     crate::acp::supervisor::test_support::managed::with_managed(|scope| {
         Box::pin(async move {
@@ -1922,7 +1922,7 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
                 .map(|frame| frame["params"]["sessionId"].as_str().unwrap())
                 .eq(["s-pending-reset", "s-pending-reset-reset-1"]));
         }
-        fake.connection.abort();
+        fake.event_rx.stop_and_forget().await;
         let _ = fake.connection.await;
         fake.agent.abort();
         let _ = fake.agent.await;
@@ -2249,305 +2249,6 @@ async fn adapter_started_idle_compaction_ends_without_a_prompt() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn request_failure_keeps_the_pending_permission_responder_usable() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-
-    use super::super::pending::{
-        ApprovalResolutionMessage, ElicitationResolutionMessage, PendingResolver,
-    };
-    use crate::acp::approvals::ApprovalDecision;
-    use crate::acp::elicitations::ElicitationOutcome;
-    use crate::acp::state::{AcpSessionId, AcpState, AgentName};
-    use agent_client_protocol::v1::schema::{CreateElicitationResponse, ElicitationAction};
-    for kind in ["permission", "elicitation"] {
-        let (prompt_ids, mut requested) = mpsc::unbounded_channel();
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let native_calls = calls.clone();
-        let mut fake = spawn_fake_connection(scope, "s-permission-error", None, false, move |id| {
-            if native_calls.fetch_add(1, Ordering::SeqCst) != 0 {
-                return vec![serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"stopReason":"end_turn"}}).to_string()];
-            }
-            prompt_ids.send(id.clone()).unwrap();
-            let (method, params) = if kind == "permission" {
-                ("session/request_permission", serde_json::json!({
-                    "sessionId":"s-permission-error",
-                    "toolCall":{"toolCallId":"pending-tool","title":"Wait for user"},
-                    "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]
-                }))
-            } else {
-                ("elicitation/create", serde_json::json!({
-                    "mode":"form","sessionId":"s-permission-error","message":"Choose",
-                    "requestedSchema":{"type":"object","properties":{"answer":{"type":"string"}}}
-                }))
-            };
-            vec![serde_json::json!({"jsonrpc":"2.0","id":"pending-interaction","method":method,"params":params}).to_string()]
-        }).await;
-        fake.cmd_tx
-            .send(ClientCmd::Prompt(Vec::new()))
-            .await
-            .unwrap();
-        let mut events = Vec::new();
-        let nonce = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = fake.event_rx.recv().await.expect("connection remains live");
-                let nonce = match &event {
-                    Event::ApprovalRequested { approval } => Some(approval.nonce.clone()),
-                    Event::ElicitationRequested { elicitation } => Some(elicitation.nonce.clone()),
-                    _ => None,
-                };
-                events.push(event);
-                if let Some(nonce) = nonce {
-                    break nonce;
-                }
-            }
-        })
-        .await
-        .unwrap_or_else(|error| panic!("{kind}: interaction was not registered: {error}"));
-        assert!(fake.pending_responders.lock().await.contains_key(&nonce));
-        let id = requested.recv().await.unwrap();
-        write_line(
-            &fake.agent_write,
-            &serde_json::json!({
-                "jsonrpc":"2.0","method":"session/update","params":{
-                    "sessionId":"s-permission-error","update":{
-                        "sessionUpdate":"agent_message_chunk",
-                        "content":{"type":"text","text":"progress while user decision is pending"}
-                    }
-                }
-            })
-            .to_string(),
-        )
-        .await;
-        write_line(
-            &fake.agent_write,
-            &serde_json::json!({
-                "jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"request failed"}
-            })
-            .to_string(),
-        )
-        .await;
-        events.extend(collect_terminal(&mut fake).await);
-        let progress = events.iter().position(|event| matches!(event,
-            Event::AgentMessageChunk { text, .. } if text == "progress while user decision is pending"
-        )).expect("pending callback must not block intervening progress");
-        let diagnostic = events
-            .iter()
-            .position(|event| matches!(event, Event::PromptRuntimeError { .. }))
-            .unwrap();
-        assert!(progress < diagnostic);
-        assert!(fake.pending_responders.lock().await.contains_key(&nonce));
-        assert!(
-            matches!(events.last(), Some(Event::Stopped { reason }) if reason == "prompt_failed")
-        );
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            Event::ApprovalResolved { .. } | Event::ElicitationResolved { .. }
-        )));
-        let pending = fake
-            .pending_responders
-            .lock()
-            .await
-            .remove(&nonce)
-            .expect("failure must not clear responders");
-        match pending.resolver {
-            PendingResolver::Approval(resolver) => resolver
-                .send(ApprovalResolutionMessage::Decision {
-                    decision: ApprovalDecision::Allow,
-                    option_id: Some("allow".into()),
-                })
-                .unwrap_or_else(|_| panic!("approval callback must remain alive")),
-            PendingResolver::Elicitation { resolver, .. } => resolver
-                .send(ElicitationResolutionMessage {
-                    response: CreateElicitationResponse::new(ElicitationAction::Decline),
-                    outcome: ElicitationOutcome::Declined,
-                    answers: Vec::new(),
-                })
-                .unwrap_or_else(|_| panic!("elicitation callback must remain alive")),
-        }
-        let response = tokio::time::timeout(Duration::from_secs(10), fake.responses.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(response["id"], "pending-interaction");
-        if kind == "permission" {
-            assert_eq!(response["result"]["outcome"]["outcome"], "selected");
-            assert_eq!(response["result"]["outcome"]["optionId"], "allow");
-        } else {
-            assert_eq!(response["result"]["action"], "decline");
-        }
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = fake.event_rx.recv().await.unwrap();
-                let resolved = matches!(&event, Event::ApprovalResolved { nonce: got, .. } | Event::ElicitationResolved { nonce: got, .. } if got == &nonce);
-                events.push(event);
-                if resolved { break; }
-            }
-        }).await.unwrap();
-        for (session_update, text) in [
-            ("agent_thought_chunk", "callback bookkeeping"),
-            ("agent_message_chunk", "interaction reply echoed"),
-        ] {
-            write_line(
-                &fake.agent_write,
-                &serde_json::json!({
-                    "jsonrpc":"2.0","method":"session/update","params":{
-                        "sessionId":"s-permission-error","update":{
-                            "sessionUpdate":session_update,"content":{"type":"text","text":text}
-                        }
-                    }
-                })
-                .to_string(),
-            )
-            .await;
-        }
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let event = fake.event_rx.recv().await.unwrap();
-                assert!(!matches!(event, Event::ThinkingStarted | Event::Stopped { .. }), "post-failure interaction output does not own another main terminal");
-                let echoed = matches!(&event, Event::AgentMessageChunk { text, .. } if text == "interaction reply echoed");
-                events.push(event);
-                if echoed { break; }
-            }
-        }).await.unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::Stopped { .. }))
-                .count(),
-            1
-        );
-        let mut state = AcpState::new(
-            AcpSessionId("s-permission-error".into()),
-            AgentName("gemini".into()),
-            None,
-        );
-        state
-            .apply_event(
-                1,
-                crate::acp::state::test_support::prompt("first explicit request"),
-            )
-            .unwrap();
-        for (index, event) in events.into_iter().enumerate() {
-            state.apply_event(index as u64 + 2, event).unwrap();
-        }
-        assert!(!state.turn_active);
-        assert_eq!(
-            state.sidebar_phase,
-            crate::acp::state::SidebarPhase::PromptFailed
-        );
-        assert_eq!(state.sidebar_status(), crate::session::Status::Error);
-        assert!(state.pending_approvals.is_empty() && state.pending_elicitations.is_empty());
-        assert!(!fake.connection.is_finished());
-        fake.cmd_tx
-            .send(ClientCmd::Prompt(Vec::new()))
-            .await
-            .unwrap();
-        let next = collect_terminal(&mut fake).await;
-        assert!(
-            matches!(next.last(), Some(Event::Stopped { reason }) if reason == "prompt_complete")
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        fake.connection.abort();
-        let _ = fake.connection.await;
-        fake.agent.abort();
-        let _ = fake.agent.await;
-    }
-
-    })).await;
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn request_error_then_eof_survives_public_event_backpressure() {
-    crate::acp::supervisor::test_support::managed::with_managed(|scope| {
-        Box::pin(async move {
-            let mut fake = spawn_fake_connection(scope, "s-backpressure", None, true, |id| {
-                let mut lines: Vec<_> = (0..80)
-                    .map(|index| {
-                        serde_json::json!({
-                        "jsonrpc": "2.0", "method": "session/update",
-                        "params": {"sessionId": "s-backpressure", "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": format!("partial output {index}\n")}
-                        }}
-                    })
-                    .to_string()
-                    })
-                    .collect();
-                lines.push(serde_json::json!({
-            "jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": "request failed"}
-        }).to_string());
-                lines
-            })
-            .await;
-            fake.cmd_tx
-                .send(ClientCmd::Prompt(Vec::new()))
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let capacity = fake
-                        .event_queue
-                        .upgrade()
-                        .expect("connection still owns its event queue")
-                        .capacity();
-                    if capacity == 0 {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("public event queue fills before draining resumes");
-            let mut events = collect_terminal(&mut fake).await;
-            tokio::time::timeout(Duration::from_secs(10), fake.connection)
-                .await
-                .unwrap()
-                .unwrap();
-            while let Some(event) = fake.event_rx.recv().await {
-                events.push(event);
-            }
-            let failure = events
-                .iter()
-                .position(|event| matches!(event, Event::PromptRuntimeError { .. }))
-                .unwrap();
-            let terminal = events
-                .iter()
-                .position(
-                    |event| matches!(event, Event::Stopped { reason } if reason == "prompt_failed"),
-                )
-                .unwrap();
-            let closure = events
-                .iter()
-                .position(|event| matches!(event, Event::AcpConnectionUnavailable { .. }))
-                .unwrap();
-            assert!(failure < terminal && terminal < closure);
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event, Event::AgentStartupError { .. })));
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, Event::Stopped { .. }))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event, Event::AgentMessageChunk { .. }))
-                    .count(),
-                80
-            );
-            fake.agent.abort();
-            let _ = fake.agent.await;
-        })
-    })
-    .await;
-}
-
-#[tokio::test]
-#[serial_test::serial]
 async fn child_cancel_targets_the_child_and_requires_the_capability() {
     crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
 
@@ -2655,8 +2356,8 @@ async fn child_cancel_targets_the_child_and_requires_the_capability() {
     .expect("root cancel reaches the agent");
     assert_eq!(*cancels.lock().unwrap(), ["c-yes", "root"]);
 
+    event_rx.stop_and_forget().await;
     agent.abort();
-    connection.abort();
     let _ = tokio::join!(agent, connection);
 
     })).await;
@@ -2779,8 +2480,8 @@ async fn reset_waits_for_a_running_subagent() {
     ));
     assert_eq!(new_sessions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
+    event_rx.stop_and_forget().await;
     agent.abort();
-    connection.abort();
     let _ = tokio::join!(agent, connection);
 
     })).await;
@@ -2795,7 +2496,6 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
         mut event_rx,
         agent_write,
         cmd_tx: _cmd_tx,
-        pending_responders,
         mut responses,
         connection,
         agent,
@@ -2829,20 +2529,16 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
     write_line(&agent_write, &announce("c2")).await;
     next_child_event(&mut event_rx, "c2").await;
 
-    let PendingResponder { resolver } = pending_responders
-        .lock()
-        .await
-        .remove(&nonce)
-        .expect("approval parked");
-    let PendingResolver::Approval(tx) = resolver else {
-        panic!("approval resolver expected");
-    };
-    tx.send(ApprovalResolutionMessage::Decision {
-        decision: ApprovalDecision::Allow,
-        option_id: None,
-    })
-    .map_err(|_| "resolver gone")
-    .unwrap();
+    use axum::response::IntoResponse;
+    let resolution = crate::server::api::resolve_approval(
+        axum::extract::State(event_rx.app_state()),
+        axum::extract::Path((event_rx.id.clone(), nonce.0.clone())),
+        Ok(axum::Json(crate::acp::protocol::ResolveApprovalRequest {
+            decision: crate::acp::protocol::ApprovalDecisionWire::Allow,
+            option_id: None,
+        })),
+    ).await.into_response();
+    assert_eq!(resolution.status(), axum::http::StatusCode::NO_CONTENT);
     let response = tokio::time::timeout(Duration::from_secs(30), responses.recv())
         .await
         .expect("response reaches the adapter")
@@ -2851,8 +2547,8 @@ async fn child_approval_wait_does_not_stall_other_sessions() {
     assert_eq!(response["result"]["outcome"]["outcome"], "selected");
     assert_eq!(response["result"]["outcome"]["optionId"], "allow");
 
+    event_rx.stop_and_forget().await;
     agent.abort();
-    connection.abort();
     let _ = tokio::join!(agent, connection);
 
     })).await;
@@ -2879,8 +2575,8 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
             if matches!(e.detail, StartupErrorDetail::InvalidProxyHello { .. })),
                 "{ready:?}"
             );
+            fake.event_rx.shutdown().await.expect("retire the exact incompatible Native fixture");
             fake.agent.abort();
-            fake.connection.abort();
 
             let (ready, mut fake) = spawn_fake_connection_raw(
                 scope,
@@ -2924,8 +2620,8 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
                 lost,
                 Some(IntegrationLostReason::ContractViolation { .. })
             ));
+            fake.event_rx.shutdown().await.expect("retire the exact primitive fixture");
             fake.agent.abort();
-            fake.connection.abort();
         })
     })
     .await;

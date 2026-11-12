@@ -2014,6 +2014,129 @@ mod tests {
     use super::*;
     use crate::daemon::AcpWorkerState;
 
+    async fn budget_publication_probe(supersede: bool) {
+        #[derive(Debug)]
+        enum Reached { Queued, Inline }
+        let (_home, _tmp) = isolate_home();
+        let sink = VecSink::new();
+        let supervisor = Arc::new(Supervisor::new(Arc::clone(&sink)));
+        let id = "ordered-restart-budget";
+        let original = supervisor.test_install_stdio(id).await;
+        supervisor.workers.lock().await.get_mut(id).unwrap().restart_history =
+            vec![Instant::now(); MAX_RESPAWNS_IN_WINDOW as usize];
+        let drain = Drain {
+            session_id: id.into(), identity_only: false, history_scope: None,
+            sink: Arc::clone(&supervisor.sink), workers: Arc::clone(&supervisor.workers),
+            next_seqs: Arc::clone(&supervisor.next_seqs),
+            incompatible_binaries: Arc::clone(&supervisor.incompatible_binaries),
+            lifecycle: Arc::clone(&supervisor.lifecycle),
+            process_control: Arc::clone(&supervisor.process_control),
+            launcher: Arc::clone(&supervisor.launcher),
+            notify: Arc::clone(&supervisor.worker_notify),
+            startup_requeues: Arc::clone(&supervisor.startup_requeues),
+            pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
+            context_reset: None, respawned_in_place: Arc::clone(&supervisor.respawned_in_place),
+            receive_owner: None,
+        };
+        let mut frames = sink.completed.lock().unwrap().resubscribe();
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release_writer, writer_released) = tokio::sync::oneshot::channel();
+        assert!(sink.durable.publish_from_worker(super::super::WorkerPublication::new(async move {
+            let _ = entered.send(());
+            writer_released.await.expect("release the actual ordered writer");
+        })).is_ok());
+        tokio::time::timeout(Duration::from_secs(10), entering).await.unwrap().unwrap();
+        let (reached, position) = std::sync::mpsc::channel();
+        let queued = reached.clone();
+        *sink.worker_queued.lock().unwrap() = Some(Box::new(move || {
+            queued.send(Reached::Queued).unwrap();
+        }));
+        let (release_budget, budget_released) = std::sync::mpsc::channel();
+        let budget_released = std::sync::Mutex::new(budget_released);
+        *sink.before_replay.lock().unwrap() = Some(Arc::new(move |event| {
+            if matches!(event, Event::SessionNotice { key: Some(key), .. } if key == "restart-budget") {
+                let _ = reached.send(Reached::Inline);
+                budget_released.lock().unwrap().recv_timeout(Duration::from_secs(10))
+                    .expect("release the original budget publication");
+            }
+        }));
+        let approval = {
+            let original = original.clone();
+            tokio::spawn(async move { drain.approve_respawn(&original).await })
+        };
+        let reached = tokio::time::timeout(Duration::from_secs(10),
+            tokio::task::spawn_blocking(move || position.recv_timeout(Duration::from_secs(10))))
+            .await.unwrap().unwrap().unwrap();
+        let replacement = if supersede {
+            supervisor.test_respawn_worker(id).await;
+            Some(supervisor.running_lease(id).unwrap())
+        } else { None };
+        let host = sink.durable.queue_persisted(
+            id, Arc::clone(&supervisor.next_seqs),
+            AcpEventData::from_host(Event::SessionNotice {
+                key: Some("host-after-budget".into()), severity: "info".into(),
+                title: "later host publication".into(), description: None,
+            }), None,
+        );
+        let mut delivered = Vec::new();
+        match reached {
+            Reached::Inline => {
+                release_writer.send(()).unwrap();
+                delivered.push(tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                    .await.unwrap().unwrap());
+                release_budget.send(()).unwrap();
+            }
+            Reached::Queued => {
+                release_budget.send(()).unwrap();
+                release_writer.send(()).unwrap();
+            }
+        }
+        assert!(tokio::time::timeout(Duration::from_secs(10), approval)
+            .await.unwrap().unwrap().is_none());
+        let host = tokio::task::spawn_blocking(move || host.wait()).await.unwrap().unwrap();
+        assert!(host.1, "the real writer must persist the host publication");
+        let flush_sink = Arc::clone(&sink);
+        tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(move || {
+            flush_sink.durable.flush();
+        })).await.unwrap().unwrap();
+        while let Ok(frame) = frames.try_recv() { delivered.push(frame); }
+        let stored = sink.establishment_store().unwrap().replay_from(id, 0).unwrap();
+        let current = supervisor.running_lease(id);
+        supervisor.test_remove_worker(id).await;
+        let mut transcript = crate::acp::transcript::TranscriptModel::new();
+        for frame in &delivered {
+            transcript.apply_scoped_event(frame.seq, &frame.event, &frame.view_metadata());
+        }
+        let broadcast_seqs: Vec<_> = delivered.iter().map(|frame| frame.seq).collect();
+        let durable_seqs: Vec<_> = stored.iter().map(|event| event.seq).collect();
+        if let Some(replacement) = replacement {
+            assert_eq!(current, Some(replacement));
+            assert_eq!(broadcast_seqs, [1], "a superseded budget notice must allocate no sequence");
+            assert_eq!(durable_seqs, [1]);
+            assert!(delivered.iter().all(|frame| !matches!(frame.event.as_ref(),
+                Event::SessionNotice { key: Some(key), .. } if key == "restart-budget")));
+        } else {
+            assert!(current.is_none(), "the exhausted original must settle without respawning");
+            assert_eq!(broadcast_seqs, [1, 2], "live delivery must follow actual writer sequence order");
+            assert_eq!(broadcast_seqs, durable_seqs);
+            assert_eq!(delivered[0].worker_generation, Some(original.epoch()));
+            assert!(transcript.rows().iter().any(|row| row.text.contains("Automatic restart budget exhausted")),
+                "the actual live transcript must retain the budget advisory");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn restart_budget_advisory_and_host_publications_share_writer_order() {
+        budget_publication_probe(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn superseded_queued_restart_budget_advisory_allocates_no_sequence() {
+        budget_publication_probe(true).await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn registry_contention_at_channel_close_eventually_settles_the_dead_original() {
@@ -3707,10 +3830,8 @@ mod tests {
                     assert!(store.replay_from(&id, prefix).unwrap().is_empty());
                     assert_eq!(store.highest_seq(&id), prefix);
                     assert_eq!(
-                        super::super::session_seq(&supervisor.next_seqs, &id)
-                            .lock()
-                            .unwrap()
-                            .seq,
+                        super::super::try_activity_seq(&supervisor.next_seqs, &id)
+                            .expect("a superseded publication cannot retain sequence exclusion"),
                         prefix
                     );
                     assert!(matches!(
@@ -3787,7 +3908,7 @@ mod tests {
                 assert!(supervisor.workers.lock().await.get(&id).unwrap().restart_history.is_empty());
                 assert!(store.replay_from(&id, prefix).unwrap().is_empty());
                 assert_eq!(store.highest_seq(&id), prefix);
-                assert_eq!(super::super::session_seq(&supervisor.next_seqs, &id).lock().unwrap().seq, prefix);
+                assert_eq!(super::super::try_activity_seq(&supervisor.next_seqs, &id).expect("the unchanged sequence remains observable"), prefix);
                 assert!(matches!(frames.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
                 let unchanged = cache.get_or_hydrate(&id, || panic!("the warm fold must survive")).unwrap();
                 assert_eq!(unchanged.last_seq, before.last_seq);

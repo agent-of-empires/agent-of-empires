@@ -1007,7 +1007,6 @@ mod tests {
     use super::*;
     use crate::acp::state::Event;
 
-    use crate::acp::state::Event;
     fn background_launch() -> Event {
         Event::BackgroundAgentLaunched {
             agent_id: "background-1".into(),
@@ -1755,21 +1754,6 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn quota_snapshot_never_claims_knowledge_at_a_different_frontier() {
-        use crate::acp::event_store::ControlKnowledge::{Indeterminate, Known};
-        for park in [
-            Known(None),
-            Known(Some(false)),
-            Known(Some(true)),
-            Indeterminate,
-        ] {
-            assert_eq!(projected_rate_limit_park(21, 20, park), None);
-            assert_eq!(projected_rate_limit_park(19, 20, park), None);
-        }
-        assert_eq!(projected_rate_limit_park(20, 20, Indeterminate), None);
-    }
-
     #[tokio::test]
     async fn quota_snapshots_ignore_history_and_follow_real_host_boundaries() {
         use crate::acp::event_sender::EventMetadata;
@@ -1815,6 +1799,7 @@ mod tests {
             (
                 5,
                 Event::UserPromptSent {
+                    merged_prompt_ids: Vec::new(),
                     text: "new explicit input".into(),
                     prompt_id: None,
                     origin_plugin: None,

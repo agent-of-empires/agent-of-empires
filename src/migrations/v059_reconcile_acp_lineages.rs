@@ -201,7 +201,7 @@ mod tests {
         assert_eq!(fs::read(app.join("sessions.json")).unwrap(), SESSION_BYTES);
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM acp_events", [], |row| row
-                .get::<_, u64>(0))
+                .get::<_, i64>(0))
                 .unwrap(),
             3
         );
@@ -222,7 +222,7 @@ mod tests {
             conn.query_row(
                 "SELECT COUNT(*) FROM acp_events WHERE scope!=0 OR qualification_json IS NOT NULL",
                 [],
-                |row| row.get::<_, u64>(0)
+                |row| row.get::<_, i64>(0)
             )
             .unwrap(),
             0
@@ -232,9 +232,9 @@ mod tests {
                 "SELECT spent,armed,known FROM acp_rate_limit_budgets WHERE session_id='pruned'",
                 [],
                 |row| Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, u64>(2)?
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?
                 ))
             )
             .unwrap(),
@@ -244,7 +244,7 @@ mod tests {
             conn.query_row(
                 "SELECT COUNT(*) FROM acp_rate_limit_budgets WHERE session_id=?1",
                 [SID],
-                |row| row.get::<_, u64>(0)
+                |row| row.get::<_, i64>(0)
             )
             .unwrap(),
             0
@@ -324,8 +324,8 @@ mod tests {
                 );
             }
             if matches!(history, History::Frontier58) {
-                assert_eq!(conn.query_row("SELECT version,through_seq,context_json FROM acp_transcript_frontier WHERE session_id=?1", [SID], |row| Ok((row.get::<_, u64>(0)?,row.get::<_, u64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,3,r#"{"last_message_id":null,"last_thought_id":null}"#.to_owned()));
-                assert_eq!(conn.query_row("SELECT phase,phase_scope,state_json FROM acp_transcript_tools WHERE session_id=?1 AND tool_call_id='old-open'", [SID], |row| Ok((row.get::<_, u64>(0)?,row.get::<_, u64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,0,r#"{"Open":{"first_seq":null,"text":""}}"#.to_owned()));
+                assert_eq!(conn.query_row("SELECT version,through_seq,context_json FROM acp_transcript_frontier WHERE session_id=?1", [SID], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,3,r#"{"last_message_id":null,"last_thought_id":null}"#.to_owned()));
+                assert_eq!(conn.query_row("SELECT phase,phase_scope,state_json FROM acp_transcript_tools WHERE session_id=?1 AND tool_call_id='old-open'", [SID], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?,row.get::<_, String>(2)?))).unwrap(), (1,0,r#"{"Open":{"first_seq":null,"text":""}}"#.to_owned()));
             }
             let path = app.join("acp_events.db");
             let backups = crate::session::migration_backups(&path).unwrap();
@@ -380,7 +380,7 @@ mod tests {
             conn.query_row(
                 "SELECT known FROM acp_rate_limit_budgets WHERE session_id='pruned'",
                 [],
-                |row| row.get::<_, u64>(0)
+                |row| row.get::<_, i64>(0)
             )
             .unwrap(),
             1

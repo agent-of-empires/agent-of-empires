@@ -1875,12 +1875,18 @@ impl AcpState {
                             metadata.native_origin,
                             metadata.clear_after_seq,
                         )?;
-                        if let Some(agent) = self.background_agents.iter_mut()
-                            .find(|agent| agent.agent_id == *agent_id) {
+                        if let Some(agent) = self
+                            .background_agents
+                            .iter_mut()
+                            .find(|agent| agent.agent_id == *agent_id)
+                        {
                             agent.resource_ref = metadata.resource_ref;
                             agent.resource_witness = metadata.resource_witness.clone();
-                            if let Some(child) = self.subagents.iter()
-                                .find(|child| agent.accepts_child(child)) {
+                            if let Some(child) = self
+                                .subagents
+                                .iter()
+                                .find(|child| agent.accepts_child(child))
+                            {
                                 agent.reconcile(child, agent.started_at);
                             }
                         }
@@ -4000,9 +4006,9 @@ mod tests {
         let mut restated = s.clone();
         restated.in_flight_tool.as_mut().unwrap().prompt = Some("full prompt".into());
         restated
-            .apply_event(
+            .apply_scoped_event(
                 restated.last_seq.saturating_add(1),
-                Event::ToolCallUpdated {
+                &Event::ToolCallUpdated {
                     prompt: None,
                     tool_call_id: "tc-1".into(),
                     title: None,
@@ -4010,6 +4016,7 @@ mod tests {
                     started_at: None,
                     diffs: None,
                 },
+                &current_session_metadata(),
             )
             .unwrap();
         assert_eq!(
@@ -4018,9 +4025,9 @@ mod tests {
             "a cut preview without its own prompt keeps the stored one"
         );
         restated
-            .apply_event(
+            .apply_scoped_event(
                 restated.last_seq.saturating_add(1),
-                Event::ToolCallUpdated {
+                &Event::ToolCallUpdated {
                     prompt: None,
                     tool_call_id: "tc-1".into(),
                     title: None,
@@ -4028,6 +4035,7 @@ mod tests {
                     started_at: None,
                     diffs: None,
                 },
+                &current_session_metadata(),
             )
             .unwrap();
         assert_eq!(
@@ -4198,8 +4206,10 @@ mod tests {
         };
         use crate::acp::event_sender::EventMetadata;
         let mut session = crate::server::test_support::managed_control_session(
-            scope, "child-resource-provenance",
-        ).await;
+            scope,
+            "child-resource-provenance",
+        )
+        .await;
         for update in [
             serde_json::json!({
                 "sessionUpdate": "subagent_update", "sessionId": "child",
@@ -4213,64 +4223,98 @@ mod tests {
                 "content": [{"type": "text", "text": "map backend"}]
             }),
         ] {
-            session.native.send(serde_json::json!({
-                "jsonrpc": "2.0", "method": "session/update",
-                "params": {"sessionId": session.sid, "update": update}
-            })).await;
+            session
+                .native
+                .send(serde_json::json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": {"sessionId": session.sid, "update": update}
+                }))
+                .await;
         }
-        session.native.send(serde_json::json!({
-            "jsonrpc": "2.0", "method": "session/update",
-            "params": {"sessionId": "child", "update": {
-                "sessionUpdate": "config_option_update",
-                "configOptions": [{
-                    "id": "model", "name": "Model", "category": "model", "type": "select",
-                    "currentValue": "child-model",
-                    "options": [{"value": "child-model", "name": "Child model"}]
-                }]
-            }}
-        })).await;
+        session
+            .native
+            .send(serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "child", "update": {
+                    "sessionUpdate": "config_option_update",
+                    "configOptions": [{
+                        "id": "model", "name": "Model", "category": "model", "type": "select",
+                        "currentValue": "child-model",
+                        "options": [{"value": "child-model", "name": "Child model"}]
+                    }]
+                }}
+            }))
+            .await;
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let event = session.client.next_event().await.expect("Native remains connected");
+                let event = session
+                    .client
+                    .next_event()
+                    .await
+                    .expect("Native remains connected");
                 if matches!(event, Event::SubagentUpdated { subagent, .. }
                     if subagent.parent_tool_call_id.as_deref() == Some("tc1")
-                        && subagent.model.as_deref() == Some("Child model")) {
+                        && subagent.model.as_deref() == Some("Child model"))
+                {
                     break;
                 }
             }
-        }).await.expect("the real Native delegation publishes its linked child");
-        let child_metadata = session.state.acp_event_store
-            .replay_from(session.id(), 0).unwrap().into_iter().rev()
-            .find(|stored| matches!(stored.event.as_ref(), Event::SubagentUpdated { subagent, .. }
+        })
+        .await
+        .expect("the real Native delegation publishes its linked child");
+        let child_metadata = session
+            .state
+            .acp_event_store
+            .replay_from(session.id(), 0)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .find(|stored| {
+                matches!(stored.event.as_ref(), Event::SubagentUpdated { subagent, .. }
                 if subagent.parent_tool_call_id.as_deref() == Some("tc1")
-                    && subagent.model.as_deref() == Some("Child model")))
-            .expect("the actual child publication is durable").metadata;
+                    && subagent.model.as_deref() == Some("Child model"))
+            })
+            .expect("the actual child publication is durable")
+            .metadata;
         let actual = session.client.actual();
-        let receipt = actual.establishment_projection().unwrap().receipt_snapshot().unwrap();
+        let receipt = actual
+            .establishment_projection()
+            .unwrap()
+            .receipt_snapshot()
+            .unwrap();
         let storage = crate::session::Storage::open_unwatched(&receipt.attempt.profile).unwrap();
-        let row = storage.load_instances_complete().unwrap().into_iter()
-            .find(|row| row.id == session.id()).unwrap();
+        let row = storage
+            .load_instances_complete()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == session.id())
+            .unwrap();
         let postimage = Arc::new(receipt.postimage(receipt.attempt.context).unwrap());
-        let stamp = NativeSessionPermission::capture_stamp(
-            &receipt, &postimage, &row, &storage,
-        ).unwrap();
-        let context = Arc::new(NativeRequestContext::session_observation(
-            receipt, postimage, stamp,
-        ).unwrap());
+        let stamp =
+            NativeSessionPermission::capture_stamp(&receipt, &postimage, &row, &storage).unwrap();
+        let context =
+            Arc::new(NativeRequestContext::session_observation(receipt, postimage, stamp).unwrap());
         let file = scope.tempdir().path().join("child-resource.output");
         std::fs::write(&file, "owned child resource fixture").unwrap();
         let authority = NativeResourceAuthority::start(
-            Arc::new(NativeResourceStartContext::from_frame(
-                context, session.sid.clone().into(),
-            ).unwrap()),
+            Arc::new(
+                NativeResourceStartContext::from_frame(context, session.sid.clone().into())
+                    .unwrap(),
+            ),
             NativeResourceSelector::Agent {
-                agent_id: "a1".into(), tool_call_id: "tc1".into(),
+                agent_id: "a1".into(),
+                tool_call_id: "tc1".into(),
                 output_file: file.to_string_lossy().into_owned(),
                 source: NativeResourceLocation::Host,
             },
-        ).unwrap().for_tracking_allocation(uuid::Uuid::new_v4()).unwrap();
+        )
+        .unwrap()
+        .for_tracking_allocation(uuid::Uuid::new_v4())
+        .unwrap();
         authority.with_read(|| Ok(std::fs::read(&file)?)).unwrap();
-        let witness = authority.witness().expect("the real read established original custody");
+        let witness = authority
+            .witness()
+            .expect("the real read established original custody");
         let resource_metadata = EventMetadata {
             native_origin: Some(witness.origin),
             resource_ref: Some(witness.allocation),
@@ -4306,37 +4350,51 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn launch_reconciles_a_child_snapshot_that_arrived_first() {
-        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-        let (session, launch, resource, child) = native_subagent_fixture(scope).await;
-        let cases = [
-            (
-                SubagentState::Idle,
-                Some("end_turn"),
-                BackgroundAgentStatus::Completed,
-                true,
-            ),
-            (
-                SubagentState::Idle,
-                Some("error"),
-                BackgroundAgentStatus::Error,
-                true,
-            ),
-            (
-                SubagentState::RequiresAction,
-                None,
-                BackgroundAgentStatus::RequiresAction,
-                false,
-            ),
-        ];
-        for (state, stop, expected, ended) in cases {
-            let mut s = session.state.session_service.fold_control_state(session.id()).await.unwrap();
-            s.apply_scoped_event(s.last_seq + 1, &subagent(state, stop, &session.sid), &child).unwrap();
-            s.apply_scoped_event(s.last_seq + 1, &launch, &resource).unwrap();
-            let agent = &s.background_agents[0];
-            assert_eq!(agent.status, expected);
-            assert_eq!(agent.ended_at.is_some(), ended);
-        }
-        })).await;
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+                let cases = [
+                    (
+                        SubagentState::Idle,
+                        Some("end_turn"),
+                        BackgroundAgentStatus::Completed,
+                        true,
+                    ),
+                    (
+                        SubagentState::Idle,
+                        Some("error"),
+                        BackgroundAgentStatus::Error,
+                        true,
+                    ),
+                    (
+                        SubagentState::RequiresAction,
+                        None,
+                        BackgroundAgentStatus::RequiresAction,
+                        false,
+                    ),
+                ];
+                for (state, stop, expected, ended) in cases {
+                    let mut s = session
+                        .state
+                        .session_service
+                        .fold_control_state(session.id())
+                        .await
+                        .unwrap();
+                    s.apply_scoped_event(
+                        s.last_seq + 1,
+                        &subagent(state, stop, &session.sid),
+                        &child,
+                    )
+                    .unwrap();
+                    s.apply_scoped_event(s.last_seq + 1, &launch, &resource)
+                        .unwrap();
+                    let agent = &s.background_agents[0];
+                    assert_eq!(agent.status, expected);
+                    assert_eq!(agent.ended_at.is_some(), ended);
+                }
+            })
+        })
+        .await;
     }
 
     /// The RFD snapshot replaces the tailer's heuristics, and an idle child that
@@ -4344,101 +4402,144 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn subagent_state_drives_the_async_agent_it_belongs_to() {
-        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-        let (session, launch, resource, child) = native_subagent_fixture(scope).await;
-        let mut s = session.state.session_service.fold_control_state(session.id()).await.unwrap();
-        s.apply_scoped_event(s.last_seq + 1, &launch, &resource).unwrap();
-        let steps = [
-            (
-                SubagentState::Running,
-                None,
-                BackgroundAgentStatus::Running,
-                true,
-            ),
-            (
-                SubagentState::RequiresAction,
-                None,
-                BackgroundAgentStatus::RequiresAction,
-                true,
-            ),
-            (
-                SubagentState::Unknown,
-                None,
-                BackgroundAgentStatus::Unknown,
-                true,
-            ),
-            (
-                SubagentState::Idle,
-                Some("end_turn"),
-                BackgroundAgentStatus::Completed,
-                false,
-            ),
-            (
-                SubagentState::Running,
-                None,
-                BackgroundAgentStatus::Running,
-                true,
-            ),
-            (
-                SubagentState::Idle,
-                Some("error"),
-                BackgroundAgentStatus::Error,
-                false,
-            ),
-        ];
-        for (state, reason, status, active) in steps {
-            s.apply_scoped_event(s.last_seq + 1, &subagent(state, reason, &session.sid), &child)
-                .unwrap();
-            assert_eq!(s.background_agents[0].status, status, "{state:?}");
-            assert_eq!(s.has_active_background_agent(), active, "{state:?}");
-        }
-        assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
-        assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
-        })).await;
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+                let mut s = session
+                    .state
+                    .session_service
+                    .fold_control_state(session.id())
+                    .await
+                    .unwrap();
+                s.apply_scoped_event(s.last_seq + 1, &launch, &resource)
+                    .unwrap();
+                let steps = [
+                    (
+                        SubagentState::Running,
+                        None,
+                        BackgroundAgentStatus::Running,
+                        true,
+                    ),
+                    (
+                        SubagentState::RequiresAction,
+                        None,
+                        BackgroundAgentStatus::RequiresAction,
+                        true,
+                    ),
+                    (
+                        SubagentState::Unknown,
+                        None,
+                        BackgroundAgentStatus::Unknown,
+                        true,
+                    ),
+                    (
+                        SubagentState::Idle,
+                        Some("end_turn"),
+                        BackgroundAgentStatus::Completed,
+                        false,
+                    ),
+                    (
+                        SubagentState::Running,
+                        None,
+                        BackgroundAgentStatus::Running,
+                        true,
+                    ),
+                    (
+                        SubagentState::Idle,
+                        Some("error"),
+                        BackgroundAgentStatus::Error,
+                        false,
+                    ),
+                ];
+                for (state, reason, status, active) in steps {
+                    s.apply_scoped_event(
+                        s.last_seq + 1,
+                        &subagent(state, reason, &session.sid),
+                        &child,
+                    )
+                    .unwrap();
+                    assert_eq!(s.background_agents[0].status, status, "{state:?}");
+                    assert_eq!(s.has_active_background_agent(), active, "{state:?}");
+                }
+                assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
+                assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+            })
+        })
+        .await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn uncertain_same_id_child_history_cannot_mutate_a_current_resource() {
-        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
-            let (session, launch, resource, child) = native_subagent_fixture(scope).await;
-            for case in ["absent", "other-source", "other-parent"] {
-                let mut s = session.state.session_service.fold_control_state(session.id()).await.unwrap();
-                s.apply_scoped_event(s.last_seq + 1, &launch, &resource).unwrap();
-                let before = (
-                    s.turn_active, s.native_control_seq, s.connection_ready,
-                    s.connection_unavailable, s.sidebar_status(), s.operation_effects.active(),
-                );
-                let mut uncertain = child.clone();
-                match case {
-                    "absent" => uncertain.child_provenance = None,
-                    "other-source" => {
-                        let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
-                        proof.origin.producer = uuid::Uuid::new_v4();
-                        uncertain.native_origin = Some(proof.origin);
-                        uncertain.child_provenance = Some(Arc::new(proof));
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+                for case in ["absent", "other-source", "other-parent"] {
+                    let mut s = session
+                        .state
+                        .session_service
+                        .fold_control_state(session.id())
+                        .await
+                        .unwrap();
+                    s.apply_scoped_event(s.last_seq + 1, &launch, &resource)
+                        .unwrap();
+                    let before = (
+                        s.turn_active,
+                        s.native_control_seq,
+                        s.connection_ready,
+                        s.connection_unavailable,
+                        s.sidebar_status(),
+                        s.operation_effects.active(),
+                    );
+                    let mut uncertain = child.clone();
+                    match case {
+                        "absent" => uncertain.child_provenance = None,
+                        "other-source" => {
+                            let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
+                            proof.origin.producer = uuid::Uuid::new_v4();
+                            uncertain.native_origin = Some(proof.origin);
+                            uncertain.child_provenance = Some(Arc::new(proof));
+                        }
+                        "other-parent" => {
+                            let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
+                            proof.ancestry = vec!["other-parent".into(), "child".into()].into();
+                            uncertain.reported_session_id = Some("other-parent".into());
+                            uncertain.child_provenance = Some(Arc::new(proof));
+                        }
+                        _ => unreachable!(),
                     }
-                    "other-parent" => {
-                        let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
-                        proof.ancestry = vec!["other-parent".into(), "child".into()].into();
-                        uncertain.reported_session_id = Some("other-parent".into());
-                        uncertain.child_provenance = Some(Arc::new(proof));
-                    }
-                    _ => unreachable!(),
+                    let parent = if case == "other-parent" {
+                        "other-parent"
+                    } else {
+                        &session.sid
+                    };
+                    let event = subagent(SubagentState::Idle, Some("error"), parent);
+                    uncertain.validate_for_event(&event).unwrap();
+                    s.apply_scoped_event(s.last_seq + 1, &event, &uncertain)
+                        .unwrap();
+                    assert_eq!(s.subagents[0].state, SubagentState::Idle, "{case}");
+                    assert_eq!(
+                        s.background_agents[0].status,
+                        BackgroundAgentStatus::Running,
+                        "{case}"
+                    );
+                    assert!(s.background_agents[0].ended_at.is_none(), "{case}");
+                    assert_eq!(
+                        (
+                            s.turn_active,
+                            s.native_control_seq,
+                            s.connection_ready,
+                            s.connection_unavailable,
+                            s.sidebar_status(),
+                            s.operation_effects.active(),
+                        ),
+                        before,
+                        "{case}"
+                    );
                 }
-                let parent = if case == "other-parent" { "other-parent" } else { &session.sid };
-                let event = subagent(SubagentState::Idle, Some("error"), parent);
-                uncertain.validate_for_event(&event).unwrap();
-                s.apply_scoped_event(s.last_seq + 1, &event, &uncertain).unwrap();
-                assert_eq!(s.subagents[0].state, SubagentState::Idle, "{case}");
-                assert_eq!(s.background_agents[0].status, BackgroundAgentStatus::Running, "{case}");
-                assert!(s.background_agents[0].ended_at.is_none(), "{case}");
-                assert_eq!((
-                    s.turn_active, s.native_control_seq, s.connection_ready,
-                    s.connection_unavailable, s.sidebar_status(), s.operation_effects.active(),
-                ), before, "{case}");
-            }
-        })).await;
+            })
+        })
+        .await;
     }
 
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {
@@ -4557,8 +4658,8 @@ mod tests {
         assert_eq!(s.background_shells[0].command, "cmd a");
         assert!(!s.background_shells[0].finished);
 
-        s.apply_event(s.last_seq + 1, finished("a")).unwrap();
-        assert!(s.background_tasks.iter().all(|id| id != "a"));
+        s.apply_scoped_event(s.last_seq + 1, &finished("a"), &crate::acp::event_sender::EventMetadata::history()).unwrap();
+        assert!(s.background_tasks.iter().all(|task| task.task_id != "a"));
         assert!(
             s.background_shells[0].finished,
             "finished shell stays listed"
@@ -4566,8 +4667,8 @@ mod tests {
 
         for i in 0..MAX_FINISHED_BACKGROUND_SHELLS + 3 {
             let id = format!("t{i}");
-            s.apply_event(s.last_seq + 1, started(&id, None)).unwrap();
-            s.apply_event(s.last_seq + 1, finished(&id)).unwrap();
+            s.apply_scoped_event(s.last_seq + 1, &started(&id, None), &crate::acp::event_sender::EventMetadata::history()).unwrap();
+            s.apply_scoped_event(s.last_seq + 1, &finished(&id), &crate::acp::event_sender::EventMetadata::history()).unwrap();
         }
         assert_eq!(s.background_shells.len(), MAX_FINISHED_BACKGROUND_SHELLS);
         assert_eq!(
@@ -4823,9 +4924,10 @@ mod tests {
             &current_session_metadata(),
         )
         .unwrap();
-        s.apply_event(
+        s.apply_scoped_event(
             s.last_seq.saturating_add(1),
-            subagent(SubagentState::Running, None, "root"),
+            &subagent(SubagentState::Running, None, "root"),
+            &crate::acp::event_sender::EventMetadata::history(),
         )
         .unwrap();
         assert_eq!(s.subagents.len(), 1);
@@ -4938,7 +5040,7 @@ mod tests {
             native_subject: None,
         };
         for (seq, event) in [lost, stopped].into_iter().enumerate() {
-            state.apply_event(seq as u64 + 1, event).unwrap();
+            state.apply_scoped_event(seq as u64 + 1, &event, &current_session_metadata()).unwrap();
         }
         assert_eq!(state.sidebar_phase, SidebarPhase::Error);
         assert_eq!(
@@ -4947,10 +5049,10 @@ mod tests {
                 .get("integration_lost"),
             Some(&serde_json::json!({"kind": "hold_overflow"}))
         );
-        state.apply_event(3, unqualified).unwrap();
+        state.apply_scoped_event(3, &unqualified, &current_session_metadata()).unwrap();
         assert!(state.integration_lost.is_some());
         assert_eq!(state.sidebar_phase, SidebarPhase::Error);
-        state.apply_event(4, observed_channel_ready("s2")).unwrap();
+        state.apply_scoped_event(4, &observed_channel_ready("s2"), &current_session_metadata()).unwrap();
         assert!(state.integration_lost.is_none());
         assert_ne!(state.sidebar_phase, SidebarPhase::Error);
         assert_eq!(

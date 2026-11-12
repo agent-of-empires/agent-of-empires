@@ -683,7 +683,7 @@ mod tests {
                     .unwrap();
             })))
         });
-        let page = store.replay_page("s-1", 0, None);
+        let page = store.replay_page("s-1", 0, None).unwrap();
         assert_eq!(
             (seqs(&page.events), page.highest_seq),
             (vec![1, 2, 3], 3),
@@ -700,7 +700,7 @@ mod tests {
         let (done, replayed) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let page = store.replay_page("s-1", 0, Some(10));
+                let page = store.replay_page("s-1", 0, Some(10)).unwrap();
                 let _ = done.send((
                     seqs(&page.events),
                     page.highest_seq,
