@@ -2335,8 +2335,9 @@ impl HomeView {
                 SuggestionsAction::Close => self.suggestions_view = None,
                 SuggestionsAction::Start(start) => self.start_suggestion(*start),
                 SuggestionsAction::OpenSession(id) => {
-                    self.suggestions_view = None;
-                    self.jump_to_session_id(&id);
+                    if self.open_linked_session(&id) {
+                        self.suggestions_view = None;
+                    }
                 }
             }
             return None;
