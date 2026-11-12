@@ -9917,6 +9917,9 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
         })
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        // CityHall forces Structured view, so its create needs an adapter the host may lack.
+        let _adapter =
+            cityhall.then(crate::session::test_support::stub_claude_adapter_on_agent_path);
         if cityhall {
             crate::session::projects::add(
                 "default",
