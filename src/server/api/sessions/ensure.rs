@@ -205,6 +205,22 @@ pub async fn ensure_session(
 }
 
 pub(crate) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<String>> {
+    agent_session_in_pane(instance, true)
+}
+
+/// Like [`ready_agent_session`] but never trusts a hook status file: an agent
+/// that exited to a live shell leaves it behind, so automatic input must see
+/// the pane itself running something other than a shell.
+pub(crate) fn ready_agent_session_for_automatic_input(
+    instance: &Instance,
+) -> anyhow::Result<Option<String>> {
+    agent_session_in_pane(instance, false)
+}
+
+fn agent_session_in_pane(
+    instance: &Instance,
+    trust_hook_status: bool,
+) -> anyhow::Result<Option<String>> {
     let panes = crate::tmux::batch_pane_metadata()?;
     let Some((name, pane)) =
         crate::tmux::agent_pane_metadata_in(&panes, &instance.id, &instance.title)?
@@ -216,7 +232,7 @@ pub(crate) fn ready_agent_session(instance: &Instance) -> anyhow::Result<Option<
     }
     if !instance.expects_shell()
         && !instance.has_command_override()
-        && crate::hooks::read_hook_status(&instance.id).is_none()
+        && !(trust_hook_status && crate::hooks::read_hook_status(&instance.id).is_some())
     {
         let command = pane
             .pane_current_command
