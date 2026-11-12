@@ -1,10 +1,11 @@
-// Async sub-agents of the active session, from the store fed by StructuredView's
-// existing WebSocket, so this pane opens no connection of its own.
+// The session's background work, shells and sub-agents, from the store fed by
+// StructuredView's existing WebSocket, so this pane opens no connection of its own.
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Bot, ChevronDown, ChevronLeft, ChevronRight, Square, Workflow } from "lucide-react";
 
 import {
+  useActivity,
   useBackgroundAgents,
   useBackgroundShells,
   useBackgroundTasks,
@@ -13,15 +14,18 @@ import {
 } from "../../hooks/useAcpSession";
 import type { BackgroundAgent, BackgroundAgentStatus, SubagentRecord } from "../../lib/acpTypes";
 import { cancelSubagent } from "../../lib/api";
+import { reportError } from "../../lib/toastBus";
 import {
   BackgroundAgentsContext,
   findSubagent,
   isActiveAgent,
+  isStoppable,
   paneAgents,
+  type PaneAgent,
   workflowPhases,
   workflowRunning,
 } from "./backgroundAgentsContext";
-import { BackgroundShells } from "./BackgroundShells";
+import { ShellDetailModal, ShellRow } from "./BackgroundShells";
 import { fromBackground } from "./subagents/model";
 import { StopSession } from "./subagents/StopSession";
 import { SubagentDetail } from "./subagents/SubagentDetail";
@@ -63,14 +67,20 @@ interface PanelProps {
   onShowThread?: () => void;
 }
 
+type Kind = "all" | "shells" | "agents";
+
 export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread }: PanelProps) {
   const background = useBackgroundAgents(sessionId);
   const subagents = useSubagents(sessionId);
-  const agents = useMemo(() => paneAgents(background, subagents), [background, subagents]);
+  const activity = useActivity(sessionId);
+  const agents = useMemo(() => paneAgents(background, subagents, activity), [background, subagents, activity]);
   const stopSession = readOnly ? null : sessionId;
   const backgroundTasks = useBackgroundTasks(sessionId);
   const workflowRuns = useWorkflowRuns(sessionId);
   const shells = useBackgroundShells(sessionId);
+  const [kind, setKind] = useState<Kind>("all");
+  const [openShell, setOpenShell] = useState<string | null>(null);
+  const closeShell = useCallback(() => setOpenShell(null), []);
   const [selected, setSelected] = useState<string | null>(focus?.agentId ?? null);
   const [seenFocus, setSeenFocus] = useState(focus);
   if (focus !== seenFocus) {
@@ -90,8 +100,17 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
     [agents],
   );
   const context = useMemo(
-    () => ({ sessionId: sessionId ?? undefined, agents, readOnly }),
-    [sessionId, agents, readOnly],
+    () => ({
+      sessionId: sessionId ?? undefined,
+      agents,
+      subagents,
+      readOnly,
+      cancelSubagent: async (childId: string) => {
+        const error = sessionId ? await cancelSubagent(sessionId, childId) : null;
+        if (error) reportError(error);
+      },
+    }),
+    [sessionId, agents, subagents, readOnly],
   );
 
   if (agents.length === 0 && shells.length === 0) {
@@ -109,6 +128,7 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
       <BackgroundAgentsContext.Provider value={context}>
         <AgentDetailView
           agents={sorted}
+          subagents={readOnly ? [] : subagents}
           index={index}
           onSelect={setSelected}
           onBack={() => setSelected(null)}
@@ -120,51 +140,88 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
 
   // A stalled agent is no longer writing, so cancel would be a no-op.
   const running = agents.filter((a) => a.status === "running").length;
+  const showShells = kind !== "agents";
+  const showAgents = kind !== "shells";
+  const live = (entry: Entry) =>
+    entry.kind === "agent"
+      ? isActiveAgent(entry.agent)
+      : workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents);
+  const all = showAgents ? entries(sorted, agents) : [];
+  const shellsBy = (finished: boolean) => (showShells ? shells.filter((s) => s.finished === finished).reverse() : []);
+  const groups = [
+    { label: "Running", shells: shellsBy(false), entries: all.filter(live) },
+    { label: "Recent", shells: shellsBy(true), entries: all.filter((e) => !live(e)) },
+  ];
+  const opened = shells.find((s) => s.taskId === openShell);
+  const chip = (value: Kind, label: string) => (
+    <button
+      key={value}
+      type="button"
+      aria-pressed={kind === value}
+      onClick={() => setKind(value)}
+      className={`rounded px-1.5 py-0.5 text-[11px] ${kind === value ? "bg-surface-700 text-text-primary" : "text-text-dim hover:text-text-secondary"}`}
+    >
+      {label}
+    </button>
+  );
 
-  // One stable slot for the shells: moving it remounts the shell dialog and closes it.
-  const hasAgents = agents.length > 0;
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      {hasAgents && (
-        <div className="flex flex-wrap items-center gap-2 border-b border-surface-700 px-3 py-1.5">
-          <span className="flex-1 text-[11px] uppercase tracking-wider text-text-dim">
-            Background agents · {agents.length}
-          </span>
-          {running > 0 && sessionId && !readOnly && <StopSession sessionId={sessionId} running={running} />}
-        </div>
+      <div className="flex flex-wrap items-center gap-2 border-b border-surface-700 px-3 py-1.5">
+        <span className="text-[11px] uppercase tracking-wider text-text-dim">
+          Background · {agents.length + shells.length}
+        </span>
+        <span className="flex flex-1 items-center gap-0.5" role="group" aria-label="Filter background work">
+          {agents.length > 0 &&
+            shells.length > 0 && [
+              chip("all", "All"),
+              chip("shells", `Shells ${shells.length}`),
+              chip("agents", `Agents ${agents.length}`),
+            ]}
+        </span>
+        {running > 0 && sessionId && !readOnly && <StopSession sessionId={sessionId} running={running} />}
+      </div>
+      {groups.map(
+        (group) =>
+          group.shells.length + group.entries.length > 0 && (
+            <div key={group.label} className="border-b border-surface-700">
+              <div className="px-3 pt-1.5 text-[10px] uppercase tracking-wider text-text-dim">
+                {group.label} · {group.shells.length + group.entries.length}
+              </div>
+              {group.shells.map((s) => (
+                <ShellRow key={s.taskId} shell={s} onOpen={setOpenShell} />
+              ))}
+              {group.entries.map((entry) =>
+                entry.kind === "agent" ? (
+                  <AgentRow
+                    key={entry.agent.agentId}
+                    agent={entry.agent}
+                    onSelect={setSelected}
+                    sessionId={stopSession}
+                    subagents={subagents}
+                  />
+                ) : (
+                  <WorkflowGroup
+                    key={entry.runId}
+                    name={entry.name}
+                    agents={entry.agents}
+                    onSelect={setSelected}
+                    sessionId={stopSession}
+                    subagents={subagents}
+                    live={live(entry)}
+                  />
+                ),
+              )}
+            </div>
+          ),
       )}
-      {sessionId && <BackgroundShells sessionId={sessionId} />}
-      {hasAgents && (
-        <>
-          <p className="border-b border-surface-800 px-3 py-1 text-[11px] leading-snug text-text-dim">
-            Delegated sub-agents, async (background) <span className="font-mono">Task</span> sub-agents and{" "}
-            <span className="font-mono">Workflow</span> agents show here. Inline sub-agents also appear in the
-            transcript.
-          </p>
-          <div className="flex flex-col">
-            {entries(sorted, agents).map((entry) =>
-              entry.kind === "agent" ? (
-                <AgentRow
-                  key={entry.agent.agentId}
-                  agent={entry.agent}
-                  onSelect={setSelected}
-                  sessionId={stopSession}
-                  subagents={subagents}
-                />
-              ) : (
-                <WorkflowGroup
-                  key={entry.runId}
-                  name={entry.name}
-                  agents={entry.agents}
-                  onSelect={setSelected}
-                  sessionId={stopSession}
-                  subagents={subagents}
-                  live={workflowRunning(workflowRuns[entry.agents[0]!.toolCallId], backgroundTasks, entry.agents)}
-                />
-              ),
-            )}
-          </div>
-        </>
+      {opened && sessionId && (
+        <ShellDetailModal
+          key={`${sessionId}:${opened.taskId}`}
+          sessionId={sessionId}
+          shell={opened}
+          onClose={closeShell}
+        />
       )}
     </div>
   );
@@ -173,19 +230,22 @@ export function BackgroundAgentsPanel({ sessionId, readOnly, focus, onShowThread
 /** The shared detail view for one agent, stepping through the list in its order. */
 function AgentDetailView({
   agents,
+  subagents,
   index,
   onSelect,
   onBack,
   onShowThread,
 }: {
-  agents: BackgroundAgent[];
+  agents: PaneAgent[];
+  subagents: SubagentRecord[];
   index: number;
   onSelect: (id: string) => void;
   onBack: () => void;
   onShowThread?: () => void;
 }) {
   const agent = agents[index]!;
-  const record = useMemo(() => fromBackground(agent), [agent]);
+  const record = useMemo(() => agent.record ?? fromBackground(agent), [agent]);
+  const roster = findSubagent(subagents, agent.toolCallId);
   const inThread = useMemo(
     () => document.querySelector(`[data-tool-id="${CSS.escape(agent.toolCallId)}"]`) !== null,
     [agent.toolCallId],
@@ -197,7 +257,7 @@ function AgentDetailView({
       <div className="flex items-center gap-2 border-b border-surface-700 px-2 py-1.5 text-[11px] text-text-dim">
         <button type="button" onClick={onBack} className="inline-flex items-center gap-0.5 hover:text-text-secondary">
           <ChevronLeft className="h-3.5 w-3.5" />
-          All agents
+          All background work
         </button>
         <span className="flex-1 text-center">
           Subagent {index + 1} of {agents.length}
@@ -226,6 +286,7 @@ function AgentDetailView({
           key={agent.agentId}
           record={record}
           alwaysOpen
+          stopChildId={isStoppable(roster) && isActiveAgent(agent) ? roster.session_id : undefined}
           actions={
             inThread && (
               <button

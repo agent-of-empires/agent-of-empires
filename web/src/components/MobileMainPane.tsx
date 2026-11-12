@@ -130,7 +130,7 @@ export function MobileMainPane({
         : view === "paired"
           ? "Paired terminal"
           : view === "agents"
-            ? "Sub agents"
+            ? "Background"
             : (activePluginPane?.title ?? "Plugin");
 
   return (

@@ -2,7 +2,7 @@
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
+import type { ActivityRow, BackgroundAgent, BackgroundShell, SubagentRecord, WorkflowRun } from "../../../lib/acpTypes";
 import { writeClipboard } from "../../../lib/clipboard";
 
 vi.mock("../../../lib/clipboard", () => ({ writeClipboard: vi.fn().mockResolvedValue(true) }));
@@ -14,12 +14,14 @@ const tasksMock = vi.fn<() => string[]>(() => []);
 const runsMock = vi.fn<() => Record<string, WorkflowRun>>(() => ({}));
 const subagentsMock = vi.fn<() => SubagentRecord[]>(() => []);
 const shellsMock = vi.fn<() => BackgroundShell[]>(() => []);
+const activityMock = vi.fn<() => ActivityRow[]>(() => []);
 const taskOutputMock = vi.fn();
 vi.mock("../../../lib/api", async (importActual) => ({
   ...(await importActual<typeof import("../../../lib/api")>()),
   fetchTaskOutput: (...args: unknown[]) => taskOutputMock(...args),
 }));
 vi.mock("../../../hooks/useAcpSession", () => ({
+  useActivity: () => activityMock(),
   useBackgroundAgents: () => agentsMock(),
   useBackgroundShells: () => shellsMock(),
   useBackgroundTasks: () => tasksMock(),
@@ -67,9 +69,35 @@ describe("BackgroundAgentsPanel shells", () => {
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const text = container.textContent ?? "";
     expect(text).not.toContain("No background work yet");
-    expect(text).toContain("Running shells · 1");
-    expect(text).toContain("Recent shells · 1");
+    expect(text).toContain("Running · 1");
+    expect(text).toContain("Recent · 1");
     expect(text.indexOf("npm run dev")).toBeLessThan(text.indexOf("make build"));
+    expect(text).not.toContain("Shells");
+  });
+
+  it("groups shells and agents by Running and Recent, and filters them by kind", () => {
+    agentsMock.mockReturnValue([
+      agent(),
+      agent({ agentId: "a2", toolCallId: "t2", description: "Old agent", status: "completed", endedAt: "2020-01-01" }),
+    ]);
+    shellsMock.mockReturnValue([
+      shell(),
+      shell({ taskId: "bx0", command: "make build", finished: true, endedAt: new Date().toISOString() }),
+    ]);
+    const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+    const text = () => container.textContent ?? "";
+    expect(text()).toContain("Background · 4");
+    const [running, recent] = [text().indexOf("Running · 2"), text().indexOf("Recent · 2")];
+    expect(running).toBeGreaterThanOrEqual(0);
+    for (const live of ["npm run dev", "Map backend lifecycle"]) expect(text().indexOf(live)).toBeLessThan(recent);
+    for (const old of ["make build", "Old agent"]) expect(text().indexOf(old)).toBeGreaterThan(recent);
+    fireEvent.click(getByRole("button", { name: "Shells 2" }));
+    expect(text()).toContain("npm run dev");
+    expect(text()).not.toContain("Map backend lifecycle");
+    fireEvent.click(getByRole("button", { name: "Agents 2" }));
+    expect(text()).not.toContain("npm run dev");
+    expect(text()).toContain("Old agent");
+    shellsMock.mockReturnValue([]);
   });
 
   it("shows the empty state with no agents and no shells", () => {
@@ -99,7 +127,7 @@ describe("BackgroundAgentsPanel shells", () => {
 
     agentsMock.mockReturnValue([agent()]);
     view.rerender(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(view.getByText("Background agents · 1")).toBeTruthy();
+    expect(view.getByText("Background · 2")).toBeTruthy();
     expect(view.getByRole("dialog")).toBeTruthy();
   });
 
@@ -286,7 +314,7 @@ describe("BackgroundAgentsPanel", () => {
     ]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
     const text = container.textContent ?? "";
-    expect(text).toContain("Background agents · 4");
+    expect(text).toContain("Background · 4");
     expect(text).toContain("issue-drafts");
     expect(text).toContain("2 of 3 done");
     expect(text).toContain("Draft · 2/2");
@@ -347,8 +375,7 @@ describe("BackgroundAgentsPanel", () => {
   it("lists a running agent with description, tool count, and last activity", () => {
     agentsMock.mockReturnValue([agent()]);
     const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-    expect(container.textContent).toContain("Background agents · 1");
-    expect(container.textContent).toContain("Inline sub-agents also appear in the transcript");
+    expect(container.textContent).toContain("Background · 1");
     expect(container.textContent).toContain("Map backend lifecycle");
     expect(container.textContent).toContain("running");
     expect(container.textContent).toContain("3 tools");
@@ -494,7 +521,7 @@ describe("BackgroundAgentsPanel", () => {
         }),
       ]);
       const { container, getAllByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-      expect(container.textContent).toContain("Background agents · 2");
+      expect(container.textContent).toContain("Background · 2");
       expect(container.textContent).toContain("Explore repo");
       expect(container.textContent).toContain("Unlinked");
       expect(container.textContent).toContain("done");
@@ -506,11 +533,58 @@ describe("BackgroundAgentsPanel", () => {
       subagentsMock.mockReturnValue([]);
     });
 
+    it("opens a child with the prompt and calls its thread card shows", () => {
+      const at = "2026-01-01T00:00:00Z";
+      const launch: ActivityRow = {
+        id: "r1",
+        kind: "tool_start",
+        text: "",
+        at,
+        tool: {
+          id: "msg-1",
+          name: "Explore repo",
+          kind: "think",
+          args_preview: JSON.stringify({ prompt: "find the flaky test" }),
+          started_at: at,
+        },
+      };
+      const call: ActivityRow = {
+        id: "r2",
+        kind: "tool_start",
+        text: "",
+        at,
+        tool: {
+          id: "c1",
+          name: "cargo test",
+          kind: "execute",
+          args_preview: JSON.stringify({ command: "cargo test" }),
+          started_at: at,
+          parent_tool_call_id: "msg-1",
+        },
+      };
+      agentsMock.mockReturnValue([]);
+      subagentsMock.mockReturnValue([record({ parent_tool_call_id: "msg-1", title: "Explore repo" })]);
+      activityMock.mockReturnValue([launch, call]);
+      const { container, getByRole } = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      fireEvent.click(getByRole("button", { name: /Explore repo/ }));
+      expect(container.textContent).toContain("find the flaky test");
+      expect(container.textContent).toContain("1 call");
+      expect(container.textContent).toContain("cargo test");
+      expect(container.textContent).not.toContain("no prompt recorded");
+
+      // Before its card's row loads, the child shows its roster title and state only.
+      activityMock.mockReturnValue([]);
+      const bare = render(<BackgroundAgentsPanel sessionId="s-1" />);
+      expect(bare.container.textContent).toContain("Explore repo");
+      expect(bare.container.textContent).toContain("running");
+      subagentsMock.mockReturnValue([]);
+    });
+
     it("lists a linked child once when a legacy record also covers it", () => {
       agentsMock.mockReturnValue([agent()]);
       subagentsMock.mockReturnValue([record()]);
       const { container } = render(<BackgroundAgentsPanel sessionId="s-1" />);
-      expect(container.textContent).toContain("Background agents · 1");
+      expect(container.textContent).toContain("Background · 1");
       subagentsMock.mockReturnValue([]);
     });
 
@@ -567,8 +641,8 @@ describe("BackgroundAgentsPanel", () => {
     expect(text).toContain("Subagent 1 of 2");
     fireEvent.click(getByRole("button", { name: "Next subagent" }));
     expect(container.textContent).toContain("Subagent 2 of 2");
-    fireEvent.click(getByRole("button", { name: /All agents/ }));
-    expect(container.textContent).toContain("Background agents · 2");
+    fireEvent.click(getByRole("button", { name: /All background work/ }));
+    expect(container.textContent).toContain("Background · 2");
   });
 });
 

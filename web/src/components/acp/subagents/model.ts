@@ -191,6 +191,28 @@ export function fromInline(
   };
 }
 
+/** A launch card's call, result and child calls, read from a session's activity rows. */
+export function launchFromRows(
+  rows: readonly ActivityRow[],
+  id: string,
+): { tool: ToolCall; result?: ActivityRow; children: ToolCardProps[] } | undefined {
+  let tool: ToolCall | undefined;
+  let result: ActivityRow | undefined;
+  const children = new Map<string, ToolCardProps>();
+  for (const row of rows) {
+    if (row.kind === "tool_start" && row.tool) {
+      if (row.tool.id === id) tool = row.tool;
+      else if (row.tool.parent_tool_call_id === id) children.set(row.tool.id, { tool: row.tool });
+    } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
+      const done = row.toolCallId ?? row.id.replace(/^(done|stopped)-/, "");
+      const child = children.get(done);
+      if (done === id) result = row;
+      else if (child) child.result = row;
+    }
+  }
+  return tool && { tool, result, children: [...children.values()] };
+}
+
 /** A tailed background agent. Its tools carry no inline card. */
 export function fromBackground(agent: BackgroundAgent): SubagentRecord {
   const status = bgStatus(agent.status);

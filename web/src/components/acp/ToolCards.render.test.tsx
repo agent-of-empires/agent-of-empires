@@ -1092,7 +1092,7 @@ describe("AsyncSubagentCard", () => {
     expect(container.textContent).toContain("Waiting on you");
   });
 
-  it("opens the Sub agents pane on click", () => {
+  it("opens the Background pane on click", () => {
     const openPane = vi.fn();
     const { getByRole } = render(
       <BackgroundAgentsContext.Provider value={{ agents: [], openPane }}>
@@ -1201,7 +1201,7 @@ describe("WorkflowToolCard", () => {
     expect(text()).toContain("Draft1 done");
     expect(text()).toContain("Verify1 running · 0 done");
     expect(text()).toContain("await agent");
-    fireEvent.click(getByText("Open Sub agents"));
+    fireEvent.click(getByText("Open Background"));
     expect(openPane).toHaveBeenCalledTimes(1);
   });
 
