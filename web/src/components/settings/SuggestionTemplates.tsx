@@ -259,6 +259,8 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
   const mounted = useRef(true);
 
   const loadSeq = useRef(0);
+  // The first load that may release the mapping lock: one started after the write has finished.
+  const releaseFrom = useRef(Infinity);
   // Resolves true when every resource loaded; only the latest call applies its result.
   const load = useCallback(async (): Promise<boolean> => {
     const seq = ++loadSeq.current;
@@ -267,6 +269,10 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
     if (t) setTemplates(t);
     if (m) setMappings(m);
     setMappingsStale(!m);
+    if (seq >= releaseFrom.current) {
+      releaseFrom.current = Infinity;
+      setSaving(false);
+    }
     if (p) setProjects(p);
     const failed = [!t && "templates", !m && "mappings", !p && "Projects"].filter(Boolean);
     setLoadError(failed.length > 0 ? `Could not load ${failed.join(", ")}.` : null);
@@ -289,8 +295,9 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
     setSaving(true);
     const result = await request;
     if (mounted.current && !result.ok) setError(result.error);
+    // Only a load that applies releases the lock; one superseded by a newer load must not.
+    releaseFrom.current = loadSeq.current + 1;
     await load();
-    if (mounted.current) setSaving(false);
   };
 
   return (
