@@ -51,6 +51,7 @@ fn active_state(mode: ServeMode) -> ServeViewState {
         }],
         url_index: 0,
         passphrase: (mode == ServeMode::Tunnel).then(|| "running daemon phrase".to_owned()),
+        funnel: crate::server::tunnel::FunnelReach::Ours,
         opened_at: Instant::now(),
         log_offset: 0,
     }
@@ -110,6 +111,7 @@ enum Held {
     Passphrase,
     ErrorContext,
     Active,
+    Access,
     Copy,
 }
 
@@ -128,6 +130,7 @@ fn operation(job: &Job) -> Held {
         Job::Passphrase => Held::Passphrase,
         Job::ErrorContext => Held::ErrorContext,
         Job::ObserveActive(_) => Held::Active,
+        Job::RefreshAccess(_) => Held::Access,
         Job::Copy(..) => Held::Copy,
     }
 }
@@ -881,6 +884,7 @@ fn every_pending_state_leaves_a_closed_worker() {
         (Held::ErrorContext, Some('P')),
         (Held::ErrorContext, Some('R')),
         (Held::Active, None),
+        (Held::Access, None),
         (Held::Copy, None),
     ] {
         let mut view = ServeView::for_test(if held == Held::ErrorContext {
@@ -952,6 +956,7 @@ fn every_pending_state_leaves_a_closed_worker() {
                 },
             ),
             Held::Active => (Job::ObserveActive(Some(target)), PendingJob::Active),
+            Held::Access => (Job::RefreshAccess(target), PendingJob::Access),
             Held::Copy => (Job::Copy("URL", "fixture".to_owned()), PendingJob::Copy),
             Held::Stop => panic!("App-owned stop has no view pending state"),
         };
@@ -995,6 +1000,7 @@ fn a_liveness_result_cannot_beat_a_published_url() {
             } else {
                 Vec::new()
             },
+            funnel: crate::server::tunnel::FunnelReach::Ours,
             passphrase: None,
             log_offset: 0,
             tail: Default::default(),
@@ -1724,6 +1730,7 @@ fn open_uses_current_credentials_without_saved_default_fallback() {
                 let changed = view.tick();
                 if let ServeViewState::Active {
                     passphrase: Some(passphrase),
+                    funnel: crate::server::tunnel::FunnelReach::Ours,
                     opened_at: current_opened_at,
                     ..
                 } = &view.state
@@ -2671,4 +2678,151 @@ async fn launch_control_preserves_observed_absence_after_fresh_start_refusal() {
             remove_app_file(name);
         }
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn active_rereads_urls_and_funnel_state_and_keeps_the_selection() {
+    use crate::server::tunnel::FunnelReach;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    let mut daemon = TestDaemon::new();
+    let target = daemon.publish();
+    std::fs::write(app.join("serve.mode"), "tailscale").unwrap();
+    let publish = |token: &str, lost: Option<&str>| {
+        match lost {
+            Some(marker) => std::fs::write(app.join("serve.funnel"), marker).unwrap(),
+            None => remove_app_file("serve.funnel"),
+        }
+        let loopback = format!("http://127.0.0.1:8080/?token={token}");
+        let urls = match lost {
+            Some(_) => format!("{loopback}\n"),
+            None => format!("https://node.ts.net/?token={token}\nlocalhost\t{loopback}\n"),
+        };
+        std::fs::write(app.join("serve.url"), urls).unwrap();
+    };
+    let selected = |view: &ServeView| match &view.state {
+        ServeViewState::Active {
+            urls,
+            url_index,
+            funnel,
+            ..
+        } => (urls[*url_index].url.clone(), *funnel),
+        _ => panic!("left Active"),
+    };
+    // Makes the next tick due for a re-read without waiting out the interval.
+    let make_due = |view: &mut ServeView| {
+        let past = Instant::now() - ACCESS_REFRESH;
+        view.access_checked_at = Some(past);
+        if let ServeViewState::Active { opened_at, .. } = &mut view.state {
+            *opened_at = past;
+        }
+    };
+    let reread = |view: &mut ServeView| {
+        make_due(view);
+        let due = view.access_checked_at;
+        wait_for(view, |view| view.access_checked_at != due);
+    };
+
+    publish("a", None);
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), jobs.submitter());
+    view.target = Some(target);
+    if let ServeViewState::Active { transport, .. } = &mut view.state {
+        *transport = Some(TunnelTransport::Tailscale);
+    }
+    reread(&mut view);
+    let localhost = "http://127.0.0.1:8080/?token=a".to_owned();
+    if let ServeViewState::Active { url_index, .. } = &mut view.state {
+        *url_index = 1;
+    }
+    assert_eq!(selected(&view), (localhost.clone(), FunnelReach::Ours));
+
+    // Unchanged files keep the selection.
+    reread(&mut view);
+    assert_eq!(selected(&view), (localhost, FunnelReach::Ours));
+
+    // A rotated token keeps the same labelled URL selected.
+    publish("b", None);
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        (
+            "http://127.0.0.1:8080/?token=b".to_owned(),
+            FunnelReach::Ours
+        )
+    );
+
+    // A takeover, then an unanswered status, then the Funnel back.
+    for (marker, want) in [
+        (Some("lost\n"), FunnelReach::Lost),
+        (Some("unknown\n"), FunnelReach::Unknown),
+    ] {
+        publish("b", marker);
+        reread(&mut view);
+        assert_eq!(
+            selected(&view),
+            ("http://127.0.0.1:8080/?token=b".to_owned(), want)
+        );
+    }
+    publish("b", None);
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        ("https://node.ts.net/?token=b".to_owned(), FunnelReach::Ours)
+    );
+
+    // Right after a re-read, ticks only observe the log until the interval passes.
+    for _ in 0..50 {
+        view.tick();
+        assert!(
+            !view
+                .pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.kind, PendingJob::Access)),
+            "re-read before the interval"
+        );
+    }
+
+    // A Local daemon has no Funnel, whatever a stale file says.
+    publish("b", Some("lost\n"));
+    std::fs::write(app.join("serve.mode"), "local").unwrap();
+    view.state = active_state(ServeMode::Local);
+    reread(&mut view);
+    assert_eq!(selected(&view).1, FunnelReach::Ours);
+}
+
+#[test]
+#[serial_test::serial]
+fn a_key_drops_a_pending_access_reread_and_restarts_its_interval() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut daemon = TestDaemon::new();
+    let target = daemon.publish();
+    let mut jobs = ServeJobs::default();
+    let (submitter, gate) = gated(&mut jobs, Held::Access);
+    let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), submitter);
+    view.target = Some(target);
+    let past = Instant::now() - ACCESS_REFRESH;
+    view.access_checked_at = Some(past);
+    if let ServeViewState::Active { opened_at, .. } = &mut view.state {
+        *opened_at = past;
+    }
+    view.tick();
+    gate.entered(Held::Access);
+    view.handle_key(KeyEvent::from(KeyCode::Down));
+    assert!(view.pending.is_none());
+    let restarted = view.access_checked_at.expect("the key stamps the interval");
+    assert!(restarted > past);
+    gate.release(JobResult::Access(None));
+    for _ in 0..50 {
+        view.tick();
+        assert!(
+            !view
+                .pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.kind, PendingJob::Access)),
+            "re-read before the restarted interval"
+        );
+    }
+    assert_eq!(view.access_checked_at, Some(restarted));
 }
