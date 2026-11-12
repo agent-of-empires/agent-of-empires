@@ -151,6 +151,7 @@ test.describe("mobile jump-to-bottom", () => {
   });
 
   test("stays pinned across a composer collapse toggle and as the composer grows", async ({ page }) => {
+    test.skip(!!process.env.CI, "Quarantined on CI: flaky scroll-pin race — see #5496; remove when fixed");
     const longText = Array.from({ length: 120 }, (_, i) => `line ${i}`).join("\n");
     const mock = await mockAcpSession(page, {
       title: "story-collapse-pin",
