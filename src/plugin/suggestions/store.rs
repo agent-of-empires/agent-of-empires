@@ -170,9 +170,12 @@ fn load_items(
     let rows: Vec<String> = conn
         .prepare(
             "SELECT item_json FROM suggestion_items
-             WHERE profile = ?1 AND provider_id = ?2 ORDER BY position",
+             WHERE profile = ?1 AND provider_id = ?2 AND spec_hash = ?3 ORDER BY position",
         )?
-        .query_map(params![profile, provider.id], |row| row.get(0))?
+        .query_map(
+            params![profile, provider.id, spec_hash(&provider.spec)],
+            |row| row.get(0),
+        )?
         .collect::<Result<_, _>>()?;
     let mut items = Vec::with_capacity(rows.len());
     for row in rows {
@@ -193,8 +196,8 @@ pub(crate) fn find_item(
     let stored: Option<String> = conn
         .query_row(
             "SELECT item_json FROM suggestion_items
-             WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3",
-            params![profile, provider.id, id],
+             WHERE profile = ?1 AND provider_id = ?2 AND item_id = ?3 AND spec_hash = ?4",
+            params![profile, provider.id, id, spec_hash(&provider.spec)],
             |row| row.get(0),
         )
         .optional()?;
@@ -569,6 +572,36 @@ mod tests {
         let snapshot = snap(&conn, "p");
         assert_eq!(ids(&snapshot), ["backlog-1", "urgent-42"]);
         assert_eq!(snapshot["items"][1]["dismissed"], true);
+    }
+
+    #[test]
+    fn a_publication_validated_against_an_older_spec_stays_hidden() {
+        let conn = store();
+        let new = || {
+            let mut p = provider();
+            p.spec.sources[0].label = "Renamed".into();
+            p
+        };
+        publish(&conn, "p", &[item("a", "assigned")]);
+        assert_eq!(ids(&snapshot(&conn, "p", &[provider()]).unwrap()), ["a"]);
+
+        // The manifest changed, the old worker's rows are still stored.
+        assert!(ids(&snapshot(&conn, "p", &[new()]).unwrap()).is_empty());
+        assert!(find_item(&conn, "p", &new(), "a").unwrap().is_none());
+        assert!(!set_dismissed(&conn, "p", &new(), "a", true).unwrap());
+
+        // A late write under the old spec stays hidden; one under the new spec shows.
+        publish(&conn, "p", &[item("a", "assigned")]);
+        assert!(ids(&snapshot(&conn, "p", &[new()]).unwrap()).is_empty());
+        set(
+            &conn,
+            "p",
+            "acme.github",
+            &new().spec,
+            &json!({ "items": [item("a", "assigned")] }),
+        )
+        .unwrap();
+        assert_eq!(ids(&snapshot(&conn, "p", &[new()]).unwrap()), ["a"]);
     }
 
     #[test]
