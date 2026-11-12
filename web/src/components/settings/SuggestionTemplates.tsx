@@ -42,7 +42,7 @@ interface BlockProps {
   disabled: boolean;
   focused: boolean;
   onSource: (providerId: string, criterion: string, enabled: boolean) => Promise<void>;
-  onSaved: () => Promise<void>;
+  onSaved: () => Promise<boolean>;
   onError: (message: string) => void;
 }
 
@@ -77,8 +77,8 @@ function TemplateBlock({
         onError(result.error);
         return;
       }
-      setEdited((current) => (current === submitted ? null : current));
-      await onSaved();
+      // The draft stays until the reload confirms the stored value, so a failed reload never shows the old prompt.
+      if (await onSaved()) setEdited((current) => (current === submitted ? null : current));
     });
   };
   const commit = () => {
@@ -252,20 +252,25 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
   const [mappings, setMappings] = useState<SuggestionMapping[]>([]);
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [wizard, setWizard] = useState(false);
   const [saving, setSaving] = useState(false);
   const [mappingsStale, setMappingsStale] = useState(false);
   const mounted = useRef(true);
 
-  const load = useCallback(async () => {
+  const loadSeq = useRef(0);
+  // Resolves true when every resource loaded; only the latest call applies its result.
+  const load = useCallback(async (): Promise<boolean> => {
+    const seq = ++loadSeq.current;
     const [t, m, p] = await Promise.all([fetchSuggestionTemplates(), fetchSuggestionMappings(), fetchProjects({})]);
-    if (!mounted.current) return;
+    if (!mounted.current || seq !== loadSeq.current) return !!(t && m && p);
     if (t) setTemplates(t);
     if (m) setMappings(m);
     setMappingsStale(!m);
     if (p) setProjects(p);
     const failed = [!t && "templates", !m && "mappings", !p && "Projects"].filter(Boolean);
-    if (failed.length > 0) setError(`Could not load ${failed.join(", ")}.`);
+    setLoadError(failed.length > 0 ? `Could not load ${failed.join(", ")}.` : null);
+    return failed.length === 0;
   }, []);
 
   useEffect(() => {
@@ -293,12 +298,12 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
       <button type="button" onClick={onReturn ?? onBack} className="cursor-pointer text-sm text-brand-500">
         &larr; {onReturn ? "Suggested sessions" : "Suggestions"}
       </button>
-      {error && (
+      {(error ?? loadError) && (
         <div
           role="alert"
           className="rounded-md border border-status-error/40 bg-status-error/10 p-3 text-sm text-status-error"
         >
-          {error}
+          {error ?? loadError}
         </div>
       )}
       {snapshot.providers.map((provider) => (
@@ -358,7 +363,7 @@ export function SuggestionTemplates({ snapshot, disabled, onBack, onReturn, focu
           providers={snapshot.providers}
           disabled={disabled}
           onClose={() => setWizard(false)}
-          onSaved={() => void load()}
+          onSaved={load}
         />
       )}
     </div>
