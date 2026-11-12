@@ -16,6 +16,13 @@ pub struct TunnelHandle {
     port: u16,
     kind: TunnelKind,
     cancel: CancellationToken,
+    /// Tailscale only: whether `/` on :443 still routes to this daemon.
+    funnel: Option<FunnelRoute>,
+}
+
+struct FunnelRoute {
+    program: std::ffi::OsString,
+    reach: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone)]
@@ -48,6 +55,11 @@ impl TunnelHandle {
 
     pub fn mode_label(&self) -> &'static str {
         self.kind.mode_label()
+    }
+
+    /// Tailscale only: true while `/` on :443 routes to this daemon, so its URL may be advertised.
+    pub fn funnel_reach(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.funnel.as_ref().map(|route| route.reach.subscribe())
     }
 
     pub fn is_stable_origin(&self) -> bool {
@@ -103,6 +115,7 @@ impl TunnelHandle {
             port: local_port,
             kind: TunnelKind::Quick,
             cancel: CancellationToken::new(),
+            funnel: None,
         })
     }
 
@@ -164,6 +177,7 @@ impl TunnelHandle {
                 tunnel_name: tunnel_name.to_string(),
             },
             cancel: CancellationToken::new(),
+            funnel: None,
         })
     }
 
@@ -174,13 +188,21 @@ impl TunnelHandle {
         let home =
             dirs::home_dir().context("couldn't find the home directory for the Funnel lock")?;
         let lock = funnel_lock_path(&home);
-        Self::spawn_tailscale_with(std::ffi::OsStr::new("tailscale"), &lock, local_port).await
+        Self::spawn_tailscale_with(
+            std::ffi::OsStr::new("tailscale"),
+            &lock,
+            local_port,
+            backend_accepts,
+        )
+        .await
     }
 
-    async fn spawn_tailscale_with(
+    /// `is_live` says whether a loopback backend accepts connections; tests pass a fake.
+    async fn spawn_tailscale_with<F: std::future::Future<Output = bool>>(
         program: &std::ffi::OsStr,
         lock: &std::path::Path,
         local_port: u16,
+        is_live: impl Fn(String) -> F,
     ) -> anyhow::Result<Self> {
         // Hard cap on each tailscale command so we never wedge if tailscale pops an
         // interactive prompt (HTTPS-certs consent, Funnel-not-enabled-in-ACL, node not
@@ -207,7 +229,7 @@ impl TunnelHandle {
         let funnel_lock = lock_funnel_starts(lock).await?;
 
         // Pre-flight 2.
-        let preflight = inspect_existing_funnel(program, local_port).await;
+        let preflight = inspect_existing_funnel(program, local_port, is_live).await;
         if let FunnelPreflight::Refuse(why) = &preflight {
             anyhow::bail!("{why}");
         }
@@ -361,6 +383,10 @@ impl TunnelHandle {
             port: local_port,
             kind: TunnelKind::Tailscale,
             cancel: CancellationToken::new(),
+            funnel: Some(FunnelRoute {
+                program: program.to_owned(),
+                reach: tokio::sync::watch::Sender::new(true),
+            }),
         })
     }
 
@@ -392,10 +418,21 @@ impl TunnelHandle {
         }
     }
 
-    /// Spawn a background task that monitors tunnel health and attempts one restart.
+    /// Spawn a background task that monitors tunnel health and attempts one restart, or for
+    /// Tailscale, watches that `/` on :443 still routes here.
     pub fn spawn_health_monitor(&self) {
+        if let Some(route) = &self.funnel {
+            tokio::spawn(watch_funnel(
+                route.program.clone(),
+                self.port,
+                FUNNEL_WATCH_INTERVAL,
+                route.reach.clone(),
+                self.cancel.clone(),
+            ));
+            return;
+        }
         let Some(child_arc) = self.child.as_ref() else {
-            return; // Tailscale: no child to monitor
+            return;
         };
         let child = Arc::clone(child_arc);
         let kind = self.kind.clone();
@@ -928,8 +965,21 @@ fn conflicting_funnel(existing: String) -> FunnelPreflight {
     ))
 }
 
+/// The refusal for a live server behind `/` on :443 that isn't this daemon.
+fn live_funnel_backend(proxy: &str) -> FunnelPreflight {
+    FunnelPreflight::Refuse(format!(
+        "port 443's Tailscale Funnel serves another running server ({proxy}), such as another \
+         user's aoe daemon, so aoe won't take it over. Stop that server, run `tailscale funnel \
+         reset` to clear the Funnel config, or pass --no-tailscale to use Cloudflare."
+    ))
+}
+
 /// Probe `tailscale funnel status --json` to see if port 443 is already configured.
-async fn inspect_existing_funnel(program: &std::ffi::OsStr, local_port: u16) -> FunnelPreflight {
+async fn inspect_existing_funnel<F: std::future::Future<Output = bool>>(
+    program: &std::ffi::OsStr,
+    local_port: u16,
+    is_live: impl Fn(String) -> F,
+) -> FunnelPreflight {
     let out = Command::new(program)
         .args(["funnel", "status", "--json"])
         .stdin(std::process::Stdio::null())
@@ -956,11 +1006,127 @@ async fn inspect_existing_funnel(program: &std::ffi::OsStr, local_port: u16) -> 
         }
     };
 
-    funnel_preflight(&parsed, local_port)
+    let mut live = std::collections::HashSet::new();
+    for proxy in root_proxies(&parsed) {
+        if let Some(addr) = loopback_addr(proxy) {
+            if is_live(format!("{}:{}", addr.0, addr.1)).await {
+                live.insert(proxy.to_owned());
+            }
+        }
+    }
+    funnel_preflight(&parsed, local_port, &|proxy| live.contains(proxy))
+}
+
+/// The `Proxy` targets of `/` on :443.
+fn root_proxies(parsed: &serde_json::Value) -> Vec<&str> {
+    let on_443 = |key: &str| key == "443" || key.ends_with(":443");
+    parsed
+        .get("Web")
+        .and_then(|w| w.as_object())
+        .into_iter()
+        .flatten()
+        .filter(|(vhost, _)| on_443(vhost))
+        .filter_map(|(_, cfg)| cfg.get("Handlers")?.get("/")?.get("Proxy")?.as_str())
+        .collect()
+}
+
+/// The host and port of a loopback proxy URL, with the scheme's default port.
+fn loopback_addr(proxy: &str) -> Option<(&str, u16)> {
+    if !proxy_is_loopback(proxy) {
+        return None;
+    }
+    let (scheme, rest) = proxy.split_once("://").unwrap_or(("http", proxy));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.ends_with(']') => (host, port.parse().ok()?),
+        _ => (
+            authority,
+            match scheme.to_ascii_lowercase().as_str() {
+                "https" => 443,
+                _ => 80,
+            },
+        ),
+    };
+    Some((host, port))
+}
+
+/// How long a loopback backend has to accept a connection before it counts as live anyway.
+const BACKEND_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether something accepts connections at `addr`.
+async fn backend_accepts(addr: String) -> bool {
+    let connect = tokio::net::TcpStream::connect(&addr);
+    counts_as_live(
+        tokio::time::timeout(BACKEND_PROBE_TIMEOUT, connect)
+            .await
+            .ok(),
+    )
+}
+
+/// A connect that timed out (`None`) counts as live, so a slow server isn't taken over.
+fn counts_as_live<T>(connect: Option<std::io::Result<T>>) -> bool {
+    !matches!(connect, Some(Err(_)))
+}
+
+/// How often a started daemon re-reads `tailscale funnel status` for a takeover of `/` on :443.
+const FUNNEL_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const FUNNEL_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether `/` on :443 routes to `port`, or None when the status can't be read.
+fn root_is_ours(status: Option<&std::process::Output>, port: u16) -> Option<bool> {
+    let parsed = status
+        .filter(|out| out.status.success())
+        .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())?;
+    let ours = format!("127.0.0.1:{port}");
+    Some(root_proxies(&parsed).into_iter().any(|proxy| {
+        let authority = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
+        authority.split(['/', '?', '#']).next() == Some(ours.as_str())
+    }))
+}
+
+/// Re-reads the Funnel until cancelled and publishes whether `/` on :443 is still this daemon's.
+/// An unreadable status keeps the last answer, so a slow `tailscale` doesn't flap it.
+async fn watch_funnel(
+    program: std::ffi::OsString,
+    port: u16,
+    every: std::time::Duration,
+    reach: tokio::sync::watch::Sender<bool>,
+    cancel: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            _ = cancel.cancelled() => return,
+        }
+        let status = Command::new(&program)
+            .args(["funnel", "status", "--json"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let status = tokio::time::timeout(FUNNEL_STATUS_TIMEOUT, status)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let Some(ours) = root_is_ours(status.as_ref(), port) else {
+            continue;
+        };
+        if reach.send_if_modified(|advertised| std::mem::replace(advertised, ours) != ours) {
+            if ours {
+                info!(target: "serve.tunnel", "Tailscale Funnel on port 443 routes to this daemon again; advertising its URL");
+            } else {
+                warn!(target: "serve.tunnel", "Tailscale Funnel on port 443 no longer routes to this daemon, so its URL is no longer advertised");
+            }
+        }
+    }
 }
 
 /// Read a `tailscale funnel status --json` document for a start on `local_port`.
-fn funnel_preflight(parsed: &serde_json::Value, local_port: u16) -> FunnelPreflight {
+/// `is_live` says whether a loopback proxy target accepts connections.
+fn funnel_preflight(
+    parsed: &serde_json::Value,
+    local_port: u16,
+    is_live: &dyn Fn(&str) -> bool,
+) -> FunnelPreflight {
     let on_443 = |key: &str| key == "443" || key.ends_with(":443");
     let keys = |field: &str| {
         parsed
@@ -981,15 +1147,18 @@ fn funnel_preflight(parsed: &serde_json::Value, local_port: u16) -> FunnelPrefli
         };
         for (path, handler) in handlers.iter() {
             if let Some(proxy) = handler.get("Proxy").and_then(|v| v.as_str()) {
-                // A loopback backend is this port from an earlier start, a prior aoe run on
-                // another port, or another local dev server; overwriting it is the expected
-                // behavior, not a conflict.
+                // `--bg` replaces only `/`. A loopback `/` is replaced when it's this daemon's
+                // port or nothing serves it; a live one may be another user's daemon.
                 if proxy_is_loopback(proxy) {
+                    let ours = loopback_addr(proxy).is_some_and(|(_, port)| port == local_port);
+                    if path == "/" && !ours && is_live(proxy) {
+                        return live_funnel_backend(proxy);
+                    }
                     debug!(
                         vhost = %vhost,
                         path = %path,
                         proxy = %proxy,
-                        "inspect_existing_funnel: stale loopback proxy, will be replaced"
+                        "inspect_existing_funnel: loopback proxy left or replaced"
                     );
                     continue;
                 }
@@ -1472,7 +1641,7 @@ mod tests {
             ),
         ];
         for (doc, want) in cases {
-            let got = funnel_preflight(&doc, 8081);
+            let got = funnel_preflight(&doc, 8081, &|_| false);
             match (&got, want) {
                 (FunnelPreflight::Unused, "unused")
                 | (FunnelPreflight::PublicLoopback, "public") => {}
@@ -1480,6 +1649,199 @@ mod tests {
                 _ => panic!("{doc}: {got:?}, want {want}"),
             }
         }
+    }
+
+    /// A start's loopback probe that finds nothing listening.
+    async fn nothing_live(_addr: String) -> bool {
+        false
+    }
+
+    #[test]
+    fn a_live_server_behind_root_is_refused_unless_it_is_this_daemon() {
+        let public = serde_json::json!({"node.ts.net:443": true});
+        let doc = |handlers: serde_json::Value| serde_json::json!({"Web": {"node.ts.net:443": {"Handlers": handlers}}, "AllowFunnel": public});
+        let root = |to: &str| doc(serde_json::json!({"/": {"Proxy": to}}));
+        let live = |proxy: &str| !proxy.contains(":7777");
+        // (status document, refused)
+        let cases = [
+            (root("http://127.0.0.1:9999"), true),
+            (root("http://localhost:9999/"), true),
+            (root("http://[::1]:9999"), true),
+            // This daemon's own port is live, and is its to replace.
+            (root("http://127.0.0.1:8081"), false),
+            // Nothing serves it: a dead earlier run.
+            (root("http://127.0.0.1:7777"), false),
+            // `--bg` leaves other paths alone, live or not.
+            (
+                doc(
+                    serde_json::json!({"/": {"Proxy": "http://127.0.0.1:8081"}, "/blog": {"Proxy": "http://127.0.0.1:3000"}}),
+                ),
+                false,
+            ),
+        ];
+        for (status, refused) in cases {
+            match funnel_preflight(&status, 8081, &live) {
+                FunnelPreflight::Refuse(why) => {
+                    assert!(refused, "{status}: {why}");
+                    assert!(why.contains("another running server"), "{why}");
+                    assert!(why.contains("tailscale funnel reset"), "{why}");
+                }
+                other => assert!(!refused, "{status}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_addr_reads_the_host_and_port_a_probe_dials() {
+        let cases = [
+            ("http://127.0.0.1:8081", Some(("127.0.0.1", 8081))),
+            ("http://localhost:3000/app?x=1", Some(("localhost", 3000))),
+            ("http://[::1]:3000", Some(("[::1]", 3000))),
+            ("http://localhost", Some(("localhost", 80))),
+            ("https://[::1]/", Some(("[::1]", 443))),
+            ("http://10.0.0.5:80", None),
+        ];
+        for (proxy, want) in cases {
+            assert_eq!(loopback_addr(proxy), want, "{proxy}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_is_live_while_it_accepts_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        assert!(backend_accepts(addr.to_string()).await);
+        // Port 0 can't be connected to, so the refusal path runs without racing for a free port.
+        assert!(!backend_accepts("127.0.0.1:0".to_owned()).await);
+        assert!(counts_as_live::<()>(None), "a probe that timed out");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_refuses_a_running_server_behind_root_and_never_runs_bg() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = listener.local_addr().unwrap().port();
+        let state = format!(
+            r#"{{"Web":{{"node.ts.net:443":{{"Handlers":{{"/":{{"Proxy":"http://127.0.0.1:{other}"}}}}}}}},"AllowFunnel":{{"node.ts.net:443":true}}}}"#
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let ok_url = r#"echo '{"Self":{"DNSName":"node.ts.net."}}'"#;
+        let fake = fake_tailscale(dir.path(), Some(&state), ok_url, "", "", "");
+        let lock = dir.path().join("funnel.lock");
+        let err =
+            TunnelHandle::spawn_tailscale_with(fake.as_os_str(), &lock, 8081, backend_accepts)
+                .await
+                .err()
+                .expect("a live server behind / is refused");
+        assert!(
+            err.to_string().contains(&format!("127.0.0.1:{other}")),
+            "{err}"
+        );
+        let calls = argv_log(dir.path());
+        assert!(
+            !calls.iter().any(|c| c.starts_with("funnel --bg")),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn root_is_ours_while_root_on_443_routes_to_this_port() {
+        let out = |code: i32, stdout: &str| {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            }
+        };
+        let ours = r#"{"Web":{"node.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"},"/blog":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
+        let taken =
+            r#"{"Web":{"node.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}"#;
+        let other_port =
+            r#"{"Web":{"node.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"}}}}}"#;
+        let cases = [
+            (Some(out(0, ours)), Some(true)),
+            (Some(out(0, taken)), Some(false)),
+            (Some(out(0, other_port)), Some(false)),
+            (Some(out(0, "{}")), Some(false)),
+            (Some(out(1, ours)), None),
+            (Some(out(0, "not json")), None),
+            (None, None),
+        ];
+        for (status, want) in cases {
+            assert_eq!(root_is_ours(status.as_ref(), 8081), want, "{status:?}");
+        }
+    }
+
+    /// A fake `tailscale` whose `funnel status --json` prints `state` and counts its calls.
+    #[cfg(unix)]
+    fn status_only_tailscale(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join("tailscale");
+        let script = format!(
+            "#!/bin/sh\necho x >> '{calls}'\ncat '{state}'\n",
+            calls = dir.join("calls").display(),
+            state = dir.join("state").display(),
+        );
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_watcher_follows_who_root_routes_to_and_keeps_its_answer_when_unreadable() {
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let fake = status_only_tailscale(dir.path());
+        let route = |port: u16| {
+            format!(
+                r#"{{"Web":{{"node.ts.net:443":{{"Handlers":{{"/":{{"Proxy":"http://127.0.0.1:{port}"}}}}}}}}}}"#
+            )
+        };
+        let set_state = |body: &str| std::fs::write(dir.path().join("state"), body).unwrap();
+        let calls = || {
+            std::fs::read_to_string(dir.path().join("calls"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        set_state("not json");
+        let (tx, mut rx) = tokio::sync::watch::channel(true);
+        let cancel = CancellationToken::new();
+        let watcher = tokio::spawn(watch_funnel(
+            fake.into_os_string(),
+            8081,
+            std::time::Duration::from_millis(10),
+            tx,
+            cancel.clone(),
+        ));
+
+        // Unreadable: two reads later the URL is still advertised.
+        tokio::time::timeout(DEADLINE, async {
+            while calls() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the watcher reads the status");
+        assert!(*rx.borrow_and_update());
+
+        set_state(&route(8080));
+        tokio::time::timeout(DEADLINE, rx.wait_for(|advertised| !advertised))
+            .await
+            .expect("a takeover is noticed")
+            .unwrap();
+        set_state(&route(8081));
+        tokio::time::timeout(DEADLINE, rx.wait_for(|advertised| *advertised))
+            .await
+            .expect("a returned route is advertised again")
+            .unwrap();
+
+        cancel.cancel();
+        tokio::time::timeout(DEADLINE, watcher)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -1728,7 +2090,9 @@ esac
             let dir = tempfile::tempdir().unwrap();
             let fake = fake_tailscale(dir.path(), r.state, r.url_read, r.off_body, r.bg_exit, "");
             let lock = dir.path().join("funnel.lock");
-            let result = TunnelHandle::spawn_tailscale_with(fake.as_os_str(), &lock, 8081).await;
+            let result =
+                TunnelHandle::spawn_tailscale_with(fake.as_os_str(), &lock, 8081, nothing_live)
+                    .await;
             let name = format!("{:?} / {} / {}", r.state, r.url_read, r.off_body);
             match (&result, r.err) {
                 (Ok(_), None) => {}
@@ -1804,7 +2168,8 @@ esac
             let program = fake.clone();
             let lock = dir.path().join("funnel.lock");
             let start = tokio::spawn(async move {
-                TunnelHandle::spawn_tailscale_with(program.as_os_str(), &lock, 8081).await
+                TunnelHandle::spawn_tailscale_with(program.as_os_str(), &lock, 8081, nothing_live)
+                    .await
             });
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1880,7 +2245,8 @@ esac
             let lock = dir.path().join("funnel.lock");
             // Start A switches Funnel on for 8081, then waits on its URL read.
             let start = tokio::spawn(async move {
-                TunnelHandle::spawn_tailscale_with(program.as_os_str(), &lock, 8081).await
+                TunnelHandle::spawn_tailscale_with(program.as_os_str(), &lock, 8081, nothing_live)
+                    .await
             });
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while argv_log(dir.path())
@@ -1943,7 +2309,8 @@ esac
         let start = |port: u16| {
             let (program, lock) = (fake.clone(), lock.clone());
             tokio::spawn(async move {
-                TunnelHandle::spawn_tailscale_with(program.as_os_str(), &lock, port).await
+                TunnelHandle::spawn_tailscale_with(program.as_os_str(), &lock, port, nothing_live)
+                    .await
             })
         };
         let wait = |what: &str, done: &dyn Fn() -> bool| {
