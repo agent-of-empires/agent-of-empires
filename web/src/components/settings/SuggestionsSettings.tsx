@@ -166,6 +166,8 @@ interface Props {
     schema: SettingsFieldDescriptor[];
     settings: Record<string, unknown> | null;
     onSaveField: (section: string, field: string, value: unknown) => Promise<boolean>;
+    /** Shown instead of the fields while the schema loads or after it fails. */
+    notice?: ReactNode;
   };
 }
 
@@ -334,18 +336,23 @@ export function SuggestionsSettings({
         </DndContext>
       </section>
 
-      {pluginSettings && (
-        <fieldset disabled={readOnly} className="m-0 min-w-0 space-y-6 border-0 p-0">
-          {providers.map((provider) => (
-            <PluginSuggestionSettings
-              key={provider.id}
-              pluginId={provider.id}
-              title={`${provider.name} source settings`}
-              {...pluginSettings}
-            />
-          ))}
-        </fieldset>
-      )}
+      {pluginSettings &&
+        (pluginSettings.notice ? (
+          <section aria-label="Source settings">{pluginSettings.notice}</section>
+        ) : (
+          <fieldset disabled={readOnly} className="m-0 min-w-0 space-y-6 border-0 p-0">
+            {providers.map((provider) => (
+              <PluginSuggestionSettings
+                key={provider.id}
+                pluginId={provider.id}
+                title={`${provider.name} source settings`}
+                schema={pluginSettings.schema}
+                settings={pluginSettings.settings}
+                onSaveField={pluginSettings.onSaveField}
+              />
+            ))}
+          </fieldset>
+        ))}
 
       <div className="divide-y divide-surface-700/40">
         <Row title="Refresh every" description="Providers can refresh less often if they need to.">
