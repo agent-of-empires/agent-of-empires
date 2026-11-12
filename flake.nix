@@ -70,8 +70,25 @@
             inherit nativeBuildInputs buildInputs;
           };
 
-          # Build only workspace dependencies first (for caching)
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # Registry dependencies call these path patches even while workspace crates are stubs.
+          # Keep the copy hook independent of application edits: this source contains only vendor.
+          # The flake's Git snapshot supplies only tracked fork files.
+          vendoredPatchSource = pkgs.lib.fileset.toSource {
+            root = ./vendor;
+            fileset = ./vendor;
+          };
+          dependencyDummySrc = craneLib.mkDummySrc {
+            src = commonArgs.src;
+            extraDummyScript = ''
+              rm -rf "$out/vendor"
+              cp -R "${vendoredPatchSource}" "$out/vendor"
+            '';
+          };
+
+          # Build only workspace dependencies first (for caching).
+          cargoArtifacts = craneLib.buildDepsOnly ((builtins.removeAttrs commonArgs [ "src" ]) // {
+            dummySrc = dependencyDummySrc;
+          });
 
           aoe = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -131,7 +148,9 @@
           };
 
           # Rust dep cache compiled with --features web (no npm involved).
-          cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
+          cargoArtifactsWithWeb = craneLib.buildDepsOnly ((builtins.removeAttrs commonArgsWithWeb [ "src" ]) // {
+            dummySrc = dependencyDummySrc;
+          });
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
             cargoArtifacts = cargoArtifactsWithWeb;

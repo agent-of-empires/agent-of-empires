@@ -130,6 +130,9 @@ Nix source filtering explicitly includes upstream extensionless notices; both Ni
 packages install notices under `$out/share/licenses/aoe`. Check both `nix build`
 and `nix build .#aoe-with-web`, then inspect their installed license directories
 and one generated release archive before approval.
+Crane dependency-only builds must restore real vendored patch sources and original
+manifests after generating workspace stubs: registry dependencies call their APIs.
+Keep that restore hook's input vendor-only so application edits retain the dependency cache.
 
 Supported source installation uses this repository's Git checkout and lockfile
 (`cargo install --path . --locked`, or the project's Git-based installer).
