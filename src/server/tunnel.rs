@@ -22,6 +22,8 @@ pub struct TunnelHandle {
 
 struct FunnelRoute {
     program: std::ffi::OsString,
+    /// The advertised `<machine>.<tailnet>.ts.net`, whose :443 vhost the watcher reads.
+    host: String,
     reach: tokio::sync::watch::Sender<bool>,
 }
 
@@ -376,6 +378,7 @@ impl TunnelHandle {
         };
         guard.disarm();
         info!(url = %url, "Tailscale Funnel established");
+        let host = url.trim_start_matches("https://").to_owned();
 
         Ok(TunnelHandle {
             child: None,
@@ -385,6 +388,7 @@ impl TunnelHandle {
             cancel: CancellationToken::new(),
             funnel: Some(FunnelRoute {
                 program: program.to_owned(),
+                host,
                 reach: tokio::sync::watch::Sender::new(true),
             }),
         })
@@ -424,6 +428,7 @@ impl TunnelHandle {
         if let Some(route) = &self.funnel {
             tokio::spawn(watch_funnel(
                 route.program.clone(),
+                route.host.clone(),
                 self.port,
                 FUNNEL_WATCH_INTERVAL,
                 route.reach.clone(),
@@ -1072,13 +1077,18 @@ fn counts_as_live<T>(connect: Option<std::io::Result<T>>) -> bool {
 const FUNNEL_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const FUNNEL_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Whether `/` on :443 routes to `port`, or None when the status can't be read.
-fn root_is_ours(status: Option<&std::process::Output>, port: u16) -> Option<bool> {
+/// Whether `/` on `host`'s :443 vhost routes to `port`, or None when the status can't be read.
+/// Only the advertised host counts: another vhost still routing here doesn't keep its URL working.
+fn root_is_ours(status: Option<&std::process::Output>, host: &str, port: u16) -> Option<bool> {
     let parsed = status
         .filter(|out| out.status.success())
         .and_then(|out| serde_json::from_slice::<serde_json::Value>(&out.stdout).ok())?;
     let ours = format!("127.0.0.1:{port}");
-    Some(root_proxies(&parsed).into_iter().any(|proxy| {
+    let proxy = parsed
+        .get("Web")
+        .and_then(|web| web.get(format!("{host}:443")))
+        .and_then(|cfg| cfg.get("Handlers")?.get("/")?.get("Proxy")?.as_str());
+    Some(proxy.is_some_and(|proxy| {
         let authority = proxy.split_once("://").map_or(proxy, |(_, rest)| rest);
         authority.split(['/', '?', '#']).next() == Some(ours.as_str())
     }))
@@ -1088,6 +1098,7 @@ fn root_is_ours(status: Option<&std::process::Output>, port: u16) -> Option<bool
 /// An unreadable status keeps the last answer, so a slow `tailscale` doesn't flap it.
 async fn watch_funnel(
     program: std::ffi::OsString,
+    host: String,
     port: u16,
     every: std::time::Duration,
     reach: tokio::sync::watch::Sender<bool>,
@@ -1107,7 +1118,7 @@ async fn watch_funnel(
             .await
             .ok()
             .and_then(Result::ok);
-        let Some(ours) = root_is_ours(status.as_ref(), port) else {
+        let Some(ours) = root_is_ours(status.as_ref(), &host, port) else {
             continue;
         };
         if reach.send_if_modified(|advertised| std::mem::replace(advertised, ours) != ours) {
@@ -1745,7 +1756,7 @@ mod tests {
     }
 
     #[test]
-    fn root_is_ours_while_root_on_443_routes_to_this_port() {
+    fn root_is_ours_only_while_the_advertised_hosts_root_routes_to_this_port() {
         let out = |code: i32, stdout: &str| {
             use std::os::unix::process::ExitStatusExt;
             std::process::Output {
@@ -1759,9 +1770,15 @@ mod tests {
             r#"{"Web":{"node.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}}}}"#;
         let other_port =
             r#"{"Web":{"node.ts.net:8443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"}}}}}"#;
+        // The advertised host was taken over; an older MagicDNS name still routes here.
+        let taken_elsewhere_ours = r#"{"Web":{"node.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8080"}}},"old.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"}}}}}"#;
+        let only_a_service_vhost =
+            r#"{"Web":{"svc:aoe:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:8081"}}}}}"#;
         let cases = [
             (Some(out(0, ours)), Some(true)),
             (Some(out(0, taken)), Some(false)),
+            (Some(out(0, taken_elsewhere_ours)), Some(false)),
+            (Some(out(0, only_a_service_vhost)), Some(false)),
             (Some(out(0, other_port)), Some(false)),
             (Some(out(0, "{}")), Some(false)),
             (Some(out(1, ours)), None),
@@ -1769,7 +1786,11 @@ mod tests {
             (None, None),
         ];
         for (status, want) in cases {
-            assert_eq!(root_is_ours(status.as_ref(), 8081), want, "{status:?}");
+            assert_eq!(
+                root_is_ours(status.as_ref(), "node.ts.net", 8081),
+                want,
+                "{status:?}"
+            );
         }
     }
 
@@ -1810,6 +1831,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let watcher = tokio::spawn(watch_funnel(
             fake.into_os_string(),
+            "node.ts.net".to_owned(),
             8081,
             std::time::Duration::from_millis(10),
             tx,
@@ -2095,7 +2117,12 @@ esac
                     .await;
             let name = format!("{:?} / {} / {}", r.state, r.url_read, r.off_body);
             match (&result, r.err) {
-                (Ok(_), None) => {}
+                // The watcher reads this host's vhost, so it must be the bare DNSName.
+                (Ok(handle), None) => assert_eq!(
+                    handle.funnel.as_ref().map(|route| route.host.as_str()),
+                    Some("node.ts.net"),
+                    "{name}"
+                ),
                 (Err(e), Some(phrase)) => assert!(e.to_string().contains(phrase), "{name}: {e}"),
                 (other, _) => panic!("{name}: {:?}", other.as_ref().map(|_| "started")),
             }
