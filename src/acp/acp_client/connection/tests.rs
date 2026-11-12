@@ -1733,7 +1733,7 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
         .await;
         let mut observed = Vec::new();
         collect_connection_events_until(&mut fake, &mut observed, |event| {
-            matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "s-pending-reset")
+            matches!(event, Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. } if acp_session_id == "s-pending-reset")
         }).await;
         let initial_end = observed.len();
         assert_eq!(
@@ -1912,7 +1912,7 @@ async fn parked_callback_refuses_clear_until_a_new_explicit_reset() {
             "{kind}: {observed:?}"
         );
         assert!(observed[initial_end..].iter().any(|event| {
-            matches!(event, Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "s-pending-reset-reset-1")
+            matches!(event, Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. } if acp_session_id == "s-pending-reset-reset-1")
         }));
         assert_eq!(
             observed[initial_end..]

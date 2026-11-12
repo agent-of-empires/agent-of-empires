@@ -874,7 +874,7 @@ mod tests {
                     assert!(matches!(events.as_slice(), [
                         Event::SessionCleared,
                         Event::SessionContextReset { .. },
-                        Event::AcpSessionAssigned { acp_session_id },
+                        Event::AcpSessionAssigned { acp_session_id, connection_ready: true, .. },
                         Event::Stopped { reason },
                     ] if acp_session_id == "s-fence-reset-reset-1" && reason == "session_reset"), "{events:?}");
                     let received = received.lock().await;
