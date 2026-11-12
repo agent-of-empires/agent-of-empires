@@ -10,6 +10,7 @@ use crate::acp::establishment::{
 use crate::acp::event_sender::{EventMetadata, EventScope, EventSender};
 use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
 use crate::acp::task_transcript::{spawn_task_tailer, ActiveTasks};
+use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v1::schema::{
     ContentBlock, SessionId, SessionNotification, SessionUpdate, ToolCallStatus,
 };
@@ -479,6 +480,8 @@ impl Shared {
         let IngressUpdate {
             mut notification,
             evidence,
+            original_source,
+            child_route,
             current_scope,
             metadata_scope,
             resource_start,
@@ -493,6 +496,50 @@ impl Shared {
         metadata.native_origin = evidence.physical_source.map(|source| source.witness);
         metadata.reported_session_id = Some(notification.session_id.clone());
         metadata.prompt_observation = evidence.prompt_observation;
+        let child_route = child_route.filter(|(_, route)| {
+            route.source == original_source
+                && route.source == evidence.physical_source.map(|physical| physical.witness)
+                && route.provenance.as_ref().is_some_and(|proof| {
+                    Some(proof.origin) == original_source
+                })
+        });
+        if let Some(route) = &child_route {
+            metadata.child_provenance = route.1.provenance.clone();
+            let sender = match current_scope.as_ref() {
+                Some(context) => {
+                    let mut metadata = metadata.clone();
+                    metadata.scope = EventScope::SessionCurrent;
+                    self.event_tx.with_scoped_metadata(metadata, Some(Arc::clone(context)))
+                }
+                None => self.event_tx.with_metadata(metadata.clone()),
+            };
+            match notification.update {
+                SessionUpdate::SubagentUpdate(update) => {
+                    return self.handle_subagent_update(
+                        &sender, route, notification.session_id, update,
+                    ).await;
+                }
+                SessionUpdate::SessionMessage(message) => {
+                    return self.handle_session_message(
+                        &sender, route, notification.session_id, message,
+                    ).await;
+                }
+                SessionUpdate::SessionMessageChunk(_) => return,
+                update if route.0 == notification.session_id => {
+                    return self.handle_child_notification(
+                        &sender, route, notification.session_id, update,
+                    ).await;
+                }
+                update => notification.update = update,
+            }
+        } else if matches!(
+            notification.update,
+            SessionUpdate::SubagentUpdate(_)
+                | SessionUpdate::SessionMessage(_)
+                | SessionUpdate::SessionMessageChunk(_)
+        ) {
+            return;
+        }
         let historical = self.event_tx.with_metadata(metadata.clone());
         if let Some(history) = &history {
             if !suppress_replay
@@ -831,22 +878,38 @@ impl Shared {
     ) {
         // Subagent traffic never feeds the root session's dedup, compaction
         // or watchdog state: a busy child would hold its parent's turn open.
-        let from_child = self.ingress.child_route(&notification.session_id).is_some();
+        let from_child = self.ingress.child_route(&notification.session_id)
+            .map(|route| (notification.session_id.clone(), route));
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
+                let Some(route) = self.ingress.child_route(&update.session_id)
+                    .map(|route| (update.session_id.clone(), route)) else {
+                    return;
+                };
                 return self
-                    .handle_subagent_update(notification.session_id, update)
+                    .handle_subagent_update(&self.event_tx, &route, notification.session_id, update)
                     .await;
             }
             SessionUpdate::SessionMessage(message) => {
+                let child = match (&message.sender_session_id, &message.recipient_session_id) {
+                    (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient))
+                        if sender == &notification.session_id => recipient,
+                    (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient))
+                        if recipient == &notification.session_id => sender,
+                    _ => return,
+                };
+                let Some(route) = self.ingress.child_route(child)
+                    .map(|route| (child.clone(), route)) else {
+                    return;
+                };
                 return self
-                    .handle_session_message(notification.session_id, message)
+                    .handle_session_message(&self.event_tx, &route, notification.session_id, message)
                     .await;
             }
             SessionUpdate::SessionMessageChunk(_) => return,
-            update if from_child => {
+            update if from_child.is_some() => {
                 return self
-                    .handle_child_notification(notification.session_id, update)
+                    .handle_child_notification(&self.event_tx, from_child.as_ref().expect("matched child route"), notification.session_id, update)
                     .await;
             }
             update => notification.update = update,

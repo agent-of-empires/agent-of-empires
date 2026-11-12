@@ -196,7 +196,6 @@ pub(crate) struct IdleDormancy {
 #[error("idle dormancy observation changed")]
 struct IdleDormancyDeclined;
 
-
 /// Result of `SessionService::edit_queued_prompt`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditQueuedOutcome {

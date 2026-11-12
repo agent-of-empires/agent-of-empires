@@ -896,11 +896,15 @@ mod tests {
         }
 
         assert_eq!(
-            config_option_category(&state, &with_id, "ultracode").await.unwrap(),
+            config_option_category(&state, &with_id, "ultracode")
+                .await
+                .unwrap(),
             Some(toggle)
         );
         assert_eq!(
-            config_option_category(&state, &without_id, "ultracode").await.unwrap(),
+            config_option_category(&state, &without_id, "ultracode")
+                .await
+                .unwrap(),
             None
         );
     }
@@ -951,7 +955,9 @@ mod tests {
             ("unknown", None),
         ] {
             assert_eq!(
-                config_option_category(&state, &id, config_id).await.unwrap(),
+                config_option_category(&state, &id, config_id)
+                    .await
+                    .unwrap(),
                 expected
             );
         }

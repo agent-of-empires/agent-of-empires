@@ -53,6 +53,10 @@ pub(super) struct IngressUpdate {
     pub(super) notification: SessionNotification,
     pub(super) evidence: crate::acp::control_protocol::NativeNotifyEvidence,
     #[serde(skip)]
+    pub(super) original_source: Option<crate::acp::state::NativeEventOrigin>,
+    #[serde(skip)]
+    pub(super) child_route: Option<(SessionId, ChildRoute)>,
+    #[serde(skip)]
     pub(super) current_scope: Option<Arc<NativeRequestContext>>,
     /// Post-result metadata retains its original Pending authority, not Applied session permission.
     #[serde(skip)]
@@ -177,6 +181,8 @@ impl SessionIngressNotification {
             IngressUpdate {
                 notification: serde_json::from_value(params).map_err(invalid)?,
                 evidence: metadata.map_or_else(Default::default, |metadata| metadata.evidence),
+                original_source: None,
+                child_route: None,
                 current_scope: None,
                 metadata_scope: None,
                 resource_start: None,
@@ -266,6 +272,7 @@ pub(super) struct ChildRoute {
     pub(super) parent: SessionId,
     pub(super) cancel_capable: bool,
     pub(super) source: Option<crate::acp::state::NativeEventOrigin>,
+    pub(super) provenance: Option<Arc<crate::acp::event_sender::NativeChildProvenance>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -304,16 +311,72 @@ fn register_child(
         }
         _ => {}
     }
+    let provenance = children
+        .get(child)
+        .filter(|route| route.source == source)
+        .and_then(|route| route.provenance.clone())
+        .or_else(|| {
+            let origin = source?;
+            let mut ancestry = if Some(parent) == root {
+                vec![parent.clone()]
+            } else {
+                children.get(parent)?.provenance.as_ref()?.ancestry.to_vec()
+            };
+            ancestry.push(child.clone());
+            Some(Arc::new(crate::acp::event_sender::NativeChildProvenance {
+                origin,
+                ancestry: ancestry.into(),
+            }))
+        });
+    if source.is_some() && provenance.is_none() {
+        return;
+    }
     let route = children.entry(child.clone()).or_insert_with(|| ChildRoute {
         parent: parent.clone(),
         cancel_capable: false,
         source,
+        provenance: None,
     });
     if route.source != source {
         route.cancel_capable = false;
         route.source = source;
     }
     route.cancel_capable = cancel_capable(update, route.cancel_capable);
+    route.provenance = provenance;
+}
+
+/// Freeze the specific direct association, not a future lookup by session string.
+fn freeze_child_route(
+    children: &HashMap<SessionId, ChildRoute>,
+    notification: &SessionNotification,
+    source: Option<crate::acp::state::NativeEventOrigin>,
+) -> Option<(SessionId, ChildRoute)> {
+    let addressed = &notification.session_id;
+    let child = match &notification.update {
+        SessionUpdate::SubagentUpdate(update) => {
+            let route = children.get(&update.session_id)?;
+            (route.parent == *addressed).then_some(&update.session_id)?
+        }
+        SessionUpdate::SessionMessage(message) => {
+            let (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient)) =
+                (&message.sender_session_id, &message.recipient_session_id)
+            else {
+                return None;
+            };
+            let child = if sender == addressed {
+                recipient
+            } else if recipient == addressed {
+                sender
+            } else {
+                return None;
+            };
+            (children.get(child)?.parent == *addressed).then_some(child)?
+        }
+        _ => addressed,
+    };
+    let route = children.get(child)?;
+    (route.source == source && (source.is_none() || route.provenance.is_some()))
+        .then(|| (child.clone(), route.clone()))
 }
 
 fn cancel_capable(update: &SubagentUpdate, current: bool) -> bool {
@@ -849,10 +912,12 @@ impl SessionIngress {
         // Wire order: an announcement admits the child frames after it.
         let mut updates = pending;
         let mut discarded = 0;
-        updates.retain(|entry| match entry {
+        updates.retain_mut(|entry| match entry {
             PendingIngress::Update(update) => {
+                let captured_source = update.original_source;
                 let source_admitted = match update.evidence.physical_source {
-                    Some(physical) => state.original.as_ref().is_some_and(|original| {
+                    Some(physical) => captured_source == Some(physical.witness)
+                        && state.original.as_ref().is_some_and(|original| {
                         crate::acp::state::NativeEventOrigin::owned_attempt(
                             &original.attempt,
                             Some(original.owner),
@@ -875,6 +940,13 @@ impl SessionIngress {
                         &update.notification,
                         update.evidence.physical_source.map(|source| source.witness),
                     );
+                    if update.child_route.is_none() {
+                        update.child_route = freeze_child_route(
+                            &children,
+                            &update.notification,
+                            update.evidence.physical_source.map(|source| source.witness),
+                        );
+                    }
                 }
                 if routed || update.evidence.physical_source.is_some() {
                     true
@@ -948,7 +1020,20 @@ impl SessionIngress {
         suppress_replay: bool,
     ) -> IngressUpdate {
         update.history = {
-            let state = self.state.lock().expect("ingress identity");
+            let mut state = self.state.lock().expect("ingress identity");
+            let source = update.evidence.physical_source.map(|physical| physical.witness);
+            update.original_source = state.original.as_ref().and_then(|original| {
+                crate::acp::state::NativeEventOrigin::owned_attempt(
+                    &original.attempt,
+                    Some(original.owner),
+                )
+                .filter(|original| Some(*original) == source)
+            });
+            if update.original_source.is_some() && state.pending.is_none() {
+                let IdentityState { current, children, .. } = &mut *state;
+                register_child(children, current.as_ref(), &update.notification, source);
+                update.child_route = freeze_child_route(children, &update.notification, source);
+            }
             state
                 .history
                 .as_ref()
@@ -1092,7 +1177,7 @@ impl SessionIngress {
 
     fn route(
         &self,
-        notification: IngressUpdate,
+        mut notification: IngressUpdate,
         wire_bytes: Option<usize>,
     ) -> agent_client_protocol::Result<Option<IngressUpdate>> {
         let unmanaged = self
@@ -1138,7 +1223,8 @@ impl SessionIngress {
             return Ok(None);
         }
         let source_admitted = match notification.evidence.physical_source {
-            Some(physical) => state.original.as_ref().is_some_and(|original| {
+            Some(physical) => notification.original_source == Some(physical.witness)
+                && state.original.as_ref().is_some_and(|original| {
                 crate::acp::state::NativeEventOrigin::owned_attempt(
                     &original.attempt,
                     Some(original.owner),
@@ -1171,6 +1257,13 @@ impl SessionIngress {
                     .physical_source
                     .map(|source| source.witness),
             );
+            if notification.child_route.is_none() {
+                notification.child_route = freeze_child_route(
+                    children,
+                    &notification.notification,
+                    notification.evidence.physical_source.map(|source| source.witness),
+                );
+            }
         }
         if routed || notification.evidence.physical_source.is_some() {
             Ok(Some(notification))

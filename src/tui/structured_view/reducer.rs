@@ -737,6 +737,7 @@ mod tests {
         let record = |id: &str, state, cancel_capable| SubagentRecord {
             session_id: id.into(),
             parent_session_id: "s-1".into(),
+            provenance: None,
             parent_tool_call_id: None,
             title: None,
             description: None,

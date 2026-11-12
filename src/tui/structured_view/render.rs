@@ -3243,6 +3243,7 @@ mod tests {
             t.subagents = vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
+                provenance: None,
                 parent_tool_call_id: Some("msg-1".into()),
                 title: Some("Explore repo".into()),
                 description: None,
@@ -3281,6 +3282,7 @@ mod tests {
             t.subagents = vec![SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
+                provenance: None,
                 parent_tool_call_id: Some("msg-1".into()),
                 title: Some("Explore repo".into()),
                 description: None,

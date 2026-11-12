@@ -7,6 +7,8 @@ use agent_client_protocol::v1::schema::{
 };
 
 use super::notifications::Shared;
+use crate::acp::acp_client::session_identity::ChildRoute;
+use crate::acp::event_sender::EventSender;
 use crate::acp::acp_client::config_options::map_acp_config_option;
 use crate::acp::acp_client::tool_context::{capture_tool_context_input, update_tool_context_cache};
 use crate::acp::acp_client::tool_output::preview_args;
@@ -63,33 +65,42 @@ impl Shared {
     /// Merge `edit` into the child's snapshot and publish the result.
     async fn publish_subagent(
         &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
         parent: &SessionId,
         child: &SessionId,
         edit: impl FnOnce(&mut SubagentRecord),
     ) {
-        let record = {
+        let fresh = || SubagentRecord {
+            session_id: child.0.to_string(),
+            parent_session_id: parent.0.to_string(),
+            provenance: route.1.provenance.clone(),
+            parent_tool_call_id: None,
+            title: None,
+            description: None,
+            state: SubagentState::default(),
+            stop_reason: None,
+            cancel_capable: route.1.cancel_capable,
+            model: None,
+        };
+        // A late frame retains its display history, never the replacement's live cache.
+        let current_route = self.ingress.child_route(child)
+            .is_some_and(|current| current == route.1);
+        let record = if current_route {
             let mut subagents = self.subagents.lock().expect("subagents mutex poisoned");
-            let record = subagents
-                .entry(child.0.to_string())
-                .or_insert_with(|| SubagentRecord {
-                    session_id: child.0.to_string(),
-                    parent_session_id: parent.0.to_string(),
-                    parent_tool_call_id: None,
-                    title: None,
-                    description: None,
-                    state: SubagentState::default(),
-                    stop_reason: None,
-                    cancel_capable: false,
-                    model: None,
-                });
-            record.cancel_capable = self
-                .ingress
-                .child_route(child)
-                .is_some_and(|route| route.cancel_capable);
+            let record = subagents.entry(child.0.to_string()).or_insert_with(fresh);
+            if record.provenance != route.1.provenance {
+                *record = fresh();
+            }
+            record.cancel_capable = route.1.cancel_capable;
             edit(record);
             record.clone()
+        } else {
+            let mut record = fresh();
+            edit(&mut record);
+            record
         };
-        self.emit(Event::SubagentUpdated {
+        let _ = sender.send(Event::SubagentUpdated {
             subagent: record,
             at: chrono::Utc::now(),
         })
@@ -97,18 +108,20 @@ impl Shared {
     }
 
     /// `parent` is the session the announcement arrived on.
-    pub(super) async fn handle_subagent_update(&self, parent: SessionId, update: SubagentUpdate) {
+    pub(super) async fn handle_subagent_update(
+        &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
+        parent: SessionId,
+        update: SubagentUpdate,
+    ) {
         let child = update.session_id.clone();
         // Ingress registers only announcements that name a valid child of the
         // session they arrived on; anything else is dropped here.
-        if self
-            .ingress
-            .child_route(&child)
-            .is_none_or(|route| route.parent != parent)
-        {
+        if route.0 != child || route.1.parent != parent {
             return;
         }
-        self.publish_subagent(&parent, &child, |record| {
+        self.publish_subagent(sender, route, &parent, &child, |record| {
             record.parent_session_id = parent.0.to_string();
             patch(&mut record.title, update.title);
             patch(&mut record.description, update.description);
@@ -121,17 +134,19 @@ impl Shared {
     /// Agent call, so the delegation prompt (parent to child) becomes the card
     /// that nests the child's tool calls, and the child's reply or hand-back
     /// report (child to parent) completes it. Other messages are dropped.
-    pub(super) async fn handle_session_message(&self, session: SessionId, message: SessionMessage) {
+    pub(super) async fn handle_session_message(
+        &self,
+        events: &EventSender,
+        route: &(SessionId, ChildRoute),
+        session: SessionId,
+        message: SessionMessage,
+    ) {
         let (MaybeUndefined::Value(sender), MaybeUndefined::Value(recipient)) =
             (&message.sender_session_id, &message.recipient_session_id)
         else {
             return;
         };
-        let child_of_session = |id: &SessionId| {
-            self.ingress
-                .child_route(id)
-                .is_some_and(|route| route.parent == session)
-        };
+        let child_of_session = |id: &SessionId| route.0 == *id && route.1.parent == session;
         let text: String = match &message.content {
             MaybeUndefined::Value(blocks) => blocks
                 .iter()
@@ -143,10 +158,10 @@ impl Shared {
             _ => String::new(),
         };
         if *sender == session && child_of_session(recipient) {
-            self.start_delegation_card(&session, recipient, message.message_id.0.to_string(), text)
+            self.start_delegation_card(events, route, &session, recipient, message.message_id.0.to_string(), text)
                 .await;
         } else if *recipient == session && child_of_session(sender) {
-            self.complete_delegation_card(sender, text).await;
+            self.complete_delegation_card(events, route, sender, text).await;
         }
     }
 
@@ -154,6 +169,8 @@ impl Shared {
     /// ones are follow-ups, not new launches.
     async fn start_delegation_card(
         &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
         parent: &SessionId,
         child: &SessionId,
         message_id: String,
@@ -161,7 +178,8 @@ impl Shared {
     ) {
         let (title, description, outer) = {
             let subagents = self.subagents.lock().expect("subagents mutex poisoned");
-            let Some(record) = subagents.get(child.0.as_ref()) else {
+            let Some(record) = subagents.get(child.0.as_ref())
+                .filter(|record| record.provenance == route.1.provenance) else {
                 return;
             };
             if record.parent_tool_call_id.is_some() {
@@ -172,12 +190,21 @@ impl Shared {
                 record.description.clone(),
                 subagents
                     .get(parent.0.as_ref())
+                    .filter(|record| match (&record.provenance, &route.1.provenance) {
+                        (Some(parent), Some(child)) => {
+                            parent.origin == child.origin
+                                && parent.ancestry.as_ref()
+                                    == &child.ancestry[..child.ancestry.len() - 1]
+                        }
+                        (None, None) => route.1.source.is_none(),
+                        _ => false,
+                    })
                     .and_then(|record| record.parent_tool_call_id.clone()),
             )
         };
         let name = title.clone().or(description.clone()).unwrap_or_default();
         let args = serde_json::json!({ "description": description.or(title), "prompt": prompt });
-        self.emit(Event::ToolCallStarted {
+        let _ = sender.send(Event::ToolCallStarted {
             tool_call: ToolCall {
                 id: message_id.clone(),
                 name,
@@ -191,23 +218,30 @@ impl Shared {
             },
         })
         .await;
-        self.publish_subagent(parent, child, |record| {
+        self.publish_subagent(sender, route, parent, child, |record| {
             record.parent_tool_call_id = Some(message_id);
         })
         .await;
     }
 
-    async fn complete_delegation_card(&self, child: &SessionId, reply: String) {
+    async fn complete_delegation_card(
+        &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
+        child: &SessionId,
+        reply: String,
+    ) {
         let Some(tool_call_id) = self
             .subagents
             .lock()
             .expect("subagents mutex poisoned")
             .get(child.0.as_ref())
+            .filter(|record| record.provenance == route.1.provenance)
             .and_then(|record| record.parent_tool_call_id.clone())
         else {
             return;
         };
-        self.emit(Event::ToolCallCompleted {
+        let _ = sender.send(Event::ToolCallCompleted {
             tool_call_id,
             is_error: false,
             output: vec![ToolOutputBlock::Text {
@@ -222,10 +256,16 @@ impl Shared {
 
     /// Only a child's tool calls and model reach the transcript; its own
     /// messages and lifecycle must never read as the root session's.
-    pub(super) async fn handle_child_notification(&self, child: SessionId, update: SessionUpdate) {
+    pub(super) async fn handle_child_notification(
+        &self,
+        sender: &EventSender,
+        route: &(SessionId, ChildRoute),
+        child: SessionId,
+        update: SessionUpdate,
+    ) {
         match update {
             SessionUpdate::SubagentUpdate(nested) => {
-                self.handle_subagent_update(child, nested).await
+                self.handle_subagent_update(sender, route, child, nested).await
             }
             tool @ (SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_)) => {
                 let link = self
@@ -233,6 +273,7 @@ impl Shared {
                     .lock()
                     .expect("subagents mutex poisoned")
                     .get(child.0.as_ref())
+                    .filter(|record| record.provenance == route.1.provenance)
                     .and_then(|record| record.parent_tool_call_id.clone());
                 let mut source = capture_tool_context_input(&tool);
                 for mut event in map_update_to_events(tool, self.profile) {
@@ -249,7 +290,7 @@ impl Shared {
                         _ => continue,
                     }
                     update_tool_context_cache(&self.tool_context_cache, &mut event, &mut source);
-                    if self.event_tx.send(event).await.is_err() {
+                    if sender.send(event).await.is_err() {
                         break;
                     }
                 }
@@ -267,12 +308,8 @@ impl Shared {
                             .find(|choice| choice.value == option.current_value)
                             .map_or(option.current_value.clone(), |choice| choice.name.clone())
                     });
-                let parent = self
-                    .ingress
-                    .child_route(&child)
-                    .map(|route| route.parent)
-                    .unwrap_or_else(|| child.clone());
-                self.publish_subagent(&parent, &child, |record| record.model = model)
+                let parent = &route.1.parent;
+                self.publish_subagent(sender, route, parent, &child, |record| record.model = model)
                     .await;
             }
             _ => {}

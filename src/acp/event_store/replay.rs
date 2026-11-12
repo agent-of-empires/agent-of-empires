@@ -115,12 +115,14 @@ impl EventStore {
                         i64::try_from(cursor).unwrap_or(i64::MAX),
                         i64::try_from(limit.saturating_add(1))?
                     ],
-                    |row| Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    )),
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
                 )?;
                 found.collect::<rusqlite::Result<Vec<_>>>()?
             };
@@ -385,7 +387,10 @@ mod tests {
             assert!(matches!(published.event.as_ref(), Event::ThinkingEnded));
             assert_eq!(seqs(&store.replay_from("unrelated", 0).unwrap()), [1]);
             assert_eq!(seqs(&page.events), [1]);
-            assert!(matches!(page.events[0].event.as_ref(), Event::UserPromptSent { .. }));
+            assert!(matches!(
+                page.events[0].event.as_ref(),
+                Event::UserPromptSent { .. }
+            ));
             assert_eq!(
                 (page.highest_seq, page.lowest_seq, page.last_scanned_seq),
                 (1, Some(1), Some(1))
@@ -477,7 +482,10 @@ mod tests {
             (max + 1, vec![max - 1, max]),
             (u64::MAX, vec![max - 1, max]),
         ] {
-            assert_eq!(seqs(&store.replay_before("boundary", cursor).unwrap()), expected);
+            assert_eq!(
+                seqs(&store.replay_before("boundary", cursor).unwrap()),
+                expected
+            );
             let (page, _) = store
                 .retained_page("boundary", 0, Some(cursor), 10, None)
                 .unwrap()

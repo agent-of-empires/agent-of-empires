@@ -1037,6 +1037,7 @@ mod tests {
             subagent: SubagentRecord {
                 session_id: "child".into(),
                 parent_session_id: "s-1".into(),
+                provenance: None,
                 parent_tool_call_id: Some("launch-1".into()),
                 title: None,
                 description: None,

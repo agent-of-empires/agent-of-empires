@@ -47,6 +47,41 @@ impl EventScope {
     }
 }
 
+/// Checked physical routing provenance; it never grants root Current authority.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NativeChildProvenance {
+    pub(crate) origin: NativeEventOrigin,
+    /// The observed root through the parent to the unchanged child target.
+    pub(crate) ancestry: Arc<[agent_client_protocol::v1::schema::SessionId]>,
+}
+
+impl NativeChildProvenance {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.origin.owner.is_some_and(|owner| owner.birth_fingerprint.is_some())
+                && (2..=257).contains(&self.ancestry.len())
+                && self.ancestry.iter().enumerate().all(|(index, id)| {
+                    !self.ancestry[..index].contains(id)
+                }),
+            "invalid persisted Native child ancestry"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn root(&self) -> &agent_client_protocol::v1::schema::SessionId {
+        &self.ancestry[0]
+    }
+
+    pub(crate) fn parent(&self) -> &agent_client_protocol::v1::schema::SessionId {
+        &self.ancestry[self.ancestry.len() - 2]
+    }
+
+    pub(crate) fn child(&self) -> &agent_client_protocol::v1::schema::SessionId {
+        &self.ancestry[self.ancestry.len() - 1]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EventMetadata {
@@ -71,6 +106,8 @@ pub(crate) struct EventMetadata {
     pub(crate) resource_ref: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resource_witness: Option<Arc<crate::acp::establishment::NativeResourceWitness>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) child_provenance: Option<Arc<NativeChildProvenance>>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) availability_denial: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -90,6 +127,7 @@ impl EventMetadata {
             clear_after_seq: None,
             resource_ref: None,
             resource_witness: None,
+            child_provenance: None,
             availability_denial: false,
             host_action: false,
         }
@@ -128,11 +166,31 @@ impl EventMetadata {
             && self.clear_after_seq.is_none()
             && self.resource_ref.is_none()
             && self.resource_witness.is_none()
+            && self.child_provenance.is_none()
             && !self.availability_denial
             && !self.host_action
     }
 
     pub(crate) fn validate_for_event(&self, event: &Event) -> anyhow::Result<()> {
+        if let Some(child) = self.child_provenance.as_deref() {
+            child.validate()?;
+            anyhow::ensure!(
+                self.native_origin == Some(child.origin)
+                    && self.reported_session_id.as_ref().is_some_and(|reported| {
+                        reported == child.parent() || reported == child.child()
+                    })
+                    && (self.scope == EventScope::HistoryOnly
+                        || self.reported_session_id.as_ref() == Some(child.root())),
+                "Native child provenance differs from its original frame"
+            );
+            if let Event::SubagentUpdated { subagent, .. } = event {
+                anyhow::ensure!(
+                    subagent.session_id == child.child().0.as_ref()
+                        && subagent.parent_session_id == child.parent().0.as_ref(),
+                    "Native child snapshot differs from its routing provenance"
+                );
+            }
+        }
         let resource_matches =
             self.resource_witness
                 .as_deref()
@@ -367,6 +425,18 @@ impl EventMetadata {
                 metadata.resource_ref == Some(witness.allocation)
                     && metadata.native_origin == Some(witness.origin),
                 "ACP resource witness differs from its event source"
+            );
+        }
+        if let Some(child) = metadata.child_provenance.as_deref() {
+            child.validate()?;
+            anyhow::ensure!(
+                metadata.native_origin == Some(child.origin)
+                    && metadata.reported_session_id.as_ref().is_some_and(|reported| {
+                        reported == child.parent() || reported == child.child()
+                    })
+                    && (scope == EventScope::HistoryOnly
+                        || metadata.reported_session_id.as_ref() == Some(child.root())),
+                "Native child provenance differs from its original frame"
             );
         }
         Ok(metadata)
@@ -1520,6 +1590,7 @@ impl EventSender {
             clear_after_seq: None,
             resource_ref: None,
             resource_witness: None,
+            child_provenance: None,
             availability_denial: false,
             host_action: false,
         };

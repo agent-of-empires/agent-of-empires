@@ -1104,6 +1104,8 @@ pub enum SubagentState {
 pub struct SubagentRecord {
     pub session_id: String,
     pub parent_session_id: String,
+    #[serde(skip)]
+    pub(crate) provenance: Option<Arc<crate::acp::event_sender::NativeChildProvenance>>,
     /// The card for the delegation message that launched it (its message id).
     /// Unset renders the child in a flat roster.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1152,6 +1154,8 @@ pub struct BackgroundAgentRecord {
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_ref: Option<uuid::Uuid>,
+    #[serde(skip)]
+    pub(crate) resource_witness: Option<Arc<crate::acp::establishment::NativeResourceWitness>>,
     /// The parent `Task` tool call that launched this agent.
     pub tool_call_id: String,
     pub description: String,
@@ -1809,6 +1813,14 @@ impl AcpState {
         metadata: &crate::acp::event_sender::EventMetadata,
     ) -> Result<u64, StateError> {
         use crate::acp::operation_effect::ControlKind;
+        if let Event::SubagentUpdated { subagent, at } = event {
+            let mut record = subagent.clone();
+            record.provenance = metadata.child_provenance.clone();
+            self.apply_subagent(record, *at);
+            self.last_seq = seq;
+            self.updated_at = Utc::now();
+            return Ok(seq);
+        }
         let previous = self.operation_effects.active();
         let kind = ControlKind::from_event(event);
         let effect = self.operation_effects.apply(kind, metadata);
@@ -1863,8 +1875,14 @@ impl AcpState {
                             metadata.native_origin,
                             metadata.clear_after_seq,
                         )?;
-                        if let Some(agent) = self.background_agent(agent_id) {
+                        if let Some(agent) = self.background_agents.iter_mut()
+                            .find(|agent| agent.agent_id == *agent_id) {
                             agent.resource_ref = metadata.resource_ref;
+                            agent.resource_witness = metadata.resource_witness.clone();
+                            if let Some(child) = self.subagents.iter()
+                                .find(|child| agent.accepts_child(child)) {
+                                agent.reconcile(child, agent.started_at);
+                            }
                         }
                         if metadata.resource_ref.is_some() {
                             self.sidebar_observation_seq = seq;
@@ -2298,9 +2316,10 @@ impl AcpState {
                 workflow,
                 started_at,
             } => {
-                let mut record = BackgroundAgentRecord {
+                let record = BackgroundAgentRecord {
                     agent_id: agent_id.clone(),
                     resource_ref: None,
+                    resource_witness: None,
                     tool_call_id: tool_call_id.clone(),
                     description: description.clone(),
                     prompt: prompt.clone(),
@@ -2316,12 +2335,6 @@ impl AcpState {
                     result: None,
                     warning: None,
                 };
-                // A child's snapshot may predate the launch event.
-                if let Some(child) = self.subagents.iter().find(|s| {
-                    s.parent_tool_call_id.as_deref() == Some(record.tool_call_id.as_str())
-                }) {
-                    record.reconcile(child, *started_at);
-                }
                 self.launch_background_agent(record);
             }
             Event::BackgroundAgentProgress {
@@ -2602,7 +2615,7 @@ impl AcpState {
             if let Some(agent) = self
                 .background_agents
                 .iter_mut()
-                .find(|a| a.tool_call_id == tool_call_id)
+                .find(|a| a.tool_call_id == tool_call_id && a.accepts_child(&subagent))
             {
                 agent.reconcile(&subagent, at);
             }
@@ -2625,6 +2638,22 @@ impl AcpState {
 }
 
 impl BackgroundAgentRecord {
+    fn accepts_child(&self, child: &SubagentRecord) -> bool {
+        let (Some(resource), Some(provenance)) = (
+            self.resource_witness.as_deref(),
+            child.provenance.as_deref(),
+        ) else {
+            return false;
+        };
+        self.resource_ref == Some(resource.allocation)
+            && resource.origin == provenance.origin
+            && &resource.native_session_id == provenance.root()
+            && &resource.native_session_id == provenance.parent()
+            && child.session_id == provenance.child().0.as_ref()
+            && child.parent_session_id == provenance.parent().0.as_ref()
+            && child.parent_tool_call_id.as_deref() == Some(self.tool_call_id.as_str())
+    }
+
     /// Folds a child's RFD snapshot in; `at` stamps a newly ended agent.
     fn reconcile(&mut self, child: &SubagentRecord, at: DateTime<Utc>) {
         let (status, ended) = match child.state {
@@ -4155,11 +4184,113 @@ mod tests {
         }
     }
 
-    fn subagent(state: SubagentState, stop_reason: Option<&str>) -> Event {
+    async fn native_subagent_fixture(
+        scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+    ) -> (
+        crate::server::test_support::ManagedControlSession,
+        Event,
+        crate::acp::event_sender::EventMetadata,
+        crate::acp::event_sender::EventMetadata,
+    ) {
+        use crate::acp::establishment::{
+            NativeRequestContext, NativeResourceAuthority, NativeResourceLocation,
+            NativeResourceSelector, NativeResourceStartContext, NativeSessionPermission,
+        };
+        use crate::acp::event_sender::EventMetadata;
+        let mut session = crate::server::test_support::managed_control_session(
+            scope, "child-resource-provenance",
+        ).await;
+        for update in [
+            serde_json::json!({
+                "sessionUpdate": "subagent_update", "sessionId": "child",
+                "title": "map backend", "state": {"state": "running"},
+                "capabilities": {"cancel": {}}
+            }),
+            serde_json::json!({
+                "sessionUpdate": "session_message", "messageId": "tc1",
+                "senderSessionId": session.sid, "recipientSessionId": "child",
+                "recipientMessageId": "tc1",
+                "content": [{"type": "text", "text": "map backend"}]
+            }),
+        ] {
+            session.native.send(serde_json::json!({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": session.sid, "update": update}
+            })).await;
+        }
+        session.native.send(serde_json::json!({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "child", "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{
+                    "id": "model", "name": "Model", "category": "model", "type": "select",
+                    "currentValue": "child-model",
+                    "options": [{"value": "child-model", "name": "Child model"}]
+                }]
+            }}
+        })).await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = session.client.next_event().await.expect("Native remains connected");
+                if matches!(event, Event::SubagentUpdated { subagent, .. }
+                    if subagent.parent_tool_call_id.as_deref() == Some("tc1")
+                        && subagent.model.as_deref() == Some("Child model")) {
+                    break;
+                }
+            }
+        }).await.expect("the real Native delegation publishes its linked child");
+        let child_metadata = session.state.acp_event_store
+            .replay_from(session.id(), 0).unwrap().into_iter().rev()
+            .find(|stored| matches!(stored.event.as_ref(), Event::SubagentUpdated { subagent, .. }
+                if subagent.parent_tool_call_id.as_deref() == Some("tc1")
+                    && subagent.model.as_deref() == Some("Child model")))
+            .expect("the actual child publication is durable").metadata;
+        let actual = session.client.actual();
+        let receipt = actual.establishment_projection().unwrap().receipt_snapshot().unwrap();
+        let storage = crate::session::Storage::open_unwatched(&receipt.attempt.profile).unwrap();
+        let row = storage.load_instances_complete().unwrap().into_iter()
+            .find(|row| row.id == session.id()).unwrap();
+        let postimage = Arc::new(receipt.postimage(receipt.attempt.context).unwrap());
+        let stamp = NativeSessionPermission::capture_stamp(
+            &receipt, &postimage, &row, &storage,
+        ).unwrap();
+        let context = Arc::new(NativeRequestContext::session_observation(
+            receipt, postimage, stamp,
+        ).unwrap());
+        let file = scope.tempdir().path().join("child-resource.output");
+        std::fs::write(&file, "owned child resource fixture").unwrap();
+        let authority = NativeResourceAuthority::start(
+            Arc::new(NativeResourceStartContext::from_frame(
+                context, session.sid.clone().into(),
+            ).unwrap()),
+            NativeResourceSelector::Agent {
+                agent_id: "a1".into(), tool_call_id: "tc1".into(),
+                output_file: file.to_string_lossy().into_owned(),
+                source: NativeResourceLocation::Host,
+            },
+        ).unwrap().for_tracking_allocation(uuid::Uuid::new_v4()).unwrap();
+        authority.with_read(|| Ok(std::fs::read(&file)?)).unwrap();
+        let witness = authority.witness().expect("the real read established original custody");
+        let resource_metadata = EventMetadata {
+            native_origin: Some(witness.origin),
+            resource_ref: Some(witness.allocation),
+            resource_witness: Some(witness),
+            ..EventMetadata::history()
+        };
+        let mut launch = launched();
+        if let Event::BackgroundAgentLaunched { output_file, .. } = &mut launch {
+            *output_file = file.to_string_lossy().into_owned();
+        }
+        resource_metadata.validate_for_event(&launch).unwrap();
+        (session, launch, resource_metadata, child_metadata)
+    }
+
+    fn subagent(state: SubagentState, stop_reason: Option<&str>, parent: &str) -> Event {
         Event::SubagentUpdated {
             subagent: SubagentRecord {
                 session_id: "child".into(),
-                parent_session_id: "root".into(),
+                parent_session_id: parent.into(),
+                provenance: None,
                 parent_tool_call_id: Some("tc1".into()),
                 title: Some("map backend".into()),
                 description: None,
@@ -4172,8 +4303,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn launch_reconciles_a_child_snapshot_that_arrived_first() {
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn launch_reconciles_a_child_snapshot_that_arrived_first() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+        let (session, launch, resource, child) = native_subagent_fixture(scope).await;
         let cases = [
             (
                 SubagentState::Idle,
@@ -4195,18 +4329,25 @@ mod tests {
             ),
         ];
         for (state, stop, expected, ended) in cases {
-            let s = applied([subagent(state, stop), launched()]);
+            let mut s = session.state.session_service.fold_control_state(session.id()).await.unwrap();
+            s.apply_scoped_event(s.last_seq + 1, &subagent(state, stop, &session.sid), &child).unwrap();
+            s.apply_scoped_event(s.last_seq + 1, &launch, &resource).unwrap();
             let agent = &s.background_agents[0];
             assert_eq!(agent.status, expected);
             assert_eq!(agent.ended_at.is_some(), ended);
         }
+        })).await;
     }
 
     /// The RFD snapshot replaces the tailer's heuristics, and an idle child that
     /// is messaged again runs again, which no tailer status could express.
-    #[test]
-    fn subagent_state_drives_the_async_agent_it_belongs_to() {
-        let mut s = applied([launched()]);
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn subagent_state_drives_the_async_agent_it_belongs_to() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+        let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+        let mut s = session.state.session_service.fold_control_state(session.id()).await.unwrap();
+        s.apply_scoped_event(s.last_seq + 1, &launch, &resource).unwrap();
         let steps = [
             (
                 SubagentState::Running,
@@ -4246,13 +4387,58 @@ mod tests {
             ),
         ];
         for (state, reason, status, active) in steps {
-            s.apply_event(s.last_seq + 1, subagent(state, reason))
+            s.apply_scoped_event(s.last_seq + 1, &subagent(state, reason, &session.sid), &child)
                 .unwrap();
             assert_eq!(s.background_agents[0].status, status, "{state:?}");
             assert_eq!(s.has_active_background_agent(), active, "{state:?}");
         }
         assert_eq!(s.subagents.len(), 1, "snapshots upsert by session id");
         assert_eq!(s.subagents[0].stop_reason.as_deref(), Some("error"));
+        })).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncertain_same_id_child_history_cannot_mutate_a_current_resource() {
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| Box::pin(async move {
+            let (session, launch, resource, child) = native_subagent_fixture(scope).await;
+            for case in ["absent", "other-source", "other-parent"] {
+                let mut s = session.state.session_service.fold_control_state(session.id()).await.unwrap();
+                s.apply_scoped_event(s.last_seq + 1, &launch, &resource).unwrap();
+                let before = (
+                    s.turn_active, s.native_control_seq, s.connection_ready,
+                    s.connection_unavailable, s.sidebar_status(), s.operation_effects.active(),
+                );
+                let mut uncertain = child.clone();
+                match case {
+                    "absent" => uncertain.child_provenance = None,
+                    "other-source" => {
+                        let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
+                        proof.origin.producer = uuid::Uuid::new_v4();
+                        uncertain.native_origin = Some(proof.origin);
+                        uncertain.child_provenance = Some(Arc::new(proof));
+                    }
+                    "other-parent" => {
+                        let mut proof = uncertain.child_provenance.as_deref().unwrap().clone();
+                        proof.ancestry = vec!["other-parent".into(), "child".into()].into();
+                        uncertain.reported_session_id = Some("other-parent".into());
+                        uncertain.child_provenance = Some(Arc::new(proof));
+                    }
+                    _ => unreachable!(),
+                }
+                let parent = if case == "other-parent" { "other-parent" } else { &session.sid };
+                let event = subagent(SubagentState::Idle, Some("error"), parent);
+                uncertain.validate_for_event(&event).unwrap();
+                s.apply_scoped_event(s.last_seq + 1, &event, &uncertain).unwrap();
+                assert_eq!(s.subagents[0].state, SubagentState::Idle, "{case}");
+                assert_eq!(s.background_agents[0].status, BackgroundAgentStatus::Running, "{case}");
+                assert!(s.background_agents[0].ended_at.is_none(), "{case}");
+                assert_eq!((
+                    s.turn_active, s.native_control_seq, s.connection_ready,
+                    s.connection_unavailable, s.sidebar_status(), s.operation_effects.active(),
+                ), before, "{case}");
+            }
+        })).await;
     }
 
     fn bg_progress(status: BackgroundAgentStatus, tool_count: u32) -> Event {
@@ -4639,7 +4825,7 @@ mod tests {
         .unwrap();
         s.apply_event(
             s.last_seq.saturating_add(1),
-            subagent(SubagentState::Running, None),
+            subagent(SubagentState::Running, None, "root"),
         )
         .unwrap();
         assert_eq!(s.subagents.len(), 1);
