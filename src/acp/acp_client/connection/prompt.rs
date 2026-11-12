@@ -561,7 +561,7 @@ impl Session {
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
         let label = self.shared.session_label.clone();
-        let subagents_active = self.shared.has_active_subagent();
+        let subagents_active = self.shared.subagent_working(now_ms());
         let fire = turn
             .watchdog
             .should_fire(Instant::now(), turn.cfg, subagents_active)
@@ -703,7 +703,7 @@ impl Session {
         if let Some(info) = f.rate_limit.take() {
             preceding.push(Event::RateLimit { info });
         }
-        let child_activity = shared.subagent_activity.load(Ordering::Relaxed);
+        let terminal_at = now_ms();
         // A completion the runner reports after this is dropped.
         shared.terminal_claim.claim();
         shared.publish_terminal(reason.into(), preceding).await;
@@ -717,8 +717,8 @@ impl Session {
         *shared.cancel_deadline.lock().unwrap() = None;
         // Child traffic that raced the terminal, or a child still running,
         // continues as an agent-initiated turn.
-        if shared.subagent_activity.load(Ordering::Relaxed) != child_activity
-            || shared.has_active_subagent()
+        if shared.subagent_activity_at.load(Ordering::Relaxed) >= terminal_at
+            || shared.subagent_working(now_ms())
         {
             shared.arm_for_subagent_activity();
         }

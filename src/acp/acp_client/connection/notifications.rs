@@ -90,9 +90,8 @@ pub(super) struct Shared {
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
-    /// Bumped on validated child traffic, so a turn's end can tell whether
-    /// any arrived while it was publishing `Stopped`.
-    pub(super) subagent_activity: AtomicU64,
+    /// Epoch-ms of the last validated child traffic.
+    pub(super) subagent_activity_at: AtomicI64,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
@@ -147,7 +146,7 @@ impl Shared {
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
-            subagent_activity: AtomicU64::new(0),
+            subagent_activity_at: AtomicI64::new(0),
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
@@ -161,7 +160,7 @@ impl Shared {
         if !accepted {
             return;
         }
-        self.subagent_activity.fetch_add(1, Ordering::Relaxed);
+        self.subagent_activity_at.store(now_ms(), Ordering::Relaxed);
         if self.prompt_in_flight.load(Ordering::Relaxed) {
             forward_lifecycle_signals(
                 local_prompt_signals && epoch != 0,

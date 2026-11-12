@@ -335,7 +335,7 @@ impl Session {
         let Some(cost_seen) = shared.between_prompt.take_idle_fire(
             now_ms(),
             shared.aoe.leases.working(now_ms()),
-            shared.has_active_subagent(),
+            shared.subagent_working(now_ms()),
         ) else {
             return false;
         };

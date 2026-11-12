@@ -162,7 +162,9 @@ impl BetweenPromptTracker {
                 terminal_claim.begin_turn();
                 armed = true;
             }
-            state.cost_seen = u.cost_seen;
+            // Child traffic proves liveness, not that accounting is stale.
+            let keeps_cost = matches!(lifecycle, Some(LifecycleSignal::SubagentActivity));
+            state.cost_seen = u.cost_seen || (keeps_cost && state.cost_seen);
             state.last_lifecycle_at = u.last_lifecycle_at;
             state.wake_at = u.wake_at;
         }
@@ -513,6 +515,15 @@ mod tests {
         let tracker = BetweenPromptTracker::default();
         let claim = TerminalClaim::new();
         let activity = LifecycleSignal::SubagentActivity;
+        let usage = LifecycleSignal::TerminalUsage;
+        assert!(tracker.observe(Some(&usage), None, 500, false, &claim));
+        assert!(!tracker.observe(Some(&activity), None, 1_000, false, &claim));
+        // The child's frame keeps the accounting: fast grace once it is done.
+        assert_eq!(
+            tracker.take_idle_fire(1_000 + ms(FAST), false, false),
+            Some(true)
+        );
+
         assert!(tracker.observe(Some(&activity), None, 1_000, false, &claim));
         assert_eq!(tracker.take_idle_fire(1_000 + ms(STALL), false, true), None);
         assert_eq!(

@@ -11,9 +11,11 @@ use crate::acp::acp_client::config_options::map_acp_config_option;
 use crate::acp::acp_client::tool_context::update_tool_context_cache;
 use crate::acp::acp_client::tool_output::preview_args;
 use crate::acp::acp_client::update_events::map_update_to_events;
+use crate::acp::acp_client::watchdog::OFF_PROTOCOL_WORK_GRACE_FLOOR;
 use crate::acp::state::{
     ConfigOptionCategory, Event, SubagentRecord, SubagentState, ToolCall, ToolOutputBlock,
 };
+use std::sync::atomic::Ordering;
 
 fn patch<T>(slot: &mut Option<T>, incoming: MaybeUndefined<T>) {
     match incoming {
@@ -46,6 +48,14 @@ fn apply_state(record: &mut SubagentRecord, state: MaybeUndefined<StateUpdate>) 
 }
 
 impl Shared {
+    /// A child still holds its parent's turn open. One silent past the
+    /// off-protocol floor lost its idle update, so it stops counting.
+    pub(super) fn subagent_working(&self, now_ms: i64) -> bool {
+        let floor = OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
+        now_ms - self.subagent_activity_at.load(Ordering::Relaxed) < floor
+            && self.has_active_subagent()
+    }
+
     /// A running child would lose its routes if the conversation reset.
     pub(super) fn has_active_subagent(&self) -> bool {
         self.subagents
@@ -301,10 +311,9 @@ mod tests {
     use crate::acp::acp_client::lifecycle::LifecycleSignal;
     use crate::acp::acp_client::SessionState;
     use crate::acp::acp_client::session_identity::SessionIngress;
-    use crate::acp::acp_client::watchdog::OFF_PROTOCOL_WORK_GRACE_FLOOR;
     use crate::acp::agent_profiles::CLAUDE;
     use agent_client_protocol::v1::schema::SessionNotification;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -678,7 +687,7 @@ mod tests {
                     assert!(matches!(env.signal, LifecycleSignal::SubagentActivity));
                 }
             } else {
-                let active = shared.has_active_subagent();
+                let active = shared.subagent_working(fed);
                 assert!(active);
                 let between = &shared.between_prompt;
                 assert_eq!(between.take_idle_fire(fed + 120_000, false, active), None);
