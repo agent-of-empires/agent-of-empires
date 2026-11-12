@@ -264,11 +264,10 @@ describe("SuggestionsView", () => {
     }
   });
 
-  it("Start without review shows a notice and never reopens the wizard when the outcome is unknown or the create fails", async () => {
+  it("Start without review shows a notice and never reopens the wizard when the outcome is unknown", async () => {
     for (const created of [
       { ok: false, error: "No answer from the server (502)", network: true },
       { ok: false, error: "Unknown outcome", outcomeUnknown: true },
-      { ok: false, error: "Sandbox unavailable" },
     ]) {
       cleanup();
       vi.clearAllMocks();
@@ -276,10 +275,19 @@ describe("SuggestionsView", () => {
       expect((await screen.findByRole("alert")).textContent).toBe(created.error);
       expect(onPrepare).not.toHaveBeenCalled();
       expect(onStarted).not.toHaveBeenCalled();
-      const unresolved = "network" in created || "outcomeUnknown" in created;
-      expect(pending.release).toHaveBeenCalledTimes(unresolved ? 1 : 0);
-      expect(pending.resolve).toHaveBeenCalledTimes(unresolved ? 0 : 1);
+      expect(pending.release).toHaveBeenCalledTimes(1);
+      expect(pending.resolve).not.toHaveBeenCalled();
     }
+  });
+
+  it("Start without review opens the prefilled wizard, with the reason shown, after a definitive refusal", async () => {
+    const { onPrepare, onStarted } = await startWithoutReview({}, { ok: false, error: "Sandbox unavailable" });
+    await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
+    expect(onPrepare).toHaveBeenCalledWith(expect.objectContaining({ initialPrompt: "Template prompt." }));
+    expect((await screen.findByRole("alert")).textContent).toBe("Sandbox unavailable");
+    expect(onStarted).not.toHaveBeenCalled();
+    expect(pending.resolve).toHaveBeenCalledWith("key-1");
+    expect(pending.release).not.toHaveBeenCalled();
   });
 
   it("Start without review refuses when another create registers while the boot id is being fetched", async () => {
