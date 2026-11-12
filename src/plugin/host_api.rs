@@ -124,6 +124,27 @@ impl HostApiState {
         f(&conn, &profile)
     }
 
+    /// `with_suggestions_db` for a worker's write: refused, under the same lock
+    /// `forget_publication` takes, once the worker's generation is retired, so
+    /// an RPC admitted before a restart or uninstall cannot recreate or replace
+    /// what the host cleared or the new worker published.
+    fn with_suggestions_db_as<T>(
+        &self,
+        ctx: &PluginRpcContext,
+        f: impl FnOnce(&Connection, &str) -> Result<T, DispatchError>,
+    ) -> Result<T, DispatchError> {
+        self.with_suggestions_db(|conn, profile| {
+            if !self.ui.is_current(&ctx.plugin_id, ctx.ui_generation) {
+                return Err(DispatchError {
+                    code: codes::FAILED_PRECONDITION,
+                    message: "plugin worker was replaced or stopped".into(),
+                    data: None,
+                });
+            }
+            f(conn, profile)
+        })
+    }
+
     pub fn bump_settings_revision(&self) -> u64 {
         self.settings_revision
             .fetch_add(1, std::sync::atomic::Ordering::Release)
@@ -242,31 +263,33 @@ pub fn dispatch(
         "suggestions.set" => {
             ctx.require(CAP_WORKER)?;
             let spec = suggestions_spec(ctx)?;
-            state.with_suggestions_db(|conn, profile| {
+            state.with_suggestions_db_as(ctx, |conn, profile| {
                 suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
             })
         }
         "suggestions.error" => {
             ctx.require(CAP_WORKER)?;
             suggestions_spec(ctx)?;
-            state.with_suggestions_db(|conn, profile| {
+            state.with_suggestions_db_as(ctx, |conn, profile| {
                 suggestions::error(conn, profile, &ctx.plugin_id, params)
             })
         }
         "suggestions.checks.set" => {
             ctx.require(CAP_WORKER)?;
             suggestions_spec(ctx)?;
-            let stored = state.with_suggestions_db(|conn, profile| {
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
                 suggestions::set_checks(conn, profile, &ctx.plugin_id, params)
             });
             // A worker may answer a refresh with checks alone, which leaves `updated_at` as it was.
-            state.clear_refreshing(&ctx.plugin_id);
+            if stored.is_ok() {
+                state.clear_refreshing(&ctx.plugin_id);
+            }
             stored
         }
         "suggestions.sources" => {
             ctx.require(CAP_WORKER)?;
             let spec = suggestions_spec(ctx)?;
-            state.with_suggestions_db(|conn, profile| {
+            state.with_suggestions_db_as(ctx, |conn, profile| {
                 suggestions::sources(conn, profile, &ctx.plugin_id, &spec)
             })
         }
@@ -1177,6 +1200,59 @@ mod tests {
                 "{method}"
             );
         }
+    }
+
+    #[test]
+    fn a_retired_worker_generation_cannot_write_suggestions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let worker = |generation| PluginRpcContext {
+            ui_generation: generation,
+            ..ctx_for("acme.worker", &[CAP_WORKER])
+        };
+        let write = |ctx: &PluginRpcContext| {
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                conn.execute(
+                    "INSERT INTO suggestion_providers (profile, provider_id, updated_at)
+                     VALUES (?1, 'acme.worker', 1)
+                     ON CONFLICT (profile, provider_id) DO NOTHING",
+                    [profile],
+                )
+                .map(|_| ())
+                .map_err(|e| DispatchError::internal(e.to_string()))
+            })
+        };
+        let published = || {
+            state.with_suggestions_db(|conn, _| {
+                conn.query_row("SELECT COUNT(*) FROM suggestion_providers", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+
+        // Restart: the old worker's RPC runs after the new generation began.
+        let old = state.begin_ui_generation("acme.worker");
+        let new = state.begin_ui_generation("acme.worker");
+        let err = write(&worker(old)).unwrap_err();
+        assert_eq!(err.code, codes::FAILED_PRECONDITION);
+        assert_eq!(published(), 0, "a stale write must not touch the store");
+        write(&worker(new)).unwrap();
+        assert_eq!(published(), 1);
+
+        // Uninstall, then reinstall with the same spec: the stopped worker's
+        // late RPC cannot recreate what the host cleared, and the reinstalled
+        // worker owns a fresh generation.
+        state.clear_ui("acme.worker", new);
+        state.with_suggestions_db(|conn, _| {
+            crate::plugin::suggestions::forget_publication(conn, "acme.worker").unwrap()
+        });
+        assert!(write(&worker(new)).is_err());
+        assert_eq!(published(), 0);
+        let reinstalled = state.begin_ui_generation("acme.worker");
+        assert!(write(&worker(new)).is_err(), "the retired id stays retired");
+        write(&worker(reinstalled)).unwrap();
+        assert_eq!(published(), 1);
     }
 
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {
