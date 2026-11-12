@@ -254,6 +254,7 @@ impl FileWatchService {
     }
 
     /// Falls back to `noop()` when the backend fails or `AOE_FILE_WATCH=off`.
+    #[track_caller]
     pub fn new() -> Result<Arc<Self>, WatchError> {
         if std::env::var("AOE_FILE_WATCH").as_deref() == Ok("off") {
             tracing::info!(
@@ -325,7 +326,11 @@ impl FileWatchService {
         crate::task_util::spawn_supervised(
             "file_watch.dispatcher",
             crate::task_util::PanicPolicy::Log,
-            dispatcher_loop(Arc::downgrade(&svc), tokio_rx),
+            dispatcher_loop(
+                Arc::downgrade(&svc),
+                tokio_rx,
+                std::panic::Location::caller(),
+            ),
         );
 
         Ok(svc)
@@ -652,20 +657,45 @@ fn classify_event_kind(ev: &notify::Event) -> Option<FileEventKind> {
 async fn dispatcher_loop(
     svc: Weak<FileWatchService>,
     mut rx: mpsc::UnboundedReceiver<DispatchMsg>,
+    origin: &'static std::panic::Location<'static>,
 ) {
-    // Flips `dispatcher_dead` on every exit path of `run_dispatcher`, including panic.
+    tracing::debug!(
+        target: "file_watch.service",
+        %origin,
+        thread = ?std::thread::current().name(),
+        "file watch dispatcher started"
+    );
+    // Flips `dispatcher_dead` on every exit path of `run_dispatcher`, including panic and
+    // the future being dropped (runtime shutdown or task abort).
     struct ExitLatch<'a> {
         svc: &'a Weak<FileWatchService>,
+        origin: &'static std::panic::Location<'static>,
+        returned: bool,
     }
     impl Drop for ExitLatch<'_> {
         fn drop(&mut self) {
+            if !self.returned {
+                tracing::error!(
+                    target: "file_watch.service",
+                    origin = %self.origin,
+                    thread = ?std::thread::current().name(),
+                    panicking = std::thread::panicking(),
+                    in_runtime = tokio::runtime::Handle::try_current().is_ok(),
+                    "file watch dispatcher future dropped before run_dispatcher returned"
+                );
+            }
             if let Some(arc) = self.svc.upgrade() {
                 log_dispatcher_dead_once(&arc, "dispatcher_loop_exit", None);
             }
         }
     }
-    let _guard = ExitLatch { svc: &svc };
+    let mut guard = ExitLatch {
+        svc: &svc,
+        origin,
+        returned: false,
+    };
     let exit_reason = run_dispatcher(svc.clone(), &mut rx).await;
+    guard.returned = true;
     if let Some(arc) = svc.upgrade() {
         log_dispatcher_dead_once(&arc, exit_reason, None);
     }
@@ -1347,6 +1377,22 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn dispatcher_dead_when_its_runtime_shuts_down() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let svc = runtime.block_on(async {
+            let svc = FileWatchService::new().expect("init");
+            // The guard exists only once the dispatcher has been polled.
+            tokio::task::yield_now().await;
+            svc
+        });
+        assert!(!svc.dispatcher_dead.load(Ordering::Acquire));
+        drop(runtime);
+        assert!(svc.dispatcher_dead.load(Ordering::Acquire));
     }
 
     #[tokio::test]
