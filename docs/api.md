@@ -801,7 +801,11 @@ message delivery. Transport loss, local request-task failure, or malformed
 mutation receipts remain unknown; effect-free daemon refusals do not acknowledge
 a commit.
 
-A `launch_indeterminate` response with a valid committed receipt is a known refusal, not an unknown RPC outcome. It stays fenced until its snapshot is applied. The TUI then displays the refusal without quarantining the row or automatically attaching, sending, or replaying input; a new operation requires explicit user submission. Readiness itself remains unconfirmed.
+A `launch_indeterminate` response with a valid committed receipt is a known
+refusal, not an unknown RPC outcome. It stays fenced until its snapshot is
+applied. The TUI then displays the refusal without quarantining the row or
+automatically attaching, sending, or replaying input; a new operation requires
+explicit user submission. Readiness itself remains unconfirmed.
 
 `409 managed_resume_refused` preserves the managed conversation. Its finite
 `aoe-managed-resume-cause` header supplies an application-owned recovery reason.

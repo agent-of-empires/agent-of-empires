@@ -721,6 +721,7 @@ fn trash_retained_transcript_is_read_only() {
                     name: "RetainedPendingTool".into(),
                     kind: "execute".into(),
                     args_preview: "{}".into(),
+                    prompt: None,
                     started_at: chrono::Utc::now(),
                     parent_tool_call_id: None,
                     memory_recall: None,

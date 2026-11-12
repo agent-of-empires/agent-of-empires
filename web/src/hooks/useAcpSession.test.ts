@@ -1317,7 +1317,11 @@ describe("live panel cancellation authority", () => {
       expect(regions).toHaveLength(2);
       for (const region of regions) {
         fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+        const previousRootPosts = posts("/acp/cancel").length;
         fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+        expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
+        expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
+        fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
       }
       await flushAsync();
       expect(posts("/cancel")).toEqual([]);
@@ -1388,7 +1392,11 @@ describe("live panel cancellation authority", () => {
     const view = renderView(panelElements(id), { wrapper: profileWrapper });
     for (const region of view.getAllByRole("region", { name: /^(desktop|mobile) background work$/ })) {
       fireEvent.click(within(region).getByRole("button", { name: "Stop sub-agent" }));
+      const previousRootPosts = posts("/acp/cancel").length;
       fireEvent.click(within(region).getByRole("button", { name: "Stop", exact: true }));
+      expect(posts("/acp/cancel")).toHaveLength(previousRootPosts);
+      expect(within(region).getByRole("alertdialog").textContent).toContain("interrupts the main agent");
+      fireEvent.click(within(region).getByRole("button", { name: "Interrupt session" }));
     }
     await flushAsync();
     expect(posts(`/acp/subagents/${childId}/cancel`)).toEqual([

@@ -2445,6 +2445,7 @@ mod tests {
 
         let approval = build_approval(
             ToolCall {
+                prompt: None,
                 id: "t".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
@@ -2546,6 +2547,7 @@ mod tests {
             );
 
             let tool_call = ToolCall {
+                prompt: None,
                 id: "t".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
@@ -4298,6 +4300,7 @@ mod tests {
                 approval: crate::acp::approvals::Approval {
                     nonce: crate::acp::approvals::Nonce("n1".into()),
                     tool_call: crate::acp::state::ToolCall {
+                        prompt: None,
                         id: "call-7".into(),
                         name: "curl -H 'Authorization: Bearer SECRET_SENTINEL_9f3'".into(),
                         kind: "execute".into(),
