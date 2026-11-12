@@ -622,7 +622,8 @@ retry until it lands. Terminal sessions wait up to 60 seconds for the agent
 prompt, then type it. On timeout nothing is typed; a send error can leave
 partial input in the pane. Either way the session row carries
 `initial_prompt_error`. A failed terminal prompt is not
-retried. A crash between delivery and bookkeeping can deliver it twice. A
+retried, unless persisting the error fails: the error then lives only in
+memory and a daemon restart retries the prompt. A crash between delivery and bookkeeping can deliver it twice. A
 blank value returns `400`.
 
 **Worktree fields**
