@@ -326,10 +326,17 @@ impl<S: BroadcastSink> Supervisor<S> {
                 if matches!(err, AcpError::IncompatibleAgent(_)) {
                     self.mark_incompatible_binary(session_id, &config.spec.command);
                 }
-                publish_rejection(&err, |event| {
-                    self.publish_next(session_id, &event);
-                });
+                let deferred =
+                    matches!(err, AcpError::RateLimited(_)) && lease.defers_rate_limit_rejection();
+                if !deferred {
+                    publish_rejection(&err, |event| {
+                        self.publish_next(session_id, &event);
+                    });
+                }
                 self.reap_failed_launch(&lease).await;
+                if matches!(err, AcpError::RateLimited(_)) && !deferred {
+                    self.rate_limit_wake.notify_one();
+                }
                 return Err(SupervisorError::Acp(err));
             }
         };

@@ -662,3 +662,16 @@ pub fn capture_log(f: impl FnOnce()) -> String {
     let out = buf.lock().unwrap().clone();
     String::from_utf8(out).unwrap()
 }
+
+/// A launcher whose agent rejects `initialize` for want of a login, as the connection task
+/// reports it before the handshake completes.
+#[cfg(test)]
+pub(crate) fn unauthenticated_launcher() -> crate::acp::supervisor::Launcher {
+    Arc::new(|_config, _id| {
+        Box::pin(async {
+            Err::<crate::acp::acp_client::AcpClient, _>(crate::acp::acp_client::AcpError::Spawn(
+                "ACP connection failed: Authentication required".into(),
+            ))
+        })
+    })
+}

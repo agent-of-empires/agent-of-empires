@@ -1457,6 +1457,145 @@ async fn trash_teardown_failure_allows_explicit_restore_and_purge() -> anyhow::R
     Ok(())
 }
 
+/// A failed Trash teardown leaves the pane alive; the startup sweep must not
+/// move the checkout out from under it.
+#[tokio::test]
+#[serial_test::serial]
+async fn startup_reconcile_keeps_worktree_after_failed_trash_teardown() -> anyhow::Result<()> {
+    if !crate::tmux::is_tmux_available() {
+        return Ok(());
+    }
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir()?)?;
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir()?)?;
+    let root = tempfile::tempdir()?;
+    let main = root.path().join("main");
+    let worktree = root.path().join("worktree");
+    let repo = git2::Repository::init(&main)?;
+    let signature = git2::Signature::now("Test", "test@example.com")?;
+    let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])?;
+    crate::git::GitWorktree::new(main.clone())?.create_worktree(
+        "failed-teardown",
+        &worktree,
+        true,
+        None,
+    )?;
+    let mut row = Instance::new("failed teardown", worktree.to_str().unwrap());
+    row.source_profile = "receipt".into();
+    row.view = crate::session::View::Terminal;
+    row.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "failed-teardown".into(),
+        main_repo_path: main.to_string_lossy().into_owned(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let id = row.id.clone();
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    let storage = Storage::new("receipt", state.file_watch.clone())?;
+    storage.update(|rows, _| {
+        rows.push(row.clone());
+        Ok(())
+    })?;
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let name = crate::server::pane::respawn_paired_if_dead(&state, &id, &row, 0).await?;
+    let pane = crate::tmux::test_helpers::TmuxTestSession::from_name(name);
+    // Keep the pane's process alive so it counts as a live pane.
+    assert!(crate::tmux::tmux_command()
+        .args(["respawn-pane", "-k", "-t", pane.name(), "sleep", "600"])
+        .output()?
+        .status
+        .success());
+    assert!(!crate::tmux::utils::is_pane_dead(pane.name()));
+    // Real Trash with the teardown fault: kill-session fails, the pane survives.
+    let tmux = which::which("tmux")?;
+    let script = format!(
+        "#!/bin/sh\nfor arg in \"$@\"; do\nif [ \"$arg\" = kill-session ]; then echo teardown-fault >&2; exit 1; fi\ndone\nexec {} \"$@\"\n",
+        shell_words::quote(tmux.to_str().unwrap()),
+    );
+    let fault =
+        crate::session::test_support::install_login_shell_path_command(&main, "tmux", &script);
+    let response = trash_session(State(state.clone()), Path(id.clone()), None)
+        .await
+        .into_response();
+    drop(fault);
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        body["outcome"]["relocation"]["status"], "teardown_failed",
+        "{body}"
+    );
+    assert!(crate::tmux::session_exists(pane.name()));
+    // Trash SIGKILLs the pane process and the fault only blocks kill-session, so the pane is
+    // dead but its session remains. Only a user-made secondary window is alive.
+    assert!(crate::tmux::utils::is_pane_dead(pane.name()));
+    let target = format!("={}:", pane.name());
+    assert!(crate::tmux::tmux_command()
+        .args([
+            "new-window",
+            "-d",
+            "-t",
+            &target,
+            "-n",
+            "secondary",
+            "sleep",
+            "600"
+        ])
+        .output()?
+        .status
+        .success());
+    assert!(crate::tmux::utils::is_pane_dead(pane.name()));
+    let trashed = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(trashed.is_trashed());
+    assert_eq!(trashed.project_path, worktree.to_str().unwrap(), "{body}");
+    drop(state);
+
+    // Fresh daemon-equivalent state rebuilt from disk, as after a restart.
+    let state = crate::server::test_support::build_test_app_state(storage.load()?);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let failed = super::delete::reconcile_trashed_worktrees(&state).await;
+    assert!(failed.is_empty(), "{failed:?}");
+
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    assert!(stored.is_trashed());
+    assert_eq!(stored.project_path, worktree.to_str().unwrap());
+    assert!(stored.pre_trash_project_path.is_none());
+    assert!(worktree.exists(), "checkout must stay under the live pane");
+
+    // Once the last surviving pane exits the same row relocates as before.
+    assert!(crate::tmux::tmux_command()
+        .args(["kill-window", "-t", &format!("={}:secondary", pane.name())])
+        .output()?
+        .status
+        .success());
+    let state = crate::server::test_support::build_test_app_state(storage.load()?);
+    *state.canonical_metadata.write().await =
+        crate::server::reload::load_all_profiles(&state.file_watch)?.metadata;
+    let failed = super::delete::reconcile_trashed_worktrees(&state).await;
+    assert!(failed.is_empty(), "{failed:?}");
+    let stored = storage
+        .load()?
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap();
+    let holding = crate::session::trash::trash_holding_path(&worktree, &id).unwrap();
+    assert_eq!(stored.project_path, holding.to_str().unwrap());
+    assert!(holding.exists() && !worktree.exists());
+    Ok(())
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn trash_retry_releases_missing_worktree_for_direct_purge() -> anyhow::Result<()> {
@@ -10371,6 +10510,63 @@ async fn a_trust_changed_refusal_does_not_freeze_its_idempotency_key() {
     );
 }
 
+/// A failing `on_create` costs the session unless the resubmit skips setup. The skip rides
+/// a fresh key: the failed key still replays its failure.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_create_without_setup_keeps_the_session_and_tags_it() {
+    use crate::server::test_support as support;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _adapter = crate::session::test_support::stub_claude_adapter_on_agent_path();
+    let ran = tempfile::tempdir().unwrap();
+    let sentinel = ran.path().join("setup-ran");
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .expect("acknowledge the agent hook paths");
+    crate::session::config::update_config(|c| {
+        c.hooks.on_create = vec![format!("touch '{}'; exit 4", sentinel.display())];
+    })
+    .unwrap();
+    crate::session::purge_owners::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    crate::tmux::tool_retirement::initialize(&crate::session::get_app_dir().unwrap()).unwrap();
+    support::seed_instances_on_disk_for_test("test", Vec::new());
+    let (launcher, _launches) = support::counting_failing_launcher();
+    let state = support::build_test_app_state_with_launcher(Vec::new(), launcher);
+    support::refresh_canonical_metadata_for_test(&state).await;
+    let project = tempfile::tempdir().unwrap();
+    let body = |key: &str, skip: bool| {
+        serde_json::json!({
+            "title": "setup", "path": project.path(), "tool": "claude",
+            "view": "structured", "profile": "test", "idempotency_key": key,
+            "skip_on_create": skip,
+        })
+    };
+
+    let (failed, error) = post_create(&state, body("first", false)).await;
+    assert_eq!(failed, axum::http::StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"], "hook_failed", "{error}");
+    assert!(sentinel.exists(), "the control ran the hook");
+    std::fs::remove_file(&sentinel).unwrap();
+
+    let (replayed, error) = post_create(&state, body("first", true)).await;
+    assert_eq!(replayed, axum::http::StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"], "hook_failed", "{error}");
+
+    let (created, session) = post_create(&state, body("second", true)).await;
+    assert_eq!(created, axum::http::StatusCode::CREATED, "{session}");
+    assert_eq!(session["created_without_setup"], true, "{session}");
+    assert!(!sentinel.exists(), "a skipped on_create still ran");
+    let stored = crate::session::Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap();
+    assert!(
+        stored.iter().any(|row| row.created_without_setup),
+        "the tag is persisted"
+    );
+}
+
 /// A cancelled create is the refusal a user asked for, so its key stays live
 /// too. Each distinct cancelled key also occupies one of the registry's
 /// `MAX_FAILURES` slots for a whole `FAILURE_TTL`, and when those run out every
@@ -11183,22 +11379,44 @@ async fn create_refuses_a_structured_session_without_its_adapter() {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         assert_ne!(body["error"], "acp_adapter_missing", "{extra}: {body}");
     }
-    // A repository on_create hook may install the adapter before launch, so it isn't refused,
-    // unless the create skips the repository's hooks.
+    // An on_create hook may install the adapter before launch, so it isn't refused, unless
+    // the create skips the repository's hooks or skips on_create.
     let hooked = project_with_on_create_hooks(&["npm install"]);
     let hooked_path = hooked.path().display().to_string();
-    for (trust_hooks, refused) in [(None, false), (Some(true), false), (Some(false), true)] {
-        let mut extra = serde_json::json!({ "view": "structured", "path": hooked_path });
+    let refused_for = |extra: serde_json::Value| {
+        let (state, request) = (state.clone(), base(extra.clone()));
+        async move {
+            let (_, bytes) = post_create_bytes(&state, request).await;
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            (
+                body["error"] == "acp_adapter_missing",
+                format!("{extra}: {body}"),
+            )
+        }
+    };
+    for (trust_hooks, skip, refused) in [
+        (None, false, false),
+        (Some(true), false, false),
+        (Some(false), false, true),
+        (None, true, true),
+    ] {
+        let mut extra = serde_json::json!({
+            "view": "structured", "path": hooked_path, "skip_on_create": skip,
+        });
         if let Some(trust) = trust_hooks {
             extra["trust_hooks"] = serde_json::json!(trust);
         }
-        let (_, bytes) = post_create_bytes(&state, base(extra.clone())).await;
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        assert_eq!(
-            body["error"] == "acp_adapter_missing",
-            refused,
-            "{extra}: {body}"
-        );
+        let (got, detail) = refused_for(extra).await;
+        assert_eq!(got, refused, "{detail}");
+    }
+    crate::session::config::update_config(|config| {
+        config.hooks.on_create = vec!["npm install".into()];
+    })
+    .unwrap();
+    for (skip, refused) in [(false, false), (true, true)] {
+        let extra = serde_json::json!({ "view": "structured", "skip_on_create": skip });
+        let (got, detail) = refused_for(extra).await;
+        assert_eq!(got, refused, "profile on_create: {detail}");
     }
 }
 
@@ -13302,4 +13520,640 @@ async fn an_explicit_wake_discards_a_stale_continuation_before_the_worker_can_dr
     }
     lifecycle::discard_stale_continuation(&state, "stale", true, true).await;
     assert_eq!(pending(&state).await, None);
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failover_swap_refuses_once_the_park_moved_on() {
+    use crate::acp::Event;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    let mut row = Instance::new("failover-cas", project.path().to_str().unwrap());
+    row.id = "failover-cas".into();
+    row.source_profile = "default".into();
+    row.view = crate::session::View::Structured;
+    row.tool = "claude".into();
+    row.status = Status::Idle;
+    crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+    let state = crate::server::test_support::build_test_app_state(vec![row]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    for (seq, event) in [
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                kind: "usage".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        state
+            .acp_event_store
+            .record("failover-cas", u64::try_from(seq).unwrap() + 1, event)
+            .unwrap();
+    }
+    let head = state.acp_event_store.highest_seq("failover-cas");
+
+    // The decision was made on an older head: a prompt landed since.
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head - 1)
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("moved on"), "{error:?}");
+    assert!(
+        !error.permanent,
+        "a log head that moved without ending the park may clear"
+    );
+
+    // On the current head the guard passes and the swap's own refusal answers
+    // (no recorded conversation), still before anything stops.
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head)
+        .await
+        .unwrap_err();
+    assert!(
+        error.message.contains("without losing the conversation"),
+        "{error:?}"
+    );
+    assert!(error.permanent, "a refused swap is not retried");
+    let rows = state.instances.read().await;
+    assert_eq!(
+        (rows[0].tool.as_str(), rows[0].status),
+        ("claude", Status::Idle)
+    );
+    assert!(
+        !rows[0].is_idle_dormant(),
+        "a refusal before the tool flipped must not leave the restart's dormant marker"
+    );
+}
+
+/// A failover swap that fails after the row took the new account must not leave it there: the
+/// next park on the old account would be recorded against the new one (the limit table is keyed
+/// by the account the row's tool resolves to).
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_failover_swap_leaves_the_row_on_its_account() {
+    use crate::acp::Event;
+
+    let (row, _a, _b, _c) =
+        carry_ready_row("claude", crate::session::View::Structured, false, true);
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &row.source_profile,
+        vec![row.clone()],
+    );
+    let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    for (seq, event) in [
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                kind: "weekly".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        state
+            .acp_event_store
+            .record(&row.id, u64::try_from(seq).unwrap() + 1, event)
+            .unwrap();
+    }
+    let head = state.acp_event_store.highest_seq(&row.id);
+
+    // The source account holds no transcript, so the carry fails once the row has moved.
+    let error = lifecycle::failover_account_swap(&state, &row.id, "b", head)
+        .await
+        .expect_err("the carry has nothing to copy");
+    assert!(
+        !error.permanent,
+        "a failed carry may clear by itself: {error:?}"
+    );
+
+    let on_disk = crate::session::Storage::open_unwatched(&row.source_profile)
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|stored| stored.id == row.id)
+        .unwrap();
+    let live = state.instances.read().await[0].clone();
+    for (place, tool, detect_as) in [
+        ("disk", &on_disk.tool, &on_disk.detect_as),
+        ("memory", &live.tool, &live.detect_as),
+    ] {
+        assert_eq!(
+            (tool.as_str(), detect_as.as_str()),
+            ("a", "claude"),
+            "{place}"
+        );
+    }
+    assert!(
+        !on_disk.is_idle_dormant() && !live.is_idle_dormant(),
+        "the reaper skips dormant rows, so a failed swap must not leave the restart's marker"
+    );
+}
+
+/// A parked structured row on account `a` whose swap to `b` fails after the row took `b`.
+async fn failing_failover_swap_fixture(
+    launcher: Option<crate::acp::supervisor::Launcher>,
+) -> (
+    Arc<AppState>,
+    Instance,
+    u64,
+    impl Sized,
+    impl Sized,
+    impl Sized,
+) {
+    use crate::acp::Event;
+
+    let (row, a, b, c) = carry_ready_row("claude", crate::session::View::Structured, false, true);
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &row.source_profile,
+        vec![row.clone()],
+    );
+    let state = match launcher {
+        Some(launcher) => {
+            // The conversation has a transcript on `a`, so the carry succeeds and the swap
+            // reaches the launch.
+            let transcript = dirs::home_dir()
+                .unwrap()
+                .join("a/projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &row.project_path,
+                ))
+                .join(format!(
+                    "{}.jsonl",
+                    row.agent_session_id.as_deref().unwrap()
+                ));
+            std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            std::fs::write(transcript, "conversation\n").unwrap();
+            crate::session::config::update_app_state(|state| {
+                state.has_acknowledged_agent_hooks = true;
+            })
+            .unwrap();
+            crate::server::test_support::build_test_app_state_with_launcher(
+                vec![row.clone()],
+                launcher,
+            )
+        }
+        None => crate::server::test_support::build_test_app_state(vec![row.clone()]),
+    };
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    for (seq, event) in [
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                kind: "weekly".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        state
+            .acp_event_store
+            .record(&row.id, u64::try_from(seq).unwrap() + 1, event)
+            .unwrap();
+    }
+    let head = state.acp_event_store.highest_seq(&row.id);
+    (state, row, head, a, b, c)
+}
+
+/// What another lifecycle operation leaves durably: a newer generation, `edit` applied.
+async fn another_operation_completes(
+    state: &Arc<AppState>,
+    row: &Instance,
+    edit: impl FnOnce(&mut Instance) + Send + 'static,
+) {
+    use crate::session::SessionStore;
+
+    let worker_state = state.clone();
+    let profile = row.source_profile.clone();
+    let id = row.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &profile,
+            Some(id.clone()),
+        )
+        .unwrap();
+        (&native as &dyn SessionStore)
+            .update(|rows, _| {
+                let row = rows.iter_mut().find(|row| row.id == id).unwrap();
+                row.lifecycle_reservation = None;
+                row.lifecycle_generation += 1;
+                edit(row);
+                Ok(())
+            })
+            .unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A user stop that completes after the failed swap released its locks but before the rollback
+/// runs keeps its dormant marker: the rollback only undoes what the swap itself wrote.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_failover_rollback_leaves_a_newer_stop_alone() {
+    let (state, row, head, _a, _b, _c) = failing_failover_swap_fixture(None).await;
+    let newer = {
+        let state = state.clone();
+        let row = row.clone();
+        async move {
+            another_operation_completes(&state, &row, |row| {
+                row.status = Status::Stopped;
+                row.idle_dormant_since = Some(chrono::Utc::now());
+            })
+            .await;
+        }
+    };
+
+    lifecycle::failover_account_swap_with(&state, &row.id, "b", head, newer)
+        .await
+        .expect_err("the carry has nothing to copy");
+
+    let live = state.instances.read().await[0].clone();
+    assert!(
+        live.is_idle_dormant(),
+        "the newer stop's marker must survive the rollback"
+    );
+}
+
+/// A newer restart that completes in the same window keeps the account it chose.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_failover_rollback_leaves_a_newer_restart_alone() {
+    let (state, row, head, _a, _b, _c) = failing_failover_swap_fixture(None).await;
+    let newer = {
+        let state = state.clone();
+        let row = row.clone();
+        async move {
+            another_operation_completes(&state, &row, |row| {
+                row.tool = "b".into();
+                row.detect_as = "claude".into();
+                row.status = Status::Idle;
+                row.idle_dormant_since = None;
+            })
+            .await;
+        }
+    };
+
+    lifecycle::failover_account_swap_with(&state, &row.id, "b", head, newer)
+        .await
+        .expect_err("the carry has nothing to copy");
+
+    let live = state.instances.read().await[0].clone();
+    assert_eq!(live.tool, "b", "the newer restart's account stands");
+}
+
+/// A restart to another account that completes after the failover was decided but before the
+/// failover takes its locks moved the row on: when the failover then fails, the rollback returns
+/// the row to the account it found under its locks, not the one the decision saw.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failed_failover_rolls_back_to_the_account_it_found_under_its_locks() {
+    let (state, row, head, _a, _b, _c) = failing_failover_swap_fixture(None).await;
+    let (entered, release) =
+        lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeLocks);
+    let swap = tokio::spawn({
+        let state = state.clone();
+        let id = row.id.clone();
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head).await }
+    });
+    entered.await.expect("the failover waits for its locks");
+
+    // A manual restart to `c` ran meanwhile and failed without appending an event.
+    another_operation_completes(&state, &row, |row| {
+        row.tool = "c".into();
+        row.detect_as = "claude".into();
+    })
+    .await;
+    {
+        let mut rows = state.instances.write().await;
+        rows[0].tool = "c".into();
+        rows[0].detect_as = "claude".into();
+    }
+
+    release.send(()).unwrap();
+    swap.await
+        .unwrap()
+        .expect_err("the carry from `c` has nothing to copy");
+
+    let live = state.instances.read().await[0].clone();
+    assert_eq!(live.tool, "c", "the rollback must not write `a` back");
+    let on_disk = crate::session::Storage::open_unwatched(&row.source_profile)
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|stored| stored.id == row.id)
+        .unwrap();
+    assert_eq!(on_disk.tool, "c");
+}
+
+/// An agent that rejects `initialize` for want of a login fails the launch on the ready
+/// channel, which publishes no startup error. The failure still names the login as the cause, so
+/// the failover can take the target out of the pool before the rollback.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_login_failure_at_initialize_is_reported_by_the_failed_swap() {
+    let (state, row, head, _a, _b, _c) = failing_failover_swap_fixture(Some(
+        crate::server::test_support::unauthenticated_launcher(),
+    ))
+    .await;
+
+    let error = lifecycle::failover_account_swap(&state, &row.id, "b", head)
+        .await
+        .expect_err("the target cannot log in");
+
+    assert!(
+        error.message.to_lowercase().contains("authentic"),
+        "the cause is kept: {error:?}"
+    );
+    assert!(
+        error.target_auth_failed,
+        "the failover learns the target could not log in: {error:?}"
+    );
+    assert!(!error.permanent, "a login may be repaired: {error:?}");
+    let live = state.instances.read().await[0].clone();
+    assert_eq!(live.tool, "a", "the row is back on its own account");
+}
+
+/// A launcher that rejects its first `limited` launches for a rate limit, as the connection task
+/// reports a limit hit at `initialize`, and starts a fake worker for every later one.
+fn rate_limited_then_working_launcher(
+    limited: usize,
+) -> (
+    crate::acp::supervisor::Launcher,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&launches);
+    let working = crate::server::test_support::succeeding_launcher();
+    let launcher: crate::acp::supervisor::Launcher = Arc::new(move |config, id| {
+        let call = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if call < limited {
+            Box::pin(async {
+                Err::<crate::acp::acp_client::AcpClient, _>(
+                    crate::acp::acp_client::AcpError::RateLimited(Box::new(
+                        crate::acp::state::RateLimitInfo {
+                            status: "limited".into(),
+                            resets_at: Some(chrono::Utc::now() + chrono::Duration::hours(3)),
+                            kind: "usage".into(),
+                        },
+                    )),
+                )
+            })
+        } else {
+            working(config, id)
+        }
+    });
+    (launcher, launches)
+}
+
+/// A parked row on account `a` with failover over `a`, `b` and `c`, a transcript on `a` so a swap
+/// carries, and `launcher` deciding how each launch ends.
+async fn failover_pool_fixture(
+    launcher: crate::acp::supervisor::Launcher,
+) -> (
+    Arc<AppState>,
+    Instance,
+    std::path::PathBuf,
+    impl Sized,
+    impl Sized,
+    impl Sized,
+) {
+    use crate::acp::Event;
+
+    let (row, guard_a, guard_b, guard_c) =
+        carry_ready_row("claude", crate::session::View::Structured, false, true);
+    let home = dirs::home_dir().unwrap();
+    std::fs::write(
+        crate::session::get_app_dir().unwrap().join("config.toml"),
+        "[acp]\nrate_limit_failover = true\n\
+         rate_limit_failover_accounts = [\"a\", \"b\", \"c\"]\n\
+         [session.agent_detect_as]\na = \"claude\"\nb = \"claude\"\nc = \"claude\"\n\
+         [session.agent_config_dir]\na = \"~/a\"\nb = \"~/b\"\nc = \"~/c\"\n",
+    )
+    .unwrap();
+    crate::session::config::profile_config::resolve_config_or_warn(&row.source_profile);
+    let transcript = home
+        .join("a/projects")
+        .join(crate::session::capture::encode_claude_project_path(
+            &row.project_path,
+        ))
+        .join(format!(
+            "{}.jsonl",
+            row.agent_session_id.as_deref().unwrap()
+        ));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(transcript, "conversation\n").unwrap();
+    crate::session::config::update_app_state(|state| {
+        state.has_acknowledged_agent_hooks = true;
+    })
+    .unwrap();
+    crate::server::test_support::seed_instances_on_disk_for_test(
+        &row.source_profile,
+        vec![row.clone()],
+    );
+    let state = crate::server::test_support::build_test_app_state_with_launcher(
+        vec![row.clone()],
+        launcher,
+    );
+    crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+    for (seq, event) in [
+        Event::RateLimit {
+            info: crate::acp::state::RateLimitInfo {
+                status: "limited".into(),
+                resets_at: Some(chrono::Utc::now() + chrono::Duration::days(2)),
+                kind: "weekly".into(),
+            },
+        },
+        Event::Stopped {
+            reason: "rate_limited".into(),
+        },
+    ]
+    .iter()
+    .enumerate()
+    {
+        state
+            .acp_event_store
+            .record(&row.id, u64::try_from(seq).unwrap() + 1, event)
+            .unwrap();
+    }
+    state
+        .acp_supervisor
+        .hydrate_seqs([(row.id.clone(), state.acp_event_store.highest_seq(&row.id))]);
+    (state, row, home, guard_a, guard_b, guard_c)
+}
+
+/// One reaper pass, then the failover it started has finished.
+async fn reaper_pass(state: &Arc<AppState>, id: &str) {
+    let mut attempted: std::collections::HashSet<String> = [id.to_string()].into();
+    crate::server::acp_reconciler::reap_rate_limit_resumes(
+        state,
+        &mut attempted,
+        &std::collections::HashSet::new(),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while crate::server::acp_reconciler::failover_in_flight(id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the failover task must finish");
+}
+
+/// B rejects `initialize` for a rate limit. The limit is B's: it is recorded against B, stays out
+/// of A's state and of the session's log, and the next pass moves on to C.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_target_limited_at_initialize_is_skipped_by_the_next_pass() {
+    let (launcher, launches) = rate_limited_then_working_launcher(1);
+    let (state, row, home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+    let key = |account: &str| home.join(account).to_string_lossy().into_owned();
+
+    reaper_pass(&state, &row.id).await;
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        state.acp_event_store.highest_seq(&row.id),
+        head,
+        "B's rejection parks nothing: the log still holds A's park"
+    );
+    let on_b = state.acp_event_store.account_state(&key("b")).unwrap();
+    let usage = on_b.window("usage").expect("B's limit is B's");
+    assert!(usage.until_ms > chrono::Utc::now().timestamp_millis());
+    let on_a = state.acp_event_store.account_state(&key("a")).unwrap();
+    assert!(on_a.window("usage").is_none(), "A never saw B's window");
+    assert!(on_a.window("weekly").is_some(), "A keeps its own park");
+    assert_eq!(state.instances.read().await[0].tool, "a");
+
+    reaper_pass(&state, &row.id).await;
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(
+        state.instances.read().await[0].tool,
+        "c",
+        "B is limited, so the next pass takes C"
+    );
+}
+
+/// A failover held before its pre-launch hooks has released its locks, so a user stop and a
+/// newer restart can launch meanwhile. A limit rejecting that newer launch is the session's own:
+/// it parks the session and wakes the reaper, and the obsolete failover, which never launched,
+/// leaves the newer row alone.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_newer_launch_limited_during_an_old_failover_hook_still_parks() {
+    let (launcher, launches) = rate_limited_then_working_launcher(1);
+    let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+    let (entered, release) =
+        lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeHooks);
+
+    let old = tokio::spawn({
+        let state = state.clone();
+        let id = row.id.clone();
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head).await }
+    });
+    entered.await.expect("the failover reached its hook");
+
+    let stopped = super::stop_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(row.id.clone()),
+    )
+    .await
+    .into_response();
+    assert!(
+        stopped.status().is_success(),
+        "the user stops the pending launch: {}",
+        stopped.status()
+    );
+    let response = lifecycle::prepare_agent_session(
+        state.clone(),
+        row.id.clone(),
+        Ok(None),
+        lifecycle::AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            tool: Some("c".into()),
+            skip_on_launch: true,
+            ..Default::default()
+        })),
+    )
+    .await;
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        launches.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the newer restart launched, and the limit rejected it: {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert!(
+        state.acp_event_store.highest_seq(&row.id) > head,
+        "the newer launch's limit is published as the session's park"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.acp_supervisor.rate_limit_parked(),
+    )
+    .await
+    .expect("the reaper is woken for the newer park");
+
+    release.send(()).unwrap();
+    old.await
+        .unwrap()
+        .expect_err("the obsolete failover was superseded");
+    assert_eq!(
+        launches.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the obsolete failover never launched"
+    );
+    assert_eq!(
+        state.instances.read().await[0].tool,
+        "c",
+        "the obsolete failover must not restore its row over the newer restart"
+    );
+}
+
+/// Every other account limited at `initialize`: attempts stop, and the session stays on A's park.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_entirely_limited_pool_is_attempted_once_per_account() {
+    let (launcher, launches) = rate_limited_then_working_launcher(usize::MAX);
+    let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+
+    for _ in 0..4 {
+        reaper_pass(&state, &row.id).await;
+    }
+
+    assert_eq!(
+        launches.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "B and C were each tried once, then nothing is left"
+    );
+    assert_eq!(state.acp_event_store.highest_seq(&row.id), head);
+    let live = state.instances.read().await[0].clone();
+    assert_eq!(live.tool, "a");
+    assert!(!live.is_idle_dormant());
 }

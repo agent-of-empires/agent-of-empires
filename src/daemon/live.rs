@@ -60,6 +60,30 @@ pub enum LiveTransportReason {
     PipeOwned,
 }
 
+/// Which kind of window holds a session's size-owner lock, from its owner id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum LiveOwnerKind {
+    /// A Web dashboard live view (`live-*`).
+    Web,
+    /// A TUI in live mode (`tui-*`).
+    Tui,
+}
+
+impl LiveOwnerKind {
+    /// The kind behind a size-owner id, or `None` for an id no known window uses.
+    pub fn from_owner_id(owner_id: &str) -> Option<Self> {
+        if owner_id.starts_with("live-") {
+            Some(Self::Web)
+        } else if owner_id.starts_with("tui-") {
+            Some(Self::Tui)
+        } else {
+            None
+        }
+    }
+}
+
 /// Daemon to client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "typescript", derive(ts_rs::TS))]
@@ -88,9 +112,15 @@ pub enum LiveServerMessage {
         #[serde(flatten)]
         meta: LivePaneMeta,
     },
-    /// Whether this viewer owns the session's size.
+    /// Whether this viewer owns the session's size. A non-owner also gets the
+    /// holder's kind when its id names one.
     #[serde(rename = "size_owner")]
-    SizeOwner { is_owner: bool },
+    SizeOwner {
+        is_owner: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "typescript", ts(optional))]
+        owner: Option<LiveOwnerKind>,
+    },
     /// An OSC 52 copy from the pane, for the viewer's own clipboard.
     #[serde(rename = "clipboard")]
     Clipboard { text: String },
@@ -156,6 +186,7 @@ pub fn typescript_declarations() -> String {
         LivePane0::decl(&cfg),
         LivePaneMeta::decl(&cfg),
         LiveTransportReason::decl(&cfg),
+        LiveOwnerKind::decl(&cfg),
         LiveServerMessage::decl(&cfg),
         LiveClientMessage::decl(&cfg),
     ];
@@ -228,8 +259,18 @@ mod tests {
                 }),
             ),
             (
-                LiveServerMessage::SizeOwner { is_owner: false },
+                LiveServerMessage::SizeOwner {
+                    is_owner: false,
+                    owner: None,
+                },
                 serde_json::json!({"type": "size_owner", "is_owner": false}),
+            ),
+            (
+                LiveServerMessage::SizeOwner {
+                    is_owner: false,
+                    owner: Some(LiveOwnerKind::Tui),
+                },
+                serde_json::json!({"type": "size_owner", "is_owner": false, "owner": "tui"}),
             ),
             (
                 LiveServerMessage::Clipboard {
@@ -260,6 +301,22 @@ mod tests {
             );
             let decoded: LiveServerMessage = serde_json::from_value(expected).unwrap();
             assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn an_owner_id_names_the_kind_of_window_by_its_prefix() {
+        let cases = [
+            ("live-3", Some(LiveOwnerKind::Web)),
+            ("tui-4812-2", Some(LiveOwnerKind::Tui)),
+            ("live", None),
+            ("tui", None),
+            ("LIVE-1", None),
+            ("pty-1", None),
+            ("", None),
+        ];
+        for (owner_id, kind) in cases {
+            assert_eq!(LiveOwnerKind::from_owner_id(owner_id), kind, "{owner_id:?}");
         }
     }
 

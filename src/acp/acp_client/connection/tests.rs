@@ -513,6 +513,12 @@ async fn rate_limit_on_an_agent_initiated_turn_ends_the_connection() {
         limit.is_some() && limit < stopped,
         "RateLimit then Stopped(rate_limited) expected: {seen:?}"
     );
+    // The rejected window travels on the event, so a later report for another window of the
+    // same account cannot replace this deadline in the account table.
+    assert!(
+        matches!(&seen[limit.unwrap()], Event::RateLimit { info } if info.kind == "five_hour"),
+        "the event names its window: {seen:?}"
+    );
     fake.agent.abort();
     let _ = fake.agent.await;
 }

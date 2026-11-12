@@ -2713,8 +2713,8 @@ function AppContent({
                 onSelect={handleSelectWorkspace}
                 onToggleGroup={toggleSidebarGroup}
                 onUpdateRepoAppearance={updateRepoAppearance}
-                onNew={() => {
-                  setWizardPrefill(undefined);
+                onNew={(prefill) => {
+                  setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
                   setShowSessionWizard(true);
                 }}
                 onCreateSession={handleCreateSession}

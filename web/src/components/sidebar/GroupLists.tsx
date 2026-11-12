@@ -28,7 +28,7 @@ export interface ListContext {
   offline: boolean;
   displayedActiveId: string | null;
   displayedActiveSessionId: string | null;
-  onNew: () => void;
+  onNew: (prefill?: { group?: string }) => void;
   onCreateSession: (repoPath: string) => void;
   onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onPinProject?: (repoPath: string) => void;
@@ -90,7 +90,9 @@ function GroupHeader({
       onNewSession={() =>
         createsInRepo && full.capabilities.create === "repo" && full.repoPath
           ? ctx.onCreateSession(full.repoPath)
-          : ctx.onNew()
+          : full.kind === "sessionGroup" && full.groupPath
+            ? ctx.onNew({ group: full.groupPath })
+            : ctx.onNew()
       }
       offline={ctx.offline}
       dragHandle={dragHandle}

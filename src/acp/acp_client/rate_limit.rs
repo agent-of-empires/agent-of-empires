@@ -3,24 +3,45 @@
 use crate::acp::state::RateLimitInfo;
 use std::collections::HashMap;
 
+/// The rejected window that clears last, which is the one the park waits for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedReset {
+    /// `rateLimitType`, or empty when the report named none.
+    pub(crate) window: String,
+    pub(crate) resets_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CapturedReset {
+    /// The window names the limit, so reports for different windows of one account stay apart.
+    fn kind(&self) -> String {
+        if self.window.is_empty() {
+            "rate_limit".to_string()
+        } else {
+            self.window.clone()
+        }
+    }
+}
+
 /// Reset time comes only from a captured rejected-window epoch; the localized
 /// message is displayed verbatim, never parsed.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
-    captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    captured: Option<CapturedReset>,
 ) -> Option<RateLimitInfo> {
     let kind = err.data.as_ref()?.get("errorKind")?.as_str()?;
     (kind == "rate_limit").then(|| RateLimitInfo {
         status: err.message.clone(),
-        resets_at: captured_resets_at,
-        kind: kind.to_string(),
+        resets_at: captured.as_ref().map(|c| c.resets_at),
+        kind: captured
+            .as_ref()
+            .map_or_else(|| kind.to_string(), |c| c.kind()),
     })
 }
 
 /// Fallback for an outer error that kept only the serialized `errorKind`.
 pub(crate) fn classify_rate_limit_from_message(
     message: &str,
-    captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    captured: Option<CapturedReset>,
 ) -> Option<RateLimitInfo> {
     let matched = [
         "\"errorKind\":\"rate_limit\"",
@@ -30,8 +51,10 @@ pub(crate) fn classify_rate_limit_from_message(
     .any(|fingerprint| message.contains(fingerprint));
     matched.then(|| RateLimitInfo {
         status: message.to_string(),
-        resets_at: captured_resets_at,
-        kind: "rate_limit".to_string(),
+        resets_at: captured.as_ref().map(|c| c.resets_at),
+        kind: captured
+            .as_ref()
+            .map_or_else(|| "rate_limit".to_string(), |c| c.kind()),
     })
 }
 
@@ -131,18 +154,33 @@ pub(super) fn record_rate_limit_report(
     false
 }
 
-/// The latest future reset, since every rejected window must clear.
-pub(super) fn captured_rate_limit_resets_at(
+/// The window with the latest future reset, since every rejected window must clear.
+fn latest_future_reset<'a>(
+    captures: impl Iterator<Item = (&'a String, &'a i64)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<CapturedReset> {
+    captures
+        .filter_map(|(window, secs)| {
+            Some(CapturedReset {
+                window: window.clone(),
+                resets_at: chrono::DateTime::from_timestamp(*secs, 0)?,
+            })
+        })
+        .filter(|captured| captured.resets_at > now)
+        .max_by_key(|captured| captured.resets_at)
+}
+
+pub(super) fn captured_rate_limit_reset(
     captures: &std::sync::Mutex<HashMap<String, i64>>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    captures
-        .lock()
-        .expect("rate-limit capture mutex poisoned")
-        .values()
-        .filter_map(|secs| chrono::DateTime::from_timestamp(*secs, 0))
-        .filter(|dt| *dt > now)
-        .max()
+) -> Option<CapturedReset> {
+    latest_future_reset(
+        captures
+            .lock()
+            .expect("rate-limit capture mutex poisoned")
+            .iter(),
+        now,
+    )
 }
 
 /// A turn nobody prompted ends without an error, so a still-future rejected
@@ -153,16 +191,11 @@ pub(super) fn take_rate_limit_from_captured_rejection(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<RateLimitInfo> {
     let drained = std::mem::take(&mut *captures.lock().expect("rate-limit capture mutex poisoned"));
-    drained
-        .values()
-        .filter_map(|secs| chrono::DateTime::from_timestamp(*secs, 0))
-        .filter(|dt| *dt > now)
-        .max()
-        .map(|resets_at| RateLimitInfo {
-            status: "usage limit reached".to_string(),
-            resets_at: Some(resets_at),
-            kind: "rate_limit".to_string(),
-        })
+    latest_future_reset(drained.iter(), now).map(|captured| RateLimitInfo {
+        status: "usage limit reached".to_string(),
+        resets_at: Some(captured.resets_at),
+        kind: captured.kind(),
+    })
 }
 
 /// Captures belong to the turn that observed them, so each turn boundary drops them.
@@ -188,7 +221,11 @@ mod tests {
     #[test]
     fn classify_rate_limit_error_cases() {
         let limit = json!({ "errorKind": "rate_limit" });
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let resets_at = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let captured = CapturedReset {
+            window: "seven_day".into(),
+            resets_at,
+        };
 
         // #3152: no captured epoch means an unknown reset, never a guess.
         let info =
@@ -199,7 +236,8 @@ mod tests {
         assert_eq!(info.resets_at, None);
 
         let info = classify_rate_limit_error(&err("limit", Some(limit)), Some(captured)).unwrap();
-        assert_eq!(info.resets_at, Some(captured));
+        assert_eq!(info.resets_at, Some(resets_at));
+        assert_eq!(info.kind, "seven_day", "the window names the limit");
 
         let with_reset = json!({ "errorKind": "rate_limit", "resets_at": "2099-01-01T00:00:00Z" });
         let info = classify_rate_limit_error(&err("x", Some(with_reset)), None).unwrap();
@@ -211,14 +249,20 @@ mod tests {
         assert!(classify_rate_limit_error(&invalid, None).is_none());
 
         // The same fingerprint inside a flattened error message.
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
+        let resets_at = chrono::Utc::now() + chrono::Duration::minutes(20);
         for msg in [
             "ACP connection failed: Internal error: limit: {\n  \"errorKind\":\"rate_limit\"\n}",
             "{\n  \"errorKind\": \"rate_limit\"\n}",
         ] {
-            let info = classify_rate_limit_from_message(msg, Some(captured)).unwrap();
-            assert_eq!(info.kind, "rate_limit");
-            assert_eq!(info.resets_at, Some(captured));
+            for (window, kind) in [("", "rate_limit"), ("five_hour", "five_hour")] {
+                let captured = CapturedReset {
+                    window: window.into(),
+                    resets_at,
+                };
+                let info = classify_rate_limit_from_message(msg, Some(captured)).unwrap();
+                assert_eq!(info.kind, kind);
+                assert_eq!(info.resets_at, Some(resets_at));
+            }
         }
         assert!(classify_rate_limit_from_message("connection refused", None).is_none());
     }
@@ -331,23 +375,32 @@ mod tests {
             let seven_day = now + chrono::Duration::days(3);
             let past = now - chrono::Duration::minutes(1);
             let cases = [
-                (vec![five_hour, seven_day], Some(seven_day)),
-                (vec![five_hour, past], Some(five_hour)),
+                (
+                    vec![("five_hour", five_hour), ("seven_day", seven_day)],
+                    Some(("seven_day", seven_day)),
+                ),
+                (
+                    vec![("five_hour", five_hour), ("seven_day", past)],
+                    Some(("five_hour", five_hour)),
+                ),
+                (vec![("", five_hour)], Some(("rate_limit", five_hour))),
                 (vec![], None),
-                (vec![past], None),
+                (vec![("five_hour", past)], None),
             ];
             for (resets, want) in cases {
                 let captures = std::sync::Mutex::new(
                     resets
                         .iter()
-                        .enumerate()
-                        .map(|(i, dt)| (i.to_string(), dt.timestamp()))
+                        .map(|(window, dt)| (window.to_string(), dt.timestamp()))
                         .collect(),
                 );
-                assert_eq!(captured_rate_limit_resets_at(&captures, now), want);
-                let info = take_rate_limit_from_captured_rejection(&captures, now);
-                assert_eq!(info.as_ref().and_then(|i| i.resets_at), want);
-                assert!(info.is_none_or(|i| i.kind == "rate_limit"));
+                let captured =
+                    captured_rate_limit_reset(&captures, now).map(|c| (c.kind(), c.resets_at));
+                let want = want.map(|(kind, dt)| (kind.to_string(), dt));
+                assert_eq!(captured, want);
+                let info = take_rate_limit_from_captured_rejection(&captures, now)
+                    .map(|i| (i.kind, i.resets_at.unwrap()));
+                assert_eq!(info, want);
                 assert!(take_rate_limit_from_captured_rejection(&captures, now).is_none());
             }
         }
