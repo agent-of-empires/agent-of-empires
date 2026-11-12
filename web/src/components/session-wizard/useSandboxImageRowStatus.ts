@@ -19,10 +19,12 @@ export function sandboxImageStatusLabel(reply: SandboxImageStatus | { error: str
   }
 }
 
-/** The status label for `image` (empty: the default image), or null until it is answered. The
- *  first answered check skips the Daemon's cache; an edited image is re-checked once typing stops. */
+/** The status label for `image` (empty: the default image), or null until it is answered. Only the
+ *  first check runs at once; an edited image is re-checked once typing stops, even while that first
+ *  check is pending. The first answered check skips the Daemon's cache. */
 export function useSandboxImageRowStatus(image: string, enabled: boolean): string | null {
   const [answer, setAnswer] = useState<{ image: string; label: string } | null>(null);
+  const started = useRef(false);
   const answered = useRef(false);
   useEffect(() => {
     if (!enabled) return;
@@ -33,7 +35,8 @@ export function useSandboxImageRowStatus(image: string, enabled: boolean): strin
       answered.current = true;
       setAnswer({ image, label: sandboxImageStatusLabel(reply) });
     };
-    const timer = answered.current ? setTimeout(check, IMAGE_RECHECK_MS) : null;
+    const timer = started.current ? setTimeout(check, IMAGE_RECHECK_MS) : null;
+    started.current = true;
     if (!timer) void check();
     return () => {
       cancelled = true;

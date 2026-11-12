@@ -69,19 +69,21 @@ describe("useSandboxImageRowStatus", () => {
     expect(result.current).toBe("Up to date");
   });
 
-  it("drops a late answer for a previous image", async () => {
+  it("waits for typing to stop while the first check is pending, and drops that late answer", async () => {
     let answerFirst: (s: SandboxImageStatus) => void = () => {};
     fetchStatus.mockReturnValueOnce(new Promise((resolve) => (answerFirst = resolve)));
     const { result, rerender } = renderHook(({ image }) => useSandboxImageRowStatus(image, true), {
       initialProps: { image: "sb:1" },
     });
-    rerender({ image: "sb:2" });
+    for (const image of ["sb:2", "sb:22", "sb:222"]) rerender({ image });
     await settle();
+    expect(fetchStatus).toHaveBeenCalledTimes(1);
+    await act(async () => vi.advanceTimersByTime(IMAGE_RECHECK_MS));
+    // Nothing was answered yet, so the one re-check still skips the cache.
+    expect(fetchStatus.mock.calls.slice(1)).toEqual([["sb:222", { fresh: true }]]);
     expect(result.current).toBe("Up to date");
     // The first image's answer lands last and changes nothing.
     await act(async () => answerFirst(status({ state: "available", remote_digest: "sha256:b" })));
     expect(result.current).toBe("Up to date");
-    // Nothing was answered yet, so the edited image is still the opening check.
-    expect(fetchStatus.mock.calls.at(-1)).toEqual(["sb:2", { fresh: true }]);
   });
 });
