@@ -277,6 +277,8 @@ do not run Rust destructors.
 Private PTY restoration checks compare all four flag groups and control characters
 with a kernel-read baseline while the child holds terminal custody, before release
 and normal reaping.
+Current-thread frame-pump regressions await a future timer deadline so the HTTP
+producer can progress; readiness still requires a real window and emitted frame.
 
 If a terminated process leaves input unusable, run `stty sane` from the shell.
 Input repair does not reset display modes. For supported xterm-compatible terminals,

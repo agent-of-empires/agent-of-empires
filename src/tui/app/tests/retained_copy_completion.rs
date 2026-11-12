@@ -143,6 +143,8 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
             {
                 break;
             }
+            // Let the current-thread HTTP producer progress between synchronous frame pumps.
+            ticker.reset();
         }
         // Observe the acknowledged frame's bytes without capturing its replacement.
         phase = "observe-emitted-content";
@@ -165,7 +167,7 @@ async fn retained_admitted_copy_reports_completion_after_presentation_invalidati
         panic!(
             "initial retained scene timed out: phase={phase}; ready={}; pending={}; \
              window_offset={:?}; pane={:?}; total_lines={}; bytes={}; parsed={}; \
-             content_present={}; content={:.240}",
+             content_present={}; content={:.2400}",
             app.home.presentation_ready,
             app.pending_presentation.is_some(),
             app.home
