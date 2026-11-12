@@ -2269,6 +2269,7 @@ mod tests {
         });
         let approval = crate::acp::permissions::build_approval(
             ToolCall {
+                prompt: None,
                 id: "pending".into(),
                 name: "shell".into(),
                 kind: "execute".into(),
