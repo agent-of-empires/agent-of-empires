@@ -298,6 +298,20 @@ describe("setup sheet", () => {
     expect(onFinished).toHaveBeenCalled();
   });
 
+  it("stops polling with an error and a Retry when the snapshot cannot be loaded", async () => {
+    await openSheet();
+    await approveInstall();
+    api.fetchSuggestions.mockResolvedValue(null);
+    fireEvent.click(await screen.findByText("close-job"));
+    expect((await screen.findByTestId("suggestions-setup-load-error")).textContent).toContain(
+      "Could not load suggestions",
+    );
+    expect(screen.queryByTestId("suggestions-setup-waiting")).toBeNull();
+    api.fetchSuggestions.mockResolvedValue(snapshot([provider({ checks: [check("a", "ok")] })]));
+    fireEvent.click(screen.getByTestId("suggestions-setup-retry"));
+    await waitFor(() => expect(screen.queryByTestId("suggestions-setup-load-error")).toBeNull());
+  });
+
   it("draws a provider's fetch error as a failed row, and does not call it done", async () => {
     await openSheet();
     await approveInstall();
