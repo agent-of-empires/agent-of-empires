@@ -19,7 +19,8 @@ pr_number() {
   echo "$pr"
 }
 
-# gate <branch> <has release label> <pr head> <group head>
+# gate <branch> <same repo> <pr head> <group head>
+# Same rule as release-plz.yml's Tag release job.
 gate() {
   if [[ $2 != true || $1 != release-plz-* ]]; then
     echo "Not a release PR."
@@ -43,13 +44,13 @@ gate() {
 }
 
 run() {
-  local pr branch release head
+  local pr branch same_repo head
   pr="$(pr_number "$HEAD_REF")"
   IFS=$'\t' read -r branch release head < <(
-    gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid,labels \
-      --jq '[.headRefName, (any(.labels[]; .name == "release") | tostring), .headRefOid] | @tsv'
+    gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json headRefName,headRefOid,isCrossRepository \
+      --jq '[.headRefName, (.isCrossRepository | not | tostring), .headRefOid] | @tsv'
   )
-  gate "$branch" "$release" "$head" "$GROUP_HEAD"
+  gate "$branch" "$same_repo" "$head" "$GROUP_HEAD"
 }
 
 self_test() {
@@ -86,7 +87,7 @@ self_test() {
   ok "fails a stale release PR and lists its missed commits"
 
   gate feature/x true "$rel" "$stale" >/dev/null || fail "gated a non-release branch"
-  gate release-plz-x false "$rel" "$stale" >/dev/null || fail "gated a PR without the release label"
+  gate release-plz-x false "$rel" "$stale" >/dev/null || fail "gated a fork PR"
   ok "skips non-release PRs"
   trap - EXIT
   rm -rf "$dir"
