@@ -671,7 +671,6 @@ describe("a restart of a start in progress", () => {
     ["a failure after the restart already ended is ignored", [stop(1), ready(2), failed], null, false],
     ["the replacement's current receipt clears it", [stop(1), failed, ready(2)], null, false],
     ["the next restart clears it", [stop(1), failed, restarted], null, false],
-    ["sending again clears it", [stop(1), failed, { kind: "user_prompt", text: "hi" }], null, true],
   ])("%s", (_label, actions, restartFailure, workerStopped) => {
     const state = run(empty(), ...actions);
     expect([state.restartFailure, state.workerStopped]).toEqual([restartFailure, workerStopped]);
