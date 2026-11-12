@@ -337,7 +337,10 @@ impl DeclaredAgent {
             session_support: support,
             fork_strategy: ForkStrategy::Unsupported,
             host_only: launch.host_only,
-            send_keys_enter_delay_ms: 0,
+            // A plugin-declared agent has no entry in the built-in table, so a
+            // paste-burst window it cannot describe would cost it every
+            // submitted message. The declaration carries it instead (API 22).
+            send_keys_enter_delay_ms: entry.send_keys_enter_delay_ms,
             ready_marker: None,
             install_hint: launch.install_hint.as_deref().unwrap_or(&entry.tool),
             permission_response,
@@ -349,6 +352,24 @@ impl DeclaredAgent {
     fn plugin_id(&self) -> &str {
         self.registry.all()[self.plugin_index].id()
     }
+}
+
+/// Pause before the Enter that submits a message for this session's agent.
+///
+/// A plugin-declared agent's own value wins; everything else keeps the built-in
+/// table's answer (Claude and Codex 150 ms, anything unlisted 0). Resolving it
+/// here rather than in `agents::send_keys_enter_delay` keeps the declaration and
+/// its consumer in one module.
+pub(crate) fn send_keys_enter_delay(instance: &Instance) -> u64 {
+    if let Some(agent) = instance.declared_agent() {
+        if let Some(delay) = agent.with_definition(|definition| definition.send_keys_enter_delay_ms)
+        {
+            if delay > 0 {
+                return delay;
+            }
+        }
+    }
+    crate::agents::send_keys_enter_delay(&instance.tool)
 }
 
 pub(crate) fn declared_agent<'a>(
@@ -1232,6 +1253,10 @@ oneshot_flag = "-p"
     }
 
     fn install_test_integration(plugin_id: &str, tool: &str) {
+        install_test_integration_with(plugin_id, tool, 19, "");
+    }
+
+    fn install_test_integration_with(plugin_id: &str, tool: &str, api_version: u32, extra: &str) {
         use crate::session::{CapabilityGrant, PluginConfig};
 
         let manifest = format!(
@@ -1239,7 +1264,7 @@ oneshot_flag = "-p"
 id = "{plugin_id}"
 name = "Integration test"
 version = "1.0.0"
-api_version = 19
+api_version = {api_version}
 capabilities = ["session.integration"]
 
 [[agent_integrations]]
@@ -1247,7 +1272,7 @@ tool = "{tool}"
 command = "{tool}"
 provider_versions = ["^18"]
 replies = true
-"#
+{extra}"#
         );
         let dir = super::super::plugins_dir().unwrap().join(plugin_id);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1268,6 +1293,40 @@ replies = true
             );
         })
         .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_declaration_carries_its_enter_delay_into_the_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        install_test_integration_with(
+            "acme.delay",
+            "delay-helper",
+            22,
+            "send_keys_enter_delay_ms = 150\n",
+        );
+        let registry = super::super::reload_registry();
+        let agent = declared_agent(registry, "delay-helper", std::iter::empty()).unwrap();
+        assert_eq!(
+            agent.with_definition(|definition| definition.send_keys_enter_delay_ms),
+            Some(150)
+        );
+
+        // A declaration that says nothing about pacing keeps the built-in answer.
+        install_test_integration("acme.nodelay", "nodelay-helper");
+        let registry = super::super::reload_registry();
+        let agent = declared_agent(registry, "nodelay-helper", std::iter::empty()).unwrap();
+        assert_eq!(
+            agent.with_definition(|definition| definition.send_keys_enter_delay_ms),
+            Some(0)
+        );
     }
 
     #[test]

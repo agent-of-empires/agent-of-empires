@@ -658,7 +658,7 @@ pub async fn live_terminal_ws(
     let target = instances.iter().find(|i| i.id == id).map(|inst| {
         (
             crate::tmux::Session::resolve_name(&inst.id, &inst.title),
-            crate::agents::send_keys_enter_delay(&inst.tool),
+            crate::plugin::agent_integration::send_keys_enter_delay(inst),
         )
     });
     drop(instances);
