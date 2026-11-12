@@ -4236,6 +4236,47 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     );
 }
 
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+// Source discovery can open the repo through libgit2, so a main checkout shared by many
+// sessions must be discovered once per request, not on every cache hit.
+#[test]
+#[serial_test::serial]
+fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    run_git(repo.path(), &["init", "-q"]);
+    let path = repo.path().to_str().unwrap();
+
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&misses);
+    for _ in 0..3 {
+        cache.resolve("default", path);
+        cache.structured_view("default", path);
+    }
+
+    assert_eq!(cache.discoveries, 1);
+    assert_eq!(misses.load(Ordering::Relaxed), 1);
+}
+
 // Regression witness for #5610: sessions in linked worktrees of one repo read the
 // same repo config, so they must share one resolution instead of one per worktree.
 #[tokio::test]
@@ -4247,29 +4288,13 @@ async fn list_sessions_resolves_config_once_per_repo_across_linked_worktrees() {
     let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
     let repo = tempfile::tempdir().expect("tempdir repo");
     let main = repo.path().join("main");
-    let git = |dir: &std::path::Path, args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args([
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "-c",
-                "init.defaultBranch=main",
-            ])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("run git");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    };
     std::fs::create_dir(&main).unwrap();
-    git(&main, &["init", "-q"]);
-    git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    run_git(&main, &["init", "-q"]);
+    run_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
     let sessions: Vec<Instance> = (0..3)
         .map(|i| {
             let worktree = repo.path().join(format!("wt{i}"));
-            git(
+            run_git(
                 &main,
                 &[
                     "worktree",
