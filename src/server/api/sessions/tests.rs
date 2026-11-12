@@ -10092,6 +10092,15 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     .unwrap();
     crate::session::Storage::new_unwatched("chosen-default").unwrap();
     let (launcher, _launches) = crate::server::test_support::counting_failing_launcher();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
     let state = crate::server::test_support::build_test_app_state_impl(
         Vec::new(),
         Vec::new(),
@@ -10100,6 +10109,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         false,
         |state| {
             state.profile = std::sync::RwLock::new(crate::session::config::effective_profile(""));
+            state.plugin_host = Some(host);
         },
         |supervisor| supervisor.with_launcher(launcher),
     );
@@ -10109,7 +10119,7 @@ async fn create_persists_initial_prompt_as_pending_turn() {
         serde_json::json!({
             "title": "with-prompt", "path": "", "tool": "claude",
             "scratch": true, "view": "structured", "initial_prompt": "fix the bug",
-            "suggestion": { "provider_id": "acme.github", "id": "42" },
+            "suggestion": { "provider_id": "acme.gh", "id": "42" },
         }),
     )
     .await;
@@ -10121,8 +10131,62 @@ async fn create_persists_initial_prompt_as_pending_turn() {
     let origin = instances[0].suggestion.as_ref().expect("linked");
     assert_eq!(
         (origin.provider_id.as_str(), origin.id.as_str()),
-        ("acme.github", "42")
+        ("acme.gh", "42")
     );
+}
+
+#[tokio::test]
+async fn create_rejects_a_suggestion_that_is_not_published() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let _registry = crate::server::api::suggestions_tests::register_provider();
+    let host = crate::plugin::host::PluginHost::new(
+        &crate::session::get_app_dir().unwrap().join("host"),
+        "default",
+        None,
+        Arc::new(crate::server::runtime::RuntimeWork::default()),
+    )
+    .unwrap();
+    crate::server::api::suggestions_tests::seed_item_on(&host, "42", None, "42");
+    let with_host = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |state| state.plugin_host = Some(host),
+        |supervisor| supervisor,
+    );
+    let without_host = crate::server::test_support::build_test_app_state_impl(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        false,
+        |_| {},
+        |supervisor| supervisor,
+    );
+    for (state, provider, id) in [
+        (&with_host, "acme.gh", "gone"),
+        (&with_host, "nobody.else", "42"),
+        (&without_host, "acme.gh", "42"),
+    ] {
+        let (status, body) = post_create(
+            state,
+            serde_json::json!({
+                "title": "unpublished", "path": "", "tool": "claude",
+                "scratch": true, "view": "structured",
+                "suggestion": { "provider_id": provider, "id": id },
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::CONFLICT,
+            "{provider} {id}: {body}"
+        );
+        assert_eq!(body["error"], "stale_suggestion");
+        assert!(state.instances.read().await.is_empty());
+    }
 }
 
 #[tokio::test]
