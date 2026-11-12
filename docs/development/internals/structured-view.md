@@ -179,6 +179,10 @@ Nested structured views borrow the remote owner's terminal and executor, so
 returning to the picker does not disable raw input. Abort and fatal termination
 do not run Rust destructors.
 
+Private PTY restoration checks compare all four flag groups and control characters
+with a kernel-read baseline while the child holds terminal custody, before release
+and normal reaping.
+
 Lock admission and final display cleanup share a 250 ms deadline. This is bounded
 best-effort emission, not confirmed restoration. Permanently stalled output can
 prevent delivery before exit; unwritten controls disappear with the process.

@@ -157,6 +157,15 @@ fn startup_case(test: &str, remote: bool, unwind: bool) {
         unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &settings) },
         0
     );
+    // Kernel readback is the baseline; tcsetattr may normalize requested flags.
+    let effective = modes(slave.as_raw_fd()).unwrap();
+    let effective_fields = (
+        effective.c_iflag,
+        effective.c_oflag,
+        effective.c_cflag,
+        effective.c_lflag,
+        effective.c_cc,
+    );
     let listener_path = home.path().join("startup-custody.sock");
     let custody_listener = UnixListener::bind(listener_path).unwrap();
     custody_listener.set_nonblocking(true).unwrap();
@@ -262,10 +271,28 @@ fn startup_case(test: &str, remote: bool, unwind: bool) {
                     // Darwin revokes the PTY on session-leader exit: observe it while held alive.
                     match modes(slave.as_raw_fd()) {
                         Ok(actual) => {
-                            let restored = actual.c_lflag == settings.c_lflag;
-                            parent_modes = Some(actual);
+                            let actual_fields = (
+                                actual.c_iflag,
+                                actual.c_oflag,
+                                actual.c_cflag,
+                                actual.c_lflag,
+                                actual.c_cc,
+                            );
+                            let restored = actual_fields == effective_fields;
+                            parent_modes = Some(actual_fields);
                             if !restored {
-                                failure = Some("parent observed unrestored terminal flags".into());
+                                failure = Some(format!(
+                                    "parent observed unrestored terminal modes \
+                                     (iflag, oflag, cflag, lflag, c_cc): requested={:?}, \
+                                     effective={effective_fields:?}, actual={actual_fields:?}",
+                                    (
+                                        settings.c_iflag,
+                                        settings.c_oflag,
+                                        settings.c_cflag,
+                                        settings.c_lflag,
+                                        settings.c_cc
+                                    )
+                                ));
                                 break None;
                             }
                         }
@@ -314,7 +341,7 @@ fn startup_case(test: &str, remote: bool, unwind: bool) {
         String::from_utf8_lossy(&emitted),
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(parent_modes.unwrap().c_lflag, settings.c_lflag);
+    assert_eq!(parent_modes.unwrap(), effective_fields);
 }
 
 #[test]
