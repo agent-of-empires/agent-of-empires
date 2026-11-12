@@ -274,6 +274,10 @@ Nested structured views borrow the remote owner's terminal and executor, so
 returning to the picker does not disable raw input. Abort and fatal termination
 do not run Rust destructors.
 
+Private PTY restoration checks compare all four flag groups and control characters
+with a kernel-read baseline while the child holds terminal custody, before release
+and normal reaping.
+
 If a terminated process leaves input unusable, run `stty sane` from the shell.
 Input repair does not reset display modes. For supported xterm-compatible terminals,
 `printf '\030\033\\\033[?2026l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1049l\033[0m\033[?25h'`
