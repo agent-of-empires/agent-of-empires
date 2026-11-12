@@ -766,6 +766,7 @@ mod tests {
         }
         fn tool_call(id: &str) -> ToolCall {
             ToolCall {
+                prompt: None,
                 id: id.to_string(),
                 name: "Terminal".to_string(),
                 kind: "execute".to_string(),

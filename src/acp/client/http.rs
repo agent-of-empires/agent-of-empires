@@ -1508,6 +1508,7 @@ mod tests {
                     name: "Ask".into(),
                     kind: "execute".into(),
                     args_preview: "{}".into(),
+                    prompt: None,
                     started_at: at,
                     parent_tool_call_id: None,
                     memory_recall: None,

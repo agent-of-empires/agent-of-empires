@@ -5,16 +5,24 @@ import { createContext, useContext, useMemo } from "react";
 import { subagentStatus, type BackgroundAgent, type SubagentRecord, type WorkflowRun } from "../../lib/acpTypes";
 
 export interface BackgroundAgentsContextValue {
+  sessionId?: string;
   agents: BackgroundAgent[];
   subagents?: SubagentRecord[];
   /** Stops one subagent; failures surface as a session error. */
   cancelSubagent?: (childId: string) => Promise<void>;
   workflowRuns?: Record<string, WorkflowRun>;
   backgroundTasks?: string[];
-  openPane?: () => void;
+  /** Opens the Sub agents pane, on one agent's detail when given its id. */
+  openPane?: (agentId?: string) => void;
+  /** Cancel is unavailable: a read-only server or a trashed/archived session. */
+  readOnly?: boolean;
 }
 
 export const BackgroundAgentsContext = createContext<BackgroundAgentsContextValue>({ agents: [] });
+
+export function useBackgroundAgentsContextValue(): BackgroundAgentsContextValue {
+  return useContext(BackgroundAgentsContext);
+}
 
 export function useBackgroundAgentFor(toolCallId: string | undefined): BackgroundAgent | undefined {
   const { agents } = useContext(BackgroundAgentsContext);
@@ -98,7 +106,7 @@ export function workflowRunning(
   return run ? !run.finished && backgroundTasks.includes(run.taskId) : agents.some(isActiveAgent);
 }
 
-export function useOpenBackgroundAgentsPane(): (() => void) | undefined {
+export function useOpenBackgroundAgentsPane(): ((agentId?: string) => void) | undefined {
   return useContext(BackgroundAgentsContext).openPane;
 }
 

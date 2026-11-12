@@ -152,17 +152,50 @@ AoE reports this fresh result only after the new association, or the cleared ass
 
 To retry the original conversation through the restart cascade, first restore its original configuration and store, then run `aoe session set-session-id <session> <native-id>`, using `--store` with the exact store or transcript where required. That assertion clears the failure marker. An intentional configured-fresh restart remains available; use the empty-ID command below for a one-shot fresh conversation.
 
-Direct `aoe session start` keeps its separate policy: it may retry a previously failed ID when native execution and target validation succeed. It performs that shared preflight before replacing an ordinary dead pane, but does not run the cascade's final resume probe. A successful start therefore does not prove that the native conversation loaded.
+Direct `aoe session start` keeps its separate policy: it may retry a previously
+failed ID when native execution and target validation succeed. It performs that
+shared preflight before replacing an ordinary dead pane, but does not run the
+cascade's final resume probe. A successful start therefore does not prove that the
+native conversation loaded.
 
-Terminal handoff additionally requires a physical receipt captured after pane creation and persisted under its owned launch generation before finalizing projection cleanup. A prepared launch payload, environment marker or healthy process is not a birth receipt. Missing evidence preserves the actual terminal, pending handoff and retained projection across maintenance and restart.
+Terminal handoff additionally requires a physical receipt captured after pane
+creation and persisted under its owned launch generation before finalizing
+projection cleanup. A prepared launch payload, environment marker or healthy
+process is not a birth receipt. Missing evidence preserves the actual terminal,
+pending handoff and retained projection across maintenance and restart.
 
-To recover an unproven terminal handoff, close its exact pane explicitly in tmux first. Then use `aoe session set-session-id <session> <native-id> --store /absolute/native/store`, or `aoe session set-session-id <session> ""` to select fresh. The command refuses a live pane, an unproven corpse, an incomplete tmux inventory or an original structured worker whose retirement is unproven. After confirmed absence, it records a new target generation without attesting the old birth. Retry the terminal-view switch to launch that target once and finish projection cleanup. Selecting a target neither recovers nor deletes the original native history.
+To recover an unproven terminal handoff, close its exact pane explicitly in tmux
+first. Then use
+`aoe session set-session-id <session> <native-id> --store /absolute/native/store`,
+or `aoe session set-session-id <session> ""` to select fresh. The command refuses a
+live pane, an unproven corpse, an incomplete tmux inventory or an original
+structured worker whose retirement is unproven. After confirmed absence, it
+records a new target generation without attesting the old birth. Retry the
+terminal-view switch to launch that target once and finish projection cleanup.
+Selecting a target neither recovers nor deletes the original native history.
 
-Recovery inventories every pane on the captured physical socket, without AoE-name, pane-index or first-window filtering. Renaming a pane or moving it between windows does not prove that it closed. Before dispatch, a durable census records pre-existing panes, including proven dead peers without a live birth; live peers require a captured birth. That negative evidence permits peers with unchanged pane IDs, PIDs and birth identities to remain after an unrecorded launch is explicitly closed; it never attests the launch itself. Missing legacy scope evidence, new or changed peers, and incomplete inspections refuse target selection rather than guessing that a missing receipt means absence.
+Recovery inventories every pane on the captured physical socket, without
+AoE-name, pane-index or first-window filtering. Renaming a pane or moving it
+between windows does not prove that it closed. Before dispatch, a durable census
+records pre-existing panes, including proven dead peers without a live birth;
+live peers require a captured birth. That negative evidence permits peers with
+unchanged pane IDs, PIDs and birth identities to remain after an unrecorded launch
+is explicitly closed; it never attests the launch itself. Missing legacy scope
+evidence, new or changed peers, and incomplete inspections refuse target
+selection rather than guessing that a missing receipt means absence.
 
-The recovery command separately checks the strict current Native registry and control-socket peer, the captured Original retirement, and the target's recorded scope obligations. A replaced Native identity, a live owned scope or an unknown inspection refuses selection; recovery never stops an unrelated new peer. An empty pane inventory is not Native process-retirement authority.
+The recovery command separately checks the strict current Native registry and
+control-socket peer, the captured Original retirement, and the target's recorded
+scope obligations. A replaced Native identity, a live owned scope or an unknown
+inspection refuses selection; recovery never stops an unrelated new peer. An
+empty pane inventory is not Native process-retirement authority.
 
-An unscoped launch has no recorded cgroup proof. The command cannot verify shutdown of an unregistered Native agent or arbitrary detached subprocess outside its captured ownership. If such work may survive closing the pane, externally settle that exact execution and retain independent evidence before selecting another target. `set-session-id` does not attest this external prerequisite, upgrade missing evidence or authorize killing those processes.
+An unscoped launch has no recorded cgroup proof. The command cannot verify
+shutdown of an unregistered Native agent or arbitrary detached subprocess
+outside its captured ownership. If such work may survive closing the pane,
+externally settle that exact execution and retain independent evidence before
+selecting another target. `set-session-id` does not attest this external
+prerequisite, upgrade missing evidence or authorize killing those processes.
 
 A direct-start indeterminate refusal releases only its captured, still-owned Launch reservation, without cleanup or changes to the pending handoff. After an unrelated split is removed, an immediate explicit retry is not held by that refused start. A superseding generation keeps its own reservation; failed release preserves the refusal and runtime rather than granting teardown authority.
 
