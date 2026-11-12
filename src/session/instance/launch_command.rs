@@ -1899,6 +1899,13 @@ instruction_flag = "--prompt={}"
         ]);
         let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
         install_shell_syntax_declarations();
+        // The declaration's binary must resolve, so the refusal under test is the
+        // one that fires rather than a missing-binary error.
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "helper",
+            "#!/bin/sh\nexit 0\n",
+        );
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
 
