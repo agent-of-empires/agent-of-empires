@@ -1515,7 +1515,27 @@ mod tests {
                     .id;
                 assert!(state.session_service.cancel_creation(&id));
                 if pull == Some("finish") {
-                    std::fs::write(&pull_gate, "\n").unwrap();
+                    // A blocking open would hang forever if the grace kill already took the reader.
+                    use std::io::Write as _;
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    let mut gate = loop {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .custom_flags(libc::O_NONBLOCK)
+                            .open(&pull_gate)
+                        {
+                            Ok(gate) => break gate,
+                            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "the fake pull stopped reading before its gate opened"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                            Err(err) => panic!("opening the pull gate: {err}"),
+                        }
+                    };
+                    gate.write_all(b"\n").unwrap();
                 }
                 pull_pid = Some(
                     std::fs::read_to_string(&pulling)
