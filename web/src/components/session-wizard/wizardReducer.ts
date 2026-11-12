@@ -41,6 +41,7 @@ export interface WizardData {
   /** Per extra repo base branch, keyed by path; outranks `baseBranch`. */
   repoBases: Record<string, string>;
   customInstruction: string;
+  initialPrompt: string;
   extraArgs: string;
   commandOverride: string;
   /** Set when the user edits an agent-step field after defaults were applied. */
@@ -148,6 +149,7 @@ export const initialData: WizardData = {
   repoBases: {},
   profileDirty: false,
   customInstruction: "",
+  initialPrompt: "",
   extraArgs: "",
   commandOverride: "",
   scratch: false,
