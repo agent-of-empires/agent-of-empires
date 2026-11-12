@@ -332,7 +332,7 @@ describe("provider source settings", () => {
   ];
 
   // Saves the way SettingsView's Plugins tab does: the settings store over PATCH /api/settings.
-  function PluginHarness() {
+  function PluginHarness({ readOnly = false }: { readOnly?: boolean }) {
     const { snapshot, failed, reload } = useSuggestionsSnapshot();
     const { settings } = useProfileSettings("main");
     return (
@@ -340,7 +340,7 @@ describe("provider source settings", () => {
         snapshot={snapshot}
         failed={failed}
         reload={reload}
-        readOnly={false}
+        readOnly={readOnly}
         pluginSettings={{
           schema: SCHEMA,
           settings,
@@ -373,6 +373,16 @@ describe("provider source settings", () => {
         "main",
       ),
     );
+  });
+
+  it("keeps a provider's source settings visible but disabled when read-only", async () => {
+    resetSettingsStore();
+    api.fetchSuggestions.mockResolvedValue(snapshot());
+    api.fetchSettings.mockResolvedValue({ plugins: { gh: { settings: { suggestion_ignore: "acme" } } } });
+    await loadSettings("main");
+    render(<PluginHarness readOnly />);
+    const section = await screen.findByRole("region", { name: "GitHub source settings" });
+    expect(within(section).getByDisplayValue("acme").matches(":disabled")).toBe(true);
   });
 });
 

@@ -334,15 +334,18 @@ export function SuggestionsSettings({
         </DndContext>
       </section>
 
-      {pluginSettings &&
-        providers.map((provider) => (
-          <PluginSuggestionSettings
-            key={provider.id}
-            pluginId={provider.id}
-            title={`${provider.name} source settings`}
-            {...pluginSettings}
-          />
-        ))}
+      {pluginSettings && (
+        <fieldset disabled={readOnly} className="m-0 min-w-0 space-y-6 border-0 p-0">
+          {providers.map((provider) => (
+            <PluginSuggestionSettings
+              key={provider.id}
+              pluginId={provider.id}
+              title={`${provider.name} source settings`}
+              {...pluginSettings}
+            />
+          ))}
+        </fieldset>
+      )}
 
       <div className="divide-y divide-surface-700/40">
         <Row title="Refresh every" description="Providers can refresh less often if they need to.">
