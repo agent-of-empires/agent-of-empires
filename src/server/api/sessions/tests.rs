@@ -8827,6 +8827,36 @@ fn resolve_hook_plan_refuses_untrusted_repo_hooks_until_trusted() {
 
 #[test]
 #[serial_test::serial]
+fn skipping_on_create_reports_only_commands_it_skipped() {
+    let temp_home = tempfile::tempdir().unwrap();
+    let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());
+    let project = tempfile::tempdir().unwrap();
+    let with_create = crate::session::HooksConfig {
+        on_create: vec!["echo setup".into()],
+        ..Default::default()
+    };
+    let launch_only = crate::session::HooksConfig {
+        on_launch: vec!["echo launch".into()],
+        ..Default::default()
+    };
+    for (base, skip, skipped, runs) in [
+        (&with_create, true, true, vec![]),
+        (&with_create, false, false, vec!["echo setup"]),
+        (&launch_only, true, false, vec![]),
+    ] {
+        let mut plan =
+            resolve_create_hook_plan("default", base, project.path(), false, None, None).unwrap();
+        assert_eq!(
+            plan.apply_skip_on_create(skip),
+            skipped,
+            "{base:?} skip={skip}"
+        );
+        assert_eq!(plan.on_create(), runs, "{base:?} skip={skip}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
 fn resolve_hook_plan_distinguishes_approval_from_skip() {
     let temp_home = tempfile::tempdir().unwrap();
     let _home = crate::session::test_support::isolate_app_dir_at(temp_home.path());

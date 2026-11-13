@@ -556,10 +556,17 @@ pub(crate) struct CreateHookPlan {
     /// Repo hooks replace global and profile ones per type, so this is per type too.
     pub(crate) on_create_from_repo: bool,
     /// The caller chose to create without setup: no `on_create` hook runs.
-    pub(crate) skip_on_create: bool,
+    skip_on_create: bool,
 }
 
 impl CreateHookPlan {
+    /// Applies the caller's skip choice; true when it skips `on_create` commands.
+    pub(crate) fn apply_skip_on_create(&mut self, skip: bool) -> bool {
+        let skipped = skip && !self.on_create().is_empty();
+        self.skip_on_create = skip;
+        skipped
+    }
+
     pub(crate) fn on_create(&self) -> &[String] {
         if self.skip_on_create {
             return &[];

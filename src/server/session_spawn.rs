@@ -196,8 +196,7 @@ pub(crate) async fn spawn_structured_session(
             trust_hooks,
             trust_review.as_ref(),
         )?;
-        let created_without_setup = skip_on_create && !hook_plan.on_create().is_empty();
-        hook_plan.skip_on_create = skip_on_create;
+        let created_without_setup = hook_plan.apply_skip_on_create(skip_on_create);
         if let Some((hooks_hash, mcp_hash)) = &hook_plan.trust_write {
             crate::session::config::repo_config::trust_repo(
                 std::path::Path::new(&original_path), hooks_hash.as_deref(), mcp_hash.as_deref(),
