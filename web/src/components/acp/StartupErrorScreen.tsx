@@ -135,9 +135,8 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     testId: "startup-error-recreate-container",
     disabled: busy,
   };
-  // A new image can fix every kind of refusal, and a new container also starts a stopped one. Waits for
-  // install-info, whose read-only and CityHall answers hide the whole action row.
-  const canRecreate = info?.sandboxed === true && recreateContainerTitle !== undefined;
+  // Waits for install-info, which also names the read-only and CityHall dashboards the server would refuse.
+  const canRecreate = info?.sandboxed === true && !observer && recreateContainerTitle !== undefined;
   const secondary = [...(webInstall && !containerDown ? [checkAgain] : []), ...(canRecreate ? [recreate] : [])];
 
   return (
@@ -275,8 +274,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
                 <p>
                   Refreshing the Sandbox image fixes new Sessions only: this Session's container keeps the image it
                   started with. When a newer image is published and update checks are on, the dashboard's "Sandbox image
-                  update available" banner offers Update now to pull it, or shows the command to run. Recreate container
-                  restarts this Session on the current image and discards changes made inside its container.
+                  update available" banner offers Update now to pull it, or shows the command to run.
+                  {canRecreate &&
+                    " Recreate container restarts this Session on the current image; files outside the Working directory and mounted folders are lost."}
                 </p>
               )}
               <p>

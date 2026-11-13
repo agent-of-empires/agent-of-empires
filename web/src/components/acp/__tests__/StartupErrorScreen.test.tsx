@@ -574,6 +574,21 @@ describe("StartupErrorScreen", () => {
     }
   });
 
+  it.each([
+    ["offered", info(sandbox), { recreateContainerTitle: "api-server" }, true],
+    ["not eligible", info(sandbox), {}, false],
+    ["read-only", info({ ...sandbox, install_blocked: "read_only" }), { recreateContainerTitle: "api-server" }, false],
+  ] as const)(
+    "Details describes Recreate container only where it's offered: %s",
+    async (_label, answer, props, shown) => {
+      const { getByTestId } = await renderScreen(incompatible(), answer, props);
+      fireEvent.click(getByTestId("startup-error-details"));
+      const text = getByTestId("startup-error-details-body").textContent ?? "";
+      expect(text).toContain("keeps the image it started with");
+      expect(text.includes("Recreate container restarts this Session on the current image")).toBe(shown);
+    },
+  );
+
   it("Recreate container opens the Session menu's confirmation, and Cancel sends nothing", async () => {
     const { getByTestId, findByRole, queryByRole } = await renderScreen(incompatible(), info(sandbox), {
       recreateContainerTitle: "api-server",
