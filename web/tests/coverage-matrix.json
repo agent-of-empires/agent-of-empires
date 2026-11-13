@@ -5580,6 +5580,55 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sessions.error-recorded",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/session-error.spec.ts",
+        "src/components/__tests__/SessionErrorPanel.test.tsx",
+        "src/components/__tests__/LiveTerminalView.errorHold.test.tsx"
+      ],
+      "components": ["web/src/components/SessionErrorPanel.tsx", "web/src/components/LiveTerminalView.tsx"],
+      "notes": "Opening a Terminal view Error Session shows <Session> reported an error with AoE's last_error verbatim, Copy error and Restart, instead of ensuring it, which would restart it and clear the error (#5055). Tapping the row reaches it on a phone. Restart starts the terminal once the Session leaves Error; read-only shows no Restart."
+    },
+    {
+      "id": "sessions.error-none-recorded",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/session-error.spec.ts", "src/components/__tests__/SessionErrorPanel.test.tsx"],
+      "components": ["web/src/components/SessionErrorPanel.tsx"],
+      "notes": "An Error Session without a last_error (or a whitespace-only one) says No details were recorded. Restart to try again. and offers no Copy."
+    },
+    {
+      "id": "sessions.error-deleting",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": [
+        "src/components/__tests__/SessionErrorPanel.test.tsx",
+        "src/components/__tests__/LiveTerminalView.errorHold.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx"
+      ],
+      "components": ["web/src/components/SessionErrorPanel.tsx", "web/src/components/sidebar/SessionRow.tsx"],
+      "notes": "An Error Session deleted from its panel keeps the panel without Restart. A Deleting row's glyph tooltip reads Deleting…."
+    },
+    {
+      "id": "sidebar.error-tooltip-and-badge",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "tests/session-error.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SidebarGroupHeader.test.tsx",
+        "src/lib/__tests__/statusLegend.test.ts"
+      ],
+      "components": [
+        "web/src/components/sidebar/SessionRow.tsx",
+        "web/src/components/sidebar/SidebarGroupHeader.tsx",
+        "web/src/lib/statusLegend.ts"
+      ],
+      "notes": "A Terminal view Error row's glyph tooltip reads Error plus the first line of last_error, or Error · no details recorded, and the glyph is described by that line. A Structured view Error row keeps its generic meaning. The Group badge says 3 Sessions need attention · 2 have errors, or 2 Sessions have errors when all are errors."
+    },
+    {
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
