@@ -324,6 +324,24 @@ pub struct ConfigOptionSwitchFailure {
     pub reason: String,
 }
 
+/// A startup failure aoe has diagnosed; clients branch on it instead of the message.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartupCause {
+    /// The sandboxed Session's container no longer exists, so a respawn can't reach it.
+    ContainerMissing,
+}
+
+impl Event {
+    /// An [`Event::AgentStartupError`] with no diagnosed cause.
+    pub fn startup_error(message: impl Into<String>) -> Self {
+        Self::AgentStartupError {
+            message: message.into(),
+            cause: None,
+        }
+    }
+}
+
 /// Why aoe refused a session whose adapter failed the compatibility check
 /// after `initialize`. `auto_install` means "Update & restart" can fix it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -939,6 +957,9 @@ pub enum Event {
     /// The agent failed to spawn or never completed `initialize`.
     AgentStartupError {
         message: String,
+        /// Set when aoe knows why, so clients never match `message` text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<StartupCause>,
     },
     /// `initialize` completed but the adapter failed the compatibility policy.
     IncompatibleAgent {
@@ -1699,9 +1720,7 @@ mod tests {
             warning: None,
             ended_at: Utc::now(),
         };
-        let startup_error = || Event::AgentStartupError {
-            message: "boom".into(),
-        };
+        let startup_error = || Event::startup_error("boom");
         let assigned = || Event::AcpSessionAssigned {
             acp_session_id: "a-1".into(),
         };
@@ -2113,6 +2132,31 @@ mod tests {
             }
         ));
 
+        let legacy: Event =
+            serde_json::from_value(serde_json::json!({ "AgentStartupError": { "message": "x" } }))
+                .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::AgentStartupError { cause: None, .. }
+        ));
+        for (event, wire) in [
+            (
+                Event::startup_error("x"),
+                serde_json::json!({ "AgentStartupError": { "message": "x" } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::ContainerMissing),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "container_missing" }
+                } }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+        }
+
         for (json, want) in [
             ("\"model\"", ConfigOptionCategory::Model),
             ("\"thought_level\"", ConfigOptionCategory::ThoughtLevel),
@@ -2144,9 +2188,7 @@ mod tests {
         assert!(!s.turn_active && s.thinking.is_none());
 
         for terminal in [
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
+            Event::startup_error("boom"),
             Event::PromptRuntimeError {
                 message: "boom".into(),
             },

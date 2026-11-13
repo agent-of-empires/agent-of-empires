@@ -162,6 +162,24 @@ impl ContainerRuntime {
         name: &str,
         command: &mut std::process::Command,
     ) -> Result<bool> {
+        self.container_exists_via(name, command, None)
+    }
+
+    /// [`Self::does_container_exist`] that kills the probe once `cancel` fires.
+    pub fn does_container_exist_until_cancelled(
+        &self,
+        name: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool> {
+        self.container_exists_via(name, &mut self.base.command(), Some(cancel))
+    }
+
+    fn container_exists_via(
+        &self,
+        name: &str,
+        command: &mut std::process::Command,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 command.args(["container", "inspect", name]);
@@ -171,7 +189,10 @@ impl ContainerRuntime {
                 command.args(["logs", name]);
             }
         }
-        let output = self.base.probe_output(command)?;
+        let output = match cancel {
+            Some(cancel) => self.base.probe_output_until_cancelled(command, cancel)?,
+            None => self.base.probe_output(command)?,
+        };
         if !output.status.success() {
             return self
                 .base

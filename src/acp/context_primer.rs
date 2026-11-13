@@ -607,9 +607,7 @@ mod tests {
         }
 
         // An unprocessed prompt is split out only when the agent never answered.
-        let startup_error = Event::AgentStartupError {
-            message: "ACP connection failed".into(),
-        };
+        let startup_error = Event::startup_error("ACP connection failed");
         // (events, unprocessed prompt, rendered turns)
         let cases = [
             (

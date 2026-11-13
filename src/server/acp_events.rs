@@ -2183,9 +2183,9 @@ mod tests {
             .send(AcpBroadcastFrame {
                 session_id: id.clone(),
                 seq: 7,
-                event: Arc::new(crate::acp::Event::AgentStartupError {
-                    message: "event store write failed at seq 7".into(),
-                }),
+                event: Arc::new(crate::acp::Event::startup_error(
+                    "event store write failed at seq 7",
+                )),
                 worker_generation: None,
                 sidebar_status: None,
             })
@@ -2687,12 +2687,7 @@ mod tests {
             (chunk("x"), Some(Authoritative)),
             (Event::ThinkingStarted, Some(Authoritative)),
             (stopped("prompt_complete"), Some(Authoritative)),
-            (
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
-                Some(Authoritative),
-            ),
+            (Event::startup_error("boom"), Some(Authoritative)),
             (
                 Event::ApprovalResolved {
                     nonce: Nonce("x".into()),

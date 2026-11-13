@@ -780,9 +780,7 @@ mod tests {
             last_text: None,
             at: chrono::Utc::now(),
         };
-        let startup_error = Event::AgentStartupError {
-            message: "boom".into(),
-        };
+        let startup_error = Event::startup_error("boom");
         // (events, in flight)
         let cases = [
             (vec![], false),

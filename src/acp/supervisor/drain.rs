@@ -29,7 +29,7 @@ use crate::acp::runner_lifecycle::{
 /// Bounds recovery of a live runner whose control channel closed.
 const CONTROL_REATTACH_ATTEMPTS: u32 = 3;
 const CONTROL_REATTACH_DEADLINE: Duration = Duration::from_secs(3);
-use crate::acp::state::{AcpSessionId, Event};
+use crate::acp::state::{AcpSessionId, Event, StartupCause};
 use crate::process::worker_registry;
 
 impl<S: BroadcastSink> Supervisor<S> {
@@ -256,11 +256,9 @@ impl<S: BroadcastSink> Drain<S> {
                                 self.sink.publish_from_worker(
                                     &self.session_id,
                                     seq,
-                                    &Event::AgentStartupError {
-                                        message: format!(
-                                            "Could not commit the isolated native context: {error}"
-                                        ),
-                                    },
+                                    &Event::startup_error(format!(
+                                        "Could not commit the isolated native context: {error}"
+                                    )),
                                     generation,
                                 )
                             });
@@ -530,9 +528,9 @@ impl<S: BroadcastSink> Drain<S> {
                 reason: "runner_control_lost".into(),
             });
         }
-        self.publish(Event::AgentStartupError {
-            message: "ACP connection failed: runner control channel closed".into(),
-        });
+        self.publish(Event::startup_error(
+            "ACP connection failed: runner control channel closed",
+        ));
     }
 
     /// Dials the runner until one attempt is installed. The client bounds the
@@ -724,14 +722,12 @@ impl<S: BroadcastSink> Drain<S> {
                     window_secs = RESTART_WINDOW.as_secs(),
                     "restart budget burned; parking session"
                 );
-                self.publish(Event::AgentStartupError {
-                    message: format!(
-                        "ACP agent crashed more than {} times in {}s; \
+                self.publish(Event::startup_error(format!(
+                    "ACP agent crashed more than {} times in {}s; \
                              not respawning. Use the web dashboard to retry.",
-                        MAX_RESPAWNS_IN_WINDOW,
-                        RESTART_WINDOW.as_secs()
-                    ),
-                });
+                    MAX_RESPAWNS_IN_WINDOW,
+                    RESTART_WINDOW.as_secs()
+                )));
             }
             RestartDecision::LeaveToReconciler => {
                 info!(
@@ -796,22 +792,52 @@ impl<S: BroadcastSink> Drain<S> {
         config.generation = respawn_lease.epoch();
         config.launch_lease = Some(respawn_lease.clone());
 
-        tokio::select! {
+        let container = config
+            .sandbox_info
+            .as_ref()
+            .filter(|sandbox| sandbox.enabled)
+            .map(|sandbox| sandbox.container_name.clone());
+        // The probe runs inside the backoff, so a healthy respawn waits no longer.
+        let container_gone = tokio::select! {
             biased;
-            _ = tokio::time::sleep(RESPAWN_BACKOFF) => {}
+            (_, gone) = async {
+                tokio::join!(tokio::time::sleep(RESPAWN_BACKOFF), async {
+                    match container {
+                        Some(name) => sandbox_container_gone(name).await,
+                        None => false,
+                    }
+                })
+            } => gone,
             _ = reservation.cancellation().cancelled() => {
                 if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
                     self.finish_cancelled(&respawn_lease, previous).await;
                 }
                 return None;
             }
-        }
+        };
         if worker_registry::stop_requested(session_id) {
             lock_recover(&self.lifecycle).begin_stop(session_id, "user_stopped", false);
         }
         let cancelled = lock_recover(&self.lifecycle).cancel_requested(&respawn_lease);
         if cancelled.is_some() {
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                self.finish_cancelled(&respawn_lease, previous).await;
+            }
+            return None;
+        }
+        // A respawn can't reach a removed container; only an explicit start rebuilds it.
+        if container_gone {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "sandbox container is gone; parking session instead of respawning"
+            );
+            if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
+                self.publish(Event::AgentStartupError {
+                    message: "This Session's sandbox container was removed. Start the Session again to create a new one."
+                        .into(),
+                    cause: Some(StartupCause::ContainerMissing),
+                });
                 self.finish_cancelled(&respawn_lease, previous).await;
             }
             return None;
@@ -841,11 +867,9 @@ impl<S: BroadcastSink> Drain<S> {
                         return None;
                     }
                     respawn_lease.owe_stop_completion(None);
-                    self.publish(Event::AgentStartupError {
-                        message:
-                            "Prime native termination is unproven; replacement remains blocked"
-                                .into(),
-                    });
+                    self.publish(Event::startup_error(
+                        "Prime native termination is unproven; replacement remains blocked",
+                    ));
                     self.settle_retirement(&respawn_lease, settlement).await;
                 }
                 return None;
@@ -1170,9 +1194,9 @@ impl<S: BroadcastSink> Drain<S> {
                     .insert(session_id.clone(), config.spec.command.clone());
             }
             if !publish_rejection(&e, |event| self.publish(event)) {
-                self.publish(Event::AgentStartupError {
-                    message: format!("ACP agent respawn failed: {e}"),
-                });
+                self.publish(Event::startup_error(format!(
+                    "ACP agent respawn failed: {e}"
+                )));
             }
         }
         if converted {
@@ -1205,6 +1229,22 @@ impl<S: BroadcastSink> Drain<S> {
             super::teardown::tear_down_lease(&*self.process_control, respawn_lease, false).await;
         self.settle_retirement(respawn_lease, settlement).await;
     }
+}
+
+/// Whether the sandbox container `name` is known to be gone. A runtime error, or a probe
+/// slower than the respawn backoff, is unknown rather than gone; the slow probe is killed.
+async fn sandbox_container_gone(name: String) -> bool {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    // Also kills the probe when a cancelled respawn drops this future.
+    let _kill = cancel.clone().drop_guard();
+    let probe = tokio::task::spawn_blocking(move || {
+        crate::containers::get_container_runtime()
+            .does_container_exist_until_cancelled(&name, &cancel)
+    });
+    matches!(
+        tokio::time::timeout(RESPAWN_BACKOFF, probe).await,
+        Ok(Ok(Ok(false)))
+    )
 }
 
 async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecision {
@@ -1589,9 +1629,9 @@ mod tests {
                 .await
                 .unwrap();
             inbound_tx
-                .send(Event::AgentStartupError {
-                    message: "ACP connection failed: native binary failed to launch".into(),
-                })
+                .send(Event::startup_error(
+                    "ACP connection failed: native binary failed to launch",
+                ))
                 .await
                 .unwrap();
             drop(inbound_tx);
@@ -1614,7 +1654,7 @@ mod tests {
                 "{id}: only a registry-backed attached crash re-arms"
             );
             let banner_published = sink.frames.lock().unwrap().iter().any(|(_, _, ev)| {
-                matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                matches!(ev, Event::AgentStartupError { message, .. } if message.contains("crashed more than"))
             });
             assert!(
                 !banner_published,
@@ -1671,9 +1711,9 @@ mod tests {
                     .unwrap();
             }
             inbound_tx
-                .send(Event::AgentStartupError {
-                    message: "ACP connection failed: agent transport closed".into(),
-                })
+                .send(Event::startup_error(
+                    "ACP connection failed: agent transport closed",
+                ))
                 .await
                 .unwrap();
             drop(inbound_tx);
@@ -1788,9 +1828,8 @@ mod tests {
         let rate_limited = vec![Event::Stopped {
             reason: "rate_limited".into(),
         }];
-        let startup_error = Event::AgentStartupError {
-            message: "ACP connection failed: native binary failed to launch".into(),
-        };
+        let startup_error =
+            Event::startup_error("ACP connection failed: native binary failed to launch");
         let established = Event::AcpSessionAssigned {
             acp_session_id: "acp-1".into(),
         };
@@ -1854,7 +1893,7 @@ mod tests {
             let crash_messages = published
                 .iter()
                 .filter(|ev| {
-                    matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                    matches!(ev, Event::AgentStartupError { message, .. } if message.contains("crashed more than"))
                 })
                 .count();
             assert_eq!(crash_messages, usize::from(expect_crash_message), "{id}");
@@ -1940,7 +1979,7 @@ mod tests {
             assert!(events
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::SessionContextReset { .. })));
-            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message } if message.contains("Could not commit the isolated native context"))));
+            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message, .. } if message.contains("Could not commit the isolated native context"))));
             assert!(!events
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));
@@ -2346,6 +2385,144 @@ mod tests {
             sup.worker_state("s-respawn-kept").await,
             AcpWorkerState::Absent
         );
+    }
+
+    /// A crash respawn parks a sandboxed Session whose container is known gone, and goes
+    /// ahead when the runtime can't say: an error, or a probe slower than the backoff.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_crash_respawn_parks_only_when_the_sandbox_container_is_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_home, tmp) = isolate_home();
+        crate::session::config::update_config(|config| {
+            config.sandbox.container_runtime = crate::session::ContainerRuntimeName::Docker
+        })
+        .unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let root = tmp.path().display();
+        // `alive` is the container; a slow probe blocks until it is killed.
+        std::fs::write(
+            bin.join("docker"),
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in \"container inspect\")\n\
+                 case \"$(cat {root}/mode)\" in\n\
+                 unreachable) echo 'Cannot connect to the Docker daemon at unix:///x. Is the docker daemon running?' >&2; exit 1 ;;\n\
+                 slow) echo $$ > {root}/slow.pid; while :; do sleep 0.05; done ;;\n\
+                 esac\n\
+                 [ -e {root}/alive ] && exit 0\n\
+                 echo \"Error: No such container: $3\" >&2; exit 1 ;;\nesac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _path = crate::session::test_support::path_prepended(&bin);
+        // (mode, container alive after the crash, parks)
+        for (mode, alive, parks) in [
+            ("gone", false, true),
+            ("present", true, false),
+            ("unreachable", false, false),
+            ("slow", false, false),
+        ] {
+            let id = format!("s-container-{mode}");
+            std::fs::write(tmp.path().join("mode"), mode).unwrap();
+            // The container exists while the worker runs.
+            std::fs::write(tmp.path().join("alive"), "").unwrap();
+            let control =
+                Arc::new(crate::acp::runner_lifecycle::test_support::FakeProcessControl::default());
+            control.alive(4242).alive(4343);
+            let launches = Arc::new(AtomicUsize::new(0));
+            let launched = Arc::new(tokio::sync::Notify::new());
+            let launcher: Launcher = {
+                let (launches, launched) = (Arc::clone(&launches), Arc::clone(&launched));
+                Arc::new(move |config: SpawnConfig, id: AcpSessionId| {
+                    let (launches, launched) = (Arc::clone(&launches), Arc::clone(&launched));
+                    Box::pin(async move {
+                        let lease = config.launch_lease.as_ref().unwrap();
+                        lease.record_scope(worker_registry::ScopeOwnership::Unscoped);
+                        assert!(
+                            lease.record_runner(attested_test_identity(4343, config.generation))
+                        );
+                        save_attested_test_record(&id.0, 4343, config.generation);
+                        launches.fetch_add(1, Ordering::SeqCst);
+                        launched.notify_one();
+                        Err(AcpError::Spawn("dial deadline".into()))
+                    })
+                })
+            };
+            let sink = VecSink::new();
+            let sup = Arc::new(
+                Supervisor::new(sink.clone())
+                    .with_process_control(control.clone())
+                    .with_launcher(launcher),
+            );
+            save_attested_test_record(&id, 4242, 0);
+            let socket = worker_registry::socket_path_for(&id).unwrap();
+            let mut config = runner_config(socket);
+            config.sandbox_info = Some(sandbox_info());
+            let lease = sup
+                .test_install_runner(&id, config, Some(attested_test_identity(4242, 0)))
+                .await;
+            let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(4);
+            let drain = sup.start_drain_task(id.clone(), lease, inbound_rx, None);
+            if !alive {
+                std::fs::remove_file(tmp.path().join("alive")).unwrap();
+            }
+            drop(inbound_tx);
+            if mode == "slow" {
+                tokio::time::timeout(Duration::from_secs(5), launched.notified())
+                    .await
+                    .expect("a slow probe must not hold back the respawn");
+                // The cap kills the blocked inspect rather than leaving it to its own timeout.
+                let pid: i32 = std::fs::read_to_string(tmp.path().join("slow.pid"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                // SAFETY: signal 0 only asks whether the probe's PID still exists.
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the capped probe still runs"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("drain task must finish")
+                .unwrap();
+
+            assert_eq!(
+                launches.load(Ordering::SeqCst),
+                usize::from(!parks),
+                "{mode}"
+            );
+            let typed = sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, event)| {
+                    matches!(
+                        event,
+                        Event::AgentStartupError {
+                            cause: Some(StartupCause::ContainerMissing),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(typed, usize::from(parks), "{mode}");
+            assert_eq!(
+                sup.worker_state(&id).await,
+                AcpWorkerState::Absent,
+                "{mode}"
+            );
+        }
     }
 
     fn seed_row(id: &str) -> (crate::session::Storage, String) {

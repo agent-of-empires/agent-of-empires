@@ -148,7 +148,7 @@ impl StartupErrorDetail {
     }
 
     /// User-facing one-liner suitable for the legacy
-    /// `AgentStartupError { message }` event channel.
+    /// `AgentStartupError { message, .. }` event channel.
     pub fn user_message(&self) -> String {
         match self {
             Self::IncompatibleAgentVersion {
