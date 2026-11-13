@@ -48,6 +48,11 @@ describe("SessionRow chips", () => {
     },
   );
 
+  it("keeps the created-without-setup chip to its icon so a long title still shows", () => {
+    renderRow(ws({ created_without_setup: true }));
+    expect(label("Created without setup")?.textContent).toBe("");
+  });
+
   it("keeps favorite identity distinct from pin in normal and compact rows", () => {
     for (const compact of [false, true]) {
       const { rerenderRow } = renderRow(ws({ favorited: true, pinned_at: null }), { compact });

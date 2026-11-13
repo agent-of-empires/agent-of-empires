@@ -150,9 +150,8 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
       )}
       <RateLimitBadge sessions={workspace.sessions} />
       {workspace.sessions.some((s) => s.created_without_setup) && (
-        <Chip title="Created without setup" label="Created without setup" className={`${CHIP} gap-0.5 ${MUTED}`}>
+        <Chip title="Created without setup" label="Created without setup" className={`${CHIP} ${MUTED}`}>
           <WrenchOff className="h-3 w-3" />
-          <span className="hidden sm:inline">Created without setup</span>
         </Chip>
       )}
       {effectiveArchived && (

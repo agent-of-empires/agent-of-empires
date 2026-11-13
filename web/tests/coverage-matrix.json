@@ -5316,7 +5316,7 @@
       "risk": "low",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/sidebar/RowBadges.tsx"],
-      "notes": "A row whose session has created_without_setup shows a muted \"Created without setup\" chip (icon only below sm); an untagged row shows none."
+      "notes": "A row whose session has created_without_setup shows a muted \"Created without setup\" icon-only chip, labelled for hover and screen readers; an untagged row shows none."
     },
     {
       "id": "sidebar.session-new-session",
