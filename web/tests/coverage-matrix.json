@@ -984,6 +984,18 @@
       "components": ["web/src/components/SuggestionsSetupHint.tsx", "web/src/components/SuggestionsSetupSheet.tsx"]
     },
     {
+      "id": "suggestions.live-persistence",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": ["tests/live/suggestions.spec.ts"],
+      "components": [
+        "web/src/components/settings/SuggestionsSettings.tsx",
+        "web/src/components/settings/SuggestionTemplates.tsx",
+        "web/src/components/SuggestionsView.tsx"
+      ],
+      "notes": "A real worker publishes; preferences, templates, mappings and dismissals round-trip through the server, and read-only refuses every write."
+    },
+    {
       "id": "settings.suggestions",
       "kind": "mocked-playwright",
       "risk": "medium",
