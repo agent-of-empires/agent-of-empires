@@ -317,16 +317,23 @@ fn is_http_url(url: &str) -> bool {
     if authority.is_empty() || authority.contains(['@', '%']) || authority.starts_with(':') {
         return false;
     }
-    // A bracketed IPv6 host keeps its colons; otherwise the last colon starts the port.
+    // A bracketed IPv6 host keeps its colons and must end at `]` or `]:port`;
+    // otherwise a single colon starts the port.
     let port = match authority.strip_prefix('[') {
         Some(v6) => match v6.split_once(']') {
             Some((_, "")) => None,
-            Some((_, tail)) => tail.strip_prefix(':'),
+            Some((_, tail)) => match tail.strip_prefix(':') {
+                Some(port) => Some(port),
+                None => return false,
+            },
             None => return false,
         },
-        None => authority.rsplit_once(':').map(|(_, port)| port),
+        None if authority.matches(':').count() > 1 => return false,
+        None => authority.split_once(':').map(|(_, port)| port),
     };
-    port.is_none_or(|port| port.is_empty() || port.parse::<u16>().is_ok())
+    port.is_none_or(|port| {
+        port.bytes().all(|b| b.is_ascii_digit()) && (port.is_empty() || port.parse::<u16>().is_ok())
+    })
 }
 
 #[cfg(test)]
@@ -414,6 +421,9 @@ mod tests {
             "https://example.com:70000/",
             "http://[::1]:x/",
             "http://[::1/",
+            "http://[::1]oops/",
+            "https://example.com:80:90/",
+            "https://example.com:+80/",
         ] {
             let mut bad = item("a", "assigned");
             bad.source_url = url.into();
