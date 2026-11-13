@@ -184,7 +184,7 @@ async fn send_terminal_message_inner(
         );
         session.send_keys_with_delay(
             &message,
-            crate::agents::send_keys_enter_delay(&instance.tool),
+            crate::plugin::agent_integration::send_keys_enter_delay(&instance),
         )?;
         store.update(|rows, _| {
             let row = rows

@@ -30,13 +30,13 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `21`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `22`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). A manifest with `[runtime]` must declare `runtime.worker`. Static contributions need none; provider-native agent status and replies require `session.integration`. |
 | `screenshots` | array | no | Up to 8. Requires `api_version >= 5`. See [Screenshots](#screenshots). |
 | `setting_defaults` | table | no | Overrides for core host settings, keyed by canonical path (e.g. `"theme.idle_decay_minutes"`). Resolution is user value, then plugin override, then core default. |
-| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21 and a host implementing them. Provider-native status and replies require `session.integration`. |
+| `agent_integrations` | array of tables | no | Agent tools may declare provider-native communication or optional launch metadata. Requires `api_version >= 19`; the launch, detection, and reply-fallback extensions require API 21 and a host implementing them, and `send_keys_enter_delay_ms` requires API 22. Provider-native status and replies require `session.integration`. |
 
 ## Agent integrations
 
@@ -64,10 +64,17 @@ replies = true
 | `provider_versions` | array of strings | conditional | Required for every entry when the manifest declares `session.integration`, including launch-only entries in a mixed manifest; nonempty valid alternative semver requirements for the agent runtime. A report's `provider_version` must match at least one. Omit only when the manifest declares no `session.integration` (launch-only agents). |
 | `command` | string | no | Launch command: optional literal `NAME=value` assignments, then the executable, then free-form agent arguments. |
 | `replies` | boolean | no | Explicitly enable provider-native prompt replies; defaults to false. Requires `session.integration`. Status-only integrations do not take over quick-response actions. |
+| `send_keys_enter_delay_ms` | integer | no | Milliseconds to wait between typing a message and pressing Enter. Requires `api_version >= 22`. Defaults to 0; at most 2000. Applies to messages the host delivers to the agent's own pane (`aoe send`, a session-list send, the web send). |
 
 Installing a plugin with agent integrations requires explicit approval. The install preview and CLI/TUI/web prompts show each tool, its command, and its agent declarations. Control and format characters are displayed as escapes. Updates require approval when an integration is added or any declaration changes; removals alone do not. AoE runs the declared command as the user only when that agent is launched.
 
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
+
+### Send timing (API 22)
+
+A message the host delivers to an agent pane is typed, then submitted with Enter. Agents whose composer reads a burst of characters as a paste drop an Enter that arrives inside that window, so the text lands as an unsent draft and the session looks busy while nothing runs. `send_keys_enter_delay_ms` declares the pause that lets the window expire first, the same guard the host applies to its own Claude and Codex definitions.
+
+The value belongs in the declaration rather than in user configuration so every install drives the agent the same way. `0` is the default and means "type and submit at once", which suits an agent with no paste heuristic; a pause over 2000 ms is rejected as a slow send rather than a guard, because the host holds the session's input lock while it waits.
 
 ### Launch, detection, and reply-fallback declarations (API 21)
 

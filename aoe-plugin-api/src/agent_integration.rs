@@ -17,6 +17,12 @@ pub struct AgentIntegrationContribution {
     /// Enable provider-native prompt replies; status-only adapters leave this disabled.
     #[serde(default)]
     pub replies: bool,
+    /// Pause between typing a message and the Enter that submits it, for agents
+    /// whose composer treats a burst of characters as a paste and drops an
+    /// Enter arriving inside that window. Requires API 22; the host ignores it
+    /// for anything but a message delivered to the agent's own pane.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub send_keys_enter_delay_ms: u64,
     /// Requires API 21 and a host that implements agent declarations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<AgentLaunchDeclaration>,
@@ -24,6 +30,10 @@ pub struct AgentIntegrationContribution {
     pub detection: Option<AgentDetectionDeclaration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_fallback: Option<AgentReplyDeclaration>,
+}
+
+fn is_zero_ms(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

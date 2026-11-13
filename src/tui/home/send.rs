@@ -94,10 +94,13 @@ impl HomeView {
         // resolved locally and a stale name cannot be sent to.
         let tmux_session = crate::tmux::Session::from_name(tmux_name);
         // Agent gets a tool-specific Enter delay so paste-burst-aware
-        // agents (e.g. Codex) don't swallow the final Enter. Shells in
+        // agents (e.g. Codex) don't swallow the final Enter, including a
+        // plugin-declared agent whose own manifest asks for one. Shells in
         // the paired terminal panes don't need the delay.
         let delay = match &target {
-            live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
+            live_send::LiveSendTarget::Agent => {
+                crate::plugin::agent_integration::send_keys_enter_delay(&inst)
+            }
             live_send::LiveSendTarget::Terminal
             | live_send::LiveSendTarget::ContainerTerminal
             | live_send::LiveSendTarget::Tool(_) => 0,
