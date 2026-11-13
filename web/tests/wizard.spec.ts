@@ -781,18 +781,17 @@ test.describe("create failure", () => {
     let refusals = 0;
     const created = await startWizard(page, {
       onCreate: (_body, route) =>
-        refusals++ === 0
-          ? route
-              .fulfill({
-                status: 400,
-                json: {
-                  error: "hook_failed",
-                  message: "An on_create hook exited with code 1.",
-                  stage: "running_hooks",
-                },
-              })
-              .then(() => true)
-          : undefined,
+        (refusals++ === 0
+          ? route.fulfill({
+              status: 400,
+              json: {
+                error: "hook_failed",
+                message: "An on_create hook exited with code 1.",
+                stage: "running_hooks",
+              },
+            })
+          : route.fulfill({ status: 201, json: { session: { id: "new-session", created_without_setup: true } } })
+        ).then(() => true),
     });
     await page.setViewportSize({ width: 375, height: 812 });
     await launch(page);
