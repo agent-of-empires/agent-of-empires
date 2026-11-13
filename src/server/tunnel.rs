@@ -47,12 +47,13 @@ impl FunnelReach {
         }
     }
 
-    /// Reads `serve.funnel`; an absent or unrecognised file means ours.
+    /// Reads `serve.funnel`. Only an absent file means ours; one caught mid-write (empty) or
+    /// holding anything else is Unknown.
     pub fn from_marker(contents: Option<&str>) -> Self {
         match contents.map(str::trim) {
+            None => Self::Ours,
             Some("lost") => Self::Lost,
-            Some("unknown") => Self::Unknown,
-            _ => Self::Ours,
+            Some(_) => Self::Unknown,
         }
     }
 }
@@ -2633,6 +2634,19 @@ esac
                 want,
                 "{line}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_missing_funnel_marker_means_ours() {
+        for (contents, want) in [
+            (None, FunnelReach::Ours),
+            (Some("lost\n"), FunnelReach::Lost),
+            (Some("unknown\n"), FunnelReach::Unknown),
+            (Some(""), FunnelReach::Unknown),
+            (Some("garbage"), FunnelReach::Unknown),
+        ] {
+            assert_eq!(FunnelReach::from_marker(contents), want, "{contents:?}");
         }
     }
 

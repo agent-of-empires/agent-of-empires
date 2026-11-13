@@ -2790,6 +2790,18 @@ fn active_rereads_urls_and_funnel_state_and_keeps_the_selection() {
     );
     std::fs::remove_dir(app.join("serve.funnel")).unwrap();
 
+    // A marker caught mid-write (empty) beside the old Funnel URL isn't taken as ours.
+    std::fs::write(app.join("serve.funnel"), "").unwrap();
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        (
+            "https://node.ts.net/?token=b".to_owned(),
+            FunnelReach::Unknown
+        )
+    );
+    remove_app_file("serve.funnel");
+
     // Right after a re-read, ticks only observe the log until the interval passes.
     for _ in 0..50 {
         view.tick();
