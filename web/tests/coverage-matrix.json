@@ -859,11 +859,12 @@
       ]
     },
     {
-      "id": "settings.tui-shortcut-bar",
+      "id": "settings.tui-only-toggles",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"],
+      "notes": "The Terminal UI fold's Shortcut bar and Show Structured view badge switches default on, save off, and stay off after reload and restart. Shortcut bar is global-only: it saves machine-wide and a profile override is refused. Show Structured view badge is profile-overridable: the switch writes a profile override while the machine layer keeps the default."
     },
     {
       "id": "settings.tmux-persistence",
