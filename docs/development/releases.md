@@ -56,3 +56,76 @@ The first nightly appears after the next scheduled run, or `gh workflow run nigh
 
 - **ClawHub** (`contrib/openclaw-skill/`) is published automatically by `release.yml` on every release. Its frontmatter must carry no top-level `version:`; ClawHub's `_meta.json` and the `--version` flag are the source of truth.
 - **Hermes** (`contrib/hermes-skill/`) is PR-based and published by hand, so the in-repo copy is the source of truth and the hub copy drifts until you re-publish. Its frontmatter must carry a `version:`. Bump it, then run `hermes skills publish contrib/hermes-skill --to github --repo NousResearch/hermes-agent` (needs the `hermes` CLI and a GitHub token with fork permissions). Cadence is on change, not every release.
+
+## Vendored terminal dependency
+
+Repository maintainers own the Crossterm patch, security updates, and upstreaming
+decision; the release approver owns its checks. Review upstream releases and
+advisories at each weekly release review and immediately for a relevant advisory.
+Dependency-update PRs do not update path-patched source.
+
+`vendor/crossterm` comes from the published
+[`crossterm-0.29.0.crate`](https://static.crates.io/crates/crossterm/crossterm-0.29.0.crate)
+archive, SHA-256
+`d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b`.
+Its recorded upstream commit is
+`36d95b26a26e64b0f8c12edfe11f410a6d56a812` at repository root.
+Download and verify that archive, extract it separately, then inspect the delta:
+
+```sh
+diff -ruN --exclude=Cargo.lock --exclude=target \
+  "$temporary/crossterm-0.29.0" vendor/crossterm
+```
+
+Only the Unix Mio consumer and its regression tests change, plus standalone
+workspace metadata and test-only dependencies. Existing upstream tests, parser,
+optional backends, and published feature choices remain intact. Saved control
+events retain their order; a TTY hint retained across a return cannot authorize a
+blocking read.
+The patch reevaluates readiness through the existing registration and poll.
+It does not eliminate every race with a concurrent competing input consumer.
+
+For an update, extract the new archive independently, record its checksum here,
+replay only the reviewed delta, and compare the pristine and patched trees.
+Review upstream release notes, Rust requirements and advisories. Keep the full
+MIT copyright notice in both the fork and `licenses/`, and update
+`THIRD_PARTY_NOTICES.md`. Propose the reusable consumer correction upstream;
+retire the patch only when the upstream version passes the same live, stale,
+control-order and zero-time regressions without changing backends.
+
+Run these checks sequentially before release on Linux and native macOS:
+
+```sh
+python3 .github/scripts/test-vendored-crossterm.py
+CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/crossterm/Cargo.toml \
+  --locked --lib --features event-stream -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo test --lib tui::terminal_output
+CARGO_BUILD_JOBS=1 cargo test --lib child_handoff_restores_real_raw_input_before_blocked_screen_controls
+```
+
+The CI helper seeds the fork's ignored lockfile from the project lock, rejects
+production dependency drift or a libc/use-dev-tty backend switch, and requires all
+18 real-consumer regressions to execute. The standalone suite is not covered by
+root workspace tests. A forced ordering of an actual fetched batch establishes a
+conditional consumer contract, not the original macOS event order. The blocking
+stale cases verify completed private-alias consumption, not end-to-end App handoff.
+Root terminal checks and native kqueue coverage are still required.
+
+Release archives carry `LICENSE`, `THIRD_PARTY_NOTICES.md`, and all of `licenses/`.
+Both Nix packages include the fork's notice and install complete notices under
+`$out/share/licenses/aoe`. Crane dependency builds restore real vendor sources and
+original manifests after generating workspace stubs, using vendor-only copy
+inputs so application edits do not invalidate the dependency cache. Dependency
+metadata and Cargo vendoring come from the original manifest and lock, not dummy
+sources. Check `nix build` and `nix build .#aoe-with-web`, installed notices, and a
+generated release archive before approval.
+
+Before release, evaluate both configured packages and the development shell for
+every system advertised by the Nix CI matrix with
+`--option allow-import-from-derivation false`; evaluation must not realize foreign
+generated sources.
+
+Supported source installation uses the Git checkout and project lockfile
+(`cargo install --path . --locked`, or the Git-based installer). Ordinary registry
+packaging strips patches and nested packages and is not a supported source
+distribution for this fork.
