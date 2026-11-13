@@ -1179,7 +1179,10 @@ fn forget_suggestion_publication(plugin_id: &str) -> Result<()> {
         rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .with_context(|| format!("opening {}", path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    super::suggestions::forget_publication(&conn, plugin_id)
+    // The schema owner creates tables an events DB from before this feature
+    // lacks, so only a real failure reaches the cleanup error.
+    super::suggestions::init(&conn)
+        .and_then(|()| super::suggestions::forget_publication(&conn, plugin_id))
         .with_context(|| format!("could not clear the published suggestions of {plugin_id}"))
 }
 
@@ -1974,6 +1977,36 @@ mod tests {
         assert_eq!(count("suggestion_items"), 0);
         assert_eq!(count("suggestion_sources"), 1);
         assert_eq!(count("suggestion_dismissals"), 1);
+    }
+
+    /// An events DB from before the suggestions feature has no suggestion
+    /// tables: uninstall still succeeds.
+    #[test]
+    #[serial]
+    fn uninstalling_with_a_pre_feature_events_db_succeeds() {
+        let _home = isolate_app_dir();
+        let db = crate::session::get_app_dir()
+            .unwrap()
+            .join(super::super::host_api::EVENTS_DB);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE events (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        update_config(|config| {
+            config.plugins.insert(
+                "acme.thing".to_string(),
+                PluginConfig {
+                    source: Some("gh:acme/thing".to_string()),
+                    ..PluginConfig::default()
+                },
+            );
+        })
+        .unwrap();
+        let dir = super::super::plugins_dir().unwrap().join("acme.thing");
+        std::fs::create_dir_all(&dir).unwrap();
+        uninstall("acme.thing").unwrap();
+        assert!(!dir.exists());
+        assert!(!Config::load().unwrap().plugins.contains_key("acme.thing"));
     }
 
     /// A failed cleanup is an error, not a logged warning, and it keeps the
