@@ -749,49 +749,63 @@ fn a_refused_resubmit_keeps_the_recovery_dialog_and_its_request() {
 }
 
 /// The session-setup dialog has no text input: a paste while it is open is dropped, not
-/// routed into a compose dialog over it or saved for whichever dialog opens next.
+/// routed into a compose dialog over it or saved for whichever dialog opens next. The
+/// settings view takes keys before the dialog, so a paste into it still lands there.
 #[test]
 #[serial]
 fn a_paste_over_the_setup_failed_dialog_goes_nowhere() {
     use crate::tui::session_feed::CommandFailure;
-    let CreationTestEnv {
-        mut view,
-        project_dir,
-        _guard,
-        _temp,
-    } = setup_creation_test_env();
-    let mut fail = view.session_feed.creation_failure_driver_for_test();
-    view.session_feed
-        .publish_for_test(creation_snapshot(vec![], "test", 1));
-    view.apply_session_feed();
-    // A runnable session for a stray paste to land in.
-    let mut running = Instance::new("Running", project_dir.to_str().unwrap());
-    running.status = Status::Running;
-    running.source_profile = "default".to_string();
-    let running_id = running.id.clone();
-    view.add_instance(running);
-    view.request_creation(creation_data(&project_dir, "Hooked", "test"), None, None);
-    fail(CommandFailure::CreateHookFailed("exit 3".into()));
-    assert!(view.apply_creation_results().is_none());
-    assert!(view.create_hook_failed.is_some());
-    view.flat_items = view.build_flat_items();
-    view.cursor = view
-        .flat_items
-        .iter()
-        .position(|item| matches!(item, Item::Session { id, .. } if id == &running_id))
-        .expect("the running row");
-    view.update_selected();
-    // The terminal target needs no live tmux pane, so a stray paste would open compose.
-    view.view_mode = crate::tui::home::ViewMode::Terminal;
+    for settings_on_top in [false, true] {
+        let CreationTestEnv {
+            mut view,
+            project_dir,
+            _guard,
+            _temp,
+        } = setup_creation_test_env();
+        let mut fail = view.session_feed.creation_failure_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
+        // A runnable session for a stray paste to land in.
+        let mut running = Instance::new("Running", project_dir.to_str().unwrap());
+        running.status = Status::Running;
+        running.source_profile = "default".to_string();
+        let running_id = running.id.clone();
+        view.add_instance(running);
+        view.request_creation(creation_data(&project_dir, "Hooked", "test"), None, None);
+        fail(CommandFailure::CreateHookFailed("exit 3".into()));
+        assert!(view.apply_creation_results().is_none());
+        assert!(view.create_hook_failed.is_some());
+        view.flat_items = view.build_flat_items();
+        view.cursor = view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Session { id, .. } if id == &running_id))
+            .expect("the running row");
+        view.update_selected();
+        // The terminal target needs no live tmux pane, so a stray paste would open compose.
+        view.view_mode = crate::tui::home::ViewMode::Terminal;
+        if settings_on_top {
+            view.settings_view =
+                Some(crate::tui::settings::SettingsView::new("default", None).unwrap());
+            view.handle_key(key(KeyCode::Char('/')), None);
+        }
 
-    view.handle_paste("pasted text");
-    assert!(
-        view.send_message_dialog.is_none(),
-        "no compose dialog opens"
-    );
-    assert_eq!(
-        view.pending_paste, None,
-        "nothing is kept for a later dialog"
-    );
-    assert!(view.create_hook_failed.is_some(), "the dialog stays");
+        view.handle_paste("zqxpasted");
+        let case = format!("settings on top: {settings_on_top}");
+        assert!(
+            view.send_message_dialog.is_none(),
+            "{case}: no compose dialog opens"
+        );
+        assert_eq!(view.pending_paste, None, "{case}: nothing is kept");
+        assert!(
+            view.create_hook_failed.is_some(),
+            "{case}: the dialog stays"
+        );
+        assert_eq!(
+            render_home_to_string(&mut view, 120, 40).contains("zqxpasted"),
+            settings_on_top,
+            "{case}: only the settings search shows the paste"
+        );
+    }
 }

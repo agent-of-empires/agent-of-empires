@@ -6808,8 +6808,9 @@ impl HomeView {
                 return;
             }
         }
-        // The session-setup dialog has no text input, so a paste there has nowhere to go.
-        if self.create_hook_failed.is_some() {
+        // The session-setup dialog has no text input. Settings takes keys before it, so
+        // a paste goes there when it's open.
+        if self.create_hook_failed.is_some() && self.settings_view.is_none() {
             return;
         }
         // Before send_message_dialog below: with the skills manager open and its editor
