@@ -566,13 +566,13 @@ pub async fn put_suggestion_template(
 
 pub async fn delete_suggestion_template(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<TemplateKey>, axum::extract::rejection::JsonRejection>,
+    query: Result<Query<TemplateKey>, axum::extract::rejection::QueryRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(key) = match body {
-        Ok(body) => body,
+    let Query(key) = match query {
+        Ok(query) => query,
         Err(rejection) => return rejection.into_response(),
     };
     let Some(host) = state.plugin_host.clone() else {

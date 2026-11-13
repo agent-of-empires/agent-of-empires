@@ -362,7 +362,6 @@ async fn sources_and_prefs() {
 #[serial_test::serial]
 async fn templates_round_trip_and_validation() {
     let f = fixture();
-    let key = json!({ "provider_id": PROVIDER, "criterion": "assigned" });
     let query = format!("/api/suggestions/templates?provider_id={PROVIDER}&criterion=assigned");
 
     let (status, _, body) = f.call(Method::GET, &query, Value::Null).await;
@@ -442,11 +441,17 @@ async fn templates_round_trip_and_validation() {
     );
 
     for _ in 0..2 {
-        let (status, _, body) = f
-            .call(Method::DELETE, "/api/suggestions/templates", key.clone())
-            .await;
+        let (status, _, body) = f.call(Method::DELETE, &query, Value::Null).await;
         assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
     }
+    let (status, _, _) = f
+        .call(
+            Method::DELETE,
+            &format!("/api/suggestions/templates?provider_id={PROVIDER}"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     let (_, _, body) = f.call(Method::GET, &query, Value::Null).await;
     assert_eq!(body["default"], true);
 }
