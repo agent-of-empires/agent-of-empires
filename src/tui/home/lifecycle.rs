@@ -204,7 +204,6 @@ impl HomeView {
             pending_native_attachment: None,
             live_send: None,
             live_send_worker: None,
-            vt_yield: None,
             preview_capture_worker: None,
             preview_capture_target: None,
             preview_worker_pulse: None,
@@ -215,6 +214,7 @@ impl HomeView {
             hover_cell: None,
             status_flash: None,
             live_send_ctrl_c_flash_until: None,
+            live_takeover: None,
             sidebar_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_sidebar_collapsed)

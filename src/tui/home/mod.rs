@@ -341,9 +341,6 @@ pub struct HomeView {
     pending_native_attachment: Option<panes::PendingNativeAttachment>,
     pub(super) live_send: Option<live_send::LiveSendState>,
     pub(super) live_send_worker: Option<live_send::LiveSendWorker>,
-    /// Tmux name of a pane whose live view another surface took. The preview keeps
-    /// showing it through capture-pane so the new owner can arm the VT pipe.
-    pub(super) vt_yield: Option<String>,
     pub(super) preview_capture_worker: Option<live_send::LiveCaptureWorker>,
     pub(super) preview_capture_target: Option<String>,
     pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,
@@ -354,6 +351,9 @@ pub struct HomeView {
     pub(super) hover_cell: Option<(u16, u16)>,
     pub(super) status_flash: Option<(String, std::time::Instant)>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
+    /// Session whose live control another window took, until the selection moves or live
+    /// mode starts again.
+    pub(super) live_takeover: Option<live_send::TakenLive>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,
