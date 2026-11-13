@@ -256,11 +256,9 @@ impl<S: BroadcastSink> Drain<S> {
                                 self.sink.publish_from_worker(
                                     &self.session_id,
                                     seq,
-                                    &Event::AgentStartupError {
-                                        message: format!(
-                                            "Could not commit the isolated native context: {error}"
-                                        ),
-                                    },
+                                    &Event::startup_error(format!(
+                                        "Could not commit the isolated native context: {error}"
+                                    )),
                                     generation,
                                 )
                             });
@@ -530,9 +528,9 @@ impl<S: BroadcastSink> Drain<S> {
                 reason: "runner_control_lost".into(),
             });
         }
-        self.publish(Event::AgentStartupError {
-            message: "ACP connection failed: runner control channel closed".into(),
-        });
+        self.publish(Event::startup_error(
+            "ACP connection failed: runner control channel closed",
+        ));
     }
 
     /// Dials the runner until one attempt is installed. The client bounds the
@@ -724,14 +722,12 @@ impl<S: BroadcastSink> Drain<S> {
                     window_secs = RESTART_WINDOW.as_secs(),
                     "restart budget burned; parking session"
                 );
-                self.publish(Event::AgentStartupError {
-                    message: format!(
-                        "ACP agent crashed more than {} times in {}s; \
+                self.publish(Event::startup_error(format!(
+                    "ACP agent crashed more than {} times in {}s; \
                              not respawning. Use the web dashboard to retry.",
-                        MAX_RESPAWNS_IN_WINDOW,
-                        RESTART_WINDOW.as_secs()
-                    ),
-                });
+                    MAX_RESPAWNS_IN_WINDOW,
+                    RESTART_WINDOW.as_secs()
+                )));
             }
             RestartDecision::LeaveToReconciler => {
                 info!(
@@ -841,11 +837,9 @@ impl<S: BroadcastSink> Drain<S> {
                         return None;
                     }
                     respawn_lease.owe_stop_completion(None);
-                    self.publish(Event::AgentStartupError {
-                        message:
-                            "Prime native termination is unproven; replacement remains blocked"
-                                .into(),
-                    });
+                    self.publish(Event::startup_error(
+                        "Prime native termination is unproven; replacement remains blocked",
+                    ));
                     self.settle_retirement(&respawn_lease, settlement).await;
                 }
                 return None;
@@ -1170,9 +1164,9 @@ impl<S: BroadcastSink> Drain<S> {
                     .insert(session_id.clone(), config.spec.command.clone());
             }
             if !publish_rejection(&e, |event| self.publish(event)) {
-                self.publish(Event::AgentStartupError {
-                    message: format!("ACP agent respawn failed: {e}"),
-                });
+                self.publish(Event::startup_error(format!(
+                    "ACP agent respawn failed: {e}"
+                )));
             }
         }
         if converted {
@@ -1589,9 +1583,9 @@ mod tests {
                 .await
                 .unwrap();
             inbound_tx
-                .send(Event::AgentStartupError {
-                    message: "ACP connection failed: native binary failed to launch".into(),
-                })
+                .send(Event::startup_error(
+                    "ACP connection failed: native binary failed to launch",
+                ))
                 .await
                 .unwrap();
             drop(inbound_tx);
@@ -1614,7 +1608,7 @@ mod tests {
                 "{id}: only a registry-backed attached crash re-arms"
             );
             let banner_published = sink.frames.lock().unwrap().iter().any(|(_, _, ev)| {
-                matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                matches!(ev, Event::AgentStartupError { message, .. } if message.contains("crashed more than"))
             });
             assert!(
                 !banner_published,
@@ -1671,9 +1665,9 @@ mod tests {
                     .unwrap();
             }
             inbound_tx
-                .send(Event::AgentStartupError {
-                    message: "ACP connection failed: agent transport closed".into(),
-                })
+                .send(Event::startup_error(
+                    "ACP connection failed: agent transport closed",
+                ))
                 .await
                 .unwrap();
             drop(inbound_tx);
@@ -1788,9 +1782,8 @@ mod tests {
         let rate_limited = vec![Event::Stopped {
             reason: "rate_limited".into(),
         }];
-        let startup_error = Event::AgentStartupError {
-            message: "ACP connection failed: native binary failed to launch".into(),
-        };
+        let startup_error =
+            Event::startup_error("ACP connection failed: native binary failed to launch");
         let established = Event::AcpSessionAssigned {
             acp_session_id: "acp-1".into(),
         };
@@ -1854,7 +1847,7 @@ mod tests {
             let crash_messages = published
                 .iter()
                 .filter(|ev| {
-                    matches!(ev, Event::AgentStartupError { message } if message.contains("crashed more than"))
+                    matches!(ev, Event::AgentStartupError { message, .. } if message.contains("crashed more than"))
                 })
                 .count();
             assert_eq!(crash_messages, usize::from(expect_crash_message), "{id}");
@@ -1940,7 +1933,7 @@ mod tests {
             assert!(events
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::SessionContextReset { .. })));
-            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message } if message.contains("Could not commit the isolated native context"))));
+            assert!(events.iter().any(|(_, _, event)| matches!(event, Event::AgentStartupError { message, .. } if message.contains("Could not commit the isolated native context"))));
             assert!(!events
                 .iter()
                 .any(|(_, _, event)| matches!(event, Event::AcpSessionAssigned { .. })));

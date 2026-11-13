@@ -1491,7 +1491,7 @@ mod tests {
                             assert_eq!(reason, "stored_session_rejected");
                             recovery.push("stopped");
                         }
-                        Event::AgentStartupError { message: error } => {
+                        Event::AgentStartupError { message: error, .. } => {
                             assert!(error.contains(message), "{error}");
                             recovery.push("error");
                         }
@@ -1665,7 +1665,7 @@ mod tests {
                     Event::AgentMessageChunk { text, .. } => chunks.push(text),
                     Event::SessionContextReset { .. } => resets += 1,
                     Event::AcpSessionAssigned { .. } => assigned = true,
-                    Event::AgentStartupError { message } => panic!("{message}"),
+                    Event::AgentStartupError { message, .. } => panic!("{message}"),
                     _ => {}
                 }
             }
@@ -1751,7 +1751,7 @@ mod tests {
                 match client.next_event().await.unwrap() {
                     Event::SessionContextReset { .. } => panic!("same id must not reset"),
                     Event::AcpSessionAssigned { .. } => break,
-                    Event::AgentStartupError { message } => panic!("{message}"),
+                    Event::AgentStartupError { message, .. } => panic!("{message}"),
                     _ => {}
                 }
             }
@@ -1873,7 +1873,7 @@ mod tests {
             while calls.len() < 3 {
                 match client.next_event().await.unwrap() {
                     Event::ToolCallStarted { tool_call } => calls.push(tool_call.id),
-                    Event::AgentStartupError { message } => panic!("{message}"),
+                    Event::AgentStartupError { message, .. } => panic!("{message}"),
                     _ => {}
                 }
             }

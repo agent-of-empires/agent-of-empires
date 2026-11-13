@@ -651,9 +651,7 @@ mod tests {
             .record(
                 "s",
                 1,
-                &crate::acp::state::Event::AgentStartupError {
-                    message: "Authentication required".into(),
-                },
+                &crate::acp::state::Event::startup_error("Authentication required"),
             )
             .unwrap();
         let now = Utc::now().timestamp_millis();
