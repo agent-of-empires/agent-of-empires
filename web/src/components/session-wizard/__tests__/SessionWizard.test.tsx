@@ -1815,6 +1815,106 @@ describe("SessionWizard create failures", () => {
     },
   );
 
+  // The wizard really unmounts on close, as in App, so only the background poll can see later output.
+  describe("after Continue in background", () => {
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      toastBus.handler = null;
+    });
+
+    const toastAction = vi.fn();
+    const launchAndBackground = async () => {
+      toastAction.mockReset();
+      toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
+      let finish!: (r: unknown) => void;
+      createSession.mockReturnValueOnce(new Promise((r) => (finish = r)));
+      const onReopenFailure = vi.fn();
+      const onCreatedInBackground = vi.fn();
+      const view = render(
+        <SessionWizard
+          servedProfile="default"
+          onClose={() => view.unmount()}
+          onCreated={vi.fn()}
+          onCreatedInBackground={onCreatedInBackground}
+          onReopenFailure={onReopenFailure}
+          prefill={{ path: "/tmp/proj", tool: "claude" }}
+        />,
+      );
+      await launch();
+      fireEvent.click(await screen.findByText("Continue in background", undefined, { timeout: 3000 }));
+      expect(screen.queryByTestId("session-wizard")).toBeNull();
+      return { finish: (r: unknown) => act(async () => finish(r)), onReopenFailure, onCreatedInBackground };
+    };
+    const polls = () => vi.mocked(fetchCreateProgress).mock.calls.length;
+
+    it("Reopen shows the hook output printed after the wizard closed", async () => {
+      vi.mocked(fetchCreateProgress).mockResolvedValue({ stage: "running_hooks", hook: null, output: ["early"] });
+      const { finish, onReopenFailure } = await launchAndBackground();
+      const late = { stage: "running_hooks" as const, hook: null, output: ["early", "npm ERR! late"] };
+      vi.mocked(fetchCreateProgress).mockResolvedValue(late);
+      const before = polls();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(polls()).toBeGreaterThan(before);
+      await finish(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."));
+      await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+      toastAction.mock.calls[0]![2]();
+      const restore = onReopenFailure.mock.calls[0]![0];
+      expect(restore.progress).toEqual(late);
+
+      render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+      expect(screen.getByTestId("create-failure-output").textContent).toContain("npm ERR! late");
+    });
+
+    it("keeps the newer snapshot when an older poll answers last", async () => {
+      const { finish, onReopenFailure } = await launchAndBackground();
+      const answers: ((p: unknown) => void)[] = [];
+      vi.mocked(fetchCreateProgress).mockImplementation(() => new Promise((r) => answers.push(r)));
+      await vi.advanceTimersByTimeAsync(1_400);
+      expect(answers.length).toBeGreaterThanOrEqual(2);
+      const snapshot = (line: string) => ({ stage: "running_hooks", hook: null, output: [line] });
+      await act(async () => answers[1]!(snapshot("newer")));
+      await act(async () => answers[0]!(snapshot("older")));
+      await finish(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."));
+      await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+      toastAction.mock.calls[0]![2]();
+      expect(onReopenFailure.mock.calls[0]![0].progress.output).toEqual(["newer"]);
+    });
+
+    it.each([
+      ["succeeds", { ok: true, session: { id: "s1" } }],
+      ["fails", failure("create_failed", "preparing", "boom")],
+    ])("stops polling once the create %s", async (outcome, result) => {
+      const { finish, onCreatedInBackground } = await launchAndBackground();
+      const before = polls();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(polls()).toBeGreaterThan(before);
+      await finish(result);
+      if (outcome === "succeeds") await waitFor(() => expect(onCreatedInBackground).toHaveBeenCalled());
+      else await waitFor(() => expect(toastAction).toHaveBeenCalledOnce());
+      const settled = polls();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(polls()).toBe(settled);
+    });
+
+    it("never polls when closed without a create", async () => {
+      const view = render(
+        <SessionWizard
+          servedProfile="default"
+          onClose={() => view.unmount()}
+          onCreated={vi.fn()}
+          prefill={{ path: "/tmp/proj", tool: "claude" }}
+        />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Close" }));
+      expect(screen.queryByTestId("session-wizard")).toBeNull();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(fetchCreateProgress).not.toHaveBeenCalled();
+    });
+  });
+
   it("a restored failure still says why its actions wait while the agent list fails", async () => {
     vi.mocked(fetchProfileAgents).mockResolvedValue(null);
     const restore = {
