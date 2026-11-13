@@ -1797,6 +1797,7 @@ mod tests {
             (Method::PATCH, "/api/theme"),
             (Method::POST, "/api/suggestions/refresh"),
             (Method::POST, "/api/suggestions/checks/run"),
+            (Method::POST, "/api/suggestions/fix"),
             (Method::POST, "/api/suggestions/dismiss"),
             (Method::POST, "/api/suggestions/undismiss"),
             (Method::PATCH, "/api/suggestions/sources"),
