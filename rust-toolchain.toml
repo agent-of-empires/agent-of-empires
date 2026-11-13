@@ -2,5 +2,5 @@
 # `.github/workflows/rust-toolchain-bump.yml` opens a PR for each new stable.
 # `rust-version` in Cargo.toml stays the MSRV.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]
