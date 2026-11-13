@@ -58,6 +58,7 @@ test("turning the setting on unlocks Update when the page regains focus", async 
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(update).toBeEnabled();
   await expect(screen.getByTestId("startup-error-step-1")).toContainText("Done");
+  await expect(screen.getByRole("button", { name: "Recreate container" })).toBeVisible();
 });
 
 test.describe("at 375px", () => {
