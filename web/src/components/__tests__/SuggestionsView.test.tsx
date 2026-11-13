@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { SuggestionsView } from "../SuggestionsView";
 import { setServerDown } from "../../lib/connectionState";
+import { toastBus } from "../../lib/toastBus";
 import type { SuggestionItem, SuggestionsSnapshot } from "../../lib/types";
 
 const {
@@ -338,6 +339,25 @@ describe("SuggestionsView", () => {
     expect((await screen.findByRole("alert")).textContent).toContain("still being created");
     expect(createSession).toHaveBeenCalledTimes(1);
     await act(async () => finish({ ok: true, session: { id: "s1" } }));
+  });
+
+  it("Start without review toasts a definitive refusal when the view unmounted mid-create", async () => {
+    let finish: (v: object) => void = () => {};
+    createSession.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    const error = vi.fn();
+    toastBus.handler = { error } as never;
+    prepareSuggestion.mockResolvedValue({ ok: true, data: prepared });
+    const snap = snapshot();
+    fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
+    const onPrepare = vi.fn();
+    const { unmount } = render(<SuggestionsView onPrepare={onPrepare} onStarted={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    unmount();
+    await act(async () => finish({ ok: false, error: "Path is not a project" }));
+    expect(error).toHaveBeenCalledWith("Path is not a project");
+    expect(onPrepare).not.toHaveBeenCalled();
+    toastBus.handler = null;
   });
 
   it("Start without review refuses a re-click while an earlier create is unresolved", async () => {

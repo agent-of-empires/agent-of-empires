@@ -17,6 +17,7 @@ import {
   releasePendingCreate,
   resolvePendingCreate,
 } from "../lib/pendingCreates";
+import { reportError } from "../lib/toastBus";
 import { STALE_NOTICE, toWizardPrefill } from "../lib/suggestionPrefill";
 import type { SessionResponse, SuggestionItem, SuggestionsSnapshot } from "../lib/types";
 import type { WizardPrefill } from "../components/session-wizard/SessionWizard";
@@ -193,7 +194,12 @@ export function useSuggestions(
             if (mounted.current) setBusy(null);
             return;
           }
-          if (!mounted.current) return;
+          if (!mounted.current) {
+            // No row or wizard to show the reason on any more.
+            if (!created.ok && !created.network && !created.outcomeUnknown)
+              reportError(created.error ?? "Could not start the session.");
+            return;
+          }
           if (created.network || created.outcomeUnknown) {
             setNotice(created.error ?? "Could not start the session.");
             setBusy(null);
