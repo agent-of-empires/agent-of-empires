@@ -1339,6 +1339,19 @@ describe("createSession errors", () => {
     expect(await api.createSession(body)).toEqual({ ok: false, error: "Network error: offline", network: true });
   });
 
+  it("tells a 2xx with an unreadable body apart from a network error on suggestion requests", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response("<html>proxy</html>", { status: 200 }));
+    expect(await api.refreshSuggestions()).toEqual({
+      ok: false,
+      error: "Unexpected response from the server. Reload to see the current state.",
+      stale: false,
+    });
+    fetchSpy.mockResolvedValueOnce(new Response("", { status: 200 }));
+    expect(await api.refreshSuggestions()).toEqual({ ok: true, data: undefined });
+    offline();
+    expect(await api.refreshSuggestions()).toMatchObject({ ok: false, error: "Network error: offline" });
+  });
+
   it("reads create progress, null once the create has finished", async () => {
     const progress = { stage: "running_hooks", hook: "npm ci", output: ["ok"] };
     fetchSpy.mockResolvedValueOnce(json(progress));

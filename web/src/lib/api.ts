@@ -3580,17 +3580,25 @@ export function fetchSuggestions(): Promise<SuggestionsSnapshot | null> {
 }
 
 async function suggestionRequest<T>(url: string, method: string, body?: unknown): Promise<SuggestionResult<T>> {
+  let res: Response;
+  let text: string;
   try {
-    const res = await fetch(url, jsonInit(method, body));
-    const text = await res.text();
-    if (!res.ok) return { ok: false, error: parseApiErrorText(text, res.status), stale: res.status === 409 };
-    return { ok: true, data: (text ? JSON.parse(text) : undefined) as T };
+    res = await fetch(url, jsonInit(method, body));
+    text = await res.text();
   } catch (error) {
     return {
       ok: false,
       error: `Network error: ${error instanceof Error ? error.message : "connection failed"}`,
       stale: false,
     };
+  }
+  if (!res.ok) return { ok: false, error: parseApiErrorText(text, res.status), stale: res.status === 409 };
+  if (!text) return { ok: true, data: undefined as T };
+  // The request reached a server and a change may have applied, so this is not a network error.
+  try {
+    return { ok: true, data: JSON.parse(text) as T };
+  } catch {
+    return { ok: false, error: "Unexpected response from the server. Reload to see the current state.", stale: false };
   }
 }
 
