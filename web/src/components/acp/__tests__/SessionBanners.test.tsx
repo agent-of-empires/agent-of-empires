@@ -490,6 +490,11 @@ describe("SessionBanners Retry", () => {
       (o) => o.respond(500, "restart spawn failed: capacity full"),
       "It failed differently this time: capacity full",
     ],
+    [
+      "a refused Retry with an empty body brings the banner back with its status",
+      (o) => o.respond(503, ""),
+      "It failed differently this time: Server returned 503.",
+    ],
   ])("%s", async (_label, settle, changed) => {
     const owner = renderFailed();
     expect([!!banner(), !!line()]).toEqual([true, false]);

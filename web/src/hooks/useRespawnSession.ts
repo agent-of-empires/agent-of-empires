@@ -79,7 +79,7 @@ export function useRespawnSession(
       }
       const error = `Server returned ${res.status}. ${body.slice(0, 200)}`.trim();
       settle("failed", error, body);
-      onFailed?.(res.status, error, body);
+      onFailed?.(res.status, error, body || error);
       return false;
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e);
