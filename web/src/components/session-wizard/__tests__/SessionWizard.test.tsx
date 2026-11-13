@@ -22,6 +22,8 @@ import {
 } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
+import { toWizardPrefill } from "../../../lib/suggestionPrefill";
+import type { SuggestionPrepared } from "../../../lib/types";
 import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
@@ -2146,6 +2148,15 @@ describe("SessionWizard initial prompt", () => {
     await launch();
     await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
     expect(payload().initial_prompt).toBeUndefined();
+  });
+
+  it("opens the project picker for an unresolved suggestion instead of restoring the last project", async () => {
+    localStorage.setItem("aoe-new-session-last-project", "/other/last");
+    const prepared = { title: "Fix it", initial_prompt: "do it", project: null } as unknown as SuggestionPrepared;
+    renderWizard(toWizardPrefill(prepared, { label: "GitHub", title: "Fix it", url: "" }));
+    fireEvent.click((await screen.findByText("/tmp/proj")).closest("button")!);
+    expect(screen.getByTestId("wizard-project-row").textContent).toContain("/tmp/proj");
+    expect(screen.getByTestId("wizard-project-row").textContent).not.toContain("/other/last");
   });
 
   it("omits initial_prompt when the field is blank", async () => {
