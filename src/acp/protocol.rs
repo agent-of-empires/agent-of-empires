@@ -274,13 +274,17 @@ pub enum TerminalContext {
     Blocked,
 }
 
-/// Why a switch to Terminal view starts fresh or can't happen yet. Also the
-/// `AoE-Error-Code` of a refused switch.
+/// Why a switch to Terminal view starts fresh, can't happen yet, or continues a
+/// conversation other than the one in Structured view. Also the `AoE-Error-Code`
+/// of a refused switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalSwitchReason {
     AgentNotResumable,
     NoConversationYet,
+    /// With `continues`: Structured view has no conversation yet, so the switch
+    /// resumes the Session's earlier one, from before Structured view.
+    EarlierConversation,
     ConversationNotBound,
     Sandboxed,
     HandoffPending,
@@ -291,9 +295,10 @@ pub enum TerminalSwitchReason {
 }
 
 impl TerminalSwitchReason {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::AgentNotResumable,
         Self::NoConversationYet,
+        Self::EarlierConversation,
         Self::ConversationNotBound,
         Self::Sandboxed,
         Self::HandoffPending,
@@ -306,6 +311,7 @@ impl TerminalSwitchReason {
         match self {
             Self::AgentNotResumable => "agent_not_resumable",
             Self::NoConversationYet => "no_conversation_yet",
+            Self::EarlierConversation => "earlier_conversation",
             Self::ConversationNotBound => "conversation_not_bound",
             Self::Sandboxed => "sandboxed",
             Self::HandoffPending => "handoff_pending",
@@ -327,7 +333,7 @@ pub enum ContainerState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalCheckResponse {
     pub context: TerminalContext,
-    /// Set unless `context` is `continues`.
+    /// Set unless `context` is `continues`, or with it only as `earlier_conversation`.
     pub reason: Option<TerminalSwitchReason>,
     pub agent: String,
     /// Set only for a sandboxed Session.

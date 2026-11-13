@@ -574,6 +574,9 @@ fn terminal_refusal(reason: TerminalSwitchReason, agent: &str) -> Response {
     let message = match reason {
         AgentNotResumable => "This agent can't carry the conversation into Terminal view".into(),
         NoConversationYet => "There is no conversation to carry into Terminal view yet".into(),
+        EarlierConversation => {
+            "Terminal view resumes this Session's conversation from before Structured view".into()
+        }
         ConversationNotBound | Sandboxed => {
             "This Session's conversation can't be carried into Terminal view".into()
         }
@@ -597,6 +600,8 @@ enum TerminalPlan {
     Continues {
         native_store: crate::session::ExecutionBinding,
     },
+    /// No ACP conversation yet, but the row's stored target resumes; the switch keeps the row as is.
+    ResumesEarlier,
     StartsFresh(TerminalSwitchReason),
     Blocked(TerminalSwitchReason),
 }
@@ -611,6 +616,9 @@ fn handoff_context(
             Ok(HandoffContext::Keep { native_store })
         }
         (_, Some(TerminalConversation::Fresh)) => Ok(HandoffContext::Discard),
+        (TerminalPlan::ResumesEarlier, None | Some(TerminalConversation::Continue)) => {
+            Ok(HandoffContext::Discard)
+        }
         (TerminalPlan::StartsFresh(reason), Some(TerminalConversation::Continue)) => Err(reason),
         // Without a choice, only an Agent or Session with nothing to carry starts fresh.
         (
@@ -657,7 +665,11 @@ async fn terminal_plan(
         return Ok(TerminalPlan::StartsFresh(AgentNotResumable));
     }
     let Some(sid) = instance.acp_session_id.as_deref() else {
-        return Ok(TerminalPlan::StartsFresh(NoConversationYet));
+        return Ok(if instance.conversation_target().is_some() {
+            TerminalPlan::ResumesEarlier
+        } else {
+            TerminalPlan::StartsFresh(NoConversationYet)
+        });
     };
     match state
         .acp_event_store
@@ -717,6 +729,10 @@ pub async fn acp_terminal_check(
     };
     let (context, reason) = match plan {
         TerminalPlan::Continues { .. } => (TerminalContext::Continues, None),
+        TerminalPlan::ResumesEarlier => (
+            TerminalContext::Continues,
+            Some(TerminalSwitchReason::EarlierConversation),
+        ),
         TerminalPlan::StartsFresh(reason) => (TerminalContext::StartsFresh, Some(reason)),
         TerminalPlan::Blocked(reason) => (TerminalContext::Blocked, Some(reason)),
     };
@@ -4048,6 +4064,16 @@ mod tests {
                 Ok(HandoffContext::Discard),
             ),
             (
+                TerminalPlan::ResumesEarlier,
+                None,
+                Ok(HandoffContext::Discard),
+            ),
+            (
+                TerminalPlan::ResumesEarlier,
+                Some(Continue),
+                Ok(HandoffContext::Discard),
+            ),
+            (
                 TerminalPlan::StartsFresh(ConversationNotBound),
                 None,
                 Err(ConversationNotBound),
@@ -4236,7 +4262,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_chosen_fresh_switch_never_resumes_even_when_recovered() -> anyhow::Result<()> {
+    async fn the_check_matches_the_switch_and_fresh_never_resumes() -> anyhow::Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
@@ -4269,13 +4295,15 @@ mod tests {
             realistic("fresh recovered", "sid-recovered"),
             "sid-recovered",
         );
-        // No body keeps the pre-choice behaviour: a leftover resume target still resumes.
-        let mut leftover = bind(
-            structured_claude_row("leftover intent", path, None),
-            "sid-leftover",
-        );
-        leftover.agent_session_id = Some("sid-leftover".into());
-        let rows = vec![unbound, bound, leftover, recovered.clone()];
+        // No ACP conversation yet, but a stored target from before Structured view.
+        let earlier = |title: &str, sid: &str| {
+            let mut row = bind(structured_claude_row(title, path, None), sid);
+            row.agent_session_id = Some(sid.into());
+            row
+        };
+        let leftover = earlier("leftover intent", "sid-leftover");
+        let leftover_fresh = earlier("leftover fresh", "sid-leftover-fresh");
+        let rows = vec![unbound, bound, leftover, leftover_fresh, recovered.clone()];
         let _panes: Vec<_> = rows
             .iter()
             .map(|row| {
@@ -4311,18 +4339,33 @@ mod tests {
             };
 
         let fresh_body = &br#"{"conversation":"fresh"}"#[..];
-        for (row, (old_sid, before, body, resumed)) in rows.iter().zip([
-            ("sid-unbound", "starts_fresh", fresh_body, false),
-            ("sid-bound", "continues", fresh_body, false),
-            ("sid-leftover", "starts_fresh", &b""[..], true),
+        let earlier = Some("earlier_conversation");
+        for (row, (old_sid, before, reason, body, resumed)) in rows.iter().zip([
+            (
+                "sid-unbound",
+                "starts_fresh",
+                Some("conversation_not_bound"),
+                fresh_body,
+                false,
+            ),
+            ("sid-bound", "continues", None, fresh_body, false),
+            ("sid-leftover", "continues", earlier, &b""[..], true),
+            (
+                "sid-leftover-fresh",
+                "continues",
+                earlier,
+                fresh_body,
+                false,
+            ),
         ]) {
             let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
-            assert_eq!(
-                response_json(checked).await?.1["context"],
-                before,
-                "{}",
-                row.title
-            );
+            let checked = response_json(checked).await?.1;
+            assert_eq!(checked["context"], before, "{}", row.title);
+            assert_eq!(checked["reason"].as_str(), reason, "{}", row.title);
+            // With no choice, the check says what the switch does.
+            if body.is_empty() {
+                assert_eq!(resumed, before == "continues", "{}", row.title);
+            }
             let response = acp_disable(
                 State(state.clone()),
                 Path(row.id.clone()),
