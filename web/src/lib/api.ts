@@ -3648,7 +3648,10 @@ export const putSuggestionTemplate = (providerId: string, criterion: string, tem
 
 /** Drops the override, so the provider's own prompt applies again. */
 export const resetSuggestionTemplate = (providerId: string, criterion: string) =>
-  suggestionRequest("/api/suggestions/templates", "DELETE", { provider_id: providerId, criterion });
+  suggestionRequest(
+    `/api/suggestions/templates?${new URLSearchParams({ provider_id: providerId, criterion })}`,
+    "DELETE",
+  );
 
 export async function fetchSuggestionMappings(): Promise<SuggestionMapping[] | null> {
   const body = await fetchJson<{ mappings: SuggestionMapping[] }>("/api/suggestions/mappings");
