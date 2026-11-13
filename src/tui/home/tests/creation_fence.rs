@@ -747,3 +747,51 @@ fn a_refused_resubmit_keeps_the_recovery_dialog_and_its_request() {
         assert_ne!(second.idempotency_key, first.idempotency_key, "{case}");
     }
 }
+
+/// The session-setup dialog has no text input: a paste while it is open is dropped, not
+/// routed into a compose dialog over it or saved for whichever dialog opens next.
+#[test]
+#[serial]
+fn a_paste_over_the_setup_failed_dialog_goes_nowhere() {
+    use crate::tui::session_feed::CommandFailure;
+    let CreationTestEnv {
+        mut view,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+    let mut fail = view.session_feed.creation_failure_driver_for_test();
+    view.session_feed
+        .publish_for_test(creation_snapshot(vec![], "test", 1));
+    view.apply_session_feed();
+    // A runnable session for a stray paste to land in.
+    let mut running = Instance::new("Running", project_dir.to_str().unwrap());
+    running.status = Status::Running;
+    running.source_profile = "default".to_string();
+    let running_id = running.id.clone();
+    view.add_instance(running);
+    view.request_creation(creation_data(&project_dir, "Hooked", "test"), None, None);
+    fail(CommandFailure::CreateHookFailed("exit 3".into()));
+    assert!(view.apply_creation_results().is_none());
+    assert!(view.create_hook_failed.is_some());
+    view.flat_items = view.build_flat_items();
+    view.cursor = view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if id == &running_id))
+        .expect("the running row");
+    view.update_selected();
+    // The terminal target needs no live tmux pane, so a stray paste would open compose.
+    view.view_mode = crate::tui::home::ViewMode::Terminal;
+
+    view.handle_paste("pasted text");
+    assert!(
+        view.send_message_dialog.is_none(),
+        "no compose dialog opens"
+    );
+    assert_eq!(
+        view.pending_paste, None,
+        "nothing is kept for a later dialog"
+    );
+    assert!(view.create_hook_failed.is_some(), "the dialog stays");
+}

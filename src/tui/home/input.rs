@@ -6808,6 +6808,10 @@ impl HomeView {
                 return;
             }
         }
+        // The session-setup dialog has no text input, so a paste there has nowhere to go.
+        if self.create_hook_failed.is_some() {
+            return;
+        }
         // Before send_message_dialog below: with the skills manager open and its editor
         // focused, a paste falling through would open a message dialog aimed at whatever
         // session was selected before the panel opened, rendering both overlays.
