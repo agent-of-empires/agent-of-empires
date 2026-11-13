@@ -129,6 +129,19 @@ fn shell_consumed_by(command: &str) -> Option<&'static str> {
     None
 }
 
+/// The text AoE appends a mode or instruction flag to, as the user or
+/// declaration wrote it: the supplied command plus the session's extra args.
+///
+/// The flag lands after both, so both are scanned. AoE's own rendering (a quoted
+/// program path, a quoted model value) is not part of it.
+fn appended_flag_invocation(supplied: &str, extra_args: &str) -> String {
+    if extra_args.is_empty() {
+        supplied.to_owned()
+    } else {
+        format!("{supplied} {extra_args}")
+    }
+}
+
 /// Refuse an argument AoE appends for the agent when the shell would consume it,
 /// naming the construct so a declaration can be corrected.
 fn refuse_shell_consumed_argument(command: &str, argument: &str) -> Result<()> {
@@ -190,18 +203,18 @@ fn wrap_prime_launch(
 
 /// Append yolo-mode flags or environment variables to a launch command.
 ///
-/// `supplied` is the command as the user or declaration wrote it, before AoE
-/// renders and pins it: the refusal is about that text, never about the quoting
-/// AoE's own rendering adds for a path.
+/// `invocation` is the command as the user or declaration wrote it plus the
+/// session's extra args, before AoE renders and pins it: the refusal is about
+/// that text, never about the quoting AoE's own rendering adds for a path.
 fn apply_yolo_mode(
     cmd: &mut String,
     yolo: &crate::agents::YoloMode,
     is_sandboxed: bool,
-    supplied: &str,
+    invocation: &str,
 ) -> Result<()> {
     match yolo {
         crate::agents::YoloMode::CliFlag(flag) => {
-            refuse_shell_consumed_argument(supplied, "mode flag")?;
+            refuse_shell_consumed_argument(invocation, "mode flag")?;
             *cmd = format!("{} {}", cmd, flag);
         }
         crate::agents::YoloMode::EnvVar(key, value) if !is_sandboxed => {
@@ -1418,6 +1431,7 @@ impl Instance {
             // AoE renders and pins it: quoting AoE adds for a model value or a
             // program path is not a shell construct.
             let supplied = self.get_launch_command();
+            let guarded = appended_flag_invocation(&supplied, &self.extra_args);
             let launch_cmd =
                 self.freeze_native_invocation(supplied.clone(), execution, None, launch_context)?;
             let base_cmd = if self.extra_args.is_empty() {
@@ -1438,7 +1452,7 @@ impl Instance {
             let mut tool_cmd = if self.is_yolo_mode() {
                 match yolo {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
-                        refuse_shell_consumed_argument(&supplied, "mode flag")?;
+                        refuse_shell_consumed_argument(&guarded, "mode flag")?;
                         format!("{} {}", base_cmd, flag)
                     }
                     Some(crate::agents::YoloMode::EnvVar(..))
@@ -1456,7 +1470,7 @@ impl Instance {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(flag_template) = agent.and_then(|a| a.instruction_flag) {
-                    refuse_shell_consumed_argument(&supplied, "instruction flag")?;
+                    refuse_shell_consumed_argument(&guarded, "instruction flag")?;
                     let escaped = shell_escape(instruction);
                     let flag = flag_template.replace("{}", &escaped);
                     tool_cmd = format!("{} {}", tool_cmd, flag);
@@ -1693,6 +1707,7 @@ impl Instance {
             match agent {
                 Some(a) => {
                     let supplied = a.launch_base_command();
+                    let guarded = appended_flag_invocation(&supplied, &self.extra_args);
                     let mut cmd = self.freeze_native_invocation(
                         supplied.clone(),
                         execution,
@@ -1714,7 +1729,7 @@ impl Instance {
                     }
                     if host_command.is_none() {
                         if let Some(yolo) = yolo {
-                            apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
+                            apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                         }
                     }
                     let is_existing = self.apply_session_flags_in(
@@ -1737,7 +1752,7 @@ impl Instance {
                             if let Some(yolo) =
                                 agent.and_then(|agent| resolved_yolo(agent, launch_context))
                             {
-                                apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
+                                apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                             }
                         }
                     }
@@ -1800,6 +1815,7 @@ impl Instance {
             }
         } else {
             let supplied = self.command.clone();
+            let guarded = appended_flag_invocation(&supplied, &self.extra_args);
             let mut cmd = self.freeze_native_invocation(
                 supplied.clone(),
                 execution,
@@ -1814,7 +1830,7 @@ impl Instance {
             }
             if host_command.is_none() {
                 if let Some(yolo) = yolo {
-                    apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
+                    apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                 }
             }
             let is_existing = self.apply_session_flags_in(
@@ -1836,7 +1852,7 @@ impl Instance {
                 if !defer_yolo && self.is_yolo_mode() {
                     if let Some(yolo) = agent.and_then(|agent| resolved_yolo(agent, launch_context))
                     {
-                        apply_yolo_mode(&mut cmd, yolo, false, &supplied)?;
+                        apply_yolo_mode(&mut cmd, yolo, false, &guarded)?;
                     }
                 }
             }
@@ -2067,6 +2083,25 @@ sandbox = "unsupported"
             );
         }
 
+        // The session's extra args are appended before the instruction, so a
+        // construct they introduce must not receive it either.
+        for extra in ["| tee log", "# trailing"] {
+            let mut inst = declared("zzgamma", "prime-agent");
+            inst.extra_args = extra.into();
+            let config = inst.build_container_config_for_test().unwrap();
+            let _transport = install_container_transport(temp.path(), "zzgamma", &config.volumes);
+            let error = match inst.prepare_launch_command(inst.conversation_state()) {
+                Err(error) => error,
+                Ok(_) => panic!("extra args `{extra}` must not receive the instruction"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("instruction flag would reach the shell"),
+                "{extra}: {error}"
+            );
+        }
+
         // YOLO off and a bare command: the instruction is appended as argv. The
         // transport is fixtures so the launch does not depend on a host runtime.
         let mut direct = declared("zzgamma", "prime-agent");
@@ -2185,6 +2220,27 @@ sandbox = "unsupported"
             !prepared.command.unwrap().contains("--resume"),
             "{command} must not receive a resume flag the shell would consume"
         );
+
+        // The session's extra args are appended before the flag, so a construct
+        // they introduce is the shell's problem too.
+        for extra in ["| tee log", "# trailing"] {
+            let (mut inst, _) = declared("zzepsilon");
+            inst.yolo_mode = true;
+            inst.extra_args = extra.into();
+            let error = match inst.prepare_launch_command(inst.conversation_state()) {
+                Err(error) => error,
+                Ok(prepared) => panic!(
+                    "extra args `{extra}` must not receive the mode flag: {:?}",
+                    prepared.command
+                ),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("mode flag would reach the shell"),
+                "{extra}: {error}"
+            );
+        }
 
         let (mut direct, _) = declared("zzepsilon");
         direct.yolo_mode = true;
