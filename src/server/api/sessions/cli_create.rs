@@ -408,6 +408,7 @@ fn resolve_host_creation(
                     std::path::Path::new(&body.path),
                     body.scratch,
                     body.trust_hooks,
+                    body.skip_on_create,
                 )
             },
         };

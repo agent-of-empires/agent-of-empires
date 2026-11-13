@@ -1467,7 +1467,7 @@ pub(super) fn hook_session_observation(
 impl Instance {
     pub(super) fn sandbox_launch_environment(
         &self,
-        agent: Option<&AgentDef>,
+        agent: Option<&AgentDef<'_>>,
         identity_extension: Option<&(String, String)>,
         profile: &str,
         source: Option<&str>,
@@ -1535,7 +1535,7 @@ impl Instance {
 
     fn native_launch_inputs(
         &self,
-        agent: &AgentDef,
+        agent: &AgentDef<'_>,
         config: &crate::session::config::Config,
     ) -> Result<NativeLaunchInputs> {
         let launch_id = uuid::Uuid::new_v4().to_string();
@@ -1920,7 +1920,7 @@ impl Instance {
         Ok(actual)
     }
 
-    pub(super) fn managed_user_argv(&self, agent: &AgentDef) -> Result<Option<String>> {
+    pub(super) fn managed_user_argv(&self, agent: &AgentDef<'_>) -> Result<Option<String>> {
         let extra = if self.command.is_empty() {
             crate::session::config::quote_model_value_in_args(&self.extra_args)
         } else {
@@ -2902,7 +2902,7 @@ enum ManagedArgumentPolicy {
     Generic,
 }
 
-fn managed_argument_policy(agent: &AgentDef) -> ManagedArgumentPolicy {
+fn managed_argument_policy(agent: &AgentDef<'_>) -> ManagedArgumentPolicy {
     use crate::agents::SessionCaptureBackend::{
         Claude, Codex, Gemini, Hermes, HookSidecar, Kimi, Omp, OpenCode, Pi, PrimeAgent,
     };
@@ -2939,7 +2939,7 @@ fn resume_contract(
     own_tool: &str,
     declared: Option<crate::plugin::agent_integration::DeclaredAgent>,
 ) -> (bool, Option<crate::agents::SessionCaptureBackend>) {
-    let contract = |agent: &AgentDef| {
+    let contract = |agent: &AgentDef<'_>| {
         (
             agent.session_support.is_some(),
             agent
@@ -2960,7 +2960,7 @@ fn resume_contract(
 }
 
 pub(super) fn validate_managed_arguments(
-    agent: &AgentDef,
+    agent: &AgentDef<'_>,
     words: &[String],
 ) -> Result<Option<String>> {
     let policy = managed_argument_policy(agent);

@@ -555,10 +555,22 @@ pub(crate) struct CreateHookPlan {
     pub(crate) trust_write: Option<(Option<String>, Option<String>)>,
     /// Repo hooks replace global and profile ones per type, so this is per type too.
     pub(crate) on_create_from_repo: bool,
+    /// The caller chose to create without setup: no `on_create` hook runs.
+    skip_on_create: bool,
 }
 
 impl CreateHookPlan {
+    /// Applies the caller's skip choice; true when it skips `on_create` commands.
+    pub(crate) fn apply_skip_on_create(&mut self, skip: bool) -> bool {
+        let skipped = skip && !self.on_create().is_empty();
+        self.skip_on_create = skip;
+        skipped
+    }
+
     pub(crate) fn on_create(&self) -> &[String] {
+        if self.skip_on_create {
+            return &[];
+        }
         self.hooks
             .as_ref()
             .map_or(&[], |hooks| &hooks.hooks().on_create)
@@ -636,6 +648,7 @@ pub(crate) fn resolve_create_hook_plan(
         hooks,
         trust_write,
         on_create_from_repo,
+        skip_on_create: false,
     })
 }
 
@@ -954,9 +967,10 @@ pub(crate) async fn create_session_with(
         body.base_branch = None;
         body.sandbox = false;
         body.sandbox_image = None;
-        // Hook approval remains operator-owned.
+        // Hook approval and skipping setup remain operator-owned.
         body.trust_hooks = None;
         body.trust_review = None;
+        body.skip_on_create = false;
         // Registry order selects the primary project.
         let mut paths = projects.into_iter().map(|p| p.path);
         body.path = paths.next().unwrap();
@@ -1138,7 +1152,8 @@ pub(crate) async fn create_session_with(
             || !body.extra_repo_paths.is_empty());
         let (tool, agent_name) = (body.tool.clone(), body.agent_name.clone());
         let (command_override, sandboxed) = (body.command_override.clone(), body.sandbox);
-        let (scratch, trust_hooks) = (body.scratch, body.trust_hooks);
+        let (scratch, trust_hooks, skip_on_create) =
+            (body.scratch, body.trust_hooks, body.skip_on_create);
         let missing = tokio::task::spawn_blocking(move || {
             use crate::session::builder::structured::{
                 preparation_hooks_apply, validate_structured_choice, StructuredChoice,
@@ -1162,6 +1177,7 @@ pub(crate) async fn create_session_with(
                         &project_path,
                         scratch,
                         trust_hooks,
+                        skip_on_create,
                     )
                 },
             };
@@ -1423,6 +1439,7 @@ pub(crate) async fn create_session_with(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         trust_review: body.trust_review,
+        skip_on_create: body.skip_on_create,
         custom_instruction: body.custom_instruction,
         callback_url: body.callback_url,
         idempotency_key: body.idempotency_key.clone(),

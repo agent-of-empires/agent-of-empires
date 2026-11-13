@@ -100,7 +100,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
   if (!prefill) return base;
   return {
     ...base,
-    path: prefill.scratch ? "" : prefill.path || "",
+    // A prefill without a path (group-only) keeps the remembered project; a tab-only one opens the picker.
+    path: prefill.scratch ? "" : prefill.path || (prefill.initialTab ? "" : base.path),
     tool: prefill.tool || base.tool,
     yoloMode: prefill.yoloMode ?? false,
     sandboxEnabled: prefill.sandboxEnabled ?? false,
@@ -180,6 +181,8 @@ const basename = (path: string) => path.replace(/\/+$/, "").split("/").pop() || 
 export interface WizardRestore {
   data: WizardData;
   failure: CreateFailure;
+  /** The create's last progress snapshot, for a failed hook's output tail. */
+  progress?: CreateProgress | null;
 }
 
 interface Props {
@@ -188,7 +191,7 @@ interface Props {
   /** A create the user sent to the background finished; the wizard is already closed. */
   onCreatedInBackground?: (session?: SessionResponse) => void;
   /** Reopens the wizard on a background create's failure, from its toast. */
-  onReopenFailure?: (restore: WizardRestore) => void;
+  onReopenFailure?: (restore: WizardRestore) => boolean | void;
   /** Opens on this failure and form instead of the prefill and profile defaults. */
   restore?: WizardRestore;
   prefill?: WizardPrefill;
@@ -238,8 +241,29 @@ export function SessionWizard({
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
   const offline = useServerDown();
-  const [progress, setProgress] = useState<CreateProgress | null>(null);
-  const [progressKey, setProgressKey] = useState<string | null>(null);
+  const [progress, setProgress] = useState<CreateProgress | null>(restore?.progress ?? null);
+  // The latest snapshot, which a backgrounded create keeps polling once the wizard is gone.
+  const lastProgressRef = useRef<CreateProgress | null>(null);
+  // Polls can overlap, so a response older than the last one accepted is dropped.
+  const progressSeqRef = useRef({ sent: 0, accepted: 0 });
+  const fetchNewerProgress = async (key: string) => {
+    const seq = ++progressSeqRef.current.sent;
+    const p = await fetchCreateProgress(key);
+    if (!p || seq <= progressSeqRef.current.accepted) return null;
+    progressSeqRef.current.accepted = seq;
+    return p;
+  };
+  const backgroundPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stopBackgroundPoll = () => {
+    if (backgroundPollRef.current) clearInterval(backgroundPollRef.current);
+    backgroundPollRef.current = null;
+  };
+  const [progressKey, setProgressKeyState] = useState<string | null>(null);
+  const progressKeyRef = useRef<string | null>(null);
+  const setProgressKey = (key: string | null) => {
+    progressKeyRef.current = key;
+    setProgressKeyState(key);
+  };
   const [showProgress, setShowProgress] = useState(false);
   // A create whose response never arrived; Launch and reconnects retry it under its key.
   // Seeded from a create an earlier wizard left unresolved, so Launch retries it under its key.
@@ -473,8 +497,10 @@ export function SessionWizard({
     let cancelled = false;
     const delay = setTimeout(() => !cancelled && setShowProgress(true), PROGRESS_DELAY_MS);
     const poll = setInterval(() => {
-      void fetchCreateProgress(progressKey).then((p) => {
-        if (!cancelled && p) setProgress(p);
+      void fetchNewerProgress(progressKey).then((p) => {
+        if (cancelled || !p) return;
+        lastProgressRef.current = p;
+        setProgress(p);
       });
     }, PROGRESS_POLL_MS);
     return () => {
@@ -593,6 +619,15 @@ export function SessionWizard({
   const runCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate, sent?: WizardData) => {
     // The last snapshot outlives the request: a failed hook's output tail comes from it.
     setProgress(null);
+    lastProgressRef.current = null;
+    try {
+      await sendCreate(body, tool, resume, sent);
+    } finally {
+      stopBackgroundPoll();
+    }
+  };
+
+  const sendCreate = async (body: CreateSessionRequest, tool: string, resume?: PendingCreate, sent?: WizardData) => {
     // A create can be sent twice: once, then again after a review that asks for no trust.
     for (let resend = 0; ; resend++) {
       setUnknownOutcome(null);
@@ -660,7 +695,7 @@ export function SessionWizard({
       } else if (background) {
         const failure = result.failure;
         if (failure && onReopenFailure && sent) {
-          const restored = { data: sent, failure };
+          const restored = { data: sent, failure, progress: lastProgressRef.current };
           const { title } = failureView(failure, { sandboxEnabled: restored.data.sandboxEnabled, runtimeDown: false });
           const reference = failure.reference ? ` Reference ${failure.reference.slice(0, 8)}… · in debug.log` : "";
           toastBus.handler?.action(`Session was not created: ${title}.${reference}`, "Reopen", () =>
@@ -693,7 +728,12 @@ export function SessionWizard({
   };
 
   // `overrides` and `runtimeUp` were dispatched in the same event, which `state` doesn't hold yet.
-  const handleSubmit = async (overrides: Partial<WizardData> = {}, runtimeUp = false) => {
+  // `skipOnCreate` stays out of the form, so a reopened or later Launch runs setup again.
+  const handleSubmit = async (
+    overrides: Partial<WizardData> = {},
+    runtimeUp = false,
+    { skipOnCreate = false }: { skipOnCreate?: boolean } = {},
+  ) => {
     dispatch({ type: "SUBMIT_START" });
     setRuntimeDown(false);
     if (unknownOutcome) {
@@ -719,6 +759,7 @@ export function SessionWizard({
           agents.find((a) => a.name === d.tool),
           d,
         ),
+        { skipOnCreate },
       ),
       idempotency_key: newIdempotencyKey(),
     };
@@ -745,6 +786,15 @@ export function SessionWizard({
     return () => {
       backgroundRef.current = true;
       unmountedRef.current = true;
+      // A create still in flight reports its failure later, so keep its output tail current.
+      const key = progressKeyRef.current;
+      if (key) {
+        backgroundPollRef.current = setInterval(() => {
+          void fetchNewerProgress(key).then((p) => {
+            if (p && backgroundPollRef.current) lastProgressRef.current = p;
+          });
+        }, PROGRESS_POLL_MS);
+      }
       if (unknownOutcomeRef.current) releasePendingCreate(unknownOutcomeRef.current.body.idempotency_key);
     };
   }, []);
@@ -835,6 +885,11 @@ export function SessionWizard({
         return;
       case "try_again":
         await handleSubmit();
+        return;
+      case "create_without_setup":
+        // A new key: the server answers a reused key with the failed create's stored result.
+        await handleSubmit({}, false, { skipOnCreate: true });
+        return;
     }
   };
 
@@ -844,7 +899,9 @@ export function SessionWizard({
   };
 
   const d = state.data;
-  const failed = state.failure && failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown });
+  const failed =
+    state.failure &&
+    failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown, canSkipSetup: !nameOnly });
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
   // Only the Yolo row needs the agent list, and a name-only form has none.
@@ -857,7 +914,8 @@ export function SessionWizard({
   const resendBlocked = (action: FailureAction) => {
     if (action === "change_image" || action === "choose_project") return false;
     // Retry checks the runtime itself, and Launch without Sandbox doesn't need it.
-    return !canResend || (action === "try_again" && d.sandboxEnabled && !state.dockerChecked);
+    const resendsSandbox = action === "try_again" || action === "create_without_setup";
+    return !canResend || (resendsSandbox && d.sandboxEnabled && !state.dockerChecked);
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);

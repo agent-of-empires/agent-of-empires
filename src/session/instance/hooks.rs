@@ -159,7 +159,7 @@ pub(crate) fn host_hook_disclosure_config_with_repo(
 /// is what the launch exports to the agent, so it is what the agent reads.
 fn host_hook_config_path(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef<'static>,
+    agent: &'static crate::agents::AgentDef,
     home: &std::path::Path,
     session_config: &crate::session::config::SessionConfig,
     host_environment: &[String],
@@ -204,7 +204,7 @@ fn routed_settings_path(
 /// decide the paths.
 pub(crate) fn host_hook_disclosure(
     tool_name: &str,
-    agent: &'static crate::agents::AgentDef<'static>,
+    agent: &'static crate::agents::AgentDef,
     config: &crate::session::config::Config,
 ) -> HostHookDisclosure {
     let mut disclosure = HostHookDisclosure {
@@ -593,7 +593,7 @@ impl Instance {
     /// keeps resolving its config directory from the environment.
     fn routed_hook_root(
         &self,
-        agent: &'static crate::agents::AgentDef<'static>,
+        agent: &'static crate::agents::AgentDef,
     ) -> Option<std::path::PathBuf> {
         let (_, binding, _) = self.conversation_target()?;
         let binding = binding.filter(|binding| binding.is_known())?;
@@ -658,7 +658,7 @@ impl Instance {
     /// settings file written here is the file the agent reads.
     fn install_host_hooks(
         &self,
-        agent: &'static crate::agents::AgentDef<'static>,
+        agent: &'static crate::agents::AgentDef,
         home: &Path,
         session_cfg: &crate::session::config::SessionConfig,
         host_environment: &[String],
@@ -942,7 +942,7 @@ pub(super) fn host_home(host_environment: &[String]) -> Option<std::path::PathBu
 }
 
 fn resolved_host_hook_events(
-    agent: &'static crate::agents::AgentDef<'static>,
+    agent: &'static crate::agents::AgentDef,
     config: &crate::session::config::Config,
     status_hooks_enabled: bool,
 ) -> Option<Vec<crate::agents::ResolvedHookEvent>> {

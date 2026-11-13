@@ -226,7 +226,7 @@ impl DeclaredAgent {
 
     pub(crate) fn with_definition<R>(
         &self,
-        use_agent: impl FnOnce(&crate::agents::AgentDef<'_>) -> R,
+        use_agent: impl FnOnce(&crate::agents::AgentDef) -> R,
     ) -> Option<R> {
         use crate::agents::{
             AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
@@ -349,6 +349,19 @@ impl DeclaredAgent {
     fn plugin_id(&self) -> &str {
         self.registry.all()[self.plugin_index].id()
     }
+}
+
+/// Whether any active plugin declares a launch command for `tool`.
+///
+/// Cheap enough to rule out a declaration before resolving config for it.
+pub(crate) fn registry_declares(registry: &super::PluginRegistry, tool: &str) -> bool {
+    registry.active().any(|plugin| {
+        plugin
+            .manifest
+            .agent_integrations
+            .iter()
+            .any(|entry| entry.tool == tool && entry.command.is_some())
+    })
 }
 
 pub(crate) fn declared_agent<'a>(

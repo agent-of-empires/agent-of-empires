@@ -20,7 +20,7 @@ interface Toast {
   message: string;
   sessionId?: string;
   href?: string;
-  action?: { label: string; run: () => void };
+  action?: { label: string; run: () => boolean | void };
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
@@ -136,7 +136,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [scheduleDismiss],
   );
 
-  const pushWithAction = useCallback((message: string, label: string, run: () => void) => {
+  const pushWithAction = useCallback((message: string, label: string, run: () => boolean | void) => {
     const id = nextId.current++;
     // Stays until used or dismissed: its action can be the only way back to what failed.
     setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
@@ -205,6 +205,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
       >
         {toasts.map((t) => {
           const clickable = !!t.sessionId || !!t.href;
+          // A blank message would leave the opener without an accessible name.
+          const openerLabel = t.message.trim() ? t.message : t.href ? "Open link" : "Open session";
           const onToastClick = () => {
             if (t.href) {
               // Defensive re-check: the server already rejects disallowed notification hrefs, but never hand an
@@ -234,14 +236,28 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   : "bg-surface-800 border-surface-700 text-text-primary"
               } ${clickable ? "cursor-pointer hover:bg-surface-700 transition-colors" : ""}`}
             >
-              <span className="flex-1 break-words">{t.message}</span>
+              {clickable ? (
+                // The message is the toast's own control, so the keyboard can follow its link; a click on the
+                // rest of the toast still opens it through the outer handler.
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToastClick();
+                  }}
+                  className="flex-1 break-words text-left cursor-pointer rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
+                >
+                  {openerLabel}
+                </button>
+              ) : (
+                <span className="flex-1 break-words">{t.message}</span>
+              )}
               {t.action && (
                 <button
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
-                    dismiss(t.id);
-                    t.action!.run();
+                    if (t.action!.run() !== false) dismiss(t.id);
                   }}
                   className="shrink-0 font-medium text-text-primary underline-offset-2 hover:underline cursor-pointer"
                 >

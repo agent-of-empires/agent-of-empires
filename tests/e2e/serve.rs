@@ -3075,7 +3075,8 @@ fn tui_local_restart_preserves_the_env_passphrase_gate() {
     h.wait_for("Connections");
     h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
-    h.send_keys("L");
+    h.send_keys("Left");
+    h.send_keys("Enter");
     let (port, token) = wait_for_local_dashboard(&h);
     assert!(
         login_status_required(port, &token).unwrap(),
@@ -3116,7 +3117,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.wait_for("Connections");
     h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
-    h.send_keys("L");
+    h.send_keys("Left");
+    h.send_keys("Enter");
     let (port, token) = wait_for_local_dashboard(&h);
     assert!(
         login_status_required(port, &token).unwrap(),

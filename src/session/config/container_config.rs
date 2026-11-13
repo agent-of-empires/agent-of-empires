@@ -2486,7 +2486,7 @@ pub(crate) fn stranded_named_ignore_volumes(
 /// Reject managed agent paths that would bypass the sandbox's private mounts.
 fn validate_managed_container_environment(
     environment: &[EnvEntry],
-    active_agent: Option<&crate::agents::AgentDef>,
+    active_agent: Option<&crate::agents::AgentDef<'_>>,
     container_home: &str,
 ) -> Result<()> {
     let require_path = |key: &str, expected: &str| -> Result<()> {
@@ -6480,7 +6480,7 @@ codex-work = "{}"
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
 
-        let sidecar_agents: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS
+        let sidecar_agents: Vec<&crate::agents::AgentDef<'_>> = crate::agents::AGENTS
             .iter()
             .filter(|a| a.sidecar_hooks.is_some() && !a.host_only)
             .collect();

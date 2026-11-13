@@ -4,7 +4,11 @@ import type { WizardData } from "./wizardReducer";
 /** The create payload for the wizard state. Scratch omits every worktree field
  *  (the server rejects scratch plus a worktree branch); the server re-validates
  *  structured view capability. */
-export function buildCreateRequest(d: WizardData, acpCapable: boolean): CreateSessionRequest {
+export function buildCreateRequest(
+  d: WizardData,
+  acpCapable: boolean,
+  { skipOnCreate = false }: { skipOnCreate?: boolean } = {},
+): CreateSessionRequest {
   const worktree = !d.scratch && d.useWorktree;
   const newBranch = worktree && !d.attachExisting;
   const structured = acpCapable && d.useStructuredView;
@@ -38,6 +42,7 @@ export function buildCreateRequest(d: WizardData, acpCapable: boolean): CreateSe
     agent_model: structured && d.agentModel ? d.agentModel : undefined,
     agent_effort: structured && d.agentEffort ? d.agentEffort : undefined,
     scratch: d.scratch || undefined,
+    skip_on_create: skipOnCreate || undefined,
     import_acp_session_id: d.importAcpSessionId || undefined,
   };
 }

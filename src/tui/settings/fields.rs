@@ -462,7 +462,7 @@ fn json_to_list(current: &Value) -> Vec<String> {
 
 /// Render from the last availability snapshot without waiting for background probes.
 fn installed_oneshot_agents() -> Vec<String> {
-    let defs: Vec<&crate::agents::AgentDef> = crate::agents::oneshot_capable_names()
+    let defs: Vec<&crate::agents::AgentDef<'_>> = crate::agents::oneshot_capable_names()
         .into_iter()
         .filter_map(crate::agents::get_agent)
         .collect();

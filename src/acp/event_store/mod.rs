@@ -1,5 +1,6 @@
 //! Disk-backed event log for structured view sessions.
 
+mod account_limits;
 mod attachments;
 pub(crate) mod identity;
 mod rate_limit;
@@ -18,6 +19,7 @@ use tracing::{debug, trace, warn};
 use super::state::Event;
 use crate::events;
 
+pub use account_limits::{AccountState, WindowLimit};
 pub use attachments::AttachmentBlob;
 pub use rate_limit::RateLimitPark;
 pub use replay::ReplayPage;
@@ -149,6 +151,7 @@ impl EventStore {
         let schema = events::Schema::new("acp")?;
         let mut conn = events::open(db_path, &schema)?;
         identity::install(&mut conn)?;
+        account_limits::ensure_schema(&conn).context("create account limits table")?;
         let private_database: bool = conn.query_row(
             "SELECT file = '' FROM pragma_database_list WHERE name = 'main'",
             [],

@@ -51,6 +51,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             launcher: Arc::clone(&self.launcher),
             notify: Arc::clone(&self.worker_notify),
             startup_failures: Arc::clone(&self.startup_failures),
+            rate_limit_wake: Arc::clone(&self.rate_limit_wake),
             pending_context_resets: Arc::clone(&self.pending_context_resets),
             context_reset,
             respawned_in_place: Arc::clone(&self.respawned_in_place),
@@ -75,6 +76,7 @@ struct Drain<S> {
     launcher: Launcher,
     notify: Arc<tokio::sync::Notify>,
     startup_failures: SharedSet,
+    rate_limit_wake: Arc<tokio::sync::Notify>,
     pending_context_resets: SharedSet,
     context_reset: Option<PendingContextReset>,
     respawned_in_place: SharedSet,
@@ -157,6 +159,7 @@ impl<S: BroadcastSink> Drain<S> {
                     "rate-limited; dropping worker handle without respawn"
                 );
                 self.drop_handle(&lease, None).await;
+                self.rate_limit_wake.notify_one();
                 return;
             }
             if end.startup_failed && self.recovery.is_none() {
@@ -1123,6 +1126,7 @@ impl<S: BroadcastSink> Drain<S> {
         e: AcpError,
     ) {
         let session_id = &self.session_id;
+        let rate_limited = matches!(e, AcpError::RateLimited(_));
         let launched = respawn_lease.spawned_runner().or_else(|| {
             worker_registry::load(session_id)
                 .ok()
@@ -1182,6 +1186,9 @@ impl<S: BroadcastSink> Drain<S> {
                 super::teardown::tear_down_lease(&*self.process_control, respawn_lease, false)
                     .await;
             self.settle_retirement(respawn_lease, settlement).await;
+        }
+        if rate_limited {
+            self.rate_limit_wake.notify_one();
         }
     }
 
@@ -1713,6 +1720,26 @@ mod tests {
                 workflow: None,
             },
         );
+        sink.publish(
+            id,
+            2,
+            &Event::SubagentUpdated {
+                subagent: crate::acp::state::SubagentRecord {
+                    session_id: "child".into(),
+                    parent_session_id: "root".into(),
+                    parent_tool_call_id: Some("msg-1".into()),
+                    title: None,
+                    description: None,
+                    state: crate::acp::state::SubagentState::Running,
+                    stop_reason: None,
+                    error: None,
+                    cancel_capable: true,
+                    model: None,
+                    background: true,
+                },
+                at: chrono::Utc::now(),
+            },
+        );
         let sup = Supervisor::new(sink);
         sup.hydrate_seqs(store.all_session_seqs());
         let (client, _client_tx) =
@@ -1743,6 +1770,12 @@ mod tests {
             state.background_agents[0].status,
             BackgroundAgentStatus::Detached
         );
+        assert_eq!(
+            state.subagents[0].stop_reason.as_deref(),
+            Some("cancelled"),
+            "the dropped worker's subagent closes as cancelled"
+        );
+        assert!(store.open_subagents(id).is_empty());
         assert!(
             !state.has_active_background_agent(),
             "the sidebar dot must not stay lit behind a stopped worker"
@@ -1789,6 +1822,15 @@ mod tests {
                 Vec::new()
             };
             assert_eq!(sup.take_startup_failures(), expected_failures, "{id}");
+            // The drain has ended, so nothing else can signal: a pending wake is this end's.
+            let woke = tokio::time::timeout(Duration::from_millis(50), sup.rate_limit_parked())
+                .await
+                .is_ok();
+            assert_eq!(
+                woke,
+                id == "s-rl",
+                "{id}: only a rate-limited end wakes the reconciler"
+            );
             let published: Vec<Event> = sink
                 .frames
                 .lock()
@@ -3171,6 +3213,7 @@ mod tests {
             launcher: Arc::clone(&supervisor.launcher),
             notify: Arc::clone(&supervisor.worker_notify),
             startup_failures: Arc::clone(&supervisor.startup_failures),
+            rate_limit_wake: Arc::clone(&supervisor.rate_limit_wake),
             pending_context_resets: Arc::clone(&supervisor.pending_context_resets),
             context_reset: None,
             respawned_in_place: Arc::clone(&supervisor.respawned_in_place),

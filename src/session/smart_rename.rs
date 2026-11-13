@@ -103,7 +103,7 @@ pub fn check_eligible(
     setting_on: bool,
     force: bool,
     title: &str,
-    agent: Option<&agents::AgentDef>,
+    agent: Option<&agents::AgentDef<'_>>,
     command: &str,
     command_override_in_cfg: bool,
 ) -> Result<(), SkipReason> {
@@ -414,7 +414,7 @@ pub enum OneshotModel {
 /// removes the key on clear), so that state is reachable only via the TUI or
 /// config.toml.
 pub fn resolve_title_model_args(
-    agent: &agents::AgentDef,
+    agent: &agents::AgentDef<'_>,
     models: &HashMap<String, String>,
 ) -> Vec<String> {
     let Some(flag) = agent.oneshot_model_flag() else {
@@ -443,7 +443,7 @@ pub fn resolve_title_model_args(
 /// the CLI has already bound the prompt to the flag, so trailing flags stay
 /// unambiguous.
 pub fn build_oneshot_argv(
-    agent: &agents::AgentDef,
+    agent: &agents::AgentDef<'_>,
     prompt: &str,
     model: OneshotModel,
 ) -> Option<Vec<String>> {
@@ -2296,7 +2296,7 @@ mod tests {
 
     /// A title one-shot with no user override: the agent's built-in default
     /// (claude pins `haiku`, others none), reproducing the pre-tunable behavior.
-    fn title_default(agent: &agents::AgentDef) -> OneshotModel {
+    fn title_default(agent: &agents::AgentDef<'_>) -> OneshotModel {
         OneshotModel::Title(resolve_title_model_args(agent, &HashMap::new()))
     }
 

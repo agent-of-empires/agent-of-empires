@@ -2413,6 +2413,9 @@ struct StructuredRestartLaunch {
     carry: Option<crate::session::conversation_carry::ConversationCarry>,
     wake: Option<String>,
     reason: &'static str,
+    /// A limit rejecting this launch is the target account's: it comes back on the error and
+    /// parks nothing.
+    defers_rate_limit: bool,
 }
 
 /// Without auto-resume a terminal launch starts a fresh conversation and still reports success,
@@ -2516,6 +2519,7 @@ async fn finish_structured_restart(
             carry,
             wake,
             reason: _,
+            defers_rate_limit,
         } = launch;
         // Read before the spawn: the new worker's session assignment retires the park.
         let resumes_rate_limit = if account_swap {
@@ -2623,6 +2627,9 @@ async fn finish_structured_restart(
             generation,
             namespace: Some(state.profile_namespace.clone()),
         });
+        if defers_rate_limit {
+            reservation.lease().defer_rate_limit_rejection();
+        }
         let profile = started.source_profile.clone();
         drop(guard);
         drop(submission);
@@ -2717,6 +2724,32 @@ async fn finish_structured_restart(
             if let Some(response) = sandbox_migration_response(state, id, &error).await {
                 return response;
             }
+            if let Some(crate::acp::supervisor::SupervisorError::Acp(failure)) =
+                error.downcast_ref::<crate::acp::supervisor::SupervisorError>()
+            {
+                if failure.is_authentication_failure() {
+                    tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed: the agent is not logged in");
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        AGENT_AUTH_FAILED,
+                        "The agent could not authenticate: Authentication required",
+                    );
+                }
+                if let crate::acp::acp_client::AcpError::RateLimited(info) = failure {
+                    tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed: the agent is rate limited");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": AGENT_RATE_LIMITED,
+                            "message": "The agent is rate limited",
+                            "status": info.status,
+                            "resets_at": info.resets_at,
+                            "kind": info.kind,
+                        })),
+                    )
+                        .into_response();
+                }
+            }
             tracing::warn!(target: "http.api.sessions", session = %id, %error, "structured restart failed");
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2738,6 +2771,10 @@ pub(super) enum AgentPreparation {
 enum RestartOrigin {
     Explicit,
     StartupRecovery,
+    /// An automatic account failover decided on this event-log head.
+    Failover {
+        park_seq: u64,
+    },
 }
 
 fn restart_reason(
@@ -2787,8 +2824,213 @@ pub(super) async fn prepare_agent_session(
         restart,
         None,
         RestartOrigin::Explicit,
+        None,
     )
     .await
+}
+
+/// Error code of a restart whose agent refused to start for want of a login.
+const AGENT_AUTH_FAILED: &str = "agent_auth_failed";
+
+/// Error code of a restart whose agent refused to start on a rate limit.
+const AGENT_RATE_LIMITED: &str = "agent_rate_limited";
+
+fn rate_limit_of(body: &serde_json::Value) -> Option<crate::acp::state::RateLimitInfo> {
+    Some(crate::acp::state::RateLimitInfo {
+        status: body["status"].as_str()?.to_owned(),
+        resets_at: body["resets_at"]
+            .as_str()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&chrono::Utc)),
+        kind: body["kind"].as_str()?.to_owned(),
+    })
+}
+
+/// Why a failover swap did not happen.
+#[derive(Debug, Clone)]
+pub(crate) struct FailoverError {
+    /// A retry cannot help for this park: the swap is refused by design.
+    /// Anything else (a worker that was still stopping, a failed spawn, a log head that moved
+    /// without ending the park) may clear by itself.
+    pub permanent: bool,
+    /// The target account's agent refused to start for want of a login.
+    pub target_auth_failed: bool,
+    /// The target account's agent refused to start on a rate limit of its own.
+    pub target_rate_limit: Option<crate::acp::state::RateLimitInfo>,
+    pub message: String,
+}
+
+impl FailoverError {
+    fn from_response(status: StatusCode, body: Option<&serde_json::Value>) -> Self {
+        let code = body
+            .and_then(|body| body["error"].as_str())
+            .unwrap_or_default();
+        let message = body
+            .and_then(|body| body["message"].as_str())
+            .unwrap_or("no detail");
+        Self {
+            permanent: code == "account_swap_unavailable",
+            target_auth_failed: code == AGENT_AUTH_FAILED,
+            target_rate_limit: (code == AGENT_RATE_LIMITED)
+                .then(|| body.and_then(rate_limit_of))
+                .flatten(),
+            message: format!("{status}: {message}"),
+        }
+    }
+}
+
+/// Switch a rate-limit-parked structured session to another account of the same agent,
+/// continuing the interrupted prompt. `expected_seq` is the event-log head the failover
+/// decision read: under the submission authority and the instance lock, the swap proceeds only
+/// if the session is still parked on that head with no worker, so a prompt, a manual resume or
+/// the timed auto-resume that landed meanwhile wins and nothing is sent twice.
+pub(crate) async fn failover_account_swap(
+    state: &Arc<AppState>,
+    id: &str,
+    tool: &str,
+    expected_seq: u64,
+) -> Result<(), FailoverError> {
+    failover_account_swap_with(state, id, tool, expected_seq, async {}).await
+}
+
+/// `after_restart` runs once the restart returned, before the failure is handled: the point
+/// where another lifecycle operation can complete.
+pub(super) async fn failover_account_swap_with(
+    state: &Arc<AppState>,
+    id: &str,
+    tool: &str,
+    expected_seq: u64,
+    after_restart: impl std::future::Future<Output = ()>,
+) -> Result<(), FailoverError> {
+    let claim = Arc::new(FailoverClaim::default());
+    let response = prepare_agent_session_inner(
+        state.clone(),
+        id.to_owned(),
+        Ok(None),
+        AgentPreparation::Restart,
+        Some(Arc::new(crate::daemon::RestartSessionBody {
+            tool: Some(tool.to_owned()),
+            require_account_carry: true,
+            ..Default::default()
+        })),
+        None,
+        RestartOrigin::Failover {
+            park_seq: expected_seq,
+        },
+        Some(claim.clone()),
+    )
+    .await;
+    after_restart.await;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let found = claim.found.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(before) = found {
+        let owned = claim
+            .owned_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        restore_account(state, id, tool, before, owned).await;
+    }
+    Err(FailoverError::from_response(status, body.as_ref()))
+}
+
+/// What a failover's restart records under its own locks, for the rollback to read: the row's
+/// account as the restart found it, and the newest generation the restart reserved (0 when none).
+#[derive(Default)]
+struct FailoverClaim {
+    found: std::sync::Mutex<Option<AccountIdentity>>,
+    owned_generation: std::sync::atomic::AtomicU64,
+}
+
+/// What names the account a row runs as: its tool and the stores its conversation resumes from.
+struct AccountIdentity {
+    tool: String,
+    detect_as: String,
+    agent_session_binding: Option<crate::session::ConversationBinding>,
+    resume_binding: Option<crate::session::ConversationBinding>,
+}
+
+impl AccountIdentity {
+    fn of(row: &Instance) -> Self {
+        Self {
+            tool: row.tool.clone(),
+            detect_as: row.detect_as.clone(),
+            agent_session_binding: row.agent_session_binding.clone(),
+            resume_binding: row.resume_binding.clone(),
+        }
+    }
+}
+
+/// A swap that failed leaves the row as it was found. The restart marks the row idle-dormant
+/// before the swap runs, and that marker alone keeps the reaper from retrying or resuming the
+/// park, so it is always cleared. A row that already took the new account gets the old one
+/// back too: left behind, it would resolve to the new account's config root, and the next
+/// limit it hits on the old account would be recorded against the new one. Only the swap's own
+/// writes are undone: `owned_generation` is the newest generation the swap itself reserved,
+/// recorded under the locks of its own operation (0 when it reserved none), and the durable
+/// update applies only to a row still at it. A row that has a worker, or that another stop or
+/// restart advanced meanwhile, was moved on by someone else.
+async fn restore_account(
+    state: &Arc<AppState>,
+    id: &str,
+    target: &str,
+    before: AccountIdentity,
+    owned_generation: u64,
+) {
+    if owned_generation == 0 {
+        return;
+    }
+    let lock = state.instance_lock(id).await;
+    let _guard = lock.lock().await;
+    let profile = {
+        let rows = state.instances.read().await;
+        let Some(row) = rows.iter().find(|row| row.id == id) else {
+            return;
+        };
+        row.source_profile.clone()
+    };
+    if state.acp_supervisor.is_running(id).await {
+        return;
+    }
+    let worker_state = state.clone();
+    let session = id.to_owned();
+    let target = target.to_owned();
+    let restored = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        use crate::session::SessionStore;
+        let native = crate::server::session_store::NativeSessionStore::open(
+            worker_state,
+            &profile,
+            Some(session.clone()),
+        )?;
+        (&native as &dyn SessionStore).update(|rows, _| {
+            let Some(row) = rows.iter_mut().find(|row| row.id == session) else {
+                return Ok(());
+            };
+            if row.lifecycle_generation != owned_generation {
+                return Ok(());
+            }
+            row.idle_dormant_since = None;
+            if row.tool == target && before.tool != target {
+                row.tool = before.tool;
+                row.detect_as = before.detect_as;
+                row.agent_session_binding = before.agent_session_binding;
+                row.resume_binding = before.resume_binding;
+            }
+            Ok(())
+        })
+    })
+    .await;
+    if let Err(error) = restored
+        .map_err(anyhow::Error::from)
+        .and_then(|result| result)
+    {
+        tracing::warn!(target: "http.api.sessions", session = %id, %error, "could not restore the account after a failed failover swap");
+    }
 }
 
 pub(crate) async fn recovery_restart(
@@ -2807,10 +3049,12 @@ pub(crate) async fn recovery_restart(
         })),
         Some(expected_generation),
         RestartOrigin::StartupRecovery,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_agent_session_inner(
     state: Arc<AppState>,
     id: String,
@@ -2822,6 +3066,7 @@ async fn prepare_agent_session_inner(
     restart: Option<Arc<crate::daemon::RestartSessionBody>>,
     expected_generation: Option<u64>,
     restart_origin: RestartOrigin,
+    failover_claim: Option<Arc<FailoverClaim>>,
 ) -> axum::response::Response {
     if preparation == AgentPreparation::Ensure && state.cityhall_mode {
         return crate::server::api::cityhall_response();
@@ -2832,6 +3077,8 @@ async fn prepare_agent_session_inner(
     if state.read_only {
         return crate::server::api::read_only_response();
     }
+    #[cfg(test)]
+    launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeLocks).await;
     let namespace = state.profile_namespace.read().await;
     if *state.canonical_health.read().await != crate::daemon::RuntimeHealth::Healthy {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -2862,6 +3109,32 @@ async fn prepare_agent_session_inner(
     };
     if preparation == AgentPreparation::Ensure && instance.is_structured() {
         return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let RestartOrigin::Failover {
+        park_seq: expected_seq,
+    } = restart_origin
+    {
+        let store = Arc::clone(&state.acp_event_store);
+        let probe_id = id.clone();
+        let still_parked = tokio::task::spawn_blocking(move || {
+            store.rate_limit_park(&probe_id).is_some()
+                && store.highest_seq(&probe_id) == expected_seq
+        })
+        .await
+        .unwrap_or(false);
+        if !still_parked || state.acp_supervisor.is_running(&id).await {
+            return api_error(
+                StatusCode::CONFLICT,
+                "park_changed",
+                "The session moved on since the failover was decided".to_string(),
+            );
+        }
+        // The account the rollback returns to is the one found under these locks: a restart
+        // that changed it since the decision was made is not this swap's to undo.
+        if let Some(claim) = &failover_claim {
+            *claim.found.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(AccountIdentity::of(&instance));
+        }
     }
     if state.cityhall_mode && !instance.is_structured() {
         return crate::server::api::cityhall_response();
@@ -2916,7 +3189,10 @@ async fn prepare_agent_session_inner(
         );
     }
     if instance.is_structured()
-        && matches!(restart_origin, RestartOrigin::Explicit)
+        && matches!(
+            restart_origin,
+            RestartOrigin::Explicit | RestartOrigin::Failover { .. }
+        )
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {
@@ -2947,6 +3223,12 @@ async fn prepare_agent_session_inner(
             }
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
+        if let Some(claim) = &failover_claim {
+            claim.owned_generation.store(
+                reserved.lifecycle_generation,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         let stopped = state
             .acp_supervisor
             .shutdown_and_wait(&id, std::time::Duration::from_secs(5))
@@ -2992,6 +3274,7 @@ async fn prepare_agent_session_inner(
         .or(expected_generation);
     let worker_restart = restart.clone();
     let worker_state = state.clone();
+    let worker_claim = failover_claim.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use crate::session::SessionStore;
         let profile = instance.source_profile.clone();
@@ -3206,6 +3489,12 @@ async fn prepare_agent_session_inner(
         let Some(mut started) = started.take() else {
             return Ok(None);
         };
+        if let Some(claim) = &worker_claim {
+            claim.owned_generation.store(
+                started.lifecycle_generation,
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         // The final capture can move an unbound id, so the copy follows the admitted row's ids.
         if let Some(carry) = conversation_carry.as_mut() {
             carry.retarget(crate::session::conversation_carry::conversation_ids(
@@ -3246,6 +3535,8 @@ async fn prepare_agent_session_inner(
     drop(guard);
     drop(submission);
     drop(namespace);
+    #[cfg(test)]
+    launch_hook_gate::pause(&id, launch_hook_gate::Stage::BeforeHooks).await;
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
@@ -3290,6 +3581,7 @@ async fn prepare_agent_session_inner(
                     carry: carry.1,
                     wake: requested_wake_message,
                     reason,
+                    defers_rate_limit: matches!(restart_origin, RestartOrigin::Failover { .. }),
                 },
             )
             .await;
@@ -3575,6 +3867,59 @@ pub(super) async fn sandbox_migration_response(
         Ok(snapshot) => crate::server::runtime::mutation_response(&snapshot.value.cursor, response),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     })
+}
+
+/// Holds one session's restart at a named point, so a test can run another operation there.
+#[cfg(test)]
+pub(super) mod launch_hook_gate {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(in crate::server::api::sessions) enum Stage {
+        /// Before the restart takes its submission and instance locks.
+        BeforeLocks,
+        /// After the locks are released, before the pre-launch hooks run.
+        BeforeHooks,
+    }
+
+    type Gate = (
+        String,
+        Stage,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+    static GATE: std::sync::Mutex<Option<Gate>> = std::sync::Mutex::new(None);
+
+    /// Arms the gate for `id` at `stage`: the receiver fires once a restart waits there, and
+    /// sending on the returned sender lets it go on.
+    pub(in crate::server::api::sessions) fn arm(
+        id: &str,
+        stage: Stage,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *GATE.lock().unwrap() = Some((id.to_owned(), stage, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    pub(super) async fn pause(id: &str, stage: Stage) {
+        let gate = {
+            let mut gate = GATE.lock().unwrap();
+            if gate
+                .as_ref()
+                .is_some_and(|(session, at, _, _)| session == id && *at == stage)
+            {
+                gate.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, _, entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

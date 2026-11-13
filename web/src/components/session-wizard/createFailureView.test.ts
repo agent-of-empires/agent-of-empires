@@ -38,7 +38,19 @@ describe("failureView", () => {
       "hook",
       failure("hook_failed", "running_hooks"),
       {},
-      { title: "An on_create hook failed", primary: "try_again", secondary: null, row: null, showOutput: true },
+      {
+        title: "An on_create hook failed",
+        primary: "try_again",
+        secondary: "create_without_setup",
+        row: null,
+        showOutput: true,
+      },
+    ],
+    [
+      "hook, on a CityHall server",
+      failure("hook_failed", "running_hooks"),
+      { canSkipSetup: false },
+      { secondary: null },
     ],
     [
       "missing working directory",

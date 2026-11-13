@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { ActivityRow, BackgroundAgent, ToolCall } from "../../../lib/acpTypes";
+import type { ActivityRow, BackgroundAgent, SubagentRecord, ToolCall } from "../../../lib/acpTypes";
 import { fromBackground, fromInline, taskPrompt } from "./model";
 
 const agent = (over: Partial<BackgroundAgent>): BackgroundAgent => ({
@@ -35,6 +35,12 @@ describe("fromBackground", () => {
     expect(t!.detail).toBe("cd repo\ncargo test");
   });
 
+  it("shows a failed child's own error over the generic fallback", () => {
+    const failed = agent({ status: "error", error: "Authentication required" });
+    expect(fromBackground(failed).error).toBe("Authentication required");
+    expect(fromBackground(agent({ status: "error" })).error).toBe("background agent error");
+  });
+
   it("keeps the total and newest call when the list is capped", () => {
     const record = fromBackground(agent({ toolCount: 300, lastTool: "Bash" }));
     expect(record.toolCount).toBe(300);
@@ -56,6 +62,68 @@ describe("fromInline", () => {
     const record = fromInline(tool, result, [{ tool: child, result: undefined }]);
     expect(record.status).toBe("done");
     expect(record.report).toBe("report");
+    expect(record.tools[0]!.status).toBe("stopped");
+  });
+
+  it("shows a background child as background and running until it reports", () => {
+    const tool: ToolCall = {
+      id: "launch",
+      name: "Explore",
+      kind: "think",
+      args_preview: "{}",
+      started_at: "2026-01-01T00:00:00Z",
+    };
+    const roster: SubagentRecord = {
+      session_id: "child",
+      parent_session_id: "root",
+      parent_tool_call_id: "launch",
+      state: "running",
+      cancel_capable: true,
+      background: true,
+    };
+    const record = fromInline(tool, undefined, [], roster);
+    expect(record.background).toBe(true);
+    expect(record.status).toBe("running");
+    expect(record.report).toBe("");
+  });
+});
+
+describe("fromInline activity rows", () => {
+  const launch: ToolCall = {
+    id: "task",
+    name: "Task",
+    kind: "other",
+    args_preview: "{}",
+    started_at: "2026-01-01T00:00:00Z",
+  };
+  const child = (id: string, name: string, args: Record<string, string>, kind = "other"): ToolCall => ({
+    id,
+    name,
+    kind,
+    args_preview: JSON.stringify(args),
+    started_at: "2026-01-01T00:00:00Z",
+  });
+
+  it("names a call by its wire name, shows the command once, and labels MCP calls", () => {
+    const cmd = "cargo test --all --features web";
+    const rows = fromInline(launch, undefined, [
+      { tool: child("a", cmd, { command: cmd, _aoe_raw_tool_name: "Bash" }, "execute") },
+      { tool: child("b", cmd, { command: cmd }, "execute") },
+      { tool: child("c", "Navigate", { url: "https://x", _aoe_raw_tool_name: "mcp__playwright__browser_navigate" }) },
+    ]).tools;
+    expect(rows.map((t) => [t.name, t.target, t.kind])).toEqual([
+      ["Bash", cmd, "execute"],
+      [cmd, null, "execute"],
+      ["Playwright Browser navigate", "https://x", "mcp"],
+    ]);
+  });
+
+  it("ends a foreground card the turn stopped, at the stop time, with its open calls stopped", () => {
+    const stopped: ActivityRow = { id: "s", kind: "tool_stopped", text: "", at: "2026-01-01T00:02:00Z" };
+    const record = fromInline(launch, stopped, [{ tool: child("a", "Read", {}) }]);
+    expect(record.status).toBe("stopped");
+    expect(record.endedAt).toBe("2026-01-01T00:02:00Z");
+    expect(record.report).toBe("");
     expect(record.tools[0]!.status).toBe("stopped");
   });
 });

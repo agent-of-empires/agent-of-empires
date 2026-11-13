@@ -24,7 +24,7 @@ use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
     is_unsupported_session_error, take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
@@ -374,10 +374,7 @@ impl Session {
             Err(error) => {
                 return classify_rate_limit_error(
                     error,
-                    captured_rate_limit_resets_at(
-                        &shared.rate_limit_rejections,
-                        chrono::Utc::now(),
-                    ),
+                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now()),
                 )
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,
@@ -561,16 +558,23 @@ impl Session {
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
         let label = self.shared.session_label.clone();
-        let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg)
+        let subagents_active = self.shared.subagent_working(now_ms());
+        let fire = turn
+            .watchdog
+            .should_fire(Instant::now(), turn.cfg, subagents_active)
             && !self.shared.aoe.leases.working(now_ms());
         let off_protocol = turn.watchdog.off_protocol_work_seen();
-        if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
+        let grace_secs = turn
+            .watchdog
+            .effective_grace(turn.cfg, subagents_active)
+            .as_secs();
+        if fire && turn.watchdog.cost_seen() && off_protocol.is_none() && !subagents_active {
             // The turn finished but the PromptResponse never came: end cleanly
             // as prompt_complete with no flag set (#2237).
             info!(
                 target: "acp.protocol",
                 session = %label,
-                grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
+                grace_secs,
                 "silent-orphan watchdog: turn wrapped up (cost-populated usage) without PromptResponse; ending cleanly as prompt_complete"
             );
             // The runner may still be running the turn; without this the next
@@ -586,7 +590,8 @@ impl Session {
                 session = %label,
                 off_protocol_work = ?off_protocol,
                 in_flight_tools = turn.watchdog.tool_calls_in_flight_len(),
-                grace_secs = turn.watchdog.effective_grace(turn.cfg).as_secs(),
+                subagents_active,
+                grace_secs,
                 "silent-orphan watchdog fired: no progress past grace and no in-flight tools; sending session/cancel"
             );
             turn.flags.prompt_orphaned = true;
@@ -695,6 +700,7 @@ impl Session {
         if let Some(info) = f.rate_limit.take() {
             preceding.push(Event::RateLimit { info });
         }
+        let terminal_at = now_ms();
         // A completion the runner reports after this is dropped.
         shared.terminal_claim.claim();
         shared.publish_terminal(reason.into(), preceding).await;
@@ -706,6 +712,13 @@ impl Session {
             .1 = now_ms();
         shared.prompt_in_flight.store(false, Ordering::Relaxed);
         *shared.cancel_deadline.lock().unwrap() = None;
+        // Child traffic that raced the terminal, or a child still running,
+        // continues as an agent-initiated turn.
+        if shared.subagent_activity_at.load(Ordering::Relaxed) >= terminal_at
+            || shared.subagent_working(now_ms())
+        {
+            shared.arm_for_subagent_activity();
+        }
         // Missing after a Stopped, this line signals a stranded prompt (#3190).
         info!(
             target: "acp.protocol",

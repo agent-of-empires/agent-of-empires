@@ -28,7 +28,6 @@ afterEach(() => {
 describe("isSyncedKey", () => {
   it("syncs preference keys but not device-local layout, caches, or per-session keys", () => {
     for (const k of [
-      "aoe-welcome-seen",
       "aoe.acp.toolDensity.v1",
       "aoe-sidebar-sort-mode",
       "aoe-sidebar-axis",
@@ -82,25 +81,25 @@ describe("safeStorage sync chokepoint", () => {
     safeSetItem("aoe-sidebar-width", "300"); // device-local, not synced
     expect(handler).not.toHaveBeenCalled();
 
-    safeRemoveItem("aoe-welcome-seen");
-    expect(handler).toHaveBeenCalledWith("aoe-welcome-seen", null);
+    safeRemoveItem("aoe-acp-last-tool");
+    expect(handler).toHaveBeenCalledWith("aoe-acp-last-tool", null);
   });
 });
 
 describe("hydrateWebUiStateFromServer", () => {
   it("backfills local keys only when the server blob is empty (first-ever sync)", async () => {
-    localStorage.setItem("aoe-welcome-seen", "1");
+    localStorage.setItem("aoe-acp-last-tool", "claude");
     getWebUiState.mockResolvedValue({});
 
     await hydrateWebUiStateFromServer();
 
     expect(patchWebUiState).toHaveBeenCalledTimes(1);
-    expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-welcome-seen": "1" });
+    expect(patchWebUiState).toHaveBeenCalledWith({ "aoe-acp-last-tool": "claude" });
   });
 
   it("server values win and local-only keys are not resurrected once the server is non-empty", async () => {
     localStorage.setItem("aoe-sidebar-axis", "repo");
-    localStorage.setItem("aoe-welcome-seen", "1");
+    localStorage.setItem("aoe-acp-last-tool", "claude");
     getWebUiState.mockResolvedValue({ "aoe-sidebar-axis": "group" });
 
     await hydrateWebUiStateFromServer();

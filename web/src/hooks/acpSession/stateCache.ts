@@ -6,6 +6,7 @@ import {
   emptyAcpState,
   normaliseTurnState,
   type AcpState,
+  type ActivityRow,
   type BackgroundAgent,
   type BackgroundShell,
   type SubagentRecord,
@@ -202,6 +203,7 @@ function subscribeAcpState(sessionId: string, cb: () => void): () => void {
   };
 }
 
+const EMPTY_ACTIVITY: ActivityRow[] = [];
 const EMPTY_BACKGROUND_AGENTS: BackgroundAgent[] = [];
 const EMPTY_BACKGROUND_TASKS: string[] = [];
 const EMPTY_SUBAGENTS: SubagentRecord[] = [];
@@ -221,11 +223,16 @@ function useCachedField<T>(sessionId: string | null, pick: (state: AcpState) => 
   return useSyncExternalStore(subscribe, getSnapshot);
 }
 
+const pickActivity = (s: AcpState) => s.activity;
 const pickBackgroundAgents = (s: AcpState) => s.backgroundAgents;
 const pickSubagents = (s: AcpState) => s.subagents;
 const pickBackgroundTasks = (s: AcpState) => s.backgroundTasks;
 const pickBackgroundShells = (s: AcpState) => s.backgroundShells;
 const pickWorkflowRuns = (s: AcpState) => s.workflowRuns;
+
+export function useActivity(sessionId: string | null): ActivityRow[] {
+  return useCachedField(sessionId, pickActivity, EMPTY_ACTIVITY);
+}
 
 export function useBackgroundAgents(sessionId: string | null): BackgroundAgent[] {
   return useCachedField(sessionId, pickBackgroundAgents, EMPTY_BACKGROUND_AGENTS);

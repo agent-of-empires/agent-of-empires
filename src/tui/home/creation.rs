@@ -583,6 +583,7 @@ fn wizard_create_body(
         scratch: data.scratch,
         trust_hooks,
         trust_review,
+        skip_on_create: false,
         import_acp_session_id: None,
         // The wizard resolved the parent's provider conversation id; the daemon
         // rebuilds the seed from it and re-checks fork capability, choosing the

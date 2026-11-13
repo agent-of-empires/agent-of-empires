@@ -1382,14 +1382,19 @@ pub mod structured {
     /// Whether an `on_create` or `on_launch` hook will run before a create in `project_path`
     /// launches, or is waiting on the user's trust decision. `profile_hooks` must be the
     /// profile's own, without the repository's, which count only under `trust_hooks` (the
-    /// create's decision; `Some(false)` skips them).
+    /// create's decision; `Some(false)` skips them). `on_create` doesn't count under
+    /// `skip_on_create`.
     pub fn preparation_hooks_apply(
         profile_hooks: &crate::session::HooksConfig,
         project_path: &std::path::Path,
         scratch: bool,
         trust_hooks: Option<bool>,
+        skip_on_create: bool,
     ) -> bool {
         use crate::session::config::repo_config::{check_repo_trust, TrustSurface};
+        let prepares = |hooks: &crate::session::HooksConfig| {
+            (!skip_on_create && !hooks.on_create.is_empty()) || !hooks.on_launch.is_empty()
+        };
         if prepares(profile_hooks) {
             return true;
         }
@@ -1403,10 +1408,6 @@ pub mod structured {
             }
             _ => false,
         }
-    }
-
-    fn prepares(hooks: &crate::session::HooksConfig) -> bool {
-        !hooks.on_create.is_empty() || !hooks.on_launch.is_empty()
     }
 
     /// Pre-create validation for an explicit structured-view choice, run BEFORE any worktree,
@@ -2212,6 +2213,7 @@ mod tests {
             project: &'a std::path::Path,
             scratch: bool,
             trust_hooks: Option<bool>,
+            skip_on_create: bool,
             want: bool,
         }
         let cases = [
@@ -2221,6 +2223,7 @@ mod tests {
                 project: plain.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: true,
             },
             Case {
@@ -2229,6 +2232,7 @@ mod tests {
                 project: plain.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: true,
             },
             Case {
@@ -2237,6 +2241,7 @@ mod tests {
                 project: plain.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: false,
             },
             Case {
@@ -2245,6 +2250,7 @@ mod tests {
                 project: untrusted.path(),
                 scratch: false,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: true,
             },
             Case {
@@ -2253,6 +2259,7 @@ mod tests {
                 project: untrusted.path(),
                 scratch: false,
                 trust_hooks: Some(false),
+                skip_on_create: false,
                 want: false,
             },
             Case {
@@ -2261,6 +2268,7 @@ mod tests {
                 project: untrusted.path(),
                 scratch: true,
                 trust_hooks: None,
+                skip_on_create: false,
                 want: false,
             },
             Case {
@@ -2269,6 +2277,25 @@ mod tests {
                 project: trusted.path(),
                 scratch: false,
                 trust_hooks: Some(false),
+                skip_on_create: false,
+                want: true,
+            },
+            Case {
+                label: "profile on_create, skipped",
+                profile: &on_create,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                skip_on_create: true,
+                want: false,
+            },
+            Case {
+                label: "profile on_launch, on_create skipped",
+                profile: &on_launch,
+                project: plain.path(),
+                scratch: false,
+                trust_hooks: None,
+                skip_on_create: true,
                 want: true,
             },
         ];
@@ -2279,6 +2306,7 @@ mod tests {
                     case.project,
                     case.scratch,
                     case.trust_hooks,
+                    case.skip_on_create,
                 ),
                 case.want,
                 "{}",
