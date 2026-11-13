@@ -93,6 +93,52 @@ describe("LiveTerminalView holds an Error Session instead of starting it (#5055)
     expect(screen.queryByTestId("session-error-panel")).toBeNull();
   });
 
+  // Restart holds the Launch reservation while the row reads Starting, so an ensure sent then is refused busy.
+  it.each<[string, SessionResponse["status"], boolean, number, number, boolean]>([
+    ["refused while Starting, ensured again once it's Running", "Starting", false, 2, 1, false],
+    ["refused while Starting and answered after it's Running, ensured again", "Starting", true, 2, 1, false],
+    ["refused while it's already Running, the refusal stays", "Running", false, 1, 0, true],
+  ])("busy ensure %s", async (_name, sentAs, late, ensures, connected, shown) => {
+    let answer!: () => void;
+    const busy = { ok: false, error: "lifecycle_busy", message: "Session lifecycle is busy" };
+    ensureSession.mockImplementationOnce(
+      () => new Promise((resolve) => (late ? (answer = () => resolve(busy as never)) : resolve(busy as never))),
+    );
+    const { rerender } = render(<LiveTerminalView readOnly={false} session={errored({ status: sentAs })} />);
+    await waitFor(() => expect(ensureSession).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    // Nothing is resent while the launch still holds the reservation.
+    expect(ensureSession).toHaveBeenCalledTimes(1);
+    rerender(<LiveTerminalView readOnly={false} session={errored({ status: "Running", last_error: null })} />);
+    if (late) await act(async () => answer());
+    await waitFor(() => expect(ensureSession).toHaveBeenCalledTimes(ensures));
+    await waitFor(() => expect(sockets).toHaveLength(connected));
+    expect(screen.queryByText("Session lifecycle is busy") !== null).toBe(shown);
+  });
+
+  it("shows a refusal other than busy while Starting", async () => {
+    ensureSession.mockResolvedValueOnce({ ok: false, error: "launch_failed", message: "tmux exited" } as never);
+    render(<LiveTerminalView readOnly={false} session={errored({ status: "Starting" })} />);
+    expect(await screen.findByText("tmux exited")).toBeTruthy();
+    expect(ensureSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a refusal from the resent ensure, without retrying it on a later launch", async () => {
+    const busy = { ok: false, error: "lifecycle_busy", message: "Session lifecycle is busy" };
+    ensureSession.mockResolvedValueOnce(busy as never).mockResolvedValueOnce(busy as never);
+    const at = (status: SessionResponse["status"]) => (
+      <LiveTerminalView readOnly={false} session={errored({ status, last_error: null })} />
+    );
+    const { rerender } = render(at("Starting"));
+    await waitFor(() => expect(ensureSession).toHaveBeenCalledTimes(1));
+    rerender(at("Running"));
+    expect(await screen.findByText("Session lifecycle is busy")).toBeTruthy();
+    rerender(at("Starting"));
+    rerender(at("Running"));
+    await act(async () => {});
+    expect(ensureSession).toHaveBeenCalledTimes(2);
+  });
+
   it("keeps the panel without Restart while the held Session is deleted", async () => {
     const { rerender } = render(<LiveTerminalView readOnly={false} session={errored()} />);
     rerender(<LiveTerminalView readOnly={false} session={errored({ status: "Deleting" })} />);

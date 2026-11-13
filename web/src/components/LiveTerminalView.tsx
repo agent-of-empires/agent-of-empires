@@ -73,6 +73,9 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const [ensureError, setEnsureError] = useState<string | null>(null);
   // An archived or trashed session stays refused until unarchived or restored, so Retry is pointless.
   const [ensureRetryable, setEnsureRetryable] = useState(true);
+  // A launch (a Restart's included) holds the lifecycle reservation while the row reads Starting, and refuses an
+  // ensure sent meanwhile; that ensure is sent again once the Session leaves Starting.
+  const [ensureAfterStart, setEnsureAfterStart] = useState(false);
   // An Error Session isn't started on open, which would clear the error it reports (#5055); Restart starts it.
   const errored = surface === "agent" && session.status === "Error";
   // One deleted from the panel keeps it, without Restart.
@@ -132,11 +135,28 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
   const [inputFocused, setInputFocused] = useState(false);
-  const policyRef = useRef({ readOnly, errorHeld, sessionId: session.id, surface, terminalIndex });
+  const awaitingStart = ensureAfterStart && session.status === "Starting";
+  const policyRef = useRef({
+    readOnly,
+    errorHeld,
+    awaitingStart,
+    status: session.status,
+    sessionId: session.id,
+    surface,
+    terminalIndex,
+  });
   useLayoutEffect(() => {
-    policyRef.current = { readOnly, errorHeld, sessionId: session.id, surface, terminalIndex };
+    policyRef.current = {
+      readOnly,
+      errorHeld,
+      awaitingStart,
+      status: session.status,
+      sessionId: session.id,
+      surface,
+      terminalIndex,
+    };
     if (readOnly) inputRef.current?.blur();
-  }, [readOnly, errorHeld, session.id, surface, terminalIndex]);
+  }, [readOnly, errorHeld, awaitingStart, session.status, session.id, surface, terminalIndex]);
   useLayoutEffect(
     () => () => {
       policyRef.current.readOnly = true;
@@ -356,6 +376,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     ensureRequestRef.current = controller;
     setEnsureError(null);
     setEnsureState("pending");
+    setEnsureAfterStart(false);
+    const sentWhileStarting = policy.status === "Starting";
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
@@ -367,6 +389,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           lastEnsuredSessionIdRef.current = session.id;
           setEnsureWarning(res.message ?? null);
           setEnsureState("ready");
+        } else if (res.error === "lifecycle_busy" && sentWhileStarting) {
+          setEnsureAfterStart(true);
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -382,13 +406,24 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     const policy = policyRef.current;
-    if (policy.readOnly || policy.errorHeld) return;
+    if (policy.readOnly || policy.errorHeld || policy.awaitingStart) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
       if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
       return;
     }
     retryEnsure();
-  }, [session.id, shelved, readOnly, errorHeld, focusSelf, focusTarget, focusIndex, retryEnsure]);
+  }, [
+    session.id,
+    shelved,
+    readOnly,
+    errorHeld,
+    ensureAfterStart,
+    awaitingStart,
+    focusSelf,
+    focusTarget,
+    focusIndex,
+    retryEnsure,
+  ]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {

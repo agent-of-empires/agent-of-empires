@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionErrorPanel } from "../SessionErrorPanel";
 import { makeSession } from "./fixtures";
@@ -62,10 +63,15 @@ describe("SessionErrorPanel", () => {
     expect(writeClipboard).toHaveBeenCalledWith(ERROR);
   });
 
+  // Strict Mode runs effect cleanup once before the real mount; the refusal must still show.
   it("restarts once, disabled while it's pending, and shows a refusal", async () => {
     let answer!: (result: { ok: boolean; message?: string }) => void;
     restartSession.mockReturnValue(new Promise((resolve) => (answer = resolve)));
-    render(<SessionErrorPanel session={session()} readOnly={false} />);
+    render(
+      <StrictMode>
+        <SessionErrorPanel session={session()} readOnly={false} />
+      </StrictMode>,
+    );
     const restart = screen.getByTestId<HTMLButtonElement>("session-error-restart");
     fireEvent.click(restart);
     expect(restart.disabled).toBe(true);

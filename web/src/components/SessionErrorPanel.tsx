@@ -25,12 +25,13 @@ export function SessionErrorPanel({ session, readOnly }: Props) {
   });
   const [copied, copy] = useCopy();
   const mounted = useRef(true);
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    // Set again in setup: Strict Mode runs the cleanup once before the real mount.
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   const onRestart = async () => {
     setRestart({ state: "restarting" });

@@ -199,6 +199,8 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
             }
             id={glyphTipId}
             open={glyphTip !== null}
+            // A recorded error's first line can be a long command or path.
+            multiline={errorLine !== null}
           >
             <span
               className={`text-sm shrink-0 leading-none font-mono ${model.showUnreadGlyph ? "text-status-unread font-semibold" : model.textClass} ${

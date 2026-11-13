@@ -521,6 +521,8 @@ describe("SessionRow mark tooltips", () => {
     const glyph = testId("sidebar-status-glyph")!;
     fireEvent.pointerEnter(glyph, { pointerType: "mouse" });
     expect(screen.getByRole("tooltip").textContent).toBe(tip);
+    // Only a recorded error's line wraps.
+    expect(screen.getByRole("tooltip").classList.contains("whitespace-normal")).toBe(described !== null);
     const describedBy = glyph.getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : null).toBe(described);
     if (over.status === "Error") expect(glyph.getAttribute("aria-label")).toBe("Error · needs attention (error)");
