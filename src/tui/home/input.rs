@@ -2315,13 +2315,16 @@ impl HomeView {
             && matches!(key.code, KeyCode::Char('k' | 'K'))
         {
             if let Some(selected) = self.suggestions_view.as_ref().map(|v| v.selected_key()) {
-                match selected.and_then(|key| self.open_source_command(&key)) {
-                    Some(command) => {
-                        self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
-                    }
-                    None => {
-                        if let Some(view) = &mut self.suggestions_view {
-                            view.set_error("This suggestion has no link to open");
+                // Nothing selected (empty or loading list): nothing to open, no error.
+                if let Some(key) = selected {
+                    match self.open_source_command(&key) {
+                        Some(command) => {
+                            self.command_palette = Some(CommandPaletteDialog::new(vec![command]));
+                        }
+                        None => {
+                            if let Some(view) = &mut self.suggestions_view {
+                                view.set_error("This suggestion has no link to open");
+                            }
                         }
                     }
                 }

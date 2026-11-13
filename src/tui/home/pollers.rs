@@ -69,8 +69,9 @@ impl HomeView {
         if let Some((key, mut start, target @ (PrepareTarget::Home | PrepareTarget::HomeAnother))) =
             polled.start
         {
-            if self.suggestions_view.is_some() {
-                // The full view opened meanwhile and owns suggestion starts now.
+            if let Some(view) = &mut self.suggestions_view {
+                // The full view owns suggestion starts now, so say why nothing opened.
+                view.set_error("Suggestion ready, press Start again in this list");
             } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
                 if target == PrepareTarget::HomeAnother {
                     start.suggestion = None;

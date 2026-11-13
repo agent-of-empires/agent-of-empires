@@ -2168,13 +2168,8 @@ impl HomeView {
             {
                 if let Some((prefix, _)) = self.suggestion_row_text(provider_id, id) {
                     let shown = truncate_to_width(&text, room);
-                    let split = prefix.chars().count().min(shown.chars().count());
-                    let (muted, title) = shown.split_at(
-                        shown
-                            .char_indices()
-                            .nth(split)
-                            .map_or(shown.len(), |(at, _)| at),
-                    );
+                    let (muted, title) =
+                        shown.split_at(prefix_within_width(&shown, rendered_width(&prefix)).len());
                     let muted_style = if is_selected {
                         text_style
                     } else {

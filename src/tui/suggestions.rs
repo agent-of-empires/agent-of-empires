@@ -1152,13 +1152,10 @@ impl SuggestionsFeed {
     pub(super) fn entry(&self, key: &ItemKey) -> Option<Entry> {
         let item = self.item(key)?;
         let provider = self.provider(&key.0)?;
-        let label: String = plain(&provider.name)
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(SOURCE_LABEL_WIDTH)
-            .collect();
+        let name = plain(&provider.name);
+        let first = name.split_whitespace().next().unwrap_or_default();
+        let label =
+            crate::tui::components::prefix_within_width(first, SOURCE_LABEL_WIDTH).to_owned();
         Some(Entry {
             label,
             source_ref: self.source_ref(item).map(plain).unwrap_or_default(),
