@@ -239,21 +239,27 @@ fn resolve_initial_prompt(args: &AddArgs) -> Result<Option<String>> {
                 bail!("Prompt file is not a regular file: {}", path.display());
             }
             if meta.len() > MAX_PROMPT_BYTES as u64 {
-                bail!(
-                    "Prompt file is larger than {} KiB: {}",
-                    MAX_PROMPT_BYTES / 1024,
-                    path.display()
-                );
+                bail!(prompt_too_large());
             }
             std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read prompt file: {}", path.display()))?
         }
         (None, None) => return Ok(None),
     };
+    if text.len() > MAX_PROMPT_BYTES {
+        bail!(prompt_too_large());
+    }
     if text.trim().is_empty() {
         bail!("The initial prompt cannot be empty");
     }
     Ok(Some(text))
+}
+
+fn prompt_too_large() -> String {
+    format!(
+        "The initial prompt is larger than {} KiB",
+        MAX_PROMPT_BYTES / 1024
+    )
 }
 
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
@@ -1016,13 +1022,21 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_prompt_file_is_refused() {
+    fn an_oversized_prompt_is_refused_the_same_way_inline_and_from_a_file() {
+        let big = "x".repeat(super::MAX_PROMPT_BYTES + 1);
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("big.md");
-        std::fs::write(&file, "x".repeat(super::MAX_PROMPT_BYTES + 1)).unwrap();
-        let args = parse_add(&["aoe", "add", "--prompt-file", file.to_str().unwrap()]).unwrap();
-        let err = super::resolve_initial_prompt(&args).unwrap_err();
-        assert!(err.to_string().contains("larger than 64 KiB"), "{err}");
+        std::fs::write(&file, &big).unwrap();
+        for argv in [
+            vec!["aoe", "add", "--prompt-file", file.to_str().unwrap()],
+            vec!["aoe", "add", "--prompt", big.as_str()],
+        ] {
+            let err = super::resolve_initial_prompt(&parse_add(&argv).unwrap()).unwrap_err();
+            assert!(
+                err.to_string().contains("larger than 64 KiB"),
+                "{argv:?}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
