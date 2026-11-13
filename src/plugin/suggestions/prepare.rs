@@ -192,7 +192,15 @@ pub(crate) fn prepare(
     }
     let prompt = match template {
         Some(t) => {
-            expand(t, &item.variables).map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?
+            let expanded = expand(t, &item.variables)
+                .map_err(|PromptTooLong| PrepareRefusal::PromptTooLong)?;
+            // Blank is an empty prompt, as for an empty template:
+            // `sessions.create` rejects a blank but non-empty one.
+            if expanded.trim().is_empty() {
+                String::new()
+            } else {
+                expanded
+            }
         }
         None => item.draft.prompt.clone(),
     };
@@ -386,6 +394,7 @@ mod tests {
             Ok(json!("Fix acme/widgets {nope}"))
         );
         assert_eq!(prompt(Some("")), Ok(json!("")));
+        assert_eq!(prompt(Some(" \n\t")), Ok(json!("")));
         let templated =
             |template| prepare("default", &i, template, None).unwrap()["templated"].clone();
         assert_eq!(templated(None), json!(false));
