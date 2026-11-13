@@ -86,6 +86,8 @@ fn shell_consumed_by(command: &str) -> Option<&'static str> {
         Double,
     }
     let mut quote = Quote::None;
+    // The shell only reads `#` as a comment where a word begins.
+    let mut at_word_start = true;
     let mut chars = command.chars();
     while let Some(c) = chars.next() {
         match quote {
@@ -100,18 +102,27 @@ fn shell_consumed_by(command: &str) -> Option<&'static str> {
                 _ => {}
             },
             Quote::None => match c {
-                '\'' => quote = Quote::Single,
-                '"' => quote = Quote::Double,
-                '\\' => drop(chars.next()),
+                '\'' => {
+                    quote = Quote::Single;
+                    at_word_start = false;
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    at_word_start = false;
+                }
+                '\\' => {
+                    at_word_start = false;
+                    let _ = chars.next();
+                }
                 '|' => return Some("a pipe (`|`)"),
                 '&' => return Some("a chained command (`&`)"),
                 ';' => return Some("a second command (`;`)"),
                 '<' | '>' => return Some("a redirection"),
-                '#' => return Some("a comment (`#`)"),
+                '#' if at_word_start => return Some("a comment (`#`)"),
                 '(' | ')' => return Some("a subshell"),
                 '`' => return Some("a command substitution"),
                 '\n' | '\r' => return Some("a line break"),
-                _ => {}
+                _ => at_word_start = c.is_whitespace(),
             },
         }
     }
@@ -2199,6 +2210,7 @@ sandbox = "unsupported"
             "/opt/my tools/helper",
             "'/opt/my tools/helper'",
             "helper --model 'opus[1m]'",
+            "/opt/proj#1/bin/helper",
         ] {
             assert_eq!(shell_consumed_by(command), None, "{command}");
         }
@@ -2220,14 +2232,25 @@ sandbox = "unsupported"
                 "{command} reports {found}, expected {construct}"
             );
         }
-        let plain = "helper".to_owned();
         let error = refuse_shell_consumed_argument("helper | tee log", "mode flag").unwrap_err();
         assert!(
             error.to_string().contains("contains a pipe (`|`)"),
             "{error}"
         );
         refuse_shell_consumed_argument("~/bin/helper", "mode flag").unwrap();
-        assert_eq!(plain, "helper", "a refused flag must not be appended");
+        let supplied = "helper | tee log".to_owned();
+        let mut rendered = supplied.clone();
+        apply_yolo_mode(
+            &mut rendered,
+            &crate::agents::YoloMode::CliFlag("--yolo"),
+            false,
+            &supplied,
+        )
+        .unwrap_err();
+        assert_eq!(
+            rendered, supplied,
+            "a refused mode flag must not be appended"
+        );
     }
 
     #[test]
