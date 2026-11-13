@@ -17,13 +17,16 @@ export type SessionAction =
 
 const isStructured = (s: SessionResponse) => s.view === "structured";
 
+/** Whether a Session has a container the dashboard may recreate: the Session menu and the startup error screen. */
+export const canRecreateContainer = (s: SessionResponse, archived: boolean) =>
+  s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status);
+
 const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) => boolean> = {
   stop: (s) => !["Stopped", "Deleting", "Creating"].includes(s.status),
   // Archived and trashed sessions must be unarchived or restored before they start (#4116).
   start: (s, archived) => s.status === "Stopped" && !archived && !s.trashed_at,
   restartUpdate: (s) => !!s.update_restart,
-  recreateContainer: (s, archived) =>
-    s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status),
+  recreateContainer: canRecreateContainer,
   fork: (s) => isStructured(s) && !!s.acp_session_id && !!s.acp_can_fork,
   switchAgent: isStructured,
   switchView: (s) => isStructured(s) || (!!s.acp_capable && !s.structured_view_off),
