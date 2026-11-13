@@ -414,8 +414,8 @@ mod forced_batch_tests {
                     &mut master_fd,
                     &mut slave_fd,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             };
             assert_eq!(opened, 0, "openpty: {}", io::Error::last_os_error());
@@ -464,7 +464,7 @@ mod forced_batch_tests {
                 );
                 assert!(unsafe { probe_libc::setsid() } > 0, "private setsid");
                 assert_eq!(
-                    unsafe { probe_libc::ioctl(slave.as_raw_fd(), probe_libc::TIOCSCTTY, 0) },
+                    unsafe { probe_libc::ioctl(slave.as_raw_fd(), probe_libc::TIOCSCTTY as _, 0) },
                     0,
                     "private TIOCSCTTY: {}",
                     io::Error::last_os_error()
