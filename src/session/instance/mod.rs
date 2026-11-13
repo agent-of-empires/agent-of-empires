@@ -602,7 +602,6 @@ pub struct Instance {
     /// releases the key. Additive: absent in older rows, no migration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugin_create_idempotency: Option<PluginCreateIdempotency>,
-
     /// Set by a plugin's `sessions.turn.send` right before waking a resting session, under the
     /// same `instances` write lock that decides to revive it, so the plugin active-session cap
     /// treats it as occupying a slot immediately rather than waiting for a status to land.
