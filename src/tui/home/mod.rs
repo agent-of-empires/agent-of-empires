@@ -352,7 +352,7 @@ pub struct HomeView {
     pub(super) live_send_resize_retry_at: Option<std::time::Instant>,
     pub(super) live_send_pending_leader: bool,
     pub(super) hover_cell: Option<(u16, u16)>,
-    pub(super) status_flash: Option<(String, std::time::Instant)>,
+    pub(super) status_flash: Option<overlays::StatusFlash>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
