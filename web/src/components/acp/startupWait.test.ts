@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { applyEvent, emptyAcpState, type AcpEvent } from "../../lib/acpTypes";
 import { reducer } from "../../hooks/acpSession/reducer";
-import { hasStartedBefore, isNewSessionStarting } from "./startupWait";
+import { hasStartedBefore, isNewSessionStarting, notRunningCopy } from "./startupWait";
 
 type Connection = Parameters<typeof isNewSessionStarting>[1];
 const connection = (over: Partial<Connection> = {}): Connection => ({
@@ -87,6 +87,21 @@ describe("isNewSessionStarting", () => {
     ],
     ["a startup error shows its own banner", [state({ startupError: "boom" }), connection(), "resuming", false], false],
     [
+      "a Retry of an older Session's startup error",
+      [state({ restartInFlight: true, retriedError: "boom", sessionAssigned: true }), connection(), "running", true],
+      true,
+    ],
+    [
+      "a Retry whose connection gave up",
+      [
+        state({ restartInFlight: true, retriedError: "boom" }),
+        connection({ status: "closed", retryCount: 7 }),
+        "running",
+        true,
+      ],
+      false,
+    ],
+    [
       "an older Session whose events haven't loaded yet",
       [state(), connection({ status: "connecting", hasEverOpened: false }), "resuming", true],
       false,
@@ -129,5 +144,27 @@ describe("hasStartedBefore", () => {
     ["an import whose history hasn't loaded", { acp_session_id: "acp-1", import_pending: true }, false],
   ])("%s", (_label, session, expected) => {
     expect(hasStartedBefore(session)).toBe(expected);
+  });
+});
+
+describe("notRunningCopy", () => {
+  const state = (over: Partial<ReturnType<typeof emptyAcpState>> = {}) => ({ ...emptyAcpState(), ...over });
+  it.each([
+    [
+      "a Retry in flight",
+      state({ restartInFlight: true, retriedError: "boom" }),
+      "Claude",
+      "Claude isn't running yet.",
+    ],
+    ["a startup error", state({ startupError: "boom" }), "Claude", "Claude isn't running."],
+    [
+      "an unknown Agent starts the sentence capitalized",
+      state({ startupError: "boom" }),
+      "the Agent",
+      "The Agent isn't running.",
+    ],
+    ["a running Agent", state(), "Claude", null],
+  ] as const)("%s", (_, s, name, want) => {
+    expect(notRunningCopy(s, name)).toBe(want);
   });
 });

@@ -65,12 +65,20 @@ function renderBanner({
   switchable = true,
   acpWorkerState = "absent",
   sentStopped = false,
+  retriedError = null,
+  restartEpoch = 0,
+  onRetryStarted,
+  onRetryFailed,
 }: {
   message?: string;
   onSwitchToTerminal?: () => void;
   switchable?: boolean;
   acpWorkerState?: AcpWorkerState;
   sentStopped?: boolean;
+  retriedError?: string | null;
+  restartEpoch?: number;
+  onRetryStarted?: (epoch: number, message: string) => void;
+  onRetryFailed?: (epoch: number, detail: string) => void;
 } = {}) {
   return render(
     <StartupErrorBanner
@@ -78,6 +86,10 @@ function renderBanner({
       message={message}
       acpWorkerState={acpWorkerState}
       sentStopped={sentStopped}
+      retriedError={retriedError}
+      restartEpoch={restartEpoch}
+      onRetryStarted={onRetryStarted}
+      onRetryFailed={onRetryFailed}
       onSwitchToTerminal={switchable ? onSwitchToTerminal : undefined}
     />,
   );
@@ -409,16 +421,18 @@ describe("StartupErrorBanner install", () => {
     await findByText("npm ERR! EACCES");
   });
 
-  it("opens Details when the respawn after a successful install fails", async () => {
+  it("hands the respawn after a successful install to the startup line, and its refusal on", async () => {
     stubApi({
       info: json(claude({ install_allowed: true })),
       install: json({ success: true, exit_code: 0, stdout: "", stderr: "", recovered_sessions: 0 }),
       spawn: json("spawn failed: capacity full", 500),
     });
-    const { findByTestId } = renderBanner();
+    const onRetryStarted = vi.fn();
+    const onRetryFailed = vi.fn();
+    const { findByTestId } = renderBanner({ onRetryStarted, onRetryFailed });
     fireEvent.click(await findByTestId("startup-error-banner-install"));
-    const details = await findByTestId("startup-error-banner-details-body");
-    await waitFor(() => expect(details.textContent).toContain("Retry failed: capacity full"));
+    await waitFor(() => expect(onRetryFailed.mock.calls).toEqual([[0, "spawn failed: capacity full"]]));
+    expect(onRetryStarted.mock.calls).toEqual([[0, SPAWN_MSG]]);
   });
 
   it("respawns once the install succeeds", async () => {
@@ -437,14 +451,31 @@ describe("StartupErrorBanner Retry", () => {
   it.each([
     ["spawns when no Worker is left", "absent", "/acp/spawn"],
     ["restarts a Worker that hasn't settled, so it can't refuse the Retry", "running", "/acp/restart"],
-  ] as const)("%s, and says what happens next", async (_label, acpWorkerState, path) => {
+  ] as const)("%s, handing the error to the startup line first", async (_label, acpWorkerState, path) => {
     const spy = stubApi({ info: json(claude()), spawn: json({}), restart: json({}) });
-    const { getByTestId, findByText, queryByTestId } = renderBanner({ acpWorkerState });
+    const onRetryStarted = vi.fn(() => expect(calls(spy, path)).toBe(0));
+    const onRetryFailed = vi.fn();
+    const { getByTestId } = renderBanner({ acpWorkerState, restartEpoch: 3, onRetryStarted, onRetryFailed });
     fireEvent.click(getByTestId("startup-error-banner-retry"));
-    await findByText("Retrying. Events will appear when Claude starts.");
-    expect(calls(spy, path)).toBe(1);
+    await waitFor(() => expect(calls(spy, path)).toBe(1));
     expect(calls(spy, path === "/acp/spawn" ? "/acp/restart" : "/acp/spawn")).toBe(0);
-    expect(queryByTestId("startup-error-banner-details-body")).toBeNull();
+    expect(onRetryStarted.mock.calls).toEqual([[3, SPAWN_MSG]]);
+    expect(onRetryFailed).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a plain refusal", "spawn failed: capacity full", "spawn failed: capacity full"],
+    [
+      "a JSON refusal, by its message",
+      JSON.stringify({ error: "session_archived", message: "session is archived; unarchive it first" }),
+      "session is archived; unarchive it first",
+    ],
+  ])("hands %s on without the HTTP status", async (_label, body, detail) => {
+    stubApi({ info: json(claude()), spawn: json(body, 500) });
+    const onRetryFailed = vi.fn();
+    const { getByTestId } = renderBanner({ restartEpoch: 3, onRetryStarted: vi.fn(), onRetryFailed });
+    fireEvent.click(getByTestId("startup-error-banner-retry"));
+    await waitFor(() => expect(onRetryFailed.mock.calls).toEqual([[3, detail]]));
   });
 });
 
@@ -462,47 +493,57 @@ describe("StartupErrorBanner Details", () => {
     expect(within(body).getByTestId("acp-agent-log-toggle")).toBeTruthy();
   });
 
+  it("copies the full error", async () => {
+    stubApi({ info: json(claude()) });
+    const { getByTestId, findByText } = renderBanner();
+    fireEvent.click(getByTestId("startup-error-banner-details"));
+    fireEvent.click(getByTestId("startup-error-banner-copy"));
+    await findByText("Copied");
+    expect(writeClipboard).toHaveBeenCalledWith(SPAWN_MSG);
+  });
+});
+
+describe("StartupErrorBanner after a Retry", () => {
   const cause = SPAWN_MSG.split(": ").slice(1).join(": ");
-  // Past the 200 characters the retry error is cut to for display.
+  // Past the 200 characters a refusal is cut to for display.
   const longCause = `acp client error: agent spawn failed: runner control attach failed at /home/me/.agent-of-empires/acp-workers/${"a".repeat(120)}.control.sock: runner closed before Hello`;
+  const SAME = "Same error as before.";
   it.each([
-    ["the same error", SPAWN_MSG, `spawn failed: ${cause}`, "Retry failed: same error"],
-    [
-      "the same error after a reason code",
-      SPAWN_MSG,
-      `worker_not_ready: spawn failed: ${cause}`,
-      "Retry failed: same error",
-    ],
+    ["the same error", SPAWN_MSG, `spawn failed: ${cause}`, SAME],
+    ["the same error after a reason code", SPAWN_MSG, `worker_not_ready: spawn failed: ${cause}`, SAME],
     [
       "the same long error",
       `Failed to start structured view agent "claude": ${longCause}`,
       `spawn failed: ${longCause}`,
-      "Retry failed: same error",
+      SAME,
     ],
-    ["the same error from a restart", SPAWN_MSG, `restart spawn failed: ${cause}`, "Retry failed: same error"],
+    ["the same error from a restart", SPAWN_MSG, `restart spawn failed: ${cause}`, SAME],
     [
       "the same error from a restart after a reason code",
       SPAWN_MSG,
       `worker_not_ready: restart spawn failed: ${cause}`,
-      "Retry failed: same error",
+      SAME,
     ],
-    ["a new error", SPAWN_MSG, "spawn failed: capacity full", "Retry failed: capacity full"],
+    ["the same error as an event", SPAWN_MSG, SPAWN_MSG, SAME],
+    ["a new error", SPAWN_MSG, "spawn failed: capacity full", "It failed differently this time: capacity full"],
     [
-      "a JSON refusal",
+      "a new error over several lines, by its first",
       SPAWN_MSG,
-      JSON.stringify({ error: "session_archived", message: "session is archived; unarchive it first" }),
-      "Retry failed: session is archived; unarchive it first",
+      "spawn failed: capacity full\nat worker.rs:12",
+      "It failed differently this time: capacity full",
     ],
-  ])("a retry failing with %s opens Details without the HTTP status", async (_label, message, body, line) => {
-    stubApi({ info: json(claude()), spawn: json(body, 500), restart: json(body, 500) });
-    const { getByTestId, findByTestId } = renderBanner({
-      message,
-      acpWorkerState: body.includes("restart") ? "running" : "absent",
-    });
-    fireEvent.click(getByTestId("startup-error-banner-retry"));
-    const details = await findByTestId("startup-error-banner-details-body");
-    await waitFor(() => expect(details.textContent).toContain(line));
-    expect(details.textContent).not.toContain("500");
+  ])("%s says it still couldn't start and how the cause compares", async (_label, retriedError, message, line) => {
+    stubApi({ info: json(claude()) });
+    const { findByRole, getByTestId } = renderBanner({ message, retriedError });
+    expect((await findByRole("heading")).textContent).toBe("Claude still couldn't start");
+    expect(getByTestId("startup-error-banner-changed").textContent).toBe(line);
+  });
+
+  it("names neither before any Retry", async () => {
+    stubApi({ info: json(claude()) });
+    const { findByRole, queryByTestId } = renderBanner();
+    expect((await findByRole("heading")).textContent).toBe("Claude couldn't start in Structured view");
+    expect(queryByTestId("startup-error-banner-changed")).toBeNull();
   });
 });
 

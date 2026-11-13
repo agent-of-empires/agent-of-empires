@@ -4160,7 +4160,59 @@
         "web/src/components/acp/adapterRecovery.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. A retry failing with the same cause, after spawn failed: or restart spawn failed: and any reason code, reads as the same error. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
+      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. What follows a Retry is in acp.startup-error-banner-retry-same-cause and -changed-cause. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
+    },
+    {
+      "id": "acp.startup-error-banner-retry-same-cause",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-startup-error-banner.spec.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/acp/startupWait.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/adapterRecovery.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
+    },
+    {
+      "id": "acp.startup-error-banner-retry-changed-cause",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-startup-error-banner.spec.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/acp/startupWait.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/adapterRecovery.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
+    },
+    {
+      "id": "acp.empty-state-not-running",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-startup-error-banner.spec.ts", "tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"],
+      "notes": "An empty transcript under a startup error says <Agent> isn't running. and, during a Retry, <Agent> isn't running yet., with no starter prompts either way; the hint and starter prompts come back once the Agent starts. Archived and trashed Sessions show neither."
     },
     {
       "id": "acp.startup-error-banner-live",
