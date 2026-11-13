@@ -256,6 +256,20 @@ jobs:
           sudo env AOE_PRIVDROP_TESTS=1 \
             "$test_binary" privdrop_ --test-threads=1 --nocapture
 
+  cargo-linux-release-pr:
+    # A matrix job skipped at job level posts one unexpanded context, so this
+    # reports the three required cargo-linux contexts on release PRs instead.
+    # The merge queue runs the real legs.
+    name: Cargo Test (linux, ${{ matrix.leg }})
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
+    runs-on: ubuntu-latest
+    permissions: {}
+    strategy:
+      matrix:
+        leg: [web-e2e, core-rest, bare-core]
+    steps:
+      - run: echo "Release PR, so the merge queue runs this leg."
+
   macos-gate:
     # Decides on Linux whether macOS runs, so a skip holds no macOS runner.
     # It runs for macOS-sensitive changes or the ci-macos label. After adding
