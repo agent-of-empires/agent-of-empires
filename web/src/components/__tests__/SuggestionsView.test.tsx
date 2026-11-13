@@ -304,6 +304,21 @@ describe("SuggestionsView", () => {
     expect(onPrepare).not.toHaveBeenCalled();
   });
 
+  it("Open wizard after a failed start never starts unreviewed, even with Start without review on", async () => {
+    prepareSuggestion
+      .mockResolvedValueOnce({ ok: false, error: "no agent", stale: false })
+      .mockResolvedValueOnce({ ok: true, data: prepared });
+    const snap = snapshot();
+    fetchSuggestions.mockResolvedValue({ ...snap, prefs: { ...snap.prefs, start_without_review: true } });
+    const onPrepare = vi.fn();
+    render(<SuggestionsView onPrepare={onPrepare} onStarted={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Start" }));
+    await screen.findByText(/Couldn't start: no agent/);
+    fireEvent.click(screen.getByRole("button", { name: "Open wizard" }));
+    await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("Start without review refuses a second view's Start while the first create is in flight", async () => {
     let finish: (v: object) => void = () => {};
     createSession.mockReturnValue(new Promise((resolve) => (finish = resolve)));

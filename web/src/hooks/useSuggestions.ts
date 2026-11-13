@@ -120,6 +120,8 @@ export function useSuggestions(
   // `another` starts a further Session without claiming the suggestion's link.
   const start = async (item: SuggestionItem, another = false) => {
     const key = suggestionKey(item);
+    // A retry after a failed start is the row's "Open wizard", so it never starts unreviewed.
+    const afterFailure = key in failures;
     setBusy(key);
     setNotice(null);
     const result = await prepareSuggestion(item.provider_id, item.id);
@@ -141,6 +143,7 @@ export function useSuggestions(
       if (
         onStarted &&
         !another &&
+        !afterFailure &&
         snapshot?.prefs.start_without_review &&
         draft.project &&
         draft.templated &&
