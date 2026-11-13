@@ -82,6 +82,15 @@ test("preferences, templates, mappings and dismissals round-trip through the ser
   expect(put.status).toBe(200);
   const stored = await (await api(serve, "/templates?provider_id=acme.sugg&criterion=assigned")).json();
   expect(stored.template).toBe("Work on {n}");
+  const reset = await api(
+    serve,
+    `/templates?${new URLSearchParams({ provider_id: "acme.sugg", criterion: "assigned" })}`,
+    {
+      method: "DELETE",
+    },
+  );
+  expect(reset.status).toBe(200);
+  expect((await (await api(serve, "/templates?provider_id=acme.sugg&criterion=assigned")).json()).template).toBeNull();
 
   const mapped = await api(serve, "/mappings", {
     method: "PUT",
