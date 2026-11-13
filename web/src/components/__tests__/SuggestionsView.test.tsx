@@ -219,7 +219,11 @@ describe("SuggestionsView", () => {
     cleanup();
     const base = snapshot();
     await open({ ...base, prefs: { ...base.prefs, start_without_review: true } });
-    expect(await screen.findByText(/Start creates the session and sends the draft prompt right away/)).toBeTruthy();
+    expect(
+      await screen.findByText(
+        /Start creates the session from your template without review when the item has a template and a Project; otherwise it opens the wizard/,
+      ),
+    ).toBeTruthy();
     expect(screen.queryByText(/Nothing runs until you press Launch/)).toBeNull();
   });
 

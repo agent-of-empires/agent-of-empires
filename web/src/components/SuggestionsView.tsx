@@ -136,7 +136,7 @@ export function SuggestionsView({
             <h1 className="text-lg font-semibold">Suggested sessions</h1>
             <p className="mt-2 max-w-2xl text-sm text-text-secondary">
               {snapshot?.prefs.start_without_review
-                ? "Start creates the session and sends the draft prompt right away."
+                ? "Start creates the session from your template without review when the item has a template and a Project; otherwise it opens the wizard."
                 : "Start opens the new session wizard with the draft prompt. Nothing runs until you press Launch."}
             </p>
           </div>
