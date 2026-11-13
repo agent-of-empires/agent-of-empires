@@ -75,6 +75,8 @@ interface Props {
   onOpenFileRef?: (ref: FileRef) => void;
   fileRefSession?: FileRefSession | null;
   isSandboxed?: boolean;
+  /** The Session's title when the dashboard may recreate its container. */
+  recreateContainerTitle?: string;
   onOpenAgentsPane?: (agentId?: string) => void;
   /** The server is read-only, so the session cannot be interrupted. */
   serverReadOnly?: boolean;
@@ -236,7 +238,12 @@ function AcpChrome({
   if (state.incompatibleAgent) {
     return (
       <div className="flex h-full flex-col bg-surface-900 text-text-primary">
-        <StartupErrorScreen detail={state.incompatibleAgent} sessionId={sessionId} isSandboxed={view.isSandboxed} />
+        <StartupErrorScreen
+          detail={state.incompatibleAgent}
+          sessionId={sessionId}
+          isSandboxed={view.isSandboxed}
+          recreateContainerTitle={view.recreateContainerTitle}
+        />
       </div>
     );
   }
