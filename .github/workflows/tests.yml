@@ -127,7 +127,8 @@ jobs:
           cargo test --features web,e2e-tests --lib -- \
             server::assets:: tui::dialogs::serve::tests::held_work_leaves_keys_clicks_ticks_and_render_usable \
             session::config::tests::web_plugin_changes_do_not_cross_lifecycle_transactions \
-            tui::dialogs::serve::render::tests::a_withdrawn_funnel_shows_why_instead_of_a_qr_code
+            tui::dialogs::serve::render::tests::a_withdrawn_funnel_shows_why_instead_of_a_qr_code \
+            tui::dialogs::serve::render::tests::a_half_published_read_opens_active_with_the_unknown_notice
       # macOS reaches its per-user temp root through a symlink, so a test that
       # compares `TempDir::path()` against a path that has been through
       # `canonicalize()` or a reported cwd passes on Linux and fails there.
