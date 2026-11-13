@@ -59,6 +59,22 @@ pub(super) fn remote_serve_url_contents(
     format!("{remote_url}\nlocalhost\t{loopback_url}\n")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishStep {
+    Marker,
+    Url,
+}
+
+/// Back to ours, the public URL goes first and the old marker still says it isn't; any other
+/// change marks first and then drops the public URL.
+fn publish_order(reach: FunnelReach) -> [PublishStep; 2] {
+    if reach == FunnelReach::Ours {
+        [PublishStep::Url, PublishStep::Marker]
+    } else {
+        [PublishStep::Marker, PublishStep::Url]
+    }
+}
+
 /// The remote daemon's `serve.url`. Token rotation and a Funnel takeover both rewrite it, one at a
 /// time and from the current token, so neither restores the other's stale contents.
 pub(super) struct RemoteServeUrl {
@@ -100,29 +116,38 @@ impl RemoteServeUrl {
         }
     }
 
-    /// Writes `serve.funnel` (absent while the Funnel is ours) before `serve.url`, so a reader
-    /// that sees the loopback-only URL also sees why.
+    /// Writes `serve.funnel` (absent while the Funnel is ours) and `serve.url` in
+    /// `publish_order`, so a read between the two writes never shows a loopback-only URL
+    /// without the marker that says why.
     async fn publish(&self, tokens: &TokenManager) {
         let _write = self.write.lock().await;
         let token = tokens.current_token().await;
         let reach = self.reach();
-        if let Ok(app_dir) = crate::session::get_app_dir() {
-            let marker = app_dir.join("serve.funnel");
-            let written = match reach.marker() {
-                Some(contents) => tokio::fs::write(&marker, contents).await,
-                None => match tokio::fs::remove_file(&marker).await {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    other => other,
-                },
-            };
-            if let Err(error) = written {
-                tracing::debug!(target: "serve.tunnel", %error, "failed to update serve.funnel");
+        let Ok(app_dir) = crate::session::get_app_dir() else {
+            return;
+        };
+        for step in publish_order(reach) {
+            match step {
+                PublishStep::Marker => {
+                    let marker = app_dir.join("serve.funnel");
+                    match reach.marker() {
+                        Some(contents) => write_secret_file(&marker, contents).await,
+                        None => match tokio::fs::remove_file(&marker).await {
+                            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                                tracing::debug!(target: "serve.tunnel", %error, "failed to remove serve.funnel");
+                            }
+                            _ => {}
+                        },
+                    }
+                }
+                PublishStep::Url => {
+                    write_secret_file(
+                        &app_dir.join("serve.url"),
+                        &self.contents(reach, token.as_deref()),
+                    )
+                    .await
+                }
             }
-            write_secret_file(
-                &app_dir.join("serve.url"),
-                &self.contents(reach, token.as_deref()),
-            )
-            .await;
         }
     }
 
@@ -1728,6 +1753,27 @@ mod tests {
             remote_serve_url_contents("https://aoe.example.test/", 8080, None),
             "https://aoe.example.test/\nlocalhost\thttp://127.0.0.1:8080/\n"
         );
+    }
+
+    /// Between the two writes of any change, a reader never finds the loopback-only URL with
+    /// no marker, the pair Remote Access can only show as unknown.
+    #[test]
+    fn no_write_order_leaves_a_loopback_url_without_its_marker() {
+        let all = [FunnelReach::Ours, FunnelReach::Lost, FunnelReach::Unknown];
+        // (marker present, URL public) once `step` of a publish for `to` has landed.
+        let after = |(marker, public): (bool, bool), to: FunnelReach, step| match step {
+            PublishStep::Marker => (to.marker().is_some(), public),
+            PublishStep::Url => (marker, to == FunnelReach::Ours),
+        };
+        for from in all {
+            for to in all {
+                let mut files = (from.marker().is_some(), from == FunnelReach::Ours);
+                for step in publish_order(to) {
+                    files = after(files, to, step);
+                    assert_ne!(files, (false, false), "{from:?} -> {to:?} after {step:?}");
+                }
+            }
+        }
     }
 
     /// A Funnel takeover drops the public line, rotation keeps it dropped, and a returned route

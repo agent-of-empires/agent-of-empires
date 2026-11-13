@@ -1271,16 +1271,18 @@ mod tests {
             .join(" ")
     }
 
+    fn draws_qr(buf: &ratatui::buffer::Buffer) -> bool {
+        buf.content()
+            .iter()
+            .any(|cell| ["\u{2588}", "\u{2580}", "\u{2584}"].contains(&cell.symbol()))
+    }
+
     #[test]
     fn a_withdrawn_funnel_shows_why_instead_of_a_qr_code() {
         use crate::server::tunnel::FunnelReach;
         let loopback = "http://127.0.0.1:8080/?token=t";
         let funnel = "https://host.tailnet.ts.net/?token=t";
-        let qr = |buf: &ratatui::buffer::Buffer| {
-            buf.content()
-                .iter()
-                .any(|cell| ["\u{2588}", "\u{2580}", "\u{2584}"].contains(&cell.symbol()))
-        };
+        let qr = draws_qr;
         // (Funnel state, the URL serve.url leads with)
         for (reach, url) in [
             (FunnelReach::Lost, loopback),
@@ -1319,6 +1321,34 @@ mod tests {
                     "{reach:?} at {width}"
                 );
             }
+        }
+    }
+
+    /// Reattach and a launch open Active through `running`. A read between the daemon's two
+    /// writes (no marker yet, the loopback-only URL) shows the Unknown notice, never a QR
+    /// code for the loopback address.
+    #[test]
+    fn a_half_published_read_opens_active_with_the_unknown_notice() {
+        use crate::server::tunnel::FunnelReach;
+        let loopback = "http://127.0.0.1:8080/?token=t";
+        let view = view(super::super::ServeViewState::running(
+            ServeMode::Tunnel,
+            Some(TunnelTransport::Tailscale),
+            Some("correct-horse".to_string()),
+            vec![ServeUrl {
+                label: None,
+                url: loopback.to_string(),
+            }],
+            FunnelReach::Ours,
+            0,
+        ));
+        let notice = crate::cli::serve::funnel_notice(FunnelReach::Unknown).unwrap();
+        for width in [60, 100] {
+            let buf = draw_at(&view, width);
+            let screen = text_in(&buf, buf.area);
+            assert!(screen.contains(notice), "at {width}: {screen}");
+            assert!(screen.contains(loopback), "at {width}: {screen}");
+            assert!(!draws_qr(&buf), "at {width}: a QR for the loopback URL");
         }
     }
 
