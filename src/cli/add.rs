@@ -178,8 +178,9 @@ pub struct AddArgs {
     #[arg(long = "structured-view")]
     structured_view: bool,
 
-    /// First turn sent to the agent once it is ready. Structured view only;
-    /// delivered when `aoe serve` starts the worker.
+    /// First turn sent to the agent once it is ready. Needs --structured-view
+    /// or --agent; delivered when `aoe serve` starts the worker. A session that
+    /// falls back to the terminal view is typed into the pane instead.
     #[arg(long, conflicts_with = "prompt_file")]
     prompt: Option<String>,
 
@@ -224,8 +225,9 @@ pub struct AddArgs {
 }
 
 const PROMPT_NEEDS_STRUCTURED: &str =
-    "--prompt needs the structured view; terminal sessions cannot receive it from `aoe add`.\n\
-     Pass --structured-view (or --agent) with an installed ACP adapter.";
+    "--prompt needs the structured view; a terminal-view request is refused here.\n\
+     Pass --structured-view (or --agent). Without an installed ACP adapter the session falls back to \
+     the terminal view and the prompt is typed there once the agent is ready.";
 
 /// The `--prompt` / `--prompt-file` text, validated before anything is created.
 /// Kept as typed: only blankness is judged on the trimmed text.
