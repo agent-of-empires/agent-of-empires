@@ -887,8 +887,9 @@ export function SessionWizard({
         await handleSubmit();
         return;
       case "create_without_setup":
-        // A new key: the failed create would be replayed to its own.
+        // A new key: the server answers a reused key with the failed create's stored result.
         await handleSubmit({}, false, { skipOnCreate: true });
+        return;
     }
   };
 

@@ -790,7 +790,7 @@ test.describe("create failure", () => {
                 stage: "running_hooks",
               },
             })
-          : route.fulfill({ status: 201, json: { session: { id: "new-session", created_without_setup: true } } })
+          : route.fulfill({ status: 201, json: { id: "new-session", created_without_setup: true } })
         ).then(() => true),
     });
     await page.setViewportSize({ width: 375, height: 812 });
@@ -811,6 +811,7 @@ test.describe("create failure", () => {
     expect(created[1]!.skip_on_create).toBe(true);
     expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
     await expect(page.getByTestId("session-wizard")).toHaveCount(0);
+    await expect(page).toHaveURL(/\/session\/new-session$/);
   });
 
   test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {

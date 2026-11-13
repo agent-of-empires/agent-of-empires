@@ -34,18 +34,15 @@ function Chip({
   title,
   label,
   className,
-  role,
   children,
 }: {
   title: string;
   label: string;
   className: string;
-  /** "img" for an icon-only chip, which a bare span can't name. */
-  role?: "img";
   children: ReactNode;
 }) {
   return (
-    <span title={title} aria-label={label} role={role} className={className}>
+    <span title={title} aria-label={label} className={className}>
       {children}
     </span>
   );
@@ -153,9 +150,11 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
       )}
       <RateLimitBadge sessions={workspace.sessions} />
       {workspace.sessions.some((s) => s.created_without_setup) && (
-        <Chip title="Created without setup" label="Created without setup" role="img" className={`${CHIP} ${MUTED}`}>
-          <WrenchOff className="h-3 w-3" />
-        </Chip>
+        // Visually hidden text, not aria-label: a generic span can't be named.
+        <span title="Created without setup" className={`${CHIP} ${MUTED}`}>
+          <WrenchOff aria-hidden="true" className="h-3 w-3" />
+          <span className="sr-only">Created without setup</span>
+        </span>
       )}
       {effectiveArchived && (
         <Chip title="Archived" label="Archived" className={`${CHIP} gap-0.5 ${MUTED}`}>
