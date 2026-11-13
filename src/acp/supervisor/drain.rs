@@ -834,7 +834,7 @@ impl<S: BroadcastSink> Drain<S> {
             );
             if lock_recover(&self.lifecycle).convert_to_stopping(&respawn_lease) {
                 self.publish(Event::AgentStartupError {
-                    message: "This Session's sandbox container is gone. Recreate it to use this Session again."
+                    message: "This Session's sandbox container was removed. Start the Session again to create a new one."
                         .into(),
                     cause: Some(StartupCause::ContainerMissing),
                 });
