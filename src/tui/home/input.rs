@@ -7324,10 +7324,12 @@ impl HomeView {
     }
 
     /// Whether Tab, not Enter, enters live mode on this Session's row (see the footer).
+    /// Only Structured view refuses a structured Session; its Terminal and Tool panes go live.
     pub(super) fn tab_enters_live(&self, id: &str) -> bool {
-        !self
-            .get_instance(id)
-            .is_some_and(|inst| inst.is_structured())
+        !(matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .get_instance(id)
+                .is_some_and(|inst| inst.is_structured()))
             && !matches!(
                 self.default_attach_mode(id),
                 Some(crate::session::AttachMode::LiveSend)

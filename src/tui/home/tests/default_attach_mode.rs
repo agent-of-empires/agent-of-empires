@@ -547,28 +547,34 @@ fn takeover_footer_names_enter_when_enter_is_live() {
 }
 
 /// With the shortcut bar hidden the takeover line never shows, so a flash says who took
-/// control and names the live key; with the bar shown the footer line is enough.
+/// control and names the live key; with the bar shown the footer line names it instead.
+/// A structured Session's Terminal and Tool views go live on Tab like any other row.
 #[test]
 #[serial]
-fn a_takeover_flashes_when_the_shortcut_bar_is_hidden() {
+fn a_takeover_names_the_live_key_in_a_flash_or_the_footer() {
     use crate::tui::home::live_send::{LiveTakeover, TakenLive};
-    // (default attach mode, shortcut bar shown, flash)
-    for (mode, bar, flash) in [
+    use crate::tui::home::ViewMode;
+    // (default attach mode, structured Session's pane, shortcut bar shown, live key)
+    for (mode, structured_pane, bar, live_key) in [
+        (AttachMode::Tmux, None, false, "Tab"),
+        (AttachMode::LiveSend, None, false, "Enter"),
+        (AttachMode::Tmux, None, true, "Tab"),
+        (AttachMode::Tmux, Some(ViewMode::Terminal), false, "Tab"),
         (
             AttachMode::Tmux,
-            false,
-            Some("Web dashboard took control: Tab to take it back"),
+            Some(ViewMode::Tool("probe".into())),
+            true,
+            "Tab",
         ),
-        (
-            AttachMode::LiveSend,
-            false,
-            Some("Web dashboard took control: Enter to take it back"),
-        ),
-        (AttachMode::Tmux, true, None),
     ] {
+        let case = format!("{mode:?} {structured_pane:?} bar={bar}");
         let mut env = create_test_env_empty();
         write_global_default_attach_mode(mode);
         let id = add_session(&mut env.view, "session-one");
+        if let Some(pane) = structured_pane {
+            env.view.instances.get_mut(&id).unwrap().view = crate::session::View::Structured;
+            env.view.view_mode = pane;
+        }
         env.view.flat_items = env.view.build_flat_items();
         env.view.cursor = 0;
         env.view.update_selected();
@@ -579,12 +585,20 @@ fn a_takeover_flashes_when_the_shortcut_bar_is_hidden() {
             taker: LiveTakeover::Web,
         };
         env.view.note_live_takeover(taken.clone());
-        assert_eq!(env.view.live_takeover, Some(taken), "{mode:?} {bar}");
-        assert_eq!(env.view.status_flash_text(), flash, "{mode:?} {bar}");
-        if let Some(flash) = flash {
-            let out = render_home(&mut env);
-            let footer = out.lines().last().unwrap_or_default();
-            assert!(footer.contains(flash), "{mode:?}: {footer}");
+        assert_eq!(env.view.live_takeover, Some(taken), "{case}");
+        let flash = format!("Web dashboard took control: {live_key} to take it back");
+        let footer_hint = match live_key {
+            "Tab" => "Tab take control",
+            _ => "↵ take control",
+        };
+        let out = render_home(&mut env);
+        let footer = out.lines().last().unwrap_or_default();
+        if bar {
+            assert_eq!(env.view.status_flash_text(), None, "{case}");
+            assert!(footer.contains(footer_hint), "{case}: {footer}");
+        } else {
+            assert_eq!(env.view.status_flash_text(), Some(flash.as_str()), "{case}");
+            assert!(footer.contains(&flash), "{case}: {footer}");
         }
     }
 }
