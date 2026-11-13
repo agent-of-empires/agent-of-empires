@@ -10,6 +10,7 @@ const EXACT_KEYS = new Set<string>([
   "aoe-sidebar-sort-mode",
   "aoe-sidebar-axis",
   "aoe-sidebar-sunk-expanded",
+  "aoe-sidebar-suggested-expanded",
   "aoe-repo-group-order-v1", // manual repo-group order
   "aoe-acp-last-tool", // last agent picked in the wizard
   "aoe-last-browse-dir", // last dir browsed (paths are identical across devices)

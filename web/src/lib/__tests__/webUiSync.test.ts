@@ -32,6 +32,7 @@ describe("isSyncedKey", () => {
       "aoe-sidebar-sort-mode",
       "aoe-sidebar-axis",
       "aoe-sidebar-sunk-expanded",
+      "aoe-sidebar-suggested-expanded",
       "aoe-repo-group-order-v1",
       "aoe-acp-last-tool",
       "aoe-last-browse-dir",
