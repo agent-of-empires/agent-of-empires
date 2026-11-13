@@ -397,6 +397,118 @@ describe("StartupWaitLine", () => {
   });
 });
 
+describe("SessionBanners Retry", () => {
+  const frame = (seq: number, event: AcpEvent): Action => ({ kind: "frame", frame: { session_id: "s1", seq, event } });
+  const FIRST =
+    'Failed to start structured view agent "claude": acp client error: agent spawn failed: runner closed before Hello';
+  const banner = () => screen.queryByTestId("startup-error-banner");
+  const line = () => screen.queryByTestId("startup-wait-line");
+
+  /** A Session that ran before and failed to start, owned as StructuredView owns it. */
+  function renderFailed() {
+    vi.useFakeTimers();
+    let respond!: (res: unknown) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (url: string) =>
+          new Promise((resolve) => {
+            if (url.endsWith("/acp/restart")) respond = resolve;
+          }),
+      ),
+    );
+    let dispatch!: (action: Action) => void;
+    function Owner() {
+      const [state, send] = useReducer(
+        reducer,
+        reducer(emptyAcpState(), frame(1, { AgentStartupError: { message: FIRST } })),
+      );
+      dispatch = send;
+      const connection = {
+        status: "open",
+        hasEverOpened: true,
+        reconnecting: false,
+        retryCount: 0,
+        maxRetries: 7,
+      } as const;
+      return (
+        <SessionBanners
+          sessionId="s1"
+          state={state}
+          startingAgent={isNewSessionStarting(state, connection, "running", true) ? "Claude Code" : null}
+          canRestart
+          onRestarted={(epoch, stoppedSent, retriedError) =>
+            send({ kind: "restart_started", epoch, stoppedSent, retriedError })
+          }
+          onRestartFailed={(epoch, message, stoppedSent) =>
+            send({ kind: "restart_failed", epoch, message, stoppedSent })
+          }
+          acpWorkerState="running"
+          trashedAt={null}
+          archivedAt={null}
+          snoozedUntil={null}
+          dismissError={vi.fn()}
+        />
+      );
+    }
+    render(<Owner />);
+    return {
+      dispatch: (action: Action) => act(() => dispatch(action)),
+      respond: (status: number, body: string) =>
+        act(async () => respond({ ok: status < 400, status, text: () => Promise.resolve(body) })),
+    };
+  }
+
+  it.each<[string, (owner: ReturnType<typeof renderFailed>) => Promise<void>, string | null]>([
+    [
+      "the Agent starting ends the line",
+      async (o) => {
+        await o.respond(200, "");
+        o.dispatch(frame(2, { AcpSessionAssigned: { acp_session_id: "acp-2" } }));
+      },
+      null,
+    ],
+    [
+      "the same error brings the banner back saying so",
+      async (o) => {
+        await o.respond(200, "");
+        o.dispatch(frame(2, { Stopped: { reason: "user_stopped" } }));
+        o.dispatch(frame(3, { AgentStartupError: { message: FIRST } }));
+      },
+      "Same error as before.",
+    ],
+    [
+      "a changed error brings the banner back naming it",
+      async (o) => {
+        await o.respond(200, "");
+        o.dispatch(frame(2, { AgentStartupError: { message: "restart spawn failed: capacity full" } }));
+      },
+      "It failed differently this time: capacity full",
+    ],
+    [
+      "a refused Retry brings the banner back with the refusal",
+      (o) => o.respond(500, "restart spawn failed: capacity full"),
+      "It failed differently this time: capacity full",
+    ],
+  ])("%s", async (_label, settle, changed) => {
+    const owner = renderFailed();
+    expect([!!banner(), !!line()]).toEqual([true, false]);
+    fireEvent.click(screen.getByTestId("startup-error-banner-retry"));
+    expect([!!banner(), screen.getByTestId("startup-wait-line").textContent]).toEqual([
+      false,
+      expect.stringContaining("Starting Claude Code…"),
+    ]);
+    await settle(owner);
+    expect(line()).toBeNull();
+    if (changed === null) {
+      expect(banner()).toBeNull();
+      return;
+    }
+    expect(screen.getByRole("heading").textContent).toMatch(/still couldn't start$/);
+    expect(screen.getByTestId("startup-error-banner-changed").textContent).toBe(changed);
+  });
+});
+
 describe("SessionBanners startup line", () => {
   it.each([
     ["offers Restart where the server allows it", true],

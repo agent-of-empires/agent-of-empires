@@ -87,6 +87,21 @@ describe("isNewSessionStarting", () => {
     ],
     ["a startup error shows its own banner", [state({ startupError: "boom" }), connection(), "resuming", false], false],
     [
+      "a Retry of an older Session's startup error",
+      [state({ restartInFlight: true, retriedError: "boom", sessionAssigned: true }), connection(), "running", true],
+      true,
+    ],
+    [
+      "a Retry whose connection gave up",
+      [
+        state({ restartInFlight: true, retriedError: "boom" }),
+        connection({ status: "closed", retryCount: 7 }),
+        "running",
+        true,
+      ],
+      false,
+    ],
+    [
       "an older Session whose events haven't loaded yet",
       [state(), connection({ status: "connecting", hasEverOpened: false }), "resuming", true],
       false,
