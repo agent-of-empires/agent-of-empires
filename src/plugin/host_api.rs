@@ -94,8 +94,12 @@ impl HostApiState {
     /// Unix seconds each provider was last asked to refresh, within [`REFRESH_TTL`]. A provider
     /// is still refreshing only if its `updated_at` is older than that.
     pub(crate) fn refreshing_providers(&self) -> HashMap<String, i64> {
+        self.refreshing_providers_at(Instant::now())
+    }
+
+    fn refreshing_providers_at(&self, now: Instant) -> HashMap<String, i64> {
         let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
-        pending.retain(|_, (at, _)| at.elapsed() < REFRESH_TTL);
+        pending.retain(|_, (at, _)| now.saturating_duration_since(*at) < REFRESH_TTL);
         pending
             .iter()
             .map(|(id, (_, unix))| (id.clone(), *unix))
@@ -1141,18 +1145,11 @@ mod tests {
         let pending = state.refreshing_providers();
         assert_eq!(pending.keys().collect::<Vec<_>>(), ["b"]);
         assert!(pending["b"] >= chrono::Utc::now().timestamp() - 5);
-        let stale = Instant::now().checked_sub(REFRESH_TTL + Duration::from_secs(1));
-        if let Some(stale) = stale {
-            state
-                .refreshing
-                .lock()
-                .unwrap()
-                .insert("b".into(), (stale, 0));
-            assert!(
-                state.refreshing_providers().is_empty(),
-                "a silent worker expires"
-            );
-        }
+        let later = Instant::now() + REFRESH_TTL + Duration::from_secs(1);
+        assert!(
+            state.refreshing_providers_at(later).is_empty(),
+            "a silent worker expires"
+        );
     }
 
     #[test]
