@@ -4375,6 +4375,141 @@ async fn list_sessions_shares_config_resolution_across_overlays() {
     );
 }
 
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+// Source discovery can open the repo through libgit2, so a main checkout shared by many
+// sessions must be discovered once per request, not on every cache hit.
+#[test]
+#[serial_test::serial]
+fn session_cfg_cache_discovers_a_repeated_main_checkout_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    run_git(repo.path(), &["init", "-q"]);
+    let path = repo.path().to_str().unwrap();
+
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&misses);
+    for _ in 0..3 {
+        cache.resolve("default", path);
+        cache.structured_view("default", path);
+    }
+
+    assert_eq!(cache.discoveries, 1);
+    assert_eq!(misses.load(Ordering::Relaxed), 1);
+}
+
+// Repo roots that differ only in non-UTF-8 bytes must not share a config. APFS rejects such names.
+#[cfg(target_os = "linux")]
+#[test]
+#[serial_test::serial]
+fn session_cfg_cache_keeps_non_utf8_repo_roots_apart() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let tmp = tempfile::tempdir().expect("tempdir repos");
+    let paths: Vec<String> = [b"r\xff".as_slice(), b"r\xfe".as_slice()]
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let main = tmp.path().join(std::ffi::OsStr::from_bytes(name));
+            std::fs::create_dir(&main).unwrap();
+            run_git(&main, &["init", "-q"]);
+            run_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            let worktree = tmp.path().join(format!("wt{i}"));
+            run_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "b",
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            worktree.to_str().unwrap().to_owned()
+        })
+        .collect();
+
+    let misses = AtomicUsize::new(0);
+    let mut cache = super::model::SessionCfgCache::new(&misses);
+    for path in &paths {
+        cache.resolve("default", path);
+    }
+
+    assert_eq!(misses.load(Ordering::Relaxed), 2);
+}
+
+// Regression witness for #5610: sessions in linked worktrees of one repo read the
+// same repo config, so they must share one resolution instead of one per worktree.
+#[tokio::test]
+#[serial_test::serial]
+async fn list_sessions_resolves_config_once_per_repo_across_linked_worktrees() {
+    use std::sync::atomic::Ordering;
+
+    let tmp_home = tempfile::tempdir().expect("tempdir HOME");
+    let _home = crate::session::test_support::isolate_app_dir_at(tmp_home.path());
+    let repo = tempfile::tempdir().expect("tempdir repo");
+    let main = repo.path().join("main");
+    std::fs::create_dir(&main).unwrap();
+    run_git(&main, &["init", "-q"]);
+    run_git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let sessions: Vec<Instance> = (0..3)
+        .map(|i| {
+            let worktree = repo.path().join(format!("wt{i}"));
+            run_git(
+                &main,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &format!("b{i}"),
+                    worktree.to_str().unwrap(),
+                ],
+            );
+            let mut inst = Instance::new("test-session", worktree.to_str().unwrap());
+            inst.tool = "custom-tool-5610".to_string();
+            inst.source_profile = "default".to_string();
+            inst
+        })
+        .collect();
+
+    let state = crate::server::test_support::build_test_app_state(sessions);
+    let _envelope = list_sessions(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(ListSessionsQuery { state: None }),
+        axum::http::HeaderMap::new(),
+    )
+    .await;
+    let misses = state.list_sessions_resolver_misses.load(Ordering::Relaxed);
+
+    assert_eq!(
+        misses, 1,
+        "linked worktrees of one repo must share one resolution; got {misses}",
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn list_sessions_flags_only_terminal_sessions_when_structured_view_is_off() {
