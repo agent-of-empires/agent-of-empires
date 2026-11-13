@@ -93,24 +93,33 @@ pub(super) fn account_key(row: &Instance) -> Option<String> {
 /// exists: the deepest existing ancestor is resolved and the missing tail appended, so a config
 /// root keys the same on the attempt that creates it and on every one after.
 pub(super) fn path_key(path: &std::path::Path) -> String {
-    let mut resolved = path.to_path_buf();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut deepest = path.to_path_buf();
     loop {
-        if let Ok(real) = std::fs::canonicalize(&resolved) {
-            let mut key = real;
-            for part in tail.iter().rev() {
-                key.push(part);
-            }
-            return key.to_string_lossy().into_owned();
+        if let Ok(real) = std::fs::canonicalize(&deepest) {
+            let tail = path
+                .strip_prefix(&deepest)
+                .unwrap_or(std::path::Path::new(""));
+            return fold_tail(real, tail).to_string_lossy().into_owned();
         }
-        let Some(name) = resolved.file_name().map(|name| name.to_os_string()) else {
-            return path.to_string_lossy().into_owned();
-        };
-        if !resolved.pop() {
-            return path.to_string_lossy().into_owned();
+        match deepest.parent() {
+            Some(parent) => deepest = parent.to_path_buf(),
+            None => return path.to_string_lossy().into_owned(),
         }
-        tail.push(name);
     }
+}
+
+/// Apply the unresolved tail to the resolved ancestor. Nothing there exists yet, so `..` can only
+/// cancel the component before it, the way `canonicalize` folds it once the path does exist.
+fn fold_tail(mut key: std::path::PathBuf, tail: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    for part in tail.components() {
+        match part {
+            Component::ParentDir => drop(key.pop()),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::Normal(name) => key.push(name),
+        }
+    }
+    key
 }
 
 /// The configured pool entries that run the same built-in agent as `row` and declare a config
@@ -778,6 +787,23 @@ mod tests {
             before,
             path_key(&root),
             "creating the root must not rekey the account"
+        );
+
+        let scope = real.join("scope");
+        std::fs::create_dir(&scope).unwrap();
+        let through_parent = scope.join("missing").join("..").join("account");
+        let before = path_key(&through_parent);
+        assert_eq!(
+            before,
+            path_key(&scope.join("account")),
+            "a `..` root names the directory it ends at"
+        );
+        std::fs::create_dir(scope.join("missing")).unwrap();
+        std::fs::create_dir(scope.join("account")).unwrap();
+        assert_eq!(
+            before,
+            path_key(&through_parent),
+            "creating the `..` root must not rekey the account"
         );
     }
 
