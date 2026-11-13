@@ -182,7 +182,7 @@ export function MobileMainPane({
                     serverReadOnly={readOnly}
                     isSandboxed={session.is_sandboxed}
                     recreateContainerTitle={
-                      !readOnly && canRecreateContainer(session, !!session.archived_at) ? session.title : undefined
+                      canRecreateContainer(session, !!session.archived_at) ? session.title : undefined
                     }
                     onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
                     onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}

@@ -135,8 +135,9 @@ export function StartupErrorScreen({ detail, sessionId, isSandboxed = false, rec
     testId: "startup-error-recreate-container",
     disabled: busy,
   };
-  // A new image can fix every kind of refusal, and a new container also starts a stopped one.
-  const canRecreate = sandboxed && !observer && recreateContainerTitle !== undefined;
+  // A new image can fix every kind of refusal, and a new container also starts a stopped one. Waits for
+  // install-info, which names read-only and CityHall dashboards the server would refuse.
+  const canRecreate = info?.sandboxed === true && !observer && recreateContainerTitle !== undefined;
   const secondary = [...(webInstall && !containerDown ? [checkAgain] : []), ...(canRecreate ? [recreate] : [])];
 
   return (

@@ -2162,9 +2162,7 @@ function AppContent({
                             serverReadOnly={caps.readOnly}
                             isSandboxed={session.is_sandboxed}
                             recreateContainerTitle={
-                              !caps.readOnly && canRecreateContainer(session, !!session.archived_at)
-                                ? session.title
-                                : undefined
+                              canRecreateContainer(session, !!session.archived_at) ? session.title : undefined
                             }
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
