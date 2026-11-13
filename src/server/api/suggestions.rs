@@ -355,8 +355,12 @@ pub async fn patch_suggestion_prefs(
 
 pub async fn prepare_suggestion(
     State(state): State<Arc<AppState>>,
-    Json(item): Json<ItemRef>,
+    body: Result<Json<ItemRef>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    let Json(item) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejection.into_response(),
+    };
     let Some(host) = state.plugin_host.clone() else {
         return unavailable();
     };
