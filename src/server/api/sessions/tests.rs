@@ -14705,6 +14705,7 @@ async fn project_sessions_resolves_profile_config_once_per_profile() {
     };
     let one = resolves_for(terminal_rows(1)).await;
     let five = resolves_for(terminal_rows(5)).await;
+    assert!(one >= 1, "the projection must resolve the row's profile");
     assert_eq!(one, five, "config resolves grew with row count");
 }
 
