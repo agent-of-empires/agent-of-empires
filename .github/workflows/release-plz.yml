@@ -66,13 +66,13 @@ jobs:
 
   release-pr:
     name: Update release PR
-    # Skip the release PR's own merge: its version is not tagged yet, and the next push
-    # opens the next release PR.
+    # Skip a push that lands the release PR, even mid-batch: its version is not tagged yet,
+    # and the next push opens the next release PR.
     if: >-
       github.repository == 'agent-of-empires/agent-of-empires' &&
       github.event_name != 'pull_request' &&
       github.ref == 'refs/heads/main' &&
-      !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: release v'))
+      !(github.event_name == 'push' && contains(toJSON(github.event.commits.*.message), 'chore: release v'))
     runs-on: ubuntu-latest
     # Never cancel: a cancelled run can leave the release PR half-updated.
     concurrency:
