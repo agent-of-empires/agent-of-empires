@@ -12,19 +12,12 @@ import {
 } from "../../lib/api";
 import type { SettingsFieldDescriptor, SuggestionProvider, SuggestionsSnapshot } from "../../lib/types";
 import { OFFLINE_TITLE, useServerDown } from "../../lib/connectionState";
+import { agoLabel } from "../../lib/suggestionTime";
 import { SectionHeader, SuggestionSwitch } from "./suggestionsShared";
 import { SuggestionTemplates, type TemplateFocus } from "./SuggestionTemplates";
 import { PluginSuggestionSettings } from "./PluginSettingsSections";
 
 const REFRESH_OPTIONS = [5, 15, 30, 60, 120];
-
-function ago(updatedAt: number): string {
-  const minutes = Math.max(0, Math.round((Date.now() / 1000 - updatedAt) / 60));
-  if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.round(minutes / 60);
-  return hours < 24 ? `${hours} h ago` : `${Math.round(hours / 24)} d ago`;
-}
 
 function Row({ title, description, children }: { title: ReactNode; description: string; children: ReactNode }) {
   return (
@@ -71,7 +64,7 @@ function ProviderRow({
     provider.status === "error" ? (
       <span className="text-status-error-text">Couldn&apos;t refresh: {provider.error ?? "provider error"}</span>
     ) : (
-      `Plugin${provider.updated_at ? ` · updated ${ago(provider.updated_at)}` : provider.status === "pending" ? " · waiting for first results" : ""}${provider.uses_agent ? " · uses an Agent to read the codebase, which uses your Agent's usage" : ""}`
+      `Plugin${provider.updated_at ? ` · updated ${agoLabel(provider.updated_at * 1000)}` : provider.status === "pending" ? " · waiting for first results" : ""}${provider.uses_agent ? " · uses an Agent to read the codebase, which uses your Agent's usage" : ""}`
     );
   return (
     <li
