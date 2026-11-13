@@ -746,6 +746,22 @@ fn link_port(url: &str) -> Option<u16> {
     link_authority(url)?.rsplit_once(':')?.1.parse().ok()
 }
 
+/// The Funnel state the view shows. Only a Tunnel has one. `serve.funnel` and `serve.url` are
+/// two writes, so a read between them can pair "ours" with the loopback-only URL; that is Unknown.
+fn shown_reach(mode: ServeMode, urls: &[ServeUrl], read: FunnelReach) -> FunnelReach {
+    if mode != ServeMode::Tunnel {
+        return FunnelReach::Ours;
+    }
+    let loopback_only = urls
+        .iter()
+        .all(|url| link_host(&url.url).is_some_and(is_loopback_host));
+    if read == FunnelReach::Ours && loopback_only {
+        FunnelReach::Unknown
+    } else {
+        read
+    }
+}
+
 /// Funnel serves the machine's stable `https://<host>.<tailnet>.ts.net` origin.
 fn is_funnel_link(url: &str) -> bool {
     link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
@@ -1729,11 +1745,7 @@ impl ServeView {
         if !observation.running || observation.urls.is_empty() {
             return false;
         }
-        let next = if *mode == ServeMode::Tunnel {
-            observation.funnel
-        } else {
-            FunnelReach::Ours
-        };
+        let next = shown_reach(*mode, &observation.urls, observation.funnel);
         let mut changed = std::mem::replace(funnel, next) != next;
         if observation.urls != *urls {
             let label = urls.get(*url_index).map(|url| url.label.clone());
@@ -1906,13 +1918,14 @@ impl ServeView {
                             .then_some(observation.passphrase)
                             .flatten()
                     });
+                    let funnel = shown_reach(*mode, &observation.urls, observation.funnel);
                     self.state = ServeViewState::Active {
                         mode: *mode,
                         transport: *transport,
                         urls: observation.urls,
                         url_index: 0,
                         passphrase,
-                        funnel: observation.funnel,
+                        funnel,
                         opened_at: Instant::now(),
                         log_offset: observation.log_offset,
                     };

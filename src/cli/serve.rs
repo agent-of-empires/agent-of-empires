@@ -1061,11 +1061,13 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
 }
 
 /// Whether the Tailscale daemon's Funnel still routes here, from `$APP_DIR/serve.funnel`.
+/// Only a missing file means ours; one that can't be read is Unknown.
 pub fn read_serve_funnel() -> crate::server::tunnel::FunnelReach {
-    let raw = launch_file("serve.funnel")
-        .ok()
-        .and_then(|file| file.read().ok().flatten());
-    crate::server::tunnel::FunnelReach::from_marker(raw.as_deref())
+    use crate::server::tunnel::FunnelReach;
+    match launch_file("serve.funnel").and_then(|file| file.read()) {
+        Ok(raw) => FunnelReach::from_marker(raw.as_deref()),
+        Err(_) => FunnelReach::Unknown,
+    }
 }
 
 /// The sentence Remote Access and `aoe serve --status` show while the Funnel URL is withdrawn.

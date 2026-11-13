@@ -2772,6 +2772,24 @@ fn active_rereads_urls_and_funnel_state_and_keeps_the_selection() {
         ("https://node.ts.net/?token=b".to_owned(), FunnelReach::Ours)
     );
 
+    // A read between the daemon's two writes: no marker yet, but the loopback-only URL.
+    std::fs::write(app.join("serve.url"), "http://127.0.0.1:8080/?token=b\n").unwrap();
+    reread(&mut view);
+    assert_eq!(selected(&view).1, FunnelReach::Unknown);
+
+    // A marker that exists but can't be read isn't taken as ours.
+    publish("b", None);
+    std::fs::create_dir(app.join("serve.funnel")).unwrap();
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        (
+            "https://node.ts.net/?token=b".to_owned(),
+            FunnelReach::Unknown
+        )
+    );
+    std::fs::remove_dir(app.join("serve.funnel")).unwrap();
+
     // Right after a re-read, ticks only observe the log until the interval passes.
     for _ in 0..50 {
         view.tick();
