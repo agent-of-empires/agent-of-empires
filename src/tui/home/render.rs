@@ -4531,16 +4531,7 @@ impl HomeView {
                 .as_ref()
                 .filter(|taken| self.selected_session.as_deref() == Some(taken.session_id.as_str()))
                 .map(|taken| taken.taker);
-            let live_key = takeover.map(|taker| {
-                let tab_is_live = self
-                    .selected_session
-                    .as_deref()
-                    .is_some_and(|id| self.tab_enters_live(id));
-                let (click, key) = if tab_is_live {
-                    (ktab, "Tab")
-                } else {
-                    (kenter, "↵")
-                };
+            let live_key = takeover.and_then(|taker| {
                 groups.push((
                     0,
                     None,
@@ -4549,8 +4540,13 @@ impl HomeView {
                         Style::default().fg(theme.text).bold(),
                     )],
                 ));
+                // No key hint where neither key enters live mode; the row's hints stay.
+                let (click, key) = match self.live_key(self.selected_session.as_deref()?)? {
+                    live_send::LiveKey::Tab => (ktab, "Tab"),
+                    live_send::LiveKey::Enter => (kenter, "↵"),
+                };
                 groups.push((0, click, mk(key, "take control")));
-                click
+                Some(click)
             });
             if let Some(enter_action_text) = enter_action_text {
                 // U+21B5 keeps Enter to one display cell without shortening its action label.

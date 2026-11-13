@@ -276,6 +276,14 @@ pub(in crate::tui) struct TakenLive {
     pub taker: LiveTakeover,
 }
 
+/// The key that enters live mode on a Session's row: Tab, or Enter under
+/// `default_attach_mode = LiveSend`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::tui) enum LiveKey {
+    Tab,
+    Enter,
+}
+
 /// Which kind of window took a Session's live control from this TUI, read from the
 /// size-owner id: the Web dashboard registers `live-*`, a TUI `tui-*`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

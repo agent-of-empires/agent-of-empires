@@ -6,6 +6,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::bindings::{self, ActionId};
+use super::live_send::LiveKey;
 use super::{
     live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
     TerminalMode, ViewMode,
@@ -3269,29 +3270,16 @@ impl HomeView {
                 if self.selected_is_trashed() {
                     return None;
                 }
+                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
-                if let Some(id) = self.selected_session.as_deref() {
-                    if matches!(self.view_mode, ViewMode::Structured)
-                        && self.get_instance(id).is_some_and(|i| i.is_structured())
-                    {
-                        return Some(Action::SetTransientStatus(
-                            "Structured sessions have no tmux pane; press Enter to open the structured view."
-                                .to_string(),
-                        ));
-                    }
+                if live_key == Some(None) {
+                    return Some(Action::SetTransientStatus(
+                        "Structured sessions have no tmux pane; press Enter to open the structured view."
+                            .to_string(),
+                    ));
                 }
-                let swap_to_attach = self
-                    .selected_session
-                    .as_deref()
-                    .map(|id| {
-                        matches!(
-                            self.default_attach_mode(id),
-                            Some(crate::session::AttachMode::LiveSend)
-                        )
-                    })
-                    .unwrap_or(false);
-                if swap_to_attach {
+                if live_key == Some(Some(LiveKey::Enter)) {
                     if let Some(action) = self.tab_attach_action() {
                         return Some(action);
                     }
@@ -6911,9 +6899,7 @@ impl HomeView {
             return None;
         }
         // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
-        if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
-            return None;
-        }
+        self.live_key(&id)?;
         // Pick the target from the pane being previewed: Structured view to the agent
         // pane, Terminal view to the paired host or container terminal so 'm'/Tab compose
         // against the shell on screen, Tool view to the named tool's pane.
@@ -7313,27 +7299,34 @@ impl HomeView {
     /// hidden that line never shows, so a flash says the same once.
     pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
         if !self.show_shortcut_bar {
-            let key = if self.tab_enters_live(&taken.session_id) {
-                "Tab"
-            } else {
-                "Enter"
-            };
-            self.flash_status(format!("{}: {key} to take it back", taken.taker.label()));
+            let label = taken.taker.label();
+            self.flash_status(match self.live_key(&taken.session_id) {
+                Some(LiveKey::Tab) => format!("{label}: Tab to take it back"),
+                Some(LiveKey::Enter) => format!("{label}: Enter to take it back"),
+                None => label.to_string(),
+            });
         }
         self.live_takeover = Some(taken);
     }
 
-    /// Whether Tab, not Enter, enters live mode on this Session's row (see the footer).
-    /// Only Structured view refuses a structured Session; its Terminal and Tool panes go live.
-    pub(super) fn tab_enters_live(&self, id: &str) -> bool {
-        !(matches!(self.view_mode, ViewMode::Structured)
+    /// The key that enters live mode on this Session's row, shared by Tab, `start_live_send`
+    /// and the takeover footer. None for a structured Session in Structured view, which has
+    /// no tmux pane there; its Terminal and Tool panes go live.
+    pub(super) fn live_key(&self, id: &str) -> Option<LiveKey> {
+        if matches!(self.view_mode, ViewMode::Structured)
             && self
                 .get_instance(id)
-                .is_some_and(|inst| inst.is_structured()))
-            && !matches!(
-                self.default_attach_mode(id),
-                Some(crate::session::AttachMode::LiveSend)
-            )
+                .is_some_and(|inst| inst.is_structured())
+        {
+            None
+        } else if matches!(
+            self.default_attach_mode(id),
+            Some(crate::session::AttachMode::LiveSend)
+        ) {
+            Some(LiveKey::Enter)
+        } else {
+            Some(LiveKey::Tab)
+        }
     }
 
     /// Open the shared permission-response dialog for the selected session.
