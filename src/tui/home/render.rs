@@ -1366,11 +1366,12 @@ impl HomeView {
             }
         }
         render_dialogs!(connections_view);
-        if self.snooze_duration_dialog.is_none() {
-            render_dialogs!(info_dialog);
-        }
+        // Under the info dialog: a refused resubmit reopens it beneath the refusal.
         if let Some((dialog, _)) = &mut self.create_hook_failed {
             dialog.render(frame, area, theme);
+        }
+        if self.snooze_duration_dialog.is_none() {
+            render_dialogs!(info_dialog);
         }
         render_dialogs!(snooze_duration_dialog);
         if self.snooze_duration_dialog.is_some() {

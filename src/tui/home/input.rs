@@ -1803,7 +1803,11 @@ impl HomeView {
             }
             return true;
         }
-        if let Some((dialog, _)) = &self.create_hook_failed {
+        if let Some((dialog, _)) = self
+            .create_hook_failed
+            .as_ref()
+            .filter(|_| self.info_dialog.is_none())
+        {
             if let Some(result) = dialog.handle_click(col, row) {
                 self.resolve_create_hook_failed(result);
             }

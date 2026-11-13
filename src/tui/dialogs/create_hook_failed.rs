@@ -28,6 +28,8 @@ pub struct CreateHookFailedDialog {
 const RETRY_LABEL: &str = "[Retry (r)]";
 const SKIP_LABEL: &str = "[Create without setup (s)]";
 const CANCEL_LABEL: &str = "[Cancel (Esc)]";
+const BUTTON_GAP: u16 = 3;
+const LABELS: [&str; 3] = [RETRY_LABEL, SKIP_LABEL, CANCEL_LABEL];
 const EXPLANATION: &str =
     "The session was not created. Retry once the hook is fixed, or create it without running on_create.";
 
@@ -104,8 +106,10 @@ impl CreateHookFailedDialog {
             rows.insert(0, format!("… {hidden} earlier lines hidden"));
         }
         let explanation_rows = super::info::wrap_to_width(EXPLANATION, text_width).len() as u16;
+        let button_rows = button_rows(text_width as u16);
         // The message, a gap, the explanation, a gap and the buttons, inside border and margin.
-        let dialog_height = (rows.len() as u16 + explanation_rows + 7).min(area.height);
+        let dialog_height =
+            (rows.len() as u16 + explanation_rows + 6 + button_rows).min(area.height);
         let block = super::toned_dialog_block(" Session setup failed ", theme.error, theme.error);
         let (_, inner) =
             super::render_dialog_frame(frame, area, dialog_width, dialog_height, block);
@@ -119,7 +123,7 @@ impl CreateHookFailedDialog {
                 Constraint::Length(1),
                 Constraint::Length(explanation_rows),
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(button_rows),
             ])
             .split(inner);
         let lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
@@ -141,32 +145,20 @@ impl CreateHookFailedDialog {
                 Style::default().fg(theme.dimmed)
             }
         };
-        let gap = 3u16;
-        let widths = [RETRY_LABEL, SKIP_LABEL, CANCEL_LABEL].map(|label| label.len() as u16);
-        let total = widths.iter().sum::<u16>() + 2 * gap;
-        let row = chunks[4];
-        if row.width >= total {
-            let x = row.x + (row.width - total) / 2;
-            self.retry_area = Rect::new(x, row.y, widths[0], 1);
-            self.skip_area = Rect::new(x + widths[0] + gap, row.y, widths[1], 1);
-            self.cancel_area = Rect::new(x + widths[0] + widths[1] + 2 * gap, row.y, widths[2], 1);
-        } else {
-            self.retry_area = Rect::default();
-            self.skip_area = Rect::default();
-            self.cancel_area = Rect::default();
+        [self.retry_area, self.skip_area, self.cancel_area] = button_rects(chunks[4]);
+        let styles = [
+            style(CreateHookFailedAction::Retry),
+            style(CreateHookFailedAction::CreateWithoutSetup),
+            Style::default().fg(theme.dimmed),
+        ];
+        for ((label, style), rect) in
+            LABELS
+                .into_iter()
+                .zip(styles)
+                .zip([self.retry_area, self.skip_area, self.cancel_area])
+        {
+            frame.render_widget(Paragraph::new(Span::styled(label, style)), rect);
         }
-        let spacer = " ".repeat(gap as usize);
-        let buttons = Line::from(vec![
-            Span::styled(RETRY_LABEL, style(CreateHookFailedAction::Retry)),
-            Span::raw(spacer.clone()),
-            Span::styled(
-                SKIP_LABEL,
-                style(CreateHookFailedAction::CreateWithoutSetup),
-            ),
-            Span::raw(spacer),
-            Span::styled(CANCEL_LABEL, Style::default().fg(theme.dimmed)),
-        ]);
-        frame.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), row);
 
         if let Some(rect) =
             self.hover
@@ -177,10 +169,98 @@ impl CreateHookFailedDialog {
     }
 }
 
+/// One row when the buttons fit side by side in `width`, else one row each.
+fn button_rows(width: u16) -> u16 {
+    let total = LABELS.iter().map(|label| label.len() as u16).sum::<u16>() + 2 * BUTTON_GAP;
+    if width >= total {
+        1
+    } else {
+        LABELS.len() as u16
+    }
+}
+
+/// Where Retry, Create without setup and Cancel are drawn in `row`, centred, and clipped
+/// to it. Rendering and clicks both read these.
+fn button_rects(row: Rect) -> [Rect; 3] {
+    let widths = LABELS.map(|label| label.len() as u16);
+    if button_rows(row.width) == 1 {
+        let total = widths.iter().sum::<u16>() + 2 * BUTTON_GAP;
+        let mut x = row.x + (row.width - total) / 2;
+        widths.map(|width| {
+            let rect = Rect::new(x, row.y, width, 1);
+            x += width + BUTTON_GAP;
+            rect.intersection(row)
+        })
+    } else {
+        let mut y = row.y;
+        widths.map(|width| {
+            let rect = Rect::new(row.x + row.width.saturating_sub(width) / 2, y, width, 1);
+            y += 1;
+            rect.intersection(row)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+
+    /// Each button is clicked where it's drawn: side by side when wide, stacked at 60
+    /// columns, where the row would otherwise be clipped.
+    #[test]
+    fn each_drawn_button_is_clickable_at_any_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = crate::tui::styles::load_theme("empire");
+        for (width, stacked) in [(100u16, false), (60, true)] {
+            let mut dialog = CreateHookFailedDialog::new("on_create hook failed: exit 1");
+            let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            terminal
+                .draw(|f| dialog.render(f, f.area(), &theme))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let lines: Vec<String> = (0..buf.area.height)
+                .map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect())
+                .collect();
+            let mut drawn_rows = Vec::new();
+            for (label, want) in [
+                (RETRY_LABEL, Some(CreateHookFailedAction::Retry)),
+                (SKIP_LABEL, Some(CreateHookFailedAction::CreateWithoutSetup)),
+                (CANCEL_LABEL, None),
+            ] {
+                let (row, col) = lines
+                    .iter()
+                    .enumerate()
+                    .find_map(|(y, line)| {
+                        let byte = line.find(label)?;
+                        Some((y as u16, line[..byte].chars().count() as u16))
+                    })
+                    .unwrap_or_else(|| panic!("{width}: {label} not drawn whole"));
+                drawn_rows.push(row);
+                let last = col + label.len() as u16 - 1;
+                for x in [col, last] {
+                    match (dialog.handle_click(x, row), want) {
+                        (Some(DialogResult::Submit(got)), Some(want)) => {
+                            assert_eq!(got, want, "{width}: {label} at {x}")
+                        }
+                        (Some(DialogResult::Cancel), None) => {}
+                        (got, _) => panic!("{width}: {label} at {x} gave {got:?}"),
+                    }
+                }
+                assert!(
+                    dialog.handle_click(last + 1, row).is_none(),
+                    "{width}: {label}"
+                );
+            }
+            drawn_rows.dedup();
+            assert_eq!(
+                drawn_rows.len() > 1,
+                stacked,
+                "{width}: rows {drawn_rows:?}"
+            );
+        }
+    }
 
     #[test]
     fn each_key_picks_one_choice() {

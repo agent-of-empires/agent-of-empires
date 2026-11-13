@@ -674,3 +674,76 @@ fn a_hook_failure_offers_retry_create_without_setup_or_cancel() {
         assert_eq!(second.trust_hooks, Some(true), "{case}: trust is kept");
     }
 }
+
+/// A resubmit refused before it is sent reopens the recovery dialog with the same request,
+/// beneath the refusal, so Retry still works once the cause clears.
+#[test]
+#[serial]
+fn a_refused_resubmit_keeps_the_recovery_dialog_and_its_request() {
+    use crate::tui::session_feed::CommandFailure;
+    for case in ["already pending", "daemon unavailable"] {
+        let CreationTestEnv {
+            mut view,
+            project_dir,
+            _guard,
+            _temp,
+        } = setup_creation_test_env();
+        let mut fail = view.session_feed.creation_failure_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
+        view.request_creation(
+            creation_data(&project_dir, "Hooked", "test"),
+            Some(true),
+            None,
+        );
+        let first = fail(CommandFailure::CreateHookFailed("exit 3".into()));
+        assert!(view.apply_creation_results().is_none());
+        assert!(view.create_hook_failed.is_some(), "{case}");
+        let kept_title = |view: &HomeView| {
+            view.create_hook_failed
+                .as_ref()
+                .map(|(_, request)| request.data.title.clone())
+        };
+
+        if case == "already pending" {
+            view.request_creation(creation_data(&project_dir, "Other", "test"), None, None);
+            assert!(view.is_creation_pending(), "{case}");
+            let stub = view.creating_stub_id.clone();
+            view.handle_key(key(KeyCode::Enter), None);
+            assert_eq!(kept_title(&view).as_deref(), Some("Hooked"), "{case}");
+            assert_eq!(
+                view.status_flash_text(),
+                Some("A session is already being created"),
+                "{case}"
+            );
+            assert_eq!(view.creating_stub_id, stub, "{case}: nothing new sent");
+            continue;
+        }
+
+        view.session_feed.set_mutation_permission_for_test(false);
+        view.handle_key(key(KeyCode::Char('s')), None);
+        assert!(view.creating_stub_id.is_none(), "{case}: nothing sent");
+        assert_eq!(kept_title(&view).as_deref(), Some("Hooked"), "{case}");
+        assert_eq!(
+            view.info_dialog.as_ref().map(|d| d.title()),
+            Some("Cannot Create Session"),
+            "{case}"
+        );
+        let screen = render_home_to_string(&mut view, 100, 30);
+        assert!(
+            screen.contains("The local daemon is unavailable"),
+            "{case}: the refusal is drawn on top\n{screen}"
+        );
+        // The refusal is read first, then the dialog takes keys again.
+        view.handle_key(key(KeyCode::Esc), None);
+        assert!(view.info_dialog.is_none(), "{case}");
+        assert_eq!(kept_title(&view).as_deref(), Some("Hooked"), "{case}");
+        view.session_feed.set_mutation_permission_for_test(true);
+        view.handle_key(key(KeyCode::Char('s')), None);
+        assert!(view.create_hook_failed.is_none(), "{case}");
+        let second = fail(CommandFailure::Rejected("done".into()));
+        assert!(second.skip_on_create, "{case}");
+        assert_ne!(second.idempotency_key, first.idempotency_key, "{case}");
+    }
+}

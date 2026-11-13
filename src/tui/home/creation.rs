@@ -14,7 +14,8 @@ impl HomeView {
         trust_hooks: Option<bool>,
         trust_review: Option<crate::daemon::CreationTrustFingerprint>,
     ) {
-        self.submit_creation(CreationRequest {
+        // The form shows its own refusal; only the recovery dialog keeps the request.
+        let _ = self.submit_creation(CreationRequest {
             data,
             trust_hooks,
             trust_review,
@@ -24,11 +25,14 @@ impl HomeView {
 
     /// Sends `request` under a new stub, whose id is also the idempotency key, so a resubmit
     /// after a refusal is never answered with the refused attempt's replay.
-    pub(super) fn submit_creation(&mut self, mut request: CreationRequest) {
+    pub(super) fn submit_creation(
+        &mut self,
+        mut request: CreationRequest,
+    ) -> Result<(), Box<CreationRequest>> {
         let data = &mut request.data;
         if self.pending_creation.is_some() {
             self.flash_status("A session is already being created");
-            return;
+            return Err(Box::new(request));
         }
         // The daemon owns the creation, so a disconnected runtime must refuse
         // before a placeholder claims a row that nothing will ever commit.
@@ -38,11 +42,11 @@ impl HomeView {
                 "Cannot Create Session",
                 "The local daemon is unavailable, so the session was not created.",
             ));
-            return;
+            return Err(Box::new(request));
         }
         let Some(origin_epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
             self.flash_status("Wait for the canonical runtime before creating a session");
-            return;
+            return Err(Box::new(request));
         };
         // Pre-resolve the title with the same logic the daemon's builder runs,
         // so the placeholder and the committed row agree (otherwise an empty
@@ -144,7 +148,7 @@ impl HomeView {
                 "Creation Failed",
                 &error.to_string(),
             ));
-            return;
+            return Err(Box::new(request));
         }
         self.pending_creation = Some(PendingCreation {
             request,
@@ -157,10 +161,12 @@ impl HomeView {
             confirmation: None,
             reload_retry_at: None,
         });
+        Ok(())
     }
 
     /// Retry and Create without setup resubmit the kept request; Cancel drops it, as the
-    /// daemon already rolled the failed attempt back.
+    /// daemon already rolled the failed attempt back. A resubmit refused before it is sent
+    /// reopens the dialog with the same request, under the refusal's message.
     pub(super) fn resolve_create_hook_failed(
         &mut self,
         result: DialogResult<CreateHookFailedAction>,
@@ -171,11 +177,13 @@ impl HomeView {
             }
             return;
         };
-        let Some((_, mut request)) = self.create_hook_failed.take() else {
+        let Some((dialog, mut request)) = self.create_hook_failed.take() else {
             return;
         };
         request.skip_on_create = action == CreateHookFailedAction::CreateWithoutSetup;
-        self.submit_creation(request);
+        if let Err(request) = self.submit_creation(request) {
+            self.create_hook_failed = Some((dialog, *request));
+        }
     }
 
     pub(super) fn bind_in_flight_creation(&mut self, rows: &[crate::daemon::SessionResponse]) {
