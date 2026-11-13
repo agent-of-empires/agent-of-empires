@@ -10,6 +10,7 @@ const EXACT_KEYS = new Set<string>([
   "aoe-sidebar-sort-mode",
   "aoe-sidebar-axis",
   "aoe-sidebar-sunk-expanded",
+  "aoe-sidebar-suggested-expanded",
   "aoe-repo-appearance-v1", // repo colors/aliases
   "aoe-repo-group-order-v1", // manual repo-group order
   "aoe-acp-last-tool", // last agent picked in the wizard
