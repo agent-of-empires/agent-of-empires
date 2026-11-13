@@ -71,22 +71,64 @@ fn resolved_yolo<'a>(
     }
 }
 
-/// Whether a declaration-derived argument appended to `command` would land on a
-/// shell operator instead of the agent, because the command is not a plain
-/// invocation. Every such argument is positional argv for the agent.
-fn declared_args_need_direct_launch(command: &str) -> bool {
-    aoe_plugin_api::agent_integration::direct_launch_words(command).is_none()
+/// The shell construct in `command` that would take an argument AoE appends, so
+/// the agent never receives it as argv.
+///
+/// Unlike `direct_launch_words`, which describes the output of executable
+/// discovery, anything the shell resolves before running the agent is fine here:
+/// a quoted path, `~`, `$HOME` or an escaped space all still name the agent. Only
+/// an operator, comment or substitution moves the appended argument elsewhere.
+fn shell_consumed_by(command: &str) -> Option<&'static str> {
+    #[derive(PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+    let mut quote = Quote::None;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => match c {
+                '"' => quote = Quote::None,
+                '\\' => drop(chars.next()),
+                _ => {}
+            },
+            Quote::None => match c {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '\\' => drop(chars.next()),
+                '|' => return Some("a pipe (`|`)"),
+                '&' => return Some("a chained command (`&`)"),
+                ';' => return Some("a second command (`;`)"),
+                '<' | '>' => return Some("a redirection"),
+                '#' => return Some("a comment (`#`)"),
+                '(' | ')' => return Some("a subshell"),
+                '`' => return Some("a command substitution"),
+                '\n' | '\r' => return Some("a line break"),
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
-/// Refuse an argument AoE appends for the agent when the command is not a plain
-/// invocation, because the shell would consume it before the agent sees it.
+/// Refuse an argument AoE appends for the agent when the shell would consume it,
+/// naming the construct so a declaration can be corrected.
 fn refuse_shell_consumed_argument(command: &str, argument: &str) -> Result<()> {
-    anyhow::ensure!(
-        !declared_args_need_direct_launch(command),
-        "`{}` is not a plain invocation, so the agent's {} would reach the shell instead of the agent; declare the bare agent invocation",
-        command,
-        argument
-    );
+    if let Some(construct) = shell_consumed_by(command) {
+        anyhow::bail!(
+            "`{}` contains {}, so the agent's {} would reach the shell instead of the agent; declare the bare agent invocation",
+            command,
+            construct,
+            argument
+        );
+    }
     Ok(())
 }
 
@@ -1361,12 +1403,12 @@ impl Instance {
                     )
                 });
 
-            let launch_cmd = self.freeze_native_invocation(
-                self.get_launch_command(),
-                execution,
-                None,
-                launch_context,
-            )?;
+            // The guard is about the text the user or declaration wrote, before
+            // AoE renders and pins it: quoting AoE adds for a model value or a
+            // program path is not a shell construct.
+            let supplied = self.get_launch_command();
+            let launch_cmd =
+                self.freeze_native_invocation(supplied.clone(), execution, None, launch_context)?;
             let base_cmd = if self.extra_args.is_empty() {
                 launch_cmd
             } else if self.command.is_empty() {
@@ -1385,7 +1427,7 @@ impl Instance {
             let mut tool_cmd = if self.is_yolo_mode() {
                 match yolo {
                     Some(crate::agents::YoloMode::CliFlag(flag)) => {
-                        refuse_shell_consumed_argument(&base_cmd, "mode flag")?;
+                        refuse_shell_consumed_argument(&supplied, "mode flag")?;
                         format!("{} {}", base_cmd, flag)
                     }
                     Some(crate::agents::YoloMode::EnvVar(..))
@@ -1403,7 +1445,7 @@ impl Instance {
                 .filter(|s| !s.is_empty())
             {
                 if let Some(flag_template) = agent.and_then(|a| a.instruction_flag) {
-                    refuse_shell_consumed_argument(&tool_cmd, "instruction flag")?;
+                    refuse_shell_consumed_argument(&supplied, "instruction flag")?;
                     let escaped = shell_escape(instruction);
                     let flag = flag_template.replace("{}", &escaped);
                     tool_cmd = format!("{} {}", tool_cmd, flag);
@@ -2028,6 +2070,45 @@ sandbox = "unsupported"
         );
     }
 
+    /// A packaged launch of a built-in agent appends the mode flag to a command
+    /// AoE rendered itself: `quote_model_value_in_args` quotes a value the shell
+    /// would otherwise read as a glob, and pinning may quote the program path.
+    /// That rendering is not a shell construct, so the launch must not be refused.
+    #[test]
+    #[serial_test::serial]
+    fn a_rendered_model_value_does_not_refuse_a_sandbox_mode_flag() {
+        use super::super::test_helpers::{
+            admit_sandbox_fixture, install_container_transport, test_sandbox, tool_instance,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_home(temp.path());
+        let _app = crate::session::test_support::isolate_app_dir_at(&temp.path().join("app"));
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = tool_instance("qwen", project.to_str().unwrap());
+        inst.sandbox_info = Some(test_sandbox("qwen-rendered", Some("/workspace/project")));
+        inst.extra_args = "--model opus[1m]".into();
+        inst.yolo_mode = true;
+        admit_sandbox_fixture(&inst);
+        let config = inst.build_container_config_for_test().unwrap();
+        let _transport = install_container_transport(temp.path(), "qwen-rendered", &config.volumes);
+        std::fs::copy(
+            temp.path().join("native-bin/prime-agent"),
+            temp.path().join("native-bin/qwen"),
+        )
+        .unwrap();
+
+        let prepared = inst
+            .prepare_launch_command(inst.conversation_state())
+            .expect("a built-in agent keeps its mode flag in a sandbox");
+        let command = prepared.command.unwrap();
+        assert!(
+            command.contains("--yolo"),
+            "the mode flag must be appended: {command}"
+        );
+    }
+
     /// The host launch appends the same declaration-derived arguments as the
     /// packaged one, and they are argv for the agent. A pipeline in the declared
     /// command would hand the mode flag to the shell, so the guard holds on the
@@ -2105,23 +2186,48 @@ sandbox = "unsupported"
         );
     }
 
+    /// An appended argument is argv for the agent unless the shell would route it
+    /// somewhere else. Quoting, `~` and `$HOME` name the agent, so they are not
+    /// refused; an operator, comment or substitution is, and the refusal names it.
     #[test]
-    fn declared_arguments_require_a_direct_agent_invocation() {
-        for (command, needs) in [
-            ("helper --verbose", false),
-            // A prefix stays inside the pipeline's first command.
-            ("TOKEN=local helper", false),
-            ("helper | tee /tmp/helper.log", true),
-            ("helper; echo done", true),
-            ("helper > /tmp/helper.log", true),
-            ("helper # trailing", true),
+    fn an_appended_argument_is_refused_only_where_the_shell_would_take_it() {
+        for command in [
+            "helper --verbose",
+            "TOKEN=local helper",
+            "~/bin/helper",
+            "$HOME/bin/helper",
+            "/opt/my tools/helper",
+            "'/opt/my tools/helper'",
+            "helper --model 'opus[1m]'",
         ] {
-            assert_eq!(
-                declared_args_need_direct_launch(command),
-                needs,
-                "{command}"
+            assert_eq!(shell_consumed_by(command), None, "{command}");
+        }
+        for (command, construct) in [
+            ("helper | tee /tmp/helper.log", "a pipe"),
+            ("helper; echo done", "a second command"),
+            ("helper && echo done", "a chained command"),
+            ("helper &", "a chained command"),
+            ("helper > /tmp/helper.log", "a redirection"),
+            ("helper < /tmp/input", "a redirection"),
+            ("helper # trailing", "a comment"),
+            ("$(which helper)", "a subshell"),
+            ("`which helper`", "a command substitution"),
+            ("helper\necho done", "a line break"),
+        ] {
+            let found = shell_consumed_by(command).unwrap_or_else(|| panic!("{command}"));
+            assert!(
+                found.contains(construct),
+                "{command} reports {found}, expected {construct}"
             );
         }
+        let plain = "helper".to_owned();
+        let error = refuse_shell_consumed_argument("helper | tee log", "mode flag").unwrap_err();
+        assert!(
+            error.to_string().contains("contains a pipe (`|`)"),
+            "{error}"
+        );
+        refuse_shell_consumed_argument("~/bin/helper", "mode flag").unwrap();
+        assert_eq!(plain, "helper", "a refused flag must not be appended");
     }
 
     #[test]

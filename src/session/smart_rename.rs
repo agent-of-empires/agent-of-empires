@@ -229,6 +229,8 @@ impl OneshotAgent {
     }
 }
 
+// `check_eligible_resolved` plus the plugin declarations; a params struct would
+// only add boilerplate to the two call sites and the unit tests.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_eligible_with_declarations(
     structured: bool,
