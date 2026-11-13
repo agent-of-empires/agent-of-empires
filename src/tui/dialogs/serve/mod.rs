@@ -25,6 +25,8 @@ use work::{run_job, Job, JobResult};
 
 const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
+/// How often the open provider screen re-checks its providers in the background.
+const PROVIDER_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum ServeAction {
     Stop(ServeStopRequest),
@@ -759,8 +761,9 @@ enum PendingJob {
     Providers {
         selected: Option<TunnelTransport>,
         failed: Option<TunnelTransport>,
-        refreshed: bool,
     },
+    /// The provider screen's background re-check; any key drops it.
+    ProvidersRefresh,
     Retry {
         failed: Option<TunnelTransport>,
         target: TuiControlTarget,
@@ -814,6 +817,8 @@ pub struct ServeView {
     stop_requested: bool,
     submitter: Submitter,
     pending: Option<PendingWork>,
+    /// When the provider screen last received provider statuses.
+    providers_checked_at: Option<Instant>,
     last_attempt: u64,
     target: Option<crate::cli::serve::TuiControlTarget>,
     control_error: Option<String>,
@@ -909,6 +914,7 @@ impl ServeView {
             stop_requested: false,
             submitter,
             pending: None,
+            providers_checked_at: None,
             last_attempt: 0,
             target: None,
             control_error: None,
@@ -1059,28 +1065,11 @@ impl ServeView {
             return false;
         };
         match &pending.kind {
-            PendingJob::Providers {
-                selected, failed, ..
-            } => {
-                let (selected, failed) = (*selected, *failed);
-                match code {
-                    KeyCode::Char('r' | 'R') => self.request(
-                        Job::Providers,
-                        PendingJob::Providers {
-                            selected,
-                            failed,
-                            refreshed: true,
-                        },
-                    ),
-                    KeyCode::Char('L') => self.request_picker(Some(ServeMode::Local)),
-                    _ => {}
-                }
-                true
-            }
+            PendingJob::Providers { .. } => true,
             PendingJob::Picker { .. } => {
                 let selected = match code {
-                    KeyCode::Char('L') | KeyCode::Left => Some(ServeMode::Local),
-                    KeyCode::Char('t' | 'T') | KeyCode::Right => Some(ServeMode::Tunnel),
+                    KeyCode::Left | KeyCode::Char('h') => Some(ServeMode::Local),
+                    KeyCode::Right | KeyCode::Char('l') => Some(ServeMode::Tunnel),
                     _ => return true,
                 };
                 self.request_picker(selected);
@@ -1110,6 +1099,12 @@ impl ServeView {
             | PendingJob::Reset
             | PendingJob::LaunchContext(_)
             | PendingJob::LaunchOutcome => true,
+            // A key restarts the interval, so typing never runs back-to-back checks.
+            PendingJob::ProvidersRefresh => {
+                self.pending = None;
+                self.providers_checked_at = Some(Instant::now());
+                false
+            }
             PendingJob::Passphrase
             | PendingJob::Starting
             | PendingJob::Active
@@ -1143,15 +1138,6 @@ impl ServeView {
                     other => other,
                 }
             }
-            KeyCode::Char('t' | 'T') => {
-                *selected = ServeMode::Tunnel;
-                return self.commit_mode();
-            }
-            // Lowercase `l` moves right, so capital `L` is the Local shortcut.
-            KeyCode::Char('L') => {
-                *selected = ServeMode::Local;
-                return self.commit_mode();
-            }
             KeyCode::Enter => return self.commit_mode(),
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
@@ -1180,7 +1166,6 @@ impl ServeView {
                     PendingJob::Providers {
                         selected: None,
                         failed: None,
-                        refreshed: false,
                     },
                 );
                 return ServeAction::Continue;
@@ -1220,17 +1205,6 @@ impl ServeView {
                 return self.commit_transport();
             }
             KeyCode::Enter => return self.commit_transport(),
-            KeyCode::Char('r' | 'R') => {
-                let selected = *selected;
-                self.request(
-                    Job::Providers,
-                    PendingJob::Providers {
-                        selected: Some(selected),
-                        failed: None,
-                        refreshed: true,
-                    },
-                );
-            }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
         }
@@ -1258,14 +1232,14 @@ impl ServeView {
                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
             }
             (TunnelTransport::Tailscale, TransportStatus::TimedOut, TransportStatus::Ready) => {
-                "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
+                "Tailscale didn't answer in time; checking again, or pick Cloudflare."
             }
             (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
-                "Tailscale didn't answer in time; press R to retry."
+                "Tailscale didn't answer in time; checking again."
             }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
             (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
-                "cloudflared isn't installed; press R to retry Tailscale."
+                "cloudflared isn't installed, and Tailscale didn't answer in time; checking again."
             }
             (TunnelTransport::Cloudflare, ..) => "cloudflared isn't installed; pick Tailscale.",
         };
@@ -1596,6 +1570,13 @@ impl ServeView {
         }
         if self.pending.is_none() && !self.launch_in_flight && !self.stop_requested {
             match self.state {
+                ServeViewState::Confirm { .. }
+                    if self
+                        .providers_checked_at
+                        .is_none_or(|at| at.elapsed() >= PROVIDER_REFRESH) =>
+                {
+                    self.request(Job::Providers, PendingJob::ProvidersRefresh);
+                }
                 ServeViewState::Starting {
                     mode, transport, ..
                 } => {
@@ -1650,6 +1631,11 @@ impl ServeView {
         transport: Option<TunnelTransport>,
         message: String,
     ) {
+        // A background re-check that fails leaves the screen as it is and tries again later.
+        if matches!(kind, PendingJob::ProvidersRefresh) {
+            self.providers_checked_at = Some(Instant::now());
+            return;
+        }
         if let PendingJob::Retry { target, .. } = kind {
             self.target = Some(target);
             self.fail_work(mode, transport, message);
@@ -1731,26 +1717,34 @@ impl ServeView {
                 self.pending_passphrase = passphrase
             }
             (
-                PendingJob::Providers {
-                    selected,
-                    failed,
-                    refreshed,
-                },
+                PendingJob::Providers { selected, failed },
                 JobResult::Providers(tailscale, cloudflare),
             ) => {
                 self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
+                self.providers_checked_at = Some(Instant::now());
+                if let (
+                    ServeViewState::Confirm {
+                        selected: current, ..
+                    },
+                    Some(selected),
+                ) = (&mut self.state, selected)
+                {
+                    *current = selected;
+                }
+            }
+            (
+                PendingJob::ProvidersRefresh,
+                JobResult::Providers(fresh_tailscale, fresh_cloudflare),
+            ) => {
                 if let ServeViewState::Confirm {
-                    selected: current,
-                    flash,
+                    tailscale,
+                    cloudflare,
                     ..
                 } = &mut self.state
                 {
-                    if let Some(selected) = selected {
-                        *current = selected;
-                    }
-                    if refreshed {
-                        *flash = Some(("Refreshed.".to_owned(), Instant::now()));
-                    }
+                    *tailscale = fresh_tailscale;
+                    *cloudflare = fresh_cloudflare;
+                    self.providers_checked_at = Some(Instant::now());
                 }
             }
             (
@@ -1763,6 +1757,7 @@ impl ServeView {
             ) => {
                 self.target = Some(target);
                 self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
+                self.providers_checked_at = Some(Instant::now());
             }
             (PendingJob::Reset, JobResult::Reset(result)) => {
                 let message = match result {

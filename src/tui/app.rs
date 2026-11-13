@@ -5471,7 +5471,7 @@ mod tests {
             };
             let mut view = if context == "preparation" {
                 let mut view = crate::tui::dialogs::ServeView::settled(&mut app.home.serve_jobs);
-                view.handle_key(KeyEvent::from(KeyCode::Char('L')));
+                view.handle_key(KeyEvent::from(KeyCode::Left));
                 view.handle_key(KeyEvent::from(KeyCode::Enter));
                 view
             } else {

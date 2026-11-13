@@ -277,8 +277,8 @@ fn render_mode_picker(
     ];
     for (card_area, title, mode, available, headline, body_lines, unavailable_note) in cards {
         let select = match mode {
-            ServeMode::Local => KeyCode::Char('h'),
-            ServeMode::Tunnel => KeyCode::Char('l'),
+            ServeMode::Local => KeyCode::Left,
+            ServeMode::Tunnel => KeyCode::Right,
         };
         mouse
             .keys
@@ -313,7 +313,7 @@ fn render_mode_picker(
     centered_line(
         frame,
         keys,
-        "[←/→] choose   [L] Local   [T] Tunnel   [Enter] confirm   [Esc] cancel",
+        "[←/→] choose  [Enter] continue  [Esc] cancel",
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
@@ -396,8 +396,8 @@ fn render_confirm(
     ];
     for (card_area, title, transport, status, body_lines, not_installed) in cards {
         let select = match transport {
-            TunnelTransport::Tailscale => KeyCode::Char('h'),
-            TunnelTransport::Cloudflare => KeyCode::Char('l'),
+            TunnelTransport::Tailscale => KeyCode::Left,
+            TunnelTransport::Cloudflare => KeyCode::Right,
         };
         mouse
             .keys
@@ -420,7 +420,7 @@ fn render_confirm(
             }
             TransportStatus::TimedOut => (
                 "\u{26A0}",
-                "Timed out, press R to retry",
+                "Timed out, checking again",
                 Style::default().fg(theme.waiting).bold(),
             ),
             TransportStatus::FunnelNotEnabled => (
@@ -445,7 +445,7 @@ fn render_confirm(
     centered_line(
         frame,
         keys,
-        "[←/→] select  [T] Tailscale  [C] Cloudflare  [R] refresh  [Enter] confirm  [Esc] cancel",
+        "[←/→] choose  [T] Tailscale  [C] Cloudflare  [Enter] start  [Esc] cancel",
         Style::default().fg(theme.dimmed),
     );
     record_hints(frame, mouse, keys);
@@ -1116,7 +1116,7 @@ mod tests {
                 }),
                 100,
             );
-            assert!(text(&buf).contains("Timed out, press R to retry"));
+            assert!(text(&buf).contains("Timed out, checking again"));
             let (x, y) = find(&buf, "Tailscale Funnel");
             assert_eq!(buf[(x, y)].fg, title_color, "{selected:?}");
         }
@@ -1560,27 +1560,64 @@ mod tests {
     }
 
     #[test]
-    fn a_card_click_selects_it_then_confirms_it() {
-        let mut view = view(ServeViewState::ModePicker {
+    fn card_clicks_select_by_arrow_then_confirm_and_footers_match_their_keys() {
+        let picker = ServeViewState::ModePicker {
             selected: ServeMode::Local,
             tunnel_available: true,
             local_available: true,
             flash: None,
-        });
-        let buf = draw(&view);
-        let (x, y) = crate::tui::dialogs::test_render::find(&buf, "Internet (HTTPS)");
-        assert_eq!(
-            view.handle_click(x, y).map(|k| k.code),
-            Some(KeyCode::Char('l'))
-        );
-        view.handle_key(KeyEvent::from(KeyCode::Char('l')));
-        draw(&view);
-        assert_eq!(
-            view.handle_click(x, y).map(|k| k.code),
-            Some(KeyCode::Enter)
-        );
-        let buf = draw(&view);
-        let (x, y) = crate::tui::dialogs::test_render::find(&buf, "[Esc] cancel");
-        assert_eq!(view.handle_click(x, y).map(|k| k.code), Some(KeyCode::Esc));
+        };
+        let providers = ServeViewState::Confirm {
+            selected: TunnelTransport::Cloudflare,
+            tailscale: TransportStatus::Ready,
+            cloudflare: TransportStatus::Ready,
+            flash: None,
+        };
+        for (state, card, arrow, footer, hints) in [
+            (
+                picker,
+                "Internet (HTTPS)",
+                KeyCode::Right,
+                "[←/→] choose  [Enter] continue  [Esc] cancel",
+                vec![("[Enter]", KeyCode::Enter), ("[Esc]", KeyCode::Esc)],
+            ),
+            (
+                providers,
+                "Tailscale Funnel",
+                KeyCode::Left,
+                "[←/→] choose  [T] Tailscale  [C] Cloudflare  [Enter] start  [Esc] cancel",
+                vec![
+                    ("[T]", KeyCode::Char('T')),
+                    ("[C]", KeyCode::Char('C')),
+                    ("[Enter]", KeyCode::Enter),
+                    ("[Esc]", KeyCode::Esc),
+                ],
+            ),
+        ] {
+            let mut view = view(state);
+            let buf = draw(&view);
+            crate::tui::dialogs::test_render::find(&buf, footer);
+            for (hint, code) in hints {
+                let (x, y) = crate::tui::dialogs::test_render::find(&buf, hint);
+                assert_eq!(
+                    view.handle_click(x, y).map(|k| k.code),
+                    Some(code),
+                    "{hint}"
+                );
+            }
+            let (x, y) = crate::tui::dialogs::test_render::find(&buf, card);
+            assert_eq!(
+                view.handle_click(x, y).map(|k| k.code),
+                Some(arrow),
+                "{card}"
+            );
+            view.handle_key(KeyEvent::from(arrow));
+            draw(&view);
+            assert_eq!(
+                view.handle_click(x, y).map(|k| k.code),
+                Some(KeyCode::Enter),
+                "{card}"
+            );
+        }
     }
 }
