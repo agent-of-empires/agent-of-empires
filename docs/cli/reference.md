@@ -238,6 +238,7 @@ Add a new session
 * `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
+* `--skip-on-create` — Create the session without running its on_create hooks, so a failing setup script does not roll the session back. on_launch hooks still run
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter

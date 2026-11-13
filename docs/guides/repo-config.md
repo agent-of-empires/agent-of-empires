@@ -13,7 +13,7 @@ on_launch  = "npm install"                   # a single command may be a string
 on_destroy = ["docker-compose down"]
 ```
 
-- **`on_create`** runs once, when the session is first created. A failing command aborts creation, so use it for one-time setup.
+- **`on_create`** runs once, when the session is first created. A failing command aborts creation and rolls the session back, so use it for one-time setup. To keep the session anyway, rerun with `aoe add --skip-on-create`: no `on_create` hook runs, `on_launch` still does, and the session is marked as created without setup.
 - **`on_launch`** runs on every start, including restarts. Failures are logged as warnings and do not prevent a user-initiated start, though during startup recovery a timed-out hook marks the recovered session as errored rather than launching with partial setup.
 
 Native starts release their API locks while pre-launch hooks run, so hooks can call the daemon. The session keeps its lifecycle reservation: a competing start or stop returns a conflict rather than taking ownership. The launcher revalidates that reservation after the hook, before spawning the agent.
