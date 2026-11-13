@@ -624,6 +624,18 @@ fn handoff_context(
     }
 }
 
+/// Whether driving a persisted handoff gives the caller what it asked for. No choice drives any.
+fn pending_handoff_honours(
+    context: &HandoffContext,
+    conversation: Option<TerminalConversation>,
+) -> bool {
+    match conversation {
+        None => true,
+        Some(TerminalConversation::Continue) => matches!(context, HandoffContext::Keep { .. }),
+        Some(TerminalConversation::Fresh) => matches!(context, HandoffContext::Discard),
+    }
+}
+
 async fn terminal_plan(
     state: &Arc<AppState>,
     id: &str,
@@ -854,6 +866,7 @@ fn reserve_handoff_in(
     native: NativeHandoffStore,
     expected: &Instance,
     context: HandoffContext,
+    fresh: bool,
     source_event_seq: u64,
     state: Arc<AppState>,
     driver: Arc<crate::session::TerminalHandoffDriver>,
@@ -954,7 +967,7 @@ fn reserve_handoff_in(
             source_conversation: row.conversation_state(),
             runner,
             unborn_fence,
-            terminal: None,
+            terminal: fresh.then(|| fresh_terminal_target(row.conversation_state())),
             launch_required: row.ensure_startable().is_ok(),
             launch_started: false,
             launch: None,
@@ -965,6 +978,15 @@ fn reserve_handoff_in(
         })
     })?;
     Ok(owner)
+}
+
+/// A chosen fresh start keeps the row and resumes nothing, like `set-session-id SESSION ""`.
+fn fresh_terminal_target(
+    mut state: crate::session::ConversationState,
+) -> crate::session::ConversationState {
+    state.intent = ResumeIntent::Cleared;
+    state.resume_binding = None;
+    state
 }
 
 fn record_retired_handoff_in(
@@ -1014,6 +1036,7 @@ fn record_retired_handoff_in(
                 }
             }
             TerminalHandoffContext::Discard => {
+                let chosen_fresh = intent.terminal.is_some();
                 if row.terminal_rebind_pending {
                     let tool = row
                         .agent_name
@@ -1035,7 +1058,13 @@ fn record_retired_handoff_in(
                         Some(yolo),
                     );
                 }
-                Some(row.conversation_state())
+                // Reservation records a chosen `fresh`; rebuild it from the retired row.
+                let terminal = row.conversation_state();
+                Some(if chosen_fresh {
+                    fresh_terminal_target(terminal)
+                } else {
+                    terminal
+                })
             }
         };
         intent.ensure_original_stopped(session_id)?;
@@ -1221,7 +1250,20 @@ async fn terminal_handoff_request(
         drop(exclusion);
         return view_response(&state, id, View::Terminal).await;
     }
-    let (key, owner) = if durable.terminal_handoff.is_some() {
+    let (key, owner) = if let Some(pending) = durable.terminal_handoff.as_ref() {
+        // The pending switch's retirement may already be durable, so a different choice is refused, not adopted.
+        if !pending_handoff_honours(&pending.context, conversation) {
+            let in_flight = match pending.context {
+                HandoffContext::Keep { .. } => "keeps the conversation",
+                HandoffContext::Discard => "starts a new conversation",
+            };
+            return crate::server::api::api_error_with_code_header(
+                crate::daemon::ApiErrorCode::TerminalSwitchRefused(
+                    TerminalSwitchReason::HandoffPending,
+                ),
+                format!("A switch that {in_flight} is already finishing; it completes on its own"),
+            );
+        }
         let key = match handoff_key(&durable) {
             Ok(key) => key,
             Err(error) => return handoff_unavailable(&error),
@@ -1245,6 +1287,7 @@ async fn terminal_handoff_request(
             Ok(context) => context,
             Err(reason) => return terminal_refusal(reason, &agent),
         };
+        let fresh = conversation == Some(TerminalConversation::Fresh);
         let reserve_state = state.clone();
         let reserve_driver = driver.clone();
         let reserved = tokio::task::spawn_blocking(move || {
@@ -1252,6 +1295,7 @@ async fn terminal_handoff_request(
                 native,
                 &instance,
                 context,
+                fresh,
                 source_event_seq,
                 reserve_state,
                 reserve_driver,
@@ -2909,6 +2953,7 @@ mod tests {
                 native,
                 &expected,
                 HandoffContext::Discard,
+                false,
                 floor,
                 reserve_state,
                 driver,
@@ -4043,7 +4088,11 @@ mod tests {
             terminal_switch_conversation(br#"{"conversation":"fresh"}"#).unwrap(),
             Some(TerminalConversation::Fresh)
         );
-        for invalid in [&b"{"[..], br#"{"conversation":"resume"}"#] {
+        for invalid in [
+            &b"{"[..],
+            br#"{"conversation":"resume"}"#,
+            br#"{"convesation":"fresh"}"#,
+        ] {
             let refused = terminal_switch_conversation(invalid).unwrap_err();
             assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
         }
@@ -4095,9 +4144,99 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_pending_handoff_is_driven_only_for_a_matching_or_absent_choice() {
+        use TerminalConversation::{Continue, Fresh};
+        let keep = HandoffContext::Keep {
+            native_store: asserted_claude_binding("sid", "/tmp")
+                .execution
+                .expect("asserted binding has an execution"),
+        };
+        let discard = HandoffContext::Discard;
+        for (context, conversation, honoured) in [
+            (&keep, None, true),
+            (&keep, Some(Continue), true),
+            (&keep, Some(Fresh), false),
+            (&discard, None, true),
+            (&discard, Some(Fresh), true),
+            (&discard, Some(Continue), false),
+        ] {
+            assert_eq!(
+                pending_handoff_honours(context, conversation),
+                honoured,
+                "{context:?} {conversation:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
-    async fn fresh_switches_an_unbound_conversation_to_terminal_view() -> anyhow::Result<()> {
+    async fn a_choice_that_contradicts_a_pending_handoff_is_refused() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let project = tempfile::tempdir()?;
+        let path = project.path().to_str().unwrap();
+        let mut discarding = structured_claude_row("pending discard", path, Some("sid-discard"));
+        discarding.terminal_handoff = Some(Box::new(
+            crate::session::test_support::launch_owed_handoff(&discarding),
+        ));
+        let mut keeping = structured_claude_row("pending keep", path, Some("sid-keep"));
+        let mut kept = crate::session::test_support::launch_owed_handoff(&keeping);
+        kept.context = HandoffContext::Keep {
+            native_store: asserted_claude_binding("sid-keep", path)
+                .execution
+                .expect("asserted binding has an execution"),
+        };
+        keeping.terminal_handoff = Some(Box::new(kept));
+        let rows = vec![discarding, keeping];
+        crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
+        let state = crate::server::test_support::build_test_app_state(rows.clone());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+
+        for (row, body) in rows.iter().zip([
+            &br#"{"conversation":"continue"}"#[..],
+            br#"{"conversation":"fresh"}"#,
+        ]) {
+            let response = acp_disable(
+                State(state.clone()),
+                Path(row.id.clone()),
+                axum::body::Bytes::from_static(body),
+            )
+            .await
+            .into_response();
+            let (status, json) = response_json(response).await?;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{}: {json}",
+                row.title
+            );
+            assert_eq!(json["error"], "handoff_pending", "{}", row.title);
+            // A drive that fails also answers handoff_pending; only the refusal names the pending switch.
+            assert!(
+                json["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("already finishing")),
+                "{}: {json}",
+                row.title
+            );
+            let stored = crate::session::Storage::open_unwatched("default")?.load()?;
+            let stored = stored.iter().find(|r| r.id == row.id).unwrap();
+            let held = |r: &Instance| r.terminal_handoff.as_ref().map(|h| (h.id, h.stage));
+            assert_eq!(held(stored), held(row), "{}", row.title);
+            assert_eq!(stored.view, View::Structured, "{}", row.title);
+            // The refusal releases its driver, so the reconciler's maintenance recovery can finish it.
+            assert!(
+                crate::session::try_acquire_terminal_handoff_driver(&row.id)?.is_some(),
+                "{}",
+                row.title
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_chosen_fresh_switch_never_resumes_even_when_recovered() -> anyhow::Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
@@ -4113,27 +4252,111 @@ mod tests {
                 .insert("claude".into(), "60".into());
         })?;
         let project = tempfile::tempdir()?;
-        let row = structured_claude_row("fresh", project.path().to_str().unwrap(), Some("sid-old"));
-        let _pane = crate::tmux::test_helpers::TmuxTestSession::from_name(
-            crate::tmux::Session::generate_name(&row.id, &row.title),
+        let path = project.path().to_str().unwrap();
+        let realistic = |title: &str, sid: &str| {
+            let mut row = structured_claude_row(title, path, Some(sid));
+            row.agent_session_id = Some(sid.into());
+            row
+        };
+        let unbound = realistic("fresh unbound", "sid-unbound");
+        let bind = |mut row: Instance, sid: &str| {
+            row.resume_intent = ResumeIntent::Use(sid.into());
+            row.resume_binding = Some(asserted_claude_binding(sid, path));
+            row
+        };
+        let bound = bind(realistic("fresh bound", "sid-bound"), "sid-bound");
+        let recovered = bind(
+            realistic("fresh recovered", "sid-recovered"),
+            "sid-recovered",
         );
-        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
-        let state = crate::server::test_support::build_test_app_state(vec![row.clone()]);
+        // No body keeps the pre-choice behaviour: a leftover resume target still resumes.
+        let mut leftover = bind(
+            structured_claude_row("leftover intent", path, None),
+            "sid-leftover",
+        );
+        leftover.agent_session_id = Some("sid-leftover".into());
+        let rows = vec![unbound, bound, leftover, recovered.clone()];
+        let _panes: Vec<_> = rows
+            .iter()
+            .map(|row| {
+                crate::tmux::test_helpers::TmuxTestSession::from_name(
+                    crate::tmux::Session::generate_name(&row.id, &row.title),
+                )
+            })
+            .collect();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", rows.clone());
+        let state = crate::server::test_support::build_test_app_state(rows.clone());
         crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let stored = |row: &Instance| -> anyhow::Result<Instance> {
+            let rows = crate::session::Storage::open_unwatched("default")?.load()?;
+            Ok(rows.into_iter().find(|r| r.id == row.id).unwrap())
+        };
+        // A fresh launch mints its own id; keeping the old one means it resumed.
+        let assert_launched =
+            |row: &Instance, old_sid: &str, resumed: bool| -> anyhow::Result<()> {
+                let stored = stored(row)?;
+                assert_eq!(stored.view, View::Terminal, "{}", row.title);
+                assert!(stored.terminal_handoff.is_none(), "{}", row.title);
+                assert_eq!(
+                    stored.agent_session_id.as_deref() == Some(old_sid),
+                    resumed,
+                    "{}: {:?}",
+                    row.title,
+                    stored.agent_session_id
+                );
+                assert!(stored.agent_session_id.is_some(), "{}", row.title);
+                assert_eq!(stored.resume_intent, ResumeIntent::Default, "{}", row.title);
+                assert!(stored.resume_binding.is_none(), "{}", row.title);
+                Ok(())
+            };
 
-        let response = acp_disable(
-            State(state.clone()),
-            Path(row.id.clone()),
-            axum::body::Bytes::from_static(br#"{"conversation":"fresh"}"#),
-        )
-        .await
-        .into_response();
+        let fresh_body = &br#"{"conversation":"fresh"}"#[..];
+        for (row, (old_sid, before, body, resumed)) in rows.iter().zip([
+            ("sid-unbound", "starts_fresh", fresh_body, false),
+            ("sid-bound", "continues", fresh_body, false),
+            ("sid-leftover", "starts_fresh", &b""[..], true),
+        ]) {
+            let checked = acp_terminal_check(State(state.clone()), Path(row.id.clone())).await;
+            assert_eq!(
+                response_json(checked).await?.1["context"],
+                before,
+                "{}",
+                row.title
+            );
+            let response = acp_disable(
+                State(state.clone()),
+                Path(row.id.clone()),
+                axum::body::Bytes::from_static(body),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::OK, "{}", row.title);
+            assert_launched(row, old_sid, resumed)?;
+        }
 
-        assert_eq!(response.status(), StatusCode::OK);
-        let stored = crate::session::Storage::open_unwatched("default")?.load()?;
-        let stored = stored.iter().find(|r| r.id == row.id).unwrap();
-        assert_eq!(stored.view, View::Terminal);
-        assert_ne!(stored.resume_intent, ResumeIntent::Use("sid-old".into()));
+        // A durable fresh choice survives a reservation that no request drives.
+        let (native, expected) = load_handoff_row(&state, "default", &recovered.id).await?;
+        let driver =
+            Arc::new(crate::session::try_acquire_terminal_handoff_driver(&recovered.id)?.unwrap());
+        let floor = state.acp_event_store.highest_seq_checked(&recovered.id)?;
+        let reserve_state = state.clone();
+        drop(
+            tokio::task::spawn_blocking(move || {
+                reserve_handoff_in(
+                    native,
+                    &expected,
+                    HandoffContext::Discard,
+                    true,
+                    floor,
+                    reserve_state,
+                    driver,
+                )
+            })
+            .await??,
+        );
+        assert!(stored(&recovered)?.terminal_handoff.is_some());
+        recover_pending_terminal_handoffs(&state, HandoffRecovery::Maintenance).await;
+        assert_launched(&recovered, "sid-recovered", false)?;
         Ok(())
     }
 }

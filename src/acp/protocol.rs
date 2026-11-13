@@ -347,6 +347,7 @@ pub enum TerminalConversation {
 /// continues when it can, starts fresh for an Agent or Session with nothing to
 /// carry, and refuses an unbound conversation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalSwitchRequest {
     #[serde(default)]
     pub conversation: Option<TerminalConversation>,
