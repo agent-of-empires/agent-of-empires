@@ -3929,4 +3929,25 @@ fn runtime_change_dialog_is_promoted_only_before_a_draw() {
         Some("Runtime change")
     );
     assert!(env.view.runtime_outcome_messages.is_empty());
+
+    // A dialog that already owns the keyboard holds the note back, and the note
+    // survives until that dialog closes.
+    env.view.info_dialog = None;
+    env.view
+        .record_runtime_message("Reveal cancelled: still open".to_string());
+    env.view.confirm_dialog = Some(crate::tui::home::ConfirmDialog::new(
+        "Delete",
+        "Delete it?",
+        "delete",
+    ));
+    env.view.apply_session_feed();
+    assert!(env.view.info_dialog.is_none());
+    assert_eq!(env.view.runtime_outcome_messages.len(), 1);
+    env.view.confirm_dialog = None;
+    env.view.apply_session_feed();
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(|dialog| dialog.title()),
+        Some("Runtime change"),
+        "the note was held, not dropped"
+    );
 }
