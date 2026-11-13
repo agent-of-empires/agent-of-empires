@@ -1,15 +1,16 @@
 name: Release-plz
 
-# Tags `vX.Y.Z` when the release PR merges, and refreshes that PR daily or on dispatch;
-# release.yml takes it from the tag. Config: release-plz.toml. RELEASE_TOKEN is required
+# Tags `vX.Y.Z` when the release PR merges, and refreshes that PR on every push to main;
+# release.yml takes it from the tag. CI skips release PRs; the merge queue tests them. Config: release-plz.toml. RELEASE_TOKEN is required
 # because pushes and PRs made with GITHUB_TOKEN start no workflows (neither CI on the PR
 # nor release.yml on the tag).
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [closed]
     branches: [main]
-  # Not on push: every refresh force-pushes the release PR and dismisses its approvals.
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
@@ -65,10 +66,13 @@ jobs:
 
   release-pr:
     name: Update release PR
+    # Skip the release PR's own merge: its version is not tagged yet, and the next push
+    # opens the next release PR.
     if: >-
       github.repository == 'agent-of-empires/agent-of-empires' &&
       github.event_name != 'pull_request' &&
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' &&
+      !(github.event_name == 'push' && startsWith(github.event.head_commit.message, 'chore: release v'))
     runs-on: ubuntu-latest
     # Never cancel: a cancelled run can leave the release PR half-updated.
     concurrency:
