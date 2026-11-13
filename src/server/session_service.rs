@@ -90,6 +90,9 @@ type Undo = Box<dyn FnOnce(&mut crate::session::Instance) + Send>;
 struct MirroredFields {
     /// The mutation cleared `pending_initial_turn`, so the disk row must drop it in the same write.
     pending_turn_cleared: bool,
+    /// `(lifecycle_generation, text, error)` of a failed pending turn; applied
+    /// only to a disk row of the same launch and turn.
+    pending_turn_failure: Option<(u64, String, String)>,
     queued_prompts: Vec<crate::daemon::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
@@ -1169,7 +1172,7 @@ impl SessionService {
                 Some((current, current_text))
                     if same_terminal_turn(&current, &current_text, &instance, &text) =>
                 {
-                    self.report_undelivered_turn(id, &text, &error).await;
+                    self.report_undelivered_turn(&instance, &text, &error).await;
                     false
                 }
                 Some(_) => true,
@@ -1193,22 +1196,23 @@ impl SessionService {
             return false;
         }
         let typed = text.clone();
+        let target = current.clone();
         let delivered = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             anyhow::ensure!(
-                crate::server::api::sessions::ready_agent_session_for_automatic_input(&current)?
+                crate::server::api::sessions::ready_agent_session_for_automatic_input(&target)?
                     .is_some(),
                 "the agent is no longer running"
             );
-            current
+            target
                 .tmux_session()?
-                .send_keys_with_delay(&typed, crate::agents::send_keys_enter_delay(&current.tool))
+                .send_keys_with_delay(&typed, crate::agents::send_keys_enter_delay(&target.tool))
         })
         .await
         .map_err(anyhow::Error::from)
         .and_then(|result| result);
         match delivered {
             Ok(()) => self.clear_pending_initial_turn(id).await,
-            Err(error) => self.report_undelivered_turn(id, &text, &error).await,
+            Err(error) => self.report_undelivered_turn(&current, &text, &error).await,
         }
         false
     }
@@ -1235,62 +1239,47 @@ impl SessionService {
 
     async fn report_undelivered_turn(
         self: &Arc<Self>,
-        id: &str,
+        waited: &Instance,
         text: &str,
         error: &anyhow::Error,
     ) {
         tracing::warn!(
             target: "tmux.command",
-            session = %id,
+            session = %waited.id,
             error = %error,
             "initial prompt not delivered"
         );
-        self.fail_pending_initial_turn(id, text, error.to_string())
+        self.fail_pending_initial_turn(waited, text, error.to_string())
             .await;
     }
 
-    /// Keep the pending turn but mark it undelivered, in memory and on disk.
-    async fn fail_pending_initial_turn(self: &Arc<Self>, id: &str, text: &str, reason: String) {
-        let profile = {
-            let mut instances = self.instances.write().await;
-            match instances.iter_mut().find(|i| i.id == id) {
-                Some(inst) => match inst.pending_initial_turn.as_mut() {
-                    Some(turn) if turn.text == text => {
-                        turn.error = Some(reason.clone());
-                        self.invalidate_disk_snapshots();
-                        inst.source_profile.clone()
-                    }
-                    _ => return,
-                },
-                None => return,
-            }
-        };
-        let persisted = match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let text = text.to_string();
-                tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(turn) = instances
-                            .iter_mut()
-                            .find(|i| i.id == id_persist)
-                            .and_then(|i| i.pending_initial_turn.as_mut())
-                            .filter(|turn| turn.text == text)
-                        {
-                            turn.error = Some(reason);
-                        }
-                        Ok(())
-                    })
-                })
-                .await
-                .is_ok_and(|result| result.is_ok())
-            }
-            Err(_) => false,
-        };
-        if !persisted {
+    /// Mark the turn undelivered, in memory and on disk, only while the row is
+    /// still the launch and turn that was waited on.
+    async fn fail_pending_initial_turn(
+        self: &Arc<Self>,
+        waited: &Instance,
+        text: &str,
+        reason: String,
+    ) {
+        let (waited, text) = (waited.clone(), text.to_string());
+        let outcome = self
+            .mutate_instance_persisted_with(&waited.id.clone(), false, move |inst| {
+                let same = inst.lifecycle_generation == waited.lifecycle_generation
+                    && inst.title == waited.title
+                    && inst.tool == waited.tool;
+                if let Some(turn) = inst
+                    .pending_initial_turn
+                    .as_mut()
+                    .filter(|turn| same && turn.text == text)
+                {
+                    turn.error = Some(reason);
+                }
+                ((), None)
+            })
+            .await;
+        if matches!(outcome, Some(((), false))) {
             tracing::warn!(
                 target: "tmux.command",
-                session = %id,
                 "failed to persist initial prompt error; a daemon restart retries the prompt"
             );
         }
@@ -1625,6 +1614,10 @@ impl SessionService {
                 undo,
                 MirroredFields {
                     pending_turn_cleared: clear_pending_turn_on_disk,
+                    pending_turn_failure: inst.pending_initial_turn.as_ref().and_then(|turn| {
+                        let error = turn.error.clone()?;
+                        Some((inst.lifecycle_generation, turn.text.clone(), error))
+                    }),
                     queued_prompts: inst.queued_prompts.clone(),
                     queued_prompt_next_seq: inst.queued_prompt_next_seq,
                     idle_dormant_since: inst.idle_dormant_since,
@@ -1645,6 +1638,18 @@ impl SessionService {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
                             if mirrored.pending_turn_cleared {
                                 inst.pending_initial_turn = None;
+                            }
+                            if let Some((generation, text, error)) = mirrored.pending_turn_failure
+                            {
+                                if inst.lifecycle_generation == generation {
+                                    if let Some(turn) = inst
+                                        .pending_initial_turn
+                                        .as_mut()
+                                        .filter(|turn| turn.text == text)
+                                    {
+                                        turn.error = Some(error);
+                                    }
+                                }
                             }
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
@@ -4159,6 +4164,87 @@ mod tests {
             .await
             .expect("turn is kept");
         assert!(turn.error.is_none());
+    }
+
+    fn disk_turn(profile: &str, id: &str) -> Option<crate::session::PendingInitialTurn> {
+        let (rows, _groups) = crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load_with_groups()
+            .expect("load");
+        rows.into_iter()
+            .find(|i| i.id == id)
+            .and_then(|i| i.pending_initial_turn)
+    }
+
+    /// A launch replaced after the wait was inspected, but before the error
+    /// is applied, keeps its turn clean in memory and on disk.
+    #[tokio::test]
+    async fn a_failure_is_fenced_to_the_waited_launch() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let waited = terminal_turn_instance("sess-fence", "term-fence", "same");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &waited.source_profile,
+            vec![waited.clone()],
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![waited.clone()])
+            .session_service
+            .clone();
+        service.instances.write().await[0].lifecycle_generation += 1;
+
+        service
+            .fail_pending_initial_turn(&waited, "same", "stale failure".to_string())
+            .await;
+
+        assert!(pending_turn(&service, "sess-fence")
+            .await
+            .unwrap()
+            .error
+            .is_none());
+        assert!(disk_turn(&waited.source_profile, "sess-fence")
+            .unwrap()
+            .error
+            .is_none());
+    }
+
+    /// The failure write holds the reload gate through persistence, so a
+    /// reload cannot sample the old disk row and overwrite the error.
+    #[tokio::test]
+    async fn a_failure_write_excludes_reload_until_persisted() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let waited = terminal_turn_instance("sess-gate", "term-gate", "turn");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &waited.source_profile,
+            vec![waited.clone()],
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![waited.clone()])
+            .session_service
+            .clone();
+
+        let reload = service.disk_reload_guard().await;
+        let mut failing =
+            Box::pin(service.fail_pending_initial_turn(&waited, "turn", "wait failed".to_string()));
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut failing).await;
+        assert!(blocked.is_err(), "the write must wait for the reload");
+        assert!(pending_turn(&service, "sess-gate")
+            .await
+            .unwrap()
+            .error
+            .is_none());
+
+        drop(reload);
+        failing.await;
+        let error = Some("wait failed".to_string());
+        assert_eq!(
+            pending_turn(&service, "sess-gate").await.unwrap().error,
+            error
+        );
+        assert_eq!(
+            disk_turn(&waited.source_profile, "sess-gate")
+                .unwrap()
+                .error,
+            error
+        );
     }
 
     /// A user message supersedes an undelivered initial turn: the drain that
