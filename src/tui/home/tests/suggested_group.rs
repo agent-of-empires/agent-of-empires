@@ -295,11 +295,14 @@ fn a_second_enter_does_not_queue_a_second_prepare() {
     assert_eq!(next_request(&requests), "prepare gh/i0");
     poll_until(&mut env, |env| env.view.new_dialog.is_some());
     env.view.new_dialog = None;
+    // The worker is FIFO: a duplicate prepare would reach it before this load.
+    env.view.suggestions_feed.reload();
+    assert_eq!(next_request(&requests), "load", "no duplicate prepare");
+    poll_until(&mut env, |env| {
+        !env.view.suggestions_feed.is_busy_for_test()
+    });
     // A duplicate answer would reopen the dialog the user just cancelled.
-    std::thread::sleep(Duration::from_millis(100));
-    env.view.apply_suggestions_results();
     assert!(env.view.new_dialog.is_none());
-    assert!(requests.try_recv().is_err(), "the duplicate was never sent");
 }
 
 #[test]
@@ -313,8 +316,10 @@ fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
         view.open_suggestions_view();
     });
     assert_eq!(next_request(&requests), "prepare gh/i0");
-    std::thread::sleep(Duration::from_millis(100));
-    env.view.apply_suggestions_results();
+    // Not busy means the answer was taken off the worker and applied.
+    poll_until(&mut env, |env| {
+        !env.view.suggestions_feed.is_busy_for_test()
+    });
     assert!(env.view.new_dialog.is_none());
     assert!(env.view.suggestions_view.is_some());
 }
