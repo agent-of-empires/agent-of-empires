@@ -545,9 +545,12 @@ Checks hit GitHub at most once a day; the dashboard re-polls the cached status h
 ```toml
 [serve]
 port = 8080               # debug builds default to 8081
+funnel_port = "443"       # "443", "8443" or "10000", quoted
 ```
 
 `aoe serve` and runtime autostart take a new daemon's port from `--port`, then `AOE_SERVE_PORT`, then this key. The TUI Serve dialog keeps its own saved port unless `AOE_SERVE_PORT` is set, and does not read this key. A restart keeps the recorded port unless one is requested, so a changed value applies after a stop and start. Global only.
+
+`funnel_port` is the public port of a Tailscale Funnel started by `aoe serve --remote` or the TUI's Remote Access; `--funnel-port` takes precedence. It must be quoted: a bare `funnel_port = 8443` fails to load. A restart keeps the recorded Funnel port while the Daemon stays on Funnel. Global only.
 
 ## Tools
 

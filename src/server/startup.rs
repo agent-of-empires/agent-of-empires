@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::access::{host_from_url, resolve_access_policy};
+use super::access::{authority_from_url, resolve_access_policy};
 use super::acp_events::{acp_event_listener, seed_acp_statuses};
 use super::disk_watch::{disk_watcher_consumer, init_disk_watch_subscriptions};
 use super::ip_discovery::{local_published_hosts, IpKind};
@@ -294,6 +294,8 @@ pub(crate) struct ServerConfig<'a> {
     pub tunnel_name: Option<&'a str>,
     pub tunnel_url: Option<&'a str>,
     pub no_tailscale: bool,
+    /// The public HTTPS port a Tailscale Funnel listens on.
+    pub funnel_port: u16,
     pub is_daemon: bool,
     pub passphrase: Option<&'a str>,
     /// True when the server sits behind an external reverse proxy
@@ -494,6 +496,7 @@ pub(crate) async fn start_server(
         tunnel_name,
         tunnel_url,
         no_tailscale,
+        funnel_port,
         is_daemon,
         passphrase,
         behind_proxy,
@@ -803,7 +806,7 @@ pub(crate) async fn start_server(
             } else if tailscale_ok {
                 info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
                 // Do NOT fall back to Cloudflare on Tailscale failure.
-                tunnel::TunnelHandle::spawn_tailscale(local_port)
+                tunnel::TunnelHandle::spawn_tailscale(local_port, funnel_port)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!(
@@ -989,7 +992,9 @@ pub(crate) async fn start_server(
         .unwrap_or("local");
 
     // DNS-rebinding gate.
-    let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
+    let tunnel_host: Option<String> = tunnel_handle
+        .as_ref()
+        .and_then(|h| authority_from_url(&h.url));
     let (allowed_hosts, allowed_origins) = resolve_access_policy(
         host,
         local_port,

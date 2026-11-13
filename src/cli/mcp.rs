@@ -811,6 +811,7 @@ mod tests {
             tunnel_name: None,
             tunnel_url: None,
             no_tailscale: false,
+            funnel_port: None,
             allowed_host: Vec::new(),
             allowed_origin: Vec::new(),
             additional_fields: serde_json::Map::new(),
