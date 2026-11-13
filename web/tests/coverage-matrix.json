@@ -3235,12 +3235,13 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card.",
+      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
         "src/components/acp/ToolCards.render.test.tsx",
         "src/components/acp/subagents/activityFold.test.ts",
+        "src/components/acp/subagents/model.test.ts",
         "src/components/acp/subagents/longText.test.ts",
         "tests/acp-subagent-view-mobile.spec.ts"
       ],

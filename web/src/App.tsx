@@ -785,7 +785,7 @@ function AppContent({
     },
     [toggleKind, togglePlugin, pluginPaneById],
   );
-  // Open (or focus) the Sub agents pane. Used by an inline async
+  // Open (or focus) the Background pane. Used by an inline async
   // sub-agent card to jump to its panel entry.
   const [agentFocus, setAgentFocus] = useState<AgentFocus | null>(null);
   const focusAgent = useCallback((agentId?: string) => {

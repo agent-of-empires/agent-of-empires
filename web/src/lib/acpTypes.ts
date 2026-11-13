@@ -718,6 +718,7 @@ export type BackgroundAgentStatus =
   | "running"
   | "stalled"
   | "completed"
+  | "stopped"
   | "detached"
   | "error"
   | "requires_action"
@@ -734,8 +735,12 @@ export interface SubagentRecord {
   description?: string | null;
   state: SubagentState;
   stop_reason?: string | null;
+  /** The message an `error` stop carried. */
+  error?: string | null;
   cancel_capable: boolean;
   model?: string | null;
+  /** Launched in the background: its card stays open until it goes idle. */
+  background?: boolean;
 }
 
 export interface BackgroundAgentTool {
@@ -801,6 +806,8 @@ export interface BackgroundAgent {
   lastText: string | null;
   result: string | null;
   warning: string | null;
+  /** The error message its RFD child stopped with; never a completion warning. */
+  error?: string | null;
 }
 
 export interface RejectedPrompt {
@@ -1459,7 +1466,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       // a terminal Stalled record (the tailer's own abort timeout) carries
       // endedAt too, and the status check alone would let a late Progress
       // reopen it, contradicting hasActiveBackgroundAgent's endedAt-keyed read.
-      if (a.endedAt || a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      if (a.endedAt || ["completed", "stopped", "detached", "error"].includes(a.status)) return a;
       return {
         ...a,
         status: e.status,
@@ -1542,13 +1549,16 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
 /** Folds a child's RFD snapshot into its agent; `at` stamps a newly ended one. */
 function reconcileChild(a: BackgroundAgent, child: SubagentRecord, at: string): BackgroundAgent {
   const status = subagentStatus(child);
-  return child.state === "idle" ? { ...a, status, endedAt: a.endedAt ?? at } : { ...a, status, endedAt: null };
+  const error = child.error ?? null;
+  return child.state === "idle"
+    ? { ...a, status, error, endedAt: a.endedAt ?? at }
+    : { ...a, status, error, endedAt: null };
 }
 
 /** The agent status a child's session state stands for. */
 export function subagentStatus(child: SubagentRecord): BackgroundAgentStatus {
   if (child.state !== "idle") return child.state;
-  return child.stop_reason === "error" ? "error" : "completed";
+  return child.stop_reason === "error" ? "error" : child.stop_reason === "cancelled" ? "stopped" : "completed";
 }
 
 /** Task ids can be reused, so only the run still open on `taskId` is closed. */
@@ -1762,17 +1772,24 @@ export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inf
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
-/** Outstanding background sub-agent (async Task) or task, mirroring
- *  `AcpState::has_active_background_agent`: agents are keyed on `endedAt`
- *  rather than status, since a stalled agent's own terminal completion counts
- *  as done. */
-export function hasActiveBackgroundAgent(state: Pick<AcpState, "backgroundAgents" | "backgroundTasks">): boolean {
-  return state.backgroundTasks.length > 0 || state.backgroundAgents.some((a) => a.endedAt === null);
+/** Outstanding background sub-agent (async Task), task, or running RFD child.
+ *  Agents are keyed on `endedAt` rather than status, since a stalled agent's own
+ *  terminal completion counts as done. */
+export function hasActiveBackgroundAgent(
+  state: Pick<AcpState, "backgroundAgents" | "backgroundTasks" | "subagents">,
+): boolean {
+  return (
+    state.backgroundTasks.length > 0 ||
+    state.backgroundAgents.some((a) => a.endedAt === null) ||
+    state.subagents.some((s) => s.state === "running" || s.state === "requires_action")
+  );
 }
 
 /** Display-only busy signal for the runtime spinner. Distinct from `turnActive`,
  *  which tracks only the main turn because send-vs-queue composer gating reads it. */
-export function isVisiblyBusy(state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks">): boolean {
+export function isVisiblyBusy(
+  state: Pick<AcpState, "turnActive" | "backgroundAgents" | "backgroundTasks" | "subagents">,
+): boolean {
   return state.turnActive || hasActiveBackgroundAgent(state);
 }
 
