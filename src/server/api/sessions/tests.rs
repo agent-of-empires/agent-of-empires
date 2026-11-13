@@ -14680,3 +14680,60 @@ async fn an_entirely_limited_pool_is_attempted_once_per_account() {
     assert_eq!(live.tool, "a");
     assert!(!live.is_idle_dormant());
 }
+
+// A projection must resolve each profile's config once, not once per row (#5665).
+#[tokio::test]
+#[serial_test::serial]
+async fn project_sessions_resolves_profile_config_once_per_profile() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let terminal_rows = |count: usize| -> Vec<Instance> {
+        (0..count)
+            .map(|i| {
+                let mut inst = Instance::new(&format!("row-{i}"), "/tmp/projection-resolves");
+                inst.id = format!("row-{i}");
+                inst.tool = "claude".to_string();
+                inst.source_profile = "projection-resolves".to_string();
+                inst
+            })
+            .collect()
+    };
+    let resolves_for = |rows: Vec<Instance>| async move {
+        let state = crate::server::test_support::build_test_app_state(rows);
+        crate::session::config::profile_config::RESOLVES.with(|n| n.set(0));
+        project_sessions(&state).await;
+        crate::session::config::profile_config::RESOLVES.with(|n| n.get())
+    };
+    let one = resolves_for(terminal_rows(1)).await;
+    let five = resolves_for(terminal_rows(5)).await;
+    assert_eq!(one, five, "config resolves grew with row count");
+}
+
+// Archived and trashed rows render stopped, so they skip resume availability (#5665).
+#[tokio::test]
+#[serial_test::serial]
+async fn project_sessions_omits_context_resume_for_archived_and_trashed_rows() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let row = |id: &str| {
+        let mut inst = Instance::new(id, "/tmp/projection-sunk");
+        inst.id = id.to_string();
+        inst.tool = "claude".to_string();
+        inst
+    };
+    let live = row("live");
+    let mut archived = row("archived");
+    archived.archived_at = Some(chrono::Utc::now());
+    let mut trashed = row("trashed");
+    trashed.trashed_at = Some(chrono::Utc::now());
+    let state = crate::server::test_support::build_test_app_state(vec![live, archived, trashed]);
+    let response = project_sessions(&state).await;
+    let resume = |id: &str| {
+        response
+            .iter()
+            .find(|s| s.id == id)
+            .expect("projected row")
+            .context_resume
+    };
+    assert!(resume("live").is_some());
+    assert_eq!(resume("archived"), None);
+    assert_eq!(resume("trashed"), None);
+}

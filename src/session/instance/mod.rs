@@ -111,6 +111,28 @@ enum ResumeStaticUnavailable {
     Command,
 }
 
+/// A profile's config as the resume check reads it. When resolution failed,
+/// `config` is the warn fallback, which answers legacy selectors but no native agent.
+pub(crate) struct ResumeProfileConfig {
+    config: crate::session::Config,
+    resolved: bool,
+}
+
+/// Resolve `source_profile` for [`Instance::terminal_context_resume_cached_with`].
+pub(crate) fn resume_profile_config(source_profile: &str) -> ResumeProfileConfig {
+    let profile = crate::session::config::effective_profile(source_profile);
+    match crate::session::config::profile_config::resolve_config(&profile) {
+        Ok(config) => ResumeProfileConfig {
+            config,
+            resolved: true,
+        },
+        Err(_) => ResumeProfileConfig {
+            config: crate::session::config::profile_config::resolve_config_or_warn(&profile),
+            resolved: false,
+        },
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TerminalContextResume {
     Available,
