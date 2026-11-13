@@ -1847,7 +1847,14 @@ mod tests {
         reach.send_replace(FunnelReach::Ours);
         wait_for("https://node.ts.net/?token=").await;
         assert!(read().contains(&rotated), "{}", read());
-        assert_eq!(marker(), None);
+        // Back to ours the URL lands before the marker goes (`publish_order`).
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while marker().is_some() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the marker is removed once the Funnel is back");
 
         shutdown.cancel();
         follow.await.unwrap();
