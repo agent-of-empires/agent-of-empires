@@ -1054,7 +1054,9 @@ pub(crate) async fn create_session_with(
                 "pull_latest_image requires sandbox",
             );
         }
-        if let Some(refusal) = crate::server::api::create_pull_refusal(&state).await {
+        if let Some(refusal) =
+            crate::server::api::create_pull_refusal(&state, body.sandbox_image.as_deref()).await
+        {
             return refusal;
         }
     }

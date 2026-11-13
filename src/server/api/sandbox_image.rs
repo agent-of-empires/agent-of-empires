@@ -288,12 +288,23 @@ fn pull_disabled() -> Response {
     )
 }
 
-/// The refusal for a create that asks to pull the latest image, or None when it may.
-pub(crate) async fn create_pull_refusal(state: &AppState) -> Option<Response> {
-    match configured().await {
-        Ok(configured) => pull_blocked(state, &configured).map(|_| pull_disabled()),
-        Err(resp) => Some(resp),
+/// The refusal for a create that asks to pull the latest `requested` image
+/// (None means the default), or None when it may. Same gate as `sandbox_image_pull`.
+pub(crate) async fn create_pull_refusal(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Option<Response> {
+    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
+        return Some(resp);
     }
+    let configured = match configured().await {
+        Ok(configured) => configured,
+        Err(resp) => return Some(resp),
+    };
+    if pull_blocked(state, &configured).is_some() {
+        return Some(pull_disabled());
+    }
+    resolve_image(&configured, requested).err()
 }
 
 fn runtime_key(runtime: &ContainerRuntime, image: &str) -> ImageKey {

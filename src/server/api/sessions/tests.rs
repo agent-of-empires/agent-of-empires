@@ -9968,9 +9968,59 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
     let _home = crate::session::test_support::isolate_app_dir();
     crate::session::config::update_config(|config| config.sandbox.allow_image_pull = true).unwrap();
     let state = crate::server::test_support::build_test_app_state_configured(Vec::new(), |_| {});
-    assert!(crate::server::api::create_pull_refusal(&state)
-        .await
-        .is_none());
+    let default_image = crate::session::Config::load()
+        .unwrap()
+        .sandbox
+        .default_image;
+    for (requested, refused) in [
+        (None, None),
+        (Some(default_image.as_str()), None),
+        (
+            Some("registry.example/other:latest"),
+            Some(StatusCode::BAD_REQUEST),
+        ),
+    ] {
+        let refusal = crate::server::api::create_pull_refusal(&state, requested).await;
+        assert_eq!(refusal.map(|r| r.status()), refused, "{requested:?}");
+    }
+}
+
+/// The dashboard pulls only a configured image; a create that pulls must not reach further.
+#[tokio::test]
+async fn create_refuses_to_pull_an_unconfigured_image() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|config| config.sandbox.allow_image_pull = true).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+        calls.display()
+    );
+    for runtime in ["docker", "podman", "container"] {
+        let path = dir.path().join(runtime);
+        std::fs::write(&path, &script).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = crate::session::test_support::path_prepended(dir.path());
+    let state = crate::server::test_support::build_test_app_state_configured(Vec::new(), |_| {});
+    let (got, body) = post_create(
+        &state,
+        serde_json::json!({
+            "title": "pull", "path": "", "tool": "claude", "scratch": true, "view": "terminal",
+            "sandbox": true, "sandbox_image": "registry.example/other:latest",
+            "pull_latest_image": true,
+        }),
+    )
+    .await;
+    assert_eq!(
+        (got, body["error"].as_str()),
+        (axum::http::StatusCode::BAD_REQUEST, Some("unknown_image")),
+        "{body}"
+    );
+    assert!(state.instances.read().await.is_empty());
+    let ran = std::fs::read_to_string(&calls).unwrap_or_default();
+    assert!(!ran.lines().any(|line| line.starts_with("pull")), "{ran}");
 }
 
 #[tokio::test]
