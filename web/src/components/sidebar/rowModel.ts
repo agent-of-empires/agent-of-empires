@@ -88,8 +88,12 @@ export function deriveRowModel(
     unreadIndicatorEnabled && effectiveUnread && !isActive && !effectiveArchived && effectiveSnoozedUntil == null;
   const status = best.status;
   const needsAttention = workspaceAttentionCount(workspace, pluginAttention) > 0;
+  // The same Session `bestSession` takes its Error status from.
+  const errorSession = status === "Error" ? sessions.find((s) => s.status === "Error") : undefined;
   return {
     ...best,
+    lastError: errorSession?.last_error ?? null,
+    structuredError: errorSession?.view === "structured",
     firstSession,
     runningSession,
     navigationSession: runningSession ?? firstSession,

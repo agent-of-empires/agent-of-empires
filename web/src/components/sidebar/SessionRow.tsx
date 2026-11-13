@@ -11,7 +11,7 @@ import { EMPTY_OPTIMISTIC, type OptimisticTriage, type RowOptimistic } from "../
 import { sessionWorkspace } from "../../lib/sessionWorkspace";
 import { reportError, reportInfo } from "../../lib/toastBus";
 import { MARK_MEANING, meaningText } from "../../lib/sidebarMarks";
-import { statusMeaning } from "../../lib/statusLegend";
+import { glyphTooltip } from "../../lib/statusLegend";
 import { StatusGlyph } from "../StatusGlyph";
 import { Tooltip } from "../Tooltip";
 import { useContextMenu } from "../useContextMenu";
@@ -68,6 +68,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
   // focus target and is described by it.
   const [glyphTip, setGlyphTip] = useState<"hover" | "focus" | null>(null);
   const glyphTipId = useId();
+  const errorLineId = useId();
 
   const openedAtRef = useRef(0);
   const { menu, menuRef, openMenu, closeMenu } = useContextMenu<SessionMenuState>(openedAtRef);
@@ -128,12 +129,16 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
       : isActive
         ? "text-text-primary"
         : "text-text-secondary";
-  const glyphMeaning = model.showUnreadGlyph
-    ? MARK_MEANING.unread
-    : statusMeaning(model.status, {
+  const tooltip = model.showUnreadGlyph
+    ? { text: meaningText(MARK_MEANING.unread), detail: null }
+    : glyphTooltip(model.status, {
         dormant: model.dormant,
         fresh: isFreshIdle({ status: model.status, idle_entered_at: model.idleEnteredAt }, idleDecayWindowMs),
+        lastError: model.lastError,
+        structured: model.structuredError,
       });
+  // Only a recorded error's first line is a detail; the glyph's aria-label doesn't carry it.
+  const errorLine = tooltip.detail;
   const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
 
@@ -176,11 +181,12 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
           <Tooltip
-            text={meaningText(glyphMeaning)}
+            text={tooltip.text}
             detail={
               // The attention hint lost its `title`; the tooltip is where a mouse user reads it. Waiting
               // and Error already say it in the glyph's meaning, so only other attention adds a line.
               [
+                errorLine,
                 // `needsAttention`, not `attention`: an unread glyph can stand in for the attention one,
                 // and the reason still has to show.
                 model.needsAttention && model.status !== "Waiting" && model.status !== "Error"
@@ -201,6 +207,7 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
               data-attention={attention ? "true" : undefined}
               data-testid="sidebar-status-glyph"
               aria-label={attention ? `${model.status} · ${model.attentionHint}` : undefined}
+              aria-describedby={errorLine ? errorLineId : undefined}
               // Only a mouse hover opens it; a tap fires emulated mouse events and must not.
               onPointerEnter={(e) => e.pointerType === "mouse" && setGlyphTip((tip) => tip ?? "hover")}
               onPointerLeave={() => setGlyphTip((tip) => (tip === "hover" ? null : tip))}
@@ -219,6 +226,11 @@ export const SessionRow = memo(function SessionRow(props: SessionRowProps) {
               )}
             </span>
           </Tooltip>
+          {errorLine && (
+            <span id={errorLineId} hidden>
+              {errorLine}
+            </span>
+          )}
           <div className="min-w-0 flex-1">
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${labelTone} ${model.effectivePinned ? "font-semibold" : ""} ${model.effectiveArchived || model.effectiveSnoozed ? "italic opacity-70" : ""}`}

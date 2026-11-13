@@ -250,6 +250,20 @@ export function workspaceAttentionCount(ws: Workspace, pluginAttention?: Readonl
   return n;
 }
 
+/** The Error Sessions among those `workspaceAttentionCount` counts. */
+export function workspaceErrorCount(ws: Workspace): number {
+  return ws.sessions.filter((s) => s.status === "Error" && sessionNeedsAttention(s)).length;
+}
+
+/** A Group attention badge's tooltip, naming errors apart from other attention. */
+export function attentionBadgeText(attention: number, errors: number): string {
+  const sessions = (n: number) => `${n} Session${n === 1 ? "" : "s"}`;
+  const haveErrors = (n: number) => (n === 1 ? "has an error" : "have errors");
+  if (errors > 0 && errors === attention) return `${sessions(errors)} ${haveErrors(errors)}`;
+  const needs = `${sessions(attention)} need${attention === 1 ? "s" : ""} attention`;
+  return errors > 0 ? `${needs} · ${errors} ${haveErrors(errors)}` : needs;
+}
+
 /** Next attention session after `activeId` in display order, wrapping; returns `activeId` when it is the only one. */
 export function nextAttentionSessionId(
   orderedIds: readonly string[],
