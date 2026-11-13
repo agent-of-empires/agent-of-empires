@@ -2703,12 +2703,82 @@ pub struct ServeConfig {
         summary = "Port for a newly started Daemon. A restart keeps the running Daemon's port."
     )]
     pub port: u16,
+
+    /// Public HTTPS port for a Tailscale Funnel started by `aoe serve --remote` or Remote
+    /// Access. `--funnel-port` takes precedence. A quoted string in `config.toml`:
+    /// `funnel_port = "8443"`.
+    #[serde(default)]
+    #[setting(
+        label = "Funnel port",
+        widget = "select",
+        options = "443:443,8443:8443,10000:10000",
+        global_only,
+        summary = "Public port for a Tailscale Funnel, so two Daemons on one machine can each have one. In config.toml write it quoted, as funnel_port = \"8443\"."
+    )]
+    pub funnel_port: FunnelPort,
 }
 
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_SERVE_PORT,
+            funnel_port: FunnelPort::default(),
+        }
+    }
+}
+
+/// The ports Tailscale Funnel can listen on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, clap::ValueEnum)]
+pub enum FunnelPort {
+    #[default]
+    #[serde(rename = "443")]
+    #[value(name = "443")]
+    Port443,
+    #[serde(rename = "8443")]
+    #[value(name = "8443")]
+    Port8443,
+    #[serde(rename = "10000")]
+    #[value(name = "10000")]
+    Port10000,
+}
+
+impl<'de> Deserialize<'de> for FunnelPort {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = FunnelPort;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(r#"a quoted Funnel port: "443", "8443" or "10000""#)
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<FunnelPort, E> {
+                FunnelPort::ALL
+                    .into_iter()
+                    .find(|port| port.number().to_string() == value)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<FunnelPort, E> {
+                Err(E::custom(format!(
+                    r#"funnel_port must be quoted, as funnel_port = "{value}""#
+                )))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<FunnelPort, E> {
+                Err(E::custom(format!(
+                    r#"funnel_port must be quoted, as funnel_port = "{value}""#
+                )))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl FunnelPort {
+    pub const ALL: [FunnelPort; 3] = [Self::Port443, Self::Port8443, Self::Port10000];
+
+    pub fn number(self) -> u16 {
+        match self {
+            Self::Port443 => 443,
+            Self::Port8443 => 8443,
+            Self::Port10000 => 10000,
         }
     }
 }
@@ -4449,6 +4519,28 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn funnel_port_reads_only_a_quoted_funnel_port() {
+        // (config.toml [serve] body, the port, or a phrase the error must hold)
+        for (body, want) in [
+            ("", Ok(FunnelPort::Port443)),
+            ("funnel_port = \"8443\"", Ok(FunnelPort::Port8443)),
+            ("funnel_port = \"10000\"", Ok(FunnelPort::Port10000)),
+            (
+                "funnel_port = 8443",
+                Err(r#"funnel_port must be quoted, as funnel_port = "8443""#),
+            ),
+            ("funnel_port = \"8080\"", Err(r#""443", "8443" or "10000""#)),
+        ] {
+            let got = toml::from_str::<ServeConfig>(body).map(|serve| serve.funnel_port);
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{body}"),
+                (Err(e), Err(phrase)) => assert!(e.to_string().contains(phrase), "{body}: {e}"),
+                (got, _) => panic!("{body}: {got:?}"),
+            }
+        }
+    }
 
     #[test]
     fn notice_policy_hides_by_display_severity_and_age() {

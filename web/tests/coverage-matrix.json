@@ -924,7 +924,7 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
       "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
-      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start."
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start. The same block renders the Funnel port select (`serve.funnel_port`) from the schema with no web code of its own."
     },
     {
       "id": "settings.global-migration-and-persistence",

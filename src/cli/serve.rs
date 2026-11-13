@@ -133,6 +133,17 @@ pub struct ServeArgs {
     #[arg(long, requires = "tunnel_name")]
     pub tunnel_url: Option<String>,
 
+    /// Public HTTPS port for Tailscale Funnel: 443, 8443 or 10000, so a second
+    /// daemon on this machine can have its own Funnel. Falls back to
+    /// `[serve] funnel_port`, then 443.
+    #[arg(
+        long,
+        value_name = "PORT",
+        requires = "remote",
+        conflicts_with_all = ["no_tailscale", "tunnel_name"],
+    )]
+    pub funnel_port: Option<crate::session::config::FunnelPort>,
+
     /// Run as a background daemon (detach from terminal)
     #[arg(long)]
     pub daemon: bool,
@@ -151,7 +162,7 @@ pub struct ServeArgs {
     /// would change daemon state (`--stop`, `--daemon`, `--remote`) or
     /// the bind config of a fresh daemon (`--no-auth`, `--auth`,
     /// `--behind-proxy`, `--read-only`, `--passphrase`, `--port`,
-    /// `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`,
+    /// `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--funnel-port`, `--open`,
     /// `--allowed-host`, `--allowed-origin`).
     /// Clap reports the misuse instead of silently ignoring the extras.
     #[arg(
@@ -160,7 +171,7 @@ pub struct ServeArgs {
             "stop", "daemon", "remote", "restart",
             "no_auth", "auth", "behind_proxy", "dangerously_allow_plaintext_remote",
             "read_only", "cityhall", "passphrase", "port",
-            "tunnel_name", "no_tailscale", "tunnel_url", "open",
+            "tunnel_name", "no_tailscale", "tunnel_url", "funnel_port", "open",
             "allowed_host", "allowed_origin",
         ],
     )]
@@ -196,7 +207,7 @@ pub struct ServeArgs {
             "stop", "status", "daemon", "daemon_child", "core_only", "remote", "rollback",
             "no_auth", "auth", "behind_proxy", "dangerously_allow_plaintext_remote",
             "read_only", "cityhall", "passphrase", "port", "host",
-            "tunnel_name", "no_tailscale", "tunnel_url", "open",
+            "tunnel_name", "no_tailscale", "tunnel_url", "funnel_port", "open",
             "allowed_host", "allowed_origin",
         ],
     )]
@@ -207,7 +218,7 @@ pub struct ServeArgs {
         "stop", "status", "restart", "daemon", "daemon_child", "core_only",
         "remote", "no_auth", "auth", "behind_proxy", "read_only", "cityhall",
         "passphrase", "port", "host", "tunnel_name", "no_tailscale",
-        "tunnel_url", "open", "allowed_host", "allowed_origin",
+        "tunnel_url", "funnel_port", "open", "allowed_host", "allowed_origin",
     ])]
     pub rollback: bool,
 }
@@ -238,6 +249,7 @@ impl ServeArgs {
                 std::env::var("AOE_SERVE_PASSPHRASE").ok()
             });
             self.resolve_port()?;
+            self.resolve_funnel_port()?;
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
         Ok(())
@@ -256,6 +268,25 @@ impl ServeArgs {
         self.fill_port(std::env::var_os("AOE_SERVE_PORT"), || {
             Ok(crate::session::config::Config::load()?.serve.port)
         })
+    }
+
+    /// Fill a missing Funnel port from `[serve] funnel_port`, and drop it when this launch
+    /// can't use Funnel.
+    fn resolve_funnel_port(&mut self) -> Result<()> {
+        self.fill_funnel_port(|| Ok(crate::session::config::Config::load()?.serve.funnel_port))
+    }
+
+    fn fill_funnel_port(
+        &mut self,
+        configured: impl FnOnce() -> Result<crate::session::config::FunnelPort>,
+    ) -> Result<()> {
+        let may_use_funnel = self.remote && !self.no_tailscale && self.tunnel_name.is_none();
+        if !may_use_funnel {
+            self.funnel_port = None;
+        } else if self.funnel_port.is_none() {
+            self.funnel_port = Some(configured()?);
+        }
+        Ok(())
     }
 
     fn fill_port(
@@ -680,6 +711,9 @@ pub struct ServeLaunch {
     pub tunnel_name: Option<String>,
     pub tunnel_url: Option<String>,
     pub no_tailscale: bool,
+    /// Absent in records written before `--funnel-port`, which read as not given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub funnel_port: Option<crate::session::config::FunnelPort>,
     #[serde(default)]
     pub allowed_host: Vec<String>,
     #[serde(default)]
@@ -713,6 +747,7 @@ impl ServeLaunch {
             tunnel_name: self.tunnel_name.clone(),
             no_tailscale: self.no_tailscale,
             tunnel_url: self.tunnel_url.clone(),
+            funnel_port: self.funnel_port,
             daemon: true,
             stop: false,
             status: false,
@@ -746,6 +781,7 @@ impl ServeLaunch {
             args.tunnel_url = None;
         }
         args.no_tailscale = requested.no_tailscale;
+        args.funnel_port = requested.funnel_port.or(args.funnel_port);
         args.passphrase = requested.passphrase;
         args
     }
@@ -862,7 +898,9 @@ async fn rollback_daemon() -> Result<()> {
             && credential.passphrase.is_some() == launch.has_passphrase,
         "Retained credentials do not match the retained launch",
     );
-    let args = launch.to_serve_args(credential.passphrase);
+    let args = rollback_args(&launch, credential.passphrase, || {
+        Ok(crate::session::config::Config::load()?.serve)
+    })?;
     validate_launch_args(&launch.profile, &args).await?;
     match daemon_status() {
         DaemonStatus::Verified(pid) => {
@@ -1616,6 +1654,7 @@ pub async fn run(profile: &str, mut args: ServeArgs, startup: Option<ServeStartu
             tunnel_name: args.tunnel_name.as_deref(),
             tunnel_url: args.tunnel_url.as_deref(),
             no_tailscale: args.no_tailscale,
+            funnel_port: args.funnel_port.unwrap_or_default().number(),
             is_daemon: args.daemon_child,
             passphrase: args.passphrase.as_deref(),
             behind_proxy: args.behind_proxy,
@@ -1945,6 +1984,106 @@ async fn connect_owned_dashboard(
     }
 }
 
+/// The `aoe serve --daemon-child` argv that replays `args`; the passphrase travels in the
+/// environment instead.
+fn daemon_child_args(args: &ServeArgs, profile: &str) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    let mut push = |items: &[&str]| argv.extend(items.iter().map(|item| item.to_string()));
+    push(&["serve", "--daemon-child"]);
+    if args.read_acquisition {
+        push(&["--read-acquisition"]);
+    }
+    if args.core_only {
+        push(&["--core-only"]);
+    } else {
+        push(&[
+            "--port",
+            &args.resolved_port().to_string(),
+            "--host",
+            &args.host,
+        ]);
+    }
+    if args.no_auth {
+        push(&["--no-auth"]);
+    }
+    if let Some(mode) = args.auth {
+        push(&["--auth", mode.as_cli_str()]);
+    }
+    if args.behind_proxy {
+        push(&["--behind-proxy"]);
+    }
+    if args.dangerously_allow_plaintext_remote {
+        push(&["--dangerously-allow-plaintext-remote"]);
+    }
+    if args.read_only {
+        push(&["--read-only"]);
+    }
+    if args.cityhall {
+        push(&["--cityhall"]);
+    }
+    if args.remote {
+        push(&["--remote"]);
+    }
+    if let Some(ref name) = args.tunnel_name {
+        push(&["--tunnel-name", name]);
+    }
+    if let Some(ref url) = args.tunnel_url {
+        push(&["--tunnel-url", url]);
+    }
+    if args.no_tailscale {
+        push(&["--no-tailscale"]);
+    }
+    if let Some(port) = args.funnel_port {
+        push(&["--funnel-port", &port.number().to_string()]);
+    }
+    for h in &args.allowed_host {
+        push(&["--allowed-host", h]);
+    }
+    for o in &args.allowed_origin {
+        push(&["--allowed-origin", o]);
+    }
+    if !profile.is_empty() {
+        push(&["--profile", profile]);
+    }
+    argv
+}
+
+/// A restart's successor arguments: the record, the TUI's request over it, then the TCP and
+/// Funnel ports neither names, from `port_env` and `[serve]`. A recorded port wins over a changed
+/// setting, as `[serve] port` does.
+fn successor_args(
+    launch: &ServeLaunch,
+    requested: Option<ServeArgs>,
+    predecessor_passphrase: Option<&str>,
+    port_env: Option<std::ffi::OsString>,
+    serve_config: impl Fn() -> Result<crate::session::config::ServeConfig>,
+) -> Result<ServeArgs> {
+    let mut args = match requested {
+        Some(requested) => launch.overlay_tui_args(requested),
+        None => launch.to_serve_args(None),
+    };
+    args.passphrase =
+        resolve_launch_passphrase(args.passphrase.take(), Some(predecessor_passphrase), || {
+            None
+        });
+    // A core-only record has no port to replay when the request enables the dashboard.
+    args.fill_port(port_env, || Ok(serve_config()?.port))?;
+    args.fill_funnel_port(|| Ok(serve_config()?.funnel_port))?;
+    Ok(args)
+}
+
+/// The retained launch to roll back to. A record from before `funnel_port` gets the setting
+/// here rather than in the child, so the new `serve.launch` records the port it runs on.
+fn rollback_args(
+    launch: &ServeLaunch,
+    passphrase: Option<String>,
+    serve_config: impl FnOnce() -> Result<crate::session::config::ServeConfig>,
+) -> Result<ServeArgs> {
+    let mut args = launch.to_serve_args(passphrase);
+    args.fill_funnel_port(|| Ok(serve_config()?.funnel_port))?;
+    Ok(args)
+}
+
 async fn start_daemon(
     profile: &str,
     args: &ServeArgs,
@@ -1968,63 +2107,10 @@ async fn start_daemon(
     cmd.env(SERVE_INSTANCE_ENV, &instance_id);
     cmd.env_remove("AOE_CITYHALL_MODE")
         .env_remove("AOE_SERVE_PASSPHRASE");
-    cmd.args(["serve", "--daemon-child"]);
-    if args.read_acquisition {
-        cmd.arg("--read-acquisition");
-    }
-    if args.core_only {
-        cmd.arg("--core-only");
-    } else {
-        cmd.args([
-            "--port",
-            &args.resolved_port().to_string(),
-            "--host",
-            &args.host,
-        ]);
-    }
-
-    if args.no_auth {
-        cmd.arg("--no-auth");
-    }
-    if let Some(mode) = args.auth {
-        cmd.args(["--auth", mode.as_cli_str()]);
-    }
-    if args.behind_proxy {
-        cmd.arg("--behind-proxy");
-    }
-    if args.dangerously_allow_plaintext_remote {
-        cmd.arg("--dangerously-allow-plaintext-remote");
-    }
-    if args.read_only {
-        cmd.arg("--read-only");
-    }
-    if args.cityhall {
-        cmd.arg("--cityhall");
-    }
-    if args.remote {
-        cmd.arg("--remote");
-    }
-    if let Some(ref name) = args.tunnel_name {
-        cmd.args(["--tunnel-name", name]);
-    }
-    if let Some(ref url) = args.tunnel_url {
-        cmd.args(["--tunnel-url", url]);
-    }
-    if args.no_tailscale {
-        cmd.arg("--no-tailscale");
-    }
-    for h in &args.allowed_host {
-        cmd.args(["--allowed-host", h]);
-    }
-    for o in &args.allowed_origin {
-        cmd.args(["--allowed-origin", o]);
-    }
+    cmd.args(daemon_child_args(args, profile));
     if let Some(ref passphrase) = args.passphrase {
         // Pass via env var to avoid exposing the passphrase in the process list
         cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
-    }
-    if !profile.is_empty() {
-        cmd.args(["--profile", profile]);
     }
 
     cmd.stdin(transaction.handoff()?);
@@ -2113,6 +2199,7 @@ async fn start_daemon(
         tunnel_name: args.tunnel_name.clone(),
         tunnel_url: args.tunnel_url.clone(),
         no_tailscale: args.no_tailscale,
+        funnel_port: args.funnel_port,
         allowed_host: args.allowed_host.clone(),
         allowed_origin: args.allowed_origin.clone(),
         additional_fields: serde_json::Map::new(),
@@ -2340,17 +2427,13 @@ async fn replay_managed_launch(
         Ok::<_, anyhow::Error>((launch, passphrase))
     })
     .await??;
-    let mut args = match override_args {
-        Some(requested) => launch.overlay_tui_args(requested),
-        None => launch.to_serve_args(None),
-    };
-    args.passphrase = resolve_launch_passphrase(
-        args.passphrase.take(),
-        Some(predecessor_passphrase.as_deref()),
-        || None,
-    );
-    // A core-only record has no port to replay when the request enables the dashboard.
-    args.resolve_port()?;
+    let args = successor_args(
+        &launch,
+        override_args,
+        predecessor_passphrase.as_deref(),
+        std::env::var_os("AOE_SERVE_PORT"),
+        || Ok(crate::session::config::Config::load()?.serve),
+    )?;
     validate_launch_args(&launch.profile, &args).await?;
     retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
@@ -3350,9 +3433,199 @@ mod tests {
             tunnel_name: Some("named".to_string()),
             tunnel_url: Some("aoe.example.com".to_string()),
             no_tailscale: true,
+            funnel_port: None,
             allowed_host: vec!["aoe.example.com".to_string()],
             allowed_origin: vec!["https://aoe.example.com:8443".to_string()],
             additional_fields: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn funnel_port_comes_from_the_flag_then_the_setting_and_only_where_funnel_runs() {
+        use crate::session::config::FunnelPort::{self, Port10000, Port8443};
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
+                Some(crate::cli::Commands::Serve(args)) => args,
+                _ => unreachable!(),
+            })
+        };
+        for argv in [
+            &["aoe", "serve", "--funnel-port", "8443"][..],
+            &[
+                "aoe",
+                "serve",
+                "--remote",
+                "--no-tailscale",
+                "--funnel-port",
+                "8443",
+            ],
+            &[
+                "aoe",
+                "serve",
+                "--remote",
+                "--tunnel-name",
+                "t",
+                "--tunnel-url",
+                "a.example.com",
+                "--funnel-port",
+                "8443",
+            ],
+            &["aoe", "serve", "--remote", "--funnel-port", "8080"],
+            &["aoe", "serve", "--status", "--funnel-port", "8443"],
+            &["aoe", "serve", "--restart", "--funnel-port", "8443"],
+        ] {
+            assert!(parse(argv).is_err(), "{argv:?}");
+        }
+        let setting = || -> Result<FunnelPort> { Ok(Port10000) };
+        let unread = || -> Result<FunnelPort> { bail!("the setting isn't read") };
+        // (argv, resolved Funnel port)
+        for (argv, want) in [
+            (&["aoe", "serve", "--remote"][..], Some(Port10000)),
+            (
+                &["aoe", "serve", "--remote", "--funnel-port", "8443"],
+                Some(Port8443),
+            ),
+            (&["aoe", "serve", "--remote", "--no-tailscale"], None),
+            (&["aoe", "serve"], None),
+        ] {
+            let mut args = parse(argv).unwrap();
+            args.fill_funnel_port(setting).unwrap();
+            assert_eq!(args.funnel_port, want, "{argv:?}");
+        }
+        let mut explicit = parse(&["aoe", "serve", "--remote", "--funnel-port", "8443"]).unwrap();
+        explicit.fill_funnel_port(unread).unwrap();
+
+        // A TUI restart keeps the recorded port while it stays on Funnel.
+        let mut recorded = sample_launch();
+        (recorded.remote, recorded.no_tailscale) = (true, false);
+        (recorded.tunnel_name, recorded.tunnel_url) = (None, None);
+        recorded.funnel_port = Some(Port8443);
+        for (tui, want) in [
+            (
+                &[
+                    "aoe",
+                    "serve",
+                    "--daemon",
+                    "--remote",
+                    "--host",
+                    "127.0.0.1",
+                ][..],
+                Some(Port8443),
+            ),
+            (
+                &[
+                    "aoe",
+                    "serve",
+                    "--daemon",
+                    "--remote",
+                    "--host",
+                    "127.0.0.1",
+                    "--no-tailscale",
+                ],
+                None,
+            ),
+            (&["aoe", "serve", "--daemon", "--host", "0.0.0.0"], None),
+        ] {
+            let mut args = recorded.overlay_tui_args(parse(tui).unwrap());
+            args.fill_funnel_port(unread).unwrap();
+            assert_eq!(args.funnel_port, want, "{tui:?}");
+        }
+        assert_eq!(recorded.to_serve_args(None).funnel_port, Some(Port8443));
+
+        // `serve.launch` records it as a string; a record from before the flag reads as None.
+        let written = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(written["funnel_port"], "8443");
+        let old = serde_json::to_value(sample_launch()).unwrap();
+        assert!(old.get("funnel_port").is_none(), "{old}");
+        let read: ServeLaunch = serde_json::from_value(old).unwrap();
+        assert_eq!(read.funnel_port, None);
+    }
+
+    #[test]
+    fn the_daemon_child_and_a_restart_carry_the_funnel_port() {
+        use crate::session::config::{FunnelPort::*, ServeConfig};
+        use clap::Parser;
+        let parse = |argv: &[&str]| match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            Some(crate::cli::Commands::Serve(args)) => args,
+            _ => unreachable!(),
+        };
+        // The child's argv parses back to the same Funnel port, and names none without one.
+        for (argv, want) in [
+            (
+                &["aoe", "serve", "--remote", "--funnel-port", "8443"][..],
+                Some(Port8443),
+            ),
+            (&["aoe", "serve", "--remote", "--no-tailscale"], None),
+        ] {
+            let child = daemon_child_args(&parse(argv), "");
+            let replayed = parse(
+                &[
+                    &["aoe"][..],
+                    &child.iter().map(String::as_str).collect::<Vec<_>>(),
+                ]
+                .concat(),
+            );
+            assert_eq!(replayed.funnel_port, want, "{child:?}");
+            assert_eq!(
+                child.iter().any(|a| a == "--funnel-port"),
+                want.is_some(),
+                "{child:?}"
+            );
+        }
+
+        // A restart keeps a recorded port over a changed setting, as `[serve] port` does, and
+        // fills one only when the record has none.
+        let setting = || {
+            Ok(ServeConfig {
+                port: 9000,
+                funnel_port: Port10000,
+            })
+        };
+        let mut funnel = sample_launch();
+        (funnel.remote, funnel.no_tailscale) = (true, false);
+        (funnel.tunnel_name, funnel.tunnel_url) = (None, None);
+        funnel.funnel_port = Some(Port8443);
+        let cloudflare = ServeLaunch {
+            no_tailscale: true,
+            funnel_port: None,
+            ..funnel.clone()
+        };
+        let tui_funnel = &[
+            "aoe",
+            "serve",
+            "--daemon",
+            "--remote",
+            "--host",
+            "127.0.0.1",
+        ][..];
+        let tui_cloudflare = &[tui_funnel, &["--no-tailscale"]].concat();
+        // (record, TUI request, Funnel port, TCP port)
+        for (record, request, want, port) in [
+            (&funnel, Some(tui_funnel), Some(Port8443), 9090),
+            (&funnel, None, Some(Port8443), 9090),
+            (&cloudflare, Some(tui_funnel), Some(Port10000), 9090),
+            (&funnel, Some(&tui_cloudflare[..]), None, 9090),
+        ] {
+            let args =
+                successor_args(record, request.map(parse), Some("pw"), None, setting).unwrap();
+            assert_eq!(args.funnel_port, want, "{request:?}");
+            assert_eq!(args.port, Some(port), "{request:?}");
+        }
+
+        // A rollback records the port it starts on: the retained one, or for a record from
+        // before `funnel_port` the setting's, and none off Funnel.
+        let legacy = ServeLaunch {
+            funnel_port: None,
+            ..funnel.clone()
+        };
+        for (name, record, want) in [
+            ("funnel", &funnel, Some(Port8443)),
+            ("legacy", &legacy, Some(Port10000)),
+            ("cloudflare", &cloudflare, None),
+        ] {
+            let args = rollback_args(record, None, setting).unwrap();
+            assert_eq!(args.funnel_port, want, "{name}");
         }
     }
 
@@ -4146,6 +4419,7 @@ mod tests {
             tunnel_name: None,
             tunnel_url: None,
             no_tailscale: false,
+            funnel_port: None,
             allowed_host: Vec::new(),
             allowed_origin: Vec::new(),
             additional_fields: serde_json::Map::new(),
