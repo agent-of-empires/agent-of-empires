@@ -1369,6 +1369,9 @@ impl HomeView {
         if self.snooze_duration_dialog.is_none() {
             render_dialogs!(info_dialog);
         }
+        if let Some((dialog, _)) = &mut self.create_hook_failed {
+            dialog.render(frame, area, theme);
+        }
         render_dialogs!(snooze_duration_dialog);
         if self.snooze_duration_dialog.is_some() {
             render_dialogs!(info_dialog, confirm_dialog);
@@ -1848,6 +1851,7 @@ impl HomeView {
             || self.rename_dialog.is_some()
             || self.worktree_name_dialog.is_some()
             || self.repo_trust_dialog.is_some()
+            || self.create_hook_failed.is_some()
             || self.hooks_install_dialog.is_some()
             || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
@@ -2169,9 +2173,12 @@ impl HomeView {
         let update_badge = (!inst.is_structured()
             && crate::session::update_restart::binary_updated(inst))
         .then_some(" [update]");
+        // Its on_create hooks were skipped at creation, so their setup never ran.
+        let setup_badge = inst.created_without_setup.then_some(" [no setup]");
         let badge_width = badge_text.map_or(0, |s| s.len())
             + terminal_badge.as_ref().map_or(0, |s| s.len())
-            + update_badge.map_or(0, |s| s.len());
+            + update_badge.map_or(0, |s| s.len())
+            + setup_badge.map_or(0, |s| s.len());
         let age = if self.show_activity_age {
             row_age(inst, in_attention)
         } else {
@@ -2242,6 +2249,17 @@ impl HomeView {
         }
         if let Some(badge) = update_badge {
             let badge_style = Style::default().fg(theme.waiting);
+            line_spans.push(Span::styled(
+                badge,
+                if is_selected {
+                    selected_row_style(badge_style, theme)
+                } else {
+                    badge_style
+                },
+            ));
+        }
+        if let Some(badge) = setup_badge {
+            let badge_style = Style::default().fg(theme.dimmed);
             line_spans.push(Span::styled(
                 badge,
                 if is_selected {

@@ -28,7 +28,7 @@ Hooks run inside the container for a sandboxed session and in your host shell ot
 on_create = ["sh -c '[ -x /opt/setup.sh ] || exit 0; exec /opt/setup.sh'"]
 ```
 
-Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log.
+Keep environment-specific hooks out of global config. A global `on_create` applies to every repo that does not declare its own, so one unresolvable path there blocks session creation in projects that never mention it. When `on_create` fails, the TUI and `aoe add` name the config file that declared it; the web dashboard shows a generic error and logs the file to the `aoe serve` log. The TUI then offers Retry, Create without setup, or Cancel. Create without setup skips every `on_create` hook, and the session's row shows `[no setup]`.
 
 #### Available environment variables
 

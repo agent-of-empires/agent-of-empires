@@ -424,9 +424,10 @@ impl DiffView {
             Ok(_) => {
                 self.base_not_saved("Runtime epoch changed; save confirmation cannot be used.")
             }
-            Err(crate::tui::session_feed::CommandFailure::Rejected(message)) => {
-                self.base_not_saved(&message)
-            }
+            Err(
+                crate::tui::session_feed::CommandFailure::Rejected(message)
+                | crate::tui::session_feed::CommandFailure::CreateHookFailed(message),
+            ) => self.base_not_saved(&message),
             Err(crate::tui::session_feed::CommandFailure::Unknown(message)) => {
                 self.base_not_saved(&format!("Outcome unknown: {message}"))
             }

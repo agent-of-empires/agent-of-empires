@@ -1803,6 +1803,12 @@ impl HomeView {
             }
             return true;
         }
+        if let Some((dialog, _)) = &self.create_hook_failed {
+            if let Some(result) = dialog.handle_click(col, row) {
+                self.resolve_create_hook_failed(result);
+            }
+            return true;
+        }
         if let Some(dialog) = &self.repo_trust_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
@@ -2630,6 +2636,12 @@ impl HomeView {
                     }
                 }
             }
+            return None;
+        }
+
+        if let Some((dialog, _)) = &mut self.create_hook_failed {
+            let result = dialog.handle_key(key);
+            self.resolve_create_hook_failed(result);
             return None;
         }
 
@@ -6582,6 +6594,9 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(dialog) = &mut self.repo_trust_dialog {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
+        if let Some((dialog, _)) = &mut self.create_hook_failed {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(picker) = &mut self.tool_picker_dialog {

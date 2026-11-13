@@ -593,3 +593,84 @@ async fn unknown_creation_uses_current_canonical_authority_after_reconnection_no
     assert!(view.apply_creation_results().is_none());
     assert!(view.get_instance(&key).is_none());
 }
+
+/// A creation refused by its on_create hook keeps the submitted request behind a dialog:
+/// Retry and Create without setup resend it under a new key (the daemon replays a failed
+/// key), the latter with the hooks skipped, and Cancel drops it. Any other refusal is the
+/// plain "Creation Failed" dialog.
+#[test]
+#[serial]
+fn a_hook_failure_offers_retry_create_without_setup_or_cancel() {
+    use crate::tui::session_feed::CommandFailure;
+    let hook = || CommandFailure::CreateHookFailed("on_create hook failed: exit 3".into());
+    // (first failure, key in the dialog, resubmitted with skip_on_create)
+    for (failure, key_code, resubmit) in [
+        (hook(), Some(KeyCode::Enter), Some(false)),
+        (hook(), Some(KeyCode::Char('s')), Some(true)),
+        (hook(), Some(KeyCode::Esc), None),
+        (CommandFailure::Rejected("denied".into()), None, None),
+    ] {
+        let case = format!("{failure:?} {key_code:?}");
+        let CreationTestEnv {
+            mut view,
+            project_dir,
+            _guard,
+            _temp,
+        } = setup_creation_test_env();
+        let mut fail = view.session_feed.creation_failure_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
+        view.request_creation(
+            creation_data(&project_dir, "Hooked", "test"),
+            Some(true),
+            None,
+        );
+        let first = fail(failure);
+        assert!(view.apply_creation_results().is_none());
+        assert!(view.creating_stub_id.is_none(), "{case}: the stub is gone");
+
+        let Some(key_code) = key_code else {
+            assert!(view.create_hook_failed.is_none(), "{case}");
+            assert_eq!(
+                view.info_dialog.as_ref().map(|d| d.title()),
+                Some("Creation Failed")
+            );
+            continue;
+        };
+        assert!(view.info_dialog.is_none(), "{case}");
+        let screen = render_home_to_string(&mut view, 100, 30);
+        assert!(screen.contains("Session setup failed"), "{case}\n{screen}");
+        assert!(
+            screen.contains("on_create hook failed: exit 3"),
+            "{case}\n{screen}"
+        );
+        assert!(
+            screen.contains("[Create without setup (s)]"),
+            "{case}\n{screen}"
+        );
+
+        view.handle_key(key(key_code), None);
+        assert!(
+            view.create_hook_failed.is_none(),
+            "{case}: the dialog closes"
+        );
+        let Some(skip) = resubmit else {
+            assert!(!view.is_creation_pending(), "{case}: Cancel sends nothing");
+            assert!(view.creating_stub_id.is_none(), "{case}");
+            continue;
+        };
+        assert!(view.creating_stub_id.is_some(), "{case}: a new stub");
+        let second = fail(CommandFailure::Rejected("done".into()));
+        assert_ne!(second.idempotency_key, first.idempotency_key, "{case}");
+        assert_eq!(second.skip_on_create, skip, "{case}");
+        let same = |body: &crate::daemon::CreateSessionBody| {
+            let mut value = serde_json::to_value(body).unwrap();
+            value["idempotency_key"] = serde_json::Value::Null;
+            value["skip_on_create"] = serde_json::Value::Null;
+            value
+        };
+        assert_eq!(same(&second), same(&first), "{case}: the same request");
+        assert_eq!(second.trust_hooks, Some(true), "{case}: trust is kept");
+    }
+}

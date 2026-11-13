@@ -50,8 +50,8 @@ use crate::tmux::AvailableTools;
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
-    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    CreateHookFailedDialog, GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog,
+    InfoDialog, IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
     SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
     WorktreeNameDialog,
@@ -191,8 +191,19 @@ pub(super) enum CreationConfirmation {
     Canonical(crate::daemon::SessionResponse),
 }
 
+/// What the wizard submitted, kept so a creation refused by its `on_create` hook can be sent
+/// again without re-filling the form.
+#[derive(Clone)]
+pub(super) struct CreationRequest {
+    pub(super) data: NewSessionData,
+    pub(super) trust_hooks: Option<bool>,
+    pub(super) trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+    pub(super) skip_on_create: bool,
+}
+
 /// A display-only creation placeholder and its retained completion proof.
 pub(super) struct PendingCreation {
+    pub(super) request: CreationRequest,
     /// The daemon's session id, known once a reservation or progress entry
     /// names this creation.
     pub(super) daemon_id: Option<String>,
@@ -286,6 +297,8 @@ pub struct HomeView {
     pub(super) group_rename_context: Option<GroupRenameContext>,
     pub(super) session_dialog_target: Option<SessionDialogTarget>,
     pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
+    /// A creation refused by its `on_create` hook, and the request its choices resubmit.
+    pub(super) create_hook_failed: Option<(CreateHookFailedDialog, CreationRequest)>,
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending
     /// approval. Approval is never persisted locally before daemon validation.

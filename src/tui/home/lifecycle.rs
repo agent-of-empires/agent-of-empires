@@ -156,6 +156,7 @@ impl HomeView {
             context_menu: None,
             group_rename_context: None,
             repo_trust_dialog: None,
+            create_hook_failed: None,
             pending_repo_trust_data: None,
             pending_repo_trust_fingerprint: None,
             hooks_install_dialog: None,

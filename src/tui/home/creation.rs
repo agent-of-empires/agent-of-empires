@@ -2,6 +2,7 @@
 //! cancel or a quit has to do.
 
 use super::*;
+use crate::tui::dialogs::{CreateHookFailedAction, DialogResult};
 
 impl HomeView {
     /// Request session creation from the daemon. The stub is a display-only
@@ -9,10 +10,22 @@ impl HomeView {
     /// which then lands through the canonical feed.
     pub fn request_creation(
         &mut self,
-        mut data: NewSessionData,
+        data: NewSessionData,
         trust_hooks: Option<bool>,
         trust_review: Option<crate::daemon::CreationTrustFingerprint>,
     ) {
+        self.submit_creation(CreationRequest {
+            data,
+            trust_hooks,
+            trust_review,
+            skip_on_create: false,
+        });
+    }
+
+    /// Sends `request` under a new stub, whose id is also the idempotency key, so a resubmit
+    /// after a refusal is never answered with the refused attempt's replay.
+    pub(super) fn submit_creation(&mut self, mut request: CreationRequest) {
+        let data = &mut request.data;
         if self.pending_creation.is_some() {
             self.flash_status("A session is already being created");
             return;
@@ -117,8 +130,13 @@ impl HomeView {
         }
         self.new_dialog = None;
 
-        let mut body = wizard_create_body(&data, trust_hooks, trust_review);
+        let mut body = wizard_create_body(
+            &request.data,
+            request.trust_hooks,
+            request.trust_review.clone(),
+        );
         body.idempotency_key = Some(stub_id.clone());
+        body.skip_on_create = request.skip_on_create;
         if let Err(error) = self.session_feed.create_session(stub_id.clone(), body) {
             self.pending_creation = None;
             self.discard_creating_stub();
@@ -129,6 +147,7 @@ impl HomeView {
             return;
         }
         self.pending_creation = Some(PendingCreation {
+            request,
             daemon_id: None,
             request_key: stub_id,
             origin_epoch,
@@ -138,6 +157,25 @@ impl HomeView {
             confirmation: None,
             reload_retry_at: None,
         });
+    }
+
+    /// Retry and Create without setup resubmit the kept request; Cancel drops it, as the
+    /// daemon already rolled the failed attempt back.
+    pub(super) fn resolve_create_hook_failed(
+        &mut self,
+        result: DialogResult<CreateHookFailedAction>,
+    ) {
+        let DialogResult::Submit(action) = result else {
+            if matches!(result, DialogResult::Cancel) {
+                self.create_hook_failed = None;
+            }
+            return;
+        };
+        let Some((_, mut request)) = self.create_hook_failed.take() else {
+            return;
+        };
+        request.skip_on_create = action == CreateHookFailedAction::CreateWithoutSetup;
+        self.submit_creation(request);
     }
 
     pub(super) fn bind_in_flight_creation(&mut self, rows: &[crate::daemon::SessionResponse]) {
@@ -322,15 +360,15 @@ impl HomeView {
                         &format!("{message}\nThe daemon may still be creating this session. Wait for its canonical row or cancel; do not submit a second creation yet."),
                     ));
                 }
+                Err(CommandFailure::CreateHookFailed(message)) => {
+                    if let Some(pending) = self.settle_refused_creation(&stub_id) {
+                        self.create_hook_failed =
+                            Some((CreateHookFailedDialog::new(&message), pending.request));
+                    }
+                    return None;
+                }
                 Err(CommandFailure::Rejected(message)) => {
-                    let cancelled = self.pending_creation.as_ref()?.cancel_requested;
-                    self.clear_creation_tracking(&stub_id);
-                    self.rebuild_group_trees();
-                    self.rebuild_flat_items();
-                    self.update_selected();
-                    if cancelled {
-                        self.flash_status("Creation was refused before commit");
-                    } else {
+                    if self.settle_refused_creation(&stub_id).is_some() {
                         self.info_dialog =
                             Some(InfoDialog::sized_to_fit("Creation Failed", &message));
                     }
@@ -368,6 +406,21 @@ impl HomeView {
                 Some(CreationConfirmation::Canonical(row));
         }
         self.commit_created_session()
+    }
+
+    /// Drops a refused creation's stub. Returns its request unless the user had already
+    /// cancelled, in which case the refusal is only flashed.
+    fn settle_refused_creation(&mut self, stub_id: &str) -> Option<PendingCreation> {
+        let pending = self.pending_creation.take()?;
+        self.clear_creation_tracking(stub_id);
+        self.rebuild_group_trees();
+        self.rebuild_flat_items();
+        self.update_selected();
+        if pending.cancel_requested {
+            self.flash_status("Creation was refused before commit");
+            return None;
+        }
+        Some(pending)
     }
 
     fn clear_creation_tracking(&mut self, stub_id: &str) {
@@ -454,7 +507,10 @@ impl HomeView {
             .await
         {
             Ok(_) => {}
-            Err(crate::tui::session_feed::CommandFailure::Rejected(error)) => {
+            Err(
+                crate::tui::session_feed::CommandFailure::Rejected(error)
+                | crate::tui::session_feed::CommandFailure::CreateHookFailed(error),
+            ) => {
                 tracing::warn!(target: "tui.home", %error, "creation cancellation at quit was refused");
             }
             Err(crate::tui::session_feed::CommandFailure::Unknown(error)) => {

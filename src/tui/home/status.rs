@@ -1207,7 +1207,9 @@ impl HomeView {
         if let Some(result) = namespace {
             let intent = self.pending_namespace_intent.take();
             match result {
-                Err(CommandFailure::Rejected(message)) => {
+                Err(
+                    CommandFailure::Rejected(message) | CommandFailure::CreateHookFailed(message),
+                ) => {
                     if matches!(&intent, Some(NamespaceIntent::Reveal { .. })) {
                         self.retained_reveal = intent;
                         self.offer_retained_reveal();
