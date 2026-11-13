@@ -37,6 +37,7 @@ describe("resolveActionTargets", () => {
       sibling("boxed", { status: "Running", is_sandboxed: true }),
       sibling("boxed-archived", { status: "Stopped", is_sandboxed: true, archived_at: "2026-01-01T00:00:00Z" }),
       sibling("boxed-creating", { status: "Creating", is_sandboxed: true }),
+      sibling("boxed-trashed", { status: "Stopped", is_sandboxed: true, trashed_at: "2026-01-01T00:00:00Z" }),
     ];
     const t = resolveActionTargets(sessions, EMPTY_OPTIMISTIC);
     expect(ids(t.stop)).toEqual(["running", "acp", "fork", "capable", "stale", "hidden", "boxed"]);

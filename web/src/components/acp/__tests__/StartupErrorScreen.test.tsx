@@ -407,11 +407,14 @@ describe("StartupErrorScreen", () => {
 
   it("installing: the primary button shows progress and every action waits", async () => {
     installAcpAgent.mockReturnValue(new Promise(() => {}));
-    const { getByTestId } = await renderScreen(incompatible(), info(allowed));
+    const { getByTestId } = await renderScreen(incompatible(), info({ ...sandbox, ...allowed }), {
+      recreateContainerTitle: "api-server",
+    });
     fireEvent.click(getByTestId("startup-error-update-restart"));
     await waitFor(() => expect(getByTestId("startup-error-update-restart").textContent).toBe("Updating…"));
-    expect((getByTestId("startup-error-update-restart") as HTMLButtonElement).disabled).toBe(true);
-    expect((getByTestId("startup-error-restart") as HTMLButtonElement).disabled).toBe(true);
+    for (const id of ["startup-error-update-restart", "startup-error-restart", "startup-error-recreate-container"]) {
+      expect((getByTestId(id) as HTMLButtonElement).disabled, id).toBe(true);
+    }
   });
 
   it("a successful install respawns and reports Sessions queued for recovery", async () => {
