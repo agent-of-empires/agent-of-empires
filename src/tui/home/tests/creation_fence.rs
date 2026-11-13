@@ -20,7 +20,12 @@ fn saving_during_creation_never_persists_the_display_placeholder() {
     view.session_feed
         .publish_for_test(creation_snapshot(vec![], "test", 1));
     view.apply_session_feed();
-    view.request_creation(creation_data(&project_dir, "Pending", "test"), None, None);
+    view.request_creation(
+        creation_data(&project_dir, "Pending", "test"),
+        None,
+        None,
+        false,
+    );
     let stub = view.creating_stub_id.clone().unwrap();
     let storage = Storage::new_unwatched("default").unwrap();
     let before = payload_bytes("default");
@@ -70,7 +75,12 @@ fn session_actions_refuse_the_creating_stub() {
     view.session_feed
         .publish_for_test(creation_snapshot(vec![], "test", 1));
     view.apply_session_feed();
-    view.request_creation(creation_data(&project_dir, "Fenced", "fenced"), None, None);
+    view.request_creation(
+        creation_data(&project_dir, "Fenced", "fenced"),
+        None,
+        None,
+        false,
+    );
     assert!(
         view.creating_stub_id.is_some(),
         "request_creation installs the stub"
@@ -159,7 +169,12 @@ fn a_cancellation_before_the_daemon_names_the_creation_is_delivered_later() {
     view.session_feed
         .publish_for_test(creation_snapshot(vec![], "test", 1));
     view.apply_session_feed();
-    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None, None);
+    view.request_creation(
+        creation_data(&project_dir, "Delayed", "test"),
+        None,
+        None,
+        false,
+    );
     let stub = view
         .creating_stub_id
         .clone()
@@ -230,7 +245,12 @@ fn refused_create_after_early_cancel_settles_without_a_stub_or_daemon_id() {
     view.session_feed
         .publish_for_test(creation_snapshot(vec![], "test", 1));
     view.apply_session_feed();
-    view.request_creation(creation_data(&project_dir, "Delayed", "test"), None, None);
+    view.request_creation(
+        creation_data(&project_dir, "Delayed", "test"),
+        None,
+        None,
+        false,
+    );
     let key = view.creating_stub_id.clone().unwrap();
     view.cancel_creation();
     assert!(view.creating_stub_id.is_none());
@@ -257,7 +277,7 @@ fn unknown_create_outcome_waits_for_matching_canonical_row_across_profiles() {
     view.apply_session_feed();
     let mut data = creation_data(&project_dir, "Same title", "group");
     data.profile = "other".into();
-    view.request_creation(data, None, None);
+    view.request_creation(data, None, None, false);
     let key = view.creating_stub_id.clone().unwrap();
     assert_eq!(driver(), vec![format!("create:{key}")]);
     assert!(view.apply_creation_results().is_none());
@@ -359,7 +379,7 @@ fn creation_receipt_waits_for_applied_snapshot_and_retries_profile_loading_witho
         view.apply_session_feed();
         let mut data = creation_data(&project_dir, "Confirmed", "group");
         data.profile = profile.into();
-        view.request_creation(data, None, None);
+        view.request_creation(data, None, None, false);
         let key = view.creating_stub_id.clone().unwrap();
         let mut committed = Instance::new("Confirmed", project_dir.to_str().unwrap());
         committed.source_profile = profile.into();
@@ -467,7 +487,12 @@ fn retrying_a_snapshot_preserves_one_creation_stub_and_never_resubmits_or_cancel
         1,
     ));
     view.apply_session_feed();
-    view.request_creation(creation_data(&project_dir, "Pending", "group"), None, None);
+    view.request_creation(
+        creation_data(&project_dir, "Pending", "group"),
+        None,
+        None,
+        false,
+    );
     let key = view.creating_stub_id.clone().unwrap();
     assert_eq!(driver(), vec![format!("create:{key}")]);
     let mut reservation = Instance::new("Pending", project_dir.to_str().unwrap());
@@ -535,7 +560,7 @@ async fn unknown_creation_uses_current_canonical_authority_after_reconnection_no
     view.apply_session_feed();
     let mut data = creation_data(&project_dir, "Unknown", "group");
     data.profile = "other".into();
-    view.request_creation(data, None, None);
+    view.request_creation(data, None, None, false);
     let key = view.creating_stub_id.clone().unwrap();
     assert_eq!(driver(), vec![format!("create:{key}")]);
     assert!(view.apply_creation_results().is_none());
@@ -625,6 +650,7 @@ fn a_hook_failure_offers_retry_create_without_setup_or_cancel() {
             creation_data(&project_dir, "Hooked", "test"),
             Some(true),
             None,
+            false,
         );
         let first = fail(failure);
         assert!(view.apply_creation_results().is_none());
@@ -696,6 +722,7 @@ fn a_refused_resubmit_keeps_the_recovery_dialog_and_its_request() {
             creation_data(&project_dir, "Hooked", "test"),
             Some(true),
             None,
+            false,
         );
         let first = fail(CommandFailure::CreateHookFailed("exit 3".into()));
         assert!(view.apply_creation_results().is_none());
@@ -707,7 +734,12 @@ fn a_refused_resubmit_keeps_the_recovery_dialog_and_its_request() {
         };
 
         if case == "already pending" {
-            view.request_creation(creation_data(&project_dir, "Other", "test"), None, None);
+            view.request_creation(
+                creation_data(&project_dir, "Other", "test"),
+                None,
+                None,
+                false,
+            );
             assert!(view.is_creation_pending(), "{case}");
             let stub = view.creating_stub_id.clone();
             view.handle_key(key(KeyCode::Enter), None);
@@ -748,6 +780,102 @@ fn a_refused_resubmit_keeps_the_recovery_dialog_and_its_request() {
     }
 }
 
+/// The daemon refuses a trust review that no longer matches, so a resubmit reviews again.
+/// Unchanged, it resends; a repo hook changed since the refusal reopens the trust prompt on
+/// the kept request; a changed global hook with no repo hooks is pinned without a prompt.
+#[test]
+#[serial]
+fn a_resubmit_reviews_trust_again_once_the_hooks_change() {
+    use crate::tui::home::input::creation_trust_review;
+    use crate::tui::session_feed::CommandFailure;
+    let write_repo_hook = |project: &std::path::Path, command: &str| {
+        let dir = project.join(".agent-of-empires");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!("[hooks]\non_create = [\"{command}\"]\n");
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    };
+    // (what changes after the refusal, the dialog key, whether the trust prompt reopens)
+    for (change, key_code, prompted) in [
+        ("nothing", KeyCode::Enter, false),
+        ("repo hook", KeyCode::Char('s'), true),
+        ("global hook", KeyCode::Enter, false),
+    ] {
+        let CreationTestEnv {
+            mut view,
+            project_dir,
+            _guard,
+            _temp,
+        } = setup_creation_test_env();
+        let mut fail = view.session_feed.creation_failure_driver_for_test();
+        view.session_feed
+            .publish_for_test(creation_snapshot(vec![], "test", 1));
+        view.apply_session_feed();
+        let repo = change != "global hook";
+        if repo {
+            write_repo_hook(&project_dir, "exit 3");
+        }
+        let data = || creation_data(&project_dir, "Hooked", "test");
+        let (_, first_review) = creation_trust_review(&data()).unwrap();
+        let trust_hooks = repo.then_some(true);
+        view.request_creation(data(), trust_hooks, Some(first_review.clone()), false);
+        let first = fail(CommandFailure::CreateHookFailed("exit 3".into()));
+        assert!(view.apply_creation_results().is_none());
+        assert!(view.create_hook_failed.is_some(), "{change}");
+
+        match change {
+            "repo hook" => write_repo_hook(&project_dir, "echo fixed"),
+            "global hook" => crate::session::config::update_config(|config| {
+                config.hooks.on_create = vec!["echo global".into()]
+            })
+            .unwrap(),
+            _ => {}
+        }
+        if change == "global hook" {
+            // A resend refused before it is sent keeps the dialog, now with the new review.
+            view.session_feed.set_mutation_permission_for_test(false);
+            view.handle_key(key(key_code), None);
+            let kept = view
+                .create_hook_failed
+                .as_ref()
+                .map(|(_, r)| r.trust_review.clone());
+            let (_, now) = creation_trust_review(&data()).unwrap();
+            assert_eq!(kept, Some(Some(now)), "{change}");
+            view.handle_key(key(KeyCode::Esc), None);
+            view.session_feed.set_mutation_permission_for_test(true);
+        }
+        view.handle_key(key(key_code), None);
+        assert!(view.create_hook_failed.is_none(), "{change}");
+        if prompted {
+            assert!(
+                view.creating_stub_id.is_none(),
+                "{change}: nothing sent yet"
+            );
+            let screen = render_home_to_string(&mut view, 120, 40);
+            assert!(
+                screen.contains("echo fixed"),
+                "{change}: the new hook\n{screen}"
+            );
+            let kept = view
+                .pending_repo_trust_data
+                .as_ref()
+                .map(|d| d.title.as_str());
+            assert_eq!(kept, Some("Hooked"), "{change}");
+            view.handle_key(key(KeyCode::Char('y')), None);
+        }
+        let second = fail(CommandFailure::Rejected("done".into()));
+        let (_, now) = creation_trust_review(&data()).unwrap();
+        assert_eq!(second.trust_review.as_ref(), Some(&now), "{change}");
+        assert_eq!(now != first_review, change != "nothing", "{change}");
+        assert_eq!(second.trust_hooks, trust_hooks, "{change}");
+        assert_eq!(
+            second.skip_on_create,
+            key_code == KeyCode::Char('s'),
+            "{change}"
+        );
+        assert_ne!(second.idempotency_key, first.idempotency_key, "{change}");
+    }
+}
+
 /// The session-setup dialog has no text input: a paste while it is open is dropped, not
 /// routed into a compose dialog over it or saved for whichever dialog opens next. The
 /// settings view takes keys before the dialog, so a paste into it still lands there.
@@ -772,7 +900,12 @@ fn a_paste_over_the_setup_failed_dialog_goes_nowhere() {
         running.source_profile = "default".to_string();
         let running_id = running.id.clone();
         view.add_instance(running);
-        view.request_creation(creation_data(&project_dir, "Hooked", "test"), None, None);
+        view.request_creation(
+            creation_data(&project_dir, "Hooked", "test"),
+            None,
+            None,
+            false,
+        );
         fail(CommandFailure::CreateHookFailed("exit 3".into()));
         assert!(view.apply_creation_results().is_none());
         assert!(view.create_hook_failed.is_some());

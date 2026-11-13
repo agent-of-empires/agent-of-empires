@@ -13,13 +13,14 @@ impl HomeView {
         data: NewSessionData,
         trust_hooks: Option<bool>,
         trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+        skip_on_create: bool,
     ) {
         // The form shows its own refusal; only the recovery dialog keeps the request.
         let _ = self.submit_creation(CreationRequest {
             data,
             trust_hooks,
             trust_review,
-            skip_on_create: false,
+            skip_on_create,
         });
     }
 
@@ -167,6 +168,10 @@ impl HomeView {
     /// Retry and Create without setup resubmit the kept request; Cancel drops it, as the
     /// daemon already rolled the failed attempt back. A resubmit refused before it is sent
     /// reopens the dialog with the same request, under the refusal's message.
+    ///
+    /// The daemon refuses a trust review that no longer matches, so a hook config changed
+    /// since the refusal is reviewed again: without a prompt the request carries the new
+    /// review, and with one the trust dialog takes over the kept request.
     pub(super) fn resolve_create_hook_failed(
         &mut self,
         result: DialogResult<CreateHookFailedAction>,
@@ -181,6 +186,23 @@ impl HomeView {
             return;
         };
         request.skip_on_create = action == CreateHookFailedAction::CreateWithoutSetup;
+        if let Some(review) = request.trust_review.as_ref() {
+            match super::input::creation_trust_review(&request.data) {
+                Ok((_, fingerprint)) if &fingerprint == review => {}
+                Ok((trust, fingerprint)) if !trust.needs_prompt() => {
+                    let decision = super::input::unprompted_trust_decision(&trust, fingerprint);
+                    (request.trust_hooks, request.trust_review) = decision.into_request();
+                }
+                Ok(_) => {
+                    let _ = self.review_creation_trust(request.data, request.skip_on_create);
+                    return;
+                }
+                // The daemon judges a review this process cannot rebuild.
+                Err(error) => {
+                    tracing::warn!(target: "tui.input", "Failed to review repo trust: {error:#}")
+                }
+            }
+        }
         if let Err(request) = self.submit_creation(request) {
             self.create_hook_failed = Some((dialog, *request));
         }

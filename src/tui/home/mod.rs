@@ -303,6 +303,8 @@ pub struct HomeView {
     /// Canonical daemon-reviewed configuration fingerprint for the pending
     /// approval. Approval is never persisted locally before daemon validation.
     pub(super) pending_repo_trust_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
+    /// Create without setup, carried through the trust prompt a resubmit reopened.
+    pub(super) pending_repo_trust_skip_on_create: bool,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
     pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
