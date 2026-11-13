@@ -14106,7 +14106,8 @@ async fn failover_pool_fixture(
 
     let (row, guard_a, guard_b, guard_c) =
         carry_ready_row("claude", crate::session::View::Structured, false, true);
-    let home = dirs::home_dir().unwrap();
+    // Account keys are resolved paths, so the expected keys must be resolved the same way.
+    let home = std::fs::canonicalize(dirs::home_dir().unwrap()).unwrap();
     std::fs::write(
         crate::session::get_app_dir().unwrap().join("config.toml"),
         "[acp]\nrate_limit_failover = true\n\

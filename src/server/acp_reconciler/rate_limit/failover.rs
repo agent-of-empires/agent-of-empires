@@ -89,13 +89,37 @@ pub(super) fn account_key(row: &Instance) -> Option<String> {
         .map(path_key)
 }
 
-/// Aliases of one directory (a symlink, `..`) are one account; a directory that does not exist
-/// yet keeps its path as written.
-fn path_key(path: &std::path::Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+/// Aliases of one directory (a symlink, `..`) are one account, including before the directory
+/// exists: the deepest existing ancestor is resolved and the missing tail appended, so a config
+/// root keys the same on the attempt that creates it and on every one after.
+pub(super) fn path_key(path: &std::path::Path) -> String {
+    let mut deepest = path.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&deepest) {
+            let tail = path
+                .strip_prefix(&deepest)
+                .unwrap_or(std::path::Path::new(""));
+            return fold_tail(real, tail).to_string_lossy().into_owned();
+        }
+        match deepest.parent() {
+            Some(parent) => deepest = parent.to_path_buf(),
+            None => return path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+/// Apply the unresolved tail to the resolved ancestor. Nothing there exists yet, so `..` can only
+/// cancel the component before it, the way `canonicalize` folds it once the path does exist.
+fn fold_tail(mut key: std::path::PathBuf, tail: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    for part in tail.components() {
+        match part {
+            Component::ParentDir => drop(key.pop()),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::Normal(name) => key.push(name),
+        }
+    }
+    key
 }
 
 /// The configured pool entries that run the same built-in agent as `row` and declare a config
@@ -736,8 +760,50 @@ mod tests {
         let missing = dir.path().join("not-yet");
         assert_eq!(
             path_key(&missing),
-            missing.to_string_lossy(),
-            "a directory that does not exist keeps its path"
+            format!("{}/not-yet", path_key(dir.path())),
+            "a missing tail is appended to the resolved parent"
+        );
+        let relative = std::path::Path::new("no-such/account");
+        assert_eq!(
+            path_key(relative),
+            relative.to_string_lossy(),
+            "a path with no existing ancestor stays as written"
+        );
+    }
+
+    #[test]
+    fn an_account_keys_the_same_before_and_after_its_root_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let root = link.join("account");
+        let before = path_key(&root);
+        assert_eq!(before, path_key(&real.join("account")));
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(
+            before,
+            path_key(&root),
+            "creating the root must not rekey the account"
+        );
+
+        let scope = real.join("scope");
+        std::fs::create_dir(&scope).unwrap();
+        let through_parent = scope.join("missing").join("..").join("account");
+        let before = path_key(&through_parent);
+        assert_eq!(
+            before,
+            path_key(&scope.join("account")),
+            "a `..` root names the directory it ends at"
+        );
+        std::fs::create_dir(scope.join("missing")).unwrap();
+        std::fs::create_dir(scope.join("account")).unwrap();
+        assert_eq!(
+            before,
+            path_key(&through_parent),
+            "creating the `..` root must not rekey the account"
         );
     }
 
