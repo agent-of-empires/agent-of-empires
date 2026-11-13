@@ -11,7 +11,7 @@ import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { isNewSessionStarting } from "./startupWait";
+import { isNewSessionStarting, isRetryingStart } from "./startupWait";
 import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
 import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
@@ -202,6 +202,12 @@ function AcpChrome({
   const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, !!view.startedBefore)
     ? agentName(state.agent ?? acpAgent)
     : null;
+  // Nothing to ask while the Agent can't start, or until a Retry has started it.
+  const notRunning = isRetryingStart(state)
+    ? `${agentName(state.agent ?? acpAgent)} isn't running yet.`
+    : state.startupError
+      ? `${agentName(state.agent ?? acpAgent)} isn't running.`
+      : null;
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   // Rows before the latest `/clear` divider are the hidden history.
@@ -294,7 +300,7 @@ function AcpChrome({
             <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
               {!readOnly && (
                 <ThreadPrimitive.Empty>
-                  <EmptyState onPick={ctx.sendPrompt} />
+                  <EmptyState onPick={ctx.sendPrompt} notRunning={notRunning} />
                 </ThreadPrimitive.Empty>
               )}
 
@@ -561,7 +567,13 @@ function ComposerDock({
   );
 }
 
-function EmptyState({ onPick }: { onPick: (text: string) => Promise<void> }) {
+function EmptyState({ onPick, notRunning }: { onPick: (text: string) => Promise<void>; notRunning: string | null }) {
+  if (notRunning)
+    return (
+      <div data-testid="acp-empty-not-running" className="mt-12 text-center text-sm text-text-muted">
+        {notRunning}
+      </div>
+    );
   return (
     <div className="mt-12 flex flex-col items-center gap-4 text-center">
       <div className="text-sm text-text-muted">Ask the agent anything about this workspace.</div>
