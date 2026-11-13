@@ -1519,8 +1519,8 @@ function AppContent({
       setWizardPrefill({
         path: repoPath,
         tool: latest?.tool,
-        yoloMode: latest?.yolo_mode ?? false,
-        sandboxEnabled: latest?.is_sandboxed ?? false,
+        yoloMode: latest?.yolo_mode,
+        sandboxEnabled: latest?.is_sandboxed,
         profile,
         group: latest?.group_path || undefined,
         worktreeEnabled: registered?.overrides?.worktree_enabled,

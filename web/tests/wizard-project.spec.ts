@@ -97,6 +97,20 @@ test.describe("project new session", () => {
     await page.getByRole("button", { name: "New session in example" }).click();
     await expect(wizard(page).getByTestId("wizard-agent-row")).toContainText("vibe");
   });
+
+  test("a project with no sessions opens with the Yolo and Sandbox defaults on (#5639)", async ({ page }) => {
+    await startWizard(page, {
+      docker: true,
+      sessions: [],
+      projects: [{ name: "example", path: "/work/example", scope: "global", pinned: false }],
+      settings: { session: { yolo_mode_default: true }, sandbox: { enabled_by_default: true } },
+      project: false,
+    });
+    await page.getByRole("button", { name: "New session in example" }).click();
+    for (const label of ["Run in a safe container", "Yolo mode"]) {
+      await expect(wizard(page).getByRole("switch", { name: label })).toHaveAttribute("aria-checked", "true");
+    }
+  });
 });
 
 test.describe("extra repos", () => {
