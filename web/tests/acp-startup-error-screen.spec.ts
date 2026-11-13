@@ -1,4 +1,4 @@
-// The adapter compatibility screen: the setting unlocks Update on focus, and the phone layout.
+// The adapter compatibility screen: the setting unlocks Update on focus, and the phone layout with Recreate container.
 
 import type { Page } from "@playwright/test";
 
@@ -11,6 +11,7 @@ const IN_CONTAINER = "podman exec aoe-sandbox-story-ad npm install -g @agentclie
 async function openRefusedSession(page: Page) {
   const mock = await mockAcpSession(page, {
     title: "story-adapter-out-of-date",
+    sessionFields: { is_sandboxed: true },
     initialEvents: [
       {
         IncompatibleAgent: {
@@ -78,5 +79,21 @@ test.describe("at 375px", () => {
       () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
     );
     expect(overflow).toBeLessThanOrEqual(0);
+  });
+
+  test("Recreate container fits beside the others and opens its confirmation on screen", async ({ page }) => {
+    const { screen } = await openRefusedSession(page);
+    const recreate = screen.getByRole("button", { name: "Recreate container" });
+    await expect(recreate).toBeInViewport({ ratio: 1 });
+    await recreate.click();
+    const dialog = page.getByRole("dialog", { name: "Recreate container" });
+    await expect(dialog).toContainText("story-adapter-out-of-date");
+    await expect(page.getByTestId("recreate-container-confirm")).toBeInViewport({ ratio: 1 });
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(dialog).toBeHidden();
   });
 });

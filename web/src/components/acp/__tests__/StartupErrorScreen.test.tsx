@@ -10,6 +10,7 @@ import { StartupErrorScreen } from "../StartupErrorScreen";
 
 const fetchAgentInstallInfo = vi.fn();
 const installAcpAgent = vi.fn();
+const recreateSessionContainer = vi.fn();
 const writeClipboard = vi.fn().mockResolvedValue(true);
 vi.mock("../../../lib/clipboard", () => ({
   writeClipboard: (text: string) => writeClipboard(text),
@@ -18,6 +19,7 @@ vi.mock("../../../lib/api", async (importOriginal) => ({
   InstallAgentError: (await importOriginal<typeof import("../../../lib/api")>()).InstallAgentError,
   fetchAgentInstallInfo: (...args: unknown[]) => fetchAgentInstallInfo(...args),
   installAcpAgent: (...args: unknown[]) => installAcpAgent(...args),
+  recreateSessionContainer: (...args: unknown[]) => recreateSessionContainer(...args),
 }));
 
 const CLAUDE_NPM = "npm install -g @agentclientprotocol/claude-agent-acp@latest";
@@ -76,9 +78,13 @@ function expectValidatedText(screen: HTMLElement) {
   expect(screen.querySelectorAll(".text-status-running:not([aria-hidden])")).toHaveLength(0);
 }
 
-async function renderScreen(detail: IncompatibleAgentDetail, answer: AgentInstallInfo | null = info()) {
+async function renderScreen(
+  detail: IncompatibleAgentDetail,
+  answer: AgentInstallInfo | null = info(),
+  props: { isSandboxed?: boolean; recreateContainerTitle?: string } = {},
+) {
   fetchAgentInstallInfo.mockResolvedValue(answer);
-  const view = render(<StartupErrorScreen detail={detail} sessionId="s1" />);
+  const view = render(<StartupErrorScreen detail={detail} sessionId="s1" {...props} />);
   await waitFor(() => expect(fetchAgentInstallInfo).toHaveBeenCalledWith("s1"));
   if (answer) await waitFor(() => expect(view.getByRole("heading").textContent).toContain(answer.display_name));
   return view;
@@ -107,6 +113,7 @@ function expectStepsNameRenderedButtons(screen: HTMLElement, titles: string[]) {
 beforeEach(() => {
   fetchAgentInstallInfo.mockReset();
   installAcpAgent.mockReset();
+  recreateSessionContainer.mockReset();
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, text: () => Promise.resolve("") }));
 });
 
@@ -511,6 +518,69 @@ describe("StartupErrorScreen", () => {
       }
       cleanup();
     }
+  });
+
+  it("offers Recreate container in every state of a sandboxed Session the dashboard may recreate", async () => {
+    const title = { recreateContainerTitle: "api-server" };
+    const stopped = { ...sandbox, install_allowed: false, install_blocked: "container_not_running" } as const;
+    const protocol: IncompatibleAgentDetail = { kind: "unsupported_protocol_version", expected: "V1", received: "V2" };
+    const proxy: IncompatibleAgentDetail = { kind: "invalid_proxy_hello", reason: "bad hello" };
+    const cases: [string, IncompatibleAgentDetail, AgentInstallInfo | null, typeof title | object, string[]][] = [
+      [
+        "web install",
+        incompatible(),
+        info({ ...sandbox, ...allowed }),
+        title,
+        ["Update in Sandbox & restart", "Check again", "Recreate container"],
+      ],
+      [
+        "installs off",
+        incompatible(),
+        info(sandbox),
+        title,
+        ["Update in Sandbox & restart", "Check again", "Recreate container"],
+      ],
+      ["stopped container", incompatible(), info(stopped), title, ["Start the container", "Recreate container"]],
+      [
+        "manual only",
+        incompatible(false, OPENCODE),
+        { ...opencode, ...sandbox, container_install_command: null },
+        title,
+        ["Check again", "Recreate container"],
+      ],
+      ["protocol", protocol, info(sandbox), title, ["Check again", "Recreate container"]],
+      ["proxy hello", proxy, info(sandbox), title, ["Check again", "Recreate container"]],
+      // install-info outranks the Session list's flag.
+      [
+        "install-info says sandboxed",
+        protocol,
+        info(sandbox),
+        { ...title, isSandboxed: false },
+        ["Check again", "Recreate container"],
+      ],
+      ["install-info says host", protocol, info(), { ...title, isSandboxed: true }, ["Check again"]],
+      ["not eligible", protocol, info(sandbox), {}, ["Check again"]],
+      ["before install-info answers", protocol, null, { ...title, isSandboxed: true }, ["Check again"]],
+      ["read-only", protocol, info({ ...sandbox, install_blocked: "read_only" }), title, []],
+      ["CityHall", protocol, info({ ...sandbox, install_blocked: "cityhall" }), title, []],
+    ];
+    for (const [label, detail, answer, props, expected] of cases) {
+      const { getByTestId } = await renderScreen(detail, answer, props);
+      expect(buttons(getByTestId("startup-error-screen")), label).toEqual(expected);
+      cleanup();
+    }
+  });
+
+  it("Recreate container opens the Session menu's confirmation, and Cancel sends nothing", async () => {
+    const { getByTestId, findByRole, queryByRole } = await renderScreen(incompatible(), info(sandbox), {
+      recreateContainerTitle: "api-server",
+    });
+    fireEvent.click(getByTestId("startup-error-recreate-container"));
+    const dialog = await findByRole("dialog", { name: "Recreate container" });
+    expect(dialog.textContent).toContain("api-server");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(queryByRole("dialog")).toBeNull());
+    expect(recreateSessionContainer).not.toHaveBeenCalled();
   });
 
   it("fails again: a version failure after the install says it changed nothing", async () => {
