@@ -531,6 +531,16 @@ describe("a Retry of a startup error", () => {
       ["worse", null, false],
     ],
     [
+      "a prompt echo during it keeps it",
+      [retry(), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p1" } })],
+      [null, "boom", true],
+    ],
+    [
+      "a later error with no Retry is a first failure again",
+      [retry(), failed(2, "worse"), failed(3, "other")],
+      ["other", null, false],
+    ],
+    [
       "sending after a failed Retry clears it",
       [retry(), failed(2, "worse"), { kind: "user_prompt", text: "hi" }],
       [null, null, false],
