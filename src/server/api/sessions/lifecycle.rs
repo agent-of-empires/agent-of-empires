@@ -2771,9 +2771,10 @@ pub(super) enum AgentPreparation {
 enum RestartOrigin {
     Explicit,
     StartupRecovery,
-    /// An automatic account failover decided on this event-log head.
+    /// An automatic account failover decided on this event-log head and lifecycle generation.
     Failover {
         park_seq: u64,
+        generation: u64,
     },
 }
 
@@ -2883,14 +2884,17 @@ impl FailoverError {
 /// continuing the interrupted prompt. `expected_seq` is the event-log head the failover
 /// decision read: under the submission authority and the instance lock, the swap proceeds only
 /// if the session is still parked on that head with no worker, so a prompt, a manual resume or
-/// the timed auto-resume that landed meanwhile wins and nothing is sent twice.
+/// the timed auto-resume that landed meanwhile wins and nothing is sent twice. `generation` is
+/// the row's lifecycle generation at the decision: a stop that landed since is the owner's and
+/// is never consumed.
 pub(crate) async fn failover_account_swap(
     state: &Arc<AppState>,
     id: &str,
     tool: &str,
     expected_seq: u64,
+    generation: u64,
 ) -> Result<(), FailoverError> {
-    failover_account_swap_with(state, id, tool, expected_seq, async {}).await
+    failover_account_swap_with(state, id, tool, expected_seq, generation, async {}).await
 }
 
 /// `after_restart` runs once the restart returned, before the failure is handled: the point
@@ -2900,6 +2904,7 @@ pub(super) async fn failover_account_swap_with(
     id: &str,
     tool: &str,
     expected_seq: u64,
+    generation: u64,
     after_restart: impl std::future::Future<Output = ()>,
 ) -> Result<(), FailoverError> {
     let claim = Arc::new(FailoverClaim::default());
@@ -2916,6 +2921,7 @@ pub(super) async fn failover_account_swap_with(
         None,
         RestartOrigin::Failover {
             park_seq: expected_seq,
+            generation,
         },
         Some(claim.clone()),
     )
@@ -3112,8 +3118,21 @@ async fn prepare_agent_session_inner(
     }
     if let RestartOrigin::Failover {
         park_seq: expected_seq,
+        generation,
     } = restart_origin
     {
+        // Idle reaping and status polling stop or dormant a row without bumping its generation,
+        // so the status checks are not covered by the comparison.
+        if instance.lifecycle_generation != generation
+            || instance.status == Status::Stopped
+            || instance.is_idle_dormant()
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "park_changed",
+                "The session was stopped or restarted since the failover was decided".to_string(),
+            );
+        }
         let store = Arc::clone(&state.acp_event_store);
         let probe_id = id.clone();
         let still_parked = tokio::task::spawn_blocking(move || {
@@ -3188,11 +3207,10 @@ async fn prepare_agent_session_inner(
             message,
         );
     }
+    // Failover is excluded: the reaper never picks a stopped or dormant row, so one found here
+    // is an owner stop that automatic work must not consume.
     if instance.is_structured()
-        && matches!(
-            restart_origin,
-            RestartOrigin::Explicit | RestartOrigin::Failover { .. }
-        )
+        && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {

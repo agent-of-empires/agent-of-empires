@@ -13726,7 +13726,7 @@ async fn a_failover_swap_refuses_once_the_park_moved_on() {
     let head = state.acp_event_store.highest_seq("failover-cas");
 
     // The decision was made on an older head: a prompt landed since.
-    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head - 1)
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head - 1, 0)
         .await
         .unwrap_err();
     assert!(error.message.contains("moved on"), "{error:?}");
@@ -13737,7 +13737,7 @@ async fn a_failover_swap_refuses_once_the_park_moved_on() {
 
     // On the current head the guard passes and the swap's own refusal answers
     // (no recorded conversation), still before anything stops.
-    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head)
+    let error = lifecycle::failover_account_swap(&state, "failover-cas", "claude-b", head, 0)
         .await
         .unwrap_err();
     assert!(
@@ -13795,9 +13795,10 @@ async fn a_failed_failover_swap_leaves_the_row_on_its_account() {
     let head = state.acp_event_store.highest_seq(&row.id);
 
     // The source account holds no transcript, so the carry fails once the row has moved.
-    let error = lifecycle::failover_account_swap(&state, &row.id, "b", head)
-        .await
-        .expect_err("the carry has nothing to copy");
+    let error =
+        lifecycle::failover_account_swap(&state, &row.id, "b", head, row.lifecycle_generation)
+            .await
+            .expect_err("the carry has nothing to copy");
     assert!(
         !error.permanent,
         "a failed carry may clear by itself: {error:?}"
@@ -13947,9 +13948,16 @@ async fn a_failed_failover_rollback_leaves_a_newer_stop_alone() {
         }
     };
 
-    lifecycle::failover_account_swap_with(&state, &row.id, "b", head, newer)
-        .await
-        .expect_err("the carry has nothing to copy");
+    lifecycle::failover_account_swap_with(
+        &state,
+        &row.id,
+        "b",
+        head,
+        row.lifecycle_generation,
+        newer,
+    )
+    .await
+    .expect_err("the carry has nothing to copy");
 
     let live = state.instances.read().await[0].clone();
     assert!(
@@ -13977,9 +13985,16 @@ async fn a_failed_failover_rollback_leaves_a_newer_restart_alone() {
         }
     };
 
-    lifecycle::failover_account_swap_with(&state, &row.id, "b", head, newer)
-        .await
-        .expect_err("the carry has nothing to copy");
+    lifecycle::failover_account_swap_with(
+        &state,
+        &row.id,
+        "b",
+        head,
+        row.lifecycle_generation,
+        newer,
+    )
+    .await
+    .expect_err("the carry has nothing to copy");
 
     let live = state.instances.read().await[0].clone();
     assert_eq!(live.tool, "b", "the newer restart's account stands");
@@ -13992,12 +14007,13 @@ async fn a_failed_failover_rollback_leaves_a_newer_restart_alone() {
 #[serial_test::serial]
 async fn a_failed_failover_rolls_back_to_the_account_it_found_under_its_locks() {
     let (state, row, head, _a, _b, _c) = failing_failover_swap_fixture(None).await;
+    let generation = row.lifecycle_generation;
     let (entered, release) =
         lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeLocks);
     let swap = tokio::spawn({
         let state = state.clone();
         let id = row.id.clone();
-        async move { lifecycle::failover_account_swap(&state, &id, "b", head).await }
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head, generation).await }
     });
     entered.await.expect("the failover waits for its locks");
 
@@ -14041,9 +14057,10 @@ async fn a_login_failure_at_initialize_is_reported_by_the_failed_swap() {
     ))
     .await;
 
-    let error = lifecycle::failover_account_swap(&state, &row.id, "b", head)
-        .await
-        .expect_err("the target cannot log in");
+    let error =
+        lifecycle::failover_account_swap(&state, &row.id, "b", head, row.lifecycle_generation)
+            .await
+            .expect_err("the target cannot log in");
 
     assert!(
         error.message.to_lowercase().contains("authentic"),
@@ -14231,13 +14248,14 @@ async fn a_newer_launch_limited_during_an_old_failover_hook_still_parks() {
     let (launcher, launches) = rate_limited_then_working_launcher(1);
     let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
     let head = state.acp_event_store.highest_seq(&row.id);
+    let generation = row.lifecycle_generation;
     let (entered, release) =
         lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeHooks);
 
     let old = tokio::spawn({
         let state = state.clone();
         let id = row.id.clone();
-        async move { lifecycle::failover_account_swap(&state, &id, "b", head).await }
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head, generation).await }
     });
     entered.await.expect("the failover reached its hook");
 
@@ -14299,6 +14317,73 @@ async fn a_newer_launch_limited_during_an_old_failover_hook_still_parks() {
         "c",
         "the obsolete failover must not restore its row over the newer restart"
     );
+}
+
+/// An owner stop of the workerless parked row that completes before the failover takes its
+/// locks leaves a newer stopped, dormant row. The failover decided on the row before it, so it
+/// neither launches nor consumes that stop.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failover_leaves_an_owner_stop_that_landed_before_its_locks() {
+    let (launcher, launches) = rate_limited_then_working_launcher(0);
+    let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+    let generation = row.lifecycle_generation;
+    let (entered, release) =
+        lifecycle::launch_hook_gate::arm(&row.id, lifecycle::launch_hook_gate::Stage::BeforeLocks);
+    let swap = tokio::spawn({
+        let state = state.clone();
+        let id = row.id.clone();
+        async move { lifecycle::failover_account_swap(&state, &id, "b", head, generation).await }
+    });
+    entered.await.expect("the failover waits for its locks");
+
+    let stopped = super::stop_session(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(row.id.clone()),
+    )
+    .await
+    .into_response();
+    assert!(stopped.status().is_success(), "{}", stopped.status());
+    let stop = state.instances.read().await[0].clone();
+    assert!(stop.is_idle_dormant(), "a stop leaves the row dormant");
+
+    release.send(()).unwrap();
+    swap.await
+        .unwrap()
+        .expect_err("the failover decided before the stop");
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let live = state.instances.read().await[0].clone();
+    let on_disk = crate::session::Storage::open_unwatched(&row.source_profile)
+        .unwrap()
+        .load()
+        .unwrap()
+        .remove(0);
+    for (place, found) in [("memory", &live), ("disk", &on_disk)] {
+        assert_eq!(
+            (found.lifecycle_generation, found.is_idle_dormant()),
+            (stop.lifecycle_generation, true),
+            "{place}: the owner's stop stands"
+        );
+        assert_eq!(found.tool, "a", "{place}");
+    }
+}
+
+/// The control for the stop above: with nothing in between, the same failover launches.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_failover_with_no_stop_in_between_launches() {
+    let (launcher, launches) = rate_limited_then_working_launcher(0);
+    let (state, row, _home, _a, _b, _c) = failover_pool_fixture(launcher).await;
+    let head = state.acp_event_store.highest_seq(&row.id);
+
+    lifecycle::failover_account_swap(&state, &row.id, "b", head, row.lifecycle_generation)
+        .await
+        .expect("nothing moved the row");
+
+    assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(state.instances.read().await[0].tool, "b");
 }
 
 /// Every other account limited at `initialize`: attempts stop, and the session stays on A's park.
