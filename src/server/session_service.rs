@@ -2529,18 +2529,25 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         "initial prompts are only typed into a known agent"
     );
     let deadline = std::time::Instant::now() + budget;
-    while crate::server::api::sessions::ready_agent_session_for_automatic_input(instance)?.is_none()
-    {
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the agent was not running within {}s",
-            budget.as_secs()
-        );
+    // A probe error is "not ready yet" while the pane is still starting; the
+    // last one is reported only when the budget runs out.
+    loop {
+        let probe = crate::server::api::sessions::ready_agent_session_for_automatic_input(instance);
+        if matches!(probe, Ok(Some(_))) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(match probe {
+                Err(error) => error.context(format!(
+                    "the agent was not running within {}s",
+                    budget.as_secs()
+                )),
+                Ok(_) => anyhow::anyhow!("the agent was not running within {}s", budget.as_secs()),
+            });
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
-    let remaining = deadline
-        .saturating_duration_since(std::time::Instant::now())
-        .max(std::time::Duration::from_secs(2));
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
     anyhow::ensure!(
         instance
             .tmux_session()?
@@ -3902,7 +3909,7 @@ mod tests {
         remain_on_exit: bool,
     ) -> crate::tmux::test_helpers::TmuxTestSession {
         let name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let mut args = vec![
+        let mut args: Vec<String> = [
             "new-session",
             "-d",
             "-s",
@@ -3914,15 +3921,12 @@ mod tests {
             "sh",
             "-c",
             script,
-            ";",
-            "set-option",
-            "-t",
-            &name,
-            "pane-base-index",
-            "0",
-        ];
+        ]
+        .map(String::from)
+        .into();
+        crate::tmux::utils::append_pane_base_index_args(&mut args, &name);
         if remain_on_exit {
-            args.extend([";", "set-option", "-t", &name, "remain-on-exit", "on"]);
+            crate::tmux::utils::append_remain_on_exit_args(&mut args, &name);
         }
         let status = crate::tmux::tmux_command()
             .args(args)
