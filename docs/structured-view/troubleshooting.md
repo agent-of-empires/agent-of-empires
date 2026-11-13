@@ -20,6 +20,7 @@ The dashboard shows the same thing inline, as a screen that names the Agent, the
 - **Installs not allowed yet:** step 1 is to turn on `acp.allow_agent_install`, and the button stays disabled until it's on. The setting is **off by default**, because a global install runs the package's lifecycle scripts as the daemon user. It is `local_only`, so the dashboard can't turn it on: enable it from the TUI settings (Advanced) or the config file. The screen notices the change when you come back to the tab.
 - **A sandbox container that isn't running:** for an npm adapter, **Start the container** first; the update comes back once it runs. For an adapter you install by hand, step 1 is **Check again**, which starts the container so the command can run inside it.
 - **Not installable from here:** the command to run by hand, with **Copy**, then **Check again**, which respawns the worker and re-runs the version check.
+- **A sandboxed session, in any of these states:** **Recreate container** restarts the session on a new container from the current local image, after the same confirmation as **More > Recreate container** in its context menu. Anything outside the working directory and the mounted folders is lost. See [Sandbox](../guides/sandbox.md#available-images).
 - **Read-only and CityHall dashboards** show the command only. Restart the agent from the TUI.
 
 ### "Failed to start structured view agent" while the adapter is installed
