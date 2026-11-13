@@ -30,6 +30,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-plz-')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -64,10 +67,16 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
+      # The push that landed this release skipped its refresh.
+      - name: Refresh the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-plz.yml --repo "$GITHUB_REPOSITORY" --ref main
+
   release-pr:
     name: Update release PR
-    # Skip a push that lands the release PR, even mid-batch: its version is not tagged yet,
-    # and the next push opens the next release PR.
+    # Skip a push that lands the release PR, even mid-batch: its version is not tagged yet.
+    # Tag release dispatches the refresh once it is.
     if: >-
       github.repository == 'agent-of-empires/agent-of-empires' &&
       github.event_name != 'pull_request' &&
