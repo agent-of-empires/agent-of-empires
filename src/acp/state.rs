@@ -2132,6 +2132,31 @@ mod tests {
             }
         ));
 
+        let legacy: Event =
+            serde_json::from_value(serde_json::json!({ "AgentStartupError": { "message": "x" } }))
+                .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::AgentStartupError { cause: None, .. }
+        ));
+        for (event, wire) in [
+            (
+                Event::startup_error("x"),
+                serde_json::json!({ "AgentStartupError": { "message": "x" } }),
+            ),
+            (
+                Event::AgentStartupError {
+                    message: "x".into(),
+                    cause: Some(StartupCause::ContainerMissing),
+                },
+                serde_json::json!({ "AgentStartupError": {
+                    "message": "x", "cause": { "kind": "container_missing" }
+                } }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&event).unwrap(), wire);
+        }
+
         for (json, want) in [
             ("\"model\"", ConfigOptionCategory::Model),
             ("\"thought_level\"", ConfigOptionCategory::ThoughtLevel),

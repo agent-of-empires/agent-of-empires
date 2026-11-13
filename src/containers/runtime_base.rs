@@ -246,7 +246,30 @@ impl RuntimeBase {
         timeout: Duration,
     ) -> Result<std::process::Output> {
         cmd.stdin(Stdio::null());
-        match crate::process::run_with_timeout(cmd, timeout) {
+        self.probe_result(crate::process::run_with_timeout(cmd, timeout), timeout)
+    }
+
+    /// [`Self::probe_output`] that kills the command's process group once `cancel` fires.
+    pub(crate) fn probe_output_until_cancelled(
+        &self,
+        cmd: &mut Command,
+        cancel: &CancellationToken,
+    ) -> Result<std::process::Output> {
+        cmd.stdin(Stdio::null());
+        let result =
+            crate::process::run_until_cancelled_process_group(cmd, RUNTIME_CMD_TIMEOUT, cancel);
+        if matches!(result, Ok(None)) && cancel.is_cancelled() {
+            return Err(DockerError::Cancelled(format!("{} probe", self.binary)));
+        }
+        self.probe_result(result, RUNTIME_CMD_TIMEOUT)
+    }
+
+    fn probe_result(
+        &self,
+        result: std::io::Result<Option<std::process::Output>>,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
+        match result {
             Ok(Some(output)) => Ok(output),
             Ok(None) => Err(DockerError::IoError(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
