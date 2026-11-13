@@ -47,12 +47,6 @@ describe("failureView", () => {
       },
     ],
     [
-      "hook, on a CityHall server",
-      failure("hook_failed", "running_hooks"),
-      { canSkipSetup: false },
-      { secondary: null },
-    ],
-    [
       "missing working directory",
       failure("working_dir_missing", "preparing"),
       {},

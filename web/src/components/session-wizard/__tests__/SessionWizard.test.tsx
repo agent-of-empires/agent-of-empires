@@ -1703,6 +1703,17 @@ describe("SessionWizard create failures", () => {
     expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
   });
 
+  it("a CityHall wizard offers only Try again after a failed hook, since the server won't skip setup", async () => {
+    createSession.mockResolvedValueOnce(
+      failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."),
+    );
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(screen.getByTestId("create-failure-try_again")).toBeTruthy();
+    expect(screen.queryByTestId("create-failure-create_without_setup")).toBeNull();
+  });
+
   it("Create without setup resends with skip_on_create under a new key, and only that once", async () => {
     createSession
       .mockResolvedValueOnce(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."))
