@@ -118,7 +118,8 @@ function initialWizardData(prefill: WizardPrefill | undefined, nameOnly: boolean
     sandboxEnabled: prefill.sandboxEnabled ?? false,
     profile: prefill.profile || "",
     group: prefill.group || "",
-    initialPrompt: prefill.initialPrompt ?? "",
+    // A name-only wizard shows no Prompt row, so a provider draft would be sent unseen.
+    initialPrompt: nameOnly ? "" : (prefill.initialPrompt ?? ""),
     title: prefill.title ?? "",
     worktreeBranch: prefill.title ? slugifyBranch(prefill.title) : base.worktreeBranch,
     scratch: prefill.scratch ?? false,

@@ -2133,6 +2133,21 @@ describe("SessionWizard initial prompt", () => {
     expect(payload()).toMatchObject({ initial_prompt: "edited" });
   });
 
+  it("does not send a prefilled prompt from a name-only wizard, which never shows it", async () => {
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        nameOnly
+        prefill={{ title: "Fix it", initialPrompt: "provider draft" }}
+      />,
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().initial_prompt).toBeUndefined();
+  });
+
   it("omits initial_prompt when the field is blank", async () => {
     renderWizard();
     fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "  " } });
