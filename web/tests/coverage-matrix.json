@@ -1864,6 +1864,14 @@
       ]
     },
     {
+      "id": "sidebar.label-contrast",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-chrome.spec.ts"],
+      "components": ["web/src/components/sidebar/SessionRow.tsx"],
+      "notes": "Archived and snoozed Idle labels retain italic styling and full effective opacity so their theme text contrast is preserved."
+    },
+    {
       "id": "sidebar.compact-mode",
       "kind": "mocked-playwright",
       "risk": "medium",
