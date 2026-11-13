@@ -455,11 +455,7 @@ impl SuggestionsView {
             .snapshot
             .iter()
             .flat_map(|s| &s.items)
-            .filter(|i| {
-                self.show_dismissed
-                    || !i.dismissed
-                    || store.is_recent(&(i.provider_id.clone(), i.id.clone()))
-            })
+            .filter(|i| store.is_listed(i, self.show_dismissed))
             .collect();
         let mut seen: Vec<&str> = Vec::new();
         for item in &listed {
@@ -1123,6 +1119,23 @@ impl SuggestionsFeed {
         let before = self.recent.len();
         self.recent.retain(|(_, at)| at.elapsed() < UNDO_WINDOW);
         self.recent.len() != before
+    }
+
+    /// Whether the full view lists `item`: undismissed, dismissed within the
+    /// undo window, or any when dismissed ones are shown. Stale items are listed.
+    fn is_listed(&self, item: &Item, show_dismissed: bool) -> bool {
+        show_dismissed
+            || !item.dismissed
+            || self.is_recent(&(item.provider_id.clone(), item.id.clone()))
+    }
+
+    /// How many suggestions the full view lists by default, stale ones included.
+    pub(super) fn listed_count(&self) -> usize {
+        self.snapshot
+            .iter()
+            .flat_map(|s| &s.items)
+            .filter(|i| self.is_listed(i, false))
+            .count()
     }
 
     /// `(provider_id, id)` of every suggestion of a listed provider that is
@@ -1922,6 +1935,20 @@ mod tests {
         let text = render_text(&rig);
         assert!(text.contains("reason · api"), "{text}");
         assert!(text.contains("reason · hint-name"), "{text}");
+    }
+
+    #[test]
+    fn the_listed_count_matches_the_rows_the_full_view_shows() {
+        let mut stale = item("old", None, false);
+        stale.stale = true;
+        let dismissed = item("gone", None, true);
+        let rig = view_with(
+            vec![item("fresh", None, false), stale, dismissed],
+            idle_worker(),
+        );
+        assert_eq!(rig.store.keys().len(), 1, "Home starts only the fresh one");
+        assert_eq!(rig.view.order.len(), 2, "the view lists the stale one too");
+        assert_eq!(rig.store.listed_count(), rig.view.order.len());
     }
 
     #[test]

@@ -213,7 +213,7 @@ impl HomeView {
         let bold = Style::default().add_modifier(Modifier::BOLD);
         let (title, lines): (String, Vec<Line>) = match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, .. }) if crate::session::is_suggested_section_path(path) => {
-                let total = self.suggestions_feed.keys().len();
+                let total = self.suggestions_feed.listed_count();
                 (
                     format!("Suggested ({total})"),
                     vec![
