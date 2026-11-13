@@ -62,7 +62,11 @@ export function failureFields(failure: CreateFailure): readonly ("path" | "sandb
  *  Container runtime still down. */
 export function failureView(
   failure: CreateFailure,
-  { sandboxEnabled, runtimeDown }: { sandboxEnabled: boolean; runtimeDown: boolean },
+  {
+    sandboxEnabled,
+    runtimeDown,
+    canSkipSetup = true,
+  }: { sandboxEnabled: boolean; runtimeDown: boolean; canSkipSetup?: boolean },
 ): FailureView {
   const base = {
     step: failure.stage ? STEP[failure.stage] : null,
@@ -96,7 +100,8 @@ export function failureView(
         ...base,
         title: "An on_create hook failed",
         primary: "try_again",
-        secondary: "create_without_setup",
+        // CityHall servers refuse to skip setup.
+        secondary: canSkipSetup ? "create_without_setup" : null,
         row: null,
         cue: null,
         showOutput: true,

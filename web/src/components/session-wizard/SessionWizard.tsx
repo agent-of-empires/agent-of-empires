@@ -898,7 +898,9 @@ export function SessionWizard({
   };
 
   const d = state.data;
-  const failed = state.failure && failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown });
+  const failed =
+    state.failure &&
+    failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown, canSkipSetup: !nameOnly });
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
   // Only the Yolo row needs the agent list, and a name-only form has none.
@@ -911,7 +913,8 @@ export function SessionWizard({
   const resendBlocked = (action: FailureAction) => {
     if (action === "change_image" || action === "choose_project") return false;
     // Retry checks the runtime itself, and Launch without Sandbox doesn't need it.
-    return !canResend || (action === "try_again" && d.sandboxEnabled && !state.dockerChecked);
+    const resendsSandbox = action === "try_again" || action === "create_without_setup";
+    return !canResend || (resendsSandbox && d.sandboxEnabled && !state.dockerChecked);
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);

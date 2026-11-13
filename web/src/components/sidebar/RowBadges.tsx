@@ -34,15 +34,18 @@ function Chip({
   title,
   label,
   className,
+  role,
   children,
 }: {
   title: string;
   label: string;
   className: string;
+  /** "img" for an icon-only chip, which a bare span can't name. */
+  role?: "img";
   children: ReactNode;
 }) {
   return (
-    <span title={title} aria-label={label} className={className}>
+    <span title={title} aria-label={label} role={role} className={className}>
       {children}
     </span>
   );
@@ -150,7 +153,7 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
       )}
       <RateLimitBadge sessions={workspace.sessions} />
       {workspace.sessions.some((s) => s.created_without_setup) && (
-        <Chip title="Created without setup" label="Created without setup" className={`${CHIP} ${MUTED}`}>
+        <Chip title="Created without setup" label="Created without setup" role="img" className={`${CHIP} ${MUTED}`}>
           <WrenchOff className="h-3 w-3" />
         </Chip>
       )}
