@@ -2653,6 +2653,9 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
     if let Some(binding) = &spec.import_binding {
         field("import_binding", &format!("{binding:?}"));
     }
+    if spec.pull_latest_image {
+        field("pull_latest_image", "true");
+    }
     use std::fmt::Write;
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
@@ -3016,6 +3019,14 @@ mod tests {
             a,
             spec_payload_hash(&with_turn),
             "the initial turn is part of the request identity"
+        );
+
+        let mut pulling = test_spec();
+        pulling.pull_latest_image = true;
+        assert_ne!(
+            a,
+            spec_payload_hash(&pulling),
+            "a pull is part of the request identity"
         );
 
         // Adjacent-field concatenation must not collide.
