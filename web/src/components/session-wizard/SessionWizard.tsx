@@ -728,7 +728,12 @@ export function SessionWizard({
   };
 
   // `overrides` and `runtimeUp` were dispatched in the same event, which `state` doesn't hold yet.
-  const handleSubmit = async (overrides: Partial<WizardData> = {}, runtimeUp = false) => {
+  // `skipOnCreate` stays out of the form, so a reopened or later Launch runs setup again.
+  const handleSubmit = async (
+    overrides: Partial<WizardData> = {},
+    runtimeUp = false,
+    { skipOnCreate = false }: { skipOnCreate?: boolean } = {},
+  ) => {
     dispatch({ type: "SUBMIT_START" });
     setRuntimeDown(false);
     if (unknownOutcome) {
@@ -754,6 +759,7 @@ export function SessionWizard({
           agents.find((a) => a.name === d.tool),
           d,
         ),
+        { skipOnCreate },
       ),
       idempotency_key: newIdempotencyKey(),
     };
@@ -879,6 +885,10 @@ export function SessionWizard({
         return;
       case "try_again":
         await handleSubmit();
+        return;
+      case "create_without_setup":
+        // A new key: the failed create would be replayed to its own.
+        await handleSubmit({}, false, { skipOnCreate: true });
     }
   };
 

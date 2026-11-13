@@ -37,6 +37,8 @@ describe("SessionRow chips", () => {
     ["worker stopping", { view: "structured", acp_worker_state: "stopping" }, ["Stopping"], []],
     ["armed monitor", { monitor_active: true, monitor_description: "clippy passes" }, ["Monitoring clippy passes"], []],
     ["no monitor", {}, [], [/^Monitoring/]],
+    ["created without setup", { created_without_setup: true }, ["Created without setup"], []],
+    ["created with setup", {}, [], ["Created without setup"]],
   ] as [string, Partial<SessionResponse>, (string | RegExp)[], (string | RegExp)[]][])(
     "%s",
     (_name, over, present, absent) => {

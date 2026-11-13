@@ -1687,6 +1687,27 @@ describe("SessionWizard create failures", () => {
     expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
   });
 
+  it("Create without setup resends with skip_on_create under a new key, and only that once", async () => {
+    createSession
+      .mockResolvedValueOnce(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."))
+      .mockResolvedValueOnce(failure("create_failed", "starting", "The agent exited."));
+    renderWizard();
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(screen.getByTestId("create-failure-try_again").textContent).toBe("Try again");
+    fireEvent.click(screen.getByTestId("create-failure-create_without_setup"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(0).skip_on_create).toBeUndefined();
+    expect(payload(1).skip_on_create).toBe(true);
+    expect(payload(1).idempotency_key).toBeTruthy();
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+    // The skip was for that resend; trying again after another failure runs setup.
+    await waitFor(() => expect(box().textContent).toContain("The agent exited."));
+    fireEvent.click(screen.getByTestId("create-failure-try_again"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(3));
+    expect(payload(2).skip_on_create).toBeUndefined();
+  });
+
   /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard.
    *  `whileSending` runs after Launch, before the progress view replaces the form. */
   const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude", whileSending?: () => void) => {

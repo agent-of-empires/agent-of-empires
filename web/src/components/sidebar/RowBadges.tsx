@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Archive, Hourglass, Moon, Pencil, Sparkles } from "lucide-react";
+import { Archive, Hourglass, Moon, Pencil, Sparkles, WrenchOff } from "lucide-react";
 import type {
   ContextResumeAvailability,
   ContextResumeUnavailableReason,
@@ -149,6 +149,12 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
         </Chip>
       )}
       <RateLimitBadge sessions={workspace.sessions} />
+      {workspace.sessions.some((s) => s.created_without_setup) && (
+        <Chip title="Created without setup" label="Created without setup" className={`${CHIP} gap-0.5 ${MUTED}`}>
+          <WrenchOff className="h-3 w-3" />
+          <span className="hidden sm:inline">Created without setup</span>
+        </Chip>
+      )}
       {effectiveArchived && (
         <Chip title="Archived" label="Archived" className={`${CHIP} gap-0.5 ${MUTED}`}>
           <Archive className="h-3 w-3" />

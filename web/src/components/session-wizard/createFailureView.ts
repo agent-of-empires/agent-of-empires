@@ -5,7 +5,8 @@ export type FailureAction =
   | "launch_without_sandbox"
   | "change_image"
   | "choose_project"
-  | "try_again";
+  | "try_again"
+  | "create_without_setup";
 
 export const FAILURE_ACTION_LABEL: Record<FailureAction, string> = {
   retry_runtime: "Retry",
@@ -13,6 +14,7 @@ export const FAILURE_ACTION_LABEL: Record<FailureAction, string> = {
   change_image: "Change image",
   choose_project: "Choose Project",
   try_again: "Try again",
+  create_without_setup: "Create without setup",
 };
 
 export interface FailureView {
@@ -94,7 +96,7 @@ export function failureView(
         ...base,
         title: "An on_create hook failed",
         primary: "try_again",
-        secondary: null,
+        secondary: "create_without_setup",
         row: null,
         cue: null,
         showOutput: true,
