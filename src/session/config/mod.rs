@@ -71,6 +71,9 @@ pub struct Config {
     pub web: WebConfig,
 
     #[serde(default)]
+    pub serve: ServeConfig,
+
+    #[serde(default)]
     pub auth: AuthConfig,
 
     #[serde(default)]
@@ -658,6 +661,31 @@ pub struct AcpConfig {
         summary = "When an Agent hits its usage limit, pick up again on its own once the limit resets. It stops trying after a few attempts in a row."
     )]
     pub rate_limit_auto_resume: bool,
+    /// Opt-in account failover. When a host structured session parks on a
+    /// rate limit and another account in `rate_limit_failover_accounts` has
+    /// headroom, the session continues there instead of waiting for the reset:
+    /// the conversation is carried to that account and the interrupted prompt
+    /// is re-sent once. Needs the same agent behind both accounts and a
+    /// carryable conversation, otherwise the normal banner stays. You are
+    /// responsible for complying with the agent provider's terms for the
+    /// accounts you configure.
+    #[serde(default)]
+    #[setting(
+        label = "Fail over to another account on rate limit",
+        widget = "toggle",
+        web = "local_only:moves a session's transcript between configured accounts"
+    )]
+    pub rate_limit_failover: bool,
+    /// Ordered failover pool: tool names, each an account declared under
+    /// `[session.agent_config_dir]`. Only names running the same built-in agent
+    /// as the session are used; others are ignored with a warning.
+    #[serde(default)]
+    #[setting(
+        label = "Failover accounts",
+        widget = "list",
+        web = "local_only:names accounts whose config directories hold credentials"
+    )]
+    pub rate_limit_failover_accounts: Vec<String>,
     /// Allow the web dashboard's "Update & restart" control to run the
     /// agent's `npm install -g <pkg>` on the host and respawn the worker.
     /// Off by default: the daemon executing a global package install is a
@@ -737,6 +765,8 @@ impl Default for AcpConfig {
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             auto_stop_idle_secs: default_acp_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
+            rate_limit_failover: false,
+            rate_limit_failover_accounts: Vec::new(),
             allow_agent_install: false,
             acp_defaults: HashMap::new(),
         }
@@ -1031,6 +1061,22 @@ pub struct AppStateConfig {
     /// found it themselves do not need its earned discovery tip.
     #[serde(default)]
     pub used_system_health: bool,
+
+    /// Web setup wizard steps the user chose to skip. See `GET /api/setup`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_skipped_steps: Vec<String>,
+    /// Optional web setup steps whose defaults the user kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_confirmed_steps: Vec<String>,
+    /// The user finished the web setup wizard.
+    #[serde(default)]
+    pub setup_finished: bool,
+    /// The user left the wizard for the dashboard, so `/` stops redirecting.
+    #[serde(default)]
+    pub setup_deferred: bool,
+    /// The user closed the dashboard's "Finish setting up" banner.
+    #[serde(default)]
+    pub setup_banner_dismissed: bool,
 
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
@@ -2641,6 +2687,41 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             persist_sessions: true,
+        }
+    }
+}
+
+/// Debug builds use 8081 so a `cargo run` daemon does not collide with an
+/// installed release `aoe` on 8080.
+pub(crate) const DEFAULT_SERVE_PORT: u16 = if cfg!(debug_assertions) { 8081 } else { 8080 };
+
+const fn default_serve_port() -> u16 {
+    DEFAULT_SERVE_PORT
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "serve", category = "Web")]
+pub struct ServeConfig {
+    /// TCP port for a newly started `aoe serve` daemon. `--port` and the
+    /// `AOE_SERVE_PORT` environment variable take precedence. A running daemon
+    /// keeps its recorded port across `--restart`.
+    #[serde(default = "default_serve_port")]
+    #[setting(
+        label = "Daemon port",
+        widget = "number",
+        min = 1,
+        max = 65535,
+        validate = "range:1:65535",
+        global_only,
+        summary = "Port for a newly started Daemon. A restart keeps the running Daemon's port."
+    )]
+    pub port: u16,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            port: DEFAULT_SERVE_PORT,
         }
     }
 }

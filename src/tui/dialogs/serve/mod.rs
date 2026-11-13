@@ -1,37 +1,134 @@
 //! Remote access view: a controller for the `aoe serve --daemon` lifecycle, which outlives the TUI.
 
 mod daemon;
+mod jobs;
 mod render;
 mod words;
+mod work;
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 
-use crate::acp::client::autostart::initial_log_tail;
-use crate::cli::serve::{read_serve_urls, ServeLaunch, ServeUrl};
+use crate::acp::client::autostart::{initial_log_tail, LogContext};
+use crate::cli::serve::{ServeLaunch, ServeUrl, TuiControlLease, TuiControlTarget};
 use crate::tui::components::hover::HoverState;
 use crate::tui::dialogs::{contains, hit, target_rects};
 use crate::tui::styles::Theme;
-use crate::tui::worker::Worker;
 use daemon::*;
+pub(crate) use jobs::ServeJobs;
+use jobs::{Submitter, Ticket};
+use work::{run_job, Job, JobResult};
 
 const FLASH_TTL: Duration = Duration::from_millis(1500);
 const CONFIRM_TTL: Duration = Duration::from_secs(3);
+/// How often the open provider screen re-checks its providers in the background.
+const PROVIDER_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum ServeAction {
-    Launch(ServeLaunchRequest),
-    Stop,
+    Stop(ServeStopRequest),
+    StopOwnedLaunch,
     Continue,
     Close,
 }
+pub struct ServeStopRequest {
+    context: DashboardStop,
+    retry: Option<(u64, Ticket)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct DashboardStop {
+    target: TuiControlTarget,
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
+}
+
+impl ServeStopRequest {
+    fn new(target: TuiControlTarget, mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
+        Self {
+            context: DashboardStop {
+                target,
+                mode,
+                transport,
+            },
+            retry: None,
+        }
+    }
+
+    pub(crate) fn presentation(&self) -> DashboardStop {
+        self.context.clone()
+    }
+
+    pub(crate) fn run(
+        self,
+        jobs: &mut ServeJobs,
+    ) -> impl Future<Output = anyhow::Result<()>> + Send + 'static {
+        let (attempt, ticket) = self.retry.unwrap_or_else(|| {
+            (
+                0,
+                jobs.submitter().request(0, Job::Stop(self.context.target)),
+            )
+        });
+        async move {
+            match ticket.finish(attempt).await? {
+                JobResult::Stopped | JobResult::Retried { .. } => Ok(()),
+                JobResult::Failed(message) => Err(anyhow::anyhow!(message)),
+                _ => anyhow::bail!("The dashboard stop returned an unrelated result"),
+            }
+        }
+    }
+}
+
+enum LaunchIntent {
+    Start(Option<TuiControlTarget>),
+    Restart(TuiControlTarget),
+}
+
 pub struct ServeLaunchRequest {
-    restart: bool,
+    intent: LaunchIntent,
     mode: ServeMode,
     transport: Option<TunnelTransport>,
     passphrase: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ServeLaunchFailure {
+    pub(crate) message: String,
+    pub(crate) log_tail: LogContext,
+    pub(crate) target: Option<TuiControlTarget>,
+}
+
+impl ServeLaunchFailure {
+    /// Capture on the launch owner, not on the event loop.
+    pub(crate) fn capture(message: String) -> Self {
+        Self {
+            message,
+            log_tail: initial_log_tail(),
+            target: None,
+        }
+    }
+}
+
+impl From<crate::cli::serve::TuiDashboardLaunchFailure> for ServeLaunchFailure {
+    fn from(failure: crate::cli::serve::TuiDashboardLaunchFailure) -> Self {
+        let error = failure.error;
+        let message = if error.downcast_ref::<crate::session::LoadSource>().is_some()
+            || matches!(
+                error.downcast_ref::<crate::daemon::RuntimeConnectionError>(),
+                Some(crate::daemon::RuntimeConnectionError::Protocol)
+            ) {
+            crate::session::sanitized_load_failure(&error)
+        } else {
+            tracing::warn!(target: "tui.home", error = %format_args!("{error:#}"), "dashboard launch failed");
+            "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
+        };
+        let mut captured = Self::capture(message);
+        captured.target = failure.target;
+        captured
+    }
 }
 
 /// A dashboard launch the App runs, kept on Home so a view opened meanwhile shows it.
@@ -44,10 +141,23 @@ pub enum DashboardLaunch {
     /// Failed with no view open; the next view shows it, once.
     Failed {
         target: LaunchTarget,
-        message: String,
-        /// The daemon log's last lines when it failed, not when the view opens.
-        log_tail: Vec<String>,
+        failure: ServeLaunchFailure,
     },
+}
+
+impl DashboardLaunch {
+    pub(crate) fn observed_target(self) -> Option<TuiControlTarget> {
+        match self {
+            Self::Running { target, .. } | Self::Failed { target, .. } => target.observed_target,
+        }
+    }
+
+    pub(crate) fn stop_request(self, control: TuiControlTarget) -> ServeStopRequest {
+        let target = match self {
+            Self::Running { target, .. } | Self::Failed { target, .. } => target,
+        };
+        ServeStopRequest::new(control, target.mode, target.transport)
+    }
 }
 
 #[cfg(test)]
@@ -58,6 +168,7 @@ impl DashboardLaunch {
                 mode: ServeMode::Tunnel,
                 transport: Some(TunnelTransport::Tailscale),
                 passphrase: None,
+                observed_target: None,
             },
             started_at,
         }
@@ -69,14 +180,20 @@ pub struct LaunchTarget {
     mode: ServeMode,
     transport: Option<TunnelTransport>,
     passphrase: Option<String>,
+    observed_target: Option<TuiControlTarget>,
 }
 
 impl ServeLaunchRequest {
     pub(crate) fn target(&self) -> LaunchTarget {
+        let observed_target = match &self.intent {
+            LaunchIntent::Start(target) => target.clone(),
+            LaunchIntent::Restart(target) => Some(target.clone()),
+        };
         LaunchTarget {
             mode: self.mode,
             transport: self.transport,
             passphrase: self.passphrase.clone(),
+            observed_target,
         }
     }
 
@@ -84,16 +201,29 @@ impl ServeLaunchRequest {
         self,
         profile: String,
         predecessor_epoch: Option<String>,
-    ) -> Result<
-        (
-            crate::daemon::RuntimeConnection,
-            crate::daemon::DaemonClient,
-        ),
-        String,
-    > {
+    ) -> Result<crate::cli::serve::TuiDashboardLaunch, ServeLaunchFailure> {
         use clap::Parser;
-        let port = crate::acp::client::autostart::load_or_generate_port().to_string();
-        let mut argv = vec!["aoe", "serve", "--daemon", "--port", port.as_str()];
+        let restart = match self.intent {
+            LaunchIntent::Restart(target) => Some(
+                TuiControlLease::prepare(target, &tokio_util::sync::CancellationToken::new())
+                    .await
+                    .map_err(|error| {
+                        ServeLaunchFailure::from(crate::cli::serve::TuiDashboardLaunchFailure {
+                            error,
+                            target: None,
+                        })
+                    })?,
+            ),
+            LaunchIntent::Start(_) => None,
+        };
+        // An explicit AOE_SERVE_PORT wins over the saved or random port.
+        let port = std::env::var_os("AOE_SERVE_PORT")
+            .is_none_or(|value| value.is_empty())
+            .then(|| crate::acp::client::autostart::load_or_generate_port().to_string());
+        let mut argv = vec!["aoe", "serve", "--daemon"];
+        if let Some(port) = port.as_deref() {
+            argv.extend(["--port", port]);
+        }
         match self.mode {
             ServeMode::Local => argv.extend(["--host", "0.0.0.0"]),
             ServeMode::Tunnel => {
@@ -103,36 +233,50 @@ impl ServeLaunchRequest {
                 }
             }
         }
-        let parsed = crate::cli::Cli::try_parse_from(argv).map_err(|error| error.to_string())?;
+        let parsed = crate::cli::Cli::try_parse_from(argv).map_err(|error| ServeLaunchFailure {
+            message: error.to_string(),
+            log_tail: LogContext::default(),
+            target: None,
+        })?;
         let Some(crate::cli::Commands::Serve(mut args)) = parsed.command else {
             unreachable!();
         };
         args.passphrase = self.passphrase.clone();
-        let result = crate::cli::serve::start_dashboard_for_tui(&profile, args, predecessor_epoch.as_deref(), self.restart).await
-            .map_err(|error| {
-                if error.downcast_ref::<crate::session::LoadSource>().is_some()
-                    || matches!(error.downcast_ref::<crate::daemon::RuntimeConnectionError>(), Some(crate::daemon::RuntimeConnectionError::Protocol))
-                {
-                    crate::session::sanitized_load_failure(&error)
-                } else {
-                    tracing::warn!(target: "tui.home", %error, "dashboard launch failed");
-                    "Dashboard start failed. Check `aoe logs`; use `aoe serve --status` to inspect the current daemon. If replacement stopped its predecessor, restore the retained launch explicitly with `aoe serve --rollback`.".to_owned()
-                }
-            });
-        if result.is_err()
-            && initial_log_tail()
-                .iter()
-                .any(|line| line.contains("EADDRINUSE") || line.contains("Address already in use"))
-        {
-            remove_app_file("serve.last_port");
-        }
+        let mut result = crate::cli::serve::start_dashboard_for_tui(
+            &profile,
+            args,
+            predecessor_epoch.as_deref(),
+            restart,
+        )
+        .await
+        .map_err(ServeLaunchFailure::from);
         if result.is_ok() {
             remember_last_mode(self.mode);
         }
         // A failed reconnect can follow a successor that already runs the new passphrase.
         if let Some(passphrase) = self.passphrase {
-            if result.is_ok() || crate::cli::serve::daemon_runs_passphrase(&passphrase) {
-                remember_passphrase(&passphrase);
+            let (passphrase, running) = if result.is_ok() {
+                (passphrase, true)
+            } else {
+                match tokio::task::spawn_blocking(move || {
+                    let running = crate::cli::serve::daemon_runs_passphrase(&passphrase);
+                    (passphrase, running)
+                })
+                .await
+                {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        if let Err(failure) = &mut result {
+                            let _ = std::fmt::Write::write_fmt(
+                                &mut failure.message,
+                                format_args!("\nCould not verify the rotated passphrase: {error}"),
+                            );
+                        }
+                        return result;
+                    }
+                }
+            };
+            if running {
                 save_passphrase_to_disk(&passphrase);
             }
         }
@@ -207,48 +351,6 @@ fn expire_flash(flash: &mut Flash) -> bool {
     expired
 }
 
-/// What a probe checks; each shells out to `ps` on macOS, so it runs on a worker.
-enum Probe {
-    /// A web daemon is running.
-    WebDaemon,
-    /// Any daemon is running.
-    Daemon,
-}
-
-fn run_probe(probe: Probe) -> bool {
-    match probe {
-        Probe::WebDaemon => crate::cli::serve::web_daemon_pid().is_some(),
-        Probe::Daemon => crate::cli::serve::daemon_pid().is_some(),
-    }
-}
-
-/// Probes run one at a time on a worker. Each carries an attempt id, and a result applies
-/// only while the state it was requested for is still waiting on that attempt.
-struct Probes {
-    worker: Worker<(u64, Probe), (u64, bool)>,
-    last_attempt: u64,
-    /// The in-flight liveness probe for `Starting`.
-    liveness: Option<u64>,
-}
-
-impl Probes {
-    fn new(mut handler: impl FnMut(Probe) -> bool + Send + 'static) -> Self {
-        Self {
-            worker: Worker::spawn("aoe-serve-dialog-probe", move |(attempt, probe)| {
-                (attempt, handler(probe))
-            }),
-            last_attempt: 0,
-            liveness: None,
-        }
-    }
-
-    fn request(&mut self, probe: Probe) -> u64 {
-        self.last_attempt += 1;
-        self.worker.request((self.last_attempt, probe));
-        self.last_attempt
-    }
-}
-
 enum ServeViewState {
     /// Waiting on the probe that decides between reattaching and the mode picker.
     Checking { attempt: u64 },
@@ -292,23 +394,35 @@ enum ServeViewState {
 }
 
 impl ServeViewState {
-    fn mode_picker() -> Self {
-        let tunnel_available = crate::server::tunnel::tailscale_probe_sync()
+    fn mode_picker(cancel: &tokio_util::sync::CancellationToken) -> (Self, String) {
+        let tunnel_available = crate::server::tunnel::tailscale_probe_sync(cancel)
             != crate::server::tunnel::TailscaleProbe::Unavailable
-            || crate::server::tunnel::check_cloudflared().is_ok();
-        let local_available = !crate::server::discover_tagged_ips().is_empty();
+            || crate::server::tunnel::check_cloudflared(cancel).is_ok();
+        let ips = crate::server::discover_tagged_ips();
+        let local_available = !ips.is_empty();
+        let primary = ips
+            .first()
+            .map(|(kind, ip)| match kind {
+                crate::server::IpKind::Tailscale => format!("{ip} (Tailscale)"),
+                crate::server::IpKind::Lan => format!("{ip} (LAN)"),
+                crate::server::IpKind::Loopback => format!("{ip} (loopback)"),
+            })
+            .unwrap_or_else(|| "only localhost available".to_owned());
         // Prefer the last launched mode, falling back to whichever one is available.
         let last = read_last_mode().unwrap_or(ServeMode::Local);
         let selected = match (last, local_available, tunnel_available) {
             (ServeMode::Local, false, true) | (ServeMode::Tunnel, _, true) => ServeMode::Tunnel,
             _ => ServeMode::Local,
         };
-        ServeViewState::ModePicker {
-            selected,
-            tunnel_available,
-            local_available,
-            flash: None,
-        }
+        (
+            ServeViewState::ModePicker {
+                selected,
+                tunnel_available,
+                local_available,
+                flash: None,
+            },
+            primary,
+        )
     }
 
     /// The provider screen after a Tunnel failure: the provider that did not just fail is
@@ -335,21 +449,14 @@ impl ServeViewState {
         }
     }
 
-    /// A start that failed, with the likely cause and the daemon's last log lines, which hold
-    /// the reason it gave.
-    fn start_failed(mode: ServeMode, transport: Option<TunnelTransport>, headline: &str) -> Self {
-        Self::start_failed_with(mode, transport, headline, initial_log_tail())
-    }
-
     fn start_failed_with(
         mode: ServeMode,
         transport: Option<TunnelTransport>,
         headline: &str,
-        tail: Vec<String>,
+        tail: LogContext,
     ) -> Self {
-        let hint = diagnose_daemon_exit(&tail.join("\n"), mode);
         ServeViewState::Error {
-            message: format!("{headline}{hint}{}", last_log_lines(&tail)),
+            message: format!("{headline}{}", last_log_lines(&tail)),
             mode,
             transport,
         }
@@ -360,9 +467,9 @@ impl ServeViewState {
         mode: ServeMode,
         transport: Option<TunnelTransport>,
         passphrase: Option<String>,
+        urls: Vec<ServeUrl>,
         log_offset: u64,
     ) -> Self {
-        let urls = read_serve_urls();
         if urls.is_empty() {
             return ServeViewState::Starting {
                 mode,
@@ -458,7 +565,11 @@ struct RestartProbe {
 }
 
 impl RestartProbe {
-    fn now(mode: ServeMode, transport: Option<TunnelTransport>) -> Self {
+    fn now(
+        mode: ServeMode,
+        transport: Option<TunnelTransport>,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Self {
         let recorded = crate::cli::serve::recorded_launch();
         match mode {
             ServeMode::Local => RestartProbe {
@@ -475,7 +586,7 @@ impl RestartProbe {
                 named_host: None,
             },
             ServeMode::Tunnel => RestartProbe {
-                on_funnel: restart_on_funnel(transport),
+                on_funnel: restart_on_funnel(transport, cancel),
                 persists: persist_sessions(),
                 named_host: recorded
                     .and_then(|launch| launch.tunnel_name.and(launch.tunnel_url))
@@ -577,10 +688,13 @@ fn persist_sessions() -> bool {
 
 /// The server's choice: `--no-tailscale` for an explicit Cloudflare pick, otherwise Funnel
 /// whenever `tailscale` is installed and logged in.
-fn restart_on_funnel(transport: Option<TunnelTransport>) -> bool {
+fn restart_on_funnel(
+    transport: Option<TunnelTransport>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
     let no_tailscale = transport == Some(TunnelTransport::Cloudflare);
     !crate::server::tunnel::skips_tailscale(no_tailscale, None, None)
-        && crate::server::tunnel::tailscale_probe_sync()
+        && crate::server::tunnel::tailscale_probe_sync(cancel)
             == crate::server::tunnel::TailscaleProbe::Available
 }
 
@@ -617,31 +731,8 @@ fn is_funnel_link(url: &str) -> bool {
     link_host(url).is_some_and(|host| host.ends_with(".ts.net"))
 }
 
-/// The error for a daemon that vanished before publishing its URL.
-fn exited_before_ready(mode: ServeMode, transport: Option<TunnelTransport>) -> ServeViewState {
-    let headline = match mode {
-        ServeMode::Tunnel => "`aoe serve --remote --daemon` exited before the tunnel came up.",
-        ServeMode::Local => "`aoe serve --daemon` exited before the server started.",
-    };
-    ServeViewState::start_failed(mode, transport, headline)
-}
-
-fn stop_failed(e: &str) -> String {
-    format!("Stop failed: {e}. Daemon may still be running; retry or use `aoe serve --stop` from a shell.")
-}
-
-/// `tailscale funnel reset` only helps a Tunnel that went through Funnel; a reattached
-/// daemon's transport is unknown, so its message decides.
-fn funnel_reset_applies(
-    message: &str,
-    mode: ServeMode,
-    transport: Option<TunnelTransport>,
-) -> bool {
-    mode == ServeMode::Tunnel
-        && transport.map_or_else(
-            || error_mentions_tailscale(message),
-            |t| t == TunnelTransport::Tailscale,
-        )
+fn funnel_reset_applies(mode: ServeMode, transport: Option<TunnelTransport>) -> bool {
+    mode == ServeMode::Tunnel && transport == Some(TunnelTransport::Tailscale)
 }
 
 /// A destructive action awaiting a second press of its key.
@@ -651,100 +742,167 @@ enum PendingConfirm {
     Restart,
 }
 
+enum RestartIntent {
+    Confirm(PendingConfirm),
+    Help,
+}
+
+enum PendingJob {
+    Open,
+    Passphrase,
+    ErrorContext,
+    RetryContext {
+        failed: Option<TunnelTransport>,
+    },
+    ResetContext,
+    Picker {
+        selected: Option<ServeMode>,
+    },
+    Providers {
+        selected: Option<TunnelTransport>,
+        failed: Option<TunnelTransport>,
+    },
+    /// The provider screen's background re-check; any key drops it.
+    ProvidersRefresh,
+    Retry {
+        failed: Option<TunnelTransport>,
+        target: TuiControlTarget,
+    },
+    Reset,
+    Restart {
+        intent: RestartIntent,
+        confirmed: Option<PendingConfirm>,
+    },
+    LaunchContext(ServeLaunchRequest),
+    LaunchOutcome,
+    Starting,
+    Active,
+    Copy,
+}
+
+impl PendingJob {
+    fn banner(&self) -> Option<&'static str> {
+        match self {
+            Self::Open => Some("Looking for a running daemon"),
+            Self::RetryContext { .. } => Some("Checking Daemon identity for provider retry"),
+            Self::ResetContext => Some("Checking Daemon identity for Funnel reset"),
+            Self::Picker { .. } => Some("Checking access options"),
+            Self::Providers { .. } => Some("Checking tunnel providers"),
+            Self::Retry { .. } => Some("Stopping the observed daemon before provider retry"),
+            Self::Reset => Some("Resetting Funnel; closing does not undo an admitted reset"),
+            _ => None,
+        }
+    }
+}
+
+struct PendingWork {
+    attempt: u64,
+    kind: PendingJob,
+    mode: ServeMode,
+    transport: Option<TunnelTransport>,
+    ticket: Ticket,
+}
+
 pub struct ServeView {
     state: ServeViewState,
-    /// Passphrase for the next Tunnel spawn; persisted so it survives stop/start.
     pending_passphrase: String,
     pending_confirm: Option<(PendingConfirm, Instant)>,
     show_help: bool,
     mouse: RefCell<ServeMouse>,
-    /// The label of the value a click last copied, shown for `FLASH_TTL`.
     copied: Option<(&'static str, Instant)>,
-    /// The setting the running daemon started with, when this view started it; `None` for a
-    /// reattached daemon.
     running_persists: Option<bool>,
-    /// What a restart would do now. Refreshed when R, G or help is pressed rather than per
-    /// frame: the probe shells out to `tailscale`.
     restart_probe: RestartProbe,
     pending_launch: Option<ServeLaunchRequest>,
     launch_in_flight: bool,
     stop_requested: bool,
-    probes: Probes,
-}
-
-impl Default for ServeView {
-    fn default() -> Self {
-        Self::new()
-    }
+    submitter: Submitter,
+    pending: Option<PendingWork>,
+    /// When the provider screen last received provider statuses.
+    providers_checked_at: Option<Instant>,
+    last_attempt: u64,
+    target: Option<crate::cli::serve::TuiControlTarget>,
+    control_error: Option<String>,
+    local_primary: String,
+    elapsed_second: Option<u64>,
 }
 
 impl ServeView {
-    /// Reattaches to a running daemon, otherwise opens the mode picker.
-    pub fn new() -> Self {
-        Self::with_probe_handler(run_probe)
+    pub(crate) fn new(jobs: &mut ServeJobs) -> Self {
+        let mut view = Self::with_state(ServeViewState::Checking { attempt: 0 }, jobs.submitter());
+        view.request(Job::Open, PendingJob::Open);
+        view.state = ServeViewState::Checking {
+            attempt: view.last_attempt,
+        };
+        view
     }
 
-    /// A view past its construction probe, for tests that need the settled screen.
     #[cfg(test)]
-    pub(crate) fn settled() -> Self {
-        let mut view = Self::new();
+    pub(crate) fn settled(jobs: &mut ServeJobs) -> Self {
+        let mut view = Self::new(jobs);
         let deadline = Instant::now() + Duration::from_secs(10);
         while matches!(view.state, ServeViewState::Checking { .. }) {
             view.tick();
-            assert!(
-                Instant::now() < deadline,
-                "construction probe never settled"
-            );
+            assert!(Instant::now() < deadline, "Serve view never settled");
             std::thread::yield_now();
         }
         view
     }
 
-    /// Opened while the App runs a launch, or after one failed with no view open.
-    pub fn for_launch(launch: DashboardLaunch) -> Self {
-        let probes = Probes::new(run_probe);
-        match launch {
-            DashboardLaunch::Running { target, started_at } => {
-                let mut view = Self::with_state(
-                    ServeViewState::Starting {
-                        mode: target.mode,
-                        transport: target.transport,
-                        passphrase: target.passphrase,
-                        started_at,
-                        log_offset: log_file_size(),
-                    },
-                    probes,
-                );
-                // The App calls finish_launch on whichever view is open when the launch ends.
-                view.launch_in_flight = true;
-                view
-            }
-            DashboardLaunch::Failed {
-                target,
-                message,
-                log_tail,
-            } => Self::with_state(
+    pub(crate) fn for_launch(launch: DashboardLaunch, jobs: &mut ServeJobs) -> Self {
+        let (state, running, observed_target) = match launch {
+            DashboardLaunch::Running { target, started_at } => (
+                ServeViewState::Starting {
+                    mode: target.mode,
+                    transport: target.transport,
+                    passphrase: target.passphrase,
+                    started_at,
+                    log_offset: 0,
+                },
+                true,
+                target.observed_target,
+            ),
+            DashboardLaunch::Failed { target, failure } => (
                 ServeViewState::start_failed_with(
                     target.mode,
                     target.transport,
-                    &message,
-                    log_tail,
+                    &failure.message,
+                    failure.log_tail,
                 ),
-                probes,
+                false,
+                failure.target.or(target.observed_target),
             ),
+        };
+        let mut view = Self::with_state(state, jobs.submitter());
+        view.launch_in_flight = running;
+        view.target = observed_target;
+        if running {
+            view.request(Job::Passphrase, PendingJob::Passphrase);
+        } else if view.target.is_none() {
+            view.request(Job::ErrorContext, PendingJob::ErrorContext);
         }
+        view
     }
 
-    fn with_probe_handler(handler: impl FnMut(Probe) -> bool + Send + 'static) -> Self {
-        let mut probes = Probes::new(handler);
-        let attempt = probes.request(Probe::WebDaemon);
-        Self::with_state(ServeViewState::Checking { attempt }, probes)
+    pub(crate) fn for_stop(stop: DashboardStop, jobs: &mut ServeJobs) -> Self {
+        let mut view = Self::with_state(
+            ServeViewState::Starting {
+                mode: stop.mode,
+                transport: stop.transport,
+                passphrase: None,
+                started_at: Instant::now(),
+                log_offset: 0,
+            },
+            jobs.submitter(),
+        );
+        view.target = Some(stop.target);
+        view.begin_stop();
+        view
     }
 
-    fn with_state(state: ServeViewState, probes: Probes) -> Self {
+    fn with_state(state: ServeViewState, submitter: Submitter) -> Self {
         Self {
             state,
-            pending_passphrase: load_or_generate_passphrase(),
+            pending_passphrase: String::new(),
             pending_confirm: None,
             show_help: false,
             mouse: RefCell::default(),
@@ -754,8 +912,57 @@ impl ServeView {
             pending_launch: None,
             launch_in_flight: false,
             stop_requested: false,
-            probes,
+            submitter,
+            pending: None,
+            providers_checked_at: None,
+            last_attempt: 0,
+            target: None,
+            control_error: None,
+            local_primary: String::new(),
+            elapsed_second: None,
         }
+    }
+
+    #[cfg(test)]
+    fn for_test(state: ServeViewState) -> Self {
+        Self::with_state(state, Submitter::closed_for_test())
+    }
+
+    fn context(&self) -> (ServeMode, Option<TunnelTransport>) {
+        match &self.state {
+            ServeViewState::Checking { .. } => (ServeMode::Local, None),
+            ServeViewState::ModePicker { selected, .. } => (*selected, None),
+            ServeViewState::Confirm { selected, .. } => (ServeMode::Tunnel, Some(*selected)),
+            ServeViewState::Starting {
+                mode, transport, ..
+            }
+            | ServeViewState::Active {
+                mode, transport, ..
+            }
+            | ServeViewState::Error {
+                mode, transport, ..
+            } => (*mode, *transport),
+        }
+    }
+
+    fn request(&mut self, job: Job, kind: PendingJob) {
+        self.pending = None;
+        self.last_attempt += 1;
+        let (mode, transport) = self.context();
+        self.pending = Some(PendingWork {
+            attempt: self.last_attempt,
+            kind,
+            mode,
+            transport,
+            ticket: self.submitter.request(self.last_attempt, job),
+        });
+    }
+
+    fn request_picker(&mut self, selected: Option<ServeMode>) {
+        self.request(Job::Picker, PendingJob::Picker { selected });
+        self.state = ServeViewState::Checking {
+            attempt: self.last_attempt,
+        };
     }
 
     /// Hints and cards return their key; the URL, token and passphrase copy
@@ -771,8 +978,7 @@ impl ServeView {
             .find(|(_, rect)| contains(*rect, col, row))
             .map(|(copy, _)| copy.clone());
         if let Some((label, value)) = copy {
-            crate::tui::clipboard::copy_to_clipboard(&value);
-            self.copied = Some((label, Instant::now()));
+            self.request(Job::Copy(label, value), PendingJob::Copy);
             return None;
         }
         hit(&mouse.keys, col, row)
@@ -785,6 +991,12 @@ impl ServeView {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ServeAction {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) && !self.show_help {
+            self.pending = None;
+            self.pending_confirm = None;
+            self.pending_launch = None;
+            return ServeAction::Close;
+        }
         if matches!(key.code, KeyCode::Char('s' | 'S'))
             && matches!(
                 self.state,
@@ -796,8 +1008,31 @@ impl ServeView {
             if self.stop_requested {
                 return ServeAction::Continue;
             }
+            let (mode, transport) = self.context();
+            let request = match self.pending.take() {
+                Some(PendingWork {
+                    attempt,
+                    kind: PendingJob::Retry { target, .. },
+                    ticket,
+                    ..
+                }) => {
+                    self.target = Some(target.clone());
+                    let mut request = ServeStopRequest::new(target, mode, transport);
+                    request.retry =
+                        (!ticket.cancel_before_admission()).then_some((attempt, ticket));
+                    request
+                }
+                _ if self.launch_in_flight || self.target.is_none() => {
+                    return ServeAction::StopOwnedLaunch;
+                }
+                _ => ServeStopRequest::new(
+                    self.target.clone().expect("observed stop target"),
+                    mode,
+                    transport,
+                ),
+            };
             self.begin_stop();
-            return ServeAction::Stop;
+            return ServeAction::Stop(request);
         }
         if self.stop_requested {
             return if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
@@ -806,7 +1041,10 @@ impl ServeView {
                 ServeAction::Continue
             };
         }
-        let action = match self.state {
+        if self.handle_pending_key(key.code) {
+            return ServeAction::Continue;
+        }
+        match self.state {
             ServeViewState::Checking { .. } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => ServeAction::Close,
                 _ => ServeAction::Continue,
@@ -819,10 +1057,62 @@ impl ServeView {
             },
             ServeViewState::Active { .. } => self.active_key(key.code),
             ServeViewState::Error { .. } => self.error_key(key.code),
+        }
+    }
+
+    fn handle_pending_key(&mut self, code: KeyCode) -> bool {
+        let Some(pending) = &self.pending else {
+            return false;
         };
-        self.pending_launch
-            .take()
-            .map_or(action, ServeAction::Launch)
+        match &pending.kind {
+            PendingJob::Providers { .. } => true,
+            PendingJob::Picker { .. } => {
+                let selected = match code {
+                    KeyCode::Left | KeyCode::Char('h') => Some(ServeMode::Local),
+                    KeyCode::Right | KeyCode::Char('l') => Some(ServeMode::Tunnel),
+                    _ => return true,
+                };
+                self.request_picker(selected);
+                true
+            }
+            PendingJob::Restart { intent, .. } => {
+                let repeated = match intent {
+                    RestartIntent::Confirm(PendingConfirm::Restart) => {
+                        matches!(code, KeyCode::Char('r' | 'R'))
+                    }
+                    RestartIntent::Confirm(PendingConfirm::NewPassphrase) => {
+                        matches!(code, KeyCode::Char('g' | 'G'))
+                    }
+                    RestartIntent::Help => code == KeyCode::Char('?'),
+                };
+                if repeated {
+                    return true;
+                }
+                self.pending = None;
+                false
+            }
+            PendingJob::Open
+            | PendingJob::ErrorContext
+            | PendingJob::RetryContext { .. }
+            | PendingJob::ResetContext
+            | PendingJob::Retry { .. }
+            | PendingJob::Reset
+            | PendingJob::LaunchContext(_)
+            | PendingJob::LaunchOutcome => true,
+            // A key restarts the interval, so typing never runs back-to-back checks.
+            PendingJob::ProvidersRefresh => {
+                self.pending = None;
+                self.providers_checked_at = Some(Instant::now());
+                false
+            }
+            PendingJob::Passphrase
+            | PendingJob::Starting
+            | PendingJob::Active
+            | PendingJob::Copy => {
+                self.pending = None;
+                false
+            }
+        }
     }
 
     fn mode_picker_key(&mut self, code: KeyCode) -> ServeAction {
@@ -848,15 +1138,6 @@ impl ServeView {
                     other => other,
                 }
             }
-            KeyCode::Char('t' | 'T') => {
-                *selected = ServeMode::Tunnel;
-                return self.commit_mode();
-            }
-            // Lowercase `l` moves right, so capital `L` is the Local shortcut.
-            KeyCode::Char('L') => {
-                *selected = ServeMode::Local;
-                return self.commit_mode();
-            }
             KeyCode::Enter => return self.commit_mode(),
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
@@ -880,13 +1161,13 @@ impl ServeView {
             }
             ServeMode::Local if !*local_available => "No non-loopback network interface available.",
             ServeMode::Tunnel => {
-                let (tailscale, cloudflare) = assess_transports();
-                self.state = ServeViewState::Confirm {
-                    selected: default_transport(tailscale, cloudflare),
-                    tailscale,
-                    cloudflare,
-                    flash: None,
-                };
+                self.request(
+                    Job::Providers,
+                    PendingJob::Providers {
+                        selected: None,
+                        failed: None,
+                    },
+                );
                 return ServeAction::Continue;
             }
             ServeMode::Local => {
@@ -900,10 +1181,7 @@ impl ServeView {
 
     fn confirm_key(&mut self, code: KeyCode) -> ServeAction {
         let ServeViewState::Confirm {
-            selected,
-            tailscale,
-            cloudflare,
-            flash,
+            selected, flash, ..
         } = &mut self.state
         else {
             return ServeAction::Continue;
@@ -927,10 +1205,6 @@ impl ServeView {
                 return self.commit_transport();
             }
             KeyCode::Enter => return self.commit_transport(),
-            KeyCode::Char('r' | 'R') => {
-                (*tailscale, *cloudflare) = assess_transports();
-                *flash = Some(("Refreshed.".to_string(), Instant::now()));
-            }
             KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
             _ => {}
         }
@@ -958,14 +1232,14 @@ impl ServeView {
                 "Tailscale Funnel isn't enabled for this node; pick Cloudflare or update your ACL."
             }
             (TunnelTransport::Tailscale, TransportStatus::TimedOut, TransportStatus::Ready) => {
-                "Tailscale didn't answer in time; press R to retry or pick Cloudflare."
+                "Tailscale didn't answer in time; checking again, or pick Cloudflare."
             }
             (TunnelTransport::Tailscale, TransportStatus::TimedOut, _) => {
-                "Tailscale didn't answer in time; press R to retry."
+                "Tailscale didn't answer in time; checking again."
             }
             (TunnelTransport::Tailscale, ..) => "Tailscale isn't installed; pick Cloudflare.",
             (TunnelTransport::Cloudflare, TransportStatus::TimedOut, _) => {
-                "cloudflared isn't installed; press R to retry Tailscale."
+                "cloudflared isn't installed, and Tailscale didn't answer in time; checking again."
             }
             (TunnelTransport::Cloudflare, ..) => "cloudflared isn't installed; pick Tailscale.",
         };
@@ -975,340 +1249,648 @@ impl ServeView {
 
     fn spawn(&mut self, mode: ServeMode, transport: Option<TunnelTransport>) {
         let passphrase = (mode == ServeMode::Tunnel).then(|| self.pending_passphrase.clone());
-        // Read just before the launch, which the daemon reads at startup.
-        self.running_persists = Some(persist_sessions());
-        self.pending_launch = Some(ServeLaunchRequest {
-            restart: false,
-            mode,
-            transport,
-            passphrase: passphrase.clone(),
-        });
-        self.launch_in_flight = true;
-        self.state = ServeViewState::Starting {
+        self.prepare_launch(ServeLaunchRequest {
+            intent: LaunchIntent::Start(self.target.clone()),
             mode,
             transport,
             passphrase,
-            started_at: Instant::now(),
-            log_offset: log_file_size(),
-        };
+        });
     }
 
-    pub(crate) fn finish_launch(&mut self, result: Result<(), String>) {
-        self.launch_in_flight = false;
+    fn prepare_launch(&mut self, request: ServeLaunchRequest) {
+        self.pending_confirm = None;
+        self.show_help = false;
+        self.launch_in_flight = true;
+        self.state = ServeViewState::Starting {
+            mode: request.mode,
+            transport: request.transport,
+            passphrase: request.passphrase.clone(),
+            started_at: Instant::now(),
+            log_offset: 0,
+        };
+        let needs_passphrase = matches!(&request.intent, LaunchIntent::Start(_))
+            && request.mode == ServeMode::Tunnel
+            && request.passphrase.as_ref().is_none_or(String::is_empty);
+        self.request(
+            Job::LaunchContext { needs_passphrase },
+            PendingJob::LaunchContext(request),
+        );
+    }
+
+    pub(crate) fn take_launch(&mut self) -> Option<ServeLaunchRequest> {
+        self.pending_launch.take()
+    }
+
+    pub(crate) fn finish_launch(
+        &mut self,
+        result: Result<TuiControlTarget, ServeLaunchFailure>,
+        observed_target: Option<TuiControlTarget>,
+    ) {
+        if self.stop_requested || !self.launch_in_flight {
+            return;
+        }
         let ServeViewState::Starting {
             mode,
             transport,
             passphrase,
             log_offset,
             ..
-        } = &self.state
+        } = &mut self.state
         else {
             return;
         };
-        self.state = match result {
-            Ok(()) => ServeViewState::running(*mode, *transport, passphrase.clone(), *log_offset),
-            Err(message) => ServeViewState::start_failed(*mode, *transport, &message),
-        };
+        let (mode, transport) = (*mode, *transport);
+        match result {
+            Ok(target) => {
+                self.launch_in_flight = false;
+                self.target = Some(target.clone());
+                let job = Job::LaunchOutcome {
+                    target,
+                    mode,
+                    transport,
+                    passphrase: passphrase.take(),
+                    log_offset: *log_offset,
+                };
+                self.request(job, PendingJob::LaunchOutcome);
+            }
+            Err(failure) => {
+                self.launch_in_flight = false;
+                self.target = failure.target.or(observed_target);
+                self.state = ServeViewState::start_failed_with(
+                    mode,
+                    transport,
+                    &failure.message,
+                    failure.log_tail,
+                );
+                if self.target.is_none() {
+                    self.request(Job::ErrorContext, PendingJob::ErrorContext);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refuse_stop(&mut self) {
+        self.pending = None;
+        self.stop_requested = false;
+        let (mode, transport) = self.context();
+        self.fail_work(
+            mode,
+            transport,
+            "No verified Daemon identity or App-owned launch is available; Stop was not performed. Inspect `aoe serve --status` before retrying.".to_owned(),
+        );
     }
 
     pub(crate) fn begin_stop(&mut self) {
+        self.pending = None;
+        self.pending_confirm = None;
+        self.pending_launch = None;
+        self.show_help = false;
         self.stop_requested = true;
         self.launch_in_flight = true;
     }
 
+    pub(crate) fn resume_owned_stop(&mut self, launch_started_at: Instant) {
+        if self.stop_requested || !self.launch_in_flight {
+            return;
+        }
+        if matches!(
+            self.state,
+            ServeViewState::Starting { started_at, .. } if started_at == launch_started_at
+        ) {
+            self.begin_stop();
+        }
+    }
+
+    pub(crate) fn bind_stop_target(&mut self, target: &TuiControlTarget) {
+        if self.stop_requested {
+            self.target = Some(target.clone());
+        }
+    }
+
     pub(crate) fn finish_stop(&mut self, result: Result<(), String>) {
+        if !self.stop_requested {
+            return;
+        }
         self.stop_requested = false;
         self.launch_in_flight = false;
-        let (mode, transport) = match &self.state {
-            ServeViewState::Checking { .. } => (ServeMode::Local, None),
-            ServeViewState::ModePicker { selected, .. } => (*selected, None),
-            ServeViewState::Confirm { selected, .. } => (ServeMode::Tunnel, Some(*selected)),
-            ServeViewState::Starting {
-                mode, transport, ..
+        let (mode, transport) = self.context();
+        match result {
+            Ok(()) => self.request_picker(None),
+            Err(message) => {
+                self.state = ServeViewState::Error {
+                    message,
+                    mode,
+                    transport,
+                };
+                if self.target.is_none() {
+                    self.control_error = None;
+                    self.request(Job::ErrorContext, PendingJob::ErrorContext);
+                }
             }
-            | ServeViewState::Active {
-                mode, transport, ..
-            }
-            | ServeViewState::Error {
-                mode, transport, ..
-            } => (*mode, *transport),
-        };
-        self.state = match result {
-            Ok(()) => ServeViewState::mode_picker(),
-            Err(message) => ServeViewState::Error {
-                message,
-                mode,
-                transport,
-            },
-        };
+        }
     }
 
     fn active_key(&mut self, code: KeyCode) -> ServeAction {
         if std::mem::take(&mut self.show_help) {
             return ServeAction::Continue;
         }
-        let confirmed = self.pending_confirm.take().and_then(|(action, when)| {
-            let repeated = match action {
-                PendingConfirm::NewPassphrase => matches!(code, KeyCode::Char('g' | 'G')),
-                PendingConfirm::Restart => matches!(code, KeyCode::Char('r' | 'R')),
-            };
-            (repeated && when.elapsed() <= CONFIRM_TTL).then_some(action)
-        });
-        let ServeViewState::Active {
-            mode,
-            transport,
-            urls,
-            url_index,
-            passphrase,
-            ..
-        } = &mut self.state
+        let confirmed = self
+            .pending_confirm
+            .take()
+            .filter(|(action, when)| {
+                let repeated = match action {
+                    PendingConfirm::NewPassphrase => matches!(code, KeyCode::Char('g' | 'G')),
+                    PendingConfirm::Restart => matches!(code, KeyCode::Char('r' | 'R')),
+                };
+                repeated && when.elapsed() <= CONFIRM_TTL
+            })
+            .map(|(action, _)| action);
+        let (mode, transport) = self.context();
+        let intent = match code {
+            KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
+                Some(RestartIntent::Confirm(PendingConfirm::NewPassphrase))
+            }
+            KeyCode::Char('r' | 'R') => Some(RestartIntent::Confirm(PendingConfirm::Restart)),
+            KeyCode::Char('?') => Some(RestartIntent::Help),
+            KeyCode::Tab => {
+                if let ServeViewState::Active {
+                    urls, url_index, ..
+                } = &mut self.state
+                {
+                    if urls.len() > 1 {
+                        *url_index = (*url_index + 1) % urls.len();
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(intent) = intent {
+            self.request(
+                Job::Restart(mode, transport),
+                PendingJob::Restart { intent, confirmed },
+            );
+        }
+        ServeAction::Continue
+    }
+
+    fn request_provider_retry(&mut self, failed: Option<TunnelTransport>) {
+        match self.target.take() {
+            Some(target) => self.request(
+                Job::Retry(target.clone()),
+                PendingJob::Retry { failed, target },
+            ),
+            None => self.request(Job::ErrorContext, PendingJob::RetryContext { failed }),
+        }
+    }
+
+    fn request_funnel_reset(&mut self) {
+        match &self.target {
+            Some(target) => self.request(Job::Reset(target.clone()), PendingJob::Reset),
+            None => self.request(Job::ErrorContext, PendingJob::ResetContext),
+        }
+    }
+
+    fn error_key(&mut self, code: KeyCode) -> ServeAction {
+        let ServeViewState::Error {
+            mode, transport, ..
+        } = &self.state
         else {
             return ServeAction::Continue;
         };
-        let (mode, transport) = (*mode, *transport);
+        let reset = funnel_reset_applies(*mode, *transport);
+        let failed = *transport;
         match code {
-            KeyCode::Char('g' | 'G') if mode == ServeMode::Tunnel => {
-                if confirmed == Some(PendingConfirm::NewPassphrase) {
-                    let new_pp = generate_passphrase();
-                    self.pending_passphrase = new_pp.clone();
-                    self.restart(mode, transport, Some(new_pp));
-                } else {
-                    self.restart_probe = RestartProbe::now(mode, transport);
-                    self.pending_confirm = Some((PendingConfirm::NewPassphrase, Instant::now()));
-                }
+            KeyCode::Char('p' | 'P') if *mode == ServeMode::Tunnel => {
+                self.request_provider_retry(failed);
             }
-            // Reusing the passphrase keeps persisted logins; see `RestartEffect`.
-            KeyCode::Char('r' | 'R') => {
-                let fresh = RestartProbe::now(mode, transport);
-                let unchanged = confirmed == Some(PendingConfirm::Restart)
-                    && RestartEffect::of(mode, urls, &fresh, self.running_persists)
-                        == RestartEffect::of(
-                            mode,
-                            urls,
-                            &self.restart_probe,
-                            self.running_persists,
-                        );
-                if unchanged {
-                    let pp = (mode == ServeMode::Tunnel).then(|| {
-                        passphrase
-                            .clone()
-                            .unwrap_or_else(|| self.pending_passphrase.clone())
-                    });
-                    self.restart(mode, transport, pp);
-                } else {
-                    self.restart_probe = fresh;
-                    self.pending_confirm = Some((PendingConfirm::Restart, Instant::now()));
-                }
-            }
-            KeyCode::Tab if urls.len() > 1 => *url_index = (*url_index + 1) % urls.len(),
-            KeyCode::Char('?') => {
-                self.restart_probe = RestartProbe::now(mode, transport);
-                self.show_help = true;
-            }
-            KeyCode::Esc | KeyCode::Char('q') => return ServeAction::Close,
+            KeyCode::Char('r' | 'R') if reset => self.request_funnel_reset(),
+            KeyCode::Enter | KeyCode::Char(' ') => return ServeAction::Close,
             _ => {}
         }
         ServeAction::Continue
     }
 
-    fn error_key(&mut self, code: KeyCode) -> ServeAction {
-        let ServeViewState::Error {
-            message,
+    fn apply_restart(
+        &mut self,
+        fresh: RestartProbe,
+        intent: RestartIntent,
+        confirmed: Option<PendingConfirm>,
+    ) {
+        let ServeViewState::Active {
             mode,
             transport,
+            urls,
+            ..
         } = &self.state
         else {
-            return ServeAction::Continue;
+            return;
         };
         let (mode, transport) = (*mode, *transport);
-        match code {
-            KeyCode::Char('p' | 'P') if mode == ServeMode::Tunnel => {
-                // Like S: a daemon left running must not outlive the retry.
-                if crate::cli::serve::daemon_pid().is_some() {
-                    if let Err(e) = stop_daemon() {
-                        self.state = ServeViewState::Error {
-                            message: stop_failed(&e),
-                            mode,
-                            transport,
-                        };
-                        return ServeAction::Continue;
-                    }
-                }
-                let (tailscale, cloudflare) = assess_transports();
-                self.state = ServeViewState::provider_retry(transport, tailscale, cloudflare);
-                ServeAction::Continue
-            }
-            // Clears a stale funnel config blocking port 443; safe when none exists.
-            KeyCode::Char('r' | 'R') if funnel_reset_applies(message, mode, transport) => {
-                let message = match run_tailscale_funnel_reset() {
-                    Ok(()) => "Ran `tailscale funnel reset`. The existing funnel \
-                         config (if any) has been cleared.\n\n\
-                         Press P to pick a provider and start again."
-                        .to_string(),
-                    Err(e) => format!(
-                        "`tailscale funnel reset` failed: {e}\n\n\
-                         Try running it manually from a shell, then press P to start again."
-                    ),
-                };
-                self.state = ServeViewState::Error {
-                    message,
+        let RestartIntent::Confirm(action) = intent else {
+            self.restart_probe = fresh;
+            self.show_help = true;
+            return;
+        };
+        let repeated = confirmed == Some(action);
+        let unchanged = action == PendingConfirm::NewPassphrase
+            || RestartEffect::of(mode, urls, &fresh, self.running_persists)
+                == RestartEffect::of(mode, urls, &self.restart_probe, self.running_persists);
+        if repeated && unchanged {
+            let Some(target) = self.target.clone() else {
+                self.fail_work(
                     mode,
                     transport,
-                };
-                ServeAction::Continue
-            }
-            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ' | 'q') => ServeAction::Close,
-            _ => ServeAction::Continue,
-        }
-    }
-
-    fn restart(
-        &mut self,
-        mode: ServeMode,
-        transport: Option<TunnelTransport>,
-        passphrase: Option<String>,
-    ) {
-        self.running_persists = Some(persist_sessions());
-        self.pending_launch = Some(ServeLaunchRequest {
-            restart: true,
-            mode,
-            transport,
-            passphrase: passphrase.clone(),
-        });
-        self.launch_in_flight = true;
-        self.state = ServeViewState::Starting {
-            mode,
-            transport,
-            passphrase,
-            started_at: Instant::now(),
-            log_offset: log_file_size(),
-        };
-    }
-
-    /// Poll the daemon's files and advance the state. Returns true when a redraw is needed.
-    pub fn tick(&mut self) -> bool {
-        let mut changed = self.apply_probes();
-        if self.launch_in_flight {
-            self.probes.liveness = None;
-            return changed;
-        }
-        changed |= self.poll_files();
-        if !matches!(self.state, ServeViewState::Starting { .. }) {
-            self.probes.liveness = None;
-        } else if self.probes.liveness.is_none() {
-            self.probes.liveness = Some(self.probes.request(Probe::Daemon));
-        }
-        changed
-    }
-
-    fn apply_probes(&mut self) -> bool {
-        use std::sync::mpsc::TryRecvError;
-        let mut changed = false;
-        loop {
-            match self.probes.worker.try_recv() {
-                Ok((attempt, running)) => changed |= self.apply_probe(attempt, running),
-                Err(TryRecvError::Empty) => return changed,
-                Err(TryRecvError::Disconnected) => return changed | self.fail_pending(),
-            }
-        }
-    }
-
-    fn apply_probe(&mut self, attempt: u64, running: bool) -> bool {
-        match &self.state {
-            ServeViewState::Checking { attempt: want } if *want == attempt => {
-                self.state = if running {
-                    // Daemons that predate `serve.mode` could only be Tunnel.
-                    let mode = read_serve_mode().unwrap_or(ServeMode::Tunnel);
-                    let passphrase = (mode == ServeMode::Tunnel)
-                        .then(recall_passphrase)
-                        .flatten();
-                    ServeViewState::running(mode, None, passphrase, log_file_size())
-                } else {
-                    ServeViewState::mode_picker()
-                };
-                true
-            }
-            ServeViewState::Starting {
-                mode, transport, ..
-            } if self.probes.liveness == Some(attempt) => {
-                self.probes.liveness = None;
-                // A published URL outranks a probe that saw the daemon exit.
-                if running || !read_serve_urls().is_empty() {
-                    return false;
-                }
-                self.state = exited_before_ready(*mode, *transport);
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// A state waiting on a dead worker becomes an error instead of hanging.
-    fn fail_pending(&mut self) -> bool {
-        let (mode, transport) = match &self.state {
-            ServeViewState::Checking { .. } => (ServeMode::Local, None),
-            ServeViewState::Starting {
-                mode, transport, ..
-            } if self.probes.liveness.is_some() => (*mode, *transport),
-            _ => return false,
-        };
-        self.probes.liveness = None;
-        self.state = ServeViewState::Error {
-            message: "The background probe worker stopped.".to_string(),
-            mode,
-            transport,
-        };
-        true
-    }
-
-    fn poll_files(&mut self) -> bool {
-        match &mut self.state {
-            ServeViewState::ModePicker { flash, .. } => expire_flash(flash),
-            ServeViewState::Starting {
+                    "Restart requires a verified Daemon identity. Reopen the dashboard before retrying.".to_owned(),
+                );
+                return;
+            };
+            let passphrase = if action == PendingConfirm::NewPassphrase {
+                self.pending_passphrase = generate_passphrase();
+                Some(self.pending_passphrase.clone())
+            } else {
+                None
+            };
+            self.prepare_launch(ServeLaunchRequest {
+                intent: LaunchIntent::Restart(target),
                 mode,
                 transport,
                 passphrase,
-                log_offset,
-                ..
-            } => {
-                let log_grew = log_grew(log_offset);
-                let mode = *mode;
-                let urls = read_serve_urls();
-                if !urls.is_empty() {
-                    // A reattached daemon writes serve.passphrase only once startup finishes.
+            });
+        } else {
+            self.restart_probe = fresh;
+            self.pending_confirm = Some((action, Instant::now()));
+        }
+    }
+
+    /// Drain one bounded result and expire UI clocks. No process or filesystem work.
+    pub fn tick(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+        let mut changed = false;
+        if let Some(pending) = &mut self.pending {
+            let result = pending.ticket.try_recv();
+            match result {
+                Ok((attempt, result)) if attempt == pending.attempt => {
+                    let pending = self.pending.take().expect("pending result");
+                    changed = self.apply_result(pending, result);
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    let pending = self.pending.take().expect("closed pending worker");
+                    self.fail_pending(
+                        pending.kind,
+                        pending.mode,
+                        pending.transport,
+                        "The background Serve worker stopped. An admitted operation may have changed state; inspect `aoe serve --status` before retrying.".to_owned(),
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if self
+            .pending_confirm
+            .is_some_and(|(_, when)| when.elapsed() > CONFIRM_TTL)
+        {
+            self.pending_confirm = None;
+            changed = true;
+        }
+        if self
+            .copied
+            .is_some_and(|(_, when)| when.elapsed() > FLASH_TTL)
+        {
+            self.copied = None;
+            changed = true;
+        }
+        match &mut self.state {
+            ServeViewState::ModePicker { flash, .. } | ServeViewState::Confirm { flash, .. } => {
+                changed |= expire_flash(flash);
+            }
+            _ => {}
+        }
+        if self.pending.is_none() && !self.launch_in_flight && !self.stop_requested {
+            match self.state {
+                ServeViewState::Confirm { .. }
+                    if self
+                        .providers_checked_at
+                        .is_none_or(|at| at.elapsed() >= PROVIDER_REFRESH) =>
+                {
+                    self.request(Job::Providers, PendingJob::ProvidersRefresh);
+                }
+                ServeViewState::Starting {
+                    mode, transport, ..
+                } => {
+                    if let Some(target) = self.target.clone() {
+                        self.request(Job::ObserveStarting(target), PendingJob::Starting);
+                    } else {
+                        self.fail_work(
+                            mode,
+                            transport,
+                            "The starting Daemon has no verified identity; reopen Remote Access before retrying."
+                                .to_owned(),
+                        );
+                        changed = true;
+                    }
+                }
+                ServeViewState::Active {
+                    mode,
+                    ref passphrase,
+                    ..
+                } => {
+                    let target = if mode == ServeMode::Tunnel && passphrase.is_none() {
+                        self.target.clone()
+                    } else {
+                        None
+                    };
+                    self.request(Job::ObserveActive(target), PendingJob::Active)
+                }
+                _ => {}
+            }
+        }
+        let elapsed = match &self.state {
+            ServeViewState::Starting { started_at, .. }
+                if !self.stop_requested
+                    && self
+                        .pending
+                        .as_ref()
+                        .is_none_or(|pending| pending.kind.banner().is_none()) =>
+            {
+                Some(started_at.elapsed().as_secs())
+            }
+            _ => None,
+        };
+        changed |= self.elapsed_second != elapsed;
+        self.elapsed_second = elapsed;
+        changed
+    }
+
+    fn fail_pending(
+        &mut self,
+        kind: PendingJob,
+        mode: ServeMode,
+        transport: Option<TunnelTransport>,
+        message: String,
+    ) {
+        // A background re-check that fails leaves the screen as it is and tries again later.
+        if matches!(kind, PendingJob::ProvidersRefresh) {
+            self.providers_checked_at = Some(Instant::now());
+            return;
+        }
+        if let PendingJob::Retry { target, .. } = kind {
+            self.target = Some(target);
+            self.fail_work(mode, transport, message);
+            return;
+        }
+        if matches!(
+            kind,
+            PendingJob::ErrorContext | PendingJob::RetryContext { .. } | PendingJob::ResetContext
+        ) && matches!(self.state, ServeViewState::Error { .. })
+        {
+            self.target = None;
+            self.control_error = Some(message);
+        } else {
+            self.fail_work(mode, transport, message);
+        }
+    }
+
+    fn fail_work(&mut self, mode: ServeMode, transport: Option<TunnelTransport>, message: String) {
+        self.pending_confirm = None;
+        self.pending_launch = None;
+        self.launch_in_flight = false;
+        self.show_help = false;
+        self.control_error = None;
+        self.state = ServeViewState::Error {
+            message,
+            mode,
+            transport,
+        };
+    }
+
+    fn apply_result(&mut self, pending: PendingWork, result: JobResult) -> bool {
+        match (pending.kind, result) {
+            (kind, JobResult::Failed(message)) => {
+                self.fail_pending(kind, pending.mode, pending.transport, message)
+            }
+            (
+                kind @ (PendingJob::Open | PendingJob::Picker { .. } | PendingJob::LaunchOutcome),
+                JobResult::Snapshot(snapshot),
+            ) => {
+                if matches!(&kind, PendingJob::Open | PendingJob::Picker { .. })
+                    && !matches!(self.state, ServeViewState::Checking { attempt } if attempt == pending.attempt)
+                {
+                    return false;
+                }
+                self.state = snapshot.state;
+                if let PendingJob::Picker {
+                    selected: Some(want),
+                } = kind
+                {
+                    if let ServeViewState::ModePicker { selected, .. } = &mut self.state {
+                        *selected = want;
+                    }
+                }
+                self.target = Some(snapshot.target);
+                self.control_error = None;
+                if let Some(passphrase) = snapshot.passphrase {
+                    self.pending_passphrase = passphrase;
+                }
+                if let Some(primary) = snapshot.local_primary {
+                    self.local_primary = primary;
+                }
+                self.launch_in_flight = false;
+            }
+            (
+                kind @ (PendingJob::ErrorContext
+                | PendingJob::RetryContext { .. }
+                | PendingJob::ResetContext),
+                JobResult::ErrorContext(target),
+            ) => {
+                self.target = Some(target);
+                self.control_error = None;
+                match kind {
+                    PendingJob::RetryContext { failed } => self.request_provider_retry(failed),
+                    PendingJob::ResetContext => self.request_funnel_reset(),
+                    _ => {}
+                }
+            }
+            (PendingJob::Passphrase, JobResult::Passphrase(passphrase)) => {
+                self.pending_passphrase = passphrase
+            }
+            (
+                PendingJob::Providers { selected, failed },
+                JobResult::Providers(tailscale, cloudflare),
+            ) => {
+                self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
+                self.providers_checked_at = Some(Instant::now());
+                if let (
+                    ServeViewState::Confirm {
+                        selected: current, ..
+                    },
+                    Some(selected),
+                ) = (&mut self.state, selected)
+                {
+                    *current = selected;
+                }
+            }
+            (
+                PendingJob::ProvidersRefresh,
+                JobResult::Providers(fresh_tailscale, fresh_cloudflare),
+            ) => {
+                if let ServeViewState::Confirm {
+                    tailscale,
+                    cloudflare,
+                    ..
+                } = &mut self.state
+                {
+                    *tailscale = fresh_tailscale;
+                    *cloudflare = fresh_cloudflare;
+                    self.providers_checked_at = Some(Instant::now());
+                }
+            }
+            (
+                PendingJob::Retry { failed, .. },
+                JobResult::Retried {
+                    tailscale,
+                    cloudflare,
+                    target,
+                },
+            ) => {
+                self.target = Some(target);
+                self.state = ServeViewState::provider_retry(failed, tailscale, cloudflare);
+                self.providers_checked_at = Some(Instant::now());
+            }
+            (PendingJob::Reset, JobResult::Reset(result)) => {
+                let message = match result {
+                    Ok(()) => "Ran `tailscale funnel reset`. The existing funnel config (if any) has been cleared.\n\nPress P to pick a provider and start again.".to_owned(),
+                    Err(error) => format!("`tailscale funnel reset` did not complete: {error}\n\nInspect Funnel state before retrying, then press P to pick a provider."),
+                };
+                self.state = ServeViewState::Error {
+                    message,
+                    mode: pending.mode,
+                    transport: pending.transport,
+                };
+            }
+            (PendingJob::Restart { intent, confirmed }, JobResult::Restart(fresh)) => {
+                self.apply_restart(fresh, intent, confirmed)
+            }
+            (
+                PendingJob::LaunchContext(mut request),
+                JobResult::LaunchContext {
+                    persists,
+                    log_offset,
+                    passphrase,
+                },
+            ) => {
+                if let Some(passphrase) = passphrase {
+                    self.pending_passphrase = passphrase;
+                    request.passphrase = Some(self.pending_passphrase.clone());
+                    if let ServeViewState::Starting {
+                        passphrase: current,
+                        ..
+                    } = &mut self.state
+                    {
+                        *current = request.passphrase.clone();
+                    }
+                }
+                self.running_persists = Some(persists);
+                if let ServeViewState::Starting {
+                    log_offset: current,
+                    ..
+                } = &mut self.state
+                {
+                    *current = log_offset;
+                }
+                self.pending_launch = Some(request);
+            }
+            (
+                PendingJob::Starting | PendingJob::LaunchOutcome,
+                JobResult::Starting(observation),
+            ) => {
+                self.launch_in_flight = false;
+                self.target = Some(observation.target);
+                let ServeViewState::Starting {
+                    mode,
+                    transport,
+                    passphrase,
+                    log_offset,
+                    ..
+                } = &mut self.state
+                else {
+                    return false;
+                };
+                let grew = *log_offset != observation.log_offset;
+                *log_offset = observation.log_offset;
+                if !observation.urls.is_empty() {
                     let passphrase = passphrase.take().or_else(|| {
-                        (mode == ServeMode::Tunnel)
-                            .then(recall_passphrase)
+                        (*mode == ServeMode::Tunnel)
+                            .then_some(observation.passphrase)
                             .flatten()
                     });
                     self.state = ServeViewState::Active {
-                        mode,
+                        mode: *mode,
                         transport: *transport,
-                        urls,
+                        urls: observation.urls,
                         url_index: 0,
                         passphrase,
                         opened_at: Instant::now(),
-                        log_offset: log_file_size(),
+                        log_offset: observation.log_offset,
                     };
-                    return true;
+                } else if !observation.running {
+                    let headline = match mode {
+                        ServeMode::Tunnel => {
+                            "`aoe serve --remote --daemon` exited before the tunnel came up."
+                        }
+                        ServeMode::Local => {
+                            "`aoe serve --daemon` exited before the server started."
+                        }
+                    };
+                    self.state = ServeViewState::start_failed_with(
+                        *mode,
+                        *transport,
+                        headline,
+                        observation.tail,
+                    );
+                } else {
+                    return grew;
                 }
-                log_grew
             }
-            ServeViewState::Active { log_offset, .. } => {
-                let log_grew = log_grew(log_offset);
-                if self
-                    .pending_confirm
-                    .is_some_and(|(_, t)| t.elapsed() > CONFIRM_TTL)
+            (
+                PendingJob::Active,
+                JobResult::Active {
+                    log_offset: offset,
+                    passphrase: observed_passphrase,
+                },
+            ) => {
+                if let ServeViewState::Active {
+                    mode,
+                    passphrase,
+                    log_offset,
+                    ..
+                } = &mut self.state
                 {
-                    self.pending_confirm = None;
-                    return true;
+                    let grew = *log_offset != offset;
+                    *log_offset = offset;
+                    let recovered = *mode == ServeMode::Tunnel
+                        && passphrase.is_none()
+                        && observed_passphrase.is_some();
+                    if recovered {
+                        *passphrase = observed_passphrase;
+                    }
+                    return grew || recovered;
                 }
-                log_grew
+                return false;
             }
-            ServeViewState::Checking { .. }
-            | ServeViewState::Confirm { .. }
-            | ServeViewState::Error { .. } => false,
+            (PendingJob::Copy, JobResult::Copied(label)) => {
+                self.copied = Some((label, Instant::now()))
+            }
+            (kind, _) => self.fail_pending(
+                kind,
+                pending.mode,
+                pending.transport,
+                "Unexpected Serve worker result; reopen the view before retrying.".to_owned(),
+            ),
         }
+        true
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -1317,541 +1899,4 @@ impl ServeView {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn serve_mode_file_token_parses_server_output() {
-        for mode in [ServeMode::Local, ServeMode::Tunnel] {
-            let written = format!("{}\n", mode.file_token());
-            assert_eq!(ServeMode::from_file_token(&written), Some(mode));
-        }
-        assert_eq!(ServeMode::from_file_token("garbage"), None);
-        assert_eq!(ServeMode::from_file_token(""), None);
-    }
-
-    /// The restarted daemon reads `auth.persist_sessions` afresh, so a change made while the
-    /// view is open must reach the confirm and help.
-    #[test]
-    #[serial_test::serial]
-    fn r_g_and_help_reread_persist_sessions() {
-        let _tmp = crate::session::test_support::isolate_app_dir();
-        for key in ['R', 'G', '?'] {
-            let mut view = ServeView {
-                state: ServeViewState::Active {
-                    mode: ServeMode::Tunnel,
-                    // Cloudflare skips the `tailscale` probe.
-                    transport: Some(TunnelTransport::Cloudflare),
-                    urls: vec![ServeUrl {
-                        label: None,
-                        url: "https://host.tailnet.ts.net/".to_string(),
-                    }],
-                    url_index: 0,
-                    passphrase: Some("correct-horse".to_string()),
-                    opened_at: Instant::now(),
-                    log_offset: 0,
-                },
-                pending_passphrase: String::new(),
-                pending_confirm: None,
-                show_help: false,
-                mouse: RefCell::default(),
-                copied: None,
-                running_persists: Some(true),
-                restart_probe: RestartProbe {
-                    persists: true,
-                    ..RestartProbe::default()
-                },
-                pending_launch: None,
-                launch_in_flight: false,
-                stop_requested: false,
-                probes: Probes::new(|_| false),
-            };
-            crate::session::config::update_config(|c| c.auth.persist_sessions = false).unwrap();
-            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
-            assert!(
-                !view.restart_probe.persists,
-                "{key} kept the value read when the view opened"
-            );
-            crate::session::config::update_config(|c| c.auth.persist_sessions = true).unwrap();
-            view.pending_confirm = None;
-            view.show_help = false;
-            view.handle_key(KeyEvent::from(KeyCode::Char(key)));
-            assert!(view.restart_probe.persists, "{key}");
-        }
-    }
-
-    #[test]
-    fn a_tunnel_retry_preselects_the_provider_that_did_not_fail() {
-        use TransportStatus::{FunnelNotEnabled, NotInstalled, Ready, TimedOut};
-        use TunnelTransport::{Cloudflare, Tailscale};
-        // (failed provider, tailscale, cloudflare, preselected)
-        let cases = [
-            (Some(Tailscale), Ready, Ready, Cloudflare),
-            // The other provider isn't ready, so the usual default applies.
-            (Some(Tailscale), Ready, NotInstalled, Tailscale),
-            (Some(Cloudflare), Ready, Ready, Tailscale),
-            (Some(Cloudflare), FunnelNotEnabled, Ready, Cloudflare),
-            (Some(Cloudflare), TimedOut, Ready, Tailscale),
-            (None, TimedOut, Ready, Tailscale),
-            // A reattached daemon's transport is unknown.
-            (None, Ready, Ready, Tailscale),
-            (None, NotInstalled, Ready, Cloudflare),
-        ];
-        for (failed, ts, cf, want) in cases {
-            let ServeViewState::Confirm {
-                selected,
-                tailscale,
-                cloudflare,
-                flash,
-            } = ServeViewState::provider_retry(failed, ts, cf)
-            else {
-                panic!("{failed:?} {ts:?} {cf:?}: not the provider screen");
-            };
-            assert_eq!(
-                (selected, tailscale, cloudflare, flash.is_none()),
-                (want, ts, cf, true),
-                "{failed:?} {ts:?} {cf:?}"
-            );
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_timed_out_tailscale_launches_nothing_until_cloudflare_is_chosen() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let mut view = ServeView::new();
-        view.state = ServeViewState::Confirm {
-            selected: TunnelTransport::Tailscale,
-            tailscale: TransportStatus::TimedOut,
-            cloudflare: TransportStatus::Ready,
-            flash: None,
-        };
-        let action = view.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(action, ServeAction::Continue));
-        assert!(matches!(
-            &view.state,
-            ServeViewState::Confirm { flash: Some((m, _)), .. } if m.contains("retry")
-        ));
-        let action = view.handle_key(KeyEvent::from(KeyCode::Char('c')));
-        assert!(matches!(
-            action,
-            ServeAction::Launch(ServeLaunchRequest {
-                transport: Some(TunnelTransport::Cloudflare),
-                ..
-            })
-        ));
-
-        // With cloudflared missing too, the only way forward is a retry.
-        view.state = ServeViewState::Confirm {
-            selected: TunnelTransport::Cloudflare,
-            tailscale: TransportStatus::TimedOut,
-            cloudflare: TransportStatus::NotInstalled,
-            flash: None,
-        };
-        let action = view.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(action, ServeAction::Continue));
-        assert!(matches!(
-            &view.state,
-            ServeViewState::Confirm { flash: Some((m, _)), .. } if m.contains("retry Tailscale")
-        ));
-        view.state = ServeViewState::Confirm {
-            selected: TunnelTransport::Tailscale,
-            tailscale: TransportStatus::TimedOut,
-            cloudflare: TransportStatus::NotInstalled,
-            flash: None,
-        };
-        view.handle_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(
-            &view.state,
-            ServeViewState::Confirm { flash: Some((m, _)), .. } if !m.contains("Cloudflare")
-        ));
-    }
-
-    #[test]
-    fn a_local_error_offers_no_provider_retry_or_funnel_reset() {
-        let message = "`aoe serve --daemon` exited: tailscale status failed".to_string();
-        let mut view = ServeView {
-            state: ServeViewState::Error {
-                message: message.clone(),
-                mode: ServeMode::Local,
-                transport: None,
-            },
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: RefCell::default(),
-            copied: None,
-            running_persists: None,
-            restart_probe: RestartProbe::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: Probes::new(|_| false),
-        };
-        for key in ['p', 'P', 'r', 'R'] {
-            let action = view.handle_key(KeyEvent::from(KeyCode::Char(key)));
-            assert!(matches!(action, ServeAction::Continue), "{key}");
-            assert!(
-                matches!(&view.state, ServeViewState::Error { message: m, mode: ServeMode::Local, .. } if *m == message),
-                "{key}"
-            );
-        }
-    }
-
-    /// A refused or failed restart leaves the old daemon running, so the saved passphrase must
-    /// stay the one that daemon accepts until `ServeLaunchRequest::run` succeeds.
-    #[test]
-    #[serial_test::serial]
-    fn new_passphrase_is_saved_only_after_the_restart_succeeds() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        save_passphrase_to_disk("running daemon phrase");
-        let mut view = ServeView {
-            state: ServeViewState::Active {
-                mode: ServeMode::Tunnel,
-                transport: Some(TunnelTransport::Cloudflare),
-                urls: vec![],
-                url_index: 0,
-                passphrase: Some("running daemon phrase".to_string()),
-                opened_at: Instant::now(),
-                log_offset: 0,
-            },
-            pending_passphrase: String::new(),
-            pending_confirm: None,
-            show_help: false,
-            mouse: RefCell::default(),
-            copied: None,
-            running_persists: None,
-            restart_probe: RestartProbe::default(),
-            pending_launch: None,
-            launch_in_flight: false,
-            stop_requested: false,
-            probes: Probes::new(|_| false),
-        };
-        let key = KeyEvent::from(KeyCode::Char('G'));
-        view.handle_key(key);
-        assert!(matches!(view.handle_key(key), ServeAction::Launch(_)));
-        assert_ne!(view.pending_passphrase, "running daemon phrase");
-        assert_eq!(
-            recall_passphrase().as_deref(),
-            Some("running daemon phrase")
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn restart_requires_an_uninterrupted_confirmation() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        for (cancelled, expired) in [(false, false), (true, false), (false, true)] {
-            let mut view = ServeView {
-                state: ServeViewState::Active {
-                    mode: ServeMode::Local,
-                    transport: None,
-                    urls: vec![ServeUrl {
-                        label: None,
-                        url: "http://127.0.0.1:8081/".to_string(),
-                    }],
-                    url_index: 0,
-                    passphrase: None,
-                    opened_at: Instant::now(),
-                    log_offset: 0,
-                },
-                pending_passphrase: String::new(),
-                pending_confirm: None,
-                show_help: false,
-                mouse: RefCell::default(),
-                copied: None,
-                running_persists: None,
-                restart_probe: RestartProbe::default(),
-                pending_launch: None,
-                launch_in_flight: false,
-                stop_requested: false,
-                probes: Probes::new(|_| false),
-            };
-            let restart_key = KeyEvent::from(KeyCode::Char('R'));
-            assert!(matches!(
-                view.handle_key(restart_key),
-                ServeAction::Continue
-            ));
-            assert!(matches!(&view.state, ServeViewState::Active { .. }));
-            assert!(!view.launch_in_flight);
-            assert!(view.pending_launch.is_none());
-            assert!(matches!(
-                view.pending_confirm,
-                Some((PendingConfirm::Restart, _))
-            ));
-
-            if cancelled {
-                assert!(matches!(
-                    view.handle_key(KeyEvent::from(KeyCode::Char('x'))),
-                    ServeAction::Continue
-                ));
-                assert!(view.pending_confirm.is_none());
-            }
-            let stale = Instant::now() - CONFIRM_TTL - Duration::from_secs(1);
-            if expired {
-                view.pending_confirm = Some((PendingConfirm::Restart, stale));
-            }
-            let action = view.handle_key(restart_key);
-            if cancelled || expired {
-                assert!(matches!(action, ServeAction::Continue));
-                assert!(matches!(&view.state, ServeViewState::Active { .. }));
-                assert!(!view.launch_in_flight);
-                assert!(view.pending_launch.is_none());
-                assert!(view.pending_confirm.is_some_and(|(action, when)| {
-                    action == PendingConfirm::Restart && when > stale
-                }));
-            } else {
-                let ServeAction::Launch(request) = action else {
-                    panic!("second restart key must launch");
-                };
-                assert!(request.restart);
-                assert_eq!(request.mode, ServeMode::Local);
-                assert!(matches!(&view.state, ServeViewState::Starting { .. }));
-                assert!(view.launch_in_flight);
-                assert!(view.pending_confirm.is_none());
-            }
-        }
-    }
-
-    #[test]
-    fn token_age_counts_only_under_token_auth() {
-        let recorded = |auth: &str, core_only: bool| -> ServeLaunch {
-            serde_json::from_value(serde_json::json!({
-                "schema": 4, "pid": 1, "profile": "", "core_only": core_only,
-                "host": "127.0.0.1", "port": 8080, "auth_mode": auth,
-                "has_passphrase": false, "behind_proxy": false, "read_only": false,
-                "remote": false, "tunnel_name": null, "tunnel_url": null,
-                "no_tailscale": false,
-            }))
-            .unwrap()
-        };
-        let renews = TokenWindow::Renews;
-        for (launch, want) in [
-            (None, renews),
-            (Some(recorded("token", false)), renews),
-            (Some(recorded("none", true)), renews),
-            (Some(recorded("passphrase", false)), TokenWindow::Reused),
-            (Some(recorded("none", false)), TokenWindow::Reused),
-        ] {
-            assert_eq!(effective_token_window(launch.as_ref(), renews), want);
-        }
-    }
-
-    /// The token can age out between the first and second R, so the second one confirms again
-    /// when what it would do no longer matches what the user read.
-    #[test]
-    #[serial_test::serial]
-    fn second_restart_key_reprobes_and_reconfirms_when_the_effect_changed() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let token = crate::session::get_app_dir().unwrap().join("serve.token");
-        let mut view = ServeView::new();
-        view.state = ServeViewState::Active {
-            mode: ServeMode::Local,
-            transport: None,
-            urls: vec![ServeUrl {
-                label: None,
-                url: "http://127.0.0.1:8080/?token=t".to_string(),
-            }],
-            url_index: 0,
-            passphrase: None,
-            opened_at: Instant::now(),
-            log_offset: 0,
-        };
-        let key = KeyEvent::from(KeyCode::Char('R'));
-        let write_token = |age: Duration| {
-            std::fs::write(&token, "t").unwrap();
-            std::fs::File::options()
-                .write(true)
-                .open(&token)
-                .unwrap()
-                .set_modified(std::time::SystemTime::now() - age)
-                .unwrap();
-        };
-        write_token(Duration::from_secs(23 * 60 * 60 + 60));
-        view.handle_key(key);
-        assert_eq!(view.restart_probe.local_token, TokenWindow::Boundary);
-        write_token(Duration::from_secs(24 * 60 * 60 + 60));
-        assert!(matches!(view.handle_key(key), ServeAction::Continue));
-        assert_eq!(view.restart_probe.local_token, TokenWindow::Renews);
-        assert!(matches!(
-            view.pending_confirm,
-            Some((PendingConfirm::Restart, _))
-        ));
-        assert!(view.pending_launch.is_none());
-        assert!(matches!(view.handle_key(key), ServeAction::Launch(_)));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_view_reopened_mid_launch_leaves_liveness_to_the_launch() {
-        // for_launch reads (or writes) the saved passphrase in the app dir.
-        let _home = crate::session::test_support::isolate_app_dir();
-        // No daemon has published yet, so a liveness probe would call the launch dead.
-        let started = Instant::now();
-        let mut view = ServeView::for_launch(DashboardLaunch::tunnel_for_test(started));
-        assert!(!view.tick());
-        assert!(view.probes.liveness.is_none());
-        assert_eq!(view.probes.last_attempt, 0, "no probe was requested");
-        assert!(
-            matches!(view.state, ServeViewState::Starting { started_at, .. } if started_at == started)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
-    async fn stop_key_returns_owned_action_while_launch_transaction_is_held() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let transaction = crate::daemon::lifecycle::Transaction::acquire()
-            .await
-            .unwrap();
-        let mut view = ServeView::new();
-        view.state = ServeViewState::Starting {
-            mode: ServeMode::Local,
-            transport: None,
-            passphrase: None,
-            started_at: Instant::now(),
-            log_offset: 0,
-        };
-        view.launch_in_flight = true;
-        let (sent, received) = tokio::sync::oneshot::channel();
-        let key_thread = std::thread::spawn(move || {
-            let action = view.handle_key(KeyEvent::from(KeyCode::Char('s')));
-            let _ = sent.send((view, action));
-        });
-        let (mut view, action) = tokio::time::timeout(Duration::from_secs(2), received)
-            .await
-            .expect("Stop must not wait for the held launch transaction")
-            .unwrap();
-        assert!(matches!(action, ServeAction::Stop));
-        assert!(view.stop_requested);
-        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
-            view.render(frame, frame.area(), theme)
-        });
-        crate::tui::dialogs::test_render::find(&buffer, "Stopping daemon");
-        assert!(matches!(
-            view.handle_key(KeyEvent::from(KeyCode::Esc)),
-            ServeAction::Close
-        ));
-        drop(transaction);
-        key_thread.join().unwrap();
-    }
-
-    /// A probe handler that reports each probe it starts, then holds it until released.
-    struct Gate {
-        entered: std::sync::mpsc::Receiver<()>,
-        release: std::sync::mpsc::Sender<bool>,
-    }
-
-    impl Gate {
-        fn wait_entered(&self) {
-            self.entered
-                .recv_timeout(Duration::from_secs(10))
-                .expect("probe never reached the worker");
-        }
-    }
-
-    fn gated_view() -> (ServeView, Gate) {
-        let (entered_tx, entered) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        let view = ServeView::with_probe_handler(move |_| {
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap()
-        });
-        (view, Gate { entered, release })
-    }
-
-    fn starting() -> ServeViewState {
-        ServeViewState::Starting {
-            mode: ServeMode::Local,
-            transport: None,
-            passphrase: None,
-            started_at: Instant::now(),
-            log_offset: 0,
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_held_probe_at_construction_leaves_the_dialog_responsive() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let (mut view, gate) = gated_view();
-        gate.wait_entered();
-
-        assert!(!view.tick());
-        assert!(matches!(
-            view.handle_key(KeyEvent::from(KeyCode::Char('x'))),
-            ServeAction::Continue
-        ));
-        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
-            view.render(frame, frame.area(), theme)
-        });
-        crate::tui::dialogs::test_render::find(&buffer, "Checking");
-        assert!(matches!(
-            view.handle_key(KeyEvent::from(KeyCode::Esc)),
-            ServeAction::Close
-        ));
-
-        gate.release.send(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while matches!(view.state, ServeViewState::Checking { .. }) {
-            view.tick();
-            assert!(Instant::now() < deadline, "probe result never applied");
-            std::thread::yield_now();
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_held_probe_leaves_a_clickable_close_control() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let (mut view, gate) = gated_view();
-        gate.wait_entered();
-        let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
-            view.render(frame, frame.area(), theme)
-        });
-        let (col, row) = crate::tui::dialogs::test_render::find(&buffer, "[Esc] cancel");
-        let key = view.handle_click(col, row).expect("close hint is a target");
-        assert!(matches!(view.handle_key(key), ServeAction::Close));
-        gate.release.send(true).unwrap();
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_starting_dialog_keeps_one_probe_in_flight_and_ignores_a_stale_result() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let (mut view, gate) = gated_view();
-        gate.wait_entered();
-        gate.release.send(true).unwrap();
-        // The construction probe's result no longer matches once the state is replaced.
-        view.state = starting();
-        view.tick();
-        gate.wait_entered();
-        let current = view.probes.liveness.expect("a liveness probe is in flight");
-        // The blocked FIFO worker hides queued requests, so count enqueues instead.
-        let enqueued = view.probes.last_attempt;
-        for _ in 0..5 {
-            view.tick();
-        }
-        assert_eq!(
-            view.probes.last_attempt, enqueued,
-            "a second probe was queued"
-        );
-
-        // A result for an attempt the state no longer awaits must not change it.
-        assert!(!view.apply_probe(current - 1, false));
-        assert!(matches!(view.state, ServeViewState::Starting { .. }));
-        assert_eq!(view.probes.liveness, Some(current));
-        gate.release.send(true).unwrap();
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn a_liveness_probe_that_saw_the_daemon_exit_errors_only_without_a_published_url() {
-        let _home = crate::session::test_support::isolate_app_dir();
-        let mut view = ServeView::with_probe_handler(|_| false);
-        view.state = starting();
-        view.probes.liveness = Some(7);
-        assert!(view.apply_probe(7, false));
-        assert!(matches!(view.state, ServeViewState::Error { .. }));
-    }
-}
+mod tests;

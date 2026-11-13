@@ -25,6 +25,7 @@ import type {
 } from "./types";
 import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
+import { INLINE_ELEVATION_HEADER } from "./fetchInterceptor";
 
 type Payload = Record<string, unknown>;
 
@@ -514,7 +515,9 @@ export function fetchSettings(profile?: string): Promise<SettingsResponse | null
 /** The machine-wide layer alone, for editors that show or set the value a
  *  profile inherits. Anything honoring a setting reads `fetchSettings`. */
 export function fetchMachineSettings(): Promise<SettingsResponse | null> {
-  return fetchJson<SettingsResponse>("/api/settings?layer=machine");
+  return fetchJson<SettingsResponse>("/api/settings?layer=machine", {
+    signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+  });
 }
 
 async function announceSave(save: Promise<boolean>): Promise<boolean> {
@@ -532,13 +535,16 @@ const POST_PERSIST_ERRORS = new Set(["partially_saved", "load_failed"]);
 const writeTab = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
 let writeSeq = 0;
 
+function saveOutcome({ ok, status, payload }: Reply): SaveOutcome {
+  if (ok) return "committed";
+  if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
+  return "rejected";
+}
+
 async function sendSave(url: string, init: RequestInit): Promise<SaveOutcome> {
   const headers = { ...(init.headers as Record<string, string>), "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
   try {
-    const { ok, status, payload } = await send(url, { ...init, headers });
-    if (ok) return "committed";
-    if (status >= 500 || POST_PERSIST_ERRORS.has(stringField(payload, "error") ?? "")) return "uncertain";
-    return "rejected";
+    return saveOutcome(await send(url, { ...init, headers }));
   } catch {
     return "uncertain";
   }
@@ -588,12 +594,17 @@ export async function fetchLogs(lines: number, signal?: AbortSignal): Promise<Lo
 // save. A failed fetch is not cached, so the next call retries.
 let schemaPromise: Promise<SettingsFieldDescriptor[] | null> | null = null;
 
+/** A stalled request fails instead of holding up setup, so the user can retry. */
+const SETUP_REQUEST_TIMEOUT_MS = 15_000;
+
 /** Fetch the settings schema (single source of truth, #1692). The generic
  *  settings renderer builds form rows from these descriptors instead of
  *  hand-written per-field JSX. */
 export function getSettingsSchema(): Promise<SettingsFieldDescriptor[] | null> {
   if (!schemaPromise) {
-    schemaPromise = fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema").then((s) => {
+    schemaPromise = fetchJson<SettingsFieldDescriptor[]>("/api/settings/schema", {
+      signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+    }).then((s) => {
       if (!s) schemaPromise = null;
       return s;
     });
@@ -1188,6 +1199,21 @@ export function updateMachineSettings(updates: Record<string, unknown>): Promise
   return announceOutcome(sendSave("/api/settings?layer=machine", jsonInit("PATCH", updates)));
 }
 
+/** Like `updateMachineSettings`, but reports a needed passphrase to the caller
+ *  instead of raising the global elevation prompt. */
+export async function updateMachineSettingsInline(
+  updates: Record<string, unknown>,
+): Promise<SaveOutcome | "elevation_required"> {
+  const headers = { [INLINE_ELEVATION_HEADER]: "1", "X-Aoe-Write-Stamp": `${writeTab}.${++writeSeq}` };
+  const init = { ...jsonInit("PATCH", updates, headers), signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS) };
+  const reply = await send("/api/settings?layer=machine", init).catch(() => null);
+  if (reply?.status === 403 && stringField(reply.payload, "error") === "elevation_required")
+    return "elevation_required";
+  const outcome = reply ? saveOutcome(reply) : "uncertain";
+  if (outcome !== "rejected") notifySettingsChanged();
+  return outcome;
+}
+
 /**
  * Sets the global theme (name and/or color mode). Dedicated endpoint, not
  * `PATCH /api/settings`: the theme is a global preference but cosmetic, so it
@@ -1508,7 +1534,9 @@ export interface TelemetryStatus {
 }
 
 export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
-  return fetchJson<TelemetryStatus>("/api/telemetry/status");
+  return fetchJson<TelemetryStatus>("/api/telemetry/status", {
+    signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+  });
 }
 
 /// Set the opt-in state. The daemon owns the anonymous install id; the
@@ -2944,11 +2972,71 @@ export async function trashSession(id: string, killPane = true): Promise<Session
   }
 }
 
+export interface TrashRetryConsent {
+  expected_profile: string;
+  expected_generation: number;
+}
+
+export async function retryTrashSession(
+  id: string,
+  consent: TrashRetryConsent,
+  expectedEpoch: string,
+): Promise<SessionSettingOutcome & { message?: string }> {
+  try {
+    const response = await fetch(
+      `/api/sessions/${encodeURIComponent(id)}/trash`,
+      jsonInit(
+        "POST",
+        {
+          kill_pane: true,
+          expected_profile: consent.expected_profile,
+          expected_generation: consent.expected_generation,
+        },
+        { "aoe-runtime-epoch": expectedEpoch },
+      ),
+    );
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as Payload | null;
+      return {
+        outcome: response.status >= 500 ? "uncertain" : "rejected",
+        message: stringField(payload, "message") ?? `Trash retry failed (HTTP ${response.status})`,
+      };
+    }
+    const result = await sessionSettingOutcome(response, id, expectedEpoch);
+    if (result.outcome !== "committed") {
+      return { ...result, message: "Trash retry was not confirmed. Refresh before retrying." };
+    }
+    const session = result.mutation.session;
+    let message: string | undefined;
+    if (
+      "outcome" in session &&
+      session.outcome &&
+      typeof session.outcome === "object" &&
+      "relocation" in session.outcome
+    ) {
+      const relocation = session.outcome.relocation;
+      if (relocation && typeof relocation === "object") {
+        if ("reason" in relocation && typeof relocation.reason === "string") message = relocation.reason;
+        else if ("warning" in relocation && typeof relocation.warning === "string") message = relocation.warning;
+      }
+    }
+    return { ...result, message };
+  } catch (error) {
+    return { outcome: "uncertain", message: networkError(error) };
+  }
+}
+
 /** Restore a trashed session (#2489): clears `trashed_at`, returning it to
  *  its prior bucket with its transcript and metadata intact. */
-export async function restoreSession(id: string): Promise<SessionResponse | null> {
+export async function restoreSession(id: string): Promise<SessionMutation | null> {
   try {
-    return withMoveWarning(await sessionUpdate(id, "restore", jsonInit("POST")), (o) => stringField(o, "warning"));
+    const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/restore`, jsonInit("POST"));
+    const mutation = await sessionMutation(response);
+    if (!mutation) return null;
+    return {
+      ...mutation,
+      session: withMoveWarning(mutation.session, (outcome) => stringField(outcome, "warning"))!,
+    };
   } catch {
     return null;
   }
@@ -3348,4 +3436,63 @@ export async function fetchTaskOutput(sessionId: string, taskId: string): Promis
     `/api/sessions/${encodeURIComponent(sessionId)}/acp/tasks/${encodeURIComponent(taskId)}/output`,
     { signal: AbortSignal.timeout(TASK_OUTPUT_TIMEOUT_MS) },
   );
+}
+
+// --- Setup wizard ---
+
+export type SetupStepKey = "theme_telemetry" | "agents" | "project" | "worktrees" | "sandbox" | "notifications";
+
+export interface SetupStep {
+  key: SetupStepKey;
+  required: boolean;
+  /** Set up: a setting differs from its default wherever it was set, or the defaults were confirmed here. */
+  configured: boolean;
+  /** The user kept this optional step's defaults in the wizard. */
+  confirmed: boolean;
+  skipped: boolean;
+}
+
+export interface SetupStatus {
+  finished: boolean;
+  /** The user left for the dashboard, so `/` stops redirecting to `/setup`. */
+  deferred: boolean;
+  banner_dismissed: boolean;
+  steps: SetupStep[];
+  tmux: boolean;
+  git: boolean;
+  access: { serve_mode: string; tunnel_url?: string };
+}
+
+export type SetupPatch = Partial<{
+  skip_step: SetupStepKey;
+  confirm_step: SetupStepKey;
+  unskip_step: SetupStepKey;
+  finished: boolean;
+  deferred: boolean;
+  banner_dismissed: boolean;
+}>;
+
+export type ContainerRuntimeKind = "docker" | "podman" | "apple_container";
+
+export interface RuntimeStatus {
+  kind: ContainerRuntimeKind;
+  installed: boolean;
+  running: boolean;
+  /** How to start it on the Daemon's platform. */
+  start_command: string;
+}
+
+export function fetchSetup(): Promise<SetupStatus | null> {
+  return fetchJson<SetupStatus>("/api/setup", { signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS) });
+}
+
+export function updateSetup(patch: SetupPatch): Promise<{ ok: boolean; message?: string }> {
+  return okWithMessage("/api/setup", {
+    ...jsonInit("PATCH", patch),
+    signal: AbortSignal.timeout(SETUP_REQUEST_TIMEOUT_MS),
+  });
+}
+
+export function fetchSetupRuntimes(): Promise<RuntimeStatus[] | null> {
+  return fetchJson<RuntimeStatus[]>("/api/setup/runtimes");
 }

@@ -8,7 +8,7 @@ use super::{
     decode_logged, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
 };
 use crate::acp::approvals::{Approval, Nonce};
-use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, WorkflowAgents};
+use crate::acp::state::{BackgroundTaskLaunch, Event, Plan, SubagentRecord, WorkflowAgents};
 use crate::events;
 
 /// A background agent silent this long without completing no longer holds a turn open.
@@ -76,6 +76,22 @@ const UNRESOLVED_BACKGROUND_TASKS_SQL: &str =
                  json_extract(started.event_json, '$.BackgroundTaskStarted.task_id')
        )
      ORDER BY started.seq ASC";
+
+/// Each subagent's latest snapshot, where it is still working. An
+/// `AgentSwitched` drops the children announced before it. SQLite takes the
+/// bare `event_json` from the `MAX(seq)` row of each group.
+const OPEN_SUBAGENTS_SQL: &str = "SELECT latest.event_json
+     FROM (SELECT event_json, MAX(seq) AS seq
+           FROM acp_events
+           WHERE session_id = ?1
+             AND discriminant = 'SubagentUpdated'
+             AND seq > COALESCE((SELECT MAX(seq) FROM acp_events
+                                 WHERE session_id = ?1
+                                   AND discriminant = 'AgentSwitched'), 0)
+           GROUP BY json_extract(event_json, '$.SubagentUpdated.subagent.session_id')) AS latest
+     WHERE json_extract(latest.event_json, '$.SubagentUpdated.subagent.state')
+           IN ('running', 'requires_action')
+     ORDER BY latest.seq ASC";
 
 /// The agents of workflow run `run_id` the log has launched, and those of
 /// them it has completed.
@@ -271,6 +287,36 @@ impl EventStore {
         )
     }
 
+    /// Subagents whose latest snapshot is still working, for the dead-worker
+    /// close-out.
+    pub fn open_subagents(&self, session_id: &str) -> Vec<SubagentRecord> {
+        query_strings(
+            &self.conn(),
+            OPEN_SUBAGENTS_SQL,
+            "open_subagents",
+            session_id,
+        )
+        .iter()
+        .filter_map(
+            |json| match decode_logged(json, session_id, "open_subagents")? {
+                Event::SubagentUpdated { subagent, .. } => Some(subagent),
+                _ => None,
+            },
+        )
+        .collect()
+    }
+
+    /// `None` when the query failed.
+    fn has_open_subagent(&self, session_id: &str) -> Option<bool> {
+        logged(
+            self.conn()
+                .prepare_cached(OPEN_SUBAGENTS_SQL)
+                .and_then(|mut statement| statement.exists(params![session_id])),
+            "has_open_subagent",
+            session_id,
+        )
+    }
+
     pub fn has_unresolved_background_tasks(&self, session_id: &str) -> bool {
         self.try_has_unresolved_background_tasks(session_id)
             .unwrap_or(false)
@@ -441,10 +487,10 @@ impl EventStore {
     }
 
     /// True while the agent process holds work a replacement would lose: an open
-    /// turn, or a recent background finish the agent has not yet answered with a
-    /// turn. `None` when a query failed.
+    /// turn, a working subagent, or a recent background finish the agent has not
+    /// yet answered with a turn. `None` when a query failed.
     pub fn holds_live_work(&self, session_id: &str) -> Option<bool> {
-        if self.has_open_turn(session_id)? {
+        if self.has_open_turn(session_id)? || self.has_open_subagent(session_id)? {
             return Some(true);
         }
         self.has_unhandled_finish(session_id)
@@ -844,6 +890,61 @@ mod tests {
         }
     }
 
+    /// A child's latest snapshot decides; a switch drops the old agent's children.
+    #[test]
+    fn a_working_child_holds_live_work_until_it_idles() {
+        use crate::acp::state::SubagentState;
+        let (_tmp, store) = open_store(1000);
+        let child = |id: &str, state| Event::SubagentUpdated {
+            subagent: SubagentRecord {
+                session_id: id.into(),
+                parent_session_id: "root".into(),
+                parent_tool_call_id: Some("msg-1".into()),
+                title: None,
+                description: None,
+                state,
+                stop_reason: None,
+                error: None,
+                cancel_capable: true,
+                model: None,
+                background: true,
+            },
+            at: chrono::Utc::now(),
+        };
+        let switched = Event::AgentSwitched {
+            from: "claude".into(),
+            to: "codex".into(),
+            reason: "user".into(),
+        };
+        let root_done = || [user_prompt("go"), stopped("end_turn")];
+        // (events after the root's terminal, holds live work)
+        let cases = [
+            (vec![child("a", SubagentState::Running)], true),
+            (vec![child("a", SubagentState::RequiresAction)], true),
+            (vec![child("a", SubagentState::Unknown)], false),
+            (
+                vec![
+                    child("a", SubagentState::Running),
+                    child("a", SubagentState::Idle),
+                ],
+                false,
+            ),
+            (
+                vec![
+                    child("a", SubagentState::Running),
+                    child("b", SubagentState::Idle),
+                ],
+                true,
+            ),
+            (vec![child("a", SubagentState::Running), switched], false),
+        ];
+        for (i, (events, holds)) in cases.into_iter().enumerate() {
+            let id = format!("c-{i}");
+            record_from(&store, &id, 1, root_done().into_iter().chain(events));
+            assert_eq!(store.holds_live_work(&id), Some(holds), "case {i}");
+        }
+    }
+
     /// An agent-initiated turn (a Monitor or background finish waking the
     /// agent) opens with no `UserPromptSent`, so only its own events show it.
     #[test]
@@ -855,6 +956,7 @@ mod tests {
                 name: "Bash".into(),
                 kind: "execute".into(),
                 args_preview: "{}".into(),
+                prompt: None,
                 started_at: chrono::Utc::now(),
                 parent_tool_call_id: None,
                 memory_recall: None,

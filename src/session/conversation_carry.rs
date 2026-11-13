@@ -853,6 +853,28 @@ fn config_root(
     .ok()
 }
 
+/// The config root `tool` reads for this host session, which identifies the account behind it.
+/// `None` for a sandboxed row (its store is per container), an unresolvable root, or an agent
+/// whose conversation AoE cannot locate in a config root: the host root resolves Claude's home.
+pub(crate) fn host_account_root(instance: &Instance, profile: &str, tool: &str) -> Option<PathBuf> {
+    if instance.is_sandboxed() {
+        return None;
+    }
+    let agent = crate::session::resolved_agent_for(profile, tool, &instance.detect_as)?;
+    if !carries_transcript(agent) {
+        return None;
+    }
+    config_root(instance, profile, tool, agent, &dirs::home_dir()?)
+}
+
+/// The directory `[session.agent_config_dir]` declares for `tool` under `profile`, if any.
+/// Unlike [`host_account_root`] it never falls back to the environment or the agent's default.
+pub(crate) fn declared_account_dir(profile: &str, tool: &str) -> Option<PathBuf> {
+    resolve_config_or_warn(profile)
+        .session
+        .agent_config_dir_for(tool, &dirs::home_dir()?)
+}
+
 /// Every `projects/<encoded-cwd>/<sid>.jsonl` under `root`.
 ///
 /// The encoded directory is derived from the cwd the agent ran in, which for a

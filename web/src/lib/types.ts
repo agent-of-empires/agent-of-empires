@@ -18,6 +18,11 @@ export interface SessionResponse {
   /** Worker auto-stopped for inactivity (resumable), unlike a deliberate Stop. */
   dormant: boolean;
   lifecycle_generation: number;
+  lifecycle_reservation?: {
+    op: "launch" | "capture" | "stop" | "purge" | "restore" | "trash";
+    generation: number;
+    at: string;
+  } | null;
   yolo_mode: boolean;
   created_at: string;
   last_accessed_at: string | null;
@@ -33,6 +38,8 @@ export interface SessionResponse {
   is_sandboxed: boolean;
   /** The Working directory is not a Repository, so Diff does not auto-open. */
   outside_repository?: boolean;
+  /** Created with its `on_create` hooks skipped, so their setup never ran. */
+  created_without_setup?: boolean;
   /** True when the session was created in scratch mode (`aoe add
    *  --scratch` or the wizard toggle). The `project_path` points
    *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
@@ -321,6 +328,10 @@ export interface AgentInfo {
   acp_args?: string[];
   /** Omitted for Active agents. Mirrors `AgentLifecycle` in src/agents.rs. */
   lifecycle?: AgentLifecycleInfo;
+  /** Resolved binary on the daemon's PATH, for installed built-in agents. */
+  path?: string;
+  /** Installs the missing ACP adapter, when known. */
+  acp_install_command?: string;
 }
 
 export interface ProfileInfo {
@@ -430,6 +441,8 @@ export interface CreateSessionRequest {
   trust_hooks?: boolean;
   /** Fingerprint of the exact hook/MCP configuration reviewed before approval. */
   trust_review?: CreationTrustFingerprint;
+  /** Skip every `on_create` hook; the session is tagged `created_without_setup` when there were any. */
+  skip_on_create?: boolean;
   /** Claude Code session id to import; `path` must be its original cwd. */
   import_acp_session_id?: string;
   /** Agent or ACP session id to fork from. */

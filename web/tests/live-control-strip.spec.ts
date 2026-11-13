@@ -14,27 +14,20 @@ const ownerScreen = () => ({
   cursor: { x: 10, y: OWNER_ROWS - 1 },
 });
 
+type Control = "claim" | { cols: number; rows: number };
 // The resize and claim controls this tab sent, in order.
-const sizing = (handle: MockHandle) =>
-  liveTexts(handle).flatMap((text) => {
-    try {
-      const msg = JSON.parse(text) as { type?: string; rows?: number };
-      if (msg.type === "claim") return ["claim"];
-      return msg.type === "resize" ? [msg.rows!] : [];
-    } catch {
-      return [];
-    }
-  });
-
-const resizes = (handle: MockHandle) =>
-  liveTexts(handle).flatMap((text) => {
+const controls = (handle: MockHandle): Control[] =>
+  liveTexts(handle).flatMap((text): Control[] => {
     try {
       const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
+      if (msg.type === "claim") return ["claim"];
       return msg.type === "resize" ? [{ cols: msg.cols!, rows: msg.rows! }] : [];
     } catch {
       return [];
     }
   });
+const resizes = (handle: MockHandle) => controls(handle).filter((c) => c !== "claim");
+const sizing = (handle: MockHandle) => controls(handle).map((c) => (c === "claim" ? c : c.rows));
 
 // Only an owner's input reaches the pane, so a key arriving shows the claim was granted. `refocus` puts focus back
 // on App's keyboard proxy first, for paths that leave it elsewhere.
@@ -165,15 +158,7 @@ test.describe("Live terminal control strip at 375px", () => {
         }),
     );
     await expect.poll(() => sizing(handle).filter((x) => x === "claim").length).toBe(1);
-    const sent = liveTexts(handle).flatMap((text) => {
-      try {
-        const msg = JSON.parse(text) as { type?: string; cols?: number; rows?: number };
-        if (msg.type === "claim") return ["claim" as const];
-        return msg.type === "resize" ? [{ cols: msg.cols!, rows: msg.rows! }] : [];
-      } catch {
-        return [];
-      }
-    });
+    const sent = controls(handle);
     const claimAt = sent.indexOf("claim");
     const carrier = sent[claimAt - 1];
     // The queued report carried the claim, at the restored width and without the strip.

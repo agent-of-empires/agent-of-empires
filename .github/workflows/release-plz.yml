@@ -50,7 +50,7 @@ jobs:
           MISSED="$(git log --oneline "$BASE..$MERGE~1")"
           if [ -n "$MISSED" ]; then
             echo "::warning title=Missing from CHANGELOG.md::$(echo "$MISSED" | wc -l) commit(s) merged after the release PR's last refresh are tagged but not in CHANGELOG.md. See the job summary."
-            { echo '### Tagged but missing from CHANGELOG.md'; echo '```'; echo "$MISSED"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            { echo '### Tagged but missing from CHANGELOG.md'; echo; echo "$MISSED" | sed 's/^/    /'; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Install Rust toolchain

@@ -692,13 +692,25 @@ export function SettingsView({
         );
       case "updates":
         return (
-          <SchemaSection
-            section="updates"
-            schema={schema}
-            focusRequest={focusRequest}
-            values={settings?.updates ?? {}}
-            onSaveField={sendSave}
-          />
+          <div className="space-y-6">
+            <SchemaSection
+              section="updates"
+              schema={schema}
+              focusRequest={focusRequest}
+              values={settings?.updates ?? {}}
+              onSaveField={sendSave}
+            />
+            <div className="space-y-4">
+              <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">Daemon</h4>
+              <SchemaSection
+                section="serve"
+                schema={schema}
+                focusRequest={focusRequest}
+                values={settings?.serve ?? {}}
+                onSaveField={sendSave}
+              />
+            </div>
+          </div>
         );
       case "telemetry":
         return <TelemetrySettings />;

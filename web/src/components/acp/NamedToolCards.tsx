@@ -224,8 +224,8 @@ export function WorkflowToolCard({ tool, result }: ToolCardProps) {
                 );
               })}
               {openPane && (
-                <button type="button" onClick={openPane} className="mt-1.5 text-accent-500 hover:underline">
-                  Open Sub agents
+                <button type="button" onClick={() => openPane()} className="mt-1.5 text-accent-500 hover:underline">
+                  Open Background
                 </button>
               )}
             </div>

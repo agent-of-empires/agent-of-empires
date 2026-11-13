@@ -666,9 +666,11 @@ impl SessionService {
         };
 
         spec.created_by_plugin = Some(plugin_id.to_string());
-        // Fail-closed: install-time plugin consent is not repository trust.
+        // Fail-closed: install-time plugin consent is not repository trust, nor a choice to
+        // skip setup.
         spec.trust_hooks = None;
         spec.trust_review = None;
+        spec.skip_on_create = false;
 
         let Some(key) = idempotency_key else {
             let outcome = spawn_structured_session(self, spec).await?;
@@ -2730,6 +2732,7 @@ mod tests {
             scratch: false,
             trust_hooks: None,
             trust_review: None,
+            skip_on_create: false,
             custom_instruction: None,
             callback_url: None,
             idempotency_key: None,
@@ -2784,6 +2787,80 @@ mod tests {
             );
         }
         assert!(storage.load()?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn plugin_creation_cannot_skip_on_create() -> anyhow::Result<()> {
+        let _home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        crate::session::config::update_config(|config| {
+            config.systemd.enabled = false;
+            config.hooks.on_create = vec!["exit 7".into()];
+        })?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let (launcher, launches) = crate::server::test_support::counting_failing_launcher();
+        let state =
+            crate::server::test_support::build_test_app_state_with_launcher(Vec::new(), launcher);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut spec = test_spec();
+        spec.scratch = true;
+        spec.skip_on_create = true;
+        let error = state
+            .session_service
+            .create_structured_session(spec, Some("cron"), None, None)
+            .await
+            .err()
+            .expect("the hook still runs and fails");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::server::api::sessions::CreateHookFailed>()),
+            "{error:#}"
+        );
+        assert_eq!(launches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(storage.load()?.is_empty());
+        Ok(())
+    }
+
+    /// Skipping setup skips only on_create: on_launch still runs.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_create_without_setup_still_runs_on_launch() -> anyhow::Result<()> {
+        let home = crate::session::test_support::isolate_app_dir();
+        let app = crate::session::get_app_dir()?;
+        crate::session::purge_owners::initialize(&app)?;
+        crate::tmux::tool_retirement::initialize(&app)?;
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })?;
+        let launched = home.path().join("on-launch-ran");
+        crate::session::config::update_config(|config| {
+            config.hooks.on_create = vec!["exit 3".into()];
+            config.hooks.on_launch = vec![format!("touch '{}'", launched.display())];
+        })?;
+        let storage = crate::session::Storage::new_unwatched("default")?;
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let mut spec = test_spec();
+        spec.scratch = true;
+        spec.view = crate::session::View::Terminal;
+        spec.skip_on_create = true;
+        let created =
+            crate::server::session_spawn::spawn_structured_session(&state.session_service, spec)
+                .await;
+        assert!(
+            launched.exists(),
+            "on_launch did not run: {:?}",
+            created.err()
+        );
+        assert!(storage.load()?.iter().any(|row| row.created_without_setup));
         Ok(())
     }
 

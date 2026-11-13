@@ -238,6 +238,7 @@ Add a new session
 * `--hook-env <KEY[=VALUE]>` — Env var for the host `before_start` hook only, never the container (`KEY=VALUE` or `KEY`; repeatable; requires --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
+* `--skip-on-create` — Create the session without running its on_create hooks, so a failing setup script does not roll the session back. on_launch hooks still run
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
@@ -1775,7 +1776,7 @@ Start the aoe daemon: REST/WebSocket API, plus the web dashboard in builds that 
 ###### **Options:**
 
 * `--core-only` — Serve the private local API without opening TCP or a dashboard
-* `--port <PORT>` — Port to listen on (default: 8080; debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
+* `--port <PORT>` — Port to listen on. Falls back to the `AOE_SERVE_PORT` environment variable, then `[serve] port` in config.toml, then 8080 (debug builds default to 8081 so a `cargo run` instance does not collide with an installed release `aoe`)
 * `--host <HOST>` — Host/IP to bind to (use 0.0.0.0 for LAN/VPN access)
 
   Default value: `127.0.0.1`

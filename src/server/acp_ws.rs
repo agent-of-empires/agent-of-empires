@@ -810,8 +810,10 @@ mod tests {
                 description: None,
                 state: SubagentState::Running,
                 stop_reason: None,
+                error: None,
                 cancel_capable: true,
                 model: None,
+                background: false,
             },
             at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
         };
@@ -877,6 +879,7 @@ mod tests {
         let approval = crate::acp::approvals::Approval {
             nonce: crate::acp::approvals::Nonce("n-1".into()),
             tool_call: crate::acp::state::ToolCall {
+                prompt: None,
                 id: "t-1".into(),
                 name: "Edit".into(),
                 kind: "edit".into(),
@@ -1069,6 +1072,7 @@ mod tests {
         let at = chrono::Utc::now();
         let started = |id: &str| Event::ToolCallStarted {
             tool_call: ToolCall {
+                prompt: None,
                 id: id.into(),
                 name: id.into(),
                 kind: "read".into(),
@@ -1370,9 +1374,12 @@ mod tests {
             receive_kind(&mut socket, "transcript_snapshot").await;
 
             let tools = vec![BackgroundAgentTool {
+                id: None,
                 name: "Read".into(),
                 title: Some("complete/file/path".into()),
                 ok: Some(true),
+                started_at: None,
+                ended_at: None,
             }];
             for (seq, kind, event) in [
                 (
@@ -1453,6 +1460,7 @@ mod tests {
         let approval = |nonce: &str| crate::acp::approvals::Approval {
             nonce: crate::acp::approvals::Nonce(nonce.into()),
             tool_call: crate::acp::state::ToolCall {
+                prompt: None,
                 id: "t-1".into(),
                 name: "Edit".into(),
                 kind: "edit".into(),
@@ -1578,6 +1586,7 @@ mod tests {
         for (seq, id) in [(1, "missed"), (2, "queued")] {
             let event = Event::ToolCallStarted {
                 tool_call: ToolCall {
+                    prompt: None,
                     id: id.into(),
                     name: id.into(),
                     kind: "read".into(),

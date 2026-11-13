@@ -26,9 +26,12 @@ impl HomeView {
             }
         }
 
-        // Poll serve dialog for subprocess startup events.
         if let Some(view) = &mut self.serve_view {
             if view.tick() {
+                changed = true;
+            }
+            if let Some(request) = view.take_launch() {
+                self.pending_dashboard_launch = Some(request);
                 changed = true;
             }
         }

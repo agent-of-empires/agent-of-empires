@@ -1,10 +1,8 @@
-// Backgrounded shell commands of the active session: what is running, what
-// ran, and each one's command and output.
+// A backgrounded shell command's row, and its command and output.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Maximize2, Terminal, X } from "lucide-react";
 
-import { useBackgroundShells } from "../../hooks/useAcpSession";
 import { fetchTaskOutput, type TaskOutput } from "../../lib/api";
 import type { BackgroundShell } from "../../lib/acpTypes";
 import { CopyMarkdownButton } from "./CopyMarkdownButton";
@@ -13,64 +11,28 @@ const OUTPUT_POLL_MS = 2000;
 // Failed reads retried after the shell ended, before the modal gives up.
 const MAX_RETRIES_AFTER_FINISH = 5;
 
-export function BackgroundShells({ sessionId }: { sessionId: string }) {
-  const shells = useBackgroundShells(sessionId);
-  const [open, setOpen] = useState<string | null>(null);
-  const close = useCallback(() => setOpen(null), []);
-  if (shells.length === 0) return null;
-  const running = shells.filter((s) => !s.finished).reverse();
-  const recent = shells.filter((s) => s.finished).reverse();
-  const opened = shells.find((s) => s.taskId === open);
+export function ShellRow({ shell, onOpen }: { shell: BackgroundShell; onOpen: (taskId: string) => void }) {
   return (
-    <div className="border-b border-surface-700">
-      <ShellGroup label="Running shells" shells={running} onOpen={setOpen} />
-      <ShellGroup label="Recent shells" shells={recent} onOpen={setOpen} />
-      {opened && (
-        <ShellDetailModal key={`${sessionId}:${opened.taskId}`} sessionId={sessionId} shell={opened} onClose={close} />
-      )}
-    </div>
+    <button
+      type="button"
+      onClick={() => onOpen(shell.taskId)}
+      title="Open command and output"
+      className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-surface-800"
+    >
+      <span
+        className={`h-2 w-2 shrink-0 rounded-full ${shell.finished ? "bg-text-dim/60" : "bg-status-waiting animate-pulse"}`}
+      />
+      <Terminal className="h-3.5 w-3.5 shrink-0 text-text-dim" />
+      <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">
+        {shell.command || "(command unavailable)"}
+      </span>
+      <span className="shrink-0 text-[11px] text-text-dim">{shell.finished ? "done" : "running"}</span>
+      <Maximize2 className="h-3.5 w-3.5 shrink-0 text-text-dim" />
+    </button>
   );
 }
 
-function ShellGroup({
-  label,
-  shells,
-  onOpen,
-}: {
-  label: string;
-  shells: BackgroundShell[];
-  onOpen: (taskId: string) => void;
-}) {
-  if (shells.length === 0) return null;
-  return (
-    <div>
-      <div className="px-3 pt-1.5 text-[10px] uppercase tracking-wider text-text-dim">
-        {label} · {shells.length}
-      </div>
-      {shells.map((s) => (
-        <button
-          key={s.taskId}
-          type="button"
-          onClick={() => onOpen(s.taskId)}
-          title="Open command and output"
-          className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-surface-800"
-        >
-          <span
-            className={`h-2 w-2 shrink-0 rounded-full ${s.finished ? "bg-text-dim/60" : "bg-status-waiting animate-pulse"}`}
-          />
-          <Terminal className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text-secondary">
-            {s.command || "(command unavailable)"}
-          </span>
-          <span className="shrink-0 text-[11px] text-text-dim">{s.finished ? "done" : "running"}</span>
-          <Maximize2 className="h-3.5 w-3.5 shrink-0 text-text-dim" />
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function ShellDetailModal({
+export function ShellDetailModal({
   sessionId,
   shell,
   onClose,

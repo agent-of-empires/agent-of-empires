@@ -41,8 +41,8 @@ it("names the step, offers its actions and copies the full reference", async () 
   await waitFor(() => expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy());
 });
 
-it("shows a failed hook's last output lines and no reference line without one", () => {
-  mount({
+it("shows a failed hook's last output lines, both ways forward, and no reference line without one", () => {
+  const { onAction } = mount({
     code: "hook_failed",
     stage: "running_hooks",
     message: "An on_create hook exited with code 2.",
@@ -50,4 +50,7 @@ it("shows a failed hook's last output lines and no reference line without one", 
   });
   expect(screen.getByTestId("create-failure-output").textContent).toBe(output.slice(-8).join("\n"));
   expect(screen.queryByTestId("create-failure-reference")).toBeNull();
+  expect(screen.getByTestId("create-failure-try_again").textContent).toBe("Try again");
+  fireEvent.click(screen.getByRole("button", { name: "Create without setup" }));
+  expect(onAction).toHaveBeenCalledWith("create_without_setup");
 });

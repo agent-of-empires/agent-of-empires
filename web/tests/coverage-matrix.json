@@ -3,6 +3,34 @@
   "description": "Surface/flow coverage matrix for the agent-of-empires web dashboard. Every component file under web/src/components/** must appear in at least one entry's `components` list (covered, deferred, or out-of-scope), or in coverage-matrix.exempt.json. CI validates this on every PR via tests/validate-coverage-matrix.mjs.",
   "surfaces": [
     {
+      "id": "trash.unfinished-recovery",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/trash-recovery.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/sidebar/TrashMenu.tsx"
+      ],
+      "notes": "Real-daemon Retry preserves unverified files and captured generations. Fresh owners refuse Retry without changing custody. Retry and read-only inspection remain available; unfinished Trash never grants purge authority."
+    },
+    {
+      "id": "trash.mixed-workspace-recovery",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash.spec.ts"],
+      "components": ["web/src/App.tsx", "web/src/components/sidebar/TrashMenu.tsx"],
+      "notes": "An unfinished Trash member remains reachable beside a live workspace sibling. Retry targets only the pending member and preserves the active live session route."
+    },
+    {
+      "id": "trash.restore-receipt-ordering",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useSessions.test.ts", "src/lib/__tests__/trashActions.test.ts", "src/lib/api.test.ts"],
+      "components": ["web/src/App.tsx"],
+      "notes": "Restore consumes its native receipt and wins over a late older Retry without fencing unrelated rows. Mixed-workspace restore excludes live members."
+    },
+    {
       "id": "settings.dialog-escape",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -599,7 +627,8 @@
         "web/src/lib/api.ts",
         "web/src/index.css",
         "src/tui/styles/resolved.rs"
-      ]
+      ],
+      "notes": "Browser: the theme picker repaints and persists across reload and serve restart. The derived colour variables are pinned in Rust, not the browser: builtins_clear_contrast_floors covers the built-in themes, and a_lift_that_cannot_clear_every_surface_keeps_the_best_worst_case covers a custom theme whose surfaces straddle mid-grey, where no lift step clears every surface and the step with the best worst-surface contrast is kept."
     },
     {
       "id": "settings.plugin-settings",
@@ -695,14 +724,8 @@
       "id": "settings.telemetry-consent",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/TelemetrySettings.test.tsx",
-        "src/components/__tests__/TelemetryConsentModal.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/TelemetrySettings.tsx",
-        "web/src/components/TelemetryConsentModal.tsx"
-      ]
+      "specs": ["src/components/settings/__tests__/TelemetrySettings.test.tsx"],
+      "components": ["web/src/components/settings/TelemetrySettings.tsx"]
     },
     {
       "id": "settings.logs-tab",
@@ -900,7 +923,8 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/SettingsView.folds.test.tsx"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"]
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/FormFields.tsx"],
+      "notes": "The Updates tab shows the Daemon port (`serve.port`) under a Daemon heading; editing it saves `{ serve: { port } }` through the normal settings path. Global only; a new value applies after a stop and start."
     },
     {
       "id": "settings.global-migration-and-persistence",
@@ -1025,6 +1049,22 @@
         "src/hooks/useSessions.test.ts"
       ],
       "components": ["web/src/lib/statusSounds.ts", "web/src/hooks/useStatusSounds.ts", "web/src/lib/soundPlayer.ts"]
+    },
+    {
+      "id": "notifications.linked-toasts",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/Toasts.test.tsx"],
+      "components": ["web/src/components/Toasts.tsx"],
+      "notes": "A toast that opens a session (in-app push) or a validated URL (plugin ui.open_url) renders its message as a native button before Dismiss in tab order, labeled \"Open link\" or \"Open session\" when the message is blank: activating it opens the target once and dismisses the toast, a click elsewhere on the toast still opens it, and Dismiss closes it without navigating. Plain toasts keep a non-interactive message; status and alert roles are unchanged."
+    },
+    {
+      "id": "notifications.linked-toasts-keyboard",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/toast-keyboard.spec.ts"],
+      "components": ["web/src/components/Toasts.tsx"],
+      "notes": "In a real browser, a session push toast and a plugin ui.open_url link toast are reached with Tab (the opener first, Dismiss after it); Enter or Space opens the target exactly once (window.open and the open-session event are counted), and Dismiss from the keyboard removes the toast without opening anything."
     },
     {
       "id": "settings.security-readonly",
@@ -1282,7 +1322,8 @@
         "src/lib/api.test.ts",
         "src/components/session-wizard/__tests__/CreateFailureBox.test.tsx",
         "src/components/session-wizard/createFailureView.test.ts",
-        "src/components/__tests__/Toasts.test.tsx"
+        "src/components/__tests__/Toasts.test.tsx",
+        "src/hooks/__tests__/useWizardReopen.test.tsx"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
@@ -1301,9 +1342,10 @@
         "web/src/components/session-wizard/steps/LaunchFields.tsx",
         "web/src/components/session-wizard/CreateFailureBox.tsx",
         "web/src/components/session-wizard/createFailureView.ts",
-        "web/src/components/Toasts.tsx"
+        "web/src/components/Toasts.tsx",
+        "web/src/hooks/app/useWizardReopen.ts"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A failed on_create hook also offers Create without setup, which resends that once with skip_on_create under a new key, and closes the wizard on a 201. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box, with the hook output the create printed after the wizard closed; while another wizard is open, Reopen asks to close it first and the toast stays. A backgrounded create polls its progress only until it settles. An adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1808,7 +1850,7 @@
       "id": "sidebar.groups",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/sidebar-grouping.spec.ts"],
+      "specs": ["tests/sidebar-grouping.spec.ts", "src/components/__tests__/WorkspaceSidebarGroupSlices.test.tsx"],
       "components": [
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/sidebar/SidebarGroupHeader.tsx",
@@ -3190,13 +3232,21 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card.",
+      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
-        "src/components/acp/ToolCards.render.test.tsx"
+        "src/components/acp/ToolCards.render.test.tsx",
+        "src/components/acp/subagents/activityFold.test.ts",
+        "src/components/acp/subagents/model.test.ts",
+        "src/components/acp/subagents/longText.test.ts",
+        "tests/acp-subagent-view-mobile.spec.ts"
       ],
       "components": [
+        "web/src/components/acp/subagents/ActivitySection.tsx",
+        "web/src/components/acp/subagents/LongMarkdown.tsx",
+        "web/src/components/acp/subagents/StopSession.tsx",
+        "web/src/components/acp/subagents/SubagentDetail.tsx",
         "web/src/components/acp/BackgroundAgentsPanel.tsx",
         "web/src/components/acp/BackgroundShells.tsx",
         "web/src/components/acp/backgroundAgentsContext.ts",
@@ -5255,6 +5305,14 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.created-without-setup-chip",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/sidebar/RowBadges.tsx"],
+      "notes": "A row with a Session that has created_without_setup (a collapsed group row if any of its Sessions does) shows a muted \"Created without setup\" icon-only chip, labelled for hover and screen readers; an untagged row shows none."
+    },
+    {
       "id": "sidebar.session-new-session",
       "kind": "vitest",
       "risk": "medium",
@@ -5399,25 +5457,50 @@
       ]
     },
     {
-      "id": "onboarding.theme-welcome",
+      "id": "onboarding.setup-wizard",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/theme-onboarding.spec.ts"],
+      "specs": ["tests/setup-wizard.spec.ts"],
       "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/App.tsx",
+        "web/src/components/Dashboard.tsx",
+        "web/src/components/setup/SetupWizardPage.tsx",
+        "web/src/components/setup/SetupRail.tsx",
+        "web/src/components/setup/SetupBanner.tsx",
+        "web/src/components/setup/ui.tsx",
+        "web/src/components/setup/steps/ThemeTelemetryStep.tsx",
+        "web/src/components/setup/steps/AgentsStep.tsx",
+        "web/src/hooks/useSetupStatus.ts",
         "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/setup.ts",
         "web/src/lib/api.ts"
       ]
     },
     {
-      "id": "onboarding.theme-welcome-unit",
+      "id": "onboarding.setup-unit",
       "kind": "vitest",
-      "risk": "low",
-      "specs": ["src/components/onboarding/__tests__/ThemeIntro.test.tsx", "src/lib/__tests__/onboarding.test.ts"],
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/setup.test.ts",
+        "src/components/setup/__tests__/SetupBanner.test.tsx",
+        "src/components/setup/__tests__/SetupWizardPage.test.tsx",
+        "src/components/setup/__tests__/SandboxStep.test.tsx",
+        "src/components/setup/__tests__/AgentsStep.test.tsx",
+        "src/components/setup/__tests__/ThemeTelemetryStep.test.tsx",
+        "src/hooks/__tests__/useInlineMachineSave.test.ts",
+        "src/hooks/__tests__/useSetupStatus.test.ts"
+      ],
       "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx",
-        "web/src/hooks/useThemeMutation.ts",
-        "web/src/lib/themeWrites.ts"
+        "web/src/components/setup/SetupWizardPage.tsx",
+        "web/src/components/setup/SetupBanner.tsx",
+        "web/src/components/setup/SetupElevationBar.tsx",
+        "web/src/components/setup/steps/ProjectStep.tsx",
+        "web/src/components/setup/steps/WorktreesStep.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx",
+        "web/src/components/setup/steps/AccessStep.tsx",
+        "web/src/hooks/useInlineMachineSave.ts",
+        "web/src/lib/fetchInterceptor.ts",
+        "web/src/lib/setup.ts"
       ]
     },
     {

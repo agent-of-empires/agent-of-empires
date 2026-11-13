@@ -29,6 +29,7 @@ import { useLatestRef } from "./useLatestRef";
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
 export {
   clearAcpCache,
+  useActivity,
   useBackgroundAgents,
   useBackgroundShells,
   useBackgroundTasks,

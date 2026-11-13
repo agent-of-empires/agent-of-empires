@@ -1110,8 +1110,9 @@ impl HomeView {
                 .render(frame, area, theme);
                 return;
             }
-            // A dashboard start hidden with Esc is still running behind this screen.
-            let message = if self.dashboard_launch.is_some() {
+            let message = if self.dashboard_stop.is_some() {
+                "Connecting to runtime…\n\nEnter: back to the Web dashboard stop   q: Quit"
+            } else if self.dashboard_launch.is_some() {
                 "Connecting to runtime…\n\nEnter: back to the Web dashboard start   q: Quit"
             } else {
                 "Connecting to runtime…\n\nq: Quit"
@@ -2616,6 +2617,18 @@ impl HomeView {
         self.preview_worker_pulse = observation;
         stalled
     }
+    /// Whether the preview of `target` may read through the VT pipe. Shell terminals and
+    /// a pane another surface took over use capture-pane; the latter lets the new owner
+    /// arm the pipe, which this process's lease would otherwise hold.
+    pub(super) fn preview_vt_enabled(&self, target: Option<&str>) -> bool {
+        self.vt_live_enabled
+            && !matches!(self.view_mode, ViewMode::Terminal)
+            && self
+                .live_takeover
+                .as_ref()
+                .is_none_or(|taken| Some(taken.tmux_name.as_str()) != target)
+    }
+
     /// Point the capture worker at `desired` (the displayed pane's tmux session) and
     /// retune its cadence for live-send vs idle. One long-lived worker is spawned lazily
     /// and retargeted in place; an empty target idles it. Idempotent and cheap when the
@@ -2639,9 +2652,7 @@ impl HomeView {
             // Shell terminals use capture-pane's authoritative snapshot: their prompt
             // repaint can expose a PROMPT_EOL_MARK to a pipe-pane seed, producing a false
             // frame before the grid reconciles. Slower, but no seed handoff.
-            worker.set_vt_enabled(
-                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
-            );
+            worker.set_vt_enabled(self.preview_vt_enabled(desired.as_deref()));
             worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
@@ -2699,7 +2710,7 @@ impl HomeView {
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
             worker.set_forward_empty(forward_empty);
-            worker.set_vt_enabled(self.vt_live_enabled && !forward_empty);
+            worker.set_vt_enabled(self.preview_vt_enabled(self.preview_capture_target.as_deref()));
             worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
     }
@@ -4512,12 +4523,40 @@ impl HomeView {
                 }
                 None => (None, None),
             };
+            // After another window took live control: its status, then the key that takes
+            // control back. Only live entry claims the size lock; a full-screen attach doesn't.
+            let takeover = self
+                .live_takeover
+                .as_ref()
+                .filter(|taken| self.selected_session.as_deref() == Some(taken.session_id.as_str()))
+                .map(|taken| taken.taker);
+            let live_key = takeover.and_then(|taker| {
+                groups.push((
+                    0,
+                    None,
+                    vec![Span::styled(
+                        taker.label(),
+                        Style::default().fg(theme.text).bold(),
+                    )],
+                ));
+                // No key hint where neither key enters live mode; the row's hints stay.
+                let (click, key) = match self.live_key(self.selected_session.as_deref()?)? {
+                    live_send::LiveKey::Tab => (ktab, "Tab"),
+                    live_send::LiveKey::Enter => (kenter, "↵"),
+                };
+                groups.push((0, click, mk(key, "take control")));
+                Some(click)
+            });
             if let Some(enter_action_text) = enter_action_text {
                 // U+21B5 keeps Enter to one display cell without shortening its action label.
-                groups.push((0, kenter, mk("↵", enter_action_text)));
+                if live_key != Some(kenter) {
+                    groups.push((0, kenter, mk("↵", enter_action_text)));
+                }
             }
             if let Some(tab_action_text) = tab_action_text {
-                groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                if live_key != Some(ktab) {
+                    groups.push((2, ktab, mk("⇥ ", tab_action_text)));
+                }
             }
 
             let (click, key) = bound(ActionId::ToggleView);

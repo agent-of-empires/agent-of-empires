@@ -1676,46 +1676,19 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let hook_alias =
-            crate::tmux::status_rules::effective_detect_as(profile, &inst.tool, &inst.detect_as);
-        let manifest_tool: &str = if hook_alias.is_empty() {
-            &inst.tool
-        } else {
-            &hook_alias
-        };
         let rules_tool =
             crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
-        let hook = crate::hooks::read_hook_status(&inst.id).map(|status| {
-            crate::tmux::detect::HookObservation {
-                status,
-                age: crate::hooks::read_hook_status_age(&inst.id),
-            }
-        });
-        let status = if let Some(plan) =
-            crate::tmux::DetectionPlan::for_manifest(profile, &rules_tool, manifest_tool)
+        let status = if let Some((status, _)) =
+            inst.detect_pane_now(profile, &tmux_session, Some((&raw, args.lines)))
         {
-            let policy = plan.capture_policy();
-            let status_raw = if policy.scope.can_reuse(args.lines) {
-                None
-            } else {
-                tmux_session.capture_pane(policy.scope.lines()).ok()
-            };
-            let status_content = status_raw.as_deref().unwrap_or(&raw);
-            let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
-            let observation = crate::tmux::Observation::new(
-                &osc_title,
-                hook,
-                !policy.observe_ownership
-                    || inst.live_pane_owned(&tmux_session, None, tmux_session.is_pane_dead()),
-            );
-            plan.detect(
-                &crate::tmux::utils::strip_ansi(status_content),
-                &observation,
-            )
-            .status
-            .unwrap_or(inst.status)
+            status.unwrap_or(inst.status)
         } else {
-            let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
+            let hook = crate::hooks::read_hook_status(&inst.id)
+                .map(|status| crate::tmux::detect::HookObservation {
+                    status,
+                    age: crate::hooks::read_hook_status_age(&inst.id),
+                })
+                .filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
             match hook {
                 Some(hook) => hook.status,
                 None => tmux_session

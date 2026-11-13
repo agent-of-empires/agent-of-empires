@@ -4,6 +4,7 @@ pub(super) use super::AppState;
 
 use axum::{http::StatusCode, response::Response};
 mod acp;
+pub(crate) use acp::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
 mod client_log;
 mod file_provenance;
 mod git;
@@ -18,6 +19,7 @@ mod projects;
 mod queue;
 mod sandbox_image;
 pub(crate) mod sessions;
+mod setup;
 mod skills;
 pub(crate) mod system;
 mod telemetry;
@@ -74,6 +76,7 @@ pub(crate) use sessions::{
     lifecycle_rejection, persist_session_update, purge_expired_trash, reconcile_trashed_worktrees,
     reconcile_worktree_paths, trash_sweep_interval,
 };
+pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
 };
@@ -229,6 +232,9 @@ pub(super) fn session_not_found() -> axum::response::Response {
     )
 }
 
+/// Why `aoe serve --read-only` refused a change.
+pub(crate) const READ_ONLY_MESSAGE: &str = "Server is in read-only mode";
+
 /// Canonical 403 body for `aoe serve --read-only`.
 pub(super) fn read_only_response() -> axum::response::Response {
     use axum::response::IntoResponse as _;
@@ -237,7 +243,7 @@ pub(super) fn read_only_response() -> axum::response::Response {
         crate::daemon::ApiErrorCode::ReadOnly.header(),
         axum::Json(serde_json::json!({
             "error": "read_only",
-            "message": "Server is in read-only mode"
+            "message": READ_ONLY_MESSAGE
         })),
     )
         .into_response()
@@ -505,6 +511,7 @@ mod tests {
             include_str!("sandbox_image.rs"),
             &["sandbox_image_pull", "sandbox_image_dismiss"],
         ),
+        ("setup.rs", include_str!("setup.rs"), &["patch_setup"]),
         (
             "system.rs",
             include_str!("system.rs"),

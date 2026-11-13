@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { Puzzle } from "lucide-react";
-import { useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
+import { Navigate, useLocation, useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
@@ -18,6 +18,7 @@ import { useAttentionCounts } from "./hooks/useAttentionCounts";
 import { useStatusSounds } from "./hooks/useStatusSounds";
 import { useSessionStatusStream } from "./hooks/useSessionStatusStream";
 import { useDashboardPresence } from "./hooks/useDashboardPresence";
+import { useWizardReopen } from "./hooks/app/useWizardReopen";
 import { useFocusMode, useFocusSession } from "./hooks/useFocusMode";
 import { createToasts, focusNavigation, noticedSessions, withFocusMode } from "./lib/focusMode";
 import { FocusModeNote } from "./components/FocusModeNote";
@@ -41,7 +42,7 @@ import { PluginUiProvider, usePluginAttention, usePluginPages, usePluginUiEntrie
 import { buildPluginPageActions } from "./lib/pluginPages";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
-import { nextAttentionSessionId, workspaceIsTrashed } from "./lib/sidebarSort";
+import { nextAttentionSessionId } from "./lib/sidebarSort";
 import { useSidebarAxis, useSidebarSortMode } from "./hooks/useSidebarPrefs";
 import { axisDrawsRepoHeaders } from "./lib/sidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -76,6 +77,9 @@ import {
   trashSessions,
   sessionsSharingWorktree,
   workspaceCleanupDefaults,
+  hasPendingTrash,
+  trashRecoveryTargetIsCurrent,
+  type TrashRecoveryTarget,
 } from "./lib/trashActions";
 import {
   loginStatus,
@@ -86,8 +90,6 @@ import {
   acpDisable,
   fetchAbout,
   fetchSettings,
-  fetchTelemetryStatus,
-  setTelemetryConsent,
   reportTelemetrySeen,
   isDebugBuild,
   markWebTourSeen,
@@ -102,7 +104,7 @@ import {
   setSessionArchive,
   setSessionSnooze,
   trashSession,
-  restoreSession,
+  retryTrashSession,
   fetchPlugins,
 } from "./lib/api";
 import type { DeleteSessionOptions, RuntimeCursor, ServerAbout, SettingsResponse } from "./lib/api";
@@ -157,7 +159,7 @@ import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
 import { PaneDndController } from "./components/PaneDndController";
 import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
-import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { BackgroundAgentsPanel, type AgentFocus } from "./components/acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./components/acp/startupWait";
 import { DiffPane } from "./components/DiffPane";
 import { FilesPane } from "./components/FilesPane";
@@ -175,18 +177,19 @@ import { ProjectFormModal } from "./components/ProjectFormModal";
 import { ScratchOverridesModal } from "./components/ScratchOverridesModal";
 import { HelpOverlay } from "./components/HelpOverlay";
 import { useTour } from "./hooks/useTour";
-import { useWelcomePhase } from "./hooks/useWelcomePhase";
-import { ThemeIntro } from "./components/onboarding/ThemeIntro";
+import { useSetupStatus } from "./hooks/useSetupStatus";
+import { bannerSteps, shouldRedirectToSetup } from "./lib/setup";
+import { SetupWizardPage } from "./components/setup/SetupWizardPage";
+import { SetupBanner } from "./components/setup/SetupBanner";
 import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
-import type { WizardPrefill, WizardRestore } from "./components/session-wizard/SessionWizard";
+import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
 import type { ProjectInfo, RepoGroup, SessionResponse, Workspace } from "./lib/types";
 import { Dashboard } from "./components/Dashboard";
 import { LoginPage } from "./components/LoginPage";
 import { TokenEntryPage } from "./components/TokenEntryPage";
 import { LOGIN_REQUIRED_EVENT, TOKEN_EXPIRED_EVENT, resetTokenExpired } from "./lib/fetchInterceptor";
 import { AboutModal } from "./components/AboutModal";
-import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
@@ -377,6 +380,7 @@ function AppContent({
   const settingsTabMatch = useMatch("/settings/:tab");
   const profilesMatch = useMatch("/profiles");
   const pluginPageMatch = useMatch("/plugins/:pluginId/:pageId");
+  const setupMatch = useMatch("/setup");
   // A focus-mode window shows one session only: no sidebar, no switching, and notifications for that session alone.
   const { focusSessionId, enterFocusMode, exitFocusMode } = useFocusMode(sessionMatch?.params.sessionId ?? null);
   const focusMode = focusSessionId !== null;
@@ -448,12 +452,17 @@ function AppContent({
         ),
     });
   }, [injectSession, focusMode]);
-  // Trash is a whole-workspace concern, so it is derived here from the
-  // authoritative unsliced workspace list rather than reconstructed from the
-  // sidebar's per-`group_path` slice views. A workspace is in Trash only when
-  // every one of its sessions is trashed, and Restore/Delete then cover all of
-  // them. See #2533.
-  const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
+  // A mixed workspace exposes only its trashed sessions in recovery controls.
+  const trashedWorkspaces = useMemo(
+    () =>
+      workspaces
+        .map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.filter((session) => session.trashed_at != null),
+        }))
+        .filter((workspace) => workspace.sessions.length > 0),
+    [workspaces],
+  );
   // The list omits the trash, so a link to a trashed session finds no row until the trash is loaded.
   const openedSessionId = focusSessionId ?? activeSessionId;
   useEffect(() => {
@@ -777,13 +786,21 @@ function AppContent({
     },
     [toggleKind, togglePlugin, pluginPaneById],
   );
-  // Open (or focus) the Sub agents pane. Used by an inline async
+  // Open (or focus) the Background pane. Used by an inline async
   // sub-agent card to jump to its panel entry.
-  const openAgentsPane = useCallback(() => {
-    const dock = dockOf(paneLayout, "agents");
-    if (dock) activateTab(dock, "agents");
-    else toggleKind("agents", "right");
-  }, [paneLayout, activateTab, toggleKind]);
+  const [agentFocus, setAgentFocus] = useState<AgentFocus | null>(null);
+  const focusAgent = useCallback((agentId?: string) => {
+    if (agentId) setAgentFocus((f) => ({ agentId, nonce: (f?.nonce ?? 0) + 1 }));
+  }, []);
+  const openAgentsPane = useCallback(
+    (agentId?: string) => {
+      focusAgent(agentId);
+      const dock = dockOf(paneLayout, "agents");
+      if (dock) activateTab(dock, "agents");
+      else toggleKind("agents", "right");
+    },
+    [paneLayout, activateTab, toggleKind, focusAgent],
+  );
   const closePaneAny = useCallback(
     (id: string) => {
       // Closing an extra terminal tab kills its tmux shell so it does not leak;
@@ -869,12 +886,6 @@ function AppContent({
   // drives the shared SnoozeModal. Null when no snooze is in flight.
   const [snoozeTargetId, setSnoozeTargetId] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
-  const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
-  // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
-  // starts false, so before this is true "no consent needed" and "not resolved
-  // yet" look the same; the tips auto-pop waits on this so it can't slip in
-  // before a pending consent modal.
-  const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
   const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
@@ -1183,8 +1194,7 @@ function AppContent({
   }, [navigate, focusSessionId]);
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
-  // A background create's failure to reopen on; the count remounts a wizard already open.
-  const [wizardRestore, setWizardRestore] = useState<{ restore: WizardRestore; n: number } | null>(null);
+  const { wizardRestore, reopenFailure, clearRestore } = useWizardReopen(showSessionWizard, setShowSessionWizard);
   const [deletingSessions, setDeletingSessions] = useState<SessionResponse[]>([]);
   const [stoppingSessionId, setStoppingSessionId] = useState<string | null>(null);
   const [switchViewTarget, setSwitchViewTarget] = useState<{ sessionId: string; toStructured: boolean } | null>(null);
@@ -1204,11 +1214,13 @@ function AppContent({
     }),
   );
   const refreshServerAbout = aboutRequests.refresh;
+  // The setup wizard applies to writable, non-CityHall dashboards; unknown until /api/about settles.
+  const setup = useSetupStatus(serverAboutLoaded ? !caps.readOnly && !caps.cityhall : null);
   const recoverServerAbout = aboutRequests.recover;
 
   // Kick off the initial server-about fetch on mount. The effect body only
-  // calls fetchAbout and schedules the telemetry consent check; neither runs
-  // setState synchronously, so set-state-in-effect is not triggered.
+  // calls fetchAbout, which doesn't setState synchronously, so
+  // set-state-in-effect is not triggered.
   useEffect(() => {
     let active = true;
     const generation = aboutRequests.begin();
@@ -1229,16 +1241,6 @@ function AppContent({
       // placeholder; it then renders read-only with a Retry notice.
       .finally(() => {
         if (active && aboutRequests.isCurrent(generation)) setServerAboutLoaded(true);
-      });
-    void fetchTelemetryStatus()
-      .then((status) => {
-        if (!active || !status) return;
-        if (!status.responded && !status.do_not_track) {
-          setTelemetryConsentNeeded(true);
-        }
-      })
-      .finally(() => {
-        if (active) setTelemetryConsentKnown(true);
       });
     return () => {
       active = false;
@@ -1266,11 +1268,6 @@ function AppContent({
     if (activeSession?.view !== "structured") return;
     reportTelemetrySeen("structured_view");
   }, [serverAboutLoaded, caps.readOnly, activeSession?.view]);
-
-  const handleTelemetryConsent = useCallback((enabled: boolean) => {
-    setTelemetryConsentNeeded(false);
-    void setTelemetryConsent(enabled);
-  }, []);
 
   const liveDeletingSessions = deletingSessions.filter((session) => !session.trashed_at);
   const deletingSession = deletingSessions[0] ?? null;
@@ -1395,12 +1392,41 @@ function AppContent({
     });
   };
 
-  // Restore a trashed workspace from the sidebar Trash section (#2489).
-  // Restores every session in the workspace (a workspace only lands in Trash
-  // when all of its sessions are trashed), not just the first.
+  // Restore only the trashed sessions supplied by the recovery surface.
   const handleRestoreSession = useCallback(
-    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
-    [applySession],
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySessionMutation, notify: toastBus.handler }),
+    [applySessionMutation],
+  );
+
+  const handleRetryTrash = useCallback(
+    async (target: TrashRecoveryTarget) => {
+      if (
+        caps.readOnly ||
+        !trashRecoveryTargetIsCurrent(
+          sessions.find((session) => session.id === target.id),
+          target,
+          runtimeEpoch,
+        )
+      ) {
+        toastBus.handler?.error("The Trash session changed. Reopen its recovery actions.");
+        return;
+      }
+      const result = await retryTrashSession(target.id, target, target.epoch);
+      if (result.outcome !== "committed") {
+        toastBus.handler?.error(result.message ?? "Trash retry was not confirmed. Refresh before retrying.");
+        refreshSessions();
+        return;
+      }
+      applySessionMutation(result.mutation);
+      if (hasPendingTrash(result.mutation.session)) {
+        toastBus.handler?.error(
+          result.message ?? "Trash remains unfinished. Its files and cleanup ownership are preserved.",
+        );
+      } else if (result.message) {
+        toastBus.handler?.info(result.message);
+      }
+    },
+    [caps.readOnly, sessions, runtimeEpoch, applySessionMutation, refreshSessions],
   );
 
   const stoppingSession = stoppingSessionId ? (sessions.find((s) => s.id === stoppingSessionId) ?? null) : null;
@@ -1929,30 +1955,29 @@ function AppContent({
     serverAboutLoaded,
   );
 
-  // Palette triage toggles for the active session. "snooze" needs a duration,
-  // so it opens the shared modal; the rest are argless server toggles that
-  // apply the returned snapshot immediately (re-bucketing without waiting for
-  // the poll) and surface a toast on failure.
   const handleSessionStateAction = useCallback(
     async (id: string, action: SessionStateAction) => {
       if (action === "snooze") {
         setSnoozeTargetId(id);
         return;
       }
-      const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
+      if (action === "untrash") {
+        await handleRestoreSession([id]);
+        return;
+      }
+      const run: Record<Exclude<SessionStateAction, "snooze" | "untrash">, () => Promise<SessionResponse | null>> = {
         pin: () => setSessionPin(id, true),
         unpin: () => setSessionPin(id, false),
         archive: () => setSessionArchive(id, true),
         unarchive: () => setSessionArchive(id, false),
         unsnooze: () => setSessionSnooze(id, null),
         trash: () => trashSession(id),
-        untrash: () => restoreSession(id),
       };
       const result = await run[action]();
       if (result) applySession(result);
       else reportError(`Failed to ${action} session`);
     },
-    [applySession],
+    [applySession, handleRestoreSession],
   );
 
   const commandActions = useCommandActions({
@@ -2023,7 +2048,13 @@ function AppContent({
       const plugin = pluginPaneById.get(id);
       if (plugin) return <PluginPaneBody entry={plugin.entry} />;
       if (id === "agents") {
-        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+        return (
+          <BackgroundAgentsPanel
+            sessionId={activeSessionId}
+            readOnly={caps.readOnly || !!activeSession?.trashed_at || !!activeSession?.archived_at}
+            focus={agentFocus}
+          />
+        );
       }
       if (id === "files") {
         // Remount on session switch so the selected file (and any in-flight
@@ -2108,6 +2139,7 @@ function AppContent({
                             onOpenFileRef={handleOpenFileRef}
                             fileRefSession={session}
                             onOpenAgentsPane={openAgentsPane}
+                            serverReadOnly={caps.readOnly}
                             isSandboxed={session.is_sandboxed}
                             onSwitchToTerminal={
                               canSwitchToTerminal ? () => handleSwitchView(session.id, false) : undefined
@@ -2326,6 +2358,16 @@ function AppContent({
           onToggleSidebar={handleToggleSidebar}
           readOnly={caps.readOnly}
           canManageProjects={caps.canManageProjects}
+          banner={
+            setupBannerSteps.length > 0 &&
+            setup.status && (
+              <SetupBanner
+                steps={setup.status.steps}
+                open={setupBannerSteps}
+                onDismiss={() => void setup.update({ banner_dismissed: true })}
+              />
+            )
+          }
         />
       );
     }
@@ -2346,7 +2388,11 @@ function AppContent({
           view={rightPanelView}
           pluginPanes={pluginPanes}
           onBackToAgent={() => handlePickView("agent")}
-          onOpenAgentsPane={() => handlePickView("agents")}
+          agentFocus={agentFocus}
+          onOpenAgentsPane={(agentId) => {
+            focusAgent(agentId);
+            handlePickView("agents");
+          }}
           onSwitchToTerminal={canSwitchToTerminal ? (id) => handleSwitchView(id, false) : undefined}
           onOpenTerminal={canSwitchToTerminal ? handleOpenPairedTerminal : undefined}
           canRestartAgent={canRestartAgent}
@@ -2462,8 +2508,20 @@ function AppContent({
 
   // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
   // an in-flight session route defers it (the flag stays unset until then).
+  const onSetup =
+    !!setupMatch ||
+    shouldRedirectToSetup({
+      status: setup.status ?? null,
+      readOnly: caps.readOnly,
+      cityhall: caps.cityhall,
+      automated: isAutomatedSession(),
+      pathname: location.pathname,
+    });
   const tourAutoLaunchReady =
     serverAboutLoaded &&
+    // The shell stays behind a placeholder until setup status answers, and the tour needs the dashboard.
+    setup.status !== undefined &&
+    !onSetup &&
     sessionsLoaded &&
     !activeSessionId &&
     !fullPageView &&
@@ -2472,21 +2530,11 @@ function AppContent({
     !showAbout &&
     !showPalette &&
     !projectForm;
-  // First-run theme choice is phase one of onboarding. It decides on the same
-  // settled-dashboard gate as the tour, then the tour follows once the modal
-  // resolves so the two never overlap on first load.
-  const welcome = useWelcomePhase({
-    scope: tourScope,
-    readOnly: caps.readOnly,
-    autoLaunchReady: tourAutoLaunchReady,
-    tourSeen,
-    tourSeenKnown,
-  });
   const tour = useTour({
     scope: tourScope,
     readOnly: caps.readOnly,
     isDesktop: !isCoarse,
-    autoLaunchReady: tourAutoLaunchReady && welcome.resolved,
+    autoLaunchReady: tourAutoLaunchReady,
     seen: tourSeen,
     seenKnown: tourSeenKnown,
     onSeen: handleTourSeen,
@@ -2505,10 +2553,7 @@ function AppContent({
       loaded: tips.loaded,
       hasUnseen: tips.hasUnseen,
       tourSeenAtLoad: tourSeenAtLoadRef.current,
-      onboardingReady: tourAutoLaunchReady && welcome.resolved,
-      // Treat "not resolved yet" as pending so tips can't pop ahead of a consent
-      // modal that the in-flight status fetch is about to raise.
-      telemetryPending: !telemetryConsentKnown || telemetryConsentNeeded,
+      onboardingReady: tourAutoLaunchReady,
       tourActive: tour.isTourActive,
       automated: isAutomatedSession(),
     });
@@ -2525,15 +2570,7 @@ function AppContent({
     // appeared for that load. The ref already makes the pop one-shot, so the
     // only cleanup needed is on unmount (below).
     tipsAutoPopFrameRef.current = requestAnimationFrame(() => tips.open());
-  }, [
-    tips,
-    tourSeenKnown,
-    tourAutoLaunchReady,
-    welcome.resolved,
-    telemetryConsentKnown,
-    telemetryConsentNeeded,
-    tour.isTourActive,
-  ]);
+  }, [tips, tourSeenKnown, tourAutoLaunchReady, tour.isTourActive]);
 
   // Drop a still-pending auto-pop frame on unmount only, so a committed open is
   // never cancelled by an unrelated re-render (see the effect above).
@@ -2550,8 +2587,32 @@ function AppContent({
   // CityHall-gated affordances (Clone URL, advanced sidebar) never flash in
   // before caps.cityhall settles. Early return (matching the other loading
   // gates) rather than a wrapper so the shell markup stays unindented. See #7.
-  if (!serverAboutLoaded) {
+  const setupViewer = {
+    status: setup.status ?? null,
+    readOnly: caps.readOnly,
+    cityhall: caps.cityhall,
+    automated: isAutomatedSession(),
+  };
+  const setupBannerSteps = bannerSteps(setupViewer);
+  // On / and /setup, also hold it until setup status answers, so a fresh install never sees the dashboard
+  // flash before /setup. Deep links render without it, so a stalled /api/setup can't blank them.
+  if (!serverAboutLoaded || (setup.status === undefined && (location.pathname === "/" || setupMatch))) {
     return <div className="h-(--app-height) bg-surface-900 safe-area-inset" />;
+  }
+  if (setupMatch) {
+    if (!setup.status) return <Navigate to="/" replace />;
+    return (
+      <SetupWizardPage
+        status={setup.status}
+        about={serverAbout}
+        profile={serverAbout?.profile ?? ""}
+        refresh={setup.refresh}
+        onLeave={() => navigate("/")}
+      />
+    );
+  }
+  if (shouldRedirectToSetup({ ...setupViewer, pathname: location.pathname })) {
+    return <Navigate to="/setup" replace />;
   }
 
   // The header collapse is a phone affordance for the conversation view only:
@@ -2658,8 +2719,8 @@ function AppContent({
                 onSelect={handleSelectWorkspace}
                 onToggleGroup={toggleSidebarGroup}
                 onUpdateRepoAppearance={updateRepoAppearance}
-                onNew={() => {
-                  setWizardPrefill(undefined);
+                onNew={(prefill) => {
+                  setWizardPrefill(prefill?.group ? { group: prefill.group } : undefined);
                   setShowSessionWizard(true);
                 }}
                 onCreateSession={handleCreateSession}
@@ -2674,6 +2735,7 @@ function AppContent({
                 onDeleteSession={handleDeleteSession}
                 onRestoreSession={handleRestoreSession}
                 onEmptyTrash={handleEmptyTrash}
+                onRetryTrash={handleRetryTrash}
                 onStopSession={handleStopSession}
                 onStartSession={handleStartSession}
                 onRestartForUpdate={restartForUpdate}
@@ -2694,18 +2756,14 @@ function AppContent({
 
           {showSessionWizard && (
             <SessionWizard
-              key={wizardRestore?.n ?? 0}
-              restore={wizardRestore?.restore}
-              onReopenFailure={(restore) => {
-                setWizardRestore((prev) => ({ restore, n: (prev?.n ?? 0) + 1 }));
-                setShowSessionWizard(true);
-              }}
+              restore={wizardRestore ?? undefined}
+              onReopenFailure={reopenFailure}
               servedProfile={servedProfileReady ? serverAbout?.profile : undefined}
               onRetryServedProfile={refreshServerAbout}
               onClose={() => {
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
-                setWizardRestore(null);
+                clearRestore();
               }}
               onCreated={(session?: SessionResponse) => {
                 if (session) {
@@ -2715,7 +2773,7 @@ function AppContent({
                 }
                 setShowSessionWizard(false);
                 setWizardPrefill(undefined);
-                setWizardRestore(null);
+                clearRestore();
               }}
               onCreatedInBackground={(session?: SessionResponse) => {
                 if (!session) return;
@@ -2740,17 +2798,6 @@ function AppContent({
             <ScratchOverridesModal profile={serverAbout?.profile ?? ""} onClose={() => setScratchSettingsOpen(false)} />
           )}
 
-          {welcome.showWelcome && (
-            <ThemeIntro
-              onDone={welcome.dismissWelcome}
-              tourFollows={!isCoarse}
-              onSkipTour={() => {
-                handleTourSeen();
-                welcome.dismissWelcome();
-              }}
-            />
-          )}
-
           {tour.tourElement}
 
           {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
@@ -2767,7 +2814,6 @@ function AppContent({
           )}
 
           {showAbout && <AboutModal onClose={() => setShowAbout(false)} sessionId={activeSessionId} />}
-          {telemetryConsentNeeded && <TelemetryConsentModal onChoose={handleTelemetryConsent} />}
 
           {deletingSession && deletingCleanupDefaults && (
             <DeleteSessionDialog

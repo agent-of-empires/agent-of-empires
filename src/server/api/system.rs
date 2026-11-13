@@ -134,6 +134,19 @@ pub struct AgentInfo {
     /// deprecated badge in the wizard picker and switch-agent modal.
     #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
     pub lifecycle: crate::agents::AgentLifecycle,
+    /// Resolved binary on the daemon's PATH, for installed built-in agents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Command that installs the ACP adapter, when it is missing and known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_install_command: Option<String>,
+}
+
+/// The install command for an ACP adapter, keyed on its binary name since the
+/// registry command may be a data-dir path (`aoe-agent`).
+fn adapter_install_command(acp_command: Option<&str>) -> Option<String> {
+    let binary = std::path::Path::new(acp_command?).file_name()?.to_str()?;
+    crate::acp::install_hints::install_hint_for(binary).map(str::to_string)
 }
 
 /// Resolve the acp launch command + args for a built-in agent from
@@ -209,6 +222,8 @@ fn build_custom_agent_infos(
                 // serialized here; they can hold hostnames or secrets.
                 acp_command: None,
                 acp_args: Vec::new(),
+                path: None,
+                acp_install_command: None,
             }
         })
         .collect();
@@ -305,6 +320,8 @@ pub async fn list_agents(
                     acp_allowed: policy.allows(a.name),
                     acp_command,
                     acp_args,
+                    path: None,
+                    acp_install_command: None,
                 }
             })
             .collect::<Vec<_>>();
@@ -346,6 +363,8 @@ pub async fn list_agents(
                 acp_command: None,
                 acp_args: Vec::new(),
                 lifecycle: crate::agents::AgentLifecycle::Active,
+                path: None,
+                acp_install_command: None,
             });
         }
         agents.extend(build_custom_agent_infos(
@@ -367,13 +386,19 @@ pub async fn list_agents(
         });
         // Without a project only the profile's hooks can run, as for scratch.
         let hooks_apply = || match project.as_deref() {
-            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None),
-            None => preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None),
+            Some(path) => preparation_hooks_apply(&config.hooks, path, false, None, false),
+            None => {
+                preparation_hooks_apply(&config.hooks, std::path::Path::new(""), true, None, false)
+            }
         };
         for agent in agents.iter_mut() {
             if agent.acp_capable {
                 agent.acp_installed =
                     adapter_installed(&agent.name, &config, &host_environment, &|| false);
+                if !agent.acp_installed {
+                    agent.acp_install_command =
+                        adapter_install_command(agent.acp_command.as_deref());
+                }
             }
             // Every row, since the repository may give a profile-terminal agent an ACP base.
             agent.acp_create_ready = adapter_installed(
@@ -382,6 +407,14 @@ pub async fn list_agents(
                 create_environment.as_deref().unwrap_or(&host_environment),
                 &hooks_apply,
             );
+        }
+        for agent in agents
+            .iter_mut()
+            .filter(|a| a.kind == "builtin" && a.installed)
+        {
+            agent.path = which::which(&agent.binary)
+                .ok()
+                .map(|p| p.display().to_string());
         }
         agents
     })
@@ -3742,6 +3775,28 @@ mod tests {
                 (entry.always_yolo, entry.acp_always_yolo),
                 expected,
                 "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_install_command_resolves_by_binary_name() {
+        for (command, expected) in [
+            (
+                Some("codex-acp"),
+                Some("npm install -g @agentclientprotocol/codex-acp@latest"),
+            ),
+            (
+                Some("/data/aoe/bin/aoe-agent"),
+                Some("aoe acp doctor --fix --adapter aoe-agent"),
+            ),
+            (Some("unknown-acp"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                adapter_install_command(command).as_deref(),
+                expected,
+                "{command:?}"
             );
         }
     }

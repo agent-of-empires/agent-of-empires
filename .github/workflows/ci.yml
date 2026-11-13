@@ -226,8 +226,8 @@ jobs:
   script-selftests:
     # Toolchain-free self-tests for the scripts other workflows rely on:
     # verify-shared-target.sh (kache verify), select-internal-pr.py
-    # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml)
-    # and classify-cachix-failure.py (cachix-push.yml).
+    # (nix-npm-hash.yml), check-dependabot-pr.py (dependabot-auto-merge.yml),
+    # classify-cachix-failure.py (cachix-push.yml) and release-pr-fresh.sh.
     name: Script Self-Tests
     runs-on: ubuntu-latest
     steps:
@@ -239,6 +239,7 @@ jobs:
       - run: python3 .github/scripts/select-internal-pr.py --self-test
       - run: python3 .github/scripts/check-dependabot-pr.py --self-test
       - run: python3 .github/scripts/classify-cachix-failure.py --self-test
+      - run: .github/scripts/release-pr-fresh.sh --self-test
       - run: python3 scripts/check-no-claude-in-core.py --self-test
       # Disabled until C25 to C29 remove Claude from core on
       # integration/claude-removal; enable there by dropping the `if`.
@@ -437,6 +438,26 @@ jobs:
         run: |
           set -euo pipefail
           nix build --no-link .#packages.x86_64-linux.aoe-web-frontend
+
+  release-pr-fresh:
+    # Fails a stale release PR in the merge queue; see release-pr-fresh.sh.
+    # Passes on other events so it can be a required check.
+    name: Release PR Up To Date
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'merge_group'
+        with:
+          persist-credentials: false
+      - if: github.event_name == 'merge_group'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: .github/scripts/release-pr-fresh.sh
 
   website:
     name: Website Build

@@ -327,8 +327,15 @@ describe("subagents", () => {
     expect(p.children.map((c: Part) => c.toolCallId)).toEqual(["a", "b", "c"]);
   });
 
-  it("leaves orphan children in place", () => {
-    expect(names(toolParts([child("ch-1", "elsewhere")]))).toEqual(["read"]);
+  // #5613: a background child running after its card's turn, with that card
+  // outside the rows, must not become a row of whichever turn is streaming.
+  it("drops a child whose card is outside the rows, with its result", () => {
+    const done = row("done-ch-1", "tool_complete", "out", { toolCallId: "ch-1" });
+    const cut = row("done-ch-0", "tool_complete", "out", { toolCallId: "ch-0" });
+    const msgs = activityToThreadMessages([user(), cut, child("ch-1", "elsewhere"), done, message("Next.")], true);
+    expect(msgs.filter((m) => m.role === "assistant").map((m) => m.content)).toEqual([
+      [{ type: "text", text: "Next." }],
+    ]);
   });
 
   describe("children after a mid-turn split", () => {
@@ -402,14 +409,19 @@ describe("subagents", () => {
       { memory_recall: { mode: "synthesize" as const, synthesized_text: "remembered" } },
       { mode: "synthesize", synthesized_text: "remembered" },
     ],
+    ["_aoe_prompt", { prompt: "the full prompt" }, "the full prompt"],
     [
       "_aoe_diffs",
       { diffs: [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }] },
       [{ path: "/a.md", old_text: null, new_text: "x", created_at: AT }],
     ],
   ])("smuggles %s through argsText", (key, over, expected) => {
-    const [part] = toolParts([toolStart("x", over)]);
-    expect(payload(part!)[key]).toEqual(expected);
+    const parent = toolStart("task-parent-1");
+    const [part] = toolParts(
+      key === "_aoe_parent_tool_call_id" ? [parent, toolStart("x", over)] : [toolStart("x", over)],
+    );
+    const smuggled = key === "_aoe_parent_tool_call_id" ? payload(part!).children[0].argsText : part!.argsText;
+    expect(JSON.parse(smuggled!)[key]).toEqual(expected);
   });
 
   // The server transcript drops raw_name; the client keeps the wire name from the first

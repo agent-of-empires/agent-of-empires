@@ -6,6 +6,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::bindings::{self, ActionId};
+use super::live_send::LiveKey;
 use super::{
     live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
     TerminalMode, ViewMode,
@@ -605,13 +606,15 @@ impl HomeView {
         true
     }
 
-    fn trash_confirmation_is_current(&self, target: &super::SessionDialogTarget) -> bool {
-        self.get_instance(&target.session_id)
-            .is_some_and(|instance| {
-                instance.source_profile == target.source_profile
-                    && instance.lifecycle_generation == target.lifecycle_generation
-                    && !instance.is_trashed()
-            })
+    fn trash_confirmation_is_current(&self, target: &super::TrashDialogTarget) -> bool {
+        self.session_feed.applied_epoch() == Some(target.epoch.as_str())
+            && self
+                .get_instance(&target.session_id)
+                .is_some_and(|instance| {
+                    instance.source_profile == target.source_profile
+                        && instance.lifecycle_generation == target.lifecycle_generation
+                        && !instance.is_trashed()
+                })
             && self
                 .session_feed
                 .applied_session(&target.session_id)
@@ -1519,7 +1522,7 @@ impl HomeView {
                 self.reconcile_trash_confirmation();
                 if let Some(target) = self.pending_trash_session.take() {
                     if self.trash_confirmation_is_current(&target) {
-                        self.trash_session_by_id(&target.session_id);
+                        self.trash_session_by_id_at_epoch(&target.session_id, target.epoch);
                     }
                 }
                 None
@@ -2267,10 +2270,25 @@ impl HomeView {
         if let Some(ref mut serve) = self.serve_view {
             match serve.handle_key(key) {
                 ServeAction::Continue => return None,
-                ServeAction::Stop => return Some(Action::StopDashboard),
-                ServeAction::Launch(request) => {
-                    self.pending_dashboard_launch = Some(request);
-                    return Some(Action::StartDashboard);
+                ServeAction::Stop(request) => {
+                    if self.pending_dashboard_stop.is_none() {
+                        self.pending_dashboard_stop =
+                            Some(crate::tui::app::DashboardStopRequest::Operation(request));
+                        return Some(Action::StopDashboard);
+                    }
+                    return None;
+                }
+                ServeAction::StopOwnedLaunch => {
+                    if !matches!(self.dashboard_launch, Some(DashboardLaunch::Running { .. })) {
+                        serve.refuse_stop();
+                        return None;
+                    }
+                    if self.pending_dashboard_stop.is_none() {
+                        self.pending_dashboard_stop =
+                            Some(crate::tui::app::DashboardStopRequest::OwnedLaunch);
+                        return Some(Action::StopDashboard);
+                    }
+                    return None;
                 }
                 ServeAction::Close => {
                     self.serve_view = None;
@@ -3252,29 +3270,16 @@ impl HomeView {
                 if self.selected_is_trashed() {
                     return None;
                 }
+                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
-                if let Some(id) = self.selected_session.as_deref() {
-                    if matches!(self.view_mode, ViewMode::Structured)
-                        && self.get_instance(id).is_some_and(|i| i.is_structured())
-                    {
-                        return Some(Action::SetTransientStatus(
-                            "Structured sessions have no tmux pane; press Enter to open the structured view."
-                                .to_string(),
-                        ));
-                    }
+                if live_key == Some(None) {
+                    return Some(Action::SetTransientStatus(
+                        "Structured sessions have no tmux pane; press Enter to open the structured view."
+                            .to_string(),
+                    ));
                 }
-                let swap_to_attach = self
-                    .selected_session
-                    .as_deref()
-                    .map(|id| {
-                        matches!(
-                            self.default_attach_mode(id),
-                            Some(crate::session::AttachMode::LiveSend)
-                        )
-                    })
-                    .unwrap_or(false);
-                if swap_to_attach {
+                if live_key == Some(Some(LiveKey::Enter)) {
                     if let Some(action) = self.tab_attach_action() {
                         return Some(action);
                     }
@@ -3431,6 +3436,8 @@ impl HomeView {
                     | ActionId::NextWaiting
                     | ActionId::Tips
                     | ActionId::EmptyTrash
+                    | ActionId::RestoreTrash
+                    | ActionId::RetryTrash
                     | ActionId::OpenCommandPalette
                     | ActionId::PreviewScrollUp
                     | ActionId::PreviewScrollDown
@@ -3587,6 +3594,8 @@ impl HomeView {
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
+            ActionId::RestoreTrash => self.restore_selected_from_trash(),
+            ActionId::RetryTrash => self.retry_selected_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
             ActionId::OpenCommandPalette => self.open_command_palette(),
             ActionId::PreviewScrollUp => {
@@ -4286,6 +4295,10 @@ impl HomeView {
     }
 
     pub(crate) fn open_serve(&mut self) {
+        if let Some(stop) = &self.dashboard_stop {
+            self.serve_view = Some(ServeView::for_stop(stop.clone(), &mut self.serve_jobs));
+            return;
+        }
         if web_plugin_disabled() {
             self.info_dialog = Some(InfoDialog::new(
                 "Web dashboard disabled",
@@ -4300,7 +4313,10 @@ impl HomeView {
         self.dashboard_launch = launch
             .clone()
             .filter(|launch| matches!(launch, DashboardLaunch::Running { .. }));
-        self.serve_view = Some(launch.map_or_else(ServeView::new, ServeView::for_launch));
+        self.serve_view = Some(match launch {
+            Some(launch) => ServeView::for_launch(launch, &mut self.serve_jobs),
+            None => ServeView::new(&mut self.serve_jobs),
+        });
     }
 
     pub(super) fn open_settings(&mut self) {
@@ -4892,6 +4908,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.live_takeover = None;
                 self.retained_preview = None;
                 self.retained_focus = None;
                 self.retained_scroll_offset = 0;
@@ -5514,11 +5531,13 @@ impl HomeView {
             if let super::Item::Session { id, .. } = &self.flat_items[idx] {
                 if let Some(inst) = self.get_instance(id).filter(|inst| inst.is_trashed()) {
                     self.context_menu = Some(
-                        ContextMenuDialog::for_trashed_session(anchor).with_session_target(
-                            &inst.id,
-                            &inst.source_profile,
-                            inst.lifecycle_generation,
-                        ),
+                        ContextMenuDialog::for_trashed_session(anchor, inst.has_pending_trash())
+                            .with_session_target(
+                                &inst.id,
+                                &inst.source_profile,
+                                inst.lifecycle_generation,
+                                self.session_feed.applied_epoch(),
+                            ),
                     );
                     return true;
                 }
@@ -5639,20 +5658,25 @@ impl HomeView {
     /// site.
     pub(super) fn dispatch_context_menu_action(&mut self, action: ContextMenuAction) {
         let menu = self.context_menu.take();
-        if let Some((id, profile, generation)) =
-            menu.as_ref().and_then(ContextMenuDialog::session_target)
-        {
-            let valid = self.selected_session.as_ref() == Some(id)
-                && self.get_instance(id).is_some_and(|inst| {
-                    inst.source_profile == *profile
-                        && inst.lifecycle_generation == *generation
+        if let Some(target) = menu.as_ref().and_then(ContextMenuDialog::session_target) {
+            let valid = target
+                .epoch
+                .as_deref()
+                .is_some_and(|epoch| self.session_feed.applied_epoch() == Some(epoch))
+                && self.selected_session.as_ref() == Some(&target.id)
+                && self.get_instance(&target.id).is_some_and(|inst| {
+                    inst.source_profile == target.profile
+                        && inst.lifecycle_generation == target.generation
                         && inst.is_trashed()
                 })
-                && self.session_feed.applied_session(id).is_some_and(|row| {
-                    row.profile == *profile
-                        && row.lifecycle_generation == *generation
-                        && row.trashed_at.is_some()
-                });
+                && self
+                    .session_feed
+                    .applied_session(&target.id)
+                    .is_some_and(|row| {
+                        row.profile == target.profile
+                            && row.lifecycle_generation == target.generation
+                            && row.trashed_at.is_some()
+                    });
             if !valid {
                 self.flash_status("Session changed; reopen the context menu");
                 return;
@@ -5663,6 +5687,7 @@ impl HomeView {
                 action,
                 ContextMenuAction::Restore
                     | ContextMenuAction::Delete
+                    | ContextMenuAction::RetryTrash
                     | ContextMenuAction::NewSession
                     | ContextMenuAction::OpenSortPicker
                     | ContextMenuAction::OpenGroupPicker
@@ -5733,6 +5758,7 @@ impl HomeView {
                 None => {}
             },
             ContextMenuAction::Restore => self.restore_selected_from_trash(),
+            ContextMenuAction::RetryTrash => self.retry_selected_trash(),
             ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
                 Some(SidebarSection::Trash) => self.toggle_trashed_section(),
                 Some(SidebarSection::Archived) => self.toggle_archived_section(),
@@ -6199,11 +6225,17 @@ impl HomeView {
                     // while a stray keystroke is harmless; the accept path runs the same
                     // trash_session_by_id.
                     if session_cfg.confirm_delete {
+                        let Some(epoch) = self.session_feed.applied_epoch().map(str::to_owned)
+                        else {
+                            self.flash_status("Runtime unavailable; reopen Trash controls");
+                            return;
+                        };
                         let message = format!("Move '{}' to the trash?", inst.title);
-                        self.pending_trash_session = Some(super::SessionDialogTarget {
+                        self.pending_trash_session = Some(super::TrashDialogTarget {
                             session_id: sid,
                             source_profile: inst.source_profile.clone(),
                             lifecycle_generation: inst.lifecycle_generation,
+                            epoch,
                         });
                         let dialog = self
                             .confirm_by_repeating(
@@ -6867,9 +6899,7 @@ impl HomeView {
             return None;
         }
         // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
-        if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
-            return None;
-        }
+        self.live_key(&id)?;
         // Pick the target from the pane being previewed: Structured view to the agent
         // pane, Terminal view to the paired host or container terminal so 'm'/Tab compose
         // against the shell on screen, Tool view to the named tool's pane.
@@ -7084,7 +7114,7 @@ impl HomeView {
             self.selected_group,
             self.selected_group_profile,
         ) = selection;
-        self.flash_status("Live send ended: its session is hidden (y to show)");
+        self.flash_status("Live mode ended: its session is hidden (y to show)");
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:
@@ -7214,7 +7244,7 @@ impl HomeView {
             return false;
         };
         self.exit_live_send_and_restore_sizing(state);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        self.info_dialog = Some(InfoDialog::new("Live mode ended", reason));
         true
     }
 
@@ -7223,7 +7253,7 @@ impl HomeView {
             return false;
         };
         self.exit_live_send_and_restore_sizing(state);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        self.info_dialog = Some(InfoDialog::new("Live mode ended", reason));
         true
     }
 
@@ -7253,20 +7283,50 @@ impl HomeView {
         if self.end_live_send_on_drift(&state) {
             return true;
         }
-        // Name the thief where the owner id is unambiguous: the web dashboard's live
-        // viewers register as `live-*` (src/server/live_ws.rs), other TUIs as `tui-*`.
-        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
-            Some((id, _)) if id.starts_with("live-") => {
-                "The web dashboard took over this session's live view."
-            }
-            Some((id, _)) if id.starts_with("tui-") => {
-                "Another aoe TUI took over this session's live view."
-            }
-            _ => "Another surface took over this session's live view.",
-        };
+        let owner = crate::tmux::Session::from_name(&state.tmux_name).size_owner();
+        let taker =
+            live_send::LiveTakeover::from_owner_id(owner.as_ref().map(|(id, _)| id.as_str()));
         self.teardown_live_send();
-        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        self.note_live_takeover(live_send::TakenLive {
+            session_id: state.session_id,
+            tmux_name: state.tmux_name,
+            taker,
+        });
         true
+    }
+
+    /// A footer line, not a dialog: the live key takes control back. With the shortcut bar
+    /// hidden that line never shows, so a flash says the same once.
+    pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
+        if !self.show_shortcut_bar {
+            let label = taken.taker.label();
+            self.flash_status(match self.live_key(&taken.session_id) {
+                Some(LiveKey::Tab) => format!("{label}: Tab to take it back"),
+                Some(LiveKey::Enter) => format!("{label}: Enter to take it back"),
+                None => label.to_string(),
+            });
+        }
+        self.live_takeover = Some(taken);
+    }
+
+    /// The key that enters live mode on this Session's row, shared by Tab, `start_live_send`
+    /// and the takeover footer. None for a structured Session in Structured view, which has
+    /// no tmux pane there; its Terminal and Tool panes go live.
+    pub(super) fn live_key(&self, id: &str) -> Option<LiveKey> {
+        if matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .get_instance(id)
+                .is_some_and(|inst| inst.is_structured())
+        {
+            None
+        } else if matches!(
+            self.default_attach_mode(id),
+            Some(crate::session::AttachMode::LiveSend)
+        ) {
+            Some(LiveKey::Enter)
+        } else {
+            Some(LiveKey::Tab)
+        }
     }
 
     /// Open the shared permission-response dialog for the selected session.

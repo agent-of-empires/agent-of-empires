@@ -113,6 +113,30 @@ An account is a tool name with its own `[session.agent_config_dir]` entry (see [
 - `switch-account` refuses and changes nothing where the swap would start a fresh conversation: the tool runs a different agent, the agent has no known transcript layout (only Claude does), the session has no recorded conversation, or a sandboxed session still has its store move pending. `restart --tool` keeps the parking swap in those cases.
 - The first turn on the new account re-reads the whole context uncached, because the prompt cache belongs to the account.
 
+### Automatic account failover
+
+With a second account of the same agent, a rate-limited session can continue on it instead of waiting for the reset. Give each account its own `[session.agent_config_dir]` entry and map each custom name to the built-in agent with `[session.agent_detect_as]` (see [One CLI, two accounts](../guides/configuration.md#one-cli-two-accounts)); a name without both is ignored. Then opt in per profile, and list the accounts to use in order:
+
+```toml
+[acp]
+rate_limit_failover = true
+rate_limit_failover_accounts = ["claude-a", "claude-b"]
+```
+
+When a host session parks on a rate limit, the first listed account other than its own that is not known to be limited takes over. The session swaps exactly as in [Switching accounts manually](#switching-accounts-manually): the conversation is carried over, and the interrupted prompt is re-sent once as the next turn. The timed auto-resume does not also fire for that park.
+
+- The swap starts within a couple of seconds of the park. Until it lands, the session list carries `rate_limit_failover_to` with the account it is moving to, so a client can show the switch instead of the choice. The field is absent when failover is off, already tried, or no account has headroom. A session parked while the whole pool was limited fails over on a later pass once an account frees up, as long as its timed resume has not fired.
+- Limits are remembered per account, by its config directory, and shared by every session. A limit on one session's account keeps the other sessions from failing over into it, and an entry lapses at the reported reset. Each quota window the agent names (five-hour, seven-day) keeps its own deadline, and an account has headroom again only once every window has reset. An account that turns out to be rate limited when the session moves to it gets that limit recorded against itself, and the session stays on its own park and tries the next account. With the failover on, a park that reports no reset follows the one-hour, doubling schedule of auto-resume, unless its account already has a reported deadline in force for the same window, which then applies instead; an estimate never shortens a reported deadline.
+- An account that fails to log in (a worker failing with `Authentication required`) is skipped for an hour.
+- Names that run another agent than the session, or have no `[session.agent_config_dir]` entry that resolves, are ignored with a warning: a pool account never falls back to the environment or the default directory.
+- The normal banner stays, and nothing changes, for sandboxed sessions, agents without a transcript layout (only Claude has one), a session with no recorded conversation, and when no listed account has headroom. A pool that is entirely limited leaves the session parked with the banner; with `rate_limit_auto_resume` on (default off) it waits for the reset under the usual auto-resume budget and ends in "Auto-resume stopped".
+- At most two failover restarts run at once; others retry on the next pass.
+- A swap that fails for a reason that may pass (a worker still stopping, a failed start) is attempted up to three times in all, with a growing delay between attempts, and the account change is undone so the session stays on its own account. After that, or after a refusal by design, the session stays parked, and the usual auto-resume schedule applies if `rate_limit_auto_resume` is on.
+- The session stays on the new account; there is no automatic switch back.
+- The setting is local-only: the web dashboard does not show or write it.
+
+You are responsible for complying with the agent provider's terms for the accounts you configure.
+
 ## `/clear` collapsed earlier turns
 
 `/clear` wipes the model's context on the adapter side but preserves the visible transcript: the view appends a "Conversation cleared" divider, resets the plan, mode, approvals, and usage, then folds everything above the divider behind a `Show N earlier turns` banner. The slash palette and mode picker stay populated.

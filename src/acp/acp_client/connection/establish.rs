@@ -210,16 +210,17 @@ pub(super) async fn establish(
             "agent supports _session/steering; mid-turn prompts will be injected into the running turn"
         );
     }
-    let arm_resume_watchdog = matches!(
-        &ctx.mode,
+    let (adopted_turn, live_recovery) = match &ctx.mode {
         ConnectMode::Resume {
-            in_flight_turn: true,
+            in_flight_turn,
+            live_recovery,
             ..
-        }
-    );
+        } => (*in_flight_turn, *live_recovery),
+        ConnectMode::Fresh { .. } => (false, None),
+    };
     shared
         .adopted_turn_active
-        .store(arm_resume_watchdog, Ordering::Relaxed);
+        .store(adopted_turn, Ordering::Relaxed);
     info!(
         target: "acp.protocol",
         session = %label,
@@ -259,7 +260,9 @@ pub(super) async fn establish(
         pending_prompts: VecDeque::new(),
     };
     session.acp_session_id = match ctx.mode {
-        ConnectMode::Resume { acp_session_id, .. } => session.resume(acp_session_id).await?,
+        ConnectMode::Resume { acp_session_id, .. } => {
+            session.resume(acp_session_id, live_recovery).await?
+        }
         ConnectMode::Fresh {
             stored_acp_session_id,
             seed_history_replay,
@@ -283,8 +286,14 @@ pub(super) async fn establish(
     session.apply_default_model().await;
     session.apply_default_effort().await;
     session.apply_default_model_config().await;
-    if arm_resume_watchdog {
-        spawn_resume_idle_watchdog(shared);
+    if adopted_turn && live_recovery.is_none() {
+        spawn_resume_idle_watchdog(
+            shared,
+            session
+                .control
+                .as_ref()
+                .map(|control| control.disconnected.clone()),
+        );
     }
     Ok(Some(session))
 }
@@ -303,12 +312,24 @@ fn resume_idle_expired(
 /// Fallback when an adopted turn neither completes nor shows activity, so the
 /// UI cannot stay "thinking" forever. Once the turn is observable, completion
 /// belongs to the between-prompt watchdog.
-fn spawn_resume_idle_watchdog(shared: Arc<Shared>) {
+fn spawn_resume_idle_watchdog(
+    shared: Arc<Shared>,
+    disconnected: Option<tokio_util::sync::CancellationToken>,
+) {
     let grace_ms = resume_idle_grace().as_millis() as i64;
     let interval = resume_idle_check_interval();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                biased;
+                _ = async {
+                    match &disconnected {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                } => return,
+                _ = tokio::time::sleep(interval) => {}
+            }
             if shared.terminal_claim.claimed()
                 || shared.prompt_sent_since_attach.load(Ordering::Relaxed)
             {
@@ -375,9 +396,18 @@ impl Session {
     /// The agent still owns the live session, so no load/new is sent. A prior
     /// daemon's reset may commit after our registry snapshot, so a runner's
     /// cached identity wins.
-    async fn resume(&self, stored: String) -> Result<SessionId, agent_client_protocol::Error> {
+    async fn resume(
+        &self,
+        stored: String,
+        resume_by: Option<tokio::time::Instant>,
+    ) -> Result<SessionId, agent_client_protocol::Error> {
         let runner = match self.control.as_ref() {
-            Some(control) => control.resume_session().await?,
+            Some(control) => match resume_by {
+                Some(deadline) => tokio::time::timeout_at(deadline, control.resume_session())
+                    .await
+                    .map_err(|_| acp_internal_error("runner control resume timed out".into()))??,
+                None => control.resume_session().await?,
+            },
             None => stored.clone(),
         };
         info!(
@@ -397,7 +427,8 @@ impl Session {
                 })
                 .await;
         }
-        // Clears a sticky startup error in the UI; same-id is a no-op server-side.
+        // Confirmed replay must finish despite backpressure or the reattach attempt deadline.
+        // Same-id assignment clears a sticky UI error without a server-side reset.
         let id = SessionId::from(runner);
         self.shared.commit_session(id.clone()).await?;
         Ok(id)

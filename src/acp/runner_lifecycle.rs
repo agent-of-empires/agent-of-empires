@@ -156,6 +156,8 @@ struct Construction {
     idle_baseline_ms: std::sync::atomic::AtomicI64,
     /// Prompts admitted to this epoch; an idle stop observed before one is void.
     admissions: std::sync::atomic::AtomicU64,
+    /// A rate limit rejecting this launch belongs to its caller, which reads it from the error.
+    defers_rate_limit_rejection: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Construction {
@@ -180,6 +182,7 @@ impl Default for Construction {
                 chrono::Utc::now().timestamp_millis(),
             ),
             admissions: std::sync::atomic::AtomicU64::new(0),
+            defers_rate_limit_rejection: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -464,6 +467,20 @@ impl Lease {
 
     pub(crate) fn cancellation(&self) -> &CancellationToken {
         &self.construction.cancellation
+    }
+
+    /// A rate limit rejecting this launch publishes no park and wakes nothing: the caller owns
+    /// the outcome. Only this lease's launch is affected, never a newer one of the session.
+    pub(crate) fn defer_rate_limit_rejection(&self) {
+        self.construction
+            .defers_rate_limit_rejection
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn defers_rate_limit_rejection(&self) -> bool {
+        self.construction
+            .defers_rate_limit_rejection
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn set_admission(&self, admission: Option<crate::acp::supervisor::LaunchAdmission>) {

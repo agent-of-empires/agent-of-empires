@@ -457,7 +457,11 @@ const requestCases: RequestCase[] = [
     () => api.trashSession("../plugins/x/uninstall#"),
     { body: { kill_pane: true } },
   ],
-  ["POST /api/sessions/s1/restore", () => api.restoreSession("s1"), { respond: json(session), result: session }],
+  [
+    "POST /api/sessions/s1/restore",
+    () => api.restoreSession("s1"),
+    { respond: runtimeJson(session), result: { session, cursor } },
+  ],
   ["POST /api/sessions/s1/stop", () => api.stopSession("s1"), { respond: json(session), result: session }],
   [
     "POST /api/sessions/s1/start",
@@ -1461,11 +1465,11 @@ describe("login", () => {
 describe("session mutation messages", () => {
   it.each([
     ["trashSession", () => api.trashSession("s1"), { relocation: { status: "relocated", warning: "w" } }],
-    ["restoreSession", () => api.restoreSession("s1"), { status: "restored", warning: "w" }],
+    ["restoreSession", async () => (await api.restoreSession("s1"))?.session, { status: "restored", warning: "w" }],
   ])("%s folds a degraded move warning into warnings", async (_name, call, outcome) => {
-    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome }));
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome }));
     expect((await call())?.warnings).toEqual(["w"]);
-    fetchSpy.mockResolvedValueOnce(json({ ...session, outcome: { status: "restored" } }));
+    fetchSpy.mockResolvedValueOnce(runtimeJson({ ...session, outcome: { status: "restored" } }));
     expect((await call())?.warnings).toBeUndefined();
   });
 
@@ -1647,6 +1651,33 @@ describe("profile settings write guard", () => {
   it("derives writable sections from the schema plus description", () => {
     const writable = api.profileWritableSections(schema);
     expect([...writable].sort()).toEqual(["description", "session", "theme"]);
+  });
+
+  it("a stalled setup read or save times out as a failure", { timeout: 1000 }, async () => {
+    const stalls = new AbortController();
+    const timeout = vi.spyOn(AbortSignal, "timeout").mockReturnValue(stalls.signal);
+    try {
+      const stall = (_: unknown, init?: RequestInit) =>
+        new Promise<Response>((_, reject) =>
+          init?.signal?.addEventListener("abort", () => reject(new Error("timeout"))),
+        );
+      fetchSpy.mockImplementation(stall);
+      const schemaRead = api.getSettingsSchema();
+      const machineRead = api.fetchMachineSettings();
+      const telemetryRead = api.fetchTelemetryStatus();
+      const save = api.updateMachineSettingsInline({ worktree: { enabled: true } });
+      const setupRead = api.fetchSetup();
+      const setupSave = api.updateSetup({ deferred: true });
+      stalls.abort();
+      expect(await schemaRead).toBeNull();
+      expect(await machineRead).toBeNull();
+      expect(await telemetryRead).toBeNull();
+      expect(await save).toBe("uncertain");
+      expect(await setupRead).toBeNull();
+      expect(await setupSave).toEqual({ ok: false });
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it("caches a successful schema fetch and retries a failed one", async () => {

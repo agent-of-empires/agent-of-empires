@@ -116,9 +116,7 @@ impl HomeView {
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
         if let Some(worker) = self.preview_capture_worker.as_ref() {
-            worker.set_vt_enabled(
-                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
-            );
+            worker.set_vt_enabled(self.preview_vt_enabled(self.preview_capture_target.as_deref()));
             worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
         self.profile_default_attach_mode = config.session.default_attach_mode;

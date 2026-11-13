@@ -2,19 +2,40 @@
 
 import { createContext, useContext, useMemo } from "react";
 
-import { subagentStatus, type BackgroundAgent, type SubagentRecord, type WorkflowRun } from "../../lib/acpTypes";
+import {
+  subagentStatus,
+  type ActivityRow,
+  type BackgroundAgent,
+  type BackgroundAgentStatus,
+  type SubagentRecord,
+  type WorkflowRun,
+} from "../../lib/acpTypes";
+import {
+  fromInline,
+  launchFromRows,
+  type SubagentRecord as SubagentView,
+  type SubagentStatus,
+} from "./subagents/model";
 
 export interface BackgroundAgentsContextValue {
+  sessionId?: string;
   agents: BackgroundAgent[];
   subagents?: SubagentRecord[];
   /** Stops one subagent; failures surface as a session error. */
   cancelSubagent?: (childId: string) => Promise<void>;
   workflowRuns?: Record<string, WorkflowRun>;
   backgroundTasks?: string[];
-  openPane?: () => void;
+  /** Opens the Background pane, on one agent's detail when given its id. */
+  openPane?: (agentId?: string) => void;
+  /** Cancel is unavailable: a read-only server or a trashed/archived session. */
+  readOnly?: boolean;
 }
 
 export const BackgroundAgentsContext = createContext<BackgroundAgentsContextValue>({ agents: [] });
+
+export function useBackgroundAgentsContextValue(): BackgroundAgentsContextValue {
+  return useContext(BackgroundAgentsContext);
+}
 
 export function useBackgroundAgentFor(toolCallId: string | undefined): BackgroundAgent | undefined {
   const { agents } = useContext(BackgroundAgentsContext);
@@ -38,37 +59,66 @@ export function findSubagent(
 export const isStoppable = (s: SubagentRecord | undefined): s is SubagentRecord =>
   !!s?.cancel_capable && s.state !== "idle";
 
-/** The pane's rows: legacy launch records, plus a row for every child no record covers. */
-export function paneAgents(agents: BackgroundAgent[], subagents: SubagentRecord[]): BackgroundAgent[] {
+export type PaneAgent = BackgroundAgent & { record?: SubagentView };
+
+const AGENT_STATUS: Record<SubagentStatus, BackgroundAgentStatus> = {
+  running: "running",
+  waiting: "requires_action",
+  done: "completed",
+  stopped: "stopped",
+  failed: "error",
+  stalled: "stalled",
+  detached: "detached",
+  unknown: "unknown",
+};
+
+/** The pane's rows: legacy launch records, plus every child no record covers, built
+ *  from the same activity rows as its thread card. With none of its rows loaded,
+ *  a child shows only its roster title and state. */
+export function paneAgents(
+  agents: BackgroundAgent[],
+  subagents: SubagentRecord[],
+  rows: readonly ActivityRow[],
+): PaneAgent[] {
   const linked = new Set(agents.map((a) => a.toolCallId));
-  const rosterOnly = subagents
+  const children = subagents
     .filter((s) => !linked.has(subagentKey(s)))
-    .map((s): BackgroundAgent => ({
-      agentId: s.session_id,
-      toolCallId: subagentKey(s),
-      description: s.title || s.description || "",
-      prompt: "",
-      model: s.model ?? "",
-      status: subagentStatus(s),
-      // The roster carries no clock, so these rows show no elapsed time.
-      startedAt: "",
-      endedAt: null,
-      toolCount: 0,
-      tools: [],
-      lastTool: null,
-      lastText: null,
-      result: null,
-      warning: null,
-    }));
-  return [...agents, ...rosterOnly];
+    .map((s): PaneAgent => {
+      const key = subagentKey(s);
+      const launch = launchFromRows(rows, key);
+      // A page can hold a child's calls without its launch row.
+      const tool = launch?.tool ?? {
+        id: key,
+        name: s.description ?? "",
+        kind: "other",
+        args_preview: "{}",
+        started_at: "",
+      };
+      const record = launch && fromInline(tool, launch.result, launch.children, s);
+      return {
+        agentId: s.session_id,
+        toolCallId: key,
+        description: record?.description ?? (s.title || s.description || ""),
+        prompt: record?.prompt ?? "",
+        model: s.model ?? "",
+        status: record ? AGENT_STATUS[record.status] : subagentStatus(s),
+        startedAt: record?.startedAt ?? "",
+        endedAt: record?.endedAt ?? null,
+        toolCount: record?.toolCount ?? 0,
+        tools: [],
+        lastTool: record?.lastTool ?? null,
+        lastText: null,
+        result: record?.report || null,
+        warning: null,
+        error: s.error ?? null,
+        record,
+      };
+    });
+  return [...agents, ...children];
 }
 
 export function useSubagentFor(toolCallId: string | undefined): SubagentRecord | undefined {
   return findSubagent(useContext(BackgroundAgentsContext).subagents, toolCallId);
-}
-
-export function useCancelSubagent(): BackgroundAgentsContextValue["cancelSubagent"] {
-  return useContext(BackgroundAgentsContext).cancelSubagent;
 }
 
 /** Every agent a `Workflow` call launched, in launch order. */
@@ -98,7 +148,7 @@ export function workflowRunning(
   return run ? !run.finished && backgroundTasks.includes(run.taskId) : agents.some(isActiveAgent);
 }
 
-export function useOpenBackgroundAgentsPane(): (() => void) | undefined {
+export function useOpenBackgroundAgentsPane(): ((agentId?: string) => void) | undefined {
   return useContext(BackgroundAgentsContext).openPane;
 }
 

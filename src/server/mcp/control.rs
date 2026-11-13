@@ -1,0 +1,991 @@
+//! Tools that create, drive and read sessions, for an agent orchestrating others. Each one
+//! calls the function its HTTP route calls, so both surfaces decide the same way.
+
+use axum::http::StatusCode;
+use rmcp::handler::server::wrapper::{Json, Parameters};
+use rmcp::model::CallToolResult;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use super::{read_only_refusal, tool_error, McpServer};
+use crate::acp::dispatch::PromptDispatch;
+use crate::daemon::{CreateSessionBody, SessionResponse};
+use crate::server::api::sessions::{
+    capture_terminal_output, create_session_with, send_terminal_message, CaptureError,
+    SendKeysError,
+};
+use crate::server::api::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
+use crate::server::session_service::{SendTurnError, SessionCaller};
+use crate::session::{Instance, Status, View, CAPTURE_FAILED_RULE};
+
+/// Transcript events read per `read_output` call; the caller pages on with `next_since`.
+const READ_PAGE: usize = 2000;
+
+/// Most rendered text one `read_output` page returns, the transcript renderer's own cap. A page
+/// stops at the last event that fits whole, so following `next_since` skips nothing.
+const TEXT_PAGE_BYTES: usize = crate::session::conversation_summary::MAX_INPUT_BYTES;
+
+/// How long a terminal `create_session` waits for its agent's input prompt before typing the
+/// first prompt. A dialog (such as Claude's folder-trust question) stops it at once instead.
+const PROMPT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pane lines `read_output` captures when the caller names none, as `GET /output` does.
+const DEFAULT_LINES: u32 = 200;
+
+/// The create fields a model may set. Hook trust, callbacks, command and environment
+/// overrides, fork and import sources and UI-only fields stay with the dashboard and CLI.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct CreateSessionParams {
+    /// Project directory the session works in.
+    path: String,
+    /// Agent to launch, e.g. `claude` or `codex`.
+    tool: String,
+    title: Option<String>,
+    /// `terminal` (the default) or `structured`.
+    #[serde(default)]
+    view: View,
+    /// The ACP agent for a structured session, when it differs from `tool`.
+    agent_name: Option<String>,
+    agent_model: Option<String>,
+    agent_effort: Option<String>,
+    /// Group path. A parent's group replaces it.
+    #[serde(default)]
+    group: String,
+    /// Work in a git worktree instead of `path` itself.
+    #[serde(default)]
+    worktree_enabled: bool,
+    worktree_branch: Option<String>,
+    #[serde(default)]
+    create_new_branch: bool,
+    base_branch: Option<String>,
+    /// Run the agent in a sandbox container.
+    #[serde(default)]
+    sandbox: bool,
+    sandbox_image: Option<String>,
+    /// Let the agent act without asking for approval.
+    #[serde(default)]
+    yolo_mode: bool,
+    profile: Option<String>,
+    /// First prompt for the new session.
+    prompt: Option<String>,
+    /// Make the session a sub-session of this top-level session, in the same profile.
+    parent_session_id: Option<String>,
+    /// Retry key: a repeated create with the same key answers with the first one's session, and
+    /// does nothing else (the prompt is not delivered again).
+    idempotency_key: Option<String>,
+}
+
+/// What happened to `create_session`'s `prompt`.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum PromptDelivery {
+    /// No prompt was given.
+    None,
+    /// Stored with the structured session; delivered once its worker runs.
+    PendingInitialTurn,
+    /// Typed into the terminal session's pane, once its agent was at its input prompt.
+    Sent,
+    /// The terminal session was not running, so nothing was typed.
+    NotRunning,
+    /// The terminal agent is waiting on a dialog (such as Claude's folder-trust question), so
+    /// nothing was typed; a person answers it in the terminal, then `send` the prompt.
+    BlockedWaiting,
+    /// The terminal agent did not reach its input prompt in time, so nothing was typed.
+    NotReady,
+    /// The create was a retry of an earlier one with the same `idempotency_key`, so the prompt
+    /// was not attempted by this call; the first create's outcome is unknown here.
+    Replayed,
+    /// Typing it failed; see `prompt_error`.
+    Failed,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct CreatedSession {
+    session: SessionResponse,
+    /// False when `idempotency_key` matched an earlier create, whose session this is.
+    fresh: bool,
+    /// Whether the prompt was sent or stored for delivery.
+    prompt_sent: bool,
+    prompt_delivery: PromptDelivery,
+    /// Why the prompt was not delivered, for `failed`, `blocked_waiting` and `not_ready`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct SendParams {
+    session_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum Disposition {
+    /// Started a turn.
+    Sent,
+    /// Joined the turn already running.
+    Steered,
+    /// Parked on the session's queue; it starts a turn once the current one ends.
+    Queued,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct SendOutcome {
+    disposition: Disposition,
+    /// Why it was queued: `turn_active`, `cancelling`, `compacting` or `worker_down`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// The queue row holding a queued prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_id: Option<String>,
+    /// Structured view only: the event seq the prompt was recorded at, for `read_output`'s
+    /// `since`. Absent for a terminal session, for a queued prompt, and for a sent prompt
+    /// whose event was not recorded, in which case nothing marks where its turn began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(super) struct ReadOutputParams {
+    session_id: String,
+    /// Structured view: only what happened after this event seq. Defaults to 0.
+    since: Option<u64>,
+    /// Structured view: the raw event list instead of rendered text.
+    #[serde(default)]
+    raw: bool,
+    /// Terminal view: how many pane lines to capture, 1 to 2000. Defaults to 200.
+    lines: Option<u32>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+pub(super) struct Output {
+    view: View,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// `raw` only: `{seq, event}` objects, oldest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    events: Option<Vec<Value>>,
+    /// Structured view: pass as `since` to read on from here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_since: Option<u64>,
+    /// Structured view: more events follow `next_since` already.
+    has_more: bool,
+}
+
+#[rmcp::tool_router(router = control_router, vis = "pub(super)")]
+impl McpServer {
+    #[rmcp::tool(
+        description = "Create a session, optionally with a first prompt. A structured session \
+            stores the prompt and delivers it once its worker runs; a terminal session types it \
+            once its agent is at its input prompt, and never into a dialog (`blocked_waiting`: \
+            a person answers the dialog, then `send` the prompt). Repository hooks that need trust are refused with \
+            `hooks_need_trust`: a human must approve them in the AoE dashboard."
+    )]
+    async fn create_session(
+        &self,
+        Parameters(params): Parameters<CreateSessionParams>,
+    ) -> Result<Json<CreatedSession>, CallToolResult> {
+        if let Some(refusal) = read_only_refusal(&self.state) {
+            return Err(refusal);
+        }
+        let structured = params.view == View::Structured;
+        // A terminal prompt is typed into the pane once the agent starts, so it gets what
+        // `send` does to keys.
+        let prompt = if structured {
+            params.prompt.clone().filter(|p| !p.trim().is_empty())
+        } else {
+            params.prompt.clone().and_then(terminal_text)
+        };
+        // `send` refuses the same input, so a create does not quietly drop it.
+        if params.prompt.is_some() && prompt.is_none() {
+            return Err(tool_error("invalid_request", "The prompt is empty"));
+        }
+        let body = create_body(&params).map_err(|e| tool_error("invalid_request", e))?;
+        let initial_turn = if structured { prompt.clone() } else { None };
+        let wait_ready = !structured && prompt.is_some();
+        // Names this create in failure logs and responses, as an HTTP request's id does.
+        let reference = format!("mcp-{}", uuid::Uuid::new_v4());
+        let response = create_session_with(
+            self.state.clone(),
+            false,
+            &reference,
+            wait_ready,
+            body,
+            initial_turn,
+        )
+        .await;
+        let (session, fresh) = success_body(response).await.map_err(|e| *e)?;
+        let (prompt_sent, prompt_delivery, prompt_error) = match prompt {
+            None => (false, PromptDelivery::None, None),
+            Some(_) if !fresh => (false, PromptDelivery::Replayed, None),
+            Some(_) if structured => (true, PromptDelivery::PendingInitialTurn, None),
+            Some(text) => match wait_for_input_prompt(&self.state, &session.id).await {
+                PaneReadiness::Waiting => (
+                    false,
+                    PromptDelivery::BlockedWaiting,
+                    Some(
+                        "The agent is waiting on a dialog in its terminal, such as a folder-trust \
+                         question. Nothing was typed: a person answers it there, then `send` the \
+                         prompt."
+                            .to_string(),
+                    ),
+                ),
+                PaneReadiness::NotYet | PaneReadiness::Unreadable => (
+                    false,
+                    PromptDelivery::NotReady,
+                    Some(format!(
+                        "The agent did not reach its input prompt within {} s, so nothing was \
+                         typed. `send` the prompt once it is ready.",
+                        PROMPT_READY_TIMEOUT.as_secs()
+                    )),
+                ),
+                PaneReadiness::NoPromptRule => (
+                    false,
+                    PromptDelivery::NotReady,
+                    Some(
+                        "This agent has no status rules that show its input prompt, so nothing \
+                         was typed. `send` the prompt instead."
+                            .to_string(),
+                    ),
+                ),
+                PaneReadiness::Gone => (false, PromptDelivery::NotRunning, None),
+                // A session that just failed to start is not restarted behind the caller's back.
+                PaneReadiness::AtPrompt => match send_terminal_message(
+                    &self.state.session_service,
+                    &session.id,
+                    text.clone(),
+                    false,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        log_terminal_message_sent(&session.id, &text);
+                        self.publish().await;
+                        (true, PromptDelivery::Sent, None)
+                    }
+                    Err(e) => match e.error {
+                        SendKeysError::NotRunning => (false, PromptDelivery::NotRunning, None),
+                        other => {
+                            let refusal = terminal_refusal(&session.id, other).await;
+                            let message = refusal
+                                .structured_content
+                                .as_ref()
+                                .and_then(|c| c["message"].as_str())
+                                .map(str::to_string);
+                            (false, PromptDelivery::Failed, message)
+                        }
+                    },
+                },
+            },
+        };
+        Ok(Json(CreatedSession {
+            session,
+            fresh,
+            prompt_sent,
+            prompt_delivery,
+            prompt_error,
+        }))
+    }
+
+    #[rmcp::tool(
+        description = "Send a prompt to a session. A structured session starts a turn, joins \
+            the running one, or queues it, and reports which, with the prompt's event seq. A \
+            terminal session gets it typed into its pane."
+    )]
+    async fn send(
+        &self,
+        Parameters(params): Parameters<SendParams>,
+    ) -> Result<Json<SendOutcome>, CallToolResult> {
+        if let Some(refusal) = read_only_refusal(&self.state) {
+            return Err(refusal);
+        }
+        let id = params.session_id;
+        let Some(structured) = self.view_of(&id).await.map(|v| v == View::Structured) else {
+            return Err(not_found(&id));
+        };
+        if structured {
+            if params.message.trim().is_empty() {
+                return Err(tool_error("invalid_request", "The message is empty"));
+            }
+            let submission = PromptSubmission {
+                text: &params.message,
+                uploads: &[],
+                prompt_id: None,
+                queued_prompt_id: None,
+                no_revive: false,
+            };
+            let submitted = submit_prompt(&self.state, &SessionCaller::User, &id, submission)
+                .await
+                .map_err(|e| prompt_refusal(&id, e))?;
+            return Ok(Json(send_outcome(submitted)));
+        }
+        let Some(message) = terminal_text(params.message) else {
+            return Err(tool_error("invalid_request", "The message is empty"));
+        };
+        // Keys sent into a dialog answer it (Enter accepts Claude's folder trust), so MCP refuses a
+        // pane whose status rules detect one; an agent without status rules gets no check. HTTP
+        // `POST /send` is left as is: a person at the dashboard sees the pane.
+        if self.terminal_pane_waiting(&id).await {
+            return Err(tool_error(
+                "waiting",
+                "The agent is waiting on a dialog or question in its terminal, or its pane could \
+                 not be read, so nothing was typed. A person answers a dialog there; retry once \
+                 the pane can be read.",
+            ));
+        }
+        // No revival: a restarted agent can open on a dialog the check above never saw.
+        if let Err(e) =
+            send_terminal_message(&self.state.session_service, &id, message.clone(), false).await
+        {
+            return Err(terminal_refusal(&id, e.error).await);
+        }
+        log_terminal_message_sent(&id, &message);
+        self.publish().await;
+        Ok(Json(SendOutcome {
+            disposition: Disposition::Sent,
+            reason: None,
+            queued_id: None,
+            seq: None,
+        }))
+    }
+
+    #[rmcp::tool(
+        description = "Read a session's output. A structured session returns its transcript \
+            since an event seq as text, or the raw events, with `next_since` to read on from \
+            without skipping anything. A text page holds whole events up to 48 KB; one event \
+            larger than that comes back whole as the only event on its page. A terminal session \
+            returns a capture of its pane."
+    )]
+    async fn read_output(
+        &self,
+        Parameters(params): Parameters<ReadOutputParams>,
+    ) -> Result<Json<Output>, CallToolResult> {
+        let id = params.session_id;
+        let instance = self
+            .state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return Err(not_found(&id));
+        };
+        if instance.is_structured() {
+            let since = params.since.unwrap_or(0);
+            let page = self
+                .state
+                .acp_event_store
+                .replay_page(&id, since, Some(READ_PAGE));
+            if params.raw {
+                let events = page
+                    .events
+                    .iter()
+                    .map(|(seq, event)| json!({"seq": seq, "event": event}))
+                    .collect();
+                return Ok(Json(Output {
+                    view: View::Structured,
+                    text: None,
+                    events: Some(events),
+                    next_since: Some(page.last_scanned_seq.unwrap_or(since)),
+                    has_more: page.has_more,
+                }));
+            }
+            let text_page = text_page(&page.events, since);
+            // A page cut short leaves events for the next call, whatever the store says.
+            let next_since = match text_page.last_seq {
+                Some(seq) if text_page.cut => seq,
+                _ => page.last_scanned_seq.unwrap_or(since),
+            };
+            return Ok(Json(Output {
+                view: View::Structured,
+                text: Some(text_page.text),
+                events: None,
+                next_since: Some(next_since),
+                has_more: page.has_more || text_page.cut,
+            }));
+        }
+        let lines = params.lines.unwrap_or(DEFAULT_LINES).clamp(1, 2000) as usize;
+        let text = capture_terminal_output(instance, lines, false)
+            .await
+            .map_err(|e| match e {
+                CaptureError::NotRunning => {
+                    tool_error("not_running", "The terminal session is not running")
+                }
+                CaptureError::Tmux(e) => {
+                    tracing::error!(target: "http.api.sessions", session = %id, error = %e, "read_output: tmux error");
+                    tool_error("internal", "Terminal capture failed")
+                }
+                CaptureError::Panicked(e) => tool_error("internal", e),
+            })?;
+        Ok(Json(Output {
+            view: View::Terminal,
+            text: Some(text),
+            events: None,
+            next_since: None,
+            has_more: false,
+        }))
+    }
+}
+
+impl McpServer {
+    async fn view_of(&self, id: &str) -> Option<View> {
+        self.state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.view)
+    }
+
+    /// Whether a terminal session's status rules detect a dialog or question waiting on a
+    /// person, read once, without waiting. A check that fails to run counts as waiting, as does,
+    /// for an agent with a status manifest, a pane that can't be captured. `send` is explicit, so
+    /// an agent without one (`NoPromptRule`) is not refused.
+    async fn terminal_pane_waiting(&self, id: &str) -> bool {
+        let instance = self
+            .state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return false;
+        };
+        tokio::task::spawn_blocking(move || refuses_send(pane_readiness(&instance)))
+            .await
+            .unwrap_or(true)
+    }
+
+    /// Mutations reach the dashboard through a published snapshot, as the HTTP routes do.
+    async fn publish(&self) {
+        if let Err(error) = self.state.runtime.publish(&self.state).await {
+            tracing::debug!(target: "server.runtime", %error, "runtime publish after MCP mutation failed");
+        }
+    }
+}
+
+fn create_body(params: &CreateSessionParams) -> Result<CreateSessionBody, String> {
+    serde_json::from_value(json!({
+        "path": params.path,
+        "tool": params.tool,
+        "title": params.title,
+        "view": params.view,
+        "agent_name": params.agent_name,
+        "agent_model": params.agent_model,
+        "agent_effort": params.agent_effort,
+        "group": params.group,
+        "worktree_enabled": params.worktree_enabled,
+        "worktree_branch": params.worktree_branch,
+        "create_new_branch": params.create_new_branch,
+        "base_branch": params.base_branch,
+        "sandbox": params.sandbox,
+        "sandbox_image": params.sandbox_image,
+        "yolo_mode": params.yolo_mode,
+        "profile": params.profile,
+        "parent_session_id": params.parent_session_id,
+        "idempotency_key": params.idempotency_key,
+    }))
+    .map_err(|e| e.to_string())
+}
+
+/// The created session from a create response, or the refusal it carries, and whether this call
+/// created it: `201` is a fresh create, `200` the answer to a retried `idempotency_key`.
+async fn success_body(
+    response: axum::response::Response,
+) -> Result<(SessionResponse, bool), Box<CallToolResult>> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|e| Box::new(tool_error("internal", e.to_string())))?;
+    if !status.is_success() {
+        return Err(Box::new(refusal(status, &bytes)));
+    }
+    let session = serde_json::from_slice(&bytes)
+        .map_err(|e| Box::new(tool_error("internal", e.to_string())))?;
+    Ok((session, status == StatusCode::CREATED))
+}
+
+/// What a terminal agent's pane shows, read with the rules the status poller uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneReadiness {
+    /// A prompt-box rule matched the agent's own input prompt.
+    AtPrompt,
+    /// A rule matched a dialog or question waiting for a person.
+    Waiting,
+    /// Neither yet: still starting, working, idle by a rule that does not see the prompt box, or
+    /// the pane could not be captured.
+    NotYet,
+    /// The agent has no detection manifest, so nothing can show it is at its prompt.
+    NoPromptRule,
+    /// The pane could not be captured, so nothing is known about it.
+    Unreadable,
+    /// The session is gone, stopped or failed.
+    Gone,
+}
+
+/// Waits up to [`PROMPT_READY_TIMEOUT`] for a terminal session's agent to reach its input
+/// prompt, so a first prompt is never typed into a dialog. Returns at once on a dialog.
+async fn wait_for_input_prompt(
+    state: &std::sync::Arc<crate::server::AppState>,
+    id: &str,
+) -> PaneReadiness {
+    let deadline = tokio::time::Instant::now() + PROMPT_READY_TIMEOUT;
+    loop {
+        let instance = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .find(|i| i.id == id)
+            .cloned();
+        let Some(instance) = instance else {
+            return PaneReadiness::Gone;
+        };
+        let readiness = tokio::task::spawn_blocking(move || pane_readiness(&instance))
+            .await
+            .unwrap_or(PaneReadiness::NotYet);
+        let settled = !matches!(readiness, PaneReadiness::NotYet | PaneReadiness::Unreadable);
+        if settled || tokio::time::Instant::now() >= deadline {
+            return readiness;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// One fresh capture of the agent's pane, decided by its detection manifest, as `aoe session
+/// show` reads it. A stopped session is `Gone` before any capture, whose failure would read as
+/// `Unreadable`.
+fn pane_readiness(instance: &Instance) -> PaneReadiness {
+    if matches!(
+        instance.status,
+        Status::Error | Status::Stopped | Status::Deleting
+    ) {
+        return PaneReadiness::Gone;
+    }
+    let Ok(session) = instance.tmux_session() else {
+        return PaneReadiness::Gone;
+    };
+    if !session.exists() || session.is_pane_dead() {
+        return PaneReadiness::Gone;
+    }
+    readiness_of(instance.detect_pane_now(&instance.source_profile, &session, None))
+}
+
+/// MCP `send` refuses a pane whose status rules detect a dialog, or one it could not read. An
+/// agent without status rules (`NoPromptRule`) gets no dialog check.
+fn refuses_send(readiness: PaneReadiness) -> bool {
+    matches!(
+        readiness,
+        PaneReadiness::Waiting | PaneReadiness::Unreadable
+    )
+}
+
+/// Only a rule that sees the prompt box counts as at the prompt: other idle rules (a finished
+/// turn, an interrupt banner, the pane title) also hold while a dialog is on screen.
+fn readiness_of(detected: Option<(Option<Status>, &str)>) -> PaneReadiness {
+    match detected {
+        None => PaneReadiness::NoPromptRule,
+        Some((_, CAPTURE_FAILED_RULE)) => PaneReadiness::Unreadable,
+        Some((Some(Status::Waiting), _)) => PaneReadiness::Waiting,
+        Some((Some(Status::Idle), "ready_prompt" | "live_prompt_box")) => PaneReadiness::AtPrompt,
+        Some(_) => PaneReadiness::NotYet,
+    }
+}
+
+/// The audit line HTTP `POST /send` writes for keystrokes typed into a pane.
+fn log_terminal_message_sent(id: &str, message: &str) {
+    tracing::info!(target: "session.lifecycle", session = %id, len = message.len(), via = "mcp", "terminal message sent");
+}
+
+/// One `read_output` text page: the longest run of whole events, from `since`, whose rendering
+/// fits in [`TEXT_PAGE_BYTES`], or the first event alone when it does not fit.
+struct TextPage {
+    text: String,
+    /// The last event rendered, when the page stops short of the events read.
+    last_seq: Option<u64>,
+    /// Fewer events were rendered than were read.
+    cut: bool,
+}
+
+fn text_page(events: &[(u64, crate::acp::state::Event)], since: u64) -> TextPage {
+    use crate::session::conversation_summary::render_transcript_delta;
+    let render = |n: usize| render_transcript_delta(&events[..n], since).0;
+    let whole = render(events.len());
+    if whole.len() <= TEXT_PAGE_BYTES {
+        return TextPage {
+            text: whole,
+            last_seq: None,
+            cut: false,
+        };
+    }
+    // The rendering only grows with the prefix, so the longest prefix that fits is found by
+    // bisection. At least one event is always returned, whole, so the cursor moves.
+    let (mut fits, mut over) = (0usize, events.len());
+    while over - fits > 1 {
+        let mid = fits + (over - fits) / 2;
+        if render(mid).len() <= TEXT_PAGE_BYTES {
+            fits = mid;
+        } else {
+            over = mid;
+        }
+    }
+    let n = fits.max(1);
+    TextPage {
+        text: render(n),
+        last_seq: Some(events[n - 1].0),
+        cut: n < events.len(),
+    }
+}
+
+/// A refused HTTP response as a tool error: the codes a caller can act on pass through, and
+/// the rest are named by status. A plain-text body becomes the message.
+fn refusal(status: StatusCode, body: &[u8]) -> CallToolResult {
+    let json: Option<Value> = serde_json::from_slice(body).ok();
+    let http_error = json
+        .as_ref()
+        .and_then(|v| v["error"].as_str())
+        .map(str::to_string);
+    let message = json
+        .as_ref()
+        .and_then(|v| v["message"].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_string());
+    match http_error.as_deref() {
+        Some("hooks_need_trust") => {
+            let v = json.unwrap_or_default();
+            CallToolResult::structured_error(json!({
+                "code": "hooks_need_trust",
+                "message": "This repository's hooks need a human to review and trust them in \
+                    the AoE dashboard before a session can be created here.",
+                "on_create": v["on_create"],
+                "on_launch": v["on_launch"],
+                "on_destroy": v["on_destroy"],
+            }))
+        }
+        Some(code @ ("parent_not_found" | "parent_is_sub_session" | "read_only")) => {
+            tool_error(code, message)
+        }
+        _ => {
+            let code = match status {
+                StatusCode::NOT_FOUND => "not_found",
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => "busy",
+                s if s.is_server_error() => "internal",
+                _ => "invalid_request",
+            };
+            let mut error = json!({
+                "code": code,
+                "message": message,
+                "http_status": status.as_u16(),
+                "http_error": http_error,
+            });
+            // A failed create names itself in the Daemon's log; pass that on so the two can be matched.
+            if let Some(reference) = json.as_ref().and_then(|v| v["reference"].as_str()) {
+                error["reference"] = reference.into();
+            }
+            CallToolResult::structured_error(error)
+        }
+    }
+}
+
+fn send_outcome(submitted: PromptSubmitted) -> SendOutcome {
+    let (disposition, reason) = match submitted.dispatch {
+        PromptDispatch::Sent => (Disposition::Sent, None),
+        PromptDispatch::Steered => (Disposition::Steered, None),
+        PromptDispatch::Queued { reason } => (
+            Disposition::Queued,
+            serde_json::to_value(reason)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string)),
+        ),
+    };
+    SendOutcome {
+        disposition,
+        reason,
+        queued_id: submitted.queued_id,
+        seq: submitted.seq,
+    }
+}
+
+fn prompt_refusal(id: &str, error: PromptSubmitError) -> CallToolResult {
+    match error {
+        PromptSubmitError::SessionNotFound
+        | PromptSubmitError::Turn(SendTurnError::SessionNotFound) => not_found(id),
+        PromptSubmitError::WorkerNotReady
+        | PromptSubmitError::Turn(SendTurnError::WorkerNotReady) => tool_error(
+            "busy",
+            "The session's agent is not ready yet; try again shortly",
+        ),
+        PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish) => tool_error(
+            "send_failed",
+            "The agent stopped after the prompt was recorded; read_output before resending it",
+        ),
+        PromptSubmitError::Turn(SendTurnError::ResumeFailed(e)) => tool_error(
+            "busy",
+            format!("The session's agent could not be resumed: {e}"),
+        ),
+        // The queue is full; it drains as turns end.
+        PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, message) => {
+            tool_error("busy", message)
+        }
+        PromptSubmitError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        PromptSubmitError::Enqueue(_, message) | PromptSubmitError::Attachments(_, message) => {
+            tool_error("invalid_request", message)
+        }
+        PromptSubmitError::Turn(SendTurnError::Send(e))
+        | PromptSubmitError::Turn(SendTurnError::ModeApplication(e)) => {
+            tool_error("send_failed", e.to_string())
+        }
+        // Unreachable for a user caller that names no queue row and allows revival.
+        PromptSubmitError::RevivalRefused
+        | PromptSubmitError::Turn(SendTurnError::RevivalRefused)
+        | PromptSubmitError::Turn(SendTurnError::NotOwner)
+        | PromptSubmitError::QueuedPromptGone
+        | PromptSubmitError::QueuedPromptChanged
+        | PromptSubmitError::QueuedAttachmentsMissing => {
+            tool_error("send_failed", "The prompt was refused")
+        }
+    }
+}
+
+/// Keys typed into a pane, as `POST /send` takes them: paste delimiters stripped so text
+/// can't end the bracketed paste early, trailing line breaks dropped, nothing if empty.
+fn terminal_text(mut text: String) -> Option<String> {
+    crate::server::live_ws::strip_paste_escapes(&mut text);
+    let len = text.trim_end_matches(['\r', '\n']).len();
+    text.truncate(len);
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// A refused terminal send as a tool error. A refusal from reviving the session carries the
+/// HTTP response `POST /send` would give, so it maps like any other refusal.
+async fn terminal_refusal(id: &str, error: SendKeysError) -> CallToolResult {
+    match error {
+        SendKeysError::NotFound | SendKeysError::Gone => not_found(id),
+        SendKeysError::NotRunning => {
+            tool_error("not_running", "The terminal session is not running")
+        }
+        SendKeysError::Transient(status) => {
+            tool_error("busy", format!("The session is {status:?}; try again"))
+        }
+        SendKeysError::Preparation { response, .. } => {
+            let status = response.status();
+            match axum::body::to_bytes(response.into_body(), usize::MAX).await {
+                Ok(bytes) => refusal(status, &bytes),
+                Err(e) => tool_error("internal", e.to_string()),
+            }
+        }
+        SendKeysError::StructuredView => tool_error(
+            "invalid_request",
+            "The session no longer has a terminal agent",
+        ),
+        SendKeysError::Blocked(blocked) => tool_error("invalid_request", blocked.to_string()),
+        SendKeysError::Tmux(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, %error, "terminal send failed");
+            tool_error("send_failed", "Terminal send failed")
+        }
+        SendKeysError::Internal => tool_error("internal", "Internal error"),
+    }
+}
+
+fn not_found(id: &str) -> CallToolResult {
+    tool_error("not_found", format!("No session {id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_prompt_box_rule_reads_as_at_the_prompt() {
+        use PaneReadiness::*;
+        // (detected, readiness, whether MCP `send` refuses it)
+        let cases = [
+            (None, NoPromptRule, false),
+            (Some((Some(Status::Waiting), "trust_dialog")), Waiting, true),
+            (Some((Some(Status::Idle), "ready_prompt")), AtPrompt, false),
+            (
+                Some((Some(Status::Idle), "live_prompt_box")),
+                AtPrompt,
+                false,
+            ),
+            (Some((Some(Status::Idle), "osc_title_idle")), NotYet, false),
+            (Some((Some(Status::Idle), "completed_turn")), NotYet, false),
+            (
+                Some((Some(Status::Idle), "interrupt_banner")),
+                NotYet,
+                false,
+            ),
+            (Some((Some(Status::Idle), "no_rule")), NotYet, false),
+            (Some((Some(Status::Running), "spinner")), NotYet, false),
+            (Some((None, CAPTURE_FAILED_RULE)), Unreadable, true),
+        ];
+        for (detected, want, refused) in cases {
+            assert_eq!(readiness_of(detected), want, "{detected:?}");
+            assert_eq!(refuses_send(want), refused, "{want:?}");
+        }
+    }
+
+    /// The codes a caller acts on pass through, the rest are named by status, and a
+    /// plain-text body becomes the message.
+    #[test]
+    fn refusals_keep_actionable_codes_and_fall_back_by_status() {
+        let hooks = json!({
+            "error": "hooks_need_trust", "message": "Resubmit with trust_hooks",
+            "on_create": ["make setup"], "on_launch": [], "on_destroy": [],
+        });
+        // (status, body, code, message contains)
+        let cases = [
+            (
+                StatusCode::FORBIDDEN,
+                hooks.to_string(),
+                "hooks_need_trust",
+                "AoE dashboard",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": "parent_not_found", "message": "No session x"}).to_string(),
+                "parent_not_found",
+                "No session x",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error": "validation_failed", "message": "bad title"}).to_string(),
+                "invalid_request",
+                "bad title",
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "Choose only one source".into(),
+                "invalid_request",
+                "Choose only one source",
+            ),
+            (StatusCode::NOT_FOUND, String::new(), "not_found", ""),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                "slow down".into(),
+                "busy",
+                "slow down",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                String::new(),
+                "internal",
+                "",
+            ),
+        ];
+        for (status, body, code, message) in cases {
+            let result = refusal(status, body.as_bytes());
+            assert_eq!(result.is_error, Some(true), "{body}");
+            let content = result.structured_content.unwrap();
+            assert_eq!(content["code"], code, "{body}");
+            assert!(
+                content["message"].as_str().unwrap().contains(message),
+                "{body}: {content}"
+            );
+        }
+        let content = refusal(StatusCode::FORBIDDEN, hooks.to_string().as_bytes())
+            .structured_content
+            .unwrap();
+        assert_eq!(content["on_create"], json!(["make setup"]));
+        assert!(content.get("trust_hooks").is_none());
+
+        // A failed create's reference reaches the caller, to match the Daemon's log line.
+        let failed = json!({
+            "error": "create_failed", "message": "Failed to create session",
+            "stage": "provisioning", "reference": "mcp-0f3a",
+        });
+        let content = refusal(StatusCode::BAD_REQUEST, failed.to_string().as_bytes())
+            .structured_content
+            .unwrap();
+        assert_eq!(content["code"], "invalid_request");
+        assert_eq!(content["reference"], "mcp-0f3a");
+    }
+
+    /// Keys reach a pane as `POST /send` sends them, so a prompt can't close the bracketed
+    /// paste and run the rest as raw keys.
+    #[test]
+    fn terminal_text_strips_paste_delimiters_and_trailing_breaks() {
+        // (input, keys sent)
+        let cases = [
+            ("review the diff\n", Some("review the diff")),
+            ("one\r\ntwo\r\n", Some("one\r\ntwo")),
+            ("first\x1b[201~rm -rf ~\n", Some("firstrm -rf ~")),
+            ("\x1b[200~pasted\x1b[201~", Some("pasted")),
+            ("\n\r\n", None),
+            ("\x1b[200~\x1b[201~", None),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                terminal_text(input.to_string()).as_deref(),
+                want,
+                "{input:?}"
+            );
+        }
+    }
+
+    /// A refused revive keeps the HTTP refusal's code, so a hook approval reads as one
+    /// instead of "try again"; a full queue is retryable, and a prompt already recorded is not.
+    #[tokio::test]
+    async fn refused_terminal_sends_and_full_queues_map_like_http() {
+        use axum::response::IntoResponse;
+        let preparation = |status: StatusCode, body: axum::response::Response| {
+            let mut response = body;
+            *response.status_mut() = status;
+            SendKeysError::Preparation {
+                response: Box::new(response),
+                detail: json!({}),
+            }
+        };
+        let hooks = axum::Json(json!({
+            "error": "hooks_need_trust", "message": "trust them",
+            "on_create": [], "on_launch": ["npm start"], "on_destroy": [],
+        }))
+        .into_response();
+        // (error, code)
+        let cases = [
+            (
+                preparation(StatusCode::FORBIDDEN, hooks),
+                "hooks_need_trust",
+            ),
+            (
+                preparation(StatusCode::CONFLICT, "resume_failed".into_response()),
+                "invalid_request",
+            ),
+            (
+                preparation(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "lifecycle busy".into_response(),
+                ),
+                "busy",
+            ),
+            (SendKeysError::NotRunning, "not_running"),
+            (SendKeysError::Gone, "not_found"),
+        ];
+        for (error, code) in cases {
+            let result = terminal_refusal("s", error).await;
+            assert_eq!(result.structured_content.unwrap()["code"], code);
+        }
+        let prompt_cases = [
+            (
+                PromptSubmitError::Enqueue(StatusCode::TOO_MANY_REQUESTS, "queue is full".into()),
+                "busy",
+            ),
+            (PromptSubmitError::WorkerNotReady, "busy"),
+            // Already in the transcript, so a retry would record it twice.
+            (
+                PromptSubmitError::Turn(SendTurnError::WorkerLostAfterPublish),
+                "send_failed",
+            ),
+        ];
+        for (error, code) in prompt_cases {
+            let result = prompt_refusal("s", error);
+            assert_eq!(result.structured_content.unwrap()["code"], code);
+        }
+    }
+}

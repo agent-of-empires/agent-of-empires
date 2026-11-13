@@ -52,6 +52,7 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 | `AOE_LOG_LEVEL` | File log level for AoE's own targets: `trace`, `debug`, `info`, `warn`, `error`. Dependency crates stay at `warn`. One-shot CLI commands always log to the same file at the configured level once the app directory exists; `[logging].output = "stdout"` applies to a foreground `aoe serve` only |
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
+| `AOE_SERVE_PORT` | Port for a newly started `aoe serve` daemon, below `--port` and above `[serve] port`. See [Serve](#serve) |
 
 ## Theme
 
@@ -138,6 +139,8 @@ Per-agent structured view defaults live under `[acp]`, not `[session]`:
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Read from the global config only, so a profile cannot widen it; changing it from the web needs the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | Registry keys allowed while the restriction is on, e.g. `["claude", "codex"]`. Each alias counts separately, and an empty list denies every agent. A worker on a now-disallowed agent is terminated at its next respawn. |
 | `acp.rate_limit_auto_resume` | `false` | Respawn a worker parked on a provider rate limit once the reported reset passes. See [Rate-limit recovery](../structured-view/troubleshooting.md#rate-limits-and-agent-hand-off). |
+| `acp.rate_limit_failover` | `false` | Continue a session parked on a rate limit on another account from `acp.rate_limit_failover_accounts` instead of waiting for the reset. Host Claude sessions only; local-only. See [Automatic account failover](../structured-view/troubleshooting.md#automatic-account-failover). You are responsible for complying with the agent provider's terms for the accounts you configure. |
+| `acp.rate_limit_failover_accounts` | `[]` | Ordered failover pool: tool names declared under `agent_config_dir` that run the same agent as the session. Others are ignored with a warning. |
 
 Agent status overrides use `[agents.<name>]`:
 
@@ -537,6 +540,15 @@ update_check_mode = "notify"   # auto | notify | off
 - `off`: no check, banner, or dashboard poll. Use it on offline networks.
 
 Checks hit GitHub at most once a day; the dashboard re-polls the cached status hourly while open.
+
+## Serve
+
+```toml
+[serve]
+port = 8080               # debug builds default to 8081
+```
+
+`aoe serve` and runtime autostart take a new daemon's port from `--port`, then `AOE_SERVE_PORT`, then this key. The TUI Serve dialog keeps its own saved port unless `AOE_SERVE_PORT` is set, and does not read this key. A restart keeps the recorded port unless one is requested, so a changed value applies after a stop and start. Global only.
 
 ## Tools
 
