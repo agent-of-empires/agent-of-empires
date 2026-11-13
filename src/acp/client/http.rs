@@ -520,11 +520,12 @@ impl HttpClient {
         if res.status().is_success() {
             return Ok(crate::daemon::decode_json(res).await?);
         }
-        // A refusal explains itself (for example an over-long prompt); keep that text.
+        // A refusal explains itself (for example an over-long prompt); keep that
+        // text, or the typed code when the body has no message.
         Err(match status_error(&res, None, false) {
-            HttpError::Server { status, .. } => HttpError::Server {
+            HttpError::Server { status, body } => HttpError::Server {
                 status,
-                body: refusal_message(res).await,
+                body: refusal_message(res).await.unwrap_or(body),
             },
             other => other,
         })
@@ -1219,8 +1220,8 @@ async fn brief_server_error(error: HttpError, res: reqwest::Response) -> HttpErr
     HttpError::Server { status, body }
 }
 
-/// The `message` of a daemon error body, bounded; empty when there is none.
-async fn refusal_message(res: reqwest::Response) -> String {
+/// The `message` of a daemon error body, bounded; `None` when there is none.
+async fn refusal_message(res: reqwest::Response) -> Option<String> {
     const MAX_BODY_BYTES: usize = 4096;
     const MAX_MESSAGE_CHARS: usize = 200;
     crate::daemon::decode_json_bounded::<serde_json::Value>(res, MAX_BODY_BYTES)
@@ -1228,7 +1229,6 @@ async fn refusal_message(res: reqwest::Response) -> String {
         .ok()
         .and_then(|body| body.get("message")?.as_str().map(str::to_owned))
         .map(|message| message.chars().take(MAX_MESSAGE_CHARS).collect())
-        .unwrap_or_default()
 }
 
 fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
@@ -2549,5 +2549,41 @@ mod tests {
             "{error:?}"
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_prepare_refusal_without_a_message_keeps_the_typed_code() {
+        use axum::{http::StatusCode as Code, routing::post, Json, Router};
+        // A typed code with no message keeps the code; plain text leaves it empty.
+        let coded = Router::new().route(
+            "/api/suggestions/prepare",
+            post(|| async {
+                (
+                    Code::INTERNAL_SERVER_ERROR,
+                    [(crate::daemon::ERROR_CODE_HEADER, "start_failed")],
+                    Json(serde_json::json!({ "error": "start_failed" })),
+                )
+            }),
+        );
+        let plain = Router::new().route(
+            "/api/suggestions/prepare",
+            post(|| async { (Code::BAD_GATEWAY, "upstream down") }),
+        );
+        for (app, status, expected) in [
+            (coded, StatusCode::INTERNAL_SERVER_ERROR, "start_failed"),
+            (plain, StatusCode::BAD_GATEWAY, ""),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = HttpClient::new(endpoint(&base, None)).unwrap();
+            let error = client.prepare_suggestion("gh", "1").await.unwrap_err();
+            assert!(
+                matches!(&error, HttpError::Server { status: s, body }
+                    if *s == status && body == expected),
+                "{error:?}"
+            );
+            server.abort();
+        }
     }
 }
