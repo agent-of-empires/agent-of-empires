@@ -21,6 +21,10 @@ const isStructured = (s: SessionResponse) => s.view === "structured";
 export const canRecreateContainer = (s: SessionResponse, archived: boolean) =>
   s.is_sandboxed && !archived && !s.trashed_at && !["Creating", "Deleting"].includes(s.status);
 
+/** The title the startup error screen's Recreate container needs, or undefined when it isn't offered. */
+export const recreateContainerTitle = (s: SessionResponse) =>
+  canRecreateContainer(s, !!s.archived_at) ? s.title : undefined;
+
 const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) => boolean> = {
   stop: (s) => !["Stopped", "Deleting", "Creating"].includes(s.status),
   // Archived and trashed sessions must be unarchived or restored before they start (#4116).

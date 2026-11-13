@@ -5,7 +5,7 @@ import { cleanup, fireEvent, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 import { EMPTY_OPTIMISTIC, optimisticForRow, optimisticKey, withOverride } from "../../lib/sidebarOptimistic";
-import { resolveActionTargets } from "../sidebar/sessionActionTargets";
+import { recreateContainerTitle, resolveActionTargets } from "../sidebar/sessionActionTargets";
 import { makeSession, makeWorkspace, openRowMenu, stubFetch } from "./fixtures";
 
 const sibling = (id: string, over: Partial<SessionResponse> = {}) => makeSession({ id, title: `title ${id}`, ...over });
@@ -47,6 +47,12 @@ describe("resolveActionTargets", () => {
     expect(ids(t.fork)).toEqual(["fork"]);
     expect(ids(t.summarize)).toEqual(["acp", "fork"]);
     expect(ids(t.switchView)).toEqual(["acp", "fork", "capable"]);
+  });
+
+  it("gives the startup error screen a title only for a Session the menu could recreate", () => {
+    expect(recreateContainerTitle(sibling("boxed", { status: "Running", is_sandboxed: true }))).toBe("title boxed");
+    expect(recreateContainerTitle(sibling("host", { status: "Running" }))).toBeUndefined();
+    expect(recreateContainerTitle(sibling("archived", { is_sandboxed: true, archived_at: "x" }))).toBeUndefined();
   });
 
   it("hides Start while an archive is pending, and allows it once unarchiving", () => {
