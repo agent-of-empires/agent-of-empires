@@ -11,7 +11,7 @@ import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { visibleSessionNotices } from "../../lib/acpTypes";
 import { useAgentDisplayNames } from "../../lib/agentDisplayName";
-import { isNewSessionStarting, isRetryingStart } from "./startupWait";
+import { isNewSessionStarting, notRunningCopy } from "./startupWait";
 import { AgentProfileProvider, useClearAliases, useCompactAliases } from "../../lib/agentProfileContext";
 import { queuedReason } from "./queuedReason";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
@@ -202,12 +202,7 @@ function AcpChrome({
   const startingAgent = isNewSessionStarting(state, ctx, acpWorkerState, !!view.startedBefore)
     ? agentName(state.agent ?? acpAgent)
     : null;
-  // Nothing to ask while the Agent can't start, or until a Retry has started it.
-  const notRunning = isRetryingStart(state)
-    ? `${agentName(state.agent ?? acpAgent)} isn't running yet.`
-    : state.startupError
-      ? `${agentName(state.agent ?? acpAgent)} isn't running.`
-      : null;
+  const notRunning = notRunningCopy(state, agentName(state.agent ?? acpAgent));
   // Neither can start until restored or unarchived, so nothing here may send (#4116).
   const readOnly = !!view.trashedAt || !!view.archivedAt;
   // Rows before the latest `/clear` divider are the hidden history.

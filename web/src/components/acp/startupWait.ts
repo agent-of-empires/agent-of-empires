@@ -18,6 +18,16 @@ export function isRetryingStart(state: Pick<AcpState, "restartInFlight" | "retri
   return state.restartInFlight && state.retriedError !== null;
 }
 
+/** The empty state while the Agent can't start, or until a Retry has started it. */
+export function notRunningCopy(
+  state: Pick<AcpState, "restartInFlight" | "retriedError" | "startupError">,
+  name: string,
+): string | null {
+  const subject = name.charAt(0).toUpperCase() + name.slice(1);
+  if (isRetryingStart(state)) return `${subject} isn't running yet.`;
+  return state.startupError ? `${subject} isn't running.` : null;
+}
+
 /** The Agent's session ran before, so an older Session is known before its events load. An import has
  *  its id from creation but has never run here. */
 export function hasStartedBefore(session: Pick<SessionResponse, "acp_session_id" | "import_pending">): boolean {
