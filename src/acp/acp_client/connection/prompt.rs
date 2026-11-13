@@ -24,7 +24,7 @@ use crate::acp::acp_client::errors::acp_internal_error;
 use crate::acp::acp_client::lifecycle::{LifecycleSignal, OffProtocolWorkKind};
 use crate::acp::acp_client::opencode::recover_opencode_prompt_error;
 use crate::acp::acp_client::rate_limit::{
-    captured_rate_limit_resets_at, classify_rate_limit_error, clear_captured_rejections,
+    captured_rate_limit_reset, classify_rate_limit_error, clear_captured_rejections,
     is_unsupported_session_error, take_rate_limit_from_captured_rejection,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
@@ -374,10 +374,7 @@ impl Session {
             Err(error) => {
                 return classify_rate_limit_error(
                     error,
-                    captured_rate_limit_resets_at(
-                        &shared.rate_limit_rejections,
-                        chrono::Utc::now(),
-                    ),
+                    captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now()),
                 )
             }
             Ok(response) if matches!(response.stop_reason, StopReason::Cancelled) => return None,

@@ -98,6 +98,11 @@ jobs:
         if: matrix.leg == 'core-rest'
         working-directory: acp-worker/test-shim
         run: npm ci
+      - name: Vendored Crossterm consumer regressions (Linux)
+        if: matrix.leg == 'core-rest'
+        env:
+          CARGO_BUILD_JOBS: '1'
+        run: python3 .github/scripts/test-vendored-crossterm.py
       # web-e2e: just the e2e binary, and the only leg that builds the
       # dashboard bundle. The e2e target is gated behind the `e2e-tests`
       # feature so the core-rest leg below can skip it; this leg opts in.
@@ -353,6 +358,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+      - name: Vendored Crossterm consumer regressions (native kqueue)
+        env:
+          CARGO_BUILD_JOBS: '1'
+        run: python3 .github/scripts/test-vendored-crossterm.py
       # Two steps so the two crate compiles (lib, then lib tests) never run at
       # once: together they overflow the runner's 7 GB and swap.
       - name: Build lib and bins (macOS)

@@ -64,6 +64,7 @@
                 ./vendor/unicode-width/LICENSE-APACHE
                 ./vendor/unicode-width/COPYRIGHT
                 ./vendor/unicode-width/tests/emoji-test.txt
+                ./vendor/crossterm/LICENSE
               ];
             };
             strictDeps = true;

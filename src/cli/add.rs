@@ -383,6 +383,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         scratch: args.scratch,
         trust_hooks: Some(trust),
         trust_review: Some(review.fingerprint),
+        skip_on_create: false,
         import_acp_session_id: None,
         fork_from: None,
         fork_session_id: None,

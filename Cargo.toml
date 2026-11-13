@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
-exclude = ["vendor/pulldown-cmark", "vendor/unicode-width"]
+exclude = ["vendor/pulldown-cmark", "vendor/unicode-width", "vendor/crossterm"]
 
 [package]
 name = "agent-of-empires"
@@ -300,3 +300,4 @@ path = "src/main.rs"
 [patch.crates-io]
 pulldown-cmark = { path = "vendor/pulldown-cmark" }
 unicode-width = { path = "vendor/unicode-width" }
+crossterm = { path = "vendor/crossterm" }

@@ -57,58 +57,93 @@ The first nightly appears after the next scheduled run, or `gh workflow run nigh
 - **ClawHub** (`contrib/openclaw-skill/`) is published automatically by `release.yml` on every release. Its frontmatter must carry no top-level `version:`; ClawHub's `_meta.json` and the `--version` flag are the source of truth.
 - **Hermes** (`contrib/hermes-skill/`) is PR-based and published by hand, so the in-repo copy is the source of truth and the hub copy drifts until you re-publish. Its frontmatter must carry a `version:`. Bump it, then run `hermes skills publish contrib/hermes-skill --to github --repo NousResearch/hermes-agent` (needs the `hermes` CLI and a GitHub token with fork permissions). Cadence is on change, not every release.
 
-## Vendored parser forks
+## Vendored dependencies
 
-Repository maintainers own both forks, including security fixes and Unicode data;
-the release approver owns the checks below. Review upstream releases and security
-advisories at each weekly release review, and immediately for a relevant advisory.
-Dependency-update PRs do not refresh path-patched sources.
+Repository maintainers own all three forks, including security fixes, Unicode data,
+and upstreaming decisions; the release approver owns the checks below. Review
+upstream releases and advisories at each weekly release review and immediately
+for a relevant advisory. Dependency-update PRs do not refresh path-patched sources.
 
-The exact bases are the published crates.io archives, not a moving Git branch:
+### Archive provenance
+
+The exact bases are published crates.io archives, not moving Git branches:
 
 | Fork | Base archive | SHA-256 |
 |---|---|---|
 | pulldown-cmark | `https://static.crates.io/crates/pulldown-cmark/pulldown-cmark-0.13.6.crate` | `3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b` |
 | unicode-width | `https://static.crates.io/crates/unicode-width/unicode-width-0.2.2.crate` | `b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254` |
+| crossterm | `https://static.crates.io/crates/crossterm/crossterm-0.29.0.crate` | `d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b` |
 
 Their archive VCS identities are pulldown-cmark
 `014b61d38d235f382935bb676bab872b7680afa2` (repository subdirectory
-`pulldown-cmark`) and unicode-width
-`9d98411769fe13c7c18cab0b3fbbab29ba8350ea` (repository root).
+`pulldown-cmark`), unicode-width
+`9d98411769fe13c7c18cab0b3fbbab29ba8350ea` (repository root), and Crossterm
+`36d95b26a26e64b0f8c12edfe11f410a6d56a812` (repository root).
 
-To reproduce the local delta, download each archive into a temporary directory,
-verify the checksum above with `sha256sum`, extract with `tar -xzf`, then run:
+Download each archive separately, verify its checksum with `sha256sum`, extract
+with `tar -xzf`, then inspect its local delta:
 
 ```sh
-diff -ruN "$temporary/pulldown-cmark-0.13.6" vendor/pulldown-cmark
-diff -ruN "$temporary/unicode-width-0.2.2" vendor/unicode-width
+diff -ruN --exclude=Cargo.lock --exclude=target \
+  "$temporary/pulldown-cmark-0.13.6" vendor/pulldown-cmark
+diff -ruN --exclude=Cargo.lock --exclude=target \
+  "$temporary/unicode-width-0.2.2" vendor/unicode-width
+diff -ruN --exclude=Cargo.lock --exclude=target \
+  "$temporary/crossterm-0.29.0" vendor/crossterm
 ```
 
-Archive packaging metadata, omitted upstream-only files, and standalone workspace
-manifests are not parser changes. Review those separately from the source delta.
+Archive packaging metadata, omitted upstream-only files, standalone workspace
+manifests, and test-only dependencies are separate from the runtime source delta.
+
+### Parser and width changes
+
 Pulldown's local delta adds shared memory/disk input, disk-backed parser storage,
-reference lookup and text normalization. Unicode-width's delta exposes incremental
-reverse-width accumulation; generated width data and upstream expectations must
-not change as a side effect. Keep upstream grammar tests intact. Do not regenerate
+reference lookup and text normalization. Unicode-width exposes incremental
+reverse-width accumulation. Generated width data and upstream expectations must
+not change as a side effect. Keep upstream grammar tests intact; do not regenerate
 Unicode tables merely to refresh packaging. Record any intentional grammar,
 Unicode-version, generated-table, or upstream-test change explicitly in the update PR.
-The Unicode-width upstream suite and its `emoji-test.txt` fixture are retained
-unchanged under `vendor/unicode-width/tests/`; the parser's upstream suites remain
-under `vendor/pulldown-cmark/tests/`. Run them from their standalone manifests,
-not only as dependencies of the root package.
+The unchanged Unicode-width suite and `emoji-test.txt` remain under
+`vendor/unicode-width/tests/`; Pulldown's upstream suites remain under
+`vendor/pulldown-cmark/tests/`.
 
-For an update, extract the new pristine archive separately, record its URL and
-checksum here, replay only the reviewed local source changes, then compare both
-old/new upstream trees and the final fork. Review upstream release notes, Rust
-minimum version, advisories, and Unicode release notes. Copy updated license texts
-to `licenses/` and update `THIRD_PARTY_NOTICES.md`. Maintainers must decide in that
-PR whether to propose the reusable disk-input and incremental-width APIs upstream.
-Until upstream can satisfy bounded-storage and parity requirements, retain the
-forks; do not replace them with stock crates merely to clear an update warning.
+### Terminal consumer changes
 
-Run these release checks sequentially, on Linux and native macOS for terminal checks:
+Crossterm's runtime delta is the Unix Mio consumer, plus removal of unnecessary
+closure parentheses in `src/terminal/sys/unix.rs` (warning-only). Its regression
+tests exercise actual fetched readiness; existing upstream tests, parser, optional
+backends, and published feature choices remain intact. Saved controls retain their
+order. A TTY hint retained across a return cannot authorize a blocking read;
+readiness is reevaluated through the existing registration and poll. This does not
+eliminate every race with a concurrent competing input consumer.
+
+A forced ordering of an actual fetched batch establishes a conditional consumer
+contract, not the original macOS event order. Blocking stale cases verify completed
+private-alias consumption, not end-to-end App handoff. Root terminal checks and
+native kqueue coverage remain required.
+
+### Updates and upstreaming
+
+Extract a new pristine archive independently, record its URL/checksum here, replay
+only the reviewed local changes, then compare old/new upstream trees and the final
+fork. Review release notes, Rust requirements, advisories, and Unicode release notes.
+Copy updated license texts to `licenses/` and update `THIRD_PARTY_NOTICES.md`.
+
+Maintainers must decide in the update PR whether to propose reusable disk-input
+and incremental-width APIs upstream. Until upstream satisfies bounded-storage and
+parity requirements, retain those forks rather than replacing them merely to clear
+an update warning. Propose the reusable Crossterm consumer correction upstream;
+retire its patch only when upstream passes the same live, stale, control-order and
+zero-time regressions without changing backends.
+
+### Release checks and distribution
+
+Run these checks sequentially, on Linux and native macOS for terminal checks:
 
 ```sh
+CARGO_BUILD_JOBS=1 python3 .github/scripts/test-vendored-crossterm.py
+CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/crossterm/Cargo.toml \
+  --locked --lib --features event-stream -- --test-threads=1
 CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/pulldown-cmark/Cargo.toml --features disk,html
 CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/unicode-width/Cargo.toml
 CARGO_BUILD_JOBS=1 cargo test --manifest-path vendor/unicode-width/Cargo.toml --no-default-features
@@ -118,31 +153,32 @@ CARGO_BUILD_JOBS=1 cargo test --lib tui::terminal_output
 CARGO_BUILD_JOBS=1 cargo test --lib child_handoff_restores_real_raw_input_before_blocked_screen_controls
 ```
 
-The standalone vendor suites are not covered by root workspace tests. Pulldown's
-upstream CommonMark/HTML suite needs `html`, unlike the production `disk` build.
-Require memory/disk event and byte parity, split-grapheme width parity, cancelled
-rendering, bounded retained storage, and exact frame/control ordering to remain
-green. A root-only test result is not evidence for the upstream suites.
+The CI helper seeds Crossterm's ignored lockfile from the project lock, rejects
+production pin drift or a libc/use-dev-tty backend switch, and requires all 18 real
+consumer regressions to execute. Standalone vendor suites are not covered by root
+workspace tests. Pulldown's upstream CommonMark/HTML suite needs `html`, unlike the
+production `disk` build. Require memory/disk event and byte parity, split-grapheme
+width parity, cancelled rendering, bounded retained storage, and exact frame/control
+ordering to remain green. Root-only results are not evidence for upstream suites.
 
-Release archives must contain `LICENSE`, `THIRD_PARTY_NOTICES.md`, and the complete
-`licenses/` directory, including both fork MIT notices and Unicode-width copyright.
-Nix source filtering explicitly includes upstream extensionless notices; both Nix
-packages install notices under `$out/share/licenses/aoe`. Check both `nix build`
-and `nix build .#aoe-with-web`, then inspect their installed license directories
-and one generated release archive before approval.
-Crane dependency-only builds must restore real vendored patch sources and original
-manifests after generating workspace stubs: registry dependencies call their APIs.
-Keep that restore hook's input vendor-only so application edits retain the dependency cache.
-Dependency derivations also take metadata and Cargo vendoring from the original
-manifest and lockfile, never from generated dummy sources. Before release, evaluate
-both configured packages and the development shell for every system advertised by
-the [Nix CI matrix](../../.github/workflows/ci.yml) with
-`--option allow-import-from-derivation false`; cross-system evaluation must not
-try to realize foreign generated sources.
+Release archives must contain `LICENSE`, `THIRD_PARTY_NOTICES.md`, and complete
+`licenses/`, including every fork's MIT notice and Unicode-width copyright. Nix
+source filtering includes upstream extensionless notices; both packages install
+complete notices under `$out/share/licenses/aoe`. Check both `nix build` and
+`nix build .#aoe-with-web`, their installed notices, and a generated release archive
+before approval.
+
+Crane dependency builds restore real vendored patch sources and original manifests
+after generating workspace stubs: registry dependencies call their APIs. Keep the
+restore input vendor-only so application edits retain the dependency cache.
+Dependency metadata and Cargo vendoring come from the original manifest and lock,
+never dummy sources. Before release, evaluate both packages and the development
+shell for every system advertised by the [Nix CI matrix](../../.github/workflows/ci.yml)
+with `--option allow-import-from-derivation false`; cross-system evaluation must not
+realize foreign generated sources.
 
 Supported source installation uses this repository's Git checkout and lockfile
-(`cargo install --path . --locked`, or the project's Git-based installer).
-Ordinary registry packaging strips patch declarations and nested packages; a
-registry archive is not a supported source distribution for these path forks.
-Do not publish one without first defining and testing a distribution that carries
-the forks and preserves their dependency resolution.
+(`cargo install --path . --locked`, or the Git-based installer). Ordinary registry
+packaging strips patches and nested packages and is not a supported distribution
+for these forks. Do not publish one without defining and testing a distribution
+that carries the forks and preserves dependency resolution.

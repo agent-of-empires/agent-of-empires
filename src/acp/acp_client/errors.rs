@@ -46,6 +46,13 @@ pub enum AcpError {
     ResetFailed(String),
 }
 
+/// Whether an agent's startup message reports a missing login.
+pub fn is_authentication_failure(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("authentication required")
+}
+
 /// The structured detail plus a formatted summary the supervisor mirrors into
 /// `Event::AgentStartupError { message }` for callers that read only that.
 #[derive(Debug)]
@@ -61,6 +68,12 @@ impl std::fmt::Display for IncompatibleAgentError {
 }
 
 impl AcpError {
+    /// The agent refused to start for want of a login. The ready-channel failure carries only
+    /// the agent's message, so this reads it.
+    pub fn is_authentication_failure(&self) -> bool {
+        matches!(self, AcpError::Spawn(message) if is_authentication_failure(message))
+    }
+
     /// POSIX returns ENOENT for both "binary not on PATH" and "cwd is gone",
     /// so only a stat can tell them apart; it runs on the ENOENT branch alone.
     /// The supervisor pre-flights `cwd.exists()`, but the directory can vanish

@@ -76,7 +76,7 @@ interface Props {
   onSelect: (workspaceId: string, sessionId: string | null) => void;
   onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
-  onNew: () => void;
+  onNew: (prefill?: { group?: string }) => void;
   onCreateSession: (repoPath: string) => void;
   onPinProject?: (repoPath: string) => void;
   onUnpinProject?: (group: SidebarGroup) => void;
@@ -330,7 +330,7 @@ export function WorkspaceSidebar(props: Props) {
           filterOpen={filterOpen}
           onToggleFilter={toggleFilter}
           offline={offline}
-          onNew={props.onNew}
+          onNew={() => props.onNew()}
           onToggleCompact={() => updateWebSettings({ sidebarCompact: !compact })}
           onClose={props.onToggle}
         />
@@ -442,7 +442,7 @@ export function WorkspaceSidebar(props: Props) {
               <p className="text-sm font-medium text-text-secondary">No sessions yet</p>
               <p className="mt-1 text-[13px] text-text-muted">Create a session to start working in a repo.</p>
               <button
-                onClick={props.onNew}
+                onClick={() => props.onNew()}
                 disabled={offline}
                 className="mt-4 inline-flex items-center gap-1.5 rounded-md bg-brand-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-brand-500 cursor-pointer transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-brand-600"
               >

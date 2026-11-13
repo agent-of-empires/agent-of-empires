@@ -41,7 +41,7 @@ use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
-use super::rate_limit::{captured_rate_limit_resets_at, classify_rate_limit_from_message};
+use super::rate_limit::{captured_rate_limit_reset, classify_rate_limit_from_message};
 use super::session_identity::{RequestPolicy, SessionIngress, SessionIngressNotification};
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
@@ -491,7 +491,7 @@ async fn report_connection_error(
     let message = format!("ACP connection failed: {e}");
     let rate_limit = classify_rate_limit_from_message(
         &message,
-        captured_rate_limit_resets_at(&shared.rate_limit_rejections, chrono::Utc::now()),
+        captured_rate_limit_reset(&shared.rate_limit_rejections, chrono::Utc::now()),
     );
     if let Some(tx) = ready_tx.lock().await.take() {
         // A handshake-time limit fails the spawn as rate-limited so the

@@ -2285,6 +2285,7 @@ mod tests {
             let mut poll = tokio::time::interval(Duration::from_millis(10));
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
+                    poll.reset();
                     tokio::select! {
                         result = &mut waiting => panic!("dismissed without input: {result:?}"),
                         _ = poll.tick() => {
@@ -2294,7 +2295,13 @@ mod tests {
                         }
                     }
                 }
-            }).await.unwrap();
+            }).await.unwrap_or_else(|error| {
+                panic!(
+                    "error frame incomplete: {error}; osc_busy={osc_busy}, emitted={}, needs_redraw={}",
+                    emitted.len(),
+                    crate::tui::terminal_output::needs_redraw()
+                )
+            });
             send.send(Ok(CrosstermEvent::Key(KeyEvent::from(KeyCode::Char('x')))))
                 .await
                 .unwrap();

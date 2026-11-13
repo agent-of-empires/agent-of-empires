@@ -62,5 +62,16 @@ copyright and permission notice is shipped in
 Modifications: the escape grammar and style transitions operate on contiguous
 or paged byte sources and emit through the shared rich-text sink.
 
+## Crossterm
+
+- Project: <https://github.com/crossterm-rs/crossterm>
+- Version: 0.29.0, vendored in `vendor/crossterm`
+- License: MIT, full copyright and permission notice in
+  [`licenses/crossterm-MIT.txt`](licenses/crossterm-MIT.txt)
+
+The Unix Mio consumer retains fetched control events across early returns and
+refreshes TTY readiness before polling again instead of reading a saved hint.
+The upstream parser and other backends are unchanged.
+
 Fork provenance, update ownership, supported distribution, and required release
-checks are documented in [Vendored parser forks](docs/development/releases.md#vendored-parser-forks).
+checks are documented in [Vendored dependencies](docs/development/releases.md#vendored-dependencies).

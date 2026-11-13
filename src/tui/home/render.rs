@@ -2658,6 +2658,15 @@ impl HomeView {
         self.preview_worker_pulse = observation;
         stalled
     }
+    /// Whether the preview of `target` may read through the VT pipe. Shell terminals and
+    /// a pane another surface took over use capture-pane; the latter lets the new owner
+    /// arm the pipe, which this process's lease would otherwise hold.
+    pub(super) fn preview_vt_enabled(&self, target: Option<&str>) -> bool {
+        self.vt_live_enabled
+            && !matches!(self.view_mode, ViewMode::Terminal)
+            && (self.vt_yield.is_none() || self.vt_yield.as_deref() != target)
+    }
+
     /// Point the capture worker at `desired` (the displayed pane's tmux session) and
     /// retune its cadence for live-send vs idle. One long-lived worker is spawned lazily
     /// and retargeted in place; an empty target idles it. Idempotent and cheap when the
@@ -2681,9 +2690,7 @@ impl HomeView {
             // Shell terminals use capture-pane's authoritative snapshot: their prompt
             // repaint can expose a PROMPT_EOL_MARK to a pipe-pane seed, producing a false
             // frame before the grid reconciles. Slower, but no seed handoff.
-            worker.set_vt_enabled(
-                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
-            );
+            worker.set_vt_enabled(self.preview_vt_enabled(desired.as_deref()));
             worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
@@ -2741,7 +2748,7 @@ impl HomeView {
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
             worker.set_forward_empty(forward_empty);
-            worker.set_vt_enabled(self.vt_live_enabled && !forward_empty);
+            worker.set_vt_enabled(self.preview_vt_enabled(self.preview_capture_target.as_deref()));
             worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
     }

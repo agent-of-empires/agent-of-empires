@@ -214,8 +214,14 @@ impl ServeLaunchRequest {
             ),
             LaunchIntent::Start(_) => None,
         };
-        let port = crate::acp::client::autostart::load_or_generate_port().to_string();
-        let mut argv = vec!["aoe", "serve", "--daemon", "--port", port.as_str()];
+        // An explicit AOE_SERVE_PORT wins over the saved or random port.
+        let port = std::env::var_os("AOE_SERVE_PORT")
+            .is_none_or(|value| value.is_empty())
+            .then(|| crate::acp::client::autostart::load_or_generate_port().to_string());
+        let mut argv = vec!["aoe", "serve", "--daemon"];
+        if let Some(port) = port.as_deref() {
+            argv.extend(["--port", port]);
+        }
         match self.mode {
             ServeMode::Local => argv.extend(["--host", "0.0.0.0"]),
             ServeMode::Tunnel => {

@@ -1095,10 +1095,16 @@ impl AcpState {
         match self.sidebar_phase {
             SidebarPhase::Error => Status::Error,
             SidebarPhase::Waiting => Status::Waiting,
+            // Subagent and late parent events re-arm `Active` while a question is open.
+            SidebarPhase::Active if self.has_pending_request() => Status::Waiting,
             SidebarPhase::Active => Status::Running,
             SidebarPhase::Idle if self.has_active_background_agent() => Status::Running,
             SidebarPhase::Idle => Status::Idle,
         }
+    }
+
+    fn has_pending_request(&self) -> bool {
+        !self.pending_approvals.is_empty() || !self.pending_elicitations.is_empty()
     }
 
     pub fn apply_event(&mut self, seq: u64, event: Event) -> Result<u64, StateError> {
@@ -1756,6 +1762,44 @@ mod tests {
                     prompt("go"),
                     Event::ElicitationRequested {
                         elicitation: elicitation.clone(),
+                    },
+                ],
+                Status::Waiting,
+            ),
+            (
+                "question open while a subagent runs tools",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                    Event::ToolCallStarted {
+                        tool_call: ToolCall {
+                            parent_tool_call_id: Some("task-1".into()),
+                            ..tool()
+                        },
+                    },
+                    chunk("x"),
+                ],
+                Status::Waiting,
+            ),
+            (
+                "one of two questions answered",
+                vec![
+                    prompt("go"),
+                    Event::ElicitationRequested {
+                        elicitation: elicitation.clone(),
+                    },
+                    Event::ElicitationRequested {
+                        elicitation: Elicitation {
+                            nonce: Nonce("e-2".into()),
+                            ..elicitation.clone()
+                        },
+                    },
+                    Event::ElicitationResolved {
+                        nonce: Nonce("e-1".into()),
+                        outcome: ElicitationOutcome::Cancelled,
+                        answers: Vec::new(),
                     },
                 ],
                 Status::Waiting,
