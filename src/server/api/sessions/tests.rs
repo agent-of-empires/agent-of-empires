@@ -9891,8 +9891,7 @@ fn only_a_local_owner_sees_why_the_latest_image_pull_failed() {
 #[tokio::test]
 async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
     use axum::http::StatusCode;
-    // None: the create gets past validation. CityHall strips the operator-owned Sandbox
-    // fields, the pull included.
+    // None: CityHall strips the operator-owned Sandbox fields, the pull included.
     for (label, sandbox, cityhall, allow_image_pull, expected) in [
         (
             "unsandboxed",
@@ -9908,7 +9907,6 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
             false,
             Some((StatusCode::FORBIDDEN, "pull_disabled")),
         ),
-        ("allowed", true, false, true, None),
         ("cityhall", true, true, true, None),
     ] {
         let _home = crate::session::test_support::isolate_app_dir();
@@ -9959,13 +9957,20 @@ async fn create_refuses_pull_latest_image_when_it_cannot_pull() {
                 );
                 assert!(state.instances.read().await.is_empty(), "{label}");
             }
-            // Past validation: only a failure inside the spawn carries a stage.
+            // Only a failure inside the spawn carries a stage.
             None => assert!(
                 body.get("error").is_none() || body["stage"].is_string(),
                 "{label}: {got} {body}"
             ),
         }
     }
+    // An allowed create would spawn a real pull, so check its gate directly.
+    let _home = crate::session::test_support::isolate_app_dir();
+    crate::session::config::update_config(|config| config.sandbox.allow_image_pull = true).unwrap();
+    let state = crate::server::test_support::build_test_app_state_configured(Vec::new(), |_| {});
+    assert!(crate::server::api::create_pull_refusal(&state)
+        .await
+        .is_none());
 }
 
 #[tokio::test]
