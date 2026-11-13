@@ -1183,6 +1183,12 @@ impl SuggestionsFeed {
         }
     }
 
+    /// True while a request is in flight: its answer is not yet processed.
+    #[cfg(test)]
+    pub(super) fn is_busy_for_test(&self) -> bool {
+        self.busy
+    }
+
     #[cfg(test)]
     pub(super) fn set_snapshot_for_test(&mut self, snapshot: serde_json::Value) {
         self.snapshot = Some(serde_json::from_value(snapshot).unwrap());
