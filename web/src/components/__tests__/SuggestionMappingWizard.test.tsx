@@ -86,6 +86,24 @@ describe("SuggestionMappingWizard", () => {
     expect(onSaved).not.toHaveBeenCalled();
   });
 
+  it("keeps the failed rows' check and Project pick after a partial save failure", async () => {
+    api.putSuggestionMapping.mockImplementation(async (_p: string, key: string) =>
+      key === "acme/api" ? { ok: false, error: "nope" } : { ok: true, data: {} },
+    );
+    await open();
+    fireEvent.click(screen.getByLabelText("Map acme/api"));
+    fireEvent.change(screen.getByLabelText("Project for acme/api"), { target: { value: "/w/other" } });
+    api.fetchSuggestionMappings.mockResolvedValue([
+      { provider_id: "gh", mapping_key: "acme/done", projects: ["/w/x"] },
+      { provider_id: "gh", mapping_key: "acme/web", projects: ["/w/web"] },
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Save 2 mappings" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("acme/api: nope");
+    await waitFor(() => expect(screen.queryByLabelText("Map acme/web")).toBeNull());
+    expect((screen.getByLabelText("Map acme/api") as HTMLInputElement).checked).toBe(true);
+    expect((screen.getByLabelText("Project for acme/api") as HTMLSelectElement).value).toBe("/w/other");
+  });
+
   it("ignores Escape and a backdrop click while a save is in flight", async () => {
     let finish: (v: unknown) => void = () => {};
     api.putSuggestionMapping.mockReturnValue(new Promise((resolve) => (finish = resolve)));

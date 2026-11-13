@@ -37,7 +37,13 @@ export function SuggestionMappingWizard({ items, providers, disabled = false, on
       return;
     }
     setProjects(registered);
-    setRows(proposeMappings(items, mappings, registered).map((p) => ({ ...p, checked: p.match === "origin" })));
+    // Rows still unmapped keep the user's check and Project pick; saved rows drop out of the fresh proposals.
+    setRows((previous) =>
+      proposeMappings(items, mappings, registered).map((p) => {
+        const kept = previous?.find((r) => rowId(r) === rowId(p));
+        return kept ? { ...p, checked: kept.checked, project: kept.project } : { ...p, checked: p.match === "origin" };
+      }),
+    );
   }, [items]);
 
   useEffect(() => {
