@@ -321,7 +321,8 @@ fn a_home_prepare_answered_after_the_full_view_opened_is_dropped() {
         !env.view.suggestions_feed.is_busy_for_test()
     });
     assert!(env.view.new_dialog.is_none());
-    assert!(env.view.suggestions_view.is_some());
+    let view = env.view.suggestions_view.as_ref().expect("view stays open");
+    assert!(view.error.as_deref().unwrap().contains("Start again"));
 }
 
 #[test]
@@ -539,6 +540,42 @@ fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
     assert!(env.view.command_palette.is_none());
     let error = env.view.suggestions_view.as_ref().unwrap().error.as_deref();
     assert_eq!(error, Some("This suggestion has no link to open"));
+}
+
+#[test]
+#[serial]
+fn ctrl_k_on_an_empty_suggestions_list_does_nothing() {
+    let (mut env, _requests) = expanded_env(1);
+    env.view
+        .suggestions_feed
+        .set_snapshot_for_test(snapshot(0, &[]));
+    env.view.open_suggestions_view();
+
+    env.view.handle_key(ctrl_k(), None);
+    assert!(env.view.command_palette.is_none());
+    assert!(env.view.suggestions_view.as_ref().unwrap().error.is_none());
+}
+
+#[test]
+#[serial]
+fn the_provider_label_is_padded_and_cut_by_display_cells() {
+    let mut env = create_test_env_with_sessions(1);
+    // "#0" ref: label column of 6 cells, a space, the ref, a space.
+    for name in [
+        "GitHub",
+        "\u{7814}\u{7a76}",
+        "\u{7814}\u{7a76}\u{6240}\u{6240}",
+    ] {
+        let mut snap = snapshot(1, &[]);
+        snap["providers"][0]["name"] = name.into();
+        env.view.suggestions_feed.set_snapshot_for_test(snap);
+        let (prefix, _) = env.view.suggestion_row_text("gh", "i0").unwrap();
+        assert_eq!(
+            crate::tui::components::rendered_width(&prefix),
+            6 + 1 + 2 + 1,
+            "{name}: {prefix:?}"
+        );
+    }
 }
 
 #[test]

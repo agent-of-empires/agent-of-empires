@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::*;
+use crate::tui::components::rendered_width;
 use crate::tui::dialogs::{PaletteAction, PaletteCommand, PaletteGroup};
 use crate::tui::styles::Theme;
 
@@ -178,7 +179,7 @@ impl HomeView {
         true
     }
 
-    /// `n` on a suggestion row prepares a second session for the same item;
+    /// `N` (Ctrl+N in strict mode) on a suggestion row prepares a second session for the same item;
     /// the new session does not claim the suggestion's link.
     pub(super) fn start_another_from_suggestion(&mut self) {
         if let Some(key) = self.cursor_suggestion() {
@@ -333,10 +334,11 @@ impl HomeView {
         let entry = self
             .suggestions_feed
             .entry(&(provider_id.to_owned(), id.to_owned()))?;
+        let pad = " ".repeat(6usize.saturating_sub(rendered_width(&entry.label)));
         let prefix = if entry.source_ref.is_empty() {
-            format!("{:<6} ", entry.label)
+            format!("{}{pad} ", entry.label)
         } else {
-            format!("{:<6} {} ", entry.label, entry.source_ref)
+            format!("{}{pad} {} ", entry.label, entry.source_ref)
         };
         Some((prefix, entry.title))
     }

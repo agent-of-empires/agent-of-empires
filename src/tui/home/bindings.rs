@@ -764,7 +764,7 @@ pub static BINDINGS: &[Binding] = &[
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "New from selection (blank on suggestion)",
+            desc: "New from selection (another from suggestion)",
         }),
         palette: Some(PaletteMeta {
             title: "New session from selection",
