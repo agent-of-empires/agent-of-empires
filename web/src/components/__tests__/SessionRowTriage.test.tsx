@@ -48,9 +48,10 @@ describe("SessionRow chips", () => {
     },
   );
 
-  it("keeps the created-without-setup chip to its icon so a long title still shows", () => {
+  it("keeps the created-without-setup chip to a named icon so a long title still shows", () => {
     renderRow(ws({ created_without_setup: true }));
     expect(label("Created without setup")?.textContent).toBe("");
+    expect(screen.getByRole("img", { name: "Created without setup" })).toBeTruthy();
   });
 
   it("keeps favorite identity distinct from pin in normal and compact rows", () => {

@@ -1166,6 +1166,22 @@ describe("SessionWizard Docker readiness", () => {
     return (available: boolean) => answer({ available, runtime: "docker", runtime_name: "Docker" });
   };
 
+  it("a reopened sandboxed hook failure holds both resends for the probe", async () => {
+    const answer = pendingProbe();
+    const restore = {
+      data: { ...initialData, path: "/tmp/proj", tool: "claude", sandboxEnabled: true },
+      failure: { code: "hook_failed", stage: "running_hooks", message: "exit 1", reference: null },
+    };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    const action = (id: string) => screen.getByTestId(`create-failure-${id}`) as HTMLButtonElement;
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("claude"));
+    await act(async () => {});
+    expect([action("try_again").disabled, action("create_without_setup").disabled]).toEqual([true, true]);
+    answer(true);
+    await waitFor(() => expect(action("create_without_setup").disabled).toBe(false));
+    expect(action("try_again").disabled).toBe(false);
+  });
+
   it("enables Launch without waiting for Docker when the sandbox is off", async () => {
     pendingProbe();
     renderWizard();
