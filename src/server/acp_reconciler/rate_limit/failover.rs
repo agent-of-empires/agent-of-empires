@@ -89,13 +89,28 @@ pub(super) fn account_key(row: &Instance) -> Option<String> {
         .map(path_key)
 }
 
-/// Aliases of one directory (a symlink, `..`) are one account; a directory that does not exist
-/// yet keeps its path as written.
-fn path_key(path: &std::path::Path) -> String {
-    std::fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
+/// Aliases of one directory (a symlink, `..`) are one account, including before the directory
+/// exists: the deepest existing ancestor is resolved and the missing tail appended, so a config
+/// root keys the same on the attempt that creates it and on every one after.
+pub(super) fn path_key(path: &std::path::Path) -> String {
+    let mut resolved = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&resolved) {
+            let mut key = real;
+            for part in tail.iter().rev() {
+                key.push(part);
+            }
+            return key.to_string_lossy().into_owned();
+        }
+        let Some(name) = resolved.file_name().map(|name| name.to_os_string()) else {
+            return path.to_string_lossy().into_owned();
+        };
+        if !resolved.pop() {
+            return path.to_string_lossy().into_owned();
+        }
+        tail.push(name);
+    }
 }
 
 /// The configured pool entries that run the same built-in agent as `row` and declare a config
@@ -736,8 +751,33 @@ mod tests {
         let missing = dir.path().join("not-yet");
         assert_eq!(
             path_key(&missing),
-            missing.to_string_lossy(),
-            "a directory that does not exist keeps its path"
+            format!("{}/not-yet", path_key(dir.path())),
+            "a missing tail is appended to the resolved parent"
+        );
+        let relative = std::path::Path::new("no-such/account");
+        assert_eq!(
+            path_key(relative),
+            relative.to_string_lossy(),
+            "a path with no existing ancestor stays as written"
+        );
+    }
+
+    #[test]
+    fn an_account_keys_the_same_before_and_after_its_root_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let root = link.join("account");
+        let before = path_key(&root);
+        assert_eq!(before, path_key(&real.join("account")));
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(
+            before,
+            path_key(&root),
+            "creating the root must not rekey the account"
         );
     }
 
