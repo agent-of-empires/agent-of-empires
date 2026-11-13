@@ -77,8 +77,9 @@ diff -ruN --exclude=Cargo.lock --exclude=target \
   "$temporary/crossterm-0.29.0" vendor/crossterm
 ```
 
-Only the Unix Mio consumer and its regression tests change, plus standalone
-workspace metadata and test-only dependencies. Existing upstream tests, parser,
+The local delta is the Unix Mio consumer and its regression tests, standalone
+workspace metadata, test-only dependencies, and removal of unnecessary closure
+parentheses in `src/terminal/sys/unix.rs` (warning-only). Existing upstream tests, parser,
 optional backends, and published feature choices remain intact. Saved control
 events retain their order; a TTY hint retained across a return cannot authorize a
 blocking read.

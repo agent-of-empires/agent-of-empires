@@ -382,6 +382,7 @@ impl Iterator for Parser {
 mod forced_batch_tests {
     use super::*;
     use crate::event::{KeyCode, KeyEvent, KeyModifiers};
+    use libc as probe_libc;
     use std::{
         fs::{self, File, OpenOptions},
         io::{Read, Write},
