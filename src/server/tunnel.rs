@@ -251,7 +251,7 @@ impl TunnelHandle {
         );
 
         // Pre-flight 1.
-        match check_funnel_capability(program).await {
+        let caps = match check_funnel_capability(program).await {
             Ok(caps) => {
                 if let Some(allowed) = funnel_port_refusal(&caps, https_port) {
                     anyhow::bail!(
@@ -261,6 +261,7 @@ impl TunnelHandle {
                          use Cloudflare."
                     );
                 }
+                caps
             }
             Err(e) => {
                 debug!(reason = %e, "spawn_tailscale: funnel cap check failed");
@@ -270,14 +271,15 @@ impl TunnelHandle {
                      (add `funnel` to nodeAttrs), or pass --no-tailscale to use Cloudflare."
                 );
             }
-        }
+        };
 
         // Held until this start succeeds or its reset ends; the guard owns it, so it's released
         // after the guard's own `off`. Another aoe daemon can't activate in between.
         let funnel_lock = lock_funnel_starts(lock).await?;
 
         // Pre-flight 2.
-        let preflight = inspect_existing_funnel(program, local_port, https_port, is_live).await;
+        let preflight =
+            inspect_existing_funnel(program, local_port, https_port, &caps, is_live).await;
         if let FunnelPreflight::Refuse(why) = &preflight {
             anyhow::bail!("{why}");
         }
@@ -1073,6 +1075,7 @@ async fn inspect_existing_funnel<F: std::future::Future<Output = bool>>(
     program: &std::ffi::OsStr,
     local_port: u16,
     https_port: u16,
+    caps: &[String],
     is_live: impl Fn(String) -> F,
 ) -> FunnelPreflight {
     let out = Command::new(program)
@@ -1109,7 +1112,7 @@ async fn inspect_existing_funnel<F: std::future::Future<Output = bool>>(
             }
         }
     }
-    funnel_preflight(&parsed, local_port, https_port, &|proxy| {
+    funnel_preflight(&parsed, local_port, https_port, caps, &|proxy| {
         live.contains(proxy)
     })
 }
@@ -1247,13 +1250,13 @@ async fn watch_funnel(
         if reach.send_if_modified(|advertised| std::mem::replace(advertised, next) != next) {
             match next {
                 FunnelReach::Ours => {
-                    info!(target: "serve.tunnel", "Tailscale Funnel on port {https_port} routes to this daemon again; advertising its URL")
+                    info!(target: "serve.tunnel", https_port, "Tailscale Funnel routes to this daemon again; advertising its URL")
                 }
                 FunnelReach::Lost => {
-                    warn!(target: "serve.tunnel", "Tailscale Funnel on port {https_port} no longer routes to this daemon, so its URL is no longer advertised")
+                    warn!(target: "serve.tunnel", https_port, "Tailscale Funnel no longer routes to this daemon, so its URL is no longer advertised")
                 }
                 FunnelReach::Unknown => {
-                    warn!(target: "serve.tunnel", "Tailscale hasn't answered `tailscale funnel status` {FUNNEL_UNREADABLE_LIMIT} times in a row, so the Funnel URL is no longer advertised until it does")
+                    warn!(target: "serve.tunnel", https_port, "Tailscale hasn't answered `tailscale funnel status` {FUNNEL_UNREADABLE_LIMIT} times in a row, so the Funnel URL is no longer advertised until it does")
                 }
             }
         }
@@ -1262,30 +1265,36 @@ async fn watch_funnel(
 
 /// Read a `tailscale funnel status --json` document for a start on `local_port` behind
 /// `https_port`. `is_live` says whether a loopback proxy target accepts connections. A refusal
-/// names another Funnel port with nothing on it, when there is one.
+/// names another Funnel port with nothing on it that the tailnet's `caps` allow, when there is
+/// one.
 fn funnel_preflight(
     parsed: &serde_json::Value,
     local_port: u16,
     https_port: u16,
+    caps: &[String],
     is_live: &dyn Fn(&str) -> bool,
 ) -> FunnelPreflight {
     match funnel_preflight_on(parsed, local_port, https_port, is_live) {
-        FunnelPreflight::Refuse(why) => FunnelPreflight::Refuse(match free_funnel_port(parsed) {
-            Some(free) => format!(
-                "{why} Port {free} has no Funnel config, so `--funnel-port {free}` would \
+        FunnelPreflight::Refuse(why) => {
+            FunnelPreflight::Refuse(match free_funnel_port(parsed, caps) {
+                Some(free) => format!(
+                    "{why} Port {free} has no Funnel config, so `--funnel-port {free}` would \
                      start one there."
-            ),
-            None => why,
-        }),
+                ),
+                None => why,
+            })
+        }
         other => other,
     }
 }
 
-/// The first Funnel port the status shows nothing on. A refused port always has config.
-fn free_funnel_port(parsed: &serde_json::Value) -> Option<u16> {
+/// The first Funnel port the tailnet allows and the status shows nothing on. A refused port
+/// always has config.
+fn free_funnel_port(parsed: &serde_json::Value, caps: &[String]) -> Option<u16> {
     crate::session::config::FunnelPort::ALL
         .map(|port| port.number())
         .into_iter()
+        .filter(|port| funnel_port_refusal(caps, *port).is_none())
         .find(|port| {
             !["TCP", "Web", "AllowFunnel"].iter().any(|field| {
                 parsed
@@ -1796,6 +1805,11 @@ mod tests {
 
     use super::*;
 
+    /// A tailnet that allows Funnel on all three ports.
+    fn all_ports() -> Vec<String> {
+        vec![format!("{FUNNEL_CAP_PREFIX}?ports=443,8443,10000")]
+    }
+
     #[test]
     fn tailscale_is_skipped_only_when_its_answer_cannot_matter() {
         // (--no-tailscale, tunnel name, tunnel URL, skipped)
@@ -1857,7 +1871,7 @@ mod tests {
             ),
         ];
         for (doc, want) in cases {
-            let got = funnel_preflight(&doc, 8081, 443, &|_| false);
+            let got = funnel_preflight(&doc, 8081, 443, &all_ports(), &|_| false);
             match (&got, want) {
                 (FunnelPreflight::Unused, "unused")
                 | (FunnelPreflight::PublicLoopback, "public") => {}
@@ -1900,7 +1914,7 @@ mod tests {
             ),
         ];
         for (status, refused) in cases {
-            match funnel_preflight(&status, 8081, 443, &live) {
+            match funnel_preflight(&status, 8081, 443, &all_ports(), &live) {
                 FunnelPreflight::Refuse(why) => {
                     assert!(refused, "{status}: {why}");
                     assert!(why.contains("another running server"), "{why}");
@@ -2877,7 +2891,7 @@ esac
             ),
             (10000, false, FunnelOwnership::Gone, false, vec![]),
         ] {
-            let preflight = funnel_preflight(&parsed, 8081, https, &live);
+            let preflight = funnel_preflight(&parsed, 8081, https, &all_ports(), &live);
             assert_eq!(
                 matches!(preflight, FunnelPreflight::Refuse(_)),
                 refuses,
@@ -2924,17 +2938,21 @@ esac
                 .collect();
             serde_json::json!({ "Web": web })
         };
-        // (ports with config, the refused port, the port the hint names)
-        for (used, https, hint) in [
-            (&[443][..], 443, Some(8443)),
-            (&[443, 8443], 443, Some(10000)),
-            (&[8443], 8443, Some(443)),
-            (&[443, 8443, 10000], 443, None),
+        let only = |ports: &str| vec![format!("{FUNNEL_CAP_PREFIX}?ports={ports}")];
+        // (ports with config, the refused port, the tailnet's caps, the port the hint names)
+        for (used, https, caps, hint) in [
+            (&[443][..], 443, all_ports(), Some(8443)),
+            (&[443, 8443], 443, all_ports(), Some(10000)),
+            (&[8443], 8443, all_ports(), Some(443)),
+            (&[443, 8443, 10000], 443, all_ports(), None),
+            // A free port the tailnet doesn't allow is never named.
+            (&[443], 443, only("443"), None),
+            (&[443], 443, only("443,10000"), Some(10000)),
         ] {
             let FunnelPreflight::Refuse(why) =
-                funnel_preflight(&taken(used), 8081, https, &|_| false)
+                funnel_preflight(&taken(used), 8081, https, &caps, &|_| false)
             else {
-                panic!("{used:?}: a text handler is refused");
+                panic!("{used:?} {caps:?}: a text handler is refused");
             };
             match hint {
                 Some(free) => assert!(
@@ -2942,9 +2960,9 @@ esac
                         "Port {free} has no Funnel config, so `--funnel-port {free}` would start \
                          one there."
                     )),
-                    "{used:?}: {why}"
+                    "{used:?} {caps:?}: {why}"
                 ),
-                None => assert!(!why.contains("--funnel-port"), "{used:?}: {why}"),
+                None => assert!(!why.contains("--funnel-port"), "{used:?} {caps:?}: {why}"),
             }
         }
     }

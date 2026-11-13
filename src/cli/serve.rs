@@ -898,7 +898,9 @@ async fn rollback_daemon() -> Result<()> {
             && credential.passphrase.is_some() == launch.has_passphrase,
         "Retained credentials do not match the retained launch",
     );
-    let args = launch.to_serve_args(credential.passphrase);
+    let args = rollback_args(&launch, credential.passphrase, || {
+        Ok(crate::session::config::Config::load()?.serve)
+    })?;
     validate_launch_args(&launch.profile, &args).await?;
     match daemon_status() {
         DaemonStatus::Verified(pid) => {
@@ -2066,6 +2068,18 @@ fn successor_args(
         });
     // A core-only record has no port to replay when the request enables the dashboard.
     args.fill_port(port_env, || Ok(serve_config()?.port))?;
+    args.fill_funnel_port(|| Ok(serve_config()?.funnel_port))?;
+    Ok(args)
+}
+
+/// The retained launch to roll back to. A record from before `funnel_port` gets the setting
+/// here rather than in the child, so the new `serve.launch` records the port it runs on.
+fn rollback_args(
+    launch: &ServeLaunch,
+    passphrase: Option<String>,
+    serve_config: impl FnOnce() -> Result<crate::session::config::ServeConfig>,
+) -> Result<ServeArgs> {
+    let mut args = launch.to_serve_args(passphrase);
     args.fill_funnel_port(|| Ok(serve_config()?.funnel_port))?;
     Ok(args)
 }
@@ -3597,6 +3611,21 @@ mod tests {
                 successor_args(record, request.map(parse), Some("pw"), None, setting).unwrap();
             assert_eq!(args.funnel_port, want, "{request:?}");
             assert_eq!(args.port, Some(port), "{request:?}");
+        }
+
+        // A rollback records the port it starts on: the retained one, or for a record from
+        // before `funnel_port` the setting's, and none off Funnel.
+        let legacy = ServeLaunch {
+            funnel_port: None,
+            ..funnel.clone()
+        };
+        for (name, record, want) in [
+            ("funnel", &funnel, Some(Port8443)),
+            ("legacy", &legacy, Some(Port10000)),
+            ("cloudflare", &cloudflare, None),
+        ] {
+            let args = rollback_args(record, None, setting).unwrap();
+            assert_eq!(args.funnel_port, want, "{name}");
         }
     }
 
