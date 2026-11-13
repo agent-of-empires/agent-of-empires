@@ -17,6 +17,8 @@ export function toWizardPrefill(
     suggestion,
     title: p.title || undefined,
     path: p.project?.path,
+    // No resolved project: open the picker, so the prompt never lands in the last-used repo.
+    initialTab: p.project ? undefined : "recent",
     tool: p.tool,
     yoloMode: p.yolo,
     sandboxEnabled: p.sandbox,
