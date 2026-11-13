@@ -1388,20 +1388,49 @@ mod tests {
         );
     }
 
-    /// Counts how often the runtime keeps running timers while `f` is pending.
-    async fn runtime_ticks_during<F: std::future::Future>(f: F) -> usize {
-        let mut ticks = 0;
+    const STALL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Runs `op` while a thread holds the suggestions lock and checks the
+    /// runtime keeps firing timers meanwhile. The lock is released only after
+    /// the timers have run, or at the deadline, which fails a stalled executor.
+    async fn assert_executor_runs_while_locked<F: std::future::Future>(
+        host: &Arc<PluginHost>,
+        op: F,
+    ) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = host.clone();
+        let thread = std::thread::spawn(move || {
+            holder.with_suggestions_db(|_, _| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(STALL_DEADLINE);
+            });
+        });
+        locked_rx.recv().unwrap();
+
+        let mut op = std::pin::pin!(op);
         let ticker = async {
-            loop {
+            for _ in 0..5 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                ticks += 1;
             }
         };
-        tokio::select! {
-            _ = f => {}
-            _ = ticker => {}
-        }
-        ticks
+        let ticked_first = tokio::time::timeout(STALL_DEADLINE, async {
+            tokio::select! {
+                _ = &mut op => false,
+                _ = ticker => true,
+            }
+        })
+        .await;
+        release_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            ticked_first,
+            Ok(true),
+            "the operation blocked the executor, or finished without the lock"
+        );
+        tokio::time::timeout(STALL_DEADLINE, op)
+            .await
+            .expect("the operation finishes once the lock is released");
     }
 
     #[tokio::test]
@@ -1414,36 +1443,13 @@ mod tests {
             Arc::new(crate::server::runtime::RuntimeWork::default()),
         )
         .unwrap();
-        let hold_lock = || {
-            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-            let holder = host.clone();
-            let thread = std::thread::spawn(move || {
-                holder.with_suggestions_db(|_, _| {
-                    locked_tx.send(()).unwrap();
-                    std::thread::sleep(Duration::from_millis(300));
-                });
-            });
-            locked_rx.recv().unwrap();
-            thread
-        };
 
-        let thread = hold_lock();
-        let ticks = runtime_ticks_during(host.refresh_suggestions(None)).await;
-        assert!(ticks >= 5, "refresh stalled the executor: {ticks} ticks");
-        thread.join().unwrap();
-
-        let thread = hold_lock();
-        let ticks = runtime_ticks_during(host.run_suggestion_checks()).await;
-        assert!(ticks >= 5, "checks stalled the executor: {ticks} ticks");
-        thread.join().unwrap();
-
-        let thread = hold_lock();
-        let ticks = runtime_ticks_during(async {
+        assert_executor_runs_while_locked(&host, host.refresh_suggestions(None)).await;
+        assert_executor_runs_while_locked(&host, host.run_suggestion_checks()).await;
+        assert_executor_runs_while_locked(&host, async {
             host.run_suggestion_fix("acme.github").await.unwrap();
         })
         .await;
-        assert!(ticks >= 5, "fix stalled the executor: {ticks} ticks");
-        thread.join().unwrap();
     }
 
     #[tokio::test]
