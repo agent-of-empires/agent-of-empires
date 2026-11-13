@@ -544,6 +544,36 @@ fn the_full_view_says_so_when_the_selected_suggestion_has_no_link() {
 
 #[test]
 #[serial]
+fn view_all_counts_what_the_full_view_lists_stale_items_included() {
+    let (mut env, _requests) = expanded_env(2);
+    let mut snap = snapshot(2, &[]);
+    snap["items"][1]["stale"] = true.into();
+    env.view.suggestions_feed.set_snapshot_for_test(snap);
+    env.view.rebuild_flat_items();
+
+    let rows = suggested_rows(&env);
+    assert!(matches!(
+        rows[0],
+        Item::Group {
+            session_count: 2,
+            ..
+        }
+    ));
+    assert!(matches!(
+        rows.last().unwrap(),
+        Item::SuggestionsViewAll { total: 2, .. }
+    ));
+    assert_eq!(
+        rows.iter()
+            .filter(|row| matches!(row, Item::Suggestion { .. }))
+            .count(),
+        1,
+        "Home previews only the startable one"
+    );
+}
+
+#[test]
+#[serial]
 fn ctrl_k_on_an_empty_suggestions_list_does_nothing() {
     let (mut env, _requests) = expanded_env(1);
     env.view

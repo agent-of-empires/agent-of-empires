@@ -1038,12 +1038,14 @@ pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], colla
     );
 }
 
-/// Append the Suggested group: a header counting every suggestion, then the
-/// first [`SUGGESTED_PREVIEW_ROWS`] `(provider_id, id)` pairs and a "View all"
-/// row unless collapsed. Absent when there are no suggestions.
+/// Append the Suggested group: a header showing `total`, then the first
+/// [`SUGGESTED_PREVIEW_ROWS`] `(provider_id, id)` pairs and a "View all" row
+/// unless collapsed. `total` counts what the full view lists, which can exceed
+/// `suggestions` (the startable ones). Absent when `suggestions` is empty.
 pub fn append_suggested_section(
     items: &mut Vec<Item>,
     suggestions: &[(String, String)],
+    total: usize,
     collapsed: bool,
 ) {
     if suggestions.is_empty() {
@@ -1054,7 +1056,7 @@ pub fn append_suggested_section(
         name: SUGGESTED_SECTION_NAME.to_string(),
         depth: 0,
         collapsed,
-        session_count: suggestions.len(),
+        session_count: total,
         profile: None,
         archived_at: None,
     });
@@ -1071,10 +1073,7 @@ pub fn append_suggested_section(
                 depth: 1,
             }),
     );
-    items.push(Item::SuggestionsViewAll {
-        total: suggestions.len(),
-        depth: 1,
-    });
+    items.push(Item::SuggestionsViewAll { total, depth: 1 });
 }
 
 pub fn append_archived_section_by_project(
