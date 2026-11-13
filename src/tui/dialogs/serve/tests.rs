@@ -2822,6 +2822,49 @@ fn active_rereads_urls_and_funnel_state_and_keeps_the_selection() {
     assert_eq!(selected(&view).1, FunnelReach::Ours);
 }
 
+/// Reattach and a launch build Active through `running`, so a loopback-only Tunnel URL
+/// read before the marker reads as unknown there too, not only after a re-read.
+#[test]
+fn running_shows_the_same_funnel_reach_as_a_reread() {
+    let url = |url: &str| ServeUrl {
+        label: None,
+        url: url.to_owned(),
+    };
+    // (mode, published URL, marker read, shown)
+    for (mode, published, read, want) in [
+        (
+            ServeMode::Tunnel,
+            "http://127.0.0.1:8080/?token=t",
+            FunnelReach::Ours,
+            FunnelReach::Unknown,
+        ),
+        (
+            ServeMode::Tunnel,
+            "https://node.ts.net/?token=t",
+            FunnelReach::Ours,
+            FunnelReach::Ours,
+        ),
+        (
+            ServeMode::Tunnel,
+            "http://127.0.0.1:8080/?token=t",
+            FunnelReach::Lost,
+            FunnelReach::Lost,
+        ),
+        (
+            ServeMode::Local,
+            "http://127.0.0.1:8080/?token=t",
+            FunnelReach::Lost,
+            FunnelReach::Ours,
+        ),
+    ] {
+        let state = ServeViewState::running(mode, None, None, vec![url(published)], read, 0);
+        let ServeViewState::Active { funnel, .. } = state else {
+            panic!("{mode:?} {published}: not Active");
+        };
+        assert_eq!(funnel, want, "{mode:?} {published} {read:?}");
+    }
+}
+
 #[test]
 #[serial_test::serial]
 fn a_key_drops_a_pending_access_reread_and_restarts_its_interval() {

@@ -467,7 +467,8 @@ impl ServeViewState {
         }
     }
 
-    /// Active once the daemon has published its URLs, Starting until then.
+    /// Active once the daemon has published its URLs, Starting until then. The Funnel
+    /// state goes through `shown_reach`, as every later re-read does.
     fn running(
         mode: ServeMode,
         transport: Option<TunnelTransport>,
@@ -488,10 +489,10 @@ impl ServeViewState {
         ServeViewState::Active {
             mode,
             transport,
+            funnel: shown_reach(mode, &urls, funnel),
             urls,
             url_index: 0,
             passphrase,
-            funnel,
             opened_at: Instant::now(),
             log_offset,
         }
