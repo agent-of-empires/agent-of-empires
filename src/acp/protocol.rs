@@ -265,6 +265,93 @@ pub struct ContextPrimerResponse {
     pub unprocessed_prompt: Option<String>,
 }
 
+/// Whether switching to Terminal view carries the conversation over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalContext {
+    Continues,
+    StartsFresh,
+    Blocked,
+}
+
+/// Why a switch to Terminal view starts fresh or can't happen yet. Also the
+/// `AoE-Error-Code` of a refused switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalSwitchReason {
+    AgentNotResumable,
+    NoConversationYet,
+    ConversationNotBound,
+    Sandboxed,
+    HandoffPending,
+    NoTerminalTool,
+    ContextUnconfirmed,
+    /// Refusal only: the Session left Structured view or changed during the switch.
+    SessionChanged,
+}
+
+impl TerminalSwitchReason {
+    pub const ALL: [Self; 8] = [
+        Self::AgentNotResumable,
+        Self::NoConversationYet,
+        Self::ConversationNotBound,
+        Self::Sandboxed,
+        Self::HandoffPending,
+        Self::NoTerminalTool,
+        Self::ContextUnconfirmed,
+        Self::SessionChanged,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentNotResumable => "agent_not_resumable",
+            Self::NoConversationYet => "no_conversation_yet",
+            Self::ConversationNotBound => "conversation_not_bound",
+            Self::Sandboxed => "sandboxed",
+            Self::HandoffPending => "handoff_pending",
+            Self::NoTerminalTool => "no_terminal_tool",
+            Self::ContextUnconfirmed => "context_unconfirmed",
+            Self::SessionChanged => "session_changed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerState {
+    Running,
+    Stopped,
+}
+
+/// `GET /api/sessions/{id}/acp/terminal-check` response.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalCheckResponse {
+    pub context: TerminalContext,
+    /// Set unless `context` is `continues`.
+    pub reason: Option<TerminalSwitchReason>,
+    pub agent: String,
+    /// Set only for a sandboxed Session.
+    pub container: Option<ContainerState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalConversation {
+    /// Refuse unless the conversation carries over.
+    Continue,
+    /// Start a new conversation even when this one could carry over.
+    Fresh,
+}
+
+/// Optional `POST /api/sessions/{id}/acp/disable` body. Without one the switch
+/// continues when it can, starts fresh for an Agent or Session with nothing to
+/// carry, and refuses an unbound conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TerminalSwitchRequest {
+    #[serde(default)]
+    pub conversation: Option<TerminalConversation>,
+}
+
 /// `POST /api/sessions/{id}/acp/switch-agent` body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchAgentRequest {

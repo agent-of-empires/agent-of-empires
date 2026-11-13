@@ -1,5 +1,6 @@
 //! Fixed error discriminators shared by native clients and daemon handlers.
 
+use crate::acp::protocol::TerminalSwitchReason;
 use crate::session::ManagedResumeCause;
 use reqwest::{header::HeaderMap, StatusCode};
 
@@ -39,6 +40,7 @@ pub enum ApiErrorCode {
     SessionArchived,
     SessionTrashed,
     AccountSwapUnavailable,
+    TerminalSwitchRefused(TerminalSwitchReason),
 }
 
 impl ApiErrorCode {
@@ -75,6 +77,7 @@ impl ApiErrorCode {
             Self::SessionArchived => "session_archived",
             Self::SessionTrashed => "session_trashed",
             Self::AccountSwapUnavailable => "account_swap_unavailable",
+            Self::TerminalSwitchRefused(reason) => reason.as_str(),
         }
     }
 
@@ -110,6 +113,10 @@ impl ApiErrorCode {
             Self::SmartRenameFailed => StatusCode::BAD_GATEWAY,
             Self::SmartRenameTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::StartFailed | Self::SandboxMigrationFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::TerminalSwitchRefused(
+                TerminalSwitchReason::HandoffPending | TerminalSwitchReason::ContextUnconfirmed,
+            ) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TerminalSwitchRefused(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -172,7 +179,11 @@ impl ApiErrorCode {
             b"session_archived" => Self::SessionArchived,
             b"session_trashed" => Self::SessionTrashed,
             b"account_swap_unavailable" => Self::AccountSwapUnavailable,
-            _ => return None,
+            other => Self::TerminalSwitchRefused(
+                TerminalSwitchReason::ALL
+                    .into_iter()
+                    .find(|reason| reason.as_str().as_bytes() == other)?,
+            ),
         };
         (status == code.status()).then_some(code)
     }
@@ -307,6 +318,23 @@ mod tests {
                 false,
                 Some(ApiErrorCode::AccountSwapUnavailable),
             ),
+            (
+                StatusCode::CONFLICT,
+                "conversation_not_bound",
+                false,
+                Some(ApiErrorCode::TerminalSwitchRefused(
+                    TerminalSwitchReason::ConversationNotBound,
+                )),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "handoff_pending",
+                false,
+                Some(ApiErrorCode::TerminalSwitchRefused(
+                    TerminalSwitchReason::HandoffPending,
+                )),
+            ),
+            (StatusCode::CONFLICT, "handoff_pending", false, None),
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(ERROR_CODE_HEADER, HeaderValue::from_static(value));

@@ -37,7 +37,7 @@ pub use prompt::{
     acp_prompt_diff_comments, resolve_approval, resolve_elicitation,
 };
 pub(crate) use prompt::{submit_prompt, PromptSubmission, PromptSubmitError, PromptSubmitted};
-pub use view::{acp_disable, acp_enable};
+pub use view::{acp_disable, acp_enable, acp_terminal_check};
 pub(crate) use view::{
     publish_startup_error_if_current, recover_pending_terminal_handoffs, HandoffRecovery,
 };
@@ -375,7 +375,9 @@ mod tests {
                 .await
                 .into_response(),
                 "enable" => acp_enable(state_arg, id).await.into_response(),
-                _ => acp_disable(state_arg, id).await.into_response(),
+                _ => acp_disable(state_arg, id, Default::default())
+                    .await
+                    .into_response(),
             };
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{which}");
             assert!(state.instance_locks.read().await.is_empty(), "{which}");
@@ -629,7 +631,9 @@ mod tests {
                         )
                         .await
                         .into_response(),
-                        _ => acp_disable(state, id).await.into_response(),
+                        _ => acp_disable(state, id, Default::default())
+                            .await
+                            .into_response(),
                     }
                 }
             };
@@ -707,7 +711,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let response = acp_disable(State(state.clone()), Path(id.clone()))
+            let response = acp_disable(State(state.clone()), Path(id.clone()), Default::default())
                 .await
                 .into_response();
             assert_eq!(response.status(), StatusCode::CONFLICT);
@@ -771,7 +775,11 @@ mod tests {
                     });
                     entered_rx.await.unwrap();
                     let lock = state.instance_lock(&id).await;
-                    let mut handler = Box::pin(acp_disable(State(state.clone()), Path(id.clone())));
+                    let mut handler = Box::pin(acp_disable(
+                        State(state.clone()),
+                        Path(id.clone()),
+                        Default::default(),
+                    ));
                     std::future::poll_fn(|cx| {
                         assert!(handler.as_mut().poll(cx).is_pending());
                         Poll::Ready(())
@@ -904,7 +912,11 @@ mod tests {
         let handler = tokio::spawn({
             let state = state.clone();
             let id = id.clone();
-            async move { acp_disable(State(state), Path(id)).await.into_response() }
+            async move {
+                acp_disable(State(state), Path(id), Default::default())
+                    .await
+                    .into_response()
+            }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
             while lock.try_lock().is_ok() {
