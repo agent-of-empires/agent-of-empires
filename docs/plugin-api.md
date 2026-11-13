@@ -478,7 +478,7 @@ Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swa
 
 > **Availability:** the `[suggestions]` manifest block, the `suggestions.*` worker RPCs and the `/api/suggestions` routes are served by this host. The web dashboard and TUI workflows described below arrive with their own changes (#5599, #5600).
 
-For using suggestions from the web dashboard and the TUI, see the suggested sessions guide.
+For using suggestions from the web dashboard and the TUI, see the [suggested sessions guide](guides/suggested-sessions.md).
 
 A worker declares the criteria it publishes in a `[suggestions]` block:
 
