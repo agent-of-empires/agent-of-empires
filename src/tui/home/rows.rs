@@ -294,6 +294,7 @@ impl HomeView {
         append_suggested_section(
             &mut items,
             &self.suggestions_feed.keys(),
+            self.suggestions_feed.listed_count(),
             self.suggested_section_collapsed,
         );
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
@@ -349,6 +350,7 @@ impl HomeView {
         append_suggested_section(
             &mut items,
             &self.suggestions_feed.keys(),
+            self.suggestions_feed.listed_count(),
             self.suggested_section_collapsed,
         );
         append_trash_section(&mut items, grouped, self.trashed_section_collapsed);
@@ -474,6 +476,7 @@ impl HomeView {
         append_suggested_section(
             &mut items,
             &self.suggestions_feed.keys(),
+            self.suggestions_feed.listed_count(),
             self.suggested_section_collapsed,
         );
         append_trash_section(&mut items, &pool, self.trashed_section_collapsed);
