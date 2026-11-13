@@ -5,6 +5,15 @@ use std::time::{Duration, Instant};
 
 const FLASH_WINDOW: Duration = Duration::from_secs(3);
 
+/// A status-bar message and the window it is shown for. `until` stays `None`
+/// until a draw can actually show the text: a takeover view (settings, diff)
+/// returns before the status bar renders, so a window armed when the message
+/// arrived would run out unseen.
+pub(in crate::tui) struct StatusFlash {
+    pub(super) text: String,
+    pub(super) until: Option<Instant>,
+}
+
 impl HomeView {
     /// Expire the settings view's transient "Settings saved" toast when its
     /// window passes, so it fades even while the keyboard is idle. Returns true
@@ -162,15 +171,28 @@ impl HomeView {
     /// Matches the Ctrl+C hint's window so the two read as the same kind of
     /// thing.
     pub(in crate::tui) fn flash_status(&mut self, text: impl Into<String>) {
-        self.status_flash = Some((text.into(), Instant::now() + FLASH_WINDOW));
+        self.status_flash = Some(StatusFlash {
+            text: text.into(),
+            until: None,
+        });
+    }
+
+    /// Start the display window of a flash that has not been drawn yet. Called
+    /// by the status bar render so the window measures time on screen.
+    pub(in crate::tui) fn arm_status_flash(&mut self) {
+        if let Some(flash) = self.status_flash.as_mut() {
+            flash
+                .until
+                .get_or_insert_with(|| Instant::now() + FLASH_WINDOW);
+        }
     }
 
     /// The flash text while it is still within its window.
     pub(in crate::tui) fn status_flash_text(&self) -> Option<&str> {
         self.status_flash
             .as_ref()
-            .filter(|(_, deadline)| Instant::now() < *deadline)
-            .map(|(text, _)| text.as_str())
+            .filter(|flash| flash.until.is_none_or(|until| Instant::now() < until))
+            .map(|flash| flash.text.as_str())
     }
 
     /// Drop a flash whose window has closed, reporting whether anything
@@ -179,7 +201,7 @@ impl HomeView {
         if self
             .status_flash
             .as_ref()
-            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+            .is_some_and(|flash| flash.until.is_some_and(|until| Instant::now() >= until))
         {
             self.status_flash = None;
             return true;

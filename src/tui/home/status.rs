@@ -765,6 +765,18 @@ impl HomeView {
     /// Apply a pending session-list result from the daemon. Returns true if
     /// the caller should redraw.
     pub fn apply_session_feed(&mut self) -> bool {
+        self.apply_session_feed_with_dialogs(true)
+    }
+
+    /// Apply a pending session-list result without promoting a runtime dialog.
+    /// The event loop dispatches the key that woke it before the next draw, so
+    /// a dialog promoted here would eat a key the user never saw. The tick path
+    /// promotes instead, always ahead of a draw.
+    pub fn apply_session_feed_before_input(&mut self) -> bool {
+        self.apply_session_feed_with_dialogs(false)
+    }
+
+    fn apply_session_feed_with_dialogs(&mut self, promote_dialogs: bool) -> bool {
         use crate::tui::session_feed::{SessionFeedResult, SidebarSource};
         use std::sync::mpsc::TryRecvError;
 
@@ -907,7 +919,7 @@ impl HomeView {
                 self.clear_unread_on_view(&id);
             }
         }
-        let outcomes_changed = self.apply_runtime_outcomes();
+        let outcomes_changed = self.apply_runtime_outcomes(promote_dialogs);
         let pending_after =
             self.session_feed.any_pending() || self.pending_namespace_intent.is_some();
         updated
@@ -1088,14 +1100,23 @@ impl HomeView {
         self.runtime_outcome_messages.push(message);
     }
 
-    fn record_purge_outcome(&mut self, id: &str, outcome: crate::daemon::PurgeOutcome) {
+    pub(super) fn record_purge_outcome(
+        &mut self,
+        id: &str,
+        outcome: crate::daemon::PurgeOutcome,
+        notes: &mut Vec<(String, String)>,
+    ) {
         match outcome {
             crate::daemon::PurgeOutcome::Deleted {
                 messages,
                 cleanup_errors,
             } => {
+                // A committed deletion needs no acknowledgement, and a modal here
+                // can land under a permission or question dialog and swallow keys.
+                // Its cleanup notes belong in the status line and the log.
                 for message in messages {
-                    self.record_runtime_message(format!("{id}: {message}"));
+                    tracing::info!(target: "tui.runtime_outcome", session = %id, message = %message, "Session deletion cleanup");
+                    notes.push((id.to_owned(), message));
                 }
                 for error in cleanup_errors {
                     self.record_runtime_message(format!(
@@ -1122,12 +1143,13 @@ impl HomeView {
         }
     }
 
-    fn apply_runtime_outcomes(&mut self) -> bool {
+    fn apply_runtime_outcomes(&mut self, promote_dialogs: bool) -> bool {
         use crate::daemon::{NamespaceOutcome, ReorderOutcome};
         use crate::tui::session_feed::{CommandFailure, SessionCommandOutcome};
         let row_outcomes = self.session_feed.drain_session_outcomes();
         let namespace = self.session_feed.drain_namespace_result();
         let mut changed = !row_outcomes.is_empty() || namespace.is_some();
+        let mut purge_notes: Vec<(String, String)> = Vec::new();
         for (id, outcome) in row_outcomes {
             match outcome {
                 SessionCommandOutcome::Trashed(receipt) => match receipt.outcome.relocation {
@@ -1144,7 +1166,7 @@ impl HomeView {
                     | crate::daemon::TrashRelocationOutcome::Skipped => {}
                 },
                 SessionCommandOutcome::Purged(receipt) => {
-                    self.record_purge_outcome(&id, receipt.outcome)
+                    self.record_purge_outcome(&id, receipt.outcome, &mut purge_notes)
                 }
                 SessionCommandOutcome::Renamed(receipt) => {
                     for warning in receipt.outcome.warnings {
@@ -1247,7 +1269,11 @@ impl HomeView {
                             );
                         }
                         for session in outcome.sessions {
-                            self.record_purge_outcome(&session.id, session.outcome);
+                            self.record_purge_outcome(
+                                &session.id,
+                                session.outcome,
+                                &mut purge_notes,
+                            );
                         }
                         for failure in outcome.failures {
                             self.record_runtime_message(format!(
@@ -1315,7 +1341,14 @@ impl HomeView {
                 },
             }
         }
-        if self.info_dialog.is_none() && !self.runtime_outcome_messages.is_empty() {
+        if !purge_notes.is_empty() {
+            self.flash_status(purge_flash_text(&purge_notes));
+            changed = true;
+        }
+        if promote_dialogs
+            && !self.has_non_live_send_overlay()
+            && !self.runtime_outcome_messages.is_empty()
+        {
             let messages = std::mem::take(&mut self.runtime_outcome_messages);
             self.info_dialog = Some(InfoDialog::sized_to_fit(
                 "Runtime change",
@@ -1348,4 +1381,22 @@ impl HomeView {
         };
         self.open_indeterminate_dialog(&id, &message);
     }
+}
+
+/// One clause per distinct cleanup note, naming every session that raised it,
+/// so a group delete cannot blur one session's cleanup into another's and no
+/// note is dropped on the way to the status line.
+pub(super) fn purge_flash_text(notes: &[(String, String)]) -> String {
+    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (id, message) in notes {
+        match grouped.iter_mut().find(|(text, _)| *text == message) {
+            Some((_, ids)) => ids.push(id),
+            None => grouped.push((message, vec![id])),
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(message, ids)| format!("{}: {message}", ids.join(", ")))
+        .collect::<Vec<_>>()
+        .join("; ")
 }

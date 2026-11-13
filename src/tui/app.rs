@@ -726,7 +726,8 @@ impl App {
 
             tokio::select! {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
-                    self.home.apply_session_feed();
+                    // Keys reach the view before the next draw, so no dialog is promoted here.
+                    self.home.apply_session_feed_before_input();
                     self.home.enforce_trash_read_only();
                     if self.home.selected_is_trashed() {
                         self.close_embedded_structured();
@@ -3206,7 +3207,7 @@ impl App {
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
-        self.home.apply_session_feed();
+        self.home.apply_session_feed_before_input();
         let result = self.home.reload();
         self.home.reload_failure_state.record_storage(&result);
         self.home.try_present_reload_failure_dialog();
@@ -3278,7 +3279,7 @@ impl App {
             }),
         )?;
         self.needs_redraw = true;
-        self.home.apply_session_feed();
+        self.home.apply_session_feed_before_input();
         self.select_after_attach(&ready.id);
         if let Err(error) = attach_result {
             tracing::warn!(target: "tui.input", %error, "Native tmux attach failed");

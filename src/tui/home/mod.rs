@@ -349,7 +349,7 @@ pub struct HomeView {
     pub(super) live_send_resize_retry_at: Option<std::time::Instant>,
     pub(super) live_send_pending_leader: bool,
     pub(super) hover_cell: Option<(u16, u16)>,
-    pub(super) status_flash: Option<(String, std::time::Instant)>,
+    pub(super) status_flash: Option<overlays::StatusFlash>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
     /// Session whose live control another window took, until the selection moves or live
     /// mode starts again.

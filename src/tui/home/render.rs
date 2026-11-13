@@ -4246,6 +4246,8 @@ impl HomeView {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // The bar is on screen from here, so a queued flash can start counting.
+        self.arm_status_flash();
         // Action feedback takes precedence over a hovered link target.
         let hovered = (!self.live_send_pending_leader)
             .then(|| self.hovered_link())
