@@ -618,10 +618,12 @@ remain sanitized rather than exposing their internal causes.
 
 `initial_prompt` is sent to the agent as its first turn, never before the
 agent is ready. Structured sessions deliver it once the worker is live and
-retry until it lands. Terminal sessions wait up to 60 seconds for the agent
-prompt, then type it. On timeout nothing is typed; a send error can leave
-partial input in the pane. Either way the session row carries
-`initial_prompt_error`. A failed terminal prompt is not retried, unless
+retry until it lands. A terminal session running an agent with a ready marker
+waits up to 60 seconds for that marker, then types it. A shell, a
+command-override session or an agent without a ready marker is refused
+immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
+a send error can leave partial input in the pane. Either way the session row
+carries `initial_prompt_error`. A failed terminal prompt is not retried, unless
 persisting the error fails: the error then lives only in memory and a daemon
 restart retries the prompt. A crash between delivery and bookkeeping can
 deliver it twice. A blank or over-64 KiB (65536 bytes) value returns `400`.

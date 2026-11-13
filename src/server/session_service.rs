@@ -1148,8 +1148,10 @@ impl SessionService {
         {}
     }
 
-    /// One drain attempt; `true` when the launch was replaced during the wait
-    /// and the new launch's turn needs its own attempt, now the claim is free.
+    /// One drain attempt; `true` when the launch was replaced during a failed
+    /// wait and the new launch's turn needs its own attempt, now the claim is
+    /// free. A launch replaced during a successful wait returns `false`: the
+    /// reconciler's next pass picks up the new launch.
     async fn drain_terminal_initial_turn_once(
         self: &Arc<Self>,
         id: &str,
@@ -1484,45 +1486,28 @@ impl SessionService {
     /// session, in memory and on disk. A newer user prompt supersedes a queued
     /// rate-limit resume continuation, so the stale continuation must not
     /// replay after the newer message (#3028). No-op when nothing is queued.
-    pub(crate) async fn clear_pending_initial_turn(&self, id: &str) {
-        let profile = {
-            let mut instances = self.instances.write().await;
-            match instances.iter_mut().find(|i| i.id == id) {
-                Some(inst) if inst.pending_initial_turn.is_some() => {
-                    inst.pending_initial_turn = None;
-                    self.invalidate_disk_snapshots();
-                    inst.source_profile.clone()
-                }
-                _ => return,
-            }
-        };
-        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
-            Ok(storage) => {
-                let id_persist = id.to_string();
-                let persisted = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            inst.pending_initial_turn = None;
-                        }
-                        Ok(())
-                    })
-                })
-                .await;
-                if !matches!(persisted, Ok(Ok(()))) {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "failed to open storage to clear pending turn: {e}"
-                );
-            }
+    pub(crate) async fn clear_pending_initial_turn(self: &Arc<Self>, id: &str) {
+        let pending = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .any(|i| i.id == id && i.pending_initial_turn.is_some());
+        if !pending {
+            return;
+        }
+        let outcome = self
+            .mutate_instance_persisted_with(id, true, |inst| {
+                inst.pending_initial_turn = None;
+                ((), None)
+            })
+            .await;
+        if matches!(outcome, Some(((), false))) {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "failed to persist pending-turn clear; the drain re-checks liveness before delivery"
+            );
         }
     }
 
@@ -2519,8 +2504,8 @@ impl SessionService {
 const TERMINAL_INITIAL_TURN_READY_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Blocks until the terminal session's agent process is up (alive pane, not a
-/// bare shell) and its prompt is showing. Stable output alone is never enough:
-/// a shell prompt or a failed launch is stable too.
+/// bare shell) and its ready marker is showing. An agent without a ready marker
+/// is refused: stable output alone cannot tell a prompt from a dialog.
 fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> anyhow::Result<()> {
     // A shell or custom command has no agent readiness signal; typing the
     // prompt there would run it as a command.
@@ -2528,6 +2513,9 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
         !instance.expects_shell() && !instance.has_command_override(),
         "initial prompts are only typed into a known agent"
     );
+    let marker = crate::agents::ready_marker(&instance.tool).ok_or_else(|| {
+        anyhow::anyhow!("this agent has no ready marker, so the prompt is not typed")
+    })?;
     let deadline = std::time::Instant::now() + budget;
     // A probe error is "not ready yet" while the pane is still starting; the
     // last one is reported only when the budget runs out.
@@ -2551,7 +2539,7 @@ fn wait_for_terminal_agent(instance: &Instance, budget: std::time::Duration) -> 
     anyhow::ensure!(
         instance
             .tmux_session()?
-            .wait_until_ready(remaining, crate::agents::ready_marker(&instance.tool)),
+            .wait_until_ready(remaining, Some(marker)),
         "the agent was not ready within {}s",
         budget.as_secs()
     );
@@ -3891,6 +3879,7 @@ mod tests {
     fn terminal_turn_instance(id: &str, title: &str, text: &str) -> Instance {
         let mut inst = Instance::new(title, "/tmp/aoe-term-drain");
         inst.id = id.to_string();
+        inst.tool = "opencode".into();
         inst.view = crate::session::View::Terminal;
         inst.status = crate::session::Status::Idle;
         inst.pending_initial_turn = Some(crate::session::PendingInitialTurn {
@@ -3937,7 +3926,7 @@ mod tests {
         crate::tmux::test_helpers::TmuxTestSession::from_name(name)
     }
 
-    const READY_AGENT_SCRIPT: &str = "echo 'agent ready banner, type a prompt below'; exec cat";
+    const READY_AGENT_SCRIPT: &str = "echo 'ask anything'; exec cat";
 
     async fn pending_turn(
         service: &SessionService,
@@ -4180,6 +4169,38 @@ mod tests {
             .and_then(|i| i.pending_initial_turn)
     }
 
+    /// An agent with no ready marker cannot tell a prompt from a dialog, so
+    /// nothing is typed into its stable pane and the failure is recorded.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_initial_turn_is_refused_for_an_agent_without_a_ready_marker() {
+        if !crate::tmux::is_tmux_available() {
+            return;
+        }
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let mut inst = terminal_turn_instance("sess-no-marker", "term-no-marker", "must-not-type");
+        inst.tool = "gemini".into();
+        assert!(crate::agents::ready_marker("gemini").is_none());
+        let pane = start_terminal_pane(
+            &inst,
+            "echo 'Do you trust this folder? (y/n) [stable dialog]'; exec cat",
+            false,
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        service
+            .drain_terminal_initial_turn_within("sess-no-marker", std::time::Duration::from_secs(5))
+            .await;
+
+        assert!(!pane_text(&pane).contains("must-not-type"));
+        let turn = pending_turn(&service, "sess-no-marker")
+            .await
+            .expect("turn is kept");
+        assert!(turn.error.is_some_and(|e| e.contains("no ready marker")));
+    }
+
     /// A launch replaced after the wait was inspected, but before the error
     /// is applied, keeps its turn clean in memory and on disk.
     #[tokio::test]
@@ -4249,6 +4270,33 @@ mod tests {
                 .error,
             error
         );
+    }
+
+    /// Clearing a delivered turn holds the reload gate through persistence,
+    /// so a reload cannot restore it from the still-pending disk row.
+    #[tokio::test]
+    async fn a_pending_turn_clear_excludes_reload_until_persisted() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let inst = terminal_turn_instance("sess-clear-gate", "term-clear-gate", "turn");
+        crate::server::test_support::seed_instances_on_disk_for_test(
+            &inst.source_profile,
+            vec![inst.clone()],
+        );
+        let service = crate::server::test_support::build_test_app_state(vec![inst.clone()])
+            .session_service
+            .clone();
+
+        let reload = service.disk_reload_guard().await;
+        let mut clearing = Box::pin(service.clear_pending_initial_turn("sess-clear-gate"));
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut clearing).await;
+        assert!(blocked.is_err(), "the clear must wait for the reload");
+        assert!(pending_turn(&service, "sess-clear-gate").await.is_some());
+
+        drop(reload);
+        clearing.await;
+        assert!(pending_turn(&service, "sess-clear-gate").await.is_none());
+        assert!(disk_turn(&inst.source_profile, "sess-clear-gate").is_none());
     }
 
     /// A user message supersedes an undelivered initial turn: the drain that
