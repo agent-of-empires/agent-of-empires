@@ -46,6 +46,19 @@ describe("SessionRow chips", () => {
     },
   );
 
+  it("names the created-without-setup chip in the row's accessible name, and shows only its icon", () => {
+    renderRow(ws({ created_without_setup: true }));
+    expect(screen.getByRole("link", { name: /Created without setup/ })).toBeTruthy();
+    const chip = screen.getByTitle("Created without setup");
+    const visible = Array.from(chip.childNodes).filter(
+      (n) => !(n instanceof SVGElement) && !(n instanceof Element && n.classList.contains("sr-only")),
+    );
+    expect(visible).toEqual([]);
+    cleanup();
+    renderRow(ws());
+    expect(screen.queryByRole("link", { name: /Created without setup/ })).toBeNull();
+  });
+
   it("keeps favorite identity distinct from pin in normal and compact rows", () => {
     for (const compact of [false, true]) {
       const { rerenderRow } = renderRow(ws({ favorited: true, pinned_at: null }), { compact });

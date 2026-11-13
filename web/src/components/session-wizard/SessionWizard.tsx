@@ -728,7 +728,12 @@ export function SessionWizard({
   };
 
   // `overrides` and `runtimeUp` were dispatched in the same event, which `state` doesn't hold yet.
-  const handleSubmit = async (overrides: Partial<WizardData> = {}, runtimeUp = false) => {
+  // `skipOnCreate` stays out of the form, so a reopened or later Launch runs setup again.
+  const handleSubmit = async (
+    overrides: Partial<WizardData> = {},
+    runtimeUp = false,
+    { skipOnCreate = false }: { skipOnCreate?: boolean } = {},
+  ) => {
     dispatch({ type: "SUBMIT_START" });
     setRuntimeDown(false);
     if (unknownOutcome) {
@@ -754,6 +759,7 @@ export function SessionWizard({
           agents.find((a) => a.name === d.tool),
           d,
         ),
+        { skipOnCreate },
       ),
       idempotency_key: newIdempotencyKey(),
     };
@@ -879,6 +885,11 @@ export function SessionWizard({
         return;
       case "try_again":
         await handleSubmit();
+        return;
+      case "create_without_setup":
+        // A new key: the server answers a reused key with the failed create's stored result.
+        await handleSubmit({}, false, { skipOnCreate: true });
+        return;
     }
   };
 
@@ -888,7 +899,9 @@ export function SessionWizard({
   };
 
   const d = state.data;
-  const failed = state.failure && failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown });
+  const failed =
+    state.failure &&
+    failureView(state.failure, { sandboxEnabled: d.sandboxEnabled, runtimeDown, canSkipSetup: !nameOnly });
   // A scratch session has no project whose overrides could be unknown.
   const projectUnresolved = registryUnresolved && !d.scratch && !d.importAcpSessionId;
   // Only the Yolo row needs the agent list, and a name-only form has none.
@@ -901,7 +914,8 @@ export function SessionWizard({
   const resendBlocked = (action: FailureAction) => {
     if (action === "change_image" || action === "choose_project") return false;
     // Retry checks the runtime itself, and Launch without Sandbox doesn't need it.
-    return !canResend || (action === "try_again" && d.sandboxEnabled && !state.dockerChecked);
+    const resendsSandbox = action === "try_again" || action === "create_without_setup";
+    return !canResend || (resendsSandbox && d.sandboxEnabled && !state.dockerChecked);
   };
   const selectedAgent = agents.find((a) => a.name === d.tool);
   const acpCapable = isAcpEligible(d.tool, selectedAgent);

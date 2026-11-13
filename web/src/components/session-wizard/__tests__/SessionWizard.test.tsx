@@ -1166,6 +1166,22 @@ describe("SessionWizard Docker readiness", () => {
     return (available: boolean) => answer({ available, runtime: "docker", runtime_name: "Docker" });
   };
 
+  it("a reopened sandboxed hook failure holds both resends for the probe", async () => {
+    const answer = pendingProbe();
+    const restore = {
+      data: { ...initialData, path: "/tmp/proj", tool: "claude", sandboxEnabled: true },
+      failure: { code: "hook_failed", stage: "running_hooks", message: "exit 1", reference: null },
+    };
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    const action = (id: string) => screen.getByTestId(`create-failure-${id}`) as HTMLButtonElement;
+    await waitFor(() => expect(screen.getByTestId("wizard-agent-row").textContent).toContain("claude"));
+    await act(async () => {});
+    expect([action("try_again").disabled, action("create_without_setup").disabled]).toEqual([true, true]);
+    answer(true);
+    await waitFor(() => expect(action("create_without_setup").disabled).toBe(false));
+    expect(action("try_again").disabled).toBe(false);
+  });
+
   it("enables Launch without waiting for Docker when the sandbox is off", async () => {
     pendingProbe();
     renderWizard();
@@ -1685,6 +1701,38 @@ describe("SessionWizard create failures", () => {
     expect(screen.getByTestId("create-failure-output").textContent).toContain("npm ERR! 404");
     expect(screen.queryByTestId("create-failure-launch_without_sandbox")).toBeNull();
     expect(screen.queryByTestId("create-failure-retry_runtime")).toBeNull();
+  });
+
+  it("a CityHall wizard offers only Try again after a failed hook, since the server won't skip setup", async () => {
+    createSession.mockResolvedValueOnce(
+      failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."),
+    );
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} nameOnly />);
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(screen.getByTestId("create-failure-try_again")).toBeTruthy();
+    expect(screen.queryByTestId("create-failure-create_without_setup")).toBeNull();
+  });
+
+  it("Create without setup resends with skip_on_create under a new key, and only that once", async () => {
+    createSession
+      .mockResolvedValueOnce(failure("hook_failed", "running_hooks", "An on_create hook exited with code 1."))
+      .mockResolvedValueOnce(failure("create_failed", "starting", "The agent exited."));
+    renderWizard();
+    await launch();
+    await screen.findByTestId("create-failure");
+    expect(screen.getByTestId("create-failure-try_again").textContent).toBe("Try again");
+    fireEvent.click(screen.getByTestId("create-failure-create_without_setup"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+    expect(payload(0).skip_on_create).toBeUndefined();
+    expect(payload(1).skip_on_create).toBe(true);
+    expect(payload(1).idempotency_key).toBeTruthy();
+    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+    // The skip was for that resend; trying again after another failure runs setup.
+    await waitFor(() => expect(box().textContent).toContain("The agent exited."));
+    fireEvent.click(screen.getByTestId("create-failure-try_again"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(3));
+    expect(payload(2).skip_on_create).toBeUndefined();
   });
 
   /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard.

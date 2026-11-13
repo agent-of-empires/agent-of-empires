@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Archive, Hourglass, Moon, Pencil, Sparkles } from "lucide-react";
+import { Archive, Hourglass, Moon, Pencil, Sparkles, WrenchOff } from "lucide-react";
 import type {
   ContextResumeAvailability,
   ContextResumeUnavailableReason,
@@ -149,6 +149,13 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
         </Chip>
       )}
       <RateLimitBadge sessions={workspace.sessions} />
+      {workspace.sessions.some((s) => s.created_without_setup) && (
+        // Visually hidden text, not aria-label: a generic span can't be named.
+        <span title="Created without setup" className={`${CHIP} ${MUTED}`}>
+          <WrenchOff aria-hidden="true" className="h-3 w-3" />
+          <span className="sr-only">Created without setup</span>
+        </span>
+      )}
       {effectiveArchived && (
         <Chip title="Archived" label="Archived" className={`${CHIP} gap-0.5 ${MUTED}`}>
           <Archive className="h-3 w-3" />

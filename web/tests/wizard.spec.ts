@@ -775,6 +775,45 @@ test.describe("create failure", () => {
     expect(created[0]!.view).toBe("structured");
   });
 
+  test("at 375px, a failed hook offers Create without setup, which sends the skip and closes on a 201", async ({
+    page,
+  }) => {
+    let refusals = 0;
+    const created = await startWizard(page, {
+      onCreate: (_body, route) =>
+        (refusals++ === 0
+          ? route.fulfill({
+              status: 400,
+              json: {
+                error: "hook_failed",
+                message: "An on_create hook exited with code 1.",
+                stage: "running_hooks",
+              },
+            })
+          : route.fulfill({ status: 201, json: { id: "new-session", created_without_setup: true } })
+        ).then(() => true),
+    });
+    await page.setViewportSize({ width: 375, height: 812 });
+    await launch(page);
+
+    const box = wizard(page).getByRole("alert").filter({ hasText: "An on_create hook failed" });
+    await expect(box.getByRole("button", { name: "Try again" })).toBeInViewport();
+    const skip = box.getByRole("button", { name: "Create without setup" });
+    await expect(skip).toBeInViewport();
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow).toBeLessThanOrEqual(0);
+
+    await skip.click();
+    await expect.poll(() => created.length).toBe(2);
+    expect(created[0]!.skip_on_create).toBeUndefined();
+    expect(created[1]!.skip_on_create).toBe(true);
+    expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
+    await expect(page.getByTestId("session-wizard")).toHaveCount(0);
+    await expect(page).toHaveURL(/\/session\/new-session$/);
+  });
+
   test("a background refusal's Reopen stays in view when the toasts overflow the column at 375px", async ({ page }) => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => (release = resolve));
