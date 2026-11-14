@@ -1918,7 +1918,9 @@ impl Instance {
             .flatten()
             .filter(|declared| declared.contribution().command.as_deref() == Some(command))
             .and_then(|_| crate::agents::native_definition(tool));
-        let logical = crate::agents::get_agent(tool);
+        // The tool's own identity outlives the declaration that hides it from
+        // listings, so a takeover cannot reattribute a stored command.
+        let logical = retained().find(|agent| agent.name == tool);
         let actual = direct
             .or(declared)
             .or(own_declaration)
