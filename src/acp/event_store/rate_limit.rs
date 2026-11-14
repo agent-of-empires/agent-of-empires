@@ -66,7 +66,7 @@ impl EventStore {
             return None;
         }
         match decode_logged(&json, session_id, "unassigned_startup_error")? {
-            Event::AgentStartupError { message } => Some((message, created_at)),
+            Event::AgentStartupError { message, .. } => Some((message, created_at)),
             _ => None,
         }
     }
@@ -471,12 +471,7 @@ mod tests {
             ("bare park", vec![], true, false),
             (
                 "failed resume",
-                vec![
-                    auto_resume(),
-                    Event::AgentStartupError {
-                        message: "spawn failed".into(),
-                    },
-                ],
+                vec![auto_resume(), Event::startup_error("spawn failed")],
                 true,
                 false,
             ),
@@ -696,9 +691,7 @@ mod tests {
                 rate_limit_event(0),
                 stopped("rate_limited"),
                 auto_resume(),
-                Event::AgentStartupError {
-                    message: "boom".into(),
-                },
+                Event::startup_error("boom"),
             ],
         );
         assert_eq!(streak(), 1, "a resume whose spawn failed spends nothing");

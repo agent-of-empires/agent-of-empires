@@ -5,6 +5,7 @@ import { TerminalSessionStack } from "./TerminalSessionStack";
 import { PairedShellPane, type ShellMode } from "./PairedTerminal";
 import { BackgroundAgentsPanel, type AgentFocus } from "./acp/BackgroundAgentsPanel";
 import { hasStartedBefore } from "./acp/startupWait";
+import { recreateContainerTitle } from "./sidebar/sessionActionTargets";
 import { FilesPane } from "./FilesPane";
 import { DiffFileList } from "./diff/DiffFileList";
 import { DiffFileViewer } from "./diff/DiffFileViewer";
@@ -130,7 +131,7 @@ export function MobileMainPane({
         : view === "paired"
           ? "Paired terminal"
           : view === "agents"
-            ? "Sub agents"
+            ? "Background"
             : (activePluginPane?.title ?? "Plugin");
 
   return (
@@ -164,6 +165,7 @@ export function MobileMainPane({
                     sessionId={session.id}
                     acpWorkerState={session.acp_worker_state ?? "absent"}
                     rateLimitAutoResume={session.rate_limit_auto_resume}
+                    rateLimitFailoverTo={session.rate_limit_failover_to}
                     settingsHref={autoResumeSettingsHref(session.profile, serverAbout)}
                     tool={session.tool}
                     acpAgent={session.acp_agent ?? null}
@@ -180,6 +182,7 @@ export function MobileMainPane({
                     onOpenAgentsPane={onOpenAgentsPane}
                     serverReadOnly={readOnly}
                     isSandboxed={session.is_sandboxed}
+                    recreateContainerTitle={recreateContainerTitle(session)}
                     onSwitchToTerminal={onSwitchToTerminal ? () => onSwitchToTerminal(session.id) : undefined}
                     onOpenTerminal={onOpenTerminal ? (mode) => onOpenTerminal(session.id, mode) : undefined}
                     canRestartAgent={canRestartAgent}

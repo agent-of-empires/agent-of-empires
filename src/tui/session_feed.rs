@@ -136,6 +136,9 @@ impl CommandReply {
 #[derive(Debug, Clone)]
 pub(crate) enum CommandFailure {
     Rejected(String),
+    /// A refused creation whose `on_create` hook failed, with the daemon's text. Retrying, or
+    /// creating without setup, can succeed where an ordinary refusal can't.
+    CreateHookFailed(String),
     Unknown(String),
 }
 
@@ -144,7 +147,21 @@ impl CommandFailure {
     /// client construction and definitive non-timeout 4xx responses prove a
     /// refusal; every transport/server/2xx-decoding failure is indeterminate.
     fn creation(error: crate::daemon::DaemonClientError) -> Self {
-        Self::classify(error, false)
+        let hook_text = match &error {
+            crate::daemon::DaemonClientError::Status {
+                code: Some(crate::daemon::ApiErrorCode::CreateHookFailed),
+                body,
+                ..
+            } => Some(body.clone()),
+            _ => None,
+        };
+        match (Self::classify(error, false), hook_text) {
+            // A local owner gets the daemon's own text; otherwise the summary is all there is.
+            (Self::Rejected(message), Some(body)) => {
+                Self::CreateHookFailed(if body.is_empty() { message } else { body })
+            }
+            (failure, _) => failure,
+        }
     }
 
     /// Classify an already-submitted mutation. A definitive 4xx (except 408)
@@ -187,7 +204,9 @@ impl CommandFailure {
 
     fn message(self) -> String {
         match self {
-            Self::Rejected(message) | Self::Unknown(message) => message,
+            Self::Rejected(message) | Self::CreateHookFailed(message) | Self::Unknown(message) => {
+                message
+            }
         }
     }
 }
@@ -648,6 +667,7 @@ async fn run_queued_command(
                             };
                             match &mut failure {
                                 CommandFailure::Rejected(message)
+                                | CommandFailure::CreateHookFailed(message)
                                 | CommandFailure::Unknown(message) => {
                                     message.insert_str(
                                         0,
@@ -2136,20 +2156,29 @@ impl SessionFeed {
 
     #[cfg(test)]
     pub(crate) fn creation_rejection_driver_for_test(&mut self) -> impl FnMut() -> String {
+        let mut fail = self.creation_failure_driver_for_test();
+        move || {
+            fail(CommandFailure::Rejected("denied".into()))
+                .idempotency_key
+                .expect("creation idempotency identity")
+        }
+    }
+
+    /// Answers the queued creation with `failure` and returns the body it was sent with.
+    #[cfg(test)]
+    pub(crate) fn creation_failure_driver_for_test(
+        &mut self,
+    ) -> impl FnMut(CommandFailure) -> CreateSessionBody {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
         self.commands = Some(sender);
         set_grant(&self.grant, true);
-        move || {
+        move |failure| {
             let command = receiver.try_recv().expect("creation queued");
             let CommandRequest::Create(body) = command.request else {
                 panic!("expected creation");
             };
-            let key = body.idempotency_key.expect("creation idempotency identity");
-            assert!(command
-                .result
-                .send(Err(CommandFailure::Rejected("denied".into())))
-                .is_ok());
-            key
+            assert!(command.result.send(Err(failure)).is_ok());
+            *body
         }
     }
 
@@ -2352,6 +2381,35 @@ mod tests {
                 truncated: false,
             }),
             CommandFailure::Rejected(_),
+        ));
+    }
+
+    #[test]
+    fn only_a_creation_refused_by_its_hook_is_told_apart() {
+        use crate::daemon::{ApiErrorCode, DaemonClientError};
+        let status = |code, body: &str| DaemonClientError::Status {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            code,
+            body: body.into(),
+            truncated: false,
+        };
+        let hook = Some(ApiErrorCode::CreateHookFailed);
+        assert!(matches!(
+            CommandFailure::creation(status(hook, "on_create hook failed: exit 3")),
+            CommandFailure::CreateHookFailed(text) if text == "on_create hook failed: exit 3"
+        ));
+        // Without the body the summary still names the refusal.
+        assert!(matches!(
+            CommandFailure::creation(status(hook, "")),
+            CommandFailure::CreateHookFailed(text) if !text.is_empty()
+        ));
+        assert!(matches!(
+            CommandFailure::creation(status(None, "on_create hook failed: exit 3")),
+            CommandFailure::Rejected(_)
+        ));
+        assert!(matches!(
+            CommandFailure::submitted(status(hook, "x")),
+            CommandFailure::Rejected(_)
         ));
     }
 

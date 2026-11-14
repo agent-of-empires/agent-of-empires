@@ -29,6 +29,7 @@ import { useLatestRef } from "./useLatestRef";
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
 export {
   clearAcpCache,
+  useActivity,
   useBackgroundAgents,
   useBackgroundShells,
   useBackgroundTasks,
@@ -437,8 +438,8 @@ export function useAcpSession(
       dismissModeSwitchFailed: () => dispatch({ kind: "dismiss_mode_switch_failed" }),
       dismissSessionNotice: (id: string) => dispatch({ kind: "dismiss_session_notice", id }),
       dismissConfigOptionSwitchFailed: () => dispatch({ kind: "dismiss_config_option_switch_failed" }),
-      markRestartStarted: (epoch: number, stoppedSent: boolean) =>
-        dispatch({ kind: "restart_started", epoch, stoppedSent }),
+      markRestartStarted: (epoch: number, stoppedSent: boolean, retriedError?: string) =>
+        dispatch({ kind: "restart_started", epoch, stoppedSent, retriedError }),
       markRestartFailed: (epoch: number, message: string, stoppedSent: boolean) =>
         dispatch({ kind: "restart_failed", epoch, message, stoppedSent }),
     }),

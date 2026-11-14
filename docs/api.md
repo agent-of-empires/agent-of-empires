@@ -534,6 +534,20 @@ running engine, when no effective `on_create` hooks need a container. Container
 creation hooks and later launch still require the engine. Non-CLI creation
 retains its existing readiness checks.
 
+`pull_latest_image: true` force-pulls the session's Sandbox image before its
+container starts and its `on_create` hooks run, so it requires a running engine.
+It applies the dashboard's pull gate. An unsandboxed request is refused with
+`400 validation_failed`. A request that can't pull (`sandbox.allow_image_pull`
+off) gets `403 pull_disabled`, and one in read-only or CityHall mode gets that
+mode's refusal. Only a configured image may be pulled: the global or a
+profile's `sandbox.default_image`. Any other `sandbox_image` is refused with
+`400 unknown_image`, and an omitted one pulls the profile's default.
+These refusals come before anything is provisioned. While the pull runs, the
+create-progress `stage` is `pulling_image`. A failed pull ends the creation with
+`400 sandbox_image_update_failed`, and the session and its resources are rolled
+back. Only the local owner sees the runtime's output in its message; a replay
+of the cached failure does not include it. CityHall creations ignore the field.
+
 With CLI intent, `extra_args` uses shell-style word grouping and each decoded
 argument is quoted for literal delivery. Only the authenticated owner on the
 Daemon's Unix socket may use shell metacharacters in decoded arguments or
@@ -583,11 +597,12 @@ resources are provisioned. Review again rather than approving unseen changes.
 Discarding a review requires no cancellation or cleanup.
 
 `POST /api/sessions/{id}/creation/cancel` requests deferred cancellation while
-provisioning or creation/launch hooks are pending. `202 Accepted` carries the
-runtime epoch and revision headers like every other mutation, so a native caller
-can fence the acknowledgement against the snapshot it was applied at. It is not
-a canonical commit receipt: the current phase finishes before the daemon rolls
-back its owned resources. The original creation request then returns `409`
+provisioning, a `pull_latest_image` pull or creation/launch hooks are pending.
+`202 Accepted` carries the runtime epoch and revision headers like every other
+mutation, so a native caller can fence the acknowledgement against the snapshot
+it was applied at. It is not a canonical commit receipt: the current phase
+finishes before the daemon rolls back its owned resources, except that an image
+pull is stopped. The original creation request then returns `409`
 with `aoe-error-code: creation_cancelled`. Cleanup failures retain resources.
 Repeated requests remain accepted until finalization; after the hook boundary
 or completion, the route returns `409` with `creation_not_pending`. Cancelling

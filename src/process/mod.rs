@@ -1450,6 +1450,20 @@ impl RunnerProcessGuard {
     }
 }
 
+/// False once `pid` has exited, including while it waits unreaped as a zombie, which
+/// `kill(pid, 0)` still reports as present.
+pub(crate) fn process_executing(pid: u32) -> anyhow::Result<bool> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::process_executing(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        anyhow::bail!("process state unsupported on this platform")
+    }
+}
+
 pub(crate) fn process_birth_identity(pid: u32) -> anyhow::Result<Option<ProcessBirthIdentity>> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {

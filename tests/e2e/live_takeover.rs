@@ -65,7 +65,7 @@ fn set_session_option(socket: &std::path::Path, session: &str, opt: &str, value:
 
 #[test]
 #[parallel]
-fn test_web_takeover_exits_tui_live_mode_with_dialog() {
+fn test_web_takeover_exits_tui_live_mode_with_a_footer_line() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("live_takeover");
@@ -116,11 +116,15 @@ fn test_web_takeover_exits_tui_live_mode_with_dialog() {
     set_session_option(&socket, &agent_session, "@aoe_size_owner_hb", &now_ms);
 
     // With NO further input, the worker's idle heartbeat notices the loss
-    // (<= 1.5s), the main-loop poll exits live mode, and the dialog names
-    // the web dashboard. The LIVE badge must be gone: live mode ended.
-    h.wait_for_timeout("Live send ended", Duration::from_secs(10));
-    h.assert_screen_contains("web dashboard");
+    // (<= 1.5s), the main-loop poll exits live mode, and the footer names
+    // the Web dashboard and the key that takes control back. Enter is the
+    // live key here, since this config routes activation into live-send.
+    h.wait_for_timeout(
+        "Web dashboard took control · ↵ take control",
+        Duration::from_secs(10),
+    );
     h.wait_for_absent("LIVE", Duration::from_secs(5));
+    h.assert_screen_not_contains("Live mode ended");
 
     // The thief keeps the lock: the TUI must not have stolen it back.
     let owner = Command::new("tmux")
@@ -326,5 +330,5 @@ fn test_web_claim_moves_the_socket_onto_the_tuis_released_pipe() {
         );
         let _ = ws.close(None).await;
     });
-    h.assert_screen_contains("Live send ended");
+    h.assert_screen_contains("Web dashboard took control");
 }

@@ -50,8 +50,8 @@ use crate::tmux::AvailableTools;
 use super::dialogs::ServeView;
 use super::dialogs::{
     AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
-    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    CreateHookFailedDialog, GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog,
+    InfoDialog, IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
     SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
     WorktreeNameDialog,
@@ -191,8 +191,19 @@ pub(super) enum CreationConfirmation {
     Canonical(crate::daemon::SessionResponse),
 }
 
+/// What the wizard submitted, kept so a creation refused by its `on_create` hook can be sent
+/// again without re-filling the form.
+#[derive(Clone)]
+pub(super) struct CreationRequest {
+    pub(super) data: NewSessionData,
+    pub(super) trust_hooks: Option<bool>,
+    pub(super) trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+    pub(super) skip_on_create: bool,
+}
+
 /// A display-only creation placeholder and its retained completion proof.
 pub(super) struct PendingCreation {
+    pub(super) request: CreationRequest,
     /// The daemon's session id, known once a reservation or progress entry
     /// names this creation.
     pub(super) daemon_id: Option<String>,
@@ -259,6 +270,7 @@ pub struct HomeView {
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
     pub(super) show_activity_age: bool,
+    pub(super) show_structured_badge: bool,
     /// Forward captured OSC 52 writes unless `[tmux] clipboard` is disabled.
     /// Tmux's own clipboard options cannot govern this in-process path.
     pub(super) agent_clipboard_forward: bool,
@@ -286,10 +298,14 @@ pub struct HomeView {
     pub(super) group_rename_context: Option<GroupRenameContext>,
     pub(super) session_dialog_target: Option<SessionDialogTarget>,
     pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
+    /// A creation refused by its `on_create` hook, and the request its choices resubmit.
+    pub(super) create_hook_failed: Option<(CreateHookFailedDialog, CreationRequest)>,
     pub(super) pending_repo_trust_data: Option<NewSessionData>,
     /// Canonical daemon-reviewed configuration fingerprint for the pending
     /// approval. Approval is never persisted locally before daemon validation.
     pub(super) pending_repo_trust_fingerprint: Option<crate::daemon::CreationTrustFingerprint>,
+    /// Create without setup, carried through the trust prompt a resubmit reopened.
+    pub(super) pending_repo_trust_skip_on_create: bool,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
     pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
@@ -341,9 +357,6 @@ pub struct HomeView {
     pending_native_attachment: Option<panes::PendingNativeAttachment>,
     pub(super) live_send: Option<live_send::LiveSendState>,
     pub(super) live_send_worker: Option<live_send::LiveSendWorker>,
-    /// Tmux name of a pane whose live view another surface took. The preview keeps
-    /// showing it through capture-pane so the new owner can arm the VT pipe.
-    pub(super) vt_yield: Option<String>,
     pub(super) preview_capture_worker: Option<live_send::LiveCaptureWorker>,
     pub(super) preview_capture_target: Option<String>,
     pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,
@@ -352,8 +365,11 @@ pub struct HomeView {
     pub(super) live_send_resize_retry_at: Option<std::time::Instant>,
     pub(super) live_send_pending_leader: bool,
     pub(super) hover_cell: Option<(u16, u16)>,
-    pub(super) status_flash: Option<(String, std::time::Instant)>,
+    pub(super) status_flash: Option<overlays::StatusFlash>,
     pub(super) live_send_ctrl_c_flash_until: Option<std::time::Instant>,
+    /// Session whose live control another window took, until the selection moves or live
+    /// mode starts again.
+    pub(super) live_takeover: Option<live_send::TakenLive>,
     pub(super) sidebar_collapsed: bool,
     pub(super) sidebar_position: crate::session::config::SidebarPosition,
     pub(super) passive_pane_synced: std::collections::HashMap<String, PassiveSynced>,

@@ -4,7 +4,7 @@ import { backgroundAgentLaunched, mockAcpSession, openStructuredSession, stopped
 
 test.use({ ...devices["iPhone 13"] });
 
-// An async sub-agent opens in the Sub agents view with the same Input, Activity
+// An async sub-agent opens in the Background view with the same Input, Activity
 // and Output layout the inline card uses, and steps between agents on a phone.
 test.describe("mobile sub-agent view", () => {
   test("opens an agent full screen and steps to the next one", async ({ page }) => {
@@ -23,7 +23,7 @@ test.describe("mobile sub-agent view", () => {
     await openStructuredSession(page, mock);
 
     await page.getByRole("button", { name: "Toggle panels" }).click();
-    await page.getByText("Sub agents", { exact: true }).first().click();
+    await page.getByText("Background", { exact: true }).first().click();
     await page
       .getByRole("button", { name: /agent number/ })
       .first()

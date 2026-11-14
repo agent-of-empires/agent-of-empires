@@ -101,6 +101,7 @@ pub(super) const FIELD_HELP: &[FieldHelp] = &[
 ];
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Default))]
 pub struct NewSessionData {
     pub profile: String,
     pub title: String,

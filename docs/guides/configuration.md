@@ -52,6 +52,7 @@ Updates use a locked read-modify-write operation, preserving concurrent changes.
 | `AOE_LOG_LEVEL` | File log level for AoE's own targets: `trace`, `debug`, `info`, `warn`, `error`. Dependency crates stay at `warn`. One-shot CLI commands always log to the same file at the configured level once the app directory exists; `[logging].output = "stdout"` applies to a foreground `aoe serve` only |
 | `AGENT_OF_EMPIRES_DEBUG` | Legacy alias for `AOE_LOG_LEVEL=debug` |
 | `AOE_DEFER_SANDBOX_MIGRATION` | Start without moving sandboxed sessions' agent stores; retried later or by `aoe migrate`. See [Per-session agent stores](sandbox.md#per-session-agent-stores) |
+| `AOE_SERVE_PORT` | Port for a newly started `aoe serve` daemon, below `--port` and above `[serve] port`. See [Serve](#serve) |
 
 ## Theme
 
@@ -105,6 +106,7 @@ You can browse tips from **Ctrl+K > Show tips** even with the bar hidden.
 | `session_id_poller_max_threads` | `50` | Ceiling on concurrent native-session-ID pollers per process. Overflow IDs stop refreshing until a poller is available, with a 5 s to 60 s retry backoff. `0` keeps the default. Global only; applied when the Daemon starts. |
 | `row_tag` | `"branch"` | Controls the compact metadata shown next to each TUI session title: `none` shows nothing; `auto` shows the profile code only in all-profiles view; `profile` always shows the profile code; `sandbox` shows `sb` on sandboxed sessions; `branch` shows a compact worktree or workspace branch tag. |
 | `show_activity_age` | `true` | Show the age column at the right edge of each TUI session row: time since the agent stopped on `Idle` rows, time since last access on `Unknown` rows, and remaining snooze time under the Attention sort. |
+| `show_structured_badge` | `true` | Show the `[structured]` badge on Structured view rows in the TUI session list. Hiding it returns the width to the title and plugin row badges; the row still opens the Structured view. TUI only; the web session list never shows the badge. |
 | `sidebar_position` | `"left"` | Places the TUI session list on the left or right. Narrow terminals keep the list above the preview. Global only. |
 | `split_terminal_height_percent` | `50` | Paired-terminal share of split preview height. Range `1` to `99`. Global only; see [Live mode](live-mode.md). |
 | `split_terminal_min_width` | `100` | Minimum whole-window width in columns for the paired-terminal split. Range `0` to `1000`. Global only. |
@@ -538,6 +540,15 @@ update_check_mode = "notify"   # auto | notify | off
 - `off`: no check, banner, or dashboard poll. Use it on offline networks.
 
 Checks hit GitHub at most once a day; the dashboard re-polls the cached status hourly while open.
+
+## Serve
+
+```toml
+[serve]
+port = 8080               # debug builds default to 8081
+```
+
+`aoe serve` and runtime autostart take a new daemon's port from `--port`, then `AOE_SERVE_PORT`, then this key. The TUI Serve dialog keeps its own saved port unless `AOE_SERVE_PORT` is set, and does not read this key. A restart keeps the recorded port unless one is requested, so a changed value applies after a stop and start. Global only.
 
 ## Tools
 

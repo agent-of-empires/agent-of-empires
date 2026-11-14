@@ -1012,11 +1012,7 @@ mod tests {
     }
 
     fn account_key_of(tool: &str) -> String {
-        dirs::home_dir()
-            .unwrap()
-            .join(format!(".{tool}"))
-            .to_string_lossy()
-            .into_owned()
+        failover::path_key(&dirs::home_dir().unwrap().join(format!(".{tool}")))
     }
 
     /// A pool name without its own `[session.agent_config_dir]` entry would resolve to the

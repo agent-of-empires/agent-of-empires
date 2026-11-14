@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::{AttachmentBlob, EventStore, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo};
+use crate::acp::state::{BackgroundTaskLaunch, Event, RateLimitInfo, SubagentRecord};
 
 /// Destination for published events; test sinks override only what they observe.
 pub trait BroadcastSink: Send + Sync + 'static {
@@ -67,6 +67,10 @@ pub trait BroadcastSink: Send + Sync + 'static {
         Vec::new()
     }
     fn unresolved_background_task_launches(&self, _session_id: &str) -> Vec<BackgroundTaskLaunch> {
+        Vec::new()
+    }
+    /// Subagents whose latest snapshot on disk is still working.
+    fn open_subagents(&self, _session_id: &str) -> Vec<SubagentRecord> {
         Vec::new()
     }
     /// The same rows, carrying `output_file` so `Supervisor::attach` can
@@ -332,6 +336,10 @@ impl BroadcastSink for ChannelSink {
             .unresolved_background_task_launches(session_id)
     }
 
+    fn open_subagents(&self, session_id: &str) -> Vec<SubagentRecord> {
+        self.flushed_store().open_subagents(session_id)
+    }
+
     fn unresolved_background_agent_launches(
         &self,
         session_id: &str,
@@ -428,9 +436,8 @@ impl Persister {
                     seq,
                     "event store write failed; substituting AgentStartupError so the gap is visible: {e}"
                 );
-                failure = Event::AgentStartupError {
-                    message: format!("event store write failed at seq {seq}: {e}"),
-                };
+                failure =
+                    Event::startup_error(format!("event store write failed at seq {seq}: {e}"));
                 (&failure, false)
             }
         };

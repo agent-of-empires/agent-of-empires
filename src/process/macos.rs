@@ -536,6 +536,11 @@ pub(super) struct ProcessHandle {
     owned_birth: Option<u64>,
 }
 
+/// False once `pid` is gone, or exited and not yet reaped (SZOMB).
+pub(super) fn process_executing(pid: u32) -> anyhow::Result<bool> {
+    Ok(process_membership(pid)?.is_some_and(|info| info.pbi_status != libc::SZOMB))
+}
+
 impl ProcessHandle {
     pub(super) fn capture(identity: &super::PrimeProcessIdentity) -> anyhow::Result<Option<Self>> {
         anyhow::ensure!(

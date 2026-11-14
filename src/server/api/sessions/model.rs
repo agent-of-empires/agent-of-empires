@@ -382,11 +382,15 @@ pub(super) fn custom_agent_acp_capable(
         || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
-/// Per-request cache for `(profile, project_path)` config resolution, shared
+/// Per-request cache for `(profile, repo config source)` config resolution, shared
 /// across the `list_sessions` overlays so a repo-local override is read from
 /// disk once per unique pair rather than once per row. See #2603.
 pub(super) struct SessionCfgCache<'a> {
-    entries: HashMap<(String, String), (SessionConfig, StructuredView)>,
+    entries: HashMap<(String, std::path::PathBuf), (SessionConfig, StructuredView)>,
+    /// `project_path` to its repo config source; discovery can open the repo through libgit2.
+    sources: HashMap<String, std::path::PathBuf>,
+    #[cfg(test)]
+    pub(super) discoveries: usize,
     /// Where this cache reports its disk reads. The counter belongs to the
     /// request, not to the cache, so every cache the request opens adds to
     /// one total: splitting the shared cache per overlay then shows up as
@@ -399,14 +403,36 @@ impl<'a> SessionCfgCache<'a> {
     pub(super) fn new(misses: &'a std::sync::atomic::AtomicUsize) -> Self {
         Self {
             entries: HashMap::new(),
+            sources: HashMap::new(),
+            #[cfg(test)]
+            discoveries: 0,
             misses,
         }
     }
+
+    fn source(&mut self, project_path: &str) -> std::path::PathBuf {
+        if let Some(source) = self.sources.get(project_path) {
+            return source.clone();
+        }
+        #[cfg(test)]
+        {
+            self.discoveries += 1;
+        }
+        let source = crate::session::config::repo_config::repo_config_source_path(
+            std::path::Path::new(project_path),
+        );
+        self.sources
+            .insert(project_path.to_string(), source.clone());
+        source
+    }
+
     /// Resolve `(profile, project_path)`, reading from disk on first miss only.
     fn entry(&mut self, profile: &str, project_path: &str) -> &(SessionConfig, StructuredView) {
         let misses = self.misses;
+        // Linked worktrees read their repo config from the main repo, so they share an entry.
+        let source = self.source(project_path);
         self.entries
-            .entry((profile.to_string(), project_path.to_string()))
+            .entry((profile.to_string(), source))
             .or_insert_with(|| {
                 misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let config = crate::session::config::repo_config::resolve_config_with_repo_or_warn(

@@ -726,7 +726,8 @@ impl App {
 
             tokio::select! {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
-                    self.home.apply_session_feed();
+                    // Keys reach the view before the next draw, so no dialog is promoted here.
+                    self.home.apply_session_feed_before_input();
                     self.home.enforce_trash_read_only();
                     if self.home.selected_is_trashed() {
                         self.close_embedded_structured();
@@ -3206,7 +3207,7 @@ impl App {
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
-        self.home.apply_session_feed();
+        self.home.apply_session_feed_before_input();
         let result = self.home.reload();
         self.home.reload_failure_state.record_storage(&result);
         self.home.try_present_reload_failure_dialog();
@@ -3278,7 +3279,7 @@ impl App {
             }),
         )?;
         self.needs_redraw = true;
-        self.home.apply_session_feed();
+        self.home.apply_session_feed_before_input();
         self.select_after_attach(&ready.id);
         if let Err(error) = attach_result {
             tracing::warn!(target: "tui.input", %error, "Native tmux attach failed");
@@ -3935,6 +3936,12 @@ mod tests {
         assert!(app.should_quit);
         app.should_quit = false;
         app.home.pending_creation = Some(crate::tui::home::PendingCreation {
+            request: crate::tui::home::CreationRequest {
+                data: Default::default(),
+                trust_hooks: None,
+                trust_review: None,
+                skip_on_create: false,
+            },
             daemon_id: None,
             request_key: "other-creation".into(),
             origin_epoch: "test".into(),
@@ -5479,7 +5486,7 @@ mod tests {
             };
             let mut view = if context == "preparation" {
                 let mut view = crate::tui::dialogs::ServeView::settled(&mut app.home.serve_jobs);
-                view.handle_key(KeyEvent::from(KeyCode::Char('L')));
+                view.handle_key(KeyEvent::from(KeyCode::Left));
                 view.handle_key(KeyEvent::from(KeyCode::Enter));
                 view
             } else {

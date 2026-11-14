@@ -2207,6 +2207,59 @@ pub(super) async fn apply_update_restart(
     .await
 }
 
+/// `GET /api/sessions/{id}/account-targets`: the configured tool names this session can swap to
+/// without losing its conversation. Names only; `agent_config_dir` paths never leave the host.
+pub async fn session_account_targets(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> axum::response::Response {
+    if let Some(response) = crate::server::api::read_only_block(&state)
+        .or_else(|| crate::server::api::cityhall_block(&state))
+    {
+        return response;
+    }
+    let Some(row) = crate::server::api::find_instance(&state, &id).await else {
+        return crate::server::api::session_not_found();
+    };
+    match tokio::task::spawn_blocking(move || account_targets(&row)).await {
+        Ok(targets) => Json(serde_json::json!({ "targets": targets })).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+pub(super) fn account_targets(row: &Instance) -> Vec<String> {
+    if !row.is_structured() {
+        return Vec::new();
+    }
+    let profile = row.effective_profile();
+    let config = crate::session::config::profile_config::resolve_config_or_warn(&profile);
+    let mut names: Vec<&str> = crate::agents::agent_names();
+    names.extend(config.session.custom_agents.keys().map(String::as_str));
+    names.extend(
+        config
+            .session
+            .agent_config_dir
+            .iter()
+            .filter(|(_, dir)| crate::session::config::is_resolvable_agent_config_dir(dir))
+            .map(|(name, _)| name.as_str()),
+    );
+    names.sort_unstable();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| *name != row.tool)
+        .filter(|name| {
+            let body = crate::daemon::RestartSessionBody {
+                tool: Some((*name).to_owned()),
+                require_account_carry: true,
+                ..Default::default()
+            };
+            account_swap_refusal(row, &body).is_none()
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Why a restart that demands an account swap (`require_account_carry`) is malformed: the
 /// tool to switch to, or what makes the swap impossible whatever the configuration says.
 fn account_swap_precondition<'a>(
@@ -2771,9 +2824,10 @@ pub(super) enum AgentPreparation {
 enum RestartOrigin {
     Explicit,
     StartupRecovery,
-    /// An automatic account failover decided on this event-log head.
+    /// An automatic account failover decided on this event-log head and lifecycle generation.
     Failover {
         park_seq: u64,
+        generation: u64,
     },
 }
 
@@ -2883,14 +2937,17 @@ impl FailoverError {
 /// continuing the interrupted prompt. `expected_seq` is the event-log head the failover
 /// decision read: under the submission authority and the instance lock, the swap proceeds only
 /// if the session is still parked on that head with no worker, so a prompt, a manual resume or
-/// the timed auto-resume that landed meanwhile wins and nothing is sent twice.
+/// the timed auto-resume that landed meanwhile wins and nothing is sent twice. `generation` is
+/// the row's lifecycle generation at the decision: a stop that landed since is the owner's and
+/// is never consumed.
 pub(crate) async fn failover_account_swap(
     state: &Arc<AppState>,
     id: &str,
     tool: &str,
     expected_seq: u64,
+    generation: u64,
 ) -> Result<(), FailoverError> {
-    failover_account_swap_with(state, id, tool, expected_seq, async {}).await
+    failover_account_swap_with(state, id, tool, expected_seq, generation, async {}).await
 }
 
 /// `after_restart` runs once the restart returned, before the failure is handled: the point
@@ -2900,6 +2957,7 @@ pub(super) async fn failover_account_swap_with(
     id: &str,
     tool: &str,
     expected_seq: u64,
+    generation: u64,
     after_restart: impl std::future::Future<Output = ()>,
 ) -> Result<(), FailoverError> {
     let claim = Arc::new(FailoverClaim::default());
@@ -2916,6 +2974,7 @@ pub(super) async fn failover_account_swap_with(
         None,
         RestartOrigin::Failover {
             park_seq: expected_seq,
+            generation,
         },
         Some(claim.clone()),
     )
@@ -3112,8 +3171,21 @@ async fn prepare_agent_session_inner(
     }
     if let RestartOrigin::Failover {
         park_seq: expected_seq,
+        generation,
     } = restart_origin
     {
+        // Idle reaping and status polling stop or dormant a row without bumping its generation,
+        // so the status checks are not covered by the comparison.
+        if instance.lifecycle_generation != generation
+            || instance.status == Status::Stopped
+            || instance.is_idle_dormant()
+        {
+            return api_error(
+                StatusCode::CONFLICT,
+                "park_changed",
+                "The session was stopped or restarted since the failover was decided".to_string(),
+            );
+        }
         let store = Arc::clone(&state.acp_event_store);
         let probe_id = id.clone();
         let still_parked = tokio::task::spawn_blocking(move || {
@@ -3188,11 +3260,10 @@ async fn prepare_agent_session_inner(
             message,
         );
     }
+    // Failover is excluded: the reaper never picks a stopped or dormant row, so one found here
+    // is an owner stop that automatic work must not consume.
     if instance.is_structured()
-        && matches!(
-            restart_origin,
-            RestartOrigin::Explicit | RestartOrigin::Failover { .. }
-        )
+        && matches!(restart_origin, RestartOrigin::Explicit)
         && (instance.status == Status::Stopped || instance.is_idle_dormant())
     {
         instance = match resume_structured_stop(&state, instance).await {

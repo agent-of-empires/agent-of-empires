@@ -182,7 +182,7 @@ impl HomeView {
             self.preview_scroll_offset = 0;
         }
         // Live mode owns the pane again, so the preview may re-arm the VT pipe.
-        self.vt_yield = None;
+        self.live_takeover = None;
         self.live_send = Some(live_send::LiveSendState {
             session_id: inst.id.clone(),
             title: inst.title.clone(),

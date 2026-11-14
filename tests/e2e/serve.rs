@@ -22,7 +22,19 @@ fn daemon_launch_path(h: &TuiTestHarness) -> PathBuf {
     crate::harness::app_dir_in(h.home_path()).join("serve.launch")
 }
 
-/// True iff the kernel still has a process with this PID.
+/// True while `pid` runs. An exited process waiting to be reaped counts as gone, since a
+/// container's PID 1 may never reap it.
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    stat.rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_ascii_whitespace().next())
+        .is_some_and(|state| !matches!(state, "Z" | "X"))
+}
+
+#[cfg(not(target_os = "linux"))]
 fn pid_alive(pid: i32) -> bool {
     nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
 }
@@ -3075,7 +3087,8 @@ fn tui_local_restart_preserves_the_env_passphrase_gate() {
     h.wait_for("Connections");
     h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
-    h.send_keys("L");
+    h.send_keys("Left");
+    h.send_keys("Enter");
     let (port, token) = wait_for_local_dashboard(&h);
     assert!(
         login_status_required(port, &token).unwrap(),
@@ -3116,7 +3129,8 @@ fn tui_local_restart_preserves_the_gate_without_the_env_variable() {
     h.wait_for("Connections");
     h.send_keys("Enter");
     h.wait_for("How should this be reachable?");
-    h.send_keys("L");
+    h.send_keys("Left");
+    h.send_keys("Enter");
     let (port, token) = wait_for_local_dashboard(&h);
     assert!(
         login_status_required(port, &token).unwrap(),

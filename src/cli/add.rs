@@ -155,6 +155,11 @@ pub struct AddArgs {
     #[arg(long = "trust-hooks")]
     trust_hooks: bool,
 
+    /// Create the session without running its on_create hooks, so a failing
+    /// setup script does not roll the session back. on_launch hooks still run
+    #[arg(long = "skip-on-create")]
+    skip_on_create: bool,
+
     /// Extra arguments to append after the agent binary
     #[arg(long, allow_hyphen_values = true)]
     extra_args: Option<String>,
@@ -346,6 +351,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         base_branch: args.base_branch,
         sandbox,
         sandbox_image: args.sandbox_image,
+        pull_latest_image: false,
         extra_args: args.extra_args.unwrap_or_default(),
         extra_env: Vec::new(),
         hook_env: explicit_hook_env(&args.hook_env),
@@ -383,7 +389,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         scratch: args.scratch,
         trust_hooks: Some(trust),
         trust_review: Some(review.fingerprint),
-        skip_on_create: false,
+        skip_on_create: args.skip_on_create,
         import_acp_session_id: None,
         fork_from: None,
         fork_session_id: None,
@@ -409,7 +415,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     };
     let signal = tokio::signal::ctrl_c();
     tokio::pin!(signal);
-    let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut()).await?;
+    let row = create_and_observe(&client, &body, &epoch, &key, signal.as_mut())
+        .await
+        .map_err(with_skip_hint)?;
     for warning in &row.warnings {
         eprintln!("Warning: {warning}");
     }
@@ -436,6 +444,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if row.yolo_mode {
         println!("  YOLO:    enabled");
+    }
+    if row.created_without_setup {
+        println!("  Setup:   skipped (on_create hooks did not run)");
     }
     if !row.workspace_repos.is_empty() {
         println!("  Workspace: {} repos", row.workspace_repos.len());
@@ -722,6 +733,19 @@ fn creation_is_final(row: &SessionResponse) -> bool {
                 .iter()
                 .any(|status| row.status.eq_ignore_ascii_case(status)),
         }
+}
+
+/// Names the way past a failed on_create hook, which rolled the creation back.
+fn with_skip_hint(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<DaemonClientError>() {
+        Some(DaemonClientError::Status {
+            code: Some(crate::daemon::ApiErrorCode::CreateHookFailed),
+            ..
+        }) => anyhow::anyhow!(
+            "{error:#}\nRerun with --skip-on-create to keep the session without running on_create."
+        ),
+        _ => error,
+    }
 }
 
 fn definitive(error: &DaemonClientError) -> bool {

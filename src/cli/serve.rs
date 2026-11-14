@@ -42,8 +42,10 @@ pub struct ServeArgs {
     #[arg(long, conflicts_with_all = ["remote", "behind_proxy", "port", "host", "auth", "no_auth", "open", "passphrase", "allowed_host", "allowed_origin"])]
     pub core_only: bool,
 
-    /// Port to listen on (default: 8080; debug builds default to 8081 so a
-    /// `cargo run` instance does not collide with an installed release `aoe`).
+    /// Port to listen on. Falls back to the `AOE_SERVE_PORT` environment
+    /// variable, then `[serve] port` in config.toml, then 8080 (debug builds
+    /// default to 8081 so a `cargo run` instance does not collide with an
+    /// installed release `aoe`).
     #[arg(long)]
     pub port: Option<u16>,
 
@@ -235,19 +237,55 @@ impl ServeArgs {
             self.passphrase = resolve_launch_passphrase(self.passphrase.take(), None, || {
                 std::env::var("AOE_SERVE_PASSPHRASE").ok()
             });
+            self.resolve_port()?;
         }
         self.cityhall = self.cityhall || std::env::var_os("AOE_CITYHALL_MODE").is_some();
         Ok(())
     }
 
-    /// Resolve the port: explicit `--port` wins; otherwise 8081 in debug
-    /// builds, 8080 in release. The `-dev` suffix on the app dir keeps
-    /// state isolated, but two daemons cannot share a port, so the default
-    /// shifts as well.
+    /// Resolve the port: explicit `--port` wins; otherwise the build default
+    /// (8081 in debug builds, 8080 in release). Fresh launches fill `port` from
+    /// `AOE_SERVE_PORT` and `[serve] port` first, in `resolve_launch`.
     pub fn resolved_port(&self) -> u16 {
         self.port
-            .unwrap_or(if cfg!(debug_assertions) { 8081 } else { 8080 })
+            .unwrap_or(crate::session::config::DEFAULT_SERVE_PORT)
     }
+
+    /// Fill a missing TCP port from `AOE_SERVE_PORT`, then `[serve] port`.
+    fn resolve_port(&mut self) -> Result<()> {
+        self.fill_port(std::env::var_os("AOE_SERVE_PORT"), || {
+            Ok(crate::session::config::Config::load()?.serve.port)
+        })
+    }
+
+    fn fill_port(
+        &mut self,
+        env: Option<std::ffi::OsString>,
+        configured: impl FnOnce() -> Result<u16>,
+    ) -> Result<()> {
+        if !self.core_only && self.port.is_none() {
+            self.port = Some(resolve_serve_port(env, configured)?);
+        }
+        Ok(())
+    }
+}
+
+/// `AOE_SERVE_PORT` wins over the configured port; an empty value counts as unset.
+fn resolve_serve_port(
+    env: Option<std::ffi::OsString>,
+    configured: impl FnOnce() -> Result<u16>,
+) -> Result<u16> {
+    let Some(raw) = env.filter(|raw| !raw.is_empty()) else {
+        // config.toml bypasses the settings validator, and port 0 binds an ephemeral port.
+        let port = configured()?;
+        return (port != 0)
+            .then_some(port)
+            .context("Invalid [serve] port 0: expected 1-65535");
+    };
+    raw.to_str()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .with_context(|| format!("Invalid AOE_SERVE_PORT {raw:?}: expected 1-65535"))
 }
 
 /// Pure check used by both the CLI validator and its unit tests.
@@ -700,7 +738,7 @@ impl ServeLaunch {
             args.auth = requested.auth;
         }
         args.core_only = requested.core_only;
-        args.port = requested.port;
+        args.port = requested.port.or(args.port);
         args.host = requested.host;
         args.remote = requested.remote;
         if !args.remote {
@@ -976,7 +1014,7 @@ fn resolve_launch_passphrase(
 /// plus a loopback alternate for same-host clients. Local mode may have
 /// multiple entries (Tailscale + LAN + localhost), and the user can Tab-cycle
 /// between them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeUrl {
     /// Optional human-readable label ("tailscale", "lan", "localhost").
     /// None for the primary URL, which does not need one.
@@ -1020,6 +1058,30 @@ pub fn read_serve_urls() -> Vec<ServeUrl> {
         }
     }
     out
+}
+
+/// Whether the Tailscale daemon's Funnel still routes here, from `$APP_DIR/serve.funnel`.
+/// Only a missing file means ours; one that can't be read is Unknown.
+pub fn read_serve_funnel() -> crate::server::tunnel::FunnelReach {
+    use crate::server::tunnel::FunnelReach;
+    match launch_file("serve.funnel").and_then(|file| file.read()) {
+        Ok(raw) => FunnelReach::from_marker(raw.as_deref()),
+        Err(_) => FunnelReach::Unknown,
+    }
+}
+
+/// The sentence Remote Access and `aoe serve --status` show while the Funnel URL is withdrawn.
+pub fn funnel_notice(reach: crate::server::tunnel::FunnelReach) -> Option<&'static str> {
+    use crate::server::tunnel::FunnelReach;
+    match reach {
+        FunnelReach::Ours => None,
+        FunnelReach::Lost => Some(
+            "Tailscale Funnel now routes to another server. This dashboard is reachable from this machine only. Restart Remote Access once the other server stops.",
+        ),
+        FunnelReach::Unknown => Some(
+            "Tailscale isn't answering, so the Funnel link is hidden until it does. This dashboard is reachable from this machine only for now.",
+        ),
+    }
 }
 
 fn read_serve_mode_label() -> Option<&'static str> {
@@ -1113,7 +1175,9 @@ fn inspect_daemon_process(pid: i32) -> DaemonProcessIdentity {
             .stdin(std::process::Stdio::null()),
         std::time::Duration::from_secs(3),
     ) {
-        Ok(Some(out)) if !out.status.success() => DaemonProcessIdentity::Indeterminate,
+        Ok(Some(out)) if !out.status.success() || out.stdout.trim_ascii().is_empty() => {
+            DaemonProcessIdentity::Indeterminate
+        }
         Ok(Some(out)) if command_is_aoe_serve(&out.stdout) => DaemonProcessIdentity::Verified,
         Ok(Some(out)) if command_mentions_aoe_executable(&out.stdout) => {
             DaemonProcessIdentity::Indeterminate
@@ -1160,11 +1224,12 @@ fn classify_daemon_probe(
     }
 }
 
-const SERVE_STATE_FILES: [&str; 4] = [
+const SERVE_STATE_FILES: [&str; 5] = [
     "serve.url",
     "serve.mode",
     "serve.passphrase",
     "serve.launch",
+    "serve.funnel",
 ];
 
 /// Separate from the lifetime lock a running server holds, which this state is
@@ -1244,7 +1309,14 @@ fn daemon_status_with(
             DaemonProcessIdentity::Indeterminate => DaemonStatus::Unverified,
         },
         DaemonProbeDisposition::Stale => DaemonStatus::Absent,
-        DaemonProbeDisposition::Indeterminate => DaemonStatus::Unverified,
+        // A pid we cannot signal (EPERM) is often a root process that reused it.
+        // Only a positively foreign command clears it; anything else fails closed.
+        DaemonProbeDisposition::Indeterminate => match inspect(pid) {
+            DaemonProcessIdentity::Foreign => DaemonStatus::Absent,
+            DaemonProcessIdentity::Verified | DaemonProcessIdentity::Indeterminate => {
+                DaemonStatus::Unverified
+            }
+        },
     }
 }
 
@@ -2277,6 +2349,8 @@ async fn replay_managed_launch(
         Some(predecessor_passphrase.as_deref()),
         || None,
     );
+    // A core-only record has no port to replay when the request enables the dashboard.
+    args.resolve_port()?;
     validate_launch_args(&launch.profile, &args).await?;
     retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
@@ -2559,6 +2633,13 @@ fn tui_observed_exit(
     Ok(Some(*pid))
 }
 
+fn bail_foreign_pid(pid: i32) -> Result<()> {
+    if clear_serve_state(pid) {
+        bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
+    }
+    bail!("PID {pid} belongs to a different process; serve state changed meanwhile and was preserved.");
+}
+
 #[tracing::instrument(target = "serve.shutdown", skip_all)]
 pub(crate) async fn stop_daemon() -> Result<()> {
     let transaction = crate::daemon::lifecycle::Transaction::acquire().await?;
@@ -2584,17 +2665,22 @@ async fn stop_daemon_locked(
         .with_context(|| format!("PID file disappeared at {}", path.display()))?;
     let pid = parse_positive_pid(&pid_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid PID in {}: {}", path.display(), pid_str.trim()))?;
-    if matches!(
-        classify_daemon_probe(nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid),
-            None
-        )),
-        DaemonProbeDisposition::Stale
-    ) {
+    let probe = classify_daemon_probe(nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        None,
+    ));
+    if probe == DaemonProbeDisposition::Stale {
         if let Some(notice) = stale_cleanup_notice(pid, announce) {
             println!("{notice}");
         }
         return Ok(());
+    }
+    // A pid we cannot signal has no capturable handle below, so settle a foreign
+    // owner here without signalling.
+    if probe == DaemonProbeDisposition::Indeterminate
+        && inspect_daemon_process(pid) == DaemonProcessIdentity::Foreign
+    {
+        return bail_foreign_pid(pid);
     }
 
     // Capture before inspecting custody, so process exit or PID reuse during
@@ -2620,14 +2706,7 @@ async fn stop_daemon_locked(
                 );
             }
         }
-        DaemonProcessIdentity::Foreign => {
-            if clear_serve_state(pid) {
-                bail!("PID {pid} belongs to a different process (stale PID file). Cleaned up.");
-            }
-            bail!(
-                "PID {pid} belongs to a different process; serve state changed meanwhile and was preserved."
-            );
-        }
+        DaemonProcessIdentity::Foreign => return bail_foreign_pid(pid),
         DaemonProcessIdentity::Indeterminate => {
             bail!(
                 "Could not verify whether PID {} is an aoe serve daemon; \
@@ -2727,6 +2806,11 @@ fn print_local_status() -> Result<()> {
         }
     } else {
         println!("URL:    (serve.url missing)");
+    }
+    if mode == "tailscale" {
+        if let Some(notice) = funnel_notice(read_serve_funnel()) {
+            println!("Funnel: {notice}");
+        }
     }
     if let Some(p) = log_path {
         println!("Log:    {}", p.display());
@@ -2925,6 +3009,29 @@ mod tests {
     #[test]
     fn cloudflared_required_when_no_tailscale_flag_set() {
         assert!(cloudflared_required(true, false, true));
+    }
+
+    #[test]
+    fn serve_port_prefers_environment_over_config() {
+        let os = |value: &str| Some(std::ffi::OsString::from(value));
+        let cases: [(Option<std::ffi::OsString>, Option<u16>); 7] = [
+            (None, Some(9000)),
+            (os(""), Some(9000)),
+            (os("8090"), Some(8090)),
+            (os(" 65535 "), Some(65535)),
+            (os("0"), None),
+            (os("65536"), None),
+            (os("abc"), None),
+        ];
+        for (env, expected) in cases {
+            assert_eq!(
+                resolve_serve_port(env.clone(), || Ok(9000)).ok(),
+                expected,
+                "{env:?}"
+            );
+        }
+        assert!(resolve_serve_port(None, || Ok(0)).is_err());
+        assert!(resolve_serve_port(None, || anyhow::bail!("bad config")).is_err());
     }
 
     #[test]
@@ -3381,6 +3488,8 @@ mod tests {
         }
         assert!(!local.remote && local.host == "0.0.0.0");
         assert!(tunnel.remote && tunnel.host == "127.0.0.1");
+        let portless = recorded.overlay_tui_args(tui_args(&["aoe", "serve", "--daemon"]));
+        assert_eq!(portless.port, Some(recorded.port));
         // clap requires `--remote` for the tunnel flags, so a Local restart must not replay them.
         assert_eq!((&local.tunnel_name, &local.tunnel_url), (&None, &None));
         assert_eq!(tunnel.tunnel_name, recorded.tunnel_name);
@@ -3393,6 +3502,40 @@ mod tests {
         ]));
         assert!(!dashboard.core_only);
         assert_eq!((dashboard.port, dashboard.auth), (Some(8080), None));
+    }
+
+    #[test]
+    fn replay_into_dashboard_resolves_a_missing_port() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            let parsed = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let Some(crate::cli::Commands::Serve(args)) = parsed.command else {
+                unreachable!();
+            };
+            args
+        };
+        let mut core = sample_launch();
+        core.core_only = true;
+        let env = |value: &str| Some(std::ffi::OsString::from(value));
+
+        let mut dashboard = core.overlay_tui_args(parse(&["aoe", "serve", "--daemon"]));
+        assert_eq!(dashboard.port, None);
+        dashboard.fill_port(env("9100"), || Ok(9000)).unwrap();
+        assert_eq!(dashboard.port, Some(9100));
+
+        let mut explicit =
+            core.overlay_tui_args(parse(&["aoe", "serve", "--daemon", "--port", "8095"]));
+        explicit.fill_port(env("9100"), || Ok(9000)).unwrap();
+        assert_eq!(explicit.port, Some(8095));
+
+        let mut config = core.overlay_tui_args(parse(&["aoe", "serve", "--daemon"]));
+        config.fill_port(None, || Ok(9000)).unwrap();
+        assert_eq!(config.port, Some(9000));
+
+        let mut still_core =
+            core.overlay_tui_args(parse(&["aoe", "serve", "--daemon", "--core-only"]));
+        still_core.fill_port(env("9100"), || Ok(9000)).unwrap();
+        assert_eq!(still_core.port, None);
     }
 
     #[test]
@@ -3702,6 +3845,27 @@ mod tests {
 
             let _ = foreign.kill();
             let _ = foreign.wait();
+        }
+
+        #[test]
+        #[serial]
+        fn unsignalable_pid_is_absent_only_when_its_command_is_foreign() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let dir = crate::session::get_app_dir().unwrap();
+            publish(&dir, 4242);
+
+            for (identity, expected) in [
+                (DaemonProcessIdentity::Foreign, DaemonStatus::Absent),
+                (DaemonProcessIdentity::Verified, DaemonStatus::Unverified),
+                (
+                    DaemonProcessIdentity::Indeterminate,
+                    DaemonStatus::Unverified,
+                ),
+            ] {
+                let status =
+                    daemon_status_with(|_| DaemonProbeDisposition::Indeterminate, |_| identity);
+                assert_eq!(status, expected, "{identity:?}");
+            }
         }
 
         #[test]

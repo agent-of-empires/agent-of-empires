@@ -104,6 +104,7 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             show_activity_age: resolved.session.show_activity_age,
+            show_structured_badge: resolved.session.show_structured_badge,
             sidebar_position: resolved.session.sidebar_position,
             agent_clipboard_forward: resolved.tmux.clipboard
                 != crate::session::config::TmuxSettingMode::Disabled,
@@ -156,8 +157,10 @@ impl HomeView {
             context_menu: None,
             group_rename_context: None,
             repo_trust_dialog: None,
+            create_hook_failed: None,
             pending_repo_trust_data: None,
             pending_repo_trust_fingerprint: None,
+            pending_repo_trust_skip_on_create: false,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             volume_ignores_glob_dialog: None,
@@ -204,7 +207,6 @@ impl HomeView {
             pending_native_attachment: None,
             live_send: None,
             live_send_worker: None,
-            vt_yield: None,
             preview_capture_worker: None,
             preview_capture_target: None,
             preview_worker_pulse: None,
@@ -215,6 +217,7 @@ impl HomeView {
             hover_cell: None,
             status_flash: None,
             live_send_ctrl_c_flash_until: None,
+            live_takeover: None,
             sidebar_collapsed: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_sidebar_collapsed)

@@ -17,7 +17,7 @@ export const BUILTIN_PANES: PaneDescriptor[] = [
   { id: "diff", title: "Diff", icon: FileDiff, defaultDock: "right" },
   { id: "files", title: "Files", icon: FolderTree, defaultDock: "right" },
   { id: "terminal", title: "Terminal", icon: SquareTerminal, defaultDock: "right" },
-  { id: "agents", title: "Sub agents", icon: Bot, defaultDock: "right" },
+  { id: "agents", title: "Background", icon: Bot, defaultDock: "right" },
 ];
 
 // Terminals are the only multi-instance pane: tab `terminal:<n>` maps to tmux index n.

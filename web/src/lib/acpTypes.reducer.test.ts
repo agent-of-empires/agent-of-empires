@@ -361,9 +361,11 @@ describe("applyEvent / subagent roster", () => {
       status: "completed",
       endedAt: "t1",
     });
-    expect(agentAfter(update("idle", "t1", { stop_reason: "error" }))).toMatchObject({
+    expect(agentAfter(update("idle", "t1", { stop_reason: "error", error: "Authentication required" }))).toMatchObject({
       status: "error",
       endedAt: "t1",
+      error: "Authentication required",
+      warning: null,
     });
     // A later idle keeps the first end time; running again reopens the agent.
     const twice = agentAfter(update("idle", "t1"), update("idle", "t2"));
@@ -387,6 +389,21 @@ describe("applyEvent / subagent roster", () => {
   it("keeps requires_action and unknown agents active", () => {
     for (const state of ["requires_action", "unknown"]) {
       expect(isVisiblyBusy(run(launched, update(state, "t1")))).toBe(true);
+    }
+  });
+
+  it("counts a running or waiting child without a legacy record as background work, not the main turn", () => {
+    const child = (state: string) =>
+      run(update(state, "t1", { parent_tool_call_id: "msg-1" }), { Stopped: { reason: "end_turn" } });
+    for (const [state, busy] of [
+      ["running", true],
+      ["requires_action", true],
+      ["idle", false],
+      ["unknown", false],
+    ] as const) {
+      const s = child(state);
+      expect(s.turnActive, state).toBe(false);
+      expect(isVisiblyBusy(s), state).toBe(busy);
     }
   });
 

@@ -6,6 +6,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::bindings::{self, ActionId};
+use super::live_send::LiveKey;
 use super::{
     live_send, DragKind, HomeView, NamespaceIntent, PermissionResponseTarget, PreviewSelection,
     TerminalMode, ViewMode,
@@ -1803,6 +1804,16 @@ impl HomeView {
             }
             return true;
         }
+        if let Some((dialog, _)) = self
+            .create_hook_failed
+            .as_ref()
+            .filter(|_| self.info_dialog.is_none())
+        {
+            if let Some(result) = dialog.handle_click(col, row) {
+                self.resolve_create_hook_failed(result);
+            }
+            return true;
+        }
         if let Some(dialog) = &self.repo_trust_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
@@ -1811,10 +1822,12 @@ impl HomeView {
                         self.repo_trust_dialog = None;
                         self.pending_repo_trust_data = None;
                         self.pending_repo_trust_fingerprint = None;
+                        self.pending_repo_trust_skip_on_create = false;
                     }
                     DialogResult::Submit(action) => {
                         self.repo_trust_dialog = None;
                         let fingerprint = self.pending_repo_trust_fingerprint.take();
+                        let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
                         if let Some(data) = self.pending_repo_trust_data.take() {
                             let decision = match action {
                                 RepoTrustAction::Trust { .. } => {
@@ -1822,7 +1835,7 @@ impl HomeView {
                                 }
                                 RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
                             };
-                            let emit = self.create_session_with_hooks(data, decision);
+                            let emit = self.create_session_with_hooks(data, decision, skip);
                             self.pending_dialog_click_action = emit;
                         }
                     }
@@ -2633,6 +2646,12 @@ impl HomeView {
             return None;
         }
 
+        if let Some((dialog, _)) = &mut self.create_hook_failed {
+            let result = dialog.handle_key(key);
+            self.resolve_create_hook_failed(result);
+            return None;
+        }
+
         if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2640,10 +2659,12 @@ impl HomeView {
                     self.repo_trust_dialog = None;
                     self.pending_repo_trust_data = None;
                     self.pending_repo_trust_fingerprint = None;
+                    self.pending_repo_trust_skip_on_create = false;
                 }
                 DialogResult::Submit(action) => {
                     self.repo_trust_dialog = None;
                     let fingerprint = self.pending_repo_trust_fingerprint.take();
+                    let skip = std::mem::take(&mut self.pending_repo_trust_skip_on_create);
                     if let Some(data) = self.pending_repo_trust_data.take() {
                         let decision = match action {
                             RepoTrustAction::Trust { .. } => {
@@ -2651,7 +2672,7 @@ impl HomeView {
                             }
                             RepoTrustAction::Skip { .. } => RepoTrustDecision::Refuse,
                         };
-                        return self.create_session_with_hooks(data, decision);
+                        return self.create_session_with_hooks(data, decision, skip);
                     }
                 }
             }
@@ -3269,29 +3290,16 @@ impl HomeView {
                 if self.selected_is_trashed() {
                     return None;
                 }
+                let live_key = self.selected_session.as_deref().map(|id| self.live_key(id));
                 // A structured session has no tmux pane to attach or live-send into, so
                 // both Tab meanings are vacuous; say so instead of ignoring the press.
-                if let Some(id) = self.selected_session.as_deref() {
-                    if matches!(self.view_mode, ViewMode::Structured)
-                        && self.get_instance(id).is_some_and(|i| i.is_structured())
-                    {
-                        return Some(Action::SetTransientStatus(
-                            "Structured sessions have no tmux pane; press Enter to open the structured view."
-                                .to_string(),
-                        ));
-                    }
+                if live_key == Some(None) {
+                    return Some(Action::SetTransientStatus(
+                        "Structured sessions have no tmux pane; press Enter to open the structured view."
+                            .to_string(),
+                    ));
                 }
-                let swap_to_attach = self
-                    .selected_session
-                    .as_deref()
-                    .map(|id| {
-                        matches!(
-                            self.default_attach_mode(id),
-                            Some(crate::session::AttachMode::LiveSend)
-                        )
-                    })
-                    .unwrap_or(false);
-                if swap_to_attach {
+                if live_key == Some(Some(LiveKey::Enter)) {
                     if let Some(action) = self.tab_attach_action() {
                         return Some(action);
                     }
@@ -4920,7 +4928,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
-                self.vt_yield = None;
+                self.live_takeover = None;
                 self.retained_preview = None;
                 self.retained_focus = None;
                 self.retained_scroll_offset = 0;
@@ -6584,6 +6592,9 @@ impl HomeView {
         if let Some(dialog) = &mut self.repo_trust_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
+        if let Some((dialog, _)) = &mut self.create_hook_failed {
+            overlay_changed |= dialog.handle_hover(col, row);
+        }
         if let Some(picker) = &mut self.tool_picker_dialog {
             overlay_changed |= picker.handle_hover(col, row);
         }
@@ -6789,6 +6800,11 @@ impl HomeView {
                 return;
             }
         }
+        // The session-setup dialog has no text input. Settings takes keys before it, so
+        // a paste goes there when it's open.
+        if self.create_hook_failed.is_some() && self.settings_view.is_none() {
+            return;
+        }
         // Before send_message_dialog below: with the skills manager open and its editor
         // focused, a paste falling through would open a message dialog aimed at whatever
         // session was selected before the panel opened, rendering both overlays.
@@ -6911,9 +6927,7 @@ impl HomeView {
             return None;
         }
         // A structured agent has no tmux target, but its auxiliary terminal/tool panes do.
-        if inst.is_structured() && matches!(self.view_mode, ViewMode::Structured) {
-            return None;
-        }
+        self.live_key(&id)?;
         // Pick the target from the pane being previewed: Structured view to the agent
         // pane, Terminal view to the paired host or container terminal so 'm'/Tab compose
         // against the shell on screen, Tool view to the named tool's pane.
@@ -7128,7 +7142,7 @@ impl HomeView {
             self.selected_group,
             self.selected_group_profile,
         ) = selection;
-        self.flash_status("Live send ended: its session is hidden (y to show)");
+        self.flash_status("Live mode ended: its session is hidden (y to show)");
     }
 
     /// Tear down live-send state and restore the tmux window's automatic sizing:
@@ -7258,7 +7272,7 @@ impl HomeView {
             return false;
         };
         self.exit_live_send_and_restore_sizing(state);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        self.info_dialog = Some(InfoDialog::new("Live mode ended", reason));
         true
     }
 
@@ -7267,7 +7281,7 @@ impl HomeView {
             return false;
         };
         self.exit_live_send_and_restore_sizing(state);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+        self.info_dialog = Some(InfoDialog::new("Live mode ended", reason));
         true
     }
 
@@ -7297,21 +7311,50 @@ impl HomeView {
         if self.end_live_send_on_drift(&state) {
             return true;
         }
-        // Name the thief where the owner id is unambiguous: the web dashboard's live
-        // viewers register as `live-*` (src/server/live_ws.rs), other TUIs as `tui-*`.
-        let message = match crate::tmux::Session::from_name(&state.tmux_name).size_owner() {
-            Some((id, _)) if id.starts_with("live-") => {
-                "The web dashboard took over this session's live view."
-            }
-            Some((id, _)) if id.starts_with("tui-") => {
-                "Another aoe TUI took over this session's live view."
-            }
-            _ => "Another surface took over this session's live view.",
-        };
+        let owner = crate::tmux::Session::from_name(&state.tmux_name).size_owner();
+        let taker =
+            live_send::LiveTakeover::from_owner_id(owner.as_ref().map(|(id, _)| id.as_str()));
         self.teardown_live_send();
-        self.vt_yield = Some(state.tmux_name);
-        self.info_dialog = Some(InfoDialog::new("Live send ended", message));
+        self.note_live_takeover(live_send::TakenLive {
+            session_id: state.session_id,
+            tmux_name: state.tmux_name,
+            taker,
+        });
         true
+    }
+
+    /// A footer line, not a dialog: the live key takes control back. With the shortcut bar
+    /// hidden that line never shows, so a flash says the same once.
+    pub(super) fn note_live_takeover(&mut self, taken: live_send::TakenLive) {
+        if !self.show_shortcut_bar {
+            let label = taken.taker.label();
+            self.flash_status(match self.live_key(&taken.session_id) {
+                Some(LiveKey::Tab) => format!("{label}: Tab to take it back"),
+                Some(LiveKey::Enter) => format!("{label}: Enter to take it back"),
+                None => label.to_string(),
+            });
+        }
+        self.live_takeover = Some(taken);
+    }
+
+    /// The key that enters live mode on this Session's row, shared by Tab, `start_live_send`
+    /// and the takeover footer. None for a structured Session in Structured view, which has
+    /// no tmux pane there; its Terminal and Tool panes go live.
+    pub(super) fn live_key(&self, id: &str) -> Option<LiveKey> {
+        if matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .get_instance(id)
+                .is_some_and(|inst| inst.is_structured())
+        {
+            None
+        } else if matches!(
+            self.default_attach_mode(id),
+            Some(crate::session::AttachMode::LiveSend)
+        ) {
+            Some(LiveKey::Enter)
+        } else {
+            Some(LiveKey::Tab)
+        }
     }
 
     /// Open the shared permission-response dialog for the selected session.
@@ -7759,24 +7802,26 @@ impl HomeView {
     /// Continue session creation after agent hooks acknowledgment.
     /// Runs the repo hook trust check and then creates the session.
     fn continue_session_creation(&mut self, data: NewSessionData) -> Option<Action> {
-        use crate::session::TrustSurface;
-        let trust = match repo_config::check_repo_trust(std::path::Path::new(&data.path)) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
-                return self.create_session_with_hooks(data, RepoTrustDecision::Refuse);
-            }
-        };
+        self.review_creation_trust(data, false)
+    }
 
-        // The daemon recomputes this before it approves anything, so it pins the exact
-        // state the user is answering for; a fingerprint we cannot build can only refuse.
-        let fingerprint = match crate::session::config::profile_config::resolve_config(
-            &data.profile,
-        ) {
-            Ok(config) => repo_config::creation_trust_fingerprint(&config.hooks, &trust),
+    /// Reviews repository trust for `data`, prompting when needed, then submits it.
+    pub(super) fn review_creation_trust(
+        &mut self,
+        data: NewSessionData,
+        skip_on_create: bool,
+    ) -> Option<Action> {
+        use crate::session::TrustSurface;
+        // A fingerprint we cannot build can only refuse.
+        let (trust, fingerprint) = match creation_trust_review(&data) {
+            Ok(review) => review,
             Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to resolve trust review base: {}", e);
-                return self.create_session_with_hooks(data, RepoTrustDecision::Refuse);
+                tracing::warn!(target: "tui.input", "Failed to review repo trust: {e:#}");
+                return self.create_session_with_hooks(
+                    data,
+                    RepoTrustDecision::Refuse,
+                    skip_on_create,
+                );
             }
         };
 
@@ -7814,16 +7859,8 @@ impl HomeView {
         };
 
         if !trust.needs_prompt() {
-            // Already-trusted repository hooks are approved explicitly so the daemon runs
-            // them; an absent repository surface approves nothing but still pins the
-            // fingerprint the daemon validated against.
-            let decision = match &trust.hooks {
-                TrustSurface::Trusted(_) => RepoTrustDecision::Approve(Some(fingerprint)),
-                TrustSurface::NeedsTrust { .. } | TrustSurface::Absent => {
-                    RepoTrustDecision::Unpinned(Some(fingerprint))
-                }
-            };
-            return self.create_session_with_hooks(data, decision);
+            let decision = unprompted_trust_decision(&trust, fingerprint);
+            return self.create_session_with_hooks(data, decision, skip_on_create);
         }
 
         use crate::tui::dialogs::RepoTrustDialog;
@@ -7843,6 +7880,7 @@ impl HomeView {
         ));
         self.pending_repo_trust_data = Some(data);
         self.pending_repo_trust_fingerprint = Some(fingerprint);
+        self.pending_repo_trust_skip_on_create = skip_on_create;
         None
     }
 
@@ -7852,9 +7890,10 @@ impl HomeView {
         &mut self,
         data: NewSessionData,
         decision: RepoTrustDecision,
+        skip_on_create: bool,
     ) -> Option<Action> {
         let (trust_hooks, trust_review) = decision.into_request();
-        self.request_creation(data, trust_hooks, trust_review);
+        self.request_creation(data, trust_hooks, trust_review, skip_on_create);
         None
     }
 
@@ -7887,6 +7926,35 @@ impl HomeView {
     }
 }
 
+/// The repository trust state for `data` and the fingerprint the daemon recomputes before it
+/// approves anything, so a request pins the exact state the user answered for.
+pub(super) fn creation_trust_review(
+    data: &NewSessionData,
+) -> anyhow::Result<(
+    repo_config::RepoTrust,
+    crate::daemon::CreationTrustFingerprint,
+)> {
+    use anyhow::Context;
+    let trust = repo_config::check_repo_trust(std::path::Path::new(&data.path))
+        .context("checking repo trust")?;
+    let config = crate::session::config::profile_config::resolve_config(&data.profile)
+        .context("resolving the trust review base")?;
+    let fingerprint = repo_config::creation_trust_fingerprint(&config.hooks, &trust);
+    Ok((trust, fingerprint))
+}
+
+/// The answer when no prompt is needed: already-trusted repository hooks are approved so the
+/// daemon runs them; otherwise nothing is approved but the fingerprint still travels.
+pub(super) fn unprompted_trust_decision(
+    trust: &repo_config::RepoTrust,
+    fingerprint: crate::daemon::CreationTrustFingerprint,
+) -> RepoTrustDecision {
+    match &trust.hooks {
+        crate::session::TrustSurface::Trusted(_) => RepoTrustDecision::Approve(Some(fingerprint)),
+        _ => RepoTrustDecision::Unpinned(Some(fingerprint)),
+    }
+}
+
 /// The user's repository-trust answer, forwarded to the daemon that owns the approval.
 #[derive(Debug, Clone)]
 pub(super) enum RepoTrustDecision {
@@ -7900,7 +7968,7 @@ pub(super) enum RepoTrustDecision {
 
 impl RepoTrustDecision {
     /// The `(trust_hooks, trust_review)` pair the daemon creation request carries.
-    fn into_request(
+    pub(super) fn into_request(
         self,
     ) -> (
         Option<bool>,

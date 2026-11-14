@@ -1,15 +1,16 @@
 name: Release-plz
 
-# Tags `vX.Y.Z` when the release PR merges, and refreshes that PR daily or on dispatch;
-# release.yml takes it from the tag. Config: release-plz.toml. RELEASE_TOKEN is required
+# Tags `vX.Y.Z` when the release PR merges, and refreshes that PR on every push to main;
+# release.yml takes it from the tag. CI skips release PRs; the merge queue tests them. Config: release-plz.toml. RELEASE_TOKEN is required
 # because pushes and PRs made with GITHUB_TOKEN start no workflows (neither CI on the PR
 # nor release.yml on the tag).
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [closed]
     branches: [main]
-  # Not on push: every refresh force-pushes the release PR and dismisses its approvals.
   schedule:
     - cron: '17 6 * * *'
   workflow_dispatch:
@@ -29,6 +30,9 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       startsWith(github.event.pull_request.head.ref, 'release-plz-')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -50,7 +54,7 @@ jobs:
           MISSED="$(git log --oneline "$BASE..$MERGE~1")"
           if [ -n "$MISSED" ]; then
             echo "::warning title=Missing from CHANGELOG.md::$(echo "$MISSED" | wc -l) commit(s) merged after the release PR's last refresh are tagged but not in CHANGELOG.md. See the job summary."
-            { echo '### Tagged but missing from CHANGELOG.md'; echo '```'; echo "$MISSED"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            { echo '### Tagged but missing from CHANGELOG.md'; echo; echo "$MISSED" | sed 's/^/    /'; } >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Install Rust toolchain
@@ -63,12 +67,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
+      # The push that landed this release skipped its refresh.
+      - name: Refresh the release PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release-plz.yml --repo "$GITHUB_REPOSITORY" --ref main
+
   release-pr:
     name: Update release PR
+    # Skip a push that lands the release PR, even mid-batch: its version is not tagged yet.
+    # Tag release dispatches the refresh once it is.
     if: >-
       github.repository == 'agent-of-empires/agent-of-empires' &&
       github.event_name != 'pull_request' &&
-      github.ref == 'refs/heads/main'
+      github.ref == 'refs/heads/main' &&
+      !(github.event_name == 'push' && contains(toJSON(github.event.commits.*.message), 'chore: release v'))
     runs-on: ubuntu-latest
     # Never cancel: a cancelled run can leave the release PR half-updated.
     concurrency:

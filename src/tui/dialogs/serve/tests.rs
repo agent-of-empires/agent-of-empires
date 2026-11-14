@@ -51,6 +51,7 @@ fn active_state(mode: ServeMode) -> ServeViewState {
         }],
         url_index: 0,
         passphrase: (mode == ServeMode::Tunnel).then(|| "running daemon phrase".to_owned()),
+        funnel: crate::server::tunnel::FunnelReach::Ours,
         opened_at: Instant::now(),
         log_offset: 0,
     }
@@ -110,6 +111,7 @@ enum Held {
     Passphrase,
     ErrorContext,
     Active,
+    Access,
     Copy,
 }
 
@@ -128,6 +130,7 @@ fn operation(job: &Job) -> Held {
         Job::Passphrase => Held::Passphrase,
         Job::ErrorContext => Held::ErrorContext,
         Job::ObserveActive(_) => Held::Active,
+        Job::RefreshAccess(_) => Held::Access,
         Job::Copy(..) => Held::Copy,
     }
 }
@@ -264,7 +267,8 @@ fn a_timed_out_tailscale_launches_nothing_until_cloudflare_is_chosen() {
                 })
             ));
         } else {
-            view.handle_key(key('R'));
+            // No key: the open screen re-checks on its own.
+            view.tick();
             gate.entered(Held::Providers);
             gate.release(JobResult::Providers(Ready, NotInstalled));
             wait_for(&mut view, |view| view.pending.is_none());
@@ -511,21 +515,19 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
     for (held, code) in [
         (Held::Open, None),
         (Held::Picker, None),
-        (Held::Providers, Some('T')),
-        (Held::Providers, Some('R')),
-        (Held::Retry, Some('P')),
-        (Held::Reset, Some('R')),
-        (Held::Restart, Some('G')),
-        (Held::Restart, Some('R')),
-        (Held::Restart, Some('?')),
+        (Held::Providers, Some(KeyCode::Enter)),
+        (Held::Retry, Some(KeyCode::Char('P'))),
+        (Held::Reset, Some(KeyCode::Char('R'))),
+        (Held::Restart, Some(KeyCode::Char('G'))),
+        (Held::Restart, Some(KeyCode::Char('R'))),
+        (Held::Restart, Some(KeyCode::Char('?'))),
         (Held::Active, None),
     ] {
         let mut jobs = ServeJobs::default();
         let (submitter, gate) = gated(&mut jobs, held);
         let state = match (held, code) {
             (Held::Open, _) => ServeViewState::Checking { attempt: 1 },
-            (Held::Picker, _) | (Held::Providers, Some('T')) => picker_state(),
-            (Held::Providers, _) => confirm_state(),
+            (Held::Picker | Held::Providers, _) => picker_state(),
             (Held::Retry | Held::Reset, _) => error_state(),
             _ => active_state(ServeMode::Tunnel),
         };
@@ -550,13 +552,16 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
                     view.tick();
                 }
                 _ => {
-                    view.handle_key(key(code.unwrap()));
+                    view.handle_key(KeyEvent::from(code.unwrap()));
                 }
             }
             exercise_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             view.tick();
             assert!(matches!(
-                view.handle_key(key(code.filter(|_| held == Held::Restart).unwrap_or('x'))),
+                view.handle_key(KeyEvent::from(
+                    code.filter(|_| held == Held::Restart)
+                        .unwrap_or(KeyCode::Char('x'))
+                )),
                 ServeAction::Continue
             ));
             let buffer = crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
@@ -615,18 +620,20 @@ fn held_work_leaves_keys_clicks_ticks_and_render_usable() {
 
 #[test]
 #[serial_test::serial]
-fn refresh_replaces_old_results_and_mode_change_invalidates_assessment() {
+fn provider_screen_refreshes_in_the_background_and_yields_to_keys() {
     let _home = crate::session::test_support::isolate_app_dir();
     let mut jobs = ServeJobs::default();
     let (submitter, gate) = gated(&mut jobs, Held::Providers);
-    let mut view = ServeView::with_state(confirm_state(), submitter);
-    view.handle_key(key('R'));
-    gate.entered(Held::Providers);
-    view.handle_key(key('R'));
-    gate.release(JobResult::Providers(
-        TransportStatus::NotInstalled,
-        TransportStatus::NotInstalled,
-    ));
+    let mut view = ServeView::with_state(
+        ServeViewState::Confirm {
+            selected: TunnelTransport::Cloudflare,
+            tailscale: TransportStatus::NotInstalled,
+            cloudflare: TransportStatus::Ready,
+            flash: None,
+        },
+        submitter,
+    );
+    view.tick();
     gate.entered(Held::Providers);
     gate.release(JobResult::Providers(
         TransportStatus::Ready,
@@ -637,8 +644,6 @@ fn refresh_replaces_old_results_and_mode_change_invalidates_assessment() {
             view.state,
             ServeViewState::Confirm {
                 tailscale: TransportStatus::Ready,
-                cloudflare: TransportStatus::Ready,
-                flash: Some(_),
                 ..
             }
         )
@@ -647,25 +652,161 @@ fn refresh_replaces_old_results_and_mode_change_invalidates_assessment() {
         view.state,
         ServeViewState::Confirm {
             selected: TunnelTransport::Cloudflare,
+            flash: None,
             ..
         }
     ));
-    view.handle_key(key('R'));
+    view.tick();
+    assert!(view.pending.is_none(), "re-checked inside the interval");
+
+    view.providers_checked_at = Instant::now().checked_sub(PROVIDER_REFRESH);
+    view.tick();
     gate.entered(Held::Providers);
-    view.handle_key(key('L'));
+    view.handle_key(KeyEvent::from(KeyCode::Left));
+    assert!(view.pending.is_none(), "a key drops the re-check");
     gate.release(JobResult::Providers(
         TransportStatus::NotInstalled,
         TransportStatus::NotInstalled,
     ));
-    wait_for(&mut view, |view| {
+    view.tick();
+    assert!(view.pending.is_none(), "a key restarts the interval");
+    assert!(matches!(
+        view.state,
+        ServeViewState::Confirm {
+            selected: TunnelTransport::Tailscale,
+            tailscale: TransportStatus::Ready,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn only_the_open_provider_screen_queues_a_refresh() {
+    let stale = Instant::now().checked_sub(PROVIDER_REFRESH);
+    let fresh = Some(Instant::now());
+    let refreshing = |view: &ServeView| {
         matches!(
-            view.state,
-            ServeViewState::ModePicker {
-                selected: ServeMode::Local,
+            view.pending,
+            Some(PendingWork {
+                kind: PendingJob::ProvidersRefresh,
                 ..
-            }
+            })
         )
-    });
+    };
+    for (case, state, checked_at, queued) in [
+        ("never checked", confirm_state(), None, true),
+        ("checked just now", confirm_state(), fresh, false),
+        ("interval passed", confirm_state(), stale, true),
+        ("mode picker", picker_state(), stale, false),
+        ("error", error_state(), stale, false),
+        ("running", active_state(ServeMode::Tunnel), stale, false),
+    ] {
+        let mut view = ServeView::for_test(state);
+        view.providers_checked_at = checked_at;
+        view.tick();
+        assert_eq!(refreshing(&view), queued, "{case}");
+    }
+    // Leaving the screen with a re-check in flight cancels it, and none follows.
+    let mut view = ServeView::for_test(confirm_state());
+    view.tick();
+    assert!(refreshing(&view));
+    view.handle_key(key('T'));
+    assert!(!matches!(view.state, ServeViewState::Confirm { .. }));
+    view.providers_checked_at = stale;
+    view.tick();
+    assert!(!refreshing(&view));
+}
+
+#[test]
+fn each_key_on_the_pickers_means_one_thing() {
+    let local_picker = || ServeViewState::ModePicker {
+        selected: ServeMode::Local,
+        tunnel_available: true,
+        local_available: true,
+        flash: None,
+    };
+    let picked = |view: &ServeView| match view.state {
+        ServeViewState::ModePicker { selected, .. } => Some(selected),
+        _ => None,
+    };
+    for (code, want) in [
+        (KeyCode::Char('l'), Some(ServeMode::Tunnel)),
+        (KeyCode::Right, Some(ServeMode::Tunnel)),
+        (KeyCode::Tab, Some(ServeMode::Tunnel)),
+        (KeyCode::Char('L'), Some(ServeMode::Local)),
+        (KeyCode::Char('t'), Some(ServeMode::Local)),
+        (KeyCode::Char('T'), Some(ServeMode::Local)),
+    ] {
+        let mut view = ServeView::for_test(local_picker());
+        view.handle_key(KeyEvent::from(code));
+        assert_eq!(picked(&view), want, "{code:?}");
+        assert!(
+            view.pending.is_none() && view.pending_launch.is_none(),
+            "{code:?}"
+        );
+    }
+    let mut view = ServeView::for_test(picker_state());
+    view.handle_key(key('h'));
+    assert_eq!(picked(&view), Some(ServeMode::Local));
+
+    for code in ['r', 'R'] {
+        let mut view = ServeView::for_test(confirm_state());
+        view.handle_key(key(code));
+        assert!(view.pending.is_none(), "{code}");
+        assert!(
+            matches!(view.state, ServeViewState::Confirm { .. }),
+            "{code}"
+        );
+    }
+
+    // While the picker's own check runs, arrows and h/l preselect; letters do nothing.
+    for (code, want) in [
+        (KeyCode::Char('h'), Some(Some(ServeMode::Local))),
+        (KeyCode::Left, Some(Some(ServeMode::Local))),
+        (KeyCode::Char('l'), Some(Some(ServeMode::Tunnel))),
+        (KeyCode::Right, Some(Some(ServeMode::Tunnel))),
+        (KeyCode::Char('L'), Some(None)),
+        (KeyCode::Char('t'), Some(None)),
+    ] {
+        let mut view = ServeView::for_test(picker_state());
+        view.request_picker(None);
+        view.handle_key(KeyEvent::from(code));
+        let preselected = match &view.pending {
+            Some(PendingWork {
+                kind: PendingJob::Picker { selected },
+                ..
+            }) => Some(*selected),
+            _ => None,
+        };
+        assert_eq!(preselected, want, "{code:?}");
+    }
+
+    // While the provider check runs, R and L do nothing.
+    for code in ['r', 'R', 'L'] {
+        let mut view = ServeView::for_test(picker_state());
+        view.request(
+            Job::Providers,
+            PendingJob::Providers {
+                selected: None,
+                failed: None,
+            },
+        );
+        view.handle_key(key(code));
+        assert!(
+            matches!(
+                view.pending,
+                Some(PendingWork {
+                    kind: PendingJob::Providers { .. },
+                    ..
+                })
+            ),
+            "{code}"
+        );
+        assert!(
+            matches!(view.state, ServeViewState::ModePicker { .. }),
+            "{code}"
+        );
+    }
 }
 
 #[test]
@@ -743,6 +884,7 @@ fn every_pending_state_leaves_a_closed_worker() {
         (Held::ErrorContext, Some('P')),
         (Held::ErrorContext, Some('R')),
         (Held::Active, None),
+        (Held::Access, None),
         (Held::Copy, None),
     ] {
         let mut view = ServeView::for_test(if held == Held::ErrorContext {
@@ -765,7 +907,6 @@ fn every_pending_state_leaves_a_closed_worker() {
                 PendingJob::Providers {
                     selected: None,
                     failed: None,
-                    refreshed: true,
                 },
             ),
             Held::Retry => (
@@ -815,6 +956,7 @@ fn every_pending_state_leaves_a_closed_worker() {
                 },
             ),
             Held::Active => (Job::ObserveActive(Some(target)), PendingJob::Active),
+            Held::Access => (Job::RefreshAccess(target), PendingJob::Access),
             Held::Copy => (Job::Copy("URL", "fixture".to_owned()), PendingJob::Copy),
             Held::Stop => panic!("App-owned stop has no view pending state"),
         };
@@ -858,6 +1000,7 @@ fn a_liveness_result_cannot_beat_a_published_url() {
             } else {
                 Vec::new()
             },
+            funnel: crate::server::tunnel::FunnelReach::Ours,
             passphrase: None,
             log_offset: 0,
             tail: Default::default(),
@@ -1587,6 +1730,7 @@ fn open_uses_current_credentials_without_saved_default_fallback() {
                 let changed = view.tick();
                 if let ServeViewState::Active {
                     passphrase: Some(passphrase),
+                    funnel: crate::server::tunnel::FunnelReach::Ours,
                     opened_at: current_opened_at,
                     ..
                 } = &view.state
@@ -2458,7 +2602,8 @@ async fn launch_control_preserves_observed_absence_after_fresh_start_refusal() {
         let mut jobs = ServeJobs::default();
         let mut view = ServeView::settled(&mut jobs);
         assert!(matches!(view.state, ServeViewState::ModePicker { .. }));
-        view.handle_key(key('T'));
+        view.handle_key(KeyEvent::from(KeyCode::Right));
+        view.handle_key(KeyEvent::from(KeyCode::Enter));
         wait_for(&mut view, |view| {
             matches!(view.state, ServeViewState::Confirm { .. })
         });
@@ -2533,4 +2678,224 @@ async fn launch_control_preserves_observed_absence_after_fresh_start_refusal() {
             remove_app_file(name);
         }
     }
+}
+
+#[test]
+#[serial_test::serial]
+fn active_rereads_urls_and_funnel_state_and_keeps_the_selection() {
+    use crate::server::tunnel::FunnelReach;
+    let _home = crate::session::test_support::isolate_app_dir();
+    let app = crate::session::get_app_dir().unwrap();
+    let mut daemon = TestDaemon::new();
+    let target = daemon.publish();
+    std::fs::write(app.join("serve.mode"), "tailscale").unwrap();
+    let publish = |token: &str, lost: Option<&str>| {
+        match lost {
+            Some(marker) => std::fs::write(app.join("serve.funnel"), marker).unwrap(),
+            None => remove_app_file("serve.funnel"),
+        }
+        let loopback = format!("http://127.0.0.1:8080/?token={token}");
+        let urls = match lost {
+            Some(_) => format!("{loopback}\n"),
+            None => format!("https://node.ts.net/?token={token}\nlocalhost\t{loopback}\n"),
+        };
+        std::fs::write(app.join("serve.url"), urls).unwrap();
+    };
+    let selected = |view: &ServeView| match &view.state {
+        ServeViewState::Active {
+            urls,
+            url_index,
+            funnel,
+            ..
+        } => (urls[*url_index].url.clone(), *funnel),
+        _ => panic!("left Active"),
+    };
+    // Makes the next tick due for a re-read without waiting out the interval.
+    let make_due = |view: &mut ServeView| {
+        let past = Instant::now() - ACCESS_REFRESH;
+        view.access_checked_at = Some(past);
+        if let ServeViewState::Active { opened_at, .. } = &mut view.state {
+            *opened_at = past;
+        }
+    };
+    let reread = |view: &mut ServeView| {
+        make_due(view);
+        let due = view.access_checked_at;
+        wait_for(view, |view| view.access_checked_at != due);
+    };
+
+    publish("a", None);
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), jobs.submitter());
+    view.target = Some(target);
+    if let ServeViewState::Active { transport, .. } = &mut view.state {
+        *transport = Some(TunnelTransport::Tailscale);
+    }
+    reread(&mut view);
+    let localhost = "http://127.0.0.1:8080/?token=a".to_owned();
+    if let ServeViewState::Active { url_index, .. } = &mut view.state {
+        *url_index = 1;
+    }
+    assert_eq!(selected(&view), (localhost.clone(), FunnelReach::Ours));
+
+    // Unchanged files keep the selection.
+    reread(&mut view);
+    assert_eq!(selected(&view), (localhost, FunnelReach::Ours));
+
+    // A rotated token keeps the same labelled URL selected.
+    publish("b", None);
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        (
+            "http://127.0.0.1:8080/?token=b".to_owned(),
+            FunnelReach::Ours
+        )
+    );
+
+    // A takeover, then an unanswered status, then the Funnel back.
+    for (marker, want) in [
+        (Some("lost\n"), FunnelReach::Lost),
+        (Some("unknown\n"), FunnelReach::Unknown),
+    ] {
+        publish("b", marker);
+        reread(&mut view);
+        assert_eq!(
+            selected(&view),
+            ("http://127.0.0.1:8080/?token=b".to_owned(), want)
+        );
+    }
+    publish("b", None);
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        ("https://node.ts.net/?token=b".to_owned(), FunnelReach::Ours)
+    );
+
+    // A read between the daemon's two writes: no marker yet, but the loopback-only URL.
+    std::fs::write(app.join("serve.url"), "http://127.0.0.1:8080/?token=b\n").unwrap();
+    reread(&mut view);
+    assert_eq!(selected(&view).1, FunnelReach::Unknown);
+
+    // A marker that exists but can't be read isn't taken as ours.
+    publish("b", None);
+    std::fs::create_dir(app.join("serve.funnel")).unwrap();
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        (
+            "https://node.ts.net/?token=b".to_owned(),
+            FunnelReach::Unknown
+        )
+    );
+    std::fs::remove_dir(app.join("serve.funnel")).unwrap();
+
+    // A marker caught mid-write (empty) beside the old Funnel URL isn't taken as ours.
+    std::fs::write(app.join("serve.funnel"), "").unwrap();
+    reread(&mut view);
+    assert_eq!(
+        selected(&view),
+        (
+            "https://node.ts.net/?token=b".to_owned(),
+            FunnelReach::Unknown
+        )
+    );
+    remove_app_file("serve.funnel");
+
+    // Right after a re-read, ticks only observe the log until the interval passes.
+    for _ in 0..50 {
+        view.tick();
+        assert!(
+            !view
+                .pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.kind, PendingJob::Access)),
+            "re-read before the interval"
+        );
+    }
+
+    // A Local daemon has no Funnel, whatever a stale file says.
+    publish("b", Some("lost\n"));
+    std::fs::write(app.join("serve.mode"), "local").unwrap();
+    view.state = active_state(ServeMode::Local);
+    reread(&mut view);
+    assert_eq!(selected(&view).1, FunnelReach::Ours);
+}
+
+/// Reattach and a launch build Active through `running`, so a loopback-only Tunnel URL
+/// read before the marker reads as unknown there too, not only after a re-read.
+#[test]
+fn running_shows_the_same_funnel_reach_as_a_reread() {
+    let url = |url: &str| ServeUrl {
+        label: None,
+        url: url.to_owned(),
+    };
+    // (mode, published URL, marker read, shown)
+    for (mode, published, read, want) in [
+        (
+            ServeMode::Tunnel,
+            "http://127.0.0.1:8080/?token=t",
+            FunnelReach::Ours,
+            FunnelReach::Unknown,
+        ),
+        (
+            ServeMode::Tunnel,
+            "https://node.ts.net/?token=t",
+            FunnelReach::Ours,
+            FunnelReach::Ours,
+        ),
+        (
+            ServeMode::Tunnel,
+            "http://127.0.0.1:8080/?token=t",
+            FunnelReach::Lost,
+            FunnelReach::Lost,
+        ),
+        (
+            ServeMode::Local,
+            "http://127.0.0.1:8080/?token=t",
+            FunnelReach::Lost,
+            FunnelReach::Ours,
+        ),
+    ] {
+        let state = ServeViewState::running(mode, None, None, vec![url(published)], read, 0);
+        let ServeViewState::Active { funnel, .. } = state else {
+            panic!("{mode:?} {published}: not Active");
+        };
+        assert_eq!(funnel, want, "{mode:?} {published} {read:?}");
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn a_key_drops_a_pending_access_reread_and_restarts_its_interval() {
+    let _home = crate::session::test_support::isolate_app_dir();
+    let mut daemon = TestDaemon::new();
+    let target = daemon.publish();
+    let mut jobs = ServeJobs::default();
+    let (submitter, gate) = gated(&mut jobs, Held::Access);
+    let mut view = ServeView::with_state(active_state(ServeMode::Tunnel), submitter);
+    view.target = Some(target);
+    let past = Instant::now() - ACCESS_REFRESH;
+    view.access_checked_at = Some(past);
+    if let ServeViewState::Active { opened_at, .. } = &mut view.state {
+        *opened_at = past;
+    }
+    view.tick();
+    gate.entered(Held::Access);
+    view.handle_key(KeyEvent::from(KeyCode::Down));
+    assert!(view.pending.is_none());
+    let restarted = view.access_checked_at.expect("the key stamps the interval");
+    assert!(restarted > past);
+    gate.release(JobResult::Access(None));
+    for _ in 0..50 {
+        view.tick();
+        assert!(
+            !view
+                .pending
+                .as_ref()
+                .is_some_and(|pending| matches!(pending.kind, PendingJob::Access)),
+            "re-read before the restarted interval"
+        );
+    }
+    assert_eq!(view.access_checked_at, Some(restarted));
 }

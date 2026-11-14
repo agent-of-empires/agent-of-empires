@@ -9,7 +9,7 @@ use super::{
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{BackgroundAgentStatus, Event};
+use crate::acp::state::{BackgroundAgentStatus, Event, SubagentState};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
@@ -18,7 +18,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
     pub fn publish_startup_error(&self, session_id: &str, message: String) {
-        self.publish_next(session_id, &Event::AgentStartupError { message });
+        self.publish_next(session_id, &Event::startup_error(message));
     }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
@@ -260,6 +260,9 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
             },
         );
     }
+    for event in cancelled_open_subagents(sink, session_id) {
+        publish_next_persisted(sink, next_seqs, session_id, &event);
+    }
     let stale_ids = sink.unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
         return;
@@ -273,6 +276,22 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
     for agent_id in stale_ids {
         publish_background_agent_detached(sink, next_seqs, session_id, agent_id, warning);
     }
+}
+
+/// A dead worker's working subagents will never report their idle, so each
+/// closes as cancelled.
+pub(super) fn cancelled_open_subagents<S: BroadcastSink>(sink: &S, session_id: &str) -> Vec<Event> {
+    sink.open_subagents(session_id)
+        .into_iter()
+        .map(|mut subagent| {
+            subagent.state = SubagentState::Idle;
+            subagent.stop_reason = Some("cancelled".into());
+            Event::SubagentUpdated {
+                subagent,
+                at: chrono::Utc::now(),
+            }
+        })
+        .collect()
 }
 
 fn publish_background_agent_detached<S: BroadcastSink>(

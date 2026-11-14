@@ -414,13 +414,12 @@ export function useTranscriptScroll({
     let raf = 0;
     const start = performance.now();
     const pin = () => {
-      vp.scrollTop = vp.scrollHeight;
-      lastScrollTopRef.current = vp.scrollTop;
+      pinToBottom("instant");
       if (performance.now() - start < 500) raf = requestAnimationFrame(pin);
     };
     raf = requestAnimationFrame(pin);
     return () => cancelAnimationFrame(raf);
-  }, [keyboardOpen, composerCollapsed]);
+  }, [keyboardOpen, composerCollapsed, pinToBottom]);
 
   return {
     viewportRef,
