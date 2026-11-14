@@ -11,6 +11,7 @@ import { ArrowJoystick } from "./ArrowJoystick";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { invalidateRetainedImeContext } from "../lib/mobileKeyboardProxy";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
+import { SessionErrorPanel } from "./SessionErrorPanel";
 import { ensureSession, ensureTerminal, isStartRefusal, pasteImage } from "../lib/api";
 import { armClipboardWrite, writeClipboard } from "../lib/clipboard";
 import type { ArmedClipboardWrite } from "../lib/clipboard";
@@ -72,6 +73,15 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const [ensureError, setEnsureError] = useState<string | null>(null);
   // An archived or trashed session stays refused until unarchived or restored, so Retry is pointless.
   const [ensureRetryable, setEnsureRetryable] = useState(true);
+  // A launch (a Restart's included) holds the lifecycle reservation while the row reads Starting, and refuses an
+  // ensure sent meanwhile; that ensure is sent again once the Session leaves Starting.
+  const [ensureAfterStart, setEnsureAfterStart] = useState(false);
+  // An Error Session isn't started on open, which would clear the error it reports (#5055); Restart starts it.
+  const errored = surface === "agent" && session.status === "Error";
+  // One deleted from the panel keeps it, without Restart.
+  const [wasErrored, setWasErrored] = useState(errored);
+  if (errored !== wasErrored && (errored || session.status !== "Deleting")) setWasErrored(errored);
+  const errorHeld = errored || (wasErrored && session.status === "Deleting");
   const clipboardArmRef = useRef<ArmedClipboardWrite | null>(null);
   const receiveAgentClipboard = useCallback((text: string) => {
     const armed = clipboardArmRef.current;
@@ -114,7 +124,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   }, [stripCollapseKey]);
   // Read-only live routes observe existing panes; their backend fences forbid creation, claims and resizing.
   const live = useLiveTerminal(
-    readOnly || ensureState === "ready" ? session.id : null,
+    !errorHeld && (readOnly || ensureState === "ready") ? session.id : null,
     readOnly,
     wsPath,
     receiveAgentClipboard,
@@ -125,11 +135,28 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
   const [inputFocused, setInputFocused] = useState(false);
-  const policyRef = useRef({ readOnly, sessionId: session.id, surface, terminalIndex });
+  const awaitingStart = ensureAfterStart && session.status === "Starting";
+  const policyRef = useRef({
+    readOnly,
+    errorHeld,
+    awaitingStart,
+    status: session.status,
+    sessionId: session.id,
+    surface,
+    terminalIndex,
+  });
   useLayoutEffect(() => {
-    policyRef.current = { readOnly, sessionId: session.id, surface, terminalIndex };
+    policyRef.current = {
+      readOnly,
+      errorHeld,
+      awaitingStart,
+      status: session.status,
+      sessionId: session.id,
+      surface,
+      terminalIndex,
+    };
     if (readOnly) inputRef.current?.blur();
-  }, [readOnly, session.id, surface, terminalIndex]);
+  }, [readOnly, errorHeld, awaitingStart, session.status, session.id, surface, terminalIndex]);
   useLayoutEffect(
     () => () => {
       policyRef.current.readOnly = true;
@@ -349,6 +376,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     ensureRequestRef.current = controller;
     setEnsureError(null);
     setEnsureState("pending");
+    setEnsureAfterStart(false);
+    const sentWhileStarting = policy.status === "Starting";
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
@@ -360,6 +389,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
           lastEnsuredSessionIdRef.current = session.id;
           setEnsureWarning(res.message ?? null);
           setEnsureState("ready");
+        } else if (res.error === "lifecycle_busy" && sentWhileStarting) {
+          setEnsureAfterStart(true);
         } else {
           setEnsureState("error");
           setEnsureError(res.message ?? "Could not start session.");
@@ -375,13 +406,24 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     const policy = policyRef.current;
-    if (policy.readOnly) return;
+    if (policy.readOnly || policy.errorHeld || policy.awaitingStart) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
       if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
       return;
     }
     retryEnsure();
-  }, [session.id, shelved, readOnly, focusSelf, focusTarget, focusIndex, retryEnsure]);
+  }, [
+    session.id,
+    shelved,
+    readOnly,
+    errorHeld,
+    ensureAfterStart,
+    awaitingStart,
+    focusSelf,
+    focusTarget,
+    focusIndex,
+    retryEnsure,
+  ]);
 
   // Drain a pending focus latch once the pane is mounted.
   useEffect(() => {
@@ -434,6 +476,8 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     if (inputFocused) ta.blur();
     else ta.focus();
   }, [inputFocused]);
+
+  if (errorHeld) return <SessionErrorPanel session={session} readOnly={readOnly} />;
 
   if (!readOnly && ensureState === "pending") {
     return (

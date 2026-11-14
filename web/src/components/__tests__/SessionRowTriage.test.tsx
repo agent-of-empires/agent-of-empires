@@ -514,4 +514,39 @@ describe("SessionRow mark tooltips", () => {
       expect(screen.getByRole("tooltip").textContent, JSON.stringify(over)).toContain(tip);
     }
   });
+
+  // An Error Session second in its row: the row reads the Session whose status it shows.
+  const pair = (over: Partial<SessionResponse>) =>
+    over.status === "Error"
+      ? makeWorkspace("w", [
+          makeSession({ id: "a", status: "Stopped", last_error: "stale" }),
+          makeSession({ id: "b", ...over }),
+        ])
+      : ws(over);
+  it.each<[string, Partial<SessionResponse>, string, string | null]>([
+    [
+      "a recorded error",
+      { status: "Error", last_error: "\nresume failed\nsecond" },
+      "Errorresume failed",
+      "resume failed",
+    ],
+    ["no recorded error", { status: "Error", last_error: null }, "Error · no details recorded", null],
+    [
+      "a Structured view error",
+      { status: "Error", last_error: "resume failed", view: "structured" },
+      "Error: the Session failed; also shown while deleting",
+      null,
+    ],
+    ["Deleting", { status: "Deleting", last_error: "resume failed" }, "Deleting…", null],
+  ])("glyph tooltip and description: %s", (_name, over, tip, described) => {
+    renderRow(pair(over));
+    const glyph = testId("sidebar-status-glyph")!;
+    fireEvent.pointerEnter(glyph, { pointerType: "mouse" });
+    expect(screen.getByRole("tooltip").textContent).toBe(tip);
+    // Only a recorded error's line wraps.
+    expect(screen.getByRole("tooltip").classList.contains("whitespace-normal")).toBe(described !== null);
+    const describedBy = glyph.getAttribute("aria-describedby");
+    expect(describedBy ? document.getElementById(describedBy)?.textContent : null).toBe(described);
+    if (over.status === "Error") expect(glyph.getAttribute("aria-label")).toBe("Error · needs attention (error)");
+  });
 });
