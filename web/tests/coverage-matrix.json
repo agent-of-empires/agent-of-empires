@@ -627,7 +627,8 @@
         "web/src/lib/api.ts",
         "web/src/index.css",
         "src/tui/styles/resolved.rs"
-      ]
+      ],
+      "notes": "Browser: the theme picker repaints and persists across reload and serve restart. The derived colour variables are pinned in Rust, not the browser: builtins_clear_contrast_floors covers the built-in themes, and a_lift_that_cannot_clear_every_surface_keeps_the_best_worst_case covers a custom theme whose surfaces straddle mid-grey, where no lift step clears every surface and the step with the best worst-surface contrast is kept."
     },
     {
       "id": "settings.plugin-settings",
@@ -723,14 +724,8 @@
       "id": "settings.telemetry-consent",
       "kind": "vitest",
       "risk": "medium",
-      "specs": [
-        "src/components/settings/__tests__/TelemetrySettings.test.tsx",
-        "src/components/__tests__/TelemetryConsentModal.test.tsx"
-      ],
-      "components": [
-        "web/src/components/settings/TelemetrySettings.tsx",
-        "web/src/components/TelemetryConsentModal.tsx"
-      ]
+      "specs": ["src/components/settings/__tests__/TelemetrySettings.test.tsx"],
+      "components": ["web/src/components/settings/TelemetrySettings.tsx"]
     },
     {
       "id": "settings.logs-tab",
@@ -864,11 +859,12 @@
       ]
     },
     {
-      "id": "settings.tui-shortcut-bar",
+      "id": "settings.tui-only-toggles",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/settings-persistence.spec.ts"],
-      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"]
+      "components": ["web/src/components/SettingsView.tsx", "web/src/components/settings/SchemaSection.tsx"],
+      "notes": "The Terminal UI fold's Shortcut bar and Show Structured view badge switches default on, save off, and stay off after reload and restart. Shortcut bar is global-only: it saves machine-wide and a profile override is refused. Show Structured view badge is profile-overridable: the switch writes a profile override while the machine layer keeps the default."
     },
     {
       "id": "settings.tmux-persistence",
@@ -1327,7 +1323,8 @@
         "src/lib/api.test.ts",
         "src/components/session-wizard/__tests__/CreateFailureBox.test.tsx",
         "src/components/session-wizard/createFailureView.test.ts",
-        "src/components/__tests__/Toasts.test.tsx"
+        "src/components/__tests__/Toasts.test.tsx",
+        "src/hooks/__tests__/useWizardReopen.test.tsx"
       ],
       "components": [
         "web/src/components/DirectoryBrowser.tsx",
@@ -1346,9 +1343,10 @@
         "web/src/components/session-wizard/steps/LaunchFields.tsx",
         "web/src/components/session-wizard/CreateFailureBox.tsx",
         "web/src/components/session-wizard/createFailureView.ts",
-        "web/src/components/Toasts.tsx"
+        "web/src/components/Toasts.tsx",
+        "web/src/hooks/app/useWizardReopen.ts"
       ],
-      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box; an adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
+      "notes": "The View row is a Structured view | Terminal view radio group: arrow keys move the selection, Structured view is disabled with the reason for an agent that can't run it, and with \"ACP adapter not installed\" when the /api/agents row for the selected Profile and project (path, or scratch) has acp_create_ready false, Sandbox is off and there is no command override, so a project whose repository hook installs the adapter stays Structured; a list fetched for another project leaves Structured available until the new project's answer arrives, except for an agent that only the repository's agent_detect_as makes ACP-capable, and the create's acp_adapter_missing refusal shows its message in the error box; acp_create_ready true counts as ACP-capable unless acp_allowed is false; at 375px the summary wraps under the label and segments, and Launch without Sandbox with no host adapter focuses Terminal view in view without sending. The Yolo mode row says what each value does and is locked on for an Agent whose /api/agents?profile= row for the selected Profile has always_yolo (Terminal view) or acp_always_yolo (Structured view), so a custom agent with its own adapter and an always-Yolo base locks only in Terminal view; the create sends the user's value and the server forces it; until /api/agents answers for that Profile (retried on failure) the row promises neither value and Launch waits, and a list loaded for another Profile is not used; a 404 profile_not_found is not retried and the footer asks for another Profile, with the Profile row shown even when only one is left; the unavailable Sandbox names the configured Container runtime from /api/docker/status. A refused create shows a box with its title, failed step, one recovery action per code and its reference, outlines the row it blames, and takes focus; Retry re-reads /api/docker/status, and every relaunch, Launch without Sandbox included, uses a new idempotency key. A failed on_create hook also offers Create without setup, which resends that once with skip_on_create under a new key, and closes the wizard on a 201. A background refusal toasts with Reopen, which stays until used or dismissed, stays in view when the toasts overflow the column, and restores the form as sent and the box, with the hook output the create printed after the wizard closed; while another wizard is open, Reopen asks to close it first and the toast stays. A backgrounded create polls its progress only until it settles. An adopted create toasts plainly. A reopened wizard sends its own form, never another wizard's unresolved create, shows an agent-list error beside the box, and applies only the newest runtime check."
     },
     {
       "id": "wizard.structured-view-exposure",
@@ -1473,6 +1471,23 @@
         "web/src/lib/registeredProjects.ts",
         "web/src/lib/api.ts"
       ]
+    },
+    {
+      "id": "wizard.sandbox-image-status",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/useSandboxImageRowStatus.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/useSandboxImageRowStatus.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "With Sandbox on and available, the row leads with /api/sandbox/image-status for the image the wizard will use (sandboxImage, seeded from the Profile's sandbox.default_image; empty asks for the default): Update available, Up to date, Couldn't check for updates (check_failed), Downloads on launch (unknown with reason not_pulled), and Update status unknown for any other unknown reason, a refusal such as unknown_image for an edited image that isn't configured, or no answer; then ' · <image>'. The first answered check of an opening sends fresh=true; an edit waits 500 ms after the last keystroke and asks from the cache, and a late answer for a previous image is dropped. Off, blocked or before the Profile's defaults settle, the row asks nothing. At 375px the status stays whole and only the image truncates."
     },
     {
       "id": "wizard.agent-lifecycle",
@@ -1859,6 +1874,14 @@
         "web/src/components/sidebar/SidebarGroupHeader.tsx",
         "web/src/components/sidebar/GroupLists.tsx"
       ]
+    },
+    {
+      "id": "sidebar.label-contrast",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-chrome.spec.ts"],
+      "components": ["web/src/components/sidebar/SessionRow.tsx"],
+      "notes": "Archived and snoozed Idle labels retain italic styling and full effective opacity so their theme text contrast is preserved."
     },
     {
       "id": "sidebar.compact-mode",
@@ -3235,12 +3258,13 @@
       "id": "acp.background-agents",
       "kind": "vitest",
       "risk": "medium",
-      "notes": "Includes Claude Workflow runs: agents grouped by run and phase in the pane, and the Workflow tool card.",
+      "notes": "The Background pane: shells and sub-agents filtered by kind and grouped Running and Recent, a child's detail built from the same rows as its thread card, and Claude Workflow runs grouped by run and phase.",
       "specs": [
         "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
         "src/lib/acpTypes.reducer.test.ts",
         "src/components/acp/ToolCards.render.test.tsx",
         "src/components/acp/subagents/activityFold.test.ts",
+        "src/components/acp/subagents/model.test.ts",
         "src/components/acp/subagents/longText.test.ts",
         "tests/acp-subagent-view-mobile.spec.ts"
       ],
@@ -3628,6 +3652,24 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/SessionRowTriage.test.tsx", "src/lib/__tests__/switchAgentTrigger.test.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/acp/Composer.tsx"]
+    },
+    {
+      "id": "acp.switch-account",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-usage-limit.spec.ts",
+        "src/components/acp/SwitchAccountModal.test.tsx",
+        "src/components/acp/UsageLimitBanner.test.tsx",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/SwitchAccountModal.tsx",
+        "web/src/components/acp/UsageLimitBanner.tsx",
+        "web/src/components/sidebar/SessionRowMenu.tsx",
+        "web/src/lib/switchAccountTrigger.ts"
+      ]
     },
     {
       "id": "acp.switch-view-ui",
@@ -4135,8 +4177,12 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/acp/__tests__/StartupErrorScreen.test.tsx", "tests/acp-startup-error-screen.spec.ts"],
-      "components": ["web/src/components/acp/StartupErrorScreen.tsx", "web/src/components/acp/RecoveryActionRow.tsx"],
-      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states."
+      "components": [
+        "web/src/components/acp/StartupErrorScreen.tsx",
+        "web/src/components/acp/RecoveryActionRow.tsx",
+        "web/src/components/sidebar/RecreateContainerDialog.tsx"
+      ],
+      "notes": "Steps follow install-info: installs allowed, read-only or CityHall, sandboxed, a stopped container (whose manual steps start with Check again, which starts it), npm-installable. Re-reads it on focus so a setting turned on in the TUI unlocks Update; the in-container command comes from the Daemon. Descriptive text uses text-text-subtle, with no text-text-secondary or text-text-dim classes, asserted across install-off, allowed, sandboxed, non-npm and protocol states. A sandboxed Session the Session menu could recreate (shared canRecreateContainer) gets Recreate container in every state once install-info confirms the Sandbox, never on read-only or CityHall; it opens the menu's confirmation, which fits at 375px, and Details describes it in the dialog's terms only where it's offered."
     },
     {
       "id": "acp.startup-error-banner",
@@ -4162,7 +4208,59 @@
         "web/src/components/acp/adapterRecovery.ts",
         "web/src/App.tsx"
       ],
-      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. A retry failing with the same cause, after spawn failed: or restart spawn failed: and any reason code, reads as the same error. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
+      "notes": "Retry restarts through /acp/restart while a Worker is present and spawns through /acp/spawn when it is absent. What follows a Retry is in acp.startup-error-banner-retry-same-cause and -changed-cause. When a restart from the startup line stopped a sent message, also when its answer arrives after the startup error, the banner says to send it again."
+    },
+    {
+      "id": "acp.startup-error-banner-retry-same-cause",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-startup-error-banner.spec.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/acp/startupWait.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/adapterRecovery.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error that ends the Retry with the same cause, after spawn failed: or restart spawn failed: and any reason code, brings the banner back as <Agent> still couldn't start with Same error as before., then the cause's own fix and actions. A refused Retry request fails the same way without its HTTP status. A reload, or a later error with no Retry, reads as a first failure again."
+    },
+    {
+      "id": "acp.startup-error-banner-retry-changed-cause",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-startup-error-banner.spec.ts",
+        "src/components/acp/__tests__/SessionBanners.test.tsx",
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/hooks/acpSession/reducer.test.ts",
+        "src/components/acp/startupWait.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/StartupErrorBanner.tsx",
+        "web/src/components/acp/SessionBanners.tsx",
+        "web/src/components/acp/startupWait.ts",
+        "web/src/components/acp/adapterRecovery.ts",
+        "web/src/hooks/acpSession/reducer.ts",
+        "web/src/hooks/acpSession/stateCache.ts",
+        "web/src/lib/acpTypes.ts"
+      ],
+      "notes": "Retry, and Install and retry once its install succeeds, replace the banner with the startup line (Starting <Agent>\u2026, with its elapsed count and Restart after 30s), also for a Session that ran before, and never show both; the Agent starting ends the line and shows the transcript. A startup error, or a refused Retry request, with a different cause brings the banner back as <Agent> still couldn't start with It failed differently this time: and the new cause's first line, then the new cause's fix and actions. Details hold the full error with Copy."
+    },
+    {
+      "id": "acp.empty-state-not-running",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/acp-startup-error-banner.spec.ts", "tests/acp-structured-view.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"],
+      "notes": "An empty transcript under a startup error says <Agent> isn't running. and, during a Retry, <Agent> isn't running yet., with no starter prompts either way; the hint and starter prompts come back once the Agent starts. Archived and trashed Sessions show neither."
     },
     {
       "id": "acp.startup-error-banner-live",
@@ -5307,6 +5405,14 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.created-without-setup-chip",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
+      "components": ["web/src/components/sidebar/RowBadges.tsx"],
+      "notes": "A row with a Session that has created_without_setup (a collapsed group row if any of its Sessions does) shows a muted \"Created without setup\" icon-only chip, labelled for hover and screen readers; an untagged row shows none."
+    },
+    {
       "id": "sidebar.session-new-session",
       "kind": "vitest",
       "risk": "medium",
@@ -5451,25 +5557,50 @@
       ]
     },
     {
-      "id": "onboarding.theme-welcome",
+      "id": "onboarding.setup-wizard",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/theme-onboarding.spec.ts"],
+      "specs": ["tests/setup-wizard.spec.ts"],
       "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx",
+        "web/src/App.tsx",
+        "web/src/components/Dashboard.tsx",
+        "web/src/components/setup/SetupWizardPage.tsx",
+        "web/src/components/setup/SetupRail.tsx",
+        "web/src/components/setup/SetupBanner.tsx",
+        "web/src/components/setup/ui.tsx",
+        "web/src/components/setup/steps/ThemeTelemetryStep.tsx",
+        "web/src/components/setup/steps/AgentsStep.tsx",
+        "web/src/hooks/useSetupStatus.ts",
         "web/src/hooks/useThemeMutation.ts",
+        "web/src/lib/setup.ts",
         "web/src/lib/api.ts"
       ]
     },
     {
-      "id": "onboarding.theme-welcome-unit",
+      "id": "onboarding.setup-unit",
       "kind": "vitest",
-      "risk": "low",
-      "specs": ["src/components/onboarding/__tests__/ThemeIntro.test.tsx", "src/lib/__tests__/onboarding.test.ts"],
+      "risk": "medium",
+      "specs": [
+        "src/lib/__tests__/setup.test.ts",
+        "src/components/setup/__tests__/SetupBanner.test.tsx",
+        "src/components/setup/__tests__/SetupWizardPage.test.tsx",
+        "src/components/setup/__tests__/SandboxStep.test.tsx",
+        "src/components/setup/__tests__/AgentsStep.test.tsx",
+        "src/components/setup/__tests__/ThemeTelemetryStep.test.tsx",
+        "src/hooks/__tests__/useInlineMachineSave.test.ts",
+        "src/hooks/__tests__/useSetupStatus.test.ts"
+      ],
       "components": [
-        "web/src/components/onboarding/ThemeIntro.tsx",
-        "web/src/hooks/useThemeMutation.ts",
-        "web/src/lib/themeWrites.ts"
+        "web/src/components/setup/SetupWizardPage.tsx",
+        "web/src/components/setup/SetupBanner.tsx",
+        "web/src/components/setup/SetupElevationBar.tsx",
+        "web/src/components/setup/steps/ProjectStep.tsx",
+        "web/src/components/setup/steps/WorktreesStep.tsx",
+        "web/src/components/setup/steps/SandboxStep.tsx",
+        "web/src/components/setup/steps/AccessStep.tsx",
+        "web/src/hooks/useInlineMachineSave.ts",
+        "web/src/lib/fetchInterceptor.ts",
+        "web/src/lib/setup.ts"
       ]
     },
     {

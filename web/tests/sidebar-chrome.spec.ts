@@ -16,6 +16,39 @@ const HEADER = "[data-testid='sidebar-group-header']";
 const COUNT = "[data-testid='sidebar-group-session-count']";
 const ROW = "[data-testid='sidebar-session-row']";
 
+test("archived and snoozed labels retain full opacity and italic styling", async ({ page }) => {
+  await openSidebar(
+    page,
+    ["archived", "snoozed"].map((state) => ({
+      id: state,
+      title: `${state}-session`,
+      project_path: "/tmp/repo",
+      branch: null,
+      fields: {
+        status: "Idle",
+        idle_entered_at: null,
+        unread: false,
+        archived_at: state === "archived" ? "2026-01-01T00:00:00Z" : null,
+        snoozed_until: state === "snoozed" ? "2099-01-01T00:00:00Z" : null,
+      },
+    })),
+  );
+  await page.getByTestId("sidebar-sunk-toggle").click();
+  for (const state of ["archived", "snoozed"]) {
+    const label = page.locator(ROW).getByTitle(`${state}-session`, { exact: true });
+    await expect(label).toBeVisible();
+    await expect(label).toHaveCSS("font-style", "italic");
+    const opacity = await label.evaluate((el) => {
+      let opacity = 1;
+      for (let node: Element | null = el; node; node = node.parentElement) {
+        opacity *= Number(getComputedStyle(node).opacity);
+      }
+      return opacity;
+    });
+    expect(opacity).toBe(1);
+  }
+});
+
 test.describe("compact mode (#2288)", () => {
   const SESSIONS = [
     { id: "s-a", title: "alpha-session", project_path: "/tmp/repo-alpha", branch: "feat/a" },

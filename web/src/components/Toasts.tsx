@@ -20,7 +20,7 @@ interface Toast {
   message: string;
   sessionId?: string;
   href?: string;
-  action?: { label: string; run: () => void };
+  action?: { label: string; run: () => boolean | void };
 }
 
 const ToastContext = createContext<ToastApi | null>(null);
@@ -136,7 +136,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [scheduleDismiss],
   );
 
-  const pushWithAction = useCallback((message: string, label: string, run: () => void) => {
+  const pushWithAction = useCallback((message: string, label: string, run: () => boolean | void) => {
     const id = nextId.current++;
     // Stays until used or dismissed: its action can be the only way back to what failed.
     setToasts((t) => [...t, { id, kind: "error", message, action: { label, run } }]);
@@ -257,8 +257,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
-                    dismiss(t.id);
-                    t.action!.run();
+                    if (t.action!.run() !== false) dismiss(t.id);
                   }}
                   className="shrink-0 font-medium text-text-primary underline-offset-2 hover:underline cursor-pointer"
                 >

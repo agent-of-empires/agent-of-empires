@@ -20,6 +20,7 @@ The dashboard shows the same thing inline, as a screen that names the Agent, the
 - **Installs not allowed yet:** step 1 is to turn on `acp.allow_agent_install`, and the button stays disabled until it's on. The setting is **off by default**, because a global install runs the package's lifecycle scripts as the daemon user. It is `local_only`, so the dashboard can't turn it on: enable it from the TUI settings (Advanced) or the config file. The screen notices the change when you come back to the tab.
 - **A sandbox container that isn't running:** for an npm adapter, **Start the container** first; the update comes back once it runs. For an adapter you install by hand, step 1 is **Check again**, which starts the container so the command can run inside it.
 - **Not installable from here:** the command to run by hand, with **Copy**, then **Check again**, which respawns the worker and re-runs the version check.
+- **A sandboxed session, in any of these states:** **Recreate container** restarts the session on a new container from the current local image, after the same confirmation as **More > Recreate container** in its context menu. Anything outside the working directory and the mounted folders is lost. See [Sandbox](../guides/sandbox.md#available-images).
 - **Read-only and CityHall dashboards** show the command only. Restart the agent from the TUI.
 
 ### "Failed to start structured view agent" while the adapter is installed
@@ -108,6 +109,8 @@ The transcript divider reads `Switched structured view agent from <from> to <to>
 ### Switching accounts manually
 
 An account is a tool name with its own `[session.agent_config_dir]` entry (see [Swapping the engine on a restart](../guides/session-resume.md#swapping-the-engine-on-a-restart)). `aoe acp switch-account <session> <tool>` restarts the worker as that account and keeps the conversation: the transcript is copied into the new account's store and the worker resumes it. The same swap is `aoe session restart <session> --tool <tool>`.
+
+In the web dashboard, **Switch account** sits in the usage-limit banner next to **Try again** and in the session's sidebar menu. It opens a picker over the configured tool names that can take the conversation over (names only; `agent_config_dir` paths stay in the aoe config and are not editable from the web), explains the transcript copy and the uncached first turn, and restarts on confirm. A refusal is shown as the server worded it, and nothing changes. The dialog shows the current tool and the label and plan the agent reported, never the email.
 
 - A session parked on a rate limit continues with the interrupted prompt as its next turn, once, and the park's auto-resume budget is disarmed like a manual **Try again**. The generic restart wake message is not sent. A session that is not parked gets the usual wake message.
 - `switch-account` refuses and changes nothing where the swap would start a fresh conversation: the tool runs a different agent, the agent has no known transcript layout (only Claude does), the session has no recorded conversation, or a sandboxed session still has its store move pending. `restart --tool` keeps the parking swap in those cases.

@@ -500,3 +500,53 @@ describe("a restart of a start in progress", () => {
     expect([state.restartFailure, state.workerStopped]).toEqual([restartFailure, workerStopped]);
   });
 });
+
+describe("a Retry of a startup error", () => {
+  const frame = (seq: number, event: AcpFrame["event"]): Action => ({
+    kind: "frame",
+    frame: { session_id: "s", seq, event },
+  });
+  const failed = (seq: number, message: string) => frame(seq, { AgentStartupError: { message } });
+  const retry = (epoch = 1): Action => ({ kind: "restart_started", epoch, stoppedSent: false, retriedError: "boom" });
+  // [startupError, retriedError, restartInFlight] after a first failure, then these.
+  it.each<[string, Action[], [string | null, string | null, boolean]]>([
+    ["starting it hides the error and keeps what it retries", [retry()], [null, "boom", true]],
+    ["its own stop doesn't end it", [retry(), frame(2, { Stopped: { reason: "user_stopped" } })], [null, "boom", true]],
+    ["typing during it keeps it", [retry(), { kind: "user_prompt", text: "hi" }], [null, "boom", true]],
+    ["a stale one is ignored", [retry(0)], ["boom", null, false]],
+    [
+      "the Agent starting ends it",
+      [retry(), frame(2, { AcpSessionAssigned: { acp_session_id: "a" } })],
+      [null, null, false],
+    ],
+    ["a new error ends it and keeps what it retried", [retry(), failed(2, "worse")], ["worse", "boom", false]],
+    [
+      "a refusal fails like the start it retried",
+      [retry(), { kind: "restart_failed", epoch: 1, message: "capacity full", stoppedSent: false }],
+      ["capacity full", "boom", false],
+    ],
+    [
+      "a startup line restart's error isn't a Retry's",
+      [{ kind: "restart_started", epoch: 1, stoppedSent: false }, failed(2, "worse")],
+      ["worse", null, false],
+    ],
+    [
+      "a prompt echo during it keeps it",
+      [retry(), frame(2, { UserPromptSent: { text: "hi", prompt_id: "p1" } })],
+      [null, "boom", true],
+    ],
+    [
+      "a later error with no Retry is a first failure again",
+      [retry(), failed(2, "worse"), failed(3, "other")],
+      ["other", null, false],
+    ],
+    [
+      "sending after a failed Retry clears it",
+      [retry(), failed(2, "worse"), { kind: "user_prompt", text: "hi" }],
+      [null, null, false],
+    ],
+  ])("%s", (_label, actions, expected) => {
+    const state = run(empty(), failed(1, "boom"), ...actions);
+    expect([state.startupError, state.retriedError, state.restartInFlight]).toEqual(expected);
+  });
+});

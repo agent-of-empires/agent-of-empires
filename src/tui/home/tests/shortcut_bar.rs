@@ -77,7 +77,7 @@ fn hidden_bar_preserves_temporary_feedback_and_keyboard_actions() {
     let screen = render_home_to_string(&mut env.view, 120, 24);
     assert!(screen.contains("Copied selection"));
     assert_eq!(env.view.preview_outer_area.bottom(), 23);
-    env.view.status_flash.as_mut().unwrap().1 = std::time::Instant::now();
+    env.view.status_flash.as_mut().unwrap().until = Some(std::time::Instant::now());
     assert!(env.view.expire_status_flash());
     render_home_to_string(&mut env.view, 120, 24);
     assert_eq!(env.view.preview_outer_area.bottom(), 24);

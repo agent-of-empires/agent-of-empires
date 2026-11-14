@@ -1364,16 +1364,19 @@ mod tests {
         }
     }
 
-    /// A replayed `Monitor` or background-command launch re-arms nothing: it
-    /// would read as a live watch after every respawn.
+    /// A replayed `Monitor` or `ScheduleWakeup` re-arms nothing: it would read
+    /// as a live watch, or a wakeup dated from the replay, after every respawn.
     #[test]
-    fn load_replay_drops_a_monitor_arm() {
-        let armed = Event::MonitorArmed { description: None };
-        assert!(
-            is_transcript_event(&armed),
-            "{}",
-            transcript_event_kind(&armed)
-        );
+    fn load_replay_drops_monitor_and_wakeup_arms() {
+        for armed in [
+            Event::MonitorArmed { description: None },
+            Event::WakeupScheduled {
+                at: chrono::Utc::now(),
+                reason: None,
+            },
+        ] {
+            assert!(is_transcript_event(&armed), "{armed:?}");
+        }
     }
 
     #[test]

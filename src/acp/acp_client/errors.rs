@@ -54,7 +54,7 @@ pub fn is_authentication_failure(message: &str) -> bool {
 }
 
 /// The structured detail plus a formatted summary the supervisor mirrors into
-/// `Event::AgentStartupError { message }` for callers that read only that.
+/// `Event::AgentStartupError { message, .. }` for callers that read only that.
 #[derive(Debug)]
 pub struct IncompatibleAgentError {
     pub detail: crate::acp::state::StartupErrorDetail,

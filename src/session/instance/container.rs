@@ -355,8 +355,8 @@ impl Instance {
             }
         }
 
-        // Ensure image is available (always pulls to get latest), aborting the
-        // pull when the start was cancelled.
+        // Pulls only a missing image, aborting when the start is cancelled. A create
+        // that asks for the latest image force-pulls earlier, before its hooks.
         checkpoint()?;
         let runtime = containers::get_container_runtime();
         runtime.ensure_image(&image, cancel)?;

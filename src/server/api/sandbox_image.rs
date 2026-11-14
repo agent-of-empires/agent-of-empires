@@ -280,6 +280,57 @@ fn pull_blocked(state: &AppState, configured: &Configured) -> Option<&'static st
     }
 }
 
+fn pull_disabled() -> Response {
+    api_error(
+        StatusCode::FORBIDDEN,
+        "pull_disabled",
+        "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull (Settings, local only).",
+    )
+}
+
+/// The refusal for a create that asks to pull the latest `requested` image
+/// (None means the default), or None when it may. Same gate as `sandbox_image_pull`.
+pub(crate) async fn create_pull_refusal(
+    state: &AppState,
+    requested: Option<&str>,
+) -> Option<Response> {
+    if let Some(resp) = read_only_block(state).or_else(|| cityhall_block(state)) {
+        return Some(resp);
+    }
+    let configured = match configured().await {
+        Ok(configured) => configured,
+        Err(resp) => return Some(resp),
+    };
+    if pull_blocked(state, &configured).is_some() {
+        return Some(pull_disabled());
+    }
+    resolve_image(&configured, requested).err()
+}
+
+fn runtime_key(runtime: &ContainerRuntime, image: &str) -> ImageKey {
+    ImageKey {
+        runtime: runtime.display_name(),
+        image: image.to_string(),
+    }
+}
+
+/// Drops `image`'s cached status after a pull the dashboard's job didn't run.
+pub(crate) fn invalidate_status(runtime: &ContainerRuntime, image: &str) {
+    STATUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .invalidate(&runtime_key(runtime, image));
+}
+
+/// How many times `image`'s cached status has been invalidated.
+#[cfg(test)]
+pub(crate) fn status_generation_for_test(runtime: &ContainerRuntime, image: &str) -> u64 {
+    STATUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .generation(&runtime_key(runtime, image))
+}
+
 #[derive(Deserialize)]
 pub struct ImageStatusQuery {
     image: Option<String>,
@@ -396,11 +447,7 @@ pub async fn sandbox_image_pull(
         Err(resp) => return resp,
     };
     if pull_blocked(&state, &configured).is_some() {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "pull_disabled",
-            "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull (Settings, local only).",
-        );
+        return pull_disabled();
     }
     let requested = match requested_image(&headers, &body) {
         Ok(requested) => requested,

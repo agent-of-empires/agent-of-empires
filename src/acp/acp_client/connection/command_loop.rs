@@ -332,10 +332,12 @@ impl Session {
     /// then end so the drain loop drops the worker and the reaper can resume it.
     async fn between_prompt_idle_tick(&self) -> bool {
         let shared = &self.shared;
-        let Some(cost_seen) = shared
-            .between_prompt
-            .take_idle_fire(now_ms(), shared.aoe.leases.working(now_ms()))
-        else {
+        shared.expire_silent_subagents(now_ms()).await;
+        let Some(cost_seen) = shared.between_prompt.take_idle_fire(
+            now_ms(),
+            shared.aoe.leases.working(now_ms()),
+            shared.subagent_working(now_ms()),
+        ) else {
             return false;
         };
         // An adopted turn races the detached resume-idle task for its

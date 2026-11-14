@@ -227,7 +227,7 @@ export function syncPluginTabs(layout: DockLayout, available: { id: TabId; defau
   return next;
 }
 
-// Sub agents and Files are opt-in, so they never auto-open as empty tabs.
+// Background and Files are opt-in, so they never auto-open as empty tabs.
 const AUTO_OPEN_PANES = BUILTIN_PANES.filter((p) => p.id !== "agents" && p.id !== "files");
 
 function defaultTemplate(): DockLayout {

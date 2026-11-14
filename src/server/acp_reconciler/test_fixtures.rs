@@ -89,7 +89,7 @@ fn count_startup_errors(state: &AppState, id: &str, filter: impl Fn(&str) -> boo
         .acp_event_store
         .replay_from(id, 0)
         .into_iter()
-        .filter(|(_, e)| matches!(e, Event::AgentStartupError { message } if filter(message)))
+        .filter(|(_, e)| matches!(e, Event::AgentStartupError { message, .. } if filter(message)))
         .count()
 }
 

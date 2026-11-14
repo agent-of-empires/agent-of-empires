@@ -296,6 +296,7 @@ fn public_creation_failure(body: &str, local_owner: bool) -> String {
             | "hook_failed"
             | "sandbox_unavailable"
             | "sandbox_image_pull_failed"
+            | "sandbox_image_update_failed"
             | "working_dir_missing"
             | "create_outcome_unknown"
             | "creation_cancelled"
@@ -1539,11 +1540,23 @@ mod tests {
         assert!(!remote.contains("SECRET"));
         assert!(public_creation_failure(private, true).contains("private configured command"));
         assert!(!public_creation_failure("raw stderr SECRET", false).contains("SECRET"));
-        let public = r#"{"error":"hook_failed","message":"An on_create hook exited with code 7.","stage":"running_hooks","reference":"creation-ref"}"#;
-        let rendered = public_creation_failure(public, false);
-        assert!(rendered.contains("exited with code 7"));
-        assert!(rendered.contains("running_hooks"));
-        assert!(rendered.contains("creation-ref"));
+        for (public, message, stage) in [
+            (
+                r#"{"error":"hook_failed","message":"An on_create hook exited with code 7.","stage":"running_hooks","reference":"creation-ref"}"#,
+                "exited with code 7",
+                "running_hooks",
+            ),
+            (
+                r#"{"error":"sandbox_image_update_failed","message":"Couldn't pull the latest Sandbox image img:1.","stage":"pulling_image","reference":"creation-ref"}"#,
+                "Couldn't pull the latest Sandbox image img:1.",
+                "pulling_image",
+            ),
+        ] {
+            let rendered = public_creation_failure(public, false);
+            assert!(rendered.contains(message), "{rendered}");
+            assert!(rendered.contains(stage), "{rendered}");
+            assert!(rendered.contains("creation-ref"), "{rendered}");
+        }
     }
 
     #[tokio::test]

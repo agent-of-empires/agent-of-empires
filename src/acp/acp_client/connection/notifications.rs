@@ -1,6 +1,7 @@
 //! Turn state shared between the notification handler and the command loop,
 //! and the `session/update` handler itself.
 
+use super::subagents::BackgroundReport;
 use crate::acp::agent_profiles::AgentProfile;
 use crate::acp::background_agent::{spawn_tailer, TailerStart, TranscriptSource};
 use crate::acp::state::{BackgroundTaskLaunch, Event, SubagentRecord};
@@ -17,7 +18,7 @@ use tracing::debug;
 use crate::acp::acp_client::aoe_ingress::{AoeIngress, Ingested};
 use crate::acp::acp_client::between_prompt::BetweenPromptTracker;
 use crate::acp::acp_client::lifecycle::{
-    forward_lifecycle_signals, LifecycleEnvelope, TerminalClaim,
+    forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, TerminalClaim,
 };
 use crate::acp::acp_client::rate_limit::record_rate_limit_report;
 use crate::acp::acp_client::session_identity::SessionIngress;
@@ -90,6 +91,13 @@ pub(super) struct Shared {
     pub(super) tool_context_cache: ToolContextCache,
     /// Merged snapshot per subagent session; see `subagents.rs`.
     pub(super) subagents: std::sync::Mutex<HashMap<String, SubagentRecord>>,
+    /// Background children whose card waits for their final answer; see
+    /// `subagents.rs`.
+    pub(super) background_reports: std::sync::Mutex<HashMap<String, BackgroundReport>>,
+    /// Epoch-ms of the last validated child traffic.
+    pub(super) subagent_activity_at: AtomicI64,
+    /// Epoch-ms of each child's own last validated traffic.
+    pub(super) subagent_seen: std::sync::Mutex<HashMap<String, i64>>,
     bg_transcript_source: TranscriptSource,
     pub(super) bg_tasks: Arc<ActiveTasks>,
     pub(super) aoe: AoeIngress,
@@ -144,11 +152,54 @@ impl Shared {
             compaction: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             subagents: Default::default(),
+            background_reports: Default::default(),
+            subagent_activity_at: AtomicI64::new(0),
+            subagent_seen: Default::default(),
             bg_transcript_source,
             bg_tasks: Arc::default(),
             aoe: AoeIngress::default(),
             claude_home,
         }
+    }
+
+    /// Validated child traffic keeps whichever watchdog owns the turn from
+    /// reading a parent that waits on its subagents as silent. Call it before
+    /// publishing events so a full event channel cannot delay the signal.
+    pub(super) async fn note_child_activity(
+        &self,
+        child: &SessionId,
+        local_prompt_signals: bool,
+        epoch: u64,
+    ) {
+        let now = now_ms();
+        self.subagent_seen
+            .lock()
+            .expect("subagent seen mutex poisoned")
+            .insert(child.0.to_string(), now);
+        self.subagent_activity_at.store(now, Ordering::Relaxed);
+        if self.prompt_in_flight.load(Ordering::Relaxed) {
+            forward_lifecycle_signals(
+                local_prompt_signals && epoch != 0,
+                &self.lifecycle_tx,
+                epoch,
+                Some(LifecycleSignal::SubagentActivity),
+                None,
+                &self.session_label,
+            )
+            .await;
+        } else {
+            self.arm_for_subagent_activity();
+        }
+    }
+
+    pub(super) fn arm_for_subagent_activity(&self) {
+        self.between_prompt.observe(
+            Some(&LifecycleSignal::SubagentActivity),
+            None,
+            now_ms(),
+            self.adopted_turn_active.load(Ordering::Relaxed),
+            &self.terminal_claim,
+        );
     }
 
     pub(super) async fn emit(&self, event: Event) {
@@ -286,30 +337,62 @@ impl Shared {
         local_prompt_signals: bool,
         epoch: u64,
     ) {
-        // Subagent traffic never feeds the root session's dedup, compaction
-        // or watchdog state: a busy child would hold its parent's turn open.
+        // Subagent traffic never feeds the root session's dedup or compaction
+        // state; it only proves the parent's turn is still live.
         let from_child = self.ingress.child_route(&notification.session_id).is_some();
+        let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
+        // Replayed children died with the old adapter; ingress already routed them.
+        if suppressing
+            && (from_child
+                || matches!(
+                    notification.update,
+                    SessionUpdate::SubagentUpdate(_)
+                        | SessionUpdate::SessionMessage(_)
+                        | SessionUpdate::SessionMessageChunk(_)
+                ))
+        {
+            tracing::trace!(
+                target: "acp.protocol",
+                session = %self.session_label,
+                "dropping post-load subagent replay frame"
+            );
+            return;
+        }
         match notification.update {
             SessionUpdate::SubagentUpdate(update) => {
                 return self
-                    .handle_subagent_update(notification.session_id, update)
+                    .handle_subagent_update(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             SessionUpdate::SessionMessage(message) => {
                 return self
-                    .handle_session_message(notification.session_id, message)
+                    .handle_session_message(
+                        notification.session_id,
+                        message,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
-            SessionUpdate::SessionMessageChunk(_) => return,
+            SessionUpdate::SessionMessageChunk(_) if !from_child => return,
             update if from_child => {
                 return self
-                    .handle_child_notification(notification.session_id, update)
+                    .handle_child_notification(
+                        notification.session_id,
+                        update,
+                        local_prompt_signals,
+                        epoch,
+                    )
                     .await;
             }
             update => notification.update = update,
         }
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
-        let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.
         {
