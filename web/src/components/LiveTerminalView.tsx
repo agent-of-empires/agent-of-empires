@@ -135,28 +135,17 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const { keyboardHeight, keyboardOpen } = useMobileKeyboard(inputRef);
   const [inputFocused, setInputFocused] = useState(false);
-  const awaitingStart = ensureAfterStart && session.status === "Starting";
-  const policyRef = useRef({
-    readOnly,
-    errorHeld,
-    awaitingStart,
-    status: session.status,
-    sessionId: session.id,
-    surface,
-    terminalIndex,
-  });
+  // A new policy object revokes write admission, so only these fences replace it.
+  const policyRef = useRef({ readOnly, errorHeld, sessionId: session.id, surface, terminalIndex });
   useLayoutEffect(() => {
-    policyRef.current = {
-      readOnly,
-      errorHeld,
-      awaitingStart,
-      status: session.status,
-      sessionId: session.id,
-      surface,
-      terminalIndex,
-    };
+    policyRef.current = { readOnly, errorHeld, sessionId: session.id, surface, terminalIndex };
     if (readOnly) inputRef.current?.blur();
-  }, [readOnly, errorHeld, awaitingStart, session.status, session.id, surface, terminalIndex]);
+  }, [readOnly, errorHeld, session.id, surface, terminalIndex]);
+  const awaitingStart = ensureAfterStart && session.status === "Starting";
+  const startRef = useRef({ status: session.status, awaitingStart });
+  useLayoutEffect(() => {
+    startRef.current = { status: session.status, awaitingStart };
+  }, [session.status, awaitingStart]);
   useLayoutEffect(
     () => () => {
       policyRef.current.readOnly = true;
@@ -377,7 +366,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
     setEnsureError(null);
     setEnsureState("pending");
     setEnsureAfterStart(false);
-    const sentWhileStarting = policy.status === "Starting";
+    const sentWhileStarting = startRef.current.status === "Starting";
     const ensure =
       surface === "agent"
         ? ensureSession(session.id, controller.signal)
@@ -406,7 +395,7 @@ export function LiveTerminalView({ session, readOnly, active = true, surface = "
   const shelved = !!session.archived_at || !!session.trashed_at;
   useEffect(() => {
     const policy = policyRef.current;
-    if (policy.readOnly || policy.errorHeld || policy.awaitingStart) return;
+    if (policy.readOnly || policy.errorHeld || startRef.current.awaitingStart) return;
     if (lastEnsuredSessionIdRef.current === policy.sessionId) {
       if (consumePendingTerminalFocus(focusTarget, focusIndex)) focusSelf();
       return;
