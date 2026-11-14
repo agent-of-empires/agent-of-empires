@@ -463,6 +463,10 @@ pub struct Instance {
     /// a path only; hook output is never recorded here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_executable: Option<std::path::PathBuf>,
+    /// `launch_executable` with symlinks resolved at launch, to tell a switched link from a
+    /// re-created one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_resolved_executable: Option<std::path::PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 

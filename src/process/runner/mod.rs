@@ -204,6 +204,11 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         .as_ref()
         .map(|unit| worker_registry::ScopeOwnership::Owned { unit: unit.clone() })
         .unwrap_or(worker_registry::ScopeOwnership::Unscoped);
+    record.launch_executable = args.agent_argv.first().map(PathBuf::from);
+    record.launch_resolved_executable = record
+        .launch_executable
+        .as_deref()
+        .and_then(|program| std::fs::canonicalize(program).ok());
     record.prime_runtime = args
         .prime_runtime
         .as_deref()

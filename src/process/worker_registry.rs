@@ -57,6 +57,12 @@ pub struct WorkerRecord {
     pub started_at: u64,
     pub last_attached_at: Option<u64>,
     pub detached_at: Option<u64>,
+    /// The adapter program this worker was spawned with, and where it resolved then. Older
+    /// records default to `None` and are never offered an update restart.
+    #[serde(default)]
+    pub launch_executable: Option<PathBuf>,
+    #[serde(default)]
+    pub launch_resolved_executable: Option<PathBuf>,
 }
 
 impl WorkerRecord {
@@ -95,6 +101,8 @@ impl WorkerRecord {
             started_at: now_secs(),
             last_attached_at: None,
             detached_at: None,
+            launch_executable: None,
+            launch_resolved_executable: None,
         }
     }
 
