@@ -95,12 +95,14 @@
             '';
           };
 
-          # Cache package dependencies; checks build test targets.
+          # Checks compile their own test targets.
           cargoArtifacts = craneLib.buildDepsOnly (
             (builtins.removeAttrs commonArgs [ "src" ]) // dependencyMetadata // {
               dummySrc = dependencyDummySrc;
               cargoVendorDir = dependencyVendorDir;
               doCheck = false;
+              buildPhaseCargoCommand =
+                "${commonArgs.cargoBuildCommand or "cargoWithProfile build"} ${commonArgs.cargoExtraArgs or "--locked"}";
             }
           );
 
@@ -167,6 +169,8 @@
               dummySrc = dependencyDummySrc;
               cargoVendorDir = dependencyVendorDir;
               doCheck = false;
+              buildPhaseCargoCommand =
+                "${commonArgsWithWeb.cargoBuildCommand or "cargoWithProfile build"} ${commonArgsWithWeb.cargoExtraArgs or "--locked"}";
             }
           );
 
