@@ -51,6 +51,23 @@ static RESERVED_WARNED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Tools already reported as ambiguously claimed, so poll-time lookups warn
+/// once per process rather than on every tick.
+static AMBIGUOUS_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// An ambiguity is a configuration fault with no report to read, so a session
+/// it affects stays plugin-owned `Unknown`; say which name collided.
+fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
+    let mut warned = AMBIGUOUS_WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if warned.insert(tool.to_owned()) {
+        tracing::warn!(target: "plugin.agents", %tool, %error,
+            "approved integrations claim this tool ambiguously; leaving its status to pane rules");
+    }
+}
+
 fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
     let mut warned = RESERVED_WARNED
         .lock()
@@ -576,32 +593,27 @@ pub(crate) fn owned_status(
         return None;
     }
     let registry = super::registry();
-    let configured = registry.active().any(|plugin| {
-        plugin
-            .manifest
-            .capabilities
-            .iter()
-            .any(|c| c.as_str() == "session.integration")
-            && plugin
-                .manifest
-                .agent_integrations
-                .iter()
-                .any(|entry| entry.tool == instance.tool)
-    });
-    if !configured {
-        return None;
-    }
+    let alias = crate::tmux::status_rules::detection_tool(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let (tool, plugin) = match provider(&registry, &instance.tool) {
+        Ok(None) => (alias.as_ref(), provider(&registry, &alias)),
+        result => (instance.tool.as_str(), result),
+    };
+    let plugin = match plugin {
+        Ok(Some(plugin)) => Some(plugin),
+        Ok(None) => return None,
+        Err(error) => {
+            warn_ambiguous(tool, &error);
+            None
+        }
+    };
     let report = if pane_dead {
         None
     } else {
-        provider(&registry, &instance.tool)
-            .ok()
-            .flatten()
-            .and_then(|plugin| {
-                read_report(&instance.id, &instance.tool, plugin)
-                    .ok()
-                    .flatten()
-            })
+        plugin.and_then(|plugin| read_report(&instance.id, tool, plugin).ok().flatten())
     };
     session_status_override(true, pane_dead, report.as_ref().map(|report| report.status))
         .map(|status| (status, report.is_some()))
@@ -1589,6 +1601,91 @@ sandbox = "unsupported"
         assert_eq!(
             (omp.detect_status)("plain command output"),
             crate::session::Status::Idle
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn status_prefers_own_provider_then_detection_alias() {
+        let (_base, _, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("alias-ownership");
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert("own-agent".into(), "alias-agent".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("unclaimed-agent".into(), "alias-agent".into());
+        crate::tmux::status_rules::install_from_config("alias-ownership", &config);
+        install_test_integration("acme.alias", "alias-agent");
+        super::super::reload_registry();
+
+        let mut instance = Instance::new("alias-report", "/tmp");
+        instance.tool = "own-agent".into();
+        instance.source_profile = "alias-ownership".into();
+        instance.status = crate::session::Status::Running;
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        let dir = dir_guard::open_instance_dir(&instance.id).unwrap();
+        let mut report = snapshot();
+        report.instance_id = instance.id.clone();
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.alias.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Waiting, true))
+        );
+
+        install_test_integration("acme.own", "own-agent");
+        super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        report.status = AgentIntegrationStatus::Running;
+        dir_guard::write_atomic(
+            dir.as_fd(),
+            "integration-acme.own.json",
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Running, true))
+        );
+        install_test_integration("acme.duplicate", "own-agent");
+        super::super::reload_registry();
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+
+        // Two claims on the detection alias leave a session whose own name no
+        // plugin claims owned but unreadable.
+        install_test_integration("acme.alias-two", "alias-agent");
+        super::super::reload_registry();
+        let mut wrapper = Instance::new("alias-ambiguity", "/tmp");
+        wrapper.tool = "unclaimed-agent".into();
+        wrapper.source_profile = "alias-ownership".into();
+        assert_eq!(
+            owned_status(&wrapper, false),
+            Some((crate::session::Status::Unknown, false))
         );
     }
 

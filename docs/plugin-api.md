@@ -69,6 +69,8 @@ Installing a plugin with agent integrations requires explicit approval. The inst
 
 The host matches status integrations to terminal sessions and rejects missing, malformed, or unsupported runtime versions before consuming reports or sending replies. The runtime extension must also enforce supported versions before activation. These requirements are independent of the plugin's `version`, AoE host `api_version` / `aoe_version`, and report/reply `schema_version`. Launch-only agent declarations do not enable provider-native status or replies.
 
+For status, a session's own integration takes precedence; an unowned tool may use the integration selected by its detection alias. Reply ownership remains tied to the session's own tool.
+
 ### Launch, detection, and reply-fallback declarations (API 21)
 
 These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. An approved, enabled API 21 OMP launch declaration supersedes the bundled OMP launch contract, including for existing sessions with no stored command; provider status and replies still require their capability and valid reports. If that declaration is absent, disabled, or not approved, the bundled OMP launch, pane detection, and capture fallback remain available. A plugin-omp release declaring API 21 behavior is a separate prerequisite for the cutover.
