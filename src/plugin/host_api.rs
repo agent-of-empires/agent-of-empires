@@ -1,17 +1,22 @@
 //! The capability-gated host API a plugin worker calls over the worker
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use aoe_plugin_api::UiSlot;
+use aoe_plugin_api::{SuggestionsSpec, UiSlot};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
+use crate::plugin::suggestions;
 use crate::plugin::ui_state::{NotifyTarget, Tone, UiError, UiSnapshot, UiStore};
 use crate::session::Storage;
+
+/// File name of the plugin database under the app directory.
+pub(crate) const EVENTS_DB: &str = "plugin_events.db";
 
 const CAP_WORKER: &str = "runtime.worker";
 pub(crate) const CAP_SESSION_READ: &str = "session.read";
@@ -31,7 +36,13 @@ pub struct HostApiState {
     profile: String,
     ui: UiStore,
     settings_revision: std::sync::atomic::AtomicU64,
+    /// Providers asked to refresh, by request time (monotonic, and unix seconds to compare
+    /// with a provider's `updated_at`).
+    refreshing: Mutex<HashMap<String, (Instant, i64)>>,
 }
+
+/// A worker that never answers stops counting as refreshing after this long.
+const REFRESH_TTL: Duration = Duration::from_secs(120);
 
 impl HostApiState {
     pub fn open(
@@ -51,6 +62,7 @@ impl HostApiState {
              );",
         )
         .context("create plugin_storage table")?;
+        suggestions::init(&conn).context("create suggestion tables")?;
         Ok(Self {
             events: Mutex::new(conn),
             schema,
@@ -58,7 +70,40 @@ impl HostApiState {
             profile: profile.to_string(),
             ui: UiStore::new(),
             settings_revision: std::sync::atomic::AtomicU64::new(0),
+            refreshing: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn mark_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(
+                provider_id.to_string(),
+                (Instant::now(), chrono::Utc::now().timestamp()),
+            );
+    }
+
+    pub(crate) fn clear_refreshing(&self, provider_id: &str) {
+        self.refreshing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(provider_id);
+    }
+
+    /// Unix seconds each provider was last asked to refresh, within [`REFRESH_TTL`]. A provider
+    /// is still refreshing only if its `updated_at` is older than that.
+    pub(crate) fn refreshing_providers(&self) -> HashMap<String, i64> {
+        self.refreshing_providers_at(Instant::now())
+    }
+
+    fn refreshing_providers_at(&self, now: Instant) -> HashMap<String, i64> {
+        let mut pending = self.refreshing.lock().unwrap_or_else(|p| p.into_inner());
+        pending.retain(|_, (at, _)| now.saturating_duration_since(*at) < REFRESH_TTL);
+        pending
+            .iter()
+            .map(|(id, (_, unix))| (id.clone(), *unix))
+            .collect()
     }
 
     fn storage(&self) -> anyhow::Result<Storage> {
@@ -67,6 +112,41 @@ impl HostApiState {
 
     pub(crate) fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// The profile key suggestions are stored and read under.
+    pub(crate) fn suggestions_profile(&self) -> String {
+        crate::session::config::effective_profile(&self.profile)
+    }
+
+    /// Run `f` on the plugin database with the profile key suggestions are
+    /// stored and read under. The key is resolved before the shared lock is
+    /// taken, and `f` must stay a short query: every worker RPC waits behind it.
+    pub(crate) fn with_suggestions_db<T>(&self, f: impl FnOnce(&Connection, &str) -> T) -> T {
+        let profile = self.suggestions_profile();
+        let conn = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        f(&conn, &profile)
+    }
+
+    /// `with_suggestions_db` for a worker's write: refused, under the same lock
+    /// `forget_publication` takes, once the worker's generation is retired, so
+    /// an RPC admitted before a restart or uninstall cannot recreate or replace
+    /// what the host cleared or the new worker published.
+    fn with_suggestions_db_as<T>(
+        &self,
+        ctx: &PluginRpcContext,
+        f: impl FnOnce(&Connection, &str) -> Result<T, DispatchError>,
+    ) -> Result<T, DispatchError> {
+        self.with_suggestions_db(|conn, profile| {
+            if !self.ui.is_current(&ctx.plugin_id, ctx.ui_generation) {
+                return Err(DispatchError {
+                    code: codes::FAILED_PRECONDITION,
+                    message: "plugin worker was replaced or stopped".into(),
+                    data: None,
+                });
+            }
+            f(conn, profile)
+        })
     }
 
     pub fn bump_settings_revision(&self) -> u64 {
@@ -184,6 +264,39 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "suggestions.set" => {
+            ctx.require(CAP_WORKER)?;
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::set(conn, profile, &ctx.plugin_id, &spec, params)
+            })
+        }
+        "suggestions.error" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::error(conn, profile, &ctx.plugin_id, params)
+            })
+        }
+        "suggestions.checks.set" => {
+            ctx.require(CAP_WORKER)?;
+            suggestions_spec(ctx)?;
+            let stored = state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::set_checks(conn, profile, &ctx.plugin_id, params)
+            });
+            // A worker may answer a refresh with checks alone, which leaves `updated_at` as it was.
+            if stored.is_ok() {
+                state.clear_refreshing(&ctx.plugin_id);
+            }
+            stored
+        }
+        "suggestions.sources" => {
+            ctx.require(CAP_WORKER)?;
+            let spec = suggestions_spec(ctx)?;
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                suggestions::sources(conn, profile, &ctx.plugin_id, &spec)
+            })
+        }
         "projects.list" => {
             ctx.require(CAP_SESSION_READ)?;
             projects_list(state)
@@ -250,6 +363,18 @@ pub fn dispatch(
         }
         other => Err(DispatchError::method_not_found(other)),
     }
+}
+
+fn suggestions_spec(ctx: &PluginRpcContext) -> Result<SuggestionsSpec, DispatchError> {
+    crate::plugin::registry()
+        .get(&ctx.plugin_id)
+        .filter(|p| p.active())
+        .and_then(|p| p.manifest.suggestions.clone())
+        .ok_or_else(|| DispatchError {
+            code: codes::FORBIDDEN,
+            message: "plugin did not declare suggestions".into(),
+            data: None,
+        })
 }
 
 fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
@@ -1011,6 +1136,23 @@ mod tests {
     }
 
     #[test]
+    fn a_refresh_counts_until_reported_or_expired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        state.mark_refreshing("a");
+        state.mark_refreshing("b");
+        state.clear_refreshing("a");
+        let pending = state.refreshing_providers();
+        assert_eq!(pending.keys().collect::<Vec<_>>(), ["b"]);
+        assert!(pending["b"] >= chrono::Utc::now().timestamp() - 5);
+        let later = Instant::now() + REFRESH_TTL + Duration::from_secs(1);
+        assert!(
+            state.refreshing_providers_at(later).is_empty(),
+            "a silent worker expires"
+        );
+    }
+
+    #[test]
     fn ungranted_capability_is_forbidden() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
@@ -1031,6 +1173,83 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[test]
+    fn suggestions_and_projects_rpcs_are_capability_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        for (method, caps) in [
+            ("suggestions.set", &[][..]),
+            ("suggestions.error", &[][..]),
+            ("suggestions.checks.set", &[][..]),
+            ("suggestions.sources", &[CAP_SESSION_READ][..]),
+            ("projects.list", &[CAP_WORKER][..]),
+        ] {
+            let err = dispatch(&state, &ctx(caps), method, &json!({"items": []})).unwrap_err();
+            assert_eq!(err.code, codes::FORBIDDEN, "{method}");
+        }
+        // A worker whose manifest declares no [suggestions] is refused too.
+        for method in ["suggestions.sources", "suggestions.checks.set"] {
+            let err = dispatch(&state, &ctx(&[CAP_WORKER]), method, &json!({})).unwrap_err();
+            assert!(
+                err.message.contains("did not declare suggestions"),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_worker_generation_cannot_write_suggestions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = state(tmp.path());
+        let worker = |generation| PluginRpcContext {
+            ui_generation: generation,
+            ..ctx_for("acme.worker", &[CAP_WORKER])
+        };
+        let write = |ctx: &PluginRpcContext| {
+            state.with_suggestions_db_as(ctx, |conn, profile| {
+                conn.execute(
+                    "INSERT INTO suggestion_providers (profile, provider_id, updated_at)
+                     VALUES (?1, 'acme.worker', 1)
+                     ON CONFLICT (profile, provider_id) DO NOTHING",
+                    [profile],
+                )
+                .map(|_| ())
+                .map_err(|e| DispatchError::internal(e.to_string()))
+            })
+        };
+        let published = || {
+            state.with_suggestions_db(|conn, _| {
+                conn.query_row("SELECT COUNT(*) FROM suggestion_providers", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+            })
+        };
+
+        // Restart: the old worker's RPC runs after the new generation began.
+        let old = state.begin_ui_generation("acme.worker");
+        let new = state.begin_ui_generation("acme.worker");
+        let err = write(&worker(old)).unwrap_err();
+        assert_eq!(err.code, codes::FAILED_PRECONDITION);
+        assert_eq!(published(), 0, "a stale write must not touch the store");
+        write(&worker(new)).unwrap();
+        assert_eq!(published(), 1);
+
+        // Uninstall, then reinstall with the same spec: the stopped worker's
+        // late RPC cannot recreate what the host cleared, and the reinstalled
+        // worker owns a fresh generation.
+        state.clear_ui("acme.worker", new);
+        state.with_suggestions_db(|conn, _| {
+            crate::plugin::suggestions::forget_publication(conn, "acme.worker").unwrap()
+        });
+        assert!(write(&worker(new)).is_err());
+        assert_eq!(published(), 0);
+        let reinstalled = state.begin_ui_generation("acme.worker");
+        assert!(write(&worker(new)).is_err(), "the retired id stays retired");
+        write(&worker(reinstalled)).unwrap();
+        assert_eq!(published(), 1);
     }
 
     fn ctx_for(plugin_id: &str, caps: &[&str]) -> PluginRpcContext {

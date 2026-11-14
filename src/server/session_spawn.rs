@@ -55,6 +55,8 @@ pub(crate) struct StructuredSessionSpec {
     /// Plugin create-idempotency record to persist with the instance,
     /// stamped alongside `created_by_plugin`.
     pub plugin_create_idempotency: Option<crate::session::PluginCreateIdempotency>,
+    /// Suggestion the session was started from, persisted onto the instance.
+    pub suggestion: Option<crate::session::SuggestionOrigin>,
     /// Initial prompt to persist with the instance and deliver once the ACP
     /// worker is live, stamped by `SessionService::create_structured_session`.
     pub pending_initial_turn: Option<String>,
@@ -210,6 +212,7 @@ pub(crate) async fn spawn_structured_session(
             profile,
             created_by_plugin,
             plugin_create_idempotency,
+            suggestion,
             pending_initial_turn,
             parent_session_id,
             acp_mode_id,
@@ -349,6 +352,7 @@ pub(crate) async fn spawn_structured_session(
         native.set_status_id(instance.id.clone());
         instance.created_by_plugin = created_by_plugin;
         instance.plugin_create_idempotency = plugin_create_idempotency;
+        instance.suggestion = suggestion;
         instance.pending_initial_turn =
             pending_initial_turn.map(|text| crate::session::PendingInitialTurn {
                 text,
@@ -1277,6 +1281,7 @@ mod tests {
             profile: profile.into(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
+            suggestion: None,
             pending_initial_turn: None,
             parent_session_id: None,
             acp_mode_id: None,
@@ -1466,6 +1471,7 @@ mod tests {
             let state = crate::server::test_support::build_test_app_state(peers.clone());
             crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
             let spec = StructuredSessionSpec {
+                suggestion: None,
                 title: Some("hooked".into()),
                 title_typed: true,
                 size: None,

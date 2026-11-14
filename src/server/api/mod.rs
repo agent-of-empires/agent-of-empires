@@ -21,6 +21,9 @@ mod sandbox_image;
 pub(crate) mod sessions;
 mod setup;
 mod skills;
+mod suggestions;
+#[cfg(test)]
+pub(crate) mod suggestions_tests;
 pub(crate) mod system;
 mod telemetry;
 
@@ -84,6 +87,13 @@ pub(crate) use sessions::{
 pub use setup::{get_setup, get_setup_runtimes, patch_setup};
 pub use skills::{
     adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
+};
+pub use suggestions::{
+    delete_suggestion_mapping, delete_suggestion_template, dismiss_suggestion,
+    get_suggestion_templates, get_suggestions, list_suggestion_mappings, list_suggestion_projects,
+    patch_suggestion_prefs, prepare_suggestion, put_suggestion_mapping, put_suggestion_template,
+    refresh_suggestions, run_suggestion_checks, run_suggestion_fix, undismiss_suggestion,
+    update_suggestion_source,
 };
 
 pub use system::{
@@ -602,6 +612,23 @@ mod tests {
             ],
         ),
         (
+            "suggestions.rs",
+            include_str!("suggestions.rs"),
+            &[
+                "delete_suggestion_mapping",
+                "delete_suggestion_template",
+                "dismiss_suggestion",
+                "patch_suggestion_prefs",
+                "put_suggestion_mapping",
+                "put_suggestion_template",
+                "refresh_suggestions",
+                "run_suggestion_checks",
+                "run_suggestion_fix",
+                "undismiss_suggestion",
+                "update_suggestion_source",
+            ],
+        ),
+        (
             "skills.rs",
             include_str!("skills.rs"),
             &[
@@ -674,6 +701,12 @@ mod tests {
             "/api/plugins/{id}/settings/options/resolve",
             "api::resolve_options",
             "UI option discovery may run capability probes and populate the shared catalog.",
+        ),
+        (
+            "POST",
+            "/api/suggestions/prepare",
+            "api::prepare_suggestion",
+            "Resolves a wizard prefill; mutates nothing.",
         ),
         (
             "POST",
@@ -1762,6 +1795,17 @@ mod tests {
             (Method::POST, "/api/plugins/missing/update/apply"),
             (Method::POST, "/api/plugins/missing/update/dismiss"),
             (Method::PATCH, "/api/theme"),
+            (Method::POST, "/api/suggestions/refresh"),
+            (Method::POST, "/api/suggestions/checks/run"),
+            (Method::POST, "/api/suggestions/fix"),
+            (Method::POST, "/api/suggestions/dismiss"),
+            (Method::POST, "/api/suggestions/undismiss"),
+            (Method::PATCH, "/api/suggestions/sources"),
+            (Method::PATCH, "/api/suggestions/prefs"),
+            (Method::PUT, "/api/suggestions/templates"),
+            (Method::DELETE, "/api/suggestions/templates"),
+            (Method::PUT, "/api/suggestions/mappings"),
+            (Method::DELETE, "/api/suggestions/mappings"),
             (Method::POST, "/api/sandbox/image-pull"),
             (Method::POST, "/api/sandbox/image-dismiss"),
         ] {

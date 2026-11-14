@@ -877,6 +877,18 @@ pub(crate) async fn create_session_with(
         );
     }
 
+    if body.suggestion.as_ref().is_some_and(|s| {
+        [&s.provider_id, &s.id]
+            .iter()
+            .any(|v| v.trim().is_empty() || v.len() > aoe_plugin_api::suggestions::MAX_KEY_BYTES)
+    }) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "suggestion ids must be non-empty and within the key size limit",
+        );
+    }
+
     // Idempotency first: a known key is answered from its result, replayed failure or
     // restart fence before any validation that reads mutable state (profiles, agents,
     // projects), which could otherwise turn a retry of an unknown outcome into a verdict.
@@ -1132,6 +1144,52 @@ pub(crate) async fn create_session_with(
         .and_then(crate::server::api::unknown_profile_response)
     {
         return resp;
+    }
+
+    if let Some(origin) = body.suggestion.clone() {
+        let host = state.plugin_host.clone();
+        let published = tokio::task::spawn_blocking(move || {
+            let Some(host) = host else {
+                return Ok(None);
+            };
+            let providers = crate::plugin::suggestions::providers();
+            host.with_suggestions_db(|conn, profile| {
+                let published =
+                    crate::plugin::suggestions::is_published(conn, profile, &providers, &origin)?;
+                Ok::<_, anyhow::Error>(published.then(|| profile.to_string()))
+            })
+        })
+        .await;
+        match published {
+            // The session may be created in another profile than the one the
+            // suggestion lives in; keep the latter so the link survives.
+            Ok(Ok(Some(profile))) => {
+                if let Some(origin) = body.suggestion.as_mut() {
+                    origin.profile = Some(profile);
+                }
+            }
+            Ok(Ok(None)) => {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "stale_suggestion",
+                    "Suggestion is no longer published; refresh and retry",
+                );
+            }
+            Ok(Err(error)) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    error.to_string(),
+                );
+            }
+            Err(error) => {
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    error.to_string(),
+                );
+            }
+        }
     }
 
     let validation_profile = body.profile.as_deref().unwrap_or(&default_profile);
@@ -1488,6 +1546,7 @@ pub(crate) async fn create_session_with(
         // stamps these, through create_structured_session (#2897).
         created_by_plugin: None,
         plugin_create_idempotency: None,
+        suggestion: body.suggestion,
         pending_initial_turn: None,
         parent_session_id: body.parent_session_id,
         cli: body.cli,

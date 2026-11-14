@@ -553,6 +553,11 @@ impl UiStore {
         Ok(seq)
     }
 
+    /// Whether `generation` is still the plugin's live worker generation.
+    pub fn is_current(&self, plugin_id: &str, generation: u64) -> bool {
+        self.read().active.get(plugin_id) == Some(&generation)
+    }
+
     pub fn clear_plugin(&self, plugin_id: &str, generation: u64) -> bool {
         let mut inner = self.write();
         if inner.active.get(plugin_id) != Some(&generation) {
