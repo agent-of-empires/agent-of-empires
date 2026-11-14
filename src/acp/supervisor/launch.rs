@@ -1414,14 +1414,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                                     .into())
                                 }
                             }
-                            Some(if recovery.is_none() {
-                                lifecycle.install(&lease, identity)
-                            } else if lifecycle.running(session_id).is_some_and(|(current, owner)| {
+                            Some(if lifecycle.running(session_id).is_some_and(|(current, owner)| {
                                 current == lease && owner == identity
                             }) {
                                 Ok(())
                             } else {
-                                Err(InstallError::Stale)
+                                lifecycle.install(&lease, identity)
                             })
                         }
                         Ok(None) => None,

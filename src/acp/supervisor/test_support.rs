@@ -874,7 +874,6 @@ pub(crate) struct HeldAttachRunner {
     peer: tokio::task::JoinHandle<()>,
     child: HeldChild,
     _retirement_input: Option<tokio::process::ChildStdin>,
-    trailer: bool,
     _socket_dir: tempfile::TempDir,
 }
 
@@ -1065,7 +1064,6 @@ with s:
             peer,
             child,
             _retirement_input: retirement_input,
-            trailer: false,
             _socket_dir: socket_dir,
         };
         use futures_util::FutureExt as _;
@@ -1125,12 +1123,6 @@ with s:
         }
     }
 
-    /// Sends one more chunk after the completion, so a test can wait on the frames
-    /// being processed in order before asserting that the completion did nothing.
-    pub(crate) fn with_trailing_chunk(mut self) -> Self {
-        self.trailer = true;
-        self
-    }
 }
 
 /// Reproduce an owned constructor's genuine control refusal, retaining its
