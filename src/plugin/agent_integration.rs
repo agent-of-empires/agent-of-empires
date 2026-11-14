@@ -51,6 +51,23 @@ static RESERVED_WARNED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+/// Tools already reported as ambiguously claimed, so poll-time lookups warn
+/// once per process rather than on every tick.
+static AMBIGUOUS_WARNED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// An ambiguity is a configuration fault with no report to read, so a session
+/// it affects stays plugin-owned `Unknown`; say which name collided.
+fn warn_ambiguous(tool: &str, error: &anyhow::Error) {
+    let mut warned = AMBIGUOUS_WARNED
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if warned.insert(tool.to_owned()) {
+        tracing::warn!(target: "plugin.agents", %tool, %error,
+            "approved integrations claim this tool ambiguously; leaving its status to pane rules");
+    }
+}
+
 fn warn_reserved(plugin: &str, tool: &str, builtin: &str) {
     let mut warned = RESERVED_WARNED
         .lock()
@@ -588,7 +605,10 @@ pub(crate) fn owned_status(
     let plugin = match plugin {
         Ok(Some(plugin)) => Some(plugin),
         Ok(None) => return None,
-        Err(_) => None,
+        Err(error) => {
+            warn_ambiguous(tool, &error);
+            None
+        }
     };
     let report = if pane_dead {
         None
@@ -1602,6 +1622,10 @@ sandbox = "unsupported"
             .session
             .agent_detect_as
             .insert("own-agent".into(), "alias-agent".into());
+        config
+            .session
+            .agent_detect_as
+            .insert("unclaimed-agent".into(), "alias-agent".into());
         crate::tmux::status_rules::install_from_config("alias-ownership", &config);
         install_test_integration("acme.alias", "alias-agent");
         super::super::reload_registry();
@@ -1649,6 +1673,18 @@ sandbox = "unsupported"
         super::super::reload_registry();
         assert_eq!(
             owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+
+        // Two claims on the detection alias leave a session whose own name no
+        // plugin claims owned but unreadable.
+        install_test_integration("acme.alias-two", "alias-agent");
+        super::super::reload_registry();
+        let mut wrapper = Instance::new("alias-ambiguity", "/tmp");
+        wrapper.tool = "unclaimed-agent".into();
+        wrapper.source_profile = "alias-ownership".into();
+        assert_eq!(
+            owned_status(&wrapper, false),
             Some((crate::session::Status::Unknown, false))
         );
     }
