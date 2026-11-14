@@ -422,9 +422,10 @@ fn type_text(env: &mut TestEnv, text: &str) {
 /// URLs recorded there.
 fn recorded_opens(body: impl FnOnce()) -> Vec<String> {
     let file = tempfile::NamedTempFile::new().unwrap();
-    std::env::set_var("AOE_OPEN_URL_TO", file.path());
-    body();
-    std::env::remove_var("AOE_OPEN_URL_TO");
+    {
+        let _env = crate::session::test_support::EnvGuard::set(&[("AOE_OPEN_URL_TO", file.path())]);
+        body();
+    }
     std::fs::read_to_string(file.path())
         .unwrap()
         .lines()
@@ -525,6 +526,20 @@ fn the_preview_key_line_names_the_source_from_120_columns() {
             "{width} cols, strict {strict}: {expected:?}"
         );
     }
+}
+
+#[test]
+#[serial]
+fn the_wide_key_line_only_offers_open_when_the_suggestion_has_a_link() {
+    let (mut env, _requests) = expanded_env(1);
+    env.view.cursor += 1;
+    env.view.update_selected();
+    let mut linkless = snapshot(1, &[]);
+    linkless["items"][0]["source_url"] = "javascript:alert(1)".into();
+    env.view.suggestions_feed.set_snapshot_for_test(linkless);
+    let text = preview_text(&mut env, 120);
+    assert!(text.contains("^K more"), "{text}");
+    assert!(!text.contains("open in"), "{text}");
 }
 
 #[test]

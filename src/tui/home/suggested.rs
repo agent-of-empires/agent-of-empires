@@ -291,7 +291,8 @@ impl HomeView {
                 } else {
                     "dismiss"
                 };
-                let keys = if frame.area().width >= WIDE_KEY_LINE_COLS {
+                let keys = if frame.area().width >= WIDE_KEY_LINE_COLS && entry.source_url.is_some()
+                {
                     format!(
                         "↵ {enter}  {dismiss} {dismiss_verb}  ^K open in {}",
                         entry.provider
