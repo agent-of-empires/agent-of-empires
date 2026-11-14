@@ -77,34 +77,25 @@ fn executable_updated(
             .is_some_and(|mtime| modified_after(mtime, started_at))
 }
 
-/// Which adapter copy a spawn runs. With both a PATH copy and a bundled one, spawn runs a version
-/// probe to choose, which a list poll must not do, so the offer is withheld instead.
-fn pick_adapter(
-    path_copy: Option<std::path::PathBuf>,
-    bundled: Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
-    match (path_copy, bundled) {
-        (Some(path), None) | (None, Some(path)) => Some(path),
-        _ => None,
-    }
-}
-
-fn adapter_observation(command: &str) -> Option<Observed> {
-    cached_observation(format!("acp:{command}"), || {
-        let app_dir = crate::session::get_app_dir().ok();
-        pick_adapter(
-            which::which(command).ok(),
-            app_dir
-                .as_deref()
-                .and_then(|dir| crate::acp::adapters::bundled_adapter_bin(dir, command)),
-        )
-    })
-}
-
 /// Whole seconds, so a binary written in the launch second is not flagged.
 fn modified_after(mtime: SystemTime, started_at: DateTime<Utc>) -> bool {
     let modified = mtime.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
     modified as i64 > started_at.timestamp()
+}
+
+fn is_stale(
+    path: &std::path::Path,
+    launched: Option<&std::path::Path>,
+    started_at: DateTime<Utc>,
+) -> bool {
+    let Some(observed) =
+        cached_observation(path.display().to_string(), || Some(path.to_path_buf()))
+    else {
+        return false;
+    };
+    // A cached view may predate the launch; confirm a flag against the live path.
+    executable_updated(&observed, launched, started_at)
+        && observe(path).is_some_and(|live| executable_updated(&live, launched, started_at))
 }
 
 /// An idle row whose agent binary was replaced after launch. Reads only the row and the
@@ -122,10 +113,11 @@ pub fn binary_updated(inst: &Instance) -> bool {
             .and_then(|record| {
                 let started_at =
                     DateTime::from_timestamp(i64::try_from(record.started_at).ok()?, 0)?;
-                let command = adapter_command(inst, &record)?;
-                Some(executable_updated(
-                    &adapter_observation(&command)?,
-                    None,
+                adapter_command(inst, &record)?;
+                let path = record.launch_executable.as_ref()?;
+                Some(is_stale(
+                    path,
+                    record.launch_resolved_executable.as_deref(),
                     started_at,
                 ))
             })
@@ -134,16 +126,8 @@ pub fn binary_updated(inst: &Instance) -> bool {
         inst.launch_executable
             .as_ref()
             .zip(inst.started_at)
-            .and_then(|(path, started_at)| {
-                let observed =
-                    cached_observation(path.display().to_string(), || Some(path.clone()))?;
-                let launched = inst.launch_resolved_executable.as_deref();
-                // A cached view may predate the launch; confirm a flag against the live path.
-                Some(
-                    executable_updated(&observed, launched, started_at)
-                        && observe(path)
-                            .is_some_and(|live| executable_updated(&live, launched, started_at)),
-                )
+            .map(|(path, started_at)| {
+                is_stale(path, inst.launch_resolved_executable.as_deref(), started_at)
             })
     };
     stale.unwrap_or(false)
@@ -320,6 +304,41 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_worker_adapter_link_switch_is_flagged_and_a_relink_is_not() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (v1, v2, link) = (
+            dir.path().join("v1"),
+            dir.path().join("v2"),
+            dir.path().join("adapter"),
+        );
+        for version in [&v1, &v2] {
+            std::fs::write(version, "#!/bin/sh\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(version)
+                .unwrap()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(500))
+                .unwrap();
+        }
+        symlink(&v1, &link).unwrap();
+        let started = DateTime::from_timestamp(1_000, 0).unwrap();
+        let launched = std::fs::canonicalize(&link).unwrap();
+        assert!(!is_stale(&link, Some(&launched), started));
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v1, &link).unwrap();
+        assert!(!is_stale(&link, Some(&launched), started));
+
+        // Past the cache TTL the switch is seen; a live re-check confirms it.
+        std::fs::remove_file(&link).unwrap();
+        symlink(&v2, &link).unwrap();
+        let switched = observe(&link).unwrap();
+        assert!(executable_updated(&switched, Some(&launched), started));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_sandboxed_row_is_never_flagged_by_host_binaries() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -346,16 +365,6 @@ mod tests {
             container_workdir: None,
         });
         assert!(!binary_updated(&inst));
-    }
-
-    #[test]
-    fn an_adapter_on_both_path_and_bundle_is_not_guessed() {
-        let path = || Some(std::path::PathBuf::from("/usr/bin/adapter"));
-        let bundled = || Some(std::path::PathBuf::from("/data/adapters/adapter"));
-        assert_eq!(pick_adapter(path(), None), path());
-        assert_eq!(pick_adapter(None, bundled()), bundled());
-        assert_eq!(pick_adapter(path(), bundled()), None);
-        assert_eq!(pick_adapter(None, None), None);
     }
 
     #[test]
