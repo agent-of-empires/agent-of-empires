@@ -103,7 +103,7 @@ pub fn check_eligible(
     setting_on: bool,
     force: bool,
     title: &str,
-    agent: Option<&agents::AgentDef>,
+    agent: Option<&agents::AgentDef<'_>>,
     command: &str,
     command_override_in_cfg: bool,
 ) -> Result<(), SkipReason> {
@@ -170,7 +170,7 @@ pub fn check_eligible_resolved(
     sandboxed: bool,
     session_command: &str,
     overrides: &HashMap<String, String>,
-) -> Result<&'static agents::AgentDef, SkipReason> {
+) -> Result<&'static agents::AgentDef<'static>, SkipReason> {
     let rename_tool = resolve_rename_tool(session_tool, rename_setting);
     let agent = agents::get_agent(rename_tool);
     let (command, command_override_in_cfg) = if rename_tool == session_tool {
@@ -193,6 +193,109 @@ pub fn check_eligible_resolved(
         return Err(SkipReason::SandboxRenameAgentMismatch);
     }
     Ok(agent.expect("check_eligible Ok implies a built-in agent"))
+}
+
+pub(crate) enum OneshotAgent {
+    Builtin(&'static agents::AgentDef<'static>),
+    Declared(crate::plugin::agent_integration::DeclaredAgent),
+}
+
+impl OneshotAgent {
+    pub(crate) fn argv(
+        &self,
+        prompt: &str,
+        models: Option<&HashMap<String, String>>,
+    ) -> Option<Vec<String>> {
+        let build = |agent: &agents::AgentDef<'_>| {
+            let model = models.map_or(OneshotModel::CliDefault, |models| {
+                OneshotModel::Title(resolve_title_model_args(agent, models))
+            });
+            build_oneshot_argv(agent, prompt, model)
+        };
+        match self {
+            Self::Builtin(agent) => build(agent),
+            Self::Declared(declared) => {
+                let argv = declared.with_definition(build)??;
+                let command = declared.contribution().command.as_deref()?;
+                let (words, _) = aoe_plugin_api::agent_integration::direct_launch_words(command)?;
+                let script = format!(
+                    "exec env {} {}",
+                    words.join(" "),
+                    shell_words::join(argv.into_iter().skip(1))
+                );
+                Some(vec!["/bin/sh".into(), "-c".into(), script])
+            }
+        }
+    }
+}
+
+// `check_eligible_resolved` plus the plugin declarations; a params struct would
+// only add boilerplate to the two call sites and the unit tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn check_eligible_with_declarations(
+    structured: bool,
+    setting_on: bool,
+    force: bool,
+    title: &str,
+    session_tool: &str,
+    rename_setting: &str,
+    sandboxed: bool,
+    session_command: &str,
+    config: &crate::session::config::SessionConfig,
+) -> Result<OneshotAgent, SkipReason> {
+    match check_eligible_resolved(
+        structured,
+        setting_on,
+        force,
+        title,
+        session_tool,
+        rename_setting,
+        sandboxed,
+        session_command,
+        &config.agent_command_override,
+    ) {
+        Ok(agent) => return Ok(OneshotAgent::Builtin(agent)),
+        Err(SkipReason::NoOneshot) => {}
+        Err(reason) => return Err(reason),
+    }
+    let tool = resolve_rename_tool(session_tool, rename_setting);
+    let declared = crate::plugin::agent_integration::declared_agent(
+        crate::plugin::registry(),
+        tool,
+        config
+            .custom_agents
+            .iter()
+            .filter(|(_, command)| !command.trim().is_empty())
+            .map(|(name, _)| name.as_str()),
+    )
+    .ok_or(SkipReason::NoOneshot)?;
+    if config.agent_command_override.contains_key(tool)
+        || (tool == session_tool
+            && !session_command.is_empty()
+            && declared.contribution().command.as_deref() != Some(session_command))
+    {
+        return Err(SkipReason::CommandOverridden);
+    }
+    declared
+        .with_definition(|agent| {
+            check_eligible(structured, setting_on, force, title, Some(agent), "", false)
+        })
+        .ok_or(SkipReason::NoOneshot)??;
+    // Flags and the prompt are appended to the declared command, so a shell tail
+    // (`helper | tee log`) would send them to the wrong program.
+    if declared
+        .contribution()
+        .command
+        .as_deref()
+        .and_then(aoe_plugin_api::agent_integration::direct_launch_words)
+        .is_none()
+    {
+        return Err(SkipReason::NoOneshot);
+    }
+    if sandboxed && tool != session_tool {
+        return Err(SkipReason::SandboxRenameAgentMismatch);
+    }
+    Ok(OneshotAgent::Declared(declared))
 }
 
 /// Config fields the smart-rename indicator and runtime gate both consume.
@@ -311,7 +414,7 @@ pub enum OneshotModel {
 /// removes the key on clear), so that state is reachable only via the TUI or
 /// config.toml.
 pub fn resolve_title_model_args(
-    agent: &agents::AgentDef,
+    agent: &agents::AgentDef<'_>,
     models: &HashMap<String, String>,
 ) -> Vec<String> {
     let Some(flag) = agent.oneshot_model_flag() else {
@@ -340,7 +443,7 @@ pub fn resolve_title_model_args(
 /// the CLI has already bound the prompt to the flag, so trailing flags stay
 /// unambiguous.
 pub fn build_oneshot_argv(
-    agent: &agents::AgentDef,
+    agent: &agents::AgentDef<'_>,
     prompt: &str,
     model: OneshotModel,
 ) -> Option<Vec<String>> {
@@ -802,7 +905,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
         &resolved.session,
     );
     let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
-    if check_eligible_resolved(
+    if check_eligible_with_declarations(
         true,
         cfg.setting_on,
         false,
@@ -811,7 +914,7 @@ pub fn maybe_spawn_terminal_smart_rename(inst: &crate::session::instance::Instan
         cfg.rename_agent,
         inst.is_sandboxed(),
         &inst.command,
-        cfg.overrides,
+        &resolved.session,
     )
     .is_err()
     {
@@ -1190,7 +1293,7 @@ fn prepare_terminal_rename(
     );
     let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
     let sandboxed = instance.is_sandboxed();
-    let agent = match check_eligible_resolved(
+    let agent = match check_eligible_with_declarations(
         true,
         cfg.setting_on || force,
         force,
@@ -1199,7 +1302,7 @@ fn prepare_terminal_rename(
         cfg.rename_agent,
         sandboxed,
         &instance.command,
-        cfg.overrides,
+        &resolved.session,
     ) {
         Ok(agent) => agent,
         Err(reason) => {
@@ -1226,8 +1329,7 @@ fn prepare_terminal_rename(
     };
     let baseline = extract_echo_baseline(&context);
     let prompt = build_prompt(&context);
-    let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
-    let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
+    let Some(argv) = agent.argv(&prompt, Some(cfg.rename_model)) else {
         return Ok(None);
     };
     let container_workdir = instance.container_workdir();
@@ -1492,7 +1594,7 @@ mod serve {
             &resolved.session,
         );
         let cfg = resolve_smart_rename_config(&resolved.session, smart_rename_override);
-        let agent = match check_eligible_resolved(
+        let agent = match check_eligible_with_declarations(
             structured,
             cfg.setting_on || force,
             force,
@@ -1501,7 +1603,7 @@ mod serve {
             cfg.rename_agent,
             sandboxed,
             &command,
-            cfg.overrides,
+            &resolved.session,
         ) {
             Ok(agent) => agent,
             Err(reason) => {
@@ -1521,8 +1623,7 @@ mod serve {
         }
 
         let prompt = build_prompt(&input.context);
-        let model = OneshotModel::Title(resolve_title_model_args(agent, cfg.rename_model));
-        let Some(argv) = build_oneshot_argv(agent, &prompt, model) else {
+        let Some(argv) = agent.argv(&prompt, Some(cfg.rename_model)) else {
             return Err(skipped(SkipReason::NoOneshot.user_message()));
         };
 
@@ -2189,13 +2290,13 @@ mod serve {
 mod tests {
     use super::*;
 
-    fn claude() -> &'static agents::AgentDef {
+    fn claude() -> &'static agents::AgentDef<'static> {
         agents::get_agent("claude").expect("claude agent exists")
     }
 
     /// A title one-shot with no user override: the agent's built-in default
     /// (claude pins `haiku`, others none), reproducing the pre-tunable behavior.
-    fn title_default(agent: &agents::AgentDef) -> OneshotModel {
+    fn title_default(agent: &agents::AgentDef<'_>) -> OneshotModel {
         OneshotModel::Title(resolve_title_model_args(agent, &HashMap::new()))
     }
 

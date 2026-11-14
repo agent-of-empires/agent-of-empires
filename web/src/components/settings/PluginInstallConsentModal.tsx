@@ -1,4 +1,5 @@
 import type { PluginInstallConsent } from "../../lib/api";
+import { agentIntegrationDetails, displayAgentText } from "./agentIntegrationDetails";
 import { BuildSteps, ModalActions, ModalSection, PluginModal } from "./PluginModal";
 import { uniqueSlots } from "./uniqueSlots";
 
@@ -47,11 +48,18 @@ export function PluginInstallConsentModal({ consent, busy, error, onApprove, onC
         </ModalSection>
       )}
       {consent.agent_integrations.length > 0 && (
-        <ModalSection label="Agent launch commands" warn testId="plugin-install-agent-integrations">
+        <ModalSection label="Agent declarations" warn testId="plugin-install-agent-integrations">
           <ul className="space-y-0.5">
             {consent.agent_integrations.map((agent) => (
               <li key={agent.tool} className="font-mono text-[11px] text-text-dim">
-                {agent.tool}: {agent.command ?? "No launch command declared"}
+                <div>
+                  {displayAgentText(agent.tool)}: {displayAgentText(agent.command ?? "No launch command declared")}
+                </div>
+                {agentIntegrationDetails(agent).map((detail, index) => (
+                  <div key={index} className="pl-4">
+                    {detail}
+                  </div>
+                ))}
               </li>
             ))}
           </ul>
