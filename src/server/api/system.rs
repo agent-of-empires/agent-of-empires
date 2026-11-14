@@ -297,6 +297,7 @@ pub async fn list_agents(
         let data_dir = crate::session::get_app_dir().ok();
         let mut agents = crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::available())
             .map(|a| {
                 let (acp_command, acp_args) =
                     acp_command_fields(acp_registry.get(a.name), data_dir.as_deref());
@@ -335,6 +336,15 @@ pub async fn list_agents(
                 .map(|(name, _)| name.as_str()),
         );
         for integration in plugin_agents {
+            // A host-owned adapter outlives the takeover: `omp acp` is still
+            // registered even while a declaration provides the tool, so the row
+            // keeps the adapter fields the builtin row would report. Selection
+            // stays keyed on the bundled identity, not the plugin-chosen name.
+            let adapter = crate::plugin::bundled_agents::contains(integration.tool)
+                .then(|| acp_registry.get(integration.tool))
+                .flatten();
+            let (acp_command, acp_args) = acp_command_fields(adapter, data_dir.as_deref());
+            let acp_capable = adapter.is_some();
             let launch = registry
                 .get(integration.plugin)
                 .and_then(|owner| {
@@ -381,12 +391,12 @@ pub async fn list_agents(
                 oneshot_capable: launch.is_some_and(|launch| launch.oneshot_flag.is_some())
                     && aoe_plugin_api::agent_integration::direct_launch_words(integration.command)
                         .is_some(),
-                acp_capable: false,
+                acp_capable,
                 acp_installed: false,
                 acp_create_ready: false,
                 acp_allowed: policy.allows(integration.tool),
-                acp_command: None,
-                acp_args: Vec::new(),
+                acp_command,
+                acp_args,
                 lifecycle: crate::agents::AgentLifecycle::Active,
                 path: None,
                 acp_install_command: None,
@@ -3887,6 +3897,79 @@ mod tests {
             panic!("an unknown profile must not list agents");
         };
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A declaration that takes over a bundled agent replaces its launch command,
+    /// not the ACP adapter the host registered for that identity, so the row
+    /// still reports `omp acp`. A plugin naming any other tool has no adapter
+    /// and must not advertise one.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_plugin_row_reports_only_the_adapter_the_host_registered() {
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let manifest = r#"
+id = "acme.takeover"
+name = "Takeover"
+version = "1.0.0"
+api_version = 21
+
+[[agent_integrations]]
+tool = "omp"
+command = "omp --takeover"
+[agent_integrations.launch]
+instruction_flag = "--prompt={}"
+
+[[agent_integrations]]
+tool = "zzzeta"
+command = "zzzeta"
+"#;
+        let dir = crate::plugin::plugins_dir().unwrap().join("acme.takeover");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.takeover".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        crate::plugin::reload_registry();
+        crate::session::create_profile("default").unwrap();
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let Ok(Json(agents)) =
+            list_agents(State(state), axum::extract::Query(AgentsQuery::default())).await
+        else {
+            panic!("list_agents failed");
+        };
+
+        let takeover = agents
+            .iter()
+            .find(|agent| agent.name == "omp")
+            .expect("the declared tool is listed");
+        assert_eq!(takeover.kind, "plugin");
+        assert!(takeover.acp_capable);
+        assert_eq!(takeover.acp_command.as_deref(), Some("omp"));
+        assert_eq!(takeover.acp_args, vec!["acp".to_string()]);
+
+        let foreign = agents
+            .iter()
+            .find(|agent| agent.name == "zzzeta")
+            .expect("the plugin row is listed");
+        assert!(!foreign.acp_capable);
+        assert!(foreign.acp_command.is_none());
+        assert!(foreign.acp_args.is_empty());
     }
 
     /// Both fields follow the structured create check, so a custom agent counts when its

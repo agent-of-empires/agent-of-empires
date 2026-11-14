@@ -251,7 +251,10 @@ impl Instance {
                 .filter(|(_, command)| !command.trim().is_empty())
                 .map(|(name, _)| name.as_str()),
         )
-        .filter(|agent| agent.contribution().command.as_deref() == Some(self.get_tool_command()))
+        .filter(|agent| {
+            self.command.is_empty()
+                || agent.contribution().command.as_deref() == Some(self.command.as_str())
+        })
     }
 
     fn declared_session_support(
@@ -361,12 +364,12 @@ impl Instance {
             self.extra_args.clone()
         };
         if raw_command.trim().is_empty()
-            || contains_active_shell_syntax(raw_command)
+            || contains_active_shell_syntax(&raw_command)
             || contains_active_shell_syntax(&launch_extra_args)
         {
             return false;
         }
-        let Some(parsed_command) = parse_launch_command(raw_command) else {
+        let Some(parsed_command) = parse_launch_command(&raw_command) else {
             return false;
         };
         let mut words = parsed_command.words;
@@ -390,7 +393,7 @@ impl Instance {
     /// `AOE_INSTANCE_ID` because [`status_hook_env_prefix`] injects the marker
     /// on hook presence alone.
     pub(crate) fn launch_executable_token(&self) -> Option<String> {
-        let words = parse_launch_command(self.get_tool_command())?.words;
+        let words = parse_launch_command(&self.get_tool_command())?.words;
         Path::new(words.first()?)
             .file_name()?
             .to_str()
@@ -431,7 +434,7 @@ impl Instance {
         {
             return true;
         }
-        let Some(parsed_command) = parse_launch_command(self.get_tool_command()) else {
+        let Some(parsed_command) = parse_launch_command(&self.get_tool_command()) else {
             return false;
         };
         let mut words = parsed_command.words;
@@ -515,15 +518,13 @@ impl Instance {
         let Some(active) = &self.active_execution else {
             return self.resolved_session_support();
         };
-        if crate::agents::get_agent(&active.binding.agent).is_none() {
+        let Some(native) = crate::agents::native_definition(&active.binding.agent) else {
             if active.binding.agent != self.tool {
                 return None;
             }
             return self.declared_session_support(active.container.is_some());
-        }
-        let capture = crate::agents::get_agent(&active.binding.agent)?
-            .session_support?
-            .capture?;
+        };
+        let capture = native.session_support?.capture?;
         let context = if active.container.is_some() {
             capture.sandbox
         } else {
@@ -574,12 +575,12 @@ impl Instance {
             return None;
         }
         let command = self.get_tool_command();
-        if Self::contains_active_shell_syntax(command)
+        if Self::contains_active_shell_syntax(&command)
             || Self::contains_active_shell_syntax(&self.extra_args)
         {
             return None;
         }
-        let parsed = parse_launch_command(command)?;
+        let parsed = parse_launch_command(&command)?;
         let [program] = parsed.words.as_slice() else {
             return None;
         };
@@ -593,6 +594,7 @@ impl Instance {
         }
         if crate::agents::AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::definitions())
             .any(|other| other.binary == program && other.name != agent.name)
         {
             return None;
@@ -1027,6 +1029,60 @@ pub(crate) fn resolved_agent_for(
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    /// A session stored with the fallback's own command keeps its capture after
+    /// an approved declaration takes over the OMP listing.
+    #[test]
+    #[serial_test::serial]
+    fn recorded_native_omp_identity_keeps_its_capture_after_takeover() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let mut instance = Instance::new("recorded", dir.path().to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.active_execution = Some(crate::session::instance::execution::ActiveExecution {
+            launch_id: "fixture-launch".into(),
+            binding: crate::session::instance::execution::ExecutionBinding {
+                agent: "omp".into(),
+                stores: vec![dir.path().join(".omp")],
+                configuration: Vec::new(),
+                cwd: dir.path().to_path_buf(),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        });
+
+        let (capture, context) = instance
+            .source_session_support()
+            .expect("a recorded native omp execution keeps its capture");
+        assert_eq!(capture.backend, crate::agents::SessionCaptureBackend::Omp);
+        assert_eq!(context, crate::agents::SessionCaptureContext::PaneScoped);
+    }
+
+    /// A wrapper whose bare command is another native agent's binary is not a
+    /// bare wrapper of its own tool. The bundled definitions count: `omp` left
+    /// the native table, and a wrapper naming it must not become a `claude`
+    /// selector just because only `AGENTS` was searched.
+    #[test]
+    fn a_bare_command_naming_the_bundled_omp_binary_is_not_this_tool() {
+        let mut inst = Instance::new("claude", "/tmp");
+        inst.command = "omp".into();
+        assert!(inst.legacy_default_selector_agent().is_none());
+
+        inst.command = "claude".into();
+        assert!(
+            inst.legacy_default_selector_agent().is_some(),
+            "a bare native wrapper keeps its selector"
+        );
+    }
 
     fn worktree(main_repo_path: &str) -> WorktreeInfo {
         WorktreeInfo {

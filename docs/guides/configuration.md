@@ -276,7 +276,8 @@ Put specific states such as `waiting` and `error` before broad `running` matches
 
 #### OMP terminal status
 
-Built-in OMP detection reads the visible pane and locates activity, pinned errors,
+When no approved, enabled OMP status integration owns the session, the bundled
+OMP detector reads the visible pane and locates activity, pinned errors,
 and blocking dialogs relative to the current composer. Question dialogs remain
 waiting when paging hides the selected option; session pickers accept bracketed
 key legends. Extension status rows, including plugin badges, do not need

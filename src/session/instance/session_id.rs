@@ -640,7 +640,7 @@ impl Instance {
         let config = &resolved.config.session;
         let native = resolved
             .resolved
-            .then(|| Self::execution_agent_for(&self.tool, self.get_tool_command(), config).ok())
+            .then(|| Self::execution_agent_for(&self.tool, &self.get_tool_command(), config).ok())
             .flatten();
         let Some(agent) = native
             .or_else(|| self.legacy_default_selector_agent_in(config))
@@ -736,7 +736,11 @@ impl Instance {
     ) -> Option<String> {
         let agent = agent?;
         let strategy = agent.session_support.as_ref()?.resume;
-        if words.first() != parse_launch_command(self.get_tool_command())?.words.first() {
+        if words.first()
+            != parse_launch_command(&self.get_tool_command())?
+                .words
+                .first()
+        {
             return None;
         }
         let flag_present = |flag: &str| {

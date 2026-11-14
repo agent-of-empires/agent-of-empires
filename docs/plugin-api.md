@@ -71,7 +71,7 @@ The host matches status integrations to terminal sessions and rejects missing, m
 
 ### Launch, detection, and reply-fallback declarations (API 21)
 
-These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. When a plugin is absent or disabled, built-in OMP and its pane detection and capture behavior remain available.
+These declarations require API 21 and a host that implements them. API 20 hosts reject them; API 20 agent integrations remain supported. Built-in agents and aliases retain precedence. An approved, enabled API 21 OMP launch declaration supersedes the bundled OMP launch contract, including for existing sessions with no stored command; provider status and replies still require their capability and valid reports. If that declaration is absent, disabled, or not approved, the bundled OMP launch, pane detection, and capture fallback remain available. A plugin-omp release declaring API 21 behavior is a separate prerequisite for the cutover.
 
 Launch flags, instruction templates, environment values, install hints, and literal reply keys reject control and Unicode format characters.
 

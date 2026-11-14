@@ -14,7 +14,11 @@ pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -
     if let Some(status) = super::status_rules::detect(profile, tool, &clean) {
         return status;
     }
+    // A launch-only declaration hides the fallback from the agent list, but a
+    // pane running that fallback still needs its detector: without it a Running
+    // pane reads as Idle, and Smart rename would run its one-shot mid-turn.
     crate::agents::get_agent(tool)
+        .or_else(|| crate::plugin::bundled_agents::definition(tool))
         .map(|a| (a.detect_status)(&clean))
         .unwrap_or(Status::Idle)
 }
