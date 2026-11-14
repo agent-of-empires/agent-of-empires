@@ -460,6 +460,38 @@ impl HomeView {
         self.creating_hook_progress.remove(stub_id);
     }
 
+    /// Tells the user once when a session was created but its first prompt
+    /// was not delivered, and puts the retained prompt on the clipboard.
+    pub(super) fn announce_prompt_failure(&mut self, row: &crate::daemon::SessionResponse) {
+        let Some(error) = &row.initial_prompt_error else {
+            self.prompt_failures_announced.remove(&row.id);
+            return;
+        };
+        // Another dialog is open: the next snapshot tries again.
+        if self.prompt_failures_announced.contains(&row.id) || self.info_dialog.is_some() {
+            return;
+        }
+        self.prompt_failures_announced.insert(row.id.clone());
+        let prompt = self
+            .get_instance(&row.id)
+            .and_then(|i| i.pending_initial_turn.as_ref())
+            .map(|turn| turn.text.clone());
+        let mut message = format!(
+            "{} was created, but its first prompt was not delivered: {error}",
+            row.title
+        );
+        match prompt {
+            Some(text) => {
+                crate::tui::clipboard::copy_to_clipboard(&text);
+                message.push_str(
+                    "\n\nThe prompt is copied to your clipboard. Attach the session and paste it.",
+                );
+            }
+            None => message.push_str("\n\nAttach the session and type the prompt again."),
+        }
+        self.info_dialog = Some(InfoDialog::sized_to_fit("Prompt not delivered", &message));
+    }
+
     fn commit_created_session(&mut self) -> Option<String> {
         // During the synchronous load the committed row must not be hidden as a reservation.
         let mut pending = self.pending_creation.take()?;
@@ -494,6 +526,13 @@ impl HomeView {
             return None;
         }
         crate::tui::app::record_session_create();
+        if let Some(origin) = self
+            .get_instance(&row.id)
+            .and_then(|i| i.suggestion.clone())
+        {
+            self.suggestions_feed
+                .link_started(&(origin.provider_id, origin.id), &row.id);
+        }
         self.clear_creation_tracking(&pending.request_key);
         self.rebuild_group_trees();
         self.rebuild_flat_items();
@@ -658,8 +697,8 @@ fn wizard_create_body(
         repo_bases: Vec::new(),
         command_override: data.command_override.clone(),
         custom_instruction: None,
-        initial_prompt: None,
-        suggestion: None,
+        initial_prompt: data.initial_prompt.clone(),
+        suggestion: data.suggestion.clone(),
         profile: Some(data.profile.clone()),
         view: if data.structured {
             crate::session::View::Structured

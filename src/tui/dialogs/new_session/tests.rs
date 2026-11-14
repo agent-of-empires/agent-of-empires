@@ -7,7 +7,7 @@ use std::fs;
 const TEST_PATH: &str = ".";
 
 /// Field layout with one tool and one profile: path 0, title 1, yolo 2,
-/// worktree 3, group 4.
+/// worktree 3, group 4, prompt 5.
 fn single_tool_dialog() -> NewSessionDialog {
     NewSessionDialog::new_with_tools(vec!["claude"], TEST_PATH.to_string())
 }
@@ -98,6 +98,209 @@ fn a_profile_default_tool_beats_the_global_one() {
     assert_eq!(dialog.available_tools[dialog.tool_index], "opencode");
 }
 
+fn github_origin() -> super::PromptOrigin {
+    super::PromptOrigin {
+        provider: "GitHub".to_string(),
+        source_ref: "#4562".to_string(),
+        reason: "review requested from you".to_string(),
+        source_text: Some("PR body: please review the \u{1b}[1mRFC\u{1b}[0m".to_string()),
+        suggestion: None,
+    }
+}
+
+#[test]
+fn a_suggested_prompt_is_shown_wrapped_attributed_and_editable() {
+    let mut dialog = single_tool_dialog();
+    let prompt = "Review PR 4562. ".repeat(8);
+    dialog.set_suggestion(prompt.clone(), github_origin());
+    let screen = screen_of(&mut dialog, 100, 40);
+    for expected in [
+        "From GitHub · #4562 · review requested from you",
+        "Prompt:",
+        &prompt[..40],
+        "from GitHub, not checked by AoE",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+    assert!(
+        !screen.contains(prompt.trim_end()),
+        "a prompt longer than the row wraps instead of running on"
+    );
+
+    dialog.focused_field = dialog.field_indices().prompt;
+    type_str(&mut dialog, "!");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some(format!("{prompt}!"))
+    );
+}
+
+#[test]
+fn a_typed_prompt_is_submitted_without_a_suggestion_and_has_no_source() {
+    let mut dialog = single_tool_dialog();
+    assert_ne!(dialog.field_indices().prompt, super::FieldIndices::ABSENT);
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        None,
+        "an empty prompt is omitted"
+    );
+
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().prompt;
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("Prompt:"));
+    assert!(!screen.contains("view source"));
+    assert!(!screen.contains("not checked by AoE"));
+
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(!dialog.show_prompt_source, "no origin, nothing to show");
+
+    type_str(&mut dialog, "  fix the build ");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some("  fix the build ".to_string())
+    );
+}
+
+#[test]
+fn pasting_into_the_prompt_keeps_newlines_but_other_fields_stay_single_line() {
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_paste("line one\nline two\r\nline three\rline four");
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        Some("line one\nline two\nline three\nline four".to_string())
+    );
+
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.field_indices().title;
+    dialog.handle_paste("one\ntwo");
+    assert_eq!(dialog.title.value(), "onetwo");
+}
+
+#[test]
+#[serial_test::serial]
+fn clicking_the_prompt_row_while_path_is_focused_focuses_the_prompt() {
+    let mut dialog = single_tool_dialog();
+    dialog.focused_field = dialog.path_field();
+    let prompt = dialog.field_indices().prompt;
+    dialog
+        .focusable_rects
+        .push((prompt, ratatui::layout::Rect::new(0, 9, 30, 1)));
+    dialog.handle_click(10, 9);
+    assert_eq!(dialog.focused_field, dialog.field_indices().prompt);
+}
+
+#[test]
+fn hostile_suggestion_text_is_neutralised_and_a_blank_one_is_omitted() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("run \u{1b}[31mnow\nthen stop".to_string(), github_origin());
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(!screen.contains('\u{1b}'));
+    assert!(screen.contains("run \u{fffd}[31mnow\u{23ce}then stop"));
+
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("   ".to_string(), github_origin());
+    assert_eq!(
+        submitted(dialog.handle_key(key(KeyCode::Enter))).initial_prompt,
+        None,
+        "a blank prompt is omitted, which creation would reject"
+    );
+}
+
+#[test]
+fn ctrl_p_on_the_prompt_row_shows_the_source_text_and_esc_closes_it() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("Review PR 4562".to_string(), github_origin());
+    dialog.focused_field = dialog.field_indices().prompt;
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("Ctrl+P view source"), "{screen}");
+    assert!(!screen.contains("Suggestion source"));
+
+    assert!(matches!(
+        dialog.handle_key(ctrl_key(KeyCode::Char('p'))),
+        DialogResult::Continue
+    ));
+    assert!(dialog.show_prompt_source);
+    let screen = screen_of(&mut dialog, 100, 40);
+    for expected in [
+        "Suggestion source",
+        "From GitHub, not checked by AoE",
+        "PR body: please review the \u{fffd}[1mRFC\u{fffd}[0m",
+    ] {
+        assert!(screen.contains(expected), "missing {expected:?}");
+    }
+    assert!(!screen.contains('\u{1b}'));
+
+    // Keys stay in the overlay until it closes; the prompt is untouched.
+    type_str(&mut dialog, "x");
+    dialog.handle_paste("pasted");
+    assert_eq!(dialog.prompt.value(), "Review PR 4562");
+    dialog.handle_key(key(KeyCode::Esc));
+    assert!(!dialog.show_prompt_source);
+
+    // Enter closes the overlay instead of submitting the form.
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(matches!(
+        dialog.handle_key(key(KeyCode::Enter)),
+        DialogResult::Continue
+    ));
+    assert!(!dialog.show_prompt_source);
+
+    let mut dialog = single_tool_dialog();
+    let mut origin = github_origin();
+    origin.source_text = None;
+    dialog.set_suggestion("Review PR 4562".to_string(), origin);
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    assert!(screen_of(&mut dialog, 100, 40).contains("No source text."));
+}
+
+#[test]
+fn the_source_overlay_wraps_by_cell_width_and_counts_hidden_rows() {
+    let wide = "\u{4e2d}".repeat(10);
+    assert_eq!(
+        super::render::wrap_cells(&wide, 8),
+        vec![
+            "\u{4e2d}".repeat(4),
+            "\u{4e2d}".repeat(4),
+            "\u{4e2d}".repeat(2)
+        ],
+        "10 CJK chars are 20 cells, so 8 cols hold 4 per row"
+    );
+    assert_eq!(
+        super::render::wrap_cells("ab\u{200d}cd", 2),
+        vec!["ab\u{200d}", "cd"],
+        "a zero-width char stays on its row"
+    );
+    assert_eq!(super::render::wrap_cells("", 8), vec![""]);
+
+    // 12 rows leave 7 for the body: 6 lines, then the hidden count.
+    let mut dialog = single_tool_dialog();
+    let mut origin = github_origin();
+    origin.source_text = Some(
+        (0..20)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    dialog.set_suggestion("Review PR 4562".to_string(), origin);
+    dialog.focused_field = dialog.field_indices().prompt;
+    dialog.handle_key(ctrl_key(KeyCode::Char('p')));
+    let screen = screen_of(&mut dialog, 100, 12);
+    assert!(screen.contains("line 05"), "{screen}");
+    assert!(!screen.contains("line 06"), "{screen}");
+    assert!(screen.contains("\u{2026} 14 more lines"), "{screen}");
+    assert!(
+        screen.contains("Press Esc, Enter or Ctrl+P to close"),
+        "{screen}"
+    );
+
+    let screen = screen_of(&mut dialog, 100, 40);
+    assert!(screen.contains("line 19"), "{screen}");
+    assert!(!screen.contains("more lines"), "{screen}");
+}
+
 #[test]
 fn enter_submits_the_form_and_esc_cancels() {
     let data = submitted(single_tool_dialog().handle_key(key(KeyCode::Enter)));
@@ -138,20 +341,20 @@ fn tab_walks_the_visible_fields_in_both_directions() {
     let mut worktree_on = single_tool_dialog();
     worktree_on.worktree_enabled = true;
     for mut dialog in [single_tool_dialog(), worktree_on] {
-        for expected in [1, 2, 3, 4, 0] {
+        for expected in [1, 2, 3, 4, 5, 0] {
             dialog.handle_key(key(KeyCode::Tab));
             assert_eq!(dialog.focused_field, expected);
         }
     }
 
     let mut dialog = multi_tool_dialog();
-    for expected in [1, 2, 3, 4, 5, 0] {
+    for expected in [1, 2, 3, 4, 5, 6, 0] {
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, expected);
     }
 
     let mut dialog = single_tool_dialog();
-    for expected in [4, 3, 2, 1, 0] {
+    for expected in [5, 4, 3, 2, 1, 0] {
         dialog.handle_key(shift_key(KeyCode::BackTab));
         assert_eq!(dialog.focused_field, expected);
     }
@@ -168,6 +371,8 @@ fn tab_walks_the_visible_fields_in_both_directions() {
         assert_eq!(dialog.focused_field, 5, "sandbox row");
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 6, "group row");
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 7, "prompt row");
         dialog.handle_key(key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 0);
     }
@@ -1087,8 +1292,8 @@ fn moving_between_repos_that_map_the_agent_differently_refreshes_its_lock_and_vi
             d.handle_key(key(KeyCode::BackTab));
             assert_eq!(
                 d.focused_field,
-                d.field_indices().group,
-                "BackTab wraps to Group"
+                d.field_indices().prompt,
+                "BackTab wraps to Prompt"
             );
         }),
         ("scratch", |d, _| {
@@ -2268,4 +2473,44 @@ fn workspace_is_unavailable_when_attaching_an_existing_branch() {
     assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [ ]"));
     dialog.create_new_branch = true;
     assert!(screen_text(&draw(&mut dialog)).contains("Workspace: [x]"));
+}
+
+#[test]
+fn the_prompt_wraps_and_places_the_cursor_by_display_cells() {
+    use super::render::wrap_prompt;
+    // 40 double-width characters are 80 cells: 34 fit a 68-cell row.
+    let rows = wrap_prompt(&"\u{4e2d}".repeat(40));
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].0, rows[0].1.chars().count()), (0, 34));
+    assert_eq!((rows[1].0, rows[1].1.chars().count()), (34, 6));
+    // A row filled to the width leaves an empty one for the cursor.
+    let rows = wrap_prompt(&"\u{4e2d}".repeat(34));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1], (34, String::new()));
+    assert_eq!(wrap_prompt("").len(), 1);
+}
+
+#[test]
+fn an_unresolved_project_waits_for_a_path_before_submitting() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_suggestion("Review PR 4562".to_string(), github_origin());
+    dialog.require_path();
+    assert_eq!(dialog.focused_field, dialog.field_indices().path);
+    assert!(matches!(
+        dialog.handle_key(key(KeyCode::Enter)),
+        DialogResult::Continue
+    ));
+    assert!(dialog
+        .error_message
+        .as_deref()
+        .is_some_and(|e| e.contains("Pick a project path")));
+    assert_eq!(
+        dialog.prompt.value(),
+        "Review PR 4562",
+        "the prompt is kept"
+    );
+
+    dialog.set_path(TEST_PATH.to_string());
+    let data = submitted(dialog.handle_key(key(KeyCode::Enter)));
+    assert_eq!(data.initial_prompt.as_deref(), Some("Review PR 4562"));
 }

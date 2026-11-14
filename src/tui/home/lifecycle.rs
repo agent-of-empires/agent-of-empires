@@ -325,6 +325,7 @@ impl HomeView {
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
+            suggestions_view: None,
             list_width: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)
@@ -363,6 +364,9 @@ impl HomeView {
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
             trashed_section_collapsed: true,
+            suggested_section_collapsed: true,
+            prompt_failures_announced: std::collections::HashSet::new(),
+            suggestions_feed: crate::tui::suggestions::SuggestionsFeed::new(),
             hide_stopped_in_groups: false,
             group_totals: HashMap::new(),
             opener_exits: Vec::new(),

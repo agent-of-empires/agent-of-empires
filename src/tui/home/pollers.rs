@@ -1,6 +1,8 @@
 //! Typed runtime completion polling; durable lifecycle work belongs to the daemon.
 
 use super::*;
+use crate::tui::dialogs::PromptOrigin;
+use crate::tui::suggestions::{PrepareTarget, Start, SuggestionsView};
 
 impl HomeView {
     pub(super) const CANONICAL_RELOAD_RETRY_INTERVAL: std::time::Duration =
@@ -45,5 +47,107 @@ impl HomeView {
                 false
             }
         }
+    }
+
+    /// Drains the suggestions worker. True when state changed.
+    pub fn apply_suggestions_results(&mut self) -> bool {
+        self.suggestions_feed
+            .set_profile(self.active_profile.clone());
+        self.suggestions_feed
+            .tick(self.session_feed.latest_snapshot().is_some());
+        let mut polled = self.suggestions_feed.poll();
+        let mut changed = match &mut self.suggestions_view {
+            Some(view) => view.apply(&self.suggestions_feed, &mut polled),
+            None => false,
+        };
+        if polled.changed {
+            self.rebuild_flat_items_keeping_cursor();
+            self.update_selected();
+            changed = true;
+        }
+        // A view prepare answered after the view closed has no one to start it.
+        if let Some((key, mut start, target @ (PrepareTarget::Home | PrepareTarget::HomeAnother))) =
+            polled.start
+        {
+            if let Some(view) = &mut self.suggestions_view {
+                // The full view owns suggestion starts now, so say why nothing opened.
+                view.set_error("Suggestion ready, press Start again in this list");
+            } else if self.cursor_suggestion().as_ref() == Some(&key) && self.new_dialog.is_none() {
+                if target == PrepareTarget::HomeAnother {
+                    start.suggestion = None;
+                }
+                self.start_suggestion(start);
+            } else {
+                self.flash_status("Selection changed, suggestion not started");
+            }
+            changed = true;
+        }
+        if let Some(error) = polled.error {
+            self.flash_status(error);
+            changed = true;
+        }
+        changed
+    }
+
+    pub(super) fn open_suggestions_view(&mut self) {
+        self.suggestions_view = Some(SuggestionsView::new(&mut self.suggestions_feed));
+    }
+
+    /// Replaces the view with the regular new-session dialog, prefilled; when
+    /// the dialog cannot open the view stays and shows why.
+    pub(super) fn start_suggestion(&mut self, start: Start) {
+        match self.suggestion_dialog(start) {
+            Ok(dialog) => {
+                self.suggestions_view = None;
+                self.new_dialog = Some(dialog);
+            }
+            Err(message) => {
+                if let Some(view) = &mut self.suggestions_view {
+                    view.set_error(message);
+                } else {
+                    self.flash_status(message);
+                }
+            }
+        }
+    }
+
+    fn suggestion_dialog(&self, start: Start) -> Result<NewSessionDialog, &'static str> {
+        if self.creating_stub_id.is_some() {
+            return Err("A session is already being created");
+        }
+        if !self.available_tools.any_available() {
+            return Err("No agent is available. Set one up before starting a suggestion");
+        }
+        let profile = self.config_profile();
+        let profiles =
+            crate::session::list_profiles_for_display().unwrap_or_else(|_| vec![profile.clone()]);
+        let mut dialog = NewSessionDialog::new(
+            self.available_tools.clone(),
+            self.all_group_paths(),
+            &profile,
+            profiles,
+        );
+        // Path first: setting it re-resolves the defaults the rest builds on.
+        let path_known = start.path.is_some();
+        match start.path {
+            Some(path) => dialog.set_path(path),
+            None => dialog.require_path(),
+        }
+        dialog.set_tool(&start.tool);
+        dialog.set_title(start.title);
+        dialog.set_suggestion(
+            start.initial_prompt,
+            PromptOrigin {
+                provider: start.provider,
+                source_ref: start.source_ref,
+                reason: start.reason,
+                source_text: start.source_text,
+                suggestion: start.suggestion,
+            },
+        );
+        if path_known {
+            dialog.focus_title();
+        }
+        Ok(dialog)
     }
 }
