@@ -4264,6 +4264,18 @@ mod tests {
     #[serial_test::serial]
     async fn the_check_matches_the_switch_and_fresh_never_resumes() -> anyhow::Result<()> {
         let _home = crate::session::test_support::isolate_app_dir();
+        // A resume resolves the row's own `claude` on PATH and its store under HOME, so neither
+        // may come from the host.
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        let _store = crate::session::test_support::EnvGuard::set(&[(
+            "CLAUDE_CONFIG_DIR",
+            home.join(".claude"),
+        )]);
+        let _claude = crate::session::test_support::install_login_shell_path_command(
+            &home,
+            "claude",
+            "#!/bin/sh\nexec sleep 60\n",
+        );
         crate::session::config::update_app_state(|state| {
             state.has_acknowledged_agent_hooks = true
         })?;
@@ -4373,7 +4385,8 @@ mod tests {
             )
             .await
             .into_response();
-            assert_eq!(response.status(), StatusCode::OK, "{}", row.title);
+            let (status, json) = response_json(response).await?;
+            assert_eq!(status, StatusCode::OK, "{}: {json}", row.title);
             assert_launched(row, old_sid, resumed)?;
         }
 
