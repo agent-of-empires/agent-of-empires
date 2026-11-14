@@ -163,6 +163,8 @@ pub(super) enum PrepareTarget {
 
 enum Res {
     Snapshot(Result<Snapshot, String>),
+    /// A dismiss or restore the daemon accepted, but the reload after it failed.
+    DismissKept(String),
     Refreshed(Result<(), String>),
     Prepared(Result<Prepared, String>),
 }
@@ -171,7 +173,10 @@ enum Res {
 impl Res {
     fn error(&self) -> Option<&str> {
         match self {
-            Res::Snapshot(Err(e)) | Res::Refreshed(Err(e)) | Res::Prepared(Err(e)) => Some(e),
+            Res::Snapshot(Err(e))
+            | Res::DismissKept(e)
+            | Res::Refreshed(Err(e))
+            | Res::Prepared(Err(e)) => Some(e),
             _ => None,
         }
     }
@@ -217,16 +222,16 @@ async fn run(req: &Req) -> Res {
             provider_id,
             id,
             dismissed,
-        } => Res::Snapshot(
-            async {
-                client
-                    .set_suggestion_dismissed(provider_id, id, *dismissed)
-                    .await
-                    .map_err(text)?;
-                load(&client).await
-            }
-            .await,
-        ),
+        } => match client
+            .set_suggestion_dismissed(provider_id, id, *dismissed)
+            .await
+        {
+            Ok(()) => match load(&client).await {
+                Ok(snapshot) => Res::Snapshot(Ok(snapshot)),
+                Err(e) => Res::DismissKept(e),
+            },
+            Err(e) => Res::Snapshot(Err(text(e))),
+        },
         Req::Prepare {
             provider_id, id, ..
         } => Res::Prepared(
@@ -260,11 +265,13 @@ fn spawn_worker() -> Worker<Req, Res> {
 }
 
 /// Provider text is untrusted: drop control characters (escape sequences) and
-/// bidi overrides, keeping newlines.
+/// bidi overrides, keeping newlines and tabs. A carriage return is dropped, so
+/// CRLF text keeps its line breaks.
 fn plain(s: &str) -> String {
     s.chars()
+        .filter(|&c| c != '\r')
         .map(|c| {
-            let hostile = (c.is_control() && c != '\n')
+            let hostile = (c.is_control() && c != '\n' && c != '\t')
                 || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
             if hostile {
                 '\u{fffd}'
@@ -275,9 +282,10 @@ fn plain(s: &str) -> String {
         .collect()
 }
 
-/// `plain` for text shown on a single line: line breaks cannot start a second one.
+/// `plain` for text shown on a single line: line breaks cannot start a second
+/// one, and a tab becomes a space.
 fn plain_line(s: &str) -> String {
-    plain(s).replace('\n', "\u{fffd}")
+    plain(s).replace('\n', "\u{fffd}").replace('\t', " ")
 }
 
 /// Resolves a prepared suggestion into a dialog `Start`. A prepare response
@@ -1380,6 +1388,28 @@ impl SuggestionsFeed {
                     tracing::debug!(target: "tui.suggestions", error = %e, "suggestions reload failed");
                 }
             }
+            Res::DismissKept(e) => {
+                // The daemon accepted it: show it from the snapshot we have and
+                // open the undo window, even though the reload failed.
+                if let (Some((key, dismissed)), Some(snapshot)) =
+                    (&in_flight_dismiss, self.snapshot.as_mut())
+                {
+                    if let Some(item) = snapshot
+                        .items
+                        .iter_mut()
+                        .find(|i| (&i.provider_id, &i.id) == (&key.0, &key.1))
+                    {
+                        item.dismissed = *dismissed;
+                    }
+                    self.settle_dismissals();
+                    out.changed = true;
+                }
+                if user {
+                    out.error = Some(format!("Saved, but the list did not reload: {e}"));
+                } else {
+                    tracing::debug!(target: "tui.suggestions", error = %e, "suggestions reload failed");
+                }
+            }
             Res::Refreshed(Ok(())) => out.refreshed = true,
         }
         if let Some(next) = self.queued.pop_front() {
@@ -1818,6 +1848,38 @@ mod tests {
             rig.store.recent.is_empty(),
             "dropped once the restore succeeded"
         );
+    }
+
+    #[test]
+    fn an_accepted_dismiss_enters_the_undo_window_even_if_the_reload_fails() {
+        let worker = Worker::seeded_for_test("t", Res::DismissKept("offline".into()));
+        let mut rig = view_with(vec![item("a", None, false)], worker);
+        let key = ("p".to_string(), "a".to_string());
+        rig.store.dismissing.push(key.clone());
+        rig.store.busy = true;
+        rig.store.in_flight_user = true;
+        rig.store.in_flight_dismiss = Some((key.clone(), true));
+        let mut polled = rig.store.poll();
+        for _ in 0..200 {
+            if polled.error.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            polled = rig.store.poll();
+        }
+        assert!(polled.changed);
+        assert!(polled.error.unwrap().contains("did not reload: offline"));
+        assert!(rig.store.is_recent(&key), "the undo is offered");
+        assert!(rig.store.dismissing.is_empty());
+        rig.view.sync(&rig.store);
+        assert_eq!(ids(&rig), ["a"], "listed while the undo window runs");
+    }
+
+    #[test]
+    fn provider_text_keeps_tabs_and_crlf_line_breaks() {
+        assert_eq!(plain("fn a() {\r\n\tx\r\n}"), "fn a() {\n\tx\n}");
+        assert_eq!(plain_line("a\tb\nc"), "a b\u{fffd}c");
+        assert_eq!(plain("a\u{1b}b"), "a\u{fffd}b");
     }
 
     #[test]
