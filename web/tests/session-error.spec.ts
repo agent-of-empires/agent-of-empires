@@ -97,5 +97,21 @@ test.describe("An Error Session's recorded error (#5636)", () => {
       await expect(tooltip).toContainText("resume failed for sid 55fd0b02; preserved for explicit retry");
       await expect(tooltip).not.toContainText("second line of detail");
     });
+
+    test("a first line with no break opportunity wraps inside the tooltip", async ({ page }) => {
+      // A path can already break after a slash; a digest can't break anywhere.
+      const digest = "0123456789abcdef".repeat(10);
+      await mockErrorSession(page, `image pull failed: sha256:${digest}`);
+      await page.goto("/");
+      await page.getByTestId("sidebar-status-glyph").hover();
+      const tooltip = page.getByRole("tooltip");
+      await expect(tooltip).toContainText(digest);
+      const box = await tooltip.evaluate((el) => ({
+        overflow: el.scrollWidth - el.clientWidth,
+        right: el.getBoundingClientRect().right,
+      }));
+      expect(box.overflow).toBe(0);
+      expect(box.right).toBeLessThanOrEqual(page.viewportSize()!.width);
+    });
   });
 });
