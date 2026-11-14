@@ -11,7 +11,11 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions, ready = 
       const target = e.target instanceof Element ? e.target : null;
       const isInput =
         target instanceof HTMLElement &&
-        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          // A select's type-ahead jumps to options by letter, so bare keys there are typing.
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
 
       // A field that marks itself closes its own open list on Escape; the surface around it stays.
       if (e.key === "Escape" && target?.closest('[data-owns-escape][aria-expanded="true"]')) return;

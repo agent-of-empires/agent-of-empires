@@ -1,5 +1,6 @@
 import { EnvVarList, LabeledInput } from "./LaunchFields";
 import type { WizardData } from "../wizardReducer";
+import { hasFinePointer } from "../../../lib/platform";
 
 /** Container image and environment behind the wizard's Sandbox row. */
 export function SandboxPanel({
@@ -13,6 +14,7 @@ export function SandboxPanel({
     <div className="space-y-5">
       <LabeledInput
         label="Container image"
+        autoFocus={hasFinePointer()}
         value={data.sandboxImage}
         onChange={(v) => onChange("sandboxImage", v)}
         placeholder="ghcr.io/agent-of-empires/aoe-sandbox:latest"

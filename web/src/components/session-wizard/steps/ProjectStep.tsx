@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AgentInfo, ImportableSession, ProjectOverrides } from "../../../lib/types";
 import { DirectoryBrowser } from "../../DirectoryBrowser";
+import { hasFinePointer } from "../../../lib/platform";
 import { ImportSessionPicker } from "./ImportSessionPicker";
 import { CloneRepoForm } from "./CloneRepoForm";
 import { ProjectSearchList } from "./ProjectSearchList";
@@ -38,6 +39,16 @@ export function ProjectStep({
   const { loading, error, retry, registryAvailable, saved, query, setQuery, filteredSaved, filteredRecent, hasPicks } =
     useProjectPicker(profile);
   const activeTab: Tab = manualTab ?? (!loading && !hasPicks ? "browse" : "recent");
+  const [tabClicked, setTabClicked] = useState(false);
+
+  const searchRef = useRef<HTMLInputElement>(null);
+  const filterRef = useRef<HTMLInputElement>(null);
+  // The fields mount only once projects load, so focus then unless the user already focused something.
+  useEffect(() => {
+    if (loading || !hasFinePointer()) return;
+    if (document.activeElement && document.activeElement !== document.body) return;
+    (searchRef.current ?? filterRef.current)?.focus();
+  }, [loading]);
 
   const normalizePath = (p: string) => p.replace(/\/+$/, "") || "/";
 
@@ -99,7 +110,10 @@ export function ProjectStep({
             <button
               key={tab.id}
               type="button"
-              onClick={() => setManualTab(tab.id)}
+              onClick={() => {
+                setManualTab(tab.id);
+                setTabClicked(true);
+              }}
               className={`px-3 py-2 text-sm whitespace-nowrap cursor-pointer transition-colors border-b-2 -mb-px ${
                 activeTab === tab.id
                   ? "border-brand-600 text-text-primary"
@@ -129,10 +143,14 @@ export function ProjectStep({
           isSelected={(path) => !data.scratch && data.path === path}
           onSelect={(path) => selectPath(path)}
           emptyMessage="No projects match that search. Try the Browse tab."
+          autoFocus={tabClicked && hasFinePointer()}
+          inputRef={searchRef}
         />
       )}
 
-      {!loading && activeTab === "browse" && <DirectoryBrowser onSelect={selectPath} />}
+      {!loading && activeTab === "browse" && (
+        <DirectoryBrowser onSelect={selectPath} autoFocus={tabClicked && hasFinePointer()} inputRef={filterRef} />
+      )}
 
       {!loading &&
         activeTab === "import" &&

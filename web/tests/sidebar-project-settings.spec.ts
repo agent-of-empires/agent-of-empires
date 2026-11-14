@@ -118,6 +118,7 @@ test.describe("Sidebar active-project settings (#4036)", () => {
 
     await expect(page.getByTestId("project-form-modal")).toBeVisible();
     await expect(page.getByText("Edit project 'repo-a'")).toBeVisible();
+    await expect(page.getByPlaceholder("blank = inherit global default, then auto-detect")).toBeFocused();
     expect(posted).toBe(false);
   });
 

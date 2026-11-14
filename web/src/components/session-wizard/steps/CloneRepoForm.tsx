@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { cloneRepo } from "../../../lib/api";
+import { hasFinePointer } from "../../../lib/platform";
 
 export function CloneRepoForm({ onCloned }: { onCloned: (path: string) => void }) {
   const [cloneUrl, setCloneUrl] = useState("");
@@ -50,7 +51,7 @@ export function CloneRepoForm({ onCloned }: { onCloned: (path: string) => void }
           placeholder="https://github.com/user/repo.git"
           className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
           disabled={cloning}
-          autoFocus
+          autoFocus={hasFinePointer()}
         />
       </div>
 

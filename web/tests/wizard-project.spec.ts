@@ -29,6 +29,18 @@ async function mockBrowse(page: Page, entries: { name: string; is_git_repo?: boo
   });
 }
 
+/** Hold a GET until `release()`; `requested` resolves once the app has sent it. */
+async function gateRoute(page: Page, url: string, json: unknown) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  const requested = page.waitForRequest(url);
+  await page.route(url, async (r) => {
+    await gate;
+    await r.fulfill({ json });
+  });
+  return { requested, release };
+}
+
 /** A pick returns to the form, whose Project row names it. */
 async function expectSelected(page: Page, path: string) {
   await expect(wizard(page).getByTestId("wizard-project-row")).toContainText(path);
@@ -65,12 +77,51 @@ test.describe("project tabs", () => {
     await expectSelected(page, "/home/user/z-project");
   });
 
+  test("Recent and Browse tabs focus their search box on open", async ({ page }) => {
+    await mockBrowse(page, [{ name: "alpha" }]);
+    await startWizard(page);
+    await openPanel(page, "Project");
+    await expect(page.getByLabel("Search projects")).toBeFocused();
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+    await expect(page.getByPlaceholder("Type to filter...")).toBeFocused();
+  });
+
+  test("Recent search does not take focus moved to Done while projects load", async ({ page }) => {
+    await startWizard(page);
+    const { requested, release } = await gateRoute(page, "**/api/recent-projects", { projects: [] });
+    await openPanel(page, "Project");
+    await requested;
+    const done = wizard(page).getByRole("button", { name: "Done" });
+    await done.focus();
+    release();
+    await expect(page.getByLabel("Search projects")).toBeVisible();
+    // Enter reaches Done only if the search box did not take focus on load.
+    await page.keyboard.press("Enter");
+    await expect(done).toBeHidden();
+  });
+
+  test("Browse filter does not take focus moved to Done while projects load", async ({ page }) => {
+    await mockBrowse(page, [{ name: "alpha" }]);
+    await startWizard(page, { sessions: [], project: false });
+    const { requested, release } = await gateRoute(page, "**/api/recent-projects", { projects: [] });
+    await openWizard(page);
+    await requested;
+    const done = wizard(page).getByRole("button", { name: "Done" });
+    await done.focus();
+    // DirectoryBrowser requests from a microtask queued in the same effect flush as the focus guard.
+    const browsed = page.waitForRequest("**/api/filesystem/**");
+    release();
+    await browsed;
+    await expect(done).toBeFocused();
+  });
+
   test("Clone tab gates the button on a non-blank URL and Advanced reveals destination + shallow", async ({ page }) => {
     await startWizard(page, { project: false });
     await openWizard(page);
     await page.getByRole("button", { name: "Clone URL", exact: true }).click();
     const cloneBtn = page.getByRole("button", { name: "Clone repository" });
     const urlInput = page.locator("#clone-url");
+    await expect(urlInput).toBeFocused();
     await expect(cloneBtn).toBeDisabled();
     await urlInput.fill("https://github.com/user/repo.git");
     await expect(cloneBtn).toBeEnabled();
@@ -129,6 +180,41 @@ test.describe("extra repos", () => {
     return { picker, chip, input: page.getByPlaceholder("/path/to/another/repo") };
   }
 
+  test("search box is focused on open", async ({ page }) => {
+    const { picker } = await openPicker(page);
+    await expect(picker.getByLabel("Search projects")).toBeFocused();
+  });
+
+  test("path input is focused when there are no other projects", async ({ page }) => {
+    await startWizard(page, { projects: [{ name: "primary", path: "/tmp/example", scope: "global" }] });
+    await openPanel(page, "Extra repos");
+    await expect(page.getByText(/No other projects to add/)).toBeVisible();
+    await expect(page.getByPlaceholder("/path/to/another/repo")).toBeFocused();
+  });
+
+  test("focus waits for projects to load and never overrides the user's choice", async ({ page }) => {
+    await startWizard(page, {
+      projects: [
+        { name: "primary", path: "/tmp/example", scope: "global" },
+        { name: "shared-lib", path: "/tmp/shared-lib", scope: "global" },
+      ],
+    });
+    const { requested, release } = await gateRoute(page, "**/api/recent-projects", { projects: [] });
+    await openPanel(page, "Extra repos");
+    await requested;
+    const input = page.getByPlaceholder("/path/to/another/repo");
+    await expect(input).not.toBeFocused();
+    await input.click();
+    await input.pressSequentially("/tmp/other");
+    release();
+    const picker = page.getByTestId("extra-repos-picker");
+    await expect(picker.getByLabel("Search projects")).toBeVisible();
+    // React flushes the load commit's effects before rendering this keystroke, which lands in the path input only if focus stayed.
+    await input.press("x");
+    await expect(input).toHaveValue("/tmp/otherx");
+    await expect(input).toBeFocused();
+  });
+
   test("saved projects render without the primary and toggle as chips", async ({ page }) => {
     const { picker, chip } = await openPicker(page);
     await expect(picker.getByText("Projects", { exact: true })).toBeVisible();
@@ -138,6 +224,17 @@ test.describe("extra repos", () => {
     await expect(page.getByText("1 selected")).toBeVisible();
     await page.getByRole("button", { name: "Remove shared-lib" }).click();
     await expect(page.getByText("none")).toBeVisible();
+  });
+});
+
+test.describe("search autofocus on touch", () => {
+  test.use({ hasTouch: true, isMobile: true });
+
+  test("project search stays unfocused so the keyboard does not cover the list", async ({ page }) => {
+    await startWizard(page);
+    await openPanel(page, "Project");
+    await expect(page.getByLabel("Search projects")).toBeVisible();
+    await expect(page.getByLabel("Search projects")).not.toBeFocused();
   });
 });
 
@@ -239,6 +336,10 @@ test.describe("import session", () => {
     const w = wizard(page);
     await w.getByRole("button", { name: "Import session", exact: true }).click();
     const agent = w.getByLabel("Agent to import from");
+    await expect(agent).toBeFocused();
+    await page.keyboard.press("s");
+    await expect(page).not.toHaveURL(/settings/);
+    await expect(agent).toBeFocused();
     await expect(agent).toHaveValue("claude");
     await agent.selectOption("pi");
     await w.getByRole("button").filter({ hasText: "Refactor the parser" }).click();
