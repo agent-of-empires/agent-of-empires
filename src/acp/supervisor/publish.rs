@@ -53,17 +53,66 @@ impl<S: BroadcastSink> Supervisor<S> {
         let (done, published) = tokio::sync::oneshot::channel();
         let publication = super::WorkerPublication::new(async move {
             let result = loop {
-                if let Some(published) = Self::try_publish_control_refusal(
-                    &workers,
-                    &lifecycle,
-                    sink.as_ref(),
-                    &next_seqs,
-                    &session_id,
-                    &scope,
-                    refusal,
-                    originating_epoch,
-                )
-                .await
+                let published = async {
+                    let workers = workers.lock().await;
+                    if workers.contains_key(&session_id) {
+                        return Some(false);
+                    }
+                    let lifecycle = super::lock_recover(&lifecycle);
+                    let current = lifecycle.current_lease(&session_id);
+                    let epoch = match lifecycle.phase(&session_id) {
+                        crate::acp::runner_lifecycle::WorkerPhase::Absent => None,
+                        crate::acp::runner_lifecycle::WorkerPhase::Resuming => {
+                            let Some(lease) = current.as_ref().filter(|lease| {
+                                originating_epoch == Some(lease.epoch())
+                                    && lease.spawned_runner() == refusal.owner
+                                    && lease
+                                        .native_scope()
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|native| native.context == scope.context)
+                            }) else {
+                                return Some(false);
+                            };
+                            Some(lease.epoch())
+                        }
+                        _ => return Some(false),
+                    };
+                    let _native = match scope.fence.try_lock_observation_matching(|_| true) {
+                        Ok(Some(guard)) => guard,
+                        Ok(None) => return None,
+                        Err(_) => return Some(false),
+                    };
+                    if !crate::process::worker_registry::refusal_still_applies(&session_id, &refusal) {
+                        return Some(false);
+                    }
+                    let observed = refusal.observation();
+                    let subject = crate::acp::state::NativeEventSubject {
+                        context: scope.context,
+                        owner: refusal.owner,
+                        kind: crate::acp::state::NativeSubjectEvent::AdmissionRefusal(refusal),
+                    };
+                    let event = Event::AcpConnectionUnavailable {
+                        source: observed.source,
+                        cause: observed.cause,
+                        phase: observed.phase,
+                        native_subject: Some(subject),
+                    };
+                    let mut data = AcpEventData::from_history(event);
+                    data.metadata.scope = EventScope::SessionCurrent;
+                    data.metadata.availability_denial = true;
+                    let seq = with_publication_seq(&next_seqs, &session_id, |seq| seq);
+                    drop(lifecycle);
+                    drop(workers);
+                    let persisted = match epoch {
+                        Some(epoch) => sink.publish_replay_from_worker(
+                            &session_id, seq, &data, epoch, Some(subject), None,
+                        ),
+                        None => sink.publish_persisted(&session_id, seq, &data),
+                    };
+                    Some(persisted)
+                }.await;
+                if let Some(published) = published
                 {
                     break published;
                 }
@@ -83,74 +132,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         published.await.unwrap_or(false)
     }
 
-    async fn try_publish_control_refusal(
-        workers: &super::Workers,
-        lifecycles: &Arc<std::sync::Mutex<crate::acp::runner_lifecycle::LifecycleTable>>,
-        sink: &S,
-        next_seqs: &Arc<SeqMap>,
-        session_id: &str,
-        scope: &crate::acp::state::NativeObservationScope,
-        refusal: crate::process::worker_registry::ControlAdmissionRefusal,
-        originating_epoch: Option<u64>,
-    ) -> Option<bool> {
-        let workers = workers.lock().await;
-        if workers.contains_key(session_id) {
-            return Some(false);
-        }
-        let lifecycle = super::lock_recover(lifecycles);
-        let current = lifecycle.current_lease(session_id);
-        let epoch = match lifecycle.phase(session_id) {
-            crate::acp::runner_lifecycle::WorkerPhase::Absent => None,
-            crate::acp::runner_lifecycle::WorkerPhase::Resuming => {
-                let Some(lease) = current.as_ref().filter(|lease| {
-                    originating_epoch == Some(lease.epoch())
-                        && lease.spawned_runner() == refusal.owner
-                        && lease
-                            .native_scope()
-                            .ok()
-                            .flatten()
-                            .is_some_and(|native| native.context == scope.context)
-                }) else {
-                    return Some(false);
-                };
-                Some(lease.epoch())
-            }
-            _ => return Some(false),
-        };
-        let _native = match scope.fence.try_lock_observation_matching(|_| true) {
-            Ok(Some(guard)) => guard,
-            Ok(None) => return None,
-            Err(_) => return Some(false),
-        };
-        if !crate::process::worker_registry::refusal_still_applies(session_id, &refusal) {
-            return Some(false);
-        }
-        let observed = refusal.observation();
-        let subject = crate::acp::state::NativeEventSubject {
-            context: scope.context,
-            owner: refusal.owner,
-            kind: crate::acp::state::NativeSubjectEvent::AdmissionRefusal(refusal),
-        };
-        let event = Event::AcpConnectionUnavailable {
-            source: observed.source,
-            cause: observed.cause,
-            phase: observed.phase,
-            native_subject: Some(subject),
-        };
-        let mut data = AcpEventData::from_history(event);
-        data.metadata.scope = EventScope::SessionCurrent;
-        data.metadata.availability_denial = true;
-        let seq = with_publication_seq(next_seqs, session_id, |seq| seq);
-        drop(lifecycle);
-        drop(workers);
-        let persisted = match epoch {
-            Some(epoch) => {
-                sink.publish_replay_from_worker(session_id, seq, &data, epoch, Some(subject), None)
-            }
-            None => sink.publish_persisted(session_id, seq, &data),
-        };
-        Some(persisted)
-    }
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
     /// session's latest seq, so a repair decided from the log cannot land
