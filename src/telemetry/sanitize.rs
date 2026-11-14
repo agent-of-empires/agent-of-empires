@@ -6,7 +6,12 @@ pub fn agent_bucket(agent: &str) -> String {
         return "custom".to_string();
     }
     let lower = trimmed.to_ascii_lowercase();
-    for def in crate::agents::AGENTS {
+    // The bundled definitions keep reporting their own bucket after a plugin
+    // declares the agent, so a tool never changes bucket with the plugin set.
+    for def in crate::agents::AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::definitions())
+    {
         if def.name.eq_ignore_ascii_case(&lower)
             || def.aliases.iter().any(|a| a.eq_ignore_ascii_case(&lower))
         {
@@ -89,6 +94,8 @@ mod tests {
             ("codex", "codex"),
             ("gemini", "gemini"),
             ("opencode", "opencode"),
+            // Bundled, but no longer in the native table since OMP moved out.
+            ("omp", "omp"),
             ("/usr/local/bin/my-secret-agent", "custom"),
             ("acme-internal-llm", "custom"),
             ("", "custom"),

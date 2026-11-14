@@ -1481,7 +1481,7 @@ impl Instance {
         let managed_codex_home =
             crate::session::config::container_config::managed_codex_home_from_config(
                 &self.tool,
-                Some(self.get_tool_command()),
+                Some(&self.get_tool_command()),
                 &config.session,
                 &self.id,
             )?;
@@ -1777,12 +1777,12 @@ impl Instance {
                 } else {
                     self.extra_args.clone()
                 };
-                if Self::contains_active_shell_syntax(command)
+                if Self::contains_active_shell_syntax(&command)
                     || Self::contains_active_shell_syntax(&extra)
                 {
                     return None;
                 }
-                let parsed = super::launch_command::parse_launch_command(command)?;
+                let parsed = super::launch_command::parse_launch_command(&command)?;
                 let program = parsed.words.first()?;
                 let config = crate::session::config::profile_config::resolve_config_or_warn(
                     &self.effective_profile(),
@@ -1866,7 +1866,7 @@ impl Instance {
     pub(super) fn execution_agent(&self) -> Result<&'static AgentDef<'static>> {
         let config =
             crate::session::config::profile_config::resolve_config(&self.effective_profile())?;
-        Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)
+        Self::execution_agent_for(&self.tool, &self.get_tool_command(), &config.session)
     }
 
     pub(crate) fn execution_agent_for(
@@ -1882,17 +1882,47 @@ impl Instance {
         let parsed = super::launch_command::parse_launch_command(command)
             .context(ManagedResumeCause::UnsupportedManagedArguments)?;
         let program = parsed.words.first().context("empty agent command")?;
-        let direct = AGENTS.iter().find(|agent| agent.binary == program);
+        // A declaration for this tool hides the bundled fallback from listings,
+        // but a session stored with the fallback's own command still runs it, so
+        // every bundled identity stays resolvable here.
+        let retained = || {
+            AGENTS
+                .iter()
+                .chain(crate::plugin::bundled_agents::definitions())
+        };
+        let direct = retained().find(|agent| agent.binary == program);
         let declared = config
             .agent_execution_as
             .get(tool)
             .map(|name| {
-                crate::agents::get_agent(name)
+                retained()
+                    .find(|agent| agent.name == name)
                     .context("agent_execution_as names an unknown builtin")
             })
             .transpose()?;
+        // A tool's own declaration is its wrapper contract: the declaration
+        // proved the command's direct invocation, so that command runs the
+        // tool's retained native identity and needs no separate namespace.
+        let own_declaration = (direct.is_none() && declared.is_none())
+            .then(|| {
+                crate::plugin::agent_integration::declared_agent(
+                    crate::plugin::registry(),
+                    tool,
+                    config
+                        .custom_agents
+                        .iter()
+                        .filter(|(_, command)| !command.trim().is_empty())
+                        .map(|(name, _)| name.as_str()),
+                )
+            })
+            .flatten()
+            .filter(|declared| declared.contribution().command.as_deref() == Some(command))
+            .and_then(|_| crate::agents::native_definition(tool));
         let logical = crate::agents::get_agent(tool);
-        let actual = direct.or(declared).context(
+        let actual = direct
+            .or(declared)
+            .or(own_declaration)
+            .context(
             "wrapper execution identity is unknown: set session.agent_execution_as and session.agent_config_dir; agent_detect_as is only status detection")
             .context(ManagedResumeCause::WrapperContractRequired)?;
         anyhow::ensure!(
@@ -1900,13 +1930,14 @@ impl Instance {
                 && declared.is_none_or(|declared| declared.name == actual.name),
             "agent command contradicts the selected native execution identity"
         );
-        if direct.is_none() {
+        if direct.is_none() && own_declaration.is_none() {
             let basename = std::path::Path::new(program)
                 .file_name()
                 .and_then(|name| name.to_str());
             anyhow::ensure!(
                 !AGENTS
                     .iter()
+                    .chain(crate::plugin::bundled_agents::definitions())
                     .any(|agent| Some(agent.binary) == basename && agent.name != actual.name),
                 "wrapper command names a different native agent"
             );
@@ -1932,7 +1963,7 @@ impl Instance {
             )
             .context(ManagedResumeCause::UnsupportedManagedArguments));
         }
-        let mut words = super::launch_command::parse_launch_command(self.get_tool_command())
+        let mut words = super::launch_command::parse_launch_command(&self.get_tool_command())
             .context(ManagedResumeCause::UnsupportedManagedArguments)?
             .words;
         words.extend(
@@ -1972,13 +2003,14 @@ impl Instance {
                     .map(|(name, _)| name.as_str()),
             )
             .filter(|agent| {
-                agent.contribution().command.as_deref() == Some(self.get_tool_command())
+                self.command.is_empty()
+                    || agent.contribution().command.as_deref() == Some(self.command.as_str())
             }) {
                 let identity = NativeAgent::Declared(declared.clone());
                 return declared
                     .with_definition(|agent| {
                         anyhow::ensure!(
-                            !Self::contains_active_shell_syntax(self.get_tool_command())
+                            !Self::contains_active_shell_syntax(&self.get_tool_command())
                                 && self.launch_invokes_resolved_agent_directly(agent),
                             "managed conversation requires the declared direct executable"
                         );
@@ -1988,7 +2020,7 @@ impl Instance {
             }
         }
         let agent =
-            Self::execution_agent_for(&self.tool, self.get_tool_command(), &config.session)?;
+            Self::execution_agent_for(&self.tool, &self.get_tool_command(), &config.session)?;
         self.resolve_native_execution_for(target, &config, agent, NativeAgent::Builtin(agent))
     }
 
@@ -2004,7 +2036,7 @@ impl Instance {
         let target_session_id = target.map(|(sid, _, _)| sid.to_owned());
         let mut resolved_target_session_id = None;
         let mut inputs = self.native_launch_inputs(agent, config)?;
-        let parsed = super::launch_command::parse_launch_command(self.get_tool_command())
+        let parsed = super::launch_command::parse_launch_command(&self.get_tool_command())
             .context("native program is missing")?;
         inputs.environment.extend(parsed.assignments);
         anyhow::ensure!(
@@ -2948,7 +2980,7 @@ fn resume_contract(
                 .map(|capture| capture.backend),
         )
     };
-    if let Some(agent) = crate::agents::get_agent(&execution.agent) {
+    if let Some(agent) = crate::agents::native_definition(&execution.agent) {
         return contract(agent);
     }
     if execution.agent != own_tool {
@@ -4209,6 +4241,9 @@ sandbox = "unsupported"
             resume_contract(&binding("example-helper"), "example-helper", Some(declared)),
             (true, omp)
         );
+        // The bundled identity answers even while a declaration hides it from
+        // listings, so recovery does not depend on which plugin provides OMP.
+        assert_eq!(resume_contract(&binding("omp"), "omp", None), (true, omp));
         // Another tool's binding never inherits this pane's declaration.
         assert_eq!(
             resume_contract(
@@ -4378,6 +4413,59 @@ sandbox = "unsupported"
         assert!(instance
             .asserted_resume_binding(sid, Some(&transcript))
             .is_err());
+    }
+
+    /// Recovery resolves the declaration itself, not the fallback listing that
+    /// an approved takeover hides.
+    #[test]
+    #[serial_test::serial]
+    fn declared_omp_recovery_survives_a_hidden_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("XDG_CONFIG_HOME", temp.path().join(".config")),
+            ("USERPROFILE", temp.path().to_path_buf()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _bin = crate::session::test_support::install_login_shell_path_command(
+            temp.path(),
+            "omp-next",
+            "#!/bin/sh\nexit 0\n",
+        );
+        crate::session::config::update_app_state(|state| {
+            state.has_acknowledged_agent_hooks = true;
+        })
+        .unwrap();
+        crate::session::test_support::install_omp_takeover("omp-next");
+        assert!(crate::agents::get_agent("omp").is_none());
+
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let sid = "22222222-3333-4444-8555-666666666666";
+        let store = temp.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let transcript = store.join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{}\n", serde_json::json!({"type": "session", "id": sid})),
+        )
+        .unwrap();
+
+        let mut instance = Instance::new("hidden-fallback", project.to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.command = "omp-next".into();
+        instance.extra_args = format!(
+            "--session-dir {}",
+            crate::session::environment::shell_escape(store.to_str().unwrap())
+        );
+
+        let binding = instance
+            .asserted_resume_binding(sid, Some(&transcript))
+            .expect("recovery still binds while the fallback is hidden");
+        assert_eq!(binding.session_id, sid);
     }
 
     #[test]
@@ -4971,6 +5059,7 @@ sandbox = "unsupported"
     }
 
     #[test]
+    #[serial_test::serial]
     fn managed_verbose_flag_is_allowed_without_namespace_effect() {
         for name in ["claude", "codex", "opencode", "omp", "prime-agent", "kimi"] {
             let agent = crate::agents::get_agent(name).unwrap();

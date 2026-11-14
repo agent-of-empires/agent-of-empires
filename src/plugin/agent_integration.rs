@@ -86,7 +86,7 @@ fn unique_candidates<'a, 'b, 'c>(
         candidate_counts.remove(name);
     }
     for (plugin, tool, _) in &candidates {
-        if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+        if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
             warn_reserved(plugin, tool, builtin);
             candidate_counts.remove(tool);
         }
@@ -114,6 +114,12 @@ pub fn catalog<'a, 'b, 'c>(
             .manifest
             .agent_integrations
             .iter()
+            .filter(move |entry| {
+                // Only the fallback's own tool is gated: the bundled contract is
+                // replaced solely by an API 21 launch declaration for that name.
+                !super::bundled_agents::contains(&entry.tool)
+                    || (plugin.manifest.api_version >= 21 && entry.launch.is_some())
+            })
             .filter_map(move |entry| {
                 entry
                     .command
@@ -228,122 +234,14 @@ impl DeclaredAgent {
         &self,
         use_agent: impl FnOnce(&crate::agents::AgentDef) -> R,
     ) -> Option<R> {
-        use crate::agents::{
-            AgentDef, AgentLifecycle, DetectionMethod, ForkStrategy, KeyToken, PermissionResponse,
-            ResumeStrategy, SessionCaptureBackend, SessionCaptureContext, SessionCaptureSpec,
-            SessionSupport, YoloMode,
-        };
-        use aoe_plugin_api::agent_integration::{
-            AgentCaptureBackend, AgentCaptureContext, AgentKeyDeclaration, AgentResumeDeclaration,
-            AgentYoloDeclaration,
-        };
-        fn key(key: &AgentKeyDeclaration) -> KeyToken<'_> {
-            match key {
-                AgentKeyDeclaration::Literal { value } => KeyToken::Literal(value),
-                AgentKeyDeclaration::Named { value } => KeyToken::Named(value),
-            }
-        }
         let entry = self.contribution();
-        let command = entry.command.as_deref()?;
-        let (prefix, _) = aoe_plugin_api::agent_integration::launch_prefix(command)?;
-        let binary = *prefix.last()?;
-        let default_launch = Default::default();
-        let launch = entry.launch.as_ref().unwrap_or(&default_launch);
-        let aliases: Vec<&str> = launch.aliases.iter().map(String::as_str).collect();
-        let environment: Vec<(&str, &str)> = launch
-            .container_env
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect();
-        let yolo = launch.yolo.as_ref().map(|yolo| match yolo {
-            AgentYoloDeclaration::Flag { flag } => YoloMode::CliFlag(flag),
-            AgentYoloDeclaration::Always => YoloMode::AlwaysYolo,
-            AgentYoloDeclaration::Env { key, value } => YoloMode::EnvVar(key, value),
-        });
-        let support = launch.resume.as_ref().map(|resume| {
-            let resume = match resume {
-                AgentResumeDeclaration::Flag { flag } => ResumeStrategy::Flag(flag),
-                AgentResumeDeclaration::FlagPair {
-                    existing,
-                    new_session,
-                } => ResumeStrategy::FlagPair {
-                    existing,
-                    new_session,
-                },
-                AgentResumeDeclaration::Subcommand { command } => {
-                    ResumeStrategy::Subcommand(command)
-                }
-            };
-            let capture = launch.capture.as_ref().and_then(|capture| {
-                let context = |context| match context {
-                    AgentCaptureContext::PaneScoped => Some(SessionCaptureContext::PaneScoped),
-                    AgentCaptureContext::Unsupported => Some(SessionCaptureContext::Unsupported),
-                    _ => None,
-                };
-                if capture.backend != AgentCaptureBackend::Omp {
-                    return None;
-                }
-                Some(SessionCaptureSpec {
-                    backend: SessionCaptureBackend::Omp,
-                    host: context(capture.host)?,
-                    sandbox: context(capture.sandbox)?,
-                })
-            });
-            SessionSupport { resume, capture }
-        });
-        let allow: Vec<_> = entry
-            .reply_fallback
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.allow.iter().map(key).collect());
-        let always: Option<Vec<_>> = entry.reply_fallback.as_ref().and_then(|r| {
-            r.allow_always
-                .as_ref()
-                .map(|keys| keys.iter().map(key).collect())
-        });
-        let deny: Vec<_> = entry
-            .reply_fallback
-            .as_ref()
-            .map_or_else(Vec::new, |r| r.deny.iter().map(key).collect());
-        let permission_response = entry.reply_fallback.as_ref().map(|_| PermissionResponse {
-            allow: &allow,
-            allow_always: always.as_deref(),
-            deny: &deny,
-        });
+        let data = super::agent_definition::DefinitionData::new(entry);
         let status = self.registry.all()[self.plugin_index]
             .manifest
             .capabilities
             .iter()
             .any(|capability| capability.as_str() == "session.integration");
-        let definition = AgentDef {
-            name: &entry.tool,
-            binary,
-            launch_subcommand: None,
-            aliases: &aliases,
-            detection: DetectionMethod::Which(binary),
-            yolo,
-            spans_agent_generations: false,
-            instruction_flag: launch.instruction_flag.as_deref(),
-            oneshot_flag: launch.oneshot_flag.as_deref(),
-            model_flag: launch.model_flag.as_deref(),
-            set_default_command: false,
-            detect_status: if status || entry.detection.is_some() {
-                crate::tmux::status_detection::detect_native_only_status
-            } else {
-                crate::tmux::status_detection::detect_hook_only_status
-            },
-            container_env: &environment,
-            hook_config: None,
-            sidecar_hooks: None,
-            session_support: support,
-            fork_strategy: ForkStrategy::Unsupported,
-            host_only: launch.host_only,
-            send_keys_enter_delay_ms: 0,
-            ready_marker: None,
-            install_hint: launch.install_hint.as_deref().unwrap_or(&entry.tool),
-            permission_response,
-            lifecycle: AgentLifecycle::Active,
-        };
-        Some(use_agent(&definition))
+        Some(use_agent(&data.definition(entry, status)?))
     }
 
     fn plugin_id(&self) -> &str {
@@ -372,7 +270,7 @@ pub(crate) fn declared_agent<'a>(
     if custom_names.into_iter().any(|name| name == tool) {
         return None;
     }
-    if let Some(builtin) = crate::agents::resolve_tool_name(tool) {
+    if let Some(builtin) = crate::agents::resolve_builtin_tool_name(tool) {
         for plugin in registry.active().filter(|plugin| {
             plugin
                 .manifest
@@ -390,6 +288,11 @@ pub(crate) fn declared_agent<'a>(
             continue;
         }
         for (entry_index, entry) in plugin.manifest.agent_integrations.iter().enumerate() {
+            if super::bundled_agents::contains(tool)
+                && (plugin.manifest.api_version < 21 || entry.launch.is_none())
+            {
+                continue;
+            }
             if entry.tool == tool && entry.command.is_some() {
                 if selected.is_some() {
                     return None;
@@ -1285,6 +1188,92 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn a_launch_only_declaration_keeps_the_fallback_identity_and_detector() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let _rules = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+        let manifest = r#"
+id = "acme.omp"
+name = "OMP"
+version = "2.0.0"
+api_version = 21
+[[agent_integrations]]
+tool = "omp"
+command = "omp-next"
+[agent_integrations.launch]
+oneshot_flag = "-p"
+"#;
+        let dir = super::super::plugins_dir().unwrap().join("acme.omp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.omp".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+
+        // The declaration owns new launches, so the listing drops the fallback.
+        assert!(crate::agents::get_agent("omp").is_none());
+        let session = crate::session::config::SessionConfig::default();
+        // A session stored with the fallback's own command keeps its native
+        // identity, which admission, mounts, resume and purge all resolve.
+        let agent = crate::session::Instance::execution_agent_for("omp", "omp", &session)
+            .expect("a stored fallback command keeps its native identity");
+        assert_eq!(agent.name, "omp");
+        assert_eq!(
+            crate::session::config::container_config::resolve_active_agent(
+                "omp",
+                Some("omp"),
+                &session
+            )
+            .map(|agent| agent.name),
+            Some("omp"),
+            "purge and mounts must still resolve the stored fallback"
+        );
+        let roots = crate::session::config::container_config::sandbox_content_roots(
+            "omp",
+            Some("omp"),
+            &session,
+            temp.path(),
+            "11111111-2222-3333-4444-555555555555",
+        )
+        .unwrap();
+        assert!(
+            !roots.is_empty(),
+            "a fresh sandbox must still own its native content roots"
+        );
+        // And the pane detector still sees a running turn, so Smart rename does
+        // not fire its one-shot before the turn finishes.
+        assert_eq!(
+            crate::tmux::detect_status_from_content_in(
+                "",
+                "⠋ Working… ⟦esc⟧\n╭── π ─╮\n╰─ ─╯",
+                "omp"
+            ),
+            crate::session::Status::Running
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn always_yolo_does_not_persist_after_declaration_update() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
@@ -1413,6 +1402,130 @@ replies = true
 
     #[test]
     #[serial_test::serial]
+    fn approved_omp_declaration_supersedes_bundled_contract_and_revocation_restores_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.omp-owner"
+name = "OMP integration"
+version = "1.0.0"
+api_version = 21
+capabilities = ["session.integration"]
+[[agent_integrations]]
+tool = "omp"
+command = "OMP_MODE=plugin omp-next --verbose"
+provider_versions = ["^18"]
+replies = true
+[agent_integrations.launch]
+oneshot_flag = "--print"
+model_flag = "--model"
+container_env = { PI_CODING_AGENT_DIR = "/root/plugin-omp" }
+[agent_integrations.launch.yolo]
+kind = "flag"
+flag = "--plugin-auto"
+[agent_integrations.launch.resume]
+kind = "flag"
+flag = "--continue"
+[agent_integrations.launch.capture]
+backend = "omp"
+host = "pane_scoped"
+sandbox = "unsupported"
+[agent_integrations.detection]
+mode = "native_only"
+"#;
+        let dir = super::super::plugins_dir().unwrap().join("acme.omp-owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        let mut instance = Instance::new("omp-declaration", temp.path().to_str().unwrap());
+        instance.tool = "omp".into();
+        instance.status = crate::session::Status::Running;
+        assert!(
+            instance.command.is_empty(),
+            "legacy rows have no stored command"
+        );
+        let fallback = || {
+            let agent = crate::agents::get_agent("omp").expect("bundled fallback");
+            assert_eq!(agent.oneshot_flag, Some("-p"));
+            assert_eq!(
+                agent.container_env,
+                &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")]
+            );
+            assert_eq!(
+                (agent.detect_status)("plain command output"),
+                crate::session::Status::Idle
+            );
+            assert!(agent.session_support.unwrap().capture.is_some());
+            assert_eq!(instance.get_tool_command(), "omp");
+            assert!(instance.declared_agent().is_none());
+        };
+        super::super::reload_registry();
+        fallback(); // Present but not approved.
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.omp-owner".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: vec!["session.integration".into()],
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert!(crate::agents::get_agent("omp").is_none());
+        assert_eq!(
+            instance.get_tool_command(),
+            "OMP_MODE=plugin omp-next --verbose"
+        );
+        assert_eq!(
+            instance.launch_executable_token().as_deref(),
+            Some("omp-next")
+        );
+        assert!(instance.supports_native_resume());
+        let declared = instance.declared_agent().expect("approved declaration");
+        declared.with_definition(|agent| {
+            assert!(instance.launch_invokes_resolved_agent_directly(agent));
+            assert_eq!(agent.oneshot_flag, Some("--print"));
+            assert_eq!(agent.container_env, &[("PI_CODING_AGENT_DIR", "/root/plugin-omp")]);
+            assert!(matches!(agent.yolo.as_ref(), Some(crate::agents::YoloMode::CliFlag(flag)) if *flag == "--plugin-auto"));
+            assert!(matches!(agent.session_support.unwrap().resume, crate::agents::ResumeStrategy::Flag("--continue")));
+            assert_eq!(agent.session_support.unwrap().capture.unwrap().sandbox, crate::agents::SessionCaptureContext::Unsupported);
+        }).unwrap();
+        assert!(replies_configured(&instance));
+        assert_eq!(
+            owned_status(&instance, false),
+            Some((crate::session::Status::Unknown, false))
+        );
+        crate::session::update_config(|config| {
+            config.plugins.get_mut("acme.omp-owner").unwrap().enabled = false;
+        })
+        .unwrap();
+        super::super::reload_registry();
+        assert!(declared.while_current(|| ()).is_none());
+        fallback();
+        crate::session::update_config(|config| {
+            let plugin = config.plugins.get_mut("acme.omp-owner").unwrap();
+            plugin.enabled = true;
+            plugin.grant = None;
+        })
+        .unwrap();
+        super::super::reload_registry();
+        fallback(); // Revoked approval must not authorize the declaration.
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn api21_generic_capture_stops_when_plugin_is_disabled_without_removing_omp() {
         let temp = tempfile::tempdir().unwrap();
         let _reload = super::super::ReloadRegistryOnDrop;
@@ -1477,6 +1590,69 @@ sandbox = "unsupported"
             (omp.detect_status)("plain command output"),
             crate::session::Status::Idle
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn bundled_fallback_gates_only_its_own_tool_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let _reload = super::super::ReloadRegistryOnDrop;
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("HOME", temp.path()),
+            ("XDG_CONFIG_HOME", temp.path()),
+            ("USERPROFILE", temp.path()),
+        ]);
+        let _featured = crate::session::test_support::EnvGuard::unset(&["AOE_FEATURED_INDEX_PATH"]);
+        let manifest = r#"
+id = "acme.name-contains-omp"
+name = "Name contains omp"
+version = "1.0.0"
+api_version = 20
+[[agent_integrations]]
+tool = "prompt-helper"
+command = "prompt-helper"
+
+[[agent_integrations]]
+tool = "omp"
+command = "acme-omp-shim"
+"#;
+        let dir = super::super::plugins_dir()
+            .unwrap()
+            .join("acme.name-contains-omp");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("aoe-plugin.toml"), manifest).unwrap();
+        crate::session::update_config(|config| {
+            config.plugins.insert(
+                "acme.name-contains-omp".into(),
+                crate::session::PluginConfig {
+                    grant: Some(crate::session::CapabilityGrant {
+                        manifest_hash: aoe_plugin_api::PluginManifest::hash_bytes(
+                            manifest.as_bytes(),
+                        ),
+                        capabilities: Vec::new(),
+                        granted_at: chrono::Utc::now(),
+                    }),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let registry = super::super::reload_registry();
+
+        // An unrelated tool whose name merely contains `omp` keeps its own declaration.
+        assert!(declared_agent(registry.clone(), "prompt-helper", std::iter::empty()).is_some());
+        let cataloged = catalog(&registry, std::iter::empty(), std::iter::empty());
+        assert!(
+            cataloged.iter().any(|agent| agent.tool == "prompt-helper"),
+            "catalog must keep a declaration whose name only contains the fallback name: {cataloged:?}"
+        );
+        // An API 20 `omp` entry cannot replace the bundled contract: it stays out
+        // of the catalog and declaration lookup keeps `omp` on the fallback.
+        assert!(
+            !cataloged.iter().any(|agent| agent.tool == "omp"),
+            "an API 20 omp entry must not replace the bundled contract: {cataloged:?}"
+        );
+        assert!(declared_agent(registry, "omp", std::iter::empty()).is_none());
     }
 
     #[test]
