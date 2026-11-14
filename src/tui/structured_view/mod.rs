@@ -484,13 +484,11 @@ async fn apply_ws_message(
             if !was_active && now_active {
                 // Turn started; the optimistic lock has served its purpose.
                 state.in_flight = false;
-            } else if was_active && !now_active {
-                // Turn ended: release the lock and pull the post-drain queue
-                // snapshot, since the daemon drains server-side at this edge.
-                state.in_flight = false;
-                refresh_queue(state).await;
-            } else if prior_host_intent.is_some() && state.transcript.host_prompt_intent.is_none() {
-                // A host-only intent can settle without ever opening a Native turn.
+            } else if (was_active && !now_active)
+                || (prior_host_intent.is_some() && state.transcript.host_prompt_intent.is_none())
+            {
+                // A Native turn ended or a host-only intent settled without opening one.
+                // Release the submit lock and pull the authoritative queue snapshot.
                 state.in_flight = false;
                 refresh_queue(state).await;
             }
