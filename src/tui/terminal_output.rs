@@ -786,7 +786,10 @@ impl TestOutput {
         Ok(state.pending.as_ref().is_some_and(|frame| {
             frame.offset < frame.bytes.len()
                 && !marker.is_empty()
-                && frame.bytes.windows(marker.len()).any(|bytes| bytes == marker)
+                && frame
+                    .bytes
+                    .windows(marker.len())
+                    .any(|bytes| bytes == marker)
         }))
     }
 
