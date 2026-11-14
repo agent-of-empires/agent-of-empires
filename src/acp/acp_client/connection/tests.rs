@@ -434,8 +434,7 @@ async fn spawn_fake_connection_with(
         mode,
         close_after_prompt,
         "",
-        default_mode,
-        config_options,
+        (default_mode, config_options),
         on_prompt,
     )
     .await;
@@ -451,8 +450,7 @@ async fn spawn_fake_connection_raw(
     mode: Option<ConnectMode>,
     close_after_prompt: bool,
     init_extra: &'static str,
-    default_mode: Option<&'static str>,
-    config_options: Option<&'static str>,
+    (default_mode, config_options): (Option<&'static str>, Option<&'static str>),
     on_prompt: impl Fn(&serde_json::Value) -> Vec<String> + Send + 'static,
 ) -> (Result<(), AcpError>, FakeConnection) {
     let (daemon_write, agent_read) = tokio::io::duplex(64 * 1024);
@@ -2565,8 +2563,7 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
                 None,
                 false,
                 BAD_HELLO,
-                None,
-                None,
+                (None, None),
                 |_| vec![],
             )
             .await;
@@ -2587,8 +2584,7 @@ async fn proxy_hello_and_primitives_shape_the_event_stream() {
                 None,
                 false,
                 GOOD_HELLO,
-                None,
-                None,
+                (None, None),
                 |_| vec![],
             )
             .await;

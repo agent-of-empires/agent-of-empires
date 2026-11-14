@@ -267,6 +267,8 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
+type ReplayPublicationObserver = Arc<dyn Fn(&Event) + Send + Sync>;
+
 /// Capture completed publications through the actual production persistence path.
 pub(super) struct VecSink {
     pub(super) frames: std::sync::Mutex<Vec<(String, u64, Event)>>,
@@ -280,7 +282,7 @@ pub(super) struct VecSink {
         Option<Box<dyn FnOnce(super::WorkerPublication) -> super::WorkerPublication + Send>>,
     >,
     pub(super) worker_queued: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    pub(super) before_replay: std::sync::Mutex<Option<Arc<dyn Fn(&Event) + Send + Sync>>>,
+    pub(super) before_replay: std::sync::Mutex<Option<ReplayPublicationObserver>>,
 }
 
 impl Default for VecSink {

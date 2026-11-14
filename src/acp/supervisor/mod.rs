@@ -220,6 +220,10 @@ impl From<WorkerPhase> for AcpWorkerState {
 #[derive(Debug, Error)]
 #[error("native observation epoch is busy")]
 pub(crate) struct NativeObservationBusy;
+#[cfg(test)]
+type InstallationRecoveryObserver =
+    Box<dyn FnOnce(&Lease, &Arc<AcpClient>, tokio::time::Instant) + Send>;
+
 
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
@@ -246,9 +250,7 @@ pub struct Supervisor<S: BroadcastSink> {
     #[cfg(test)]
     worker_waits: tokio::sync::broadcast::Sender<String>,
     #[cfg(test)]
-    installation_recovery: std::sync::Mutex<
-        Option<Box<dyn FnOnce(&Lease, &Arc<AcpClient>, tokio::time::Instant) + Send>>,
-    >,
+    installation_recovery: std::sync::Mutex<Option<InstallationRecoveryObserver>>,
     /// Build-stale sessions draining a turn before the reconciler respawns them.
     respawn_pending: SharedSet,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
