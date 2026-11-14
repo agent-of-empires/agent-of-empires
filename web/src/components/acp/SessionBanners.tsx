@@ -119,7 +119,7 @@ export function SessionBanners({
         <StartupWaitLine
           sessionId={sessionId}
           agent={startingAgent}
-          sentPending={state.turnActive}
+          sentPending={state.turnActive || state.hostPromptIntent != null}
           queuedPending={state.queuedPrompts.length > 0}
           canRestart={canRestart}
           restartEpoch={state.restartEpoch}

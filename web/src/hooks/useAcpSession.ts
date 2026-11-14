@@ -449,9 +449,11 @@ export function useAcpSession(
   }, [sessionId]);
 
   // Never bind this to Escape: an accidental press would abort work the user meant to keep.
+  const hostPromptIntent = state.hostPromptIntent;
   const performCancelPrompt = useCallback(async (): Promise<string | null> => {
     if (!sessionId || !ownsLiveAcpActions(sessionId, actionOwner)) return NATIVE_INPUT_UNCONFIRMED;
     const current = inputStateRef.current;
+    if (current.hostPromptIntent !== hostPromptIntent) return NATIVE_INPUT_UNCONFIRMED;
     const hostIntent =
       current.nativeSnapshotSeq != null &&
       Number.isFinite(current.nativeSnapshotSeq) &&
@@ -467,7 +469,7 @@ export function useAcpSession(
     const message = await postErrorMessage(acpUrl(sessionId, "cancel"), request, ["cancel", "cancelling"]);
     if (message && ownsLiveAcpActions(sessionId, actionOwner)) dispatch({ kind: "error", message });
     return message;
-  }, [sessionId, actionOwner, requireNativeInput]);
+  }, [sessionId, actionOwner, hostPromptIntent, requireNativeInput]);
   const cancelPrompt = useCallback(async () => (await performCancelPrompt()) === null, [performCancelPrompt]);
 
   const performCancelSubagent = useCallback(

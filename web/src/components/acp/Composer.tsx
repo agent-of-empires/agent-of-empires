@@ -83,6 +83,8 @@ interface Props {
   availableCommands: AcpState["availableCommands"];
   /** Current live daemon snapshot permits native input; a socket alone is insufficient. */
   connected: boolean;
+  /** Exact current host intent may be stopped without granting any Native action. */
+  canCancelHostIntent: boolean;
   canForceEndTurn: boolean;
   stopTurn: () => void;
   /** Explicit managed wake/queue intent; the daemon still rechecks admission. */
@@ -385,9 +387,14 @@ export function Composer(props: Props) {
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
                 <PluginComposerActions sessionId={sessionId} getSnapshot={() => pluginSnapshot(client, taRef)} />
+                {(turnActive || props.canCancelHostIntent) && (
+                  <StopButton
+                    disabled={!connected && !props.canForceEndTurn && !props.canCancelHostIntent}
+                    onCancel={props.stopTurn}
+                    title={props.canCancelHostIntent && !turnActive ? "Stop the pending message" : undefined}
+                  />
+                )}
                 {turnActive ? (
-                  <>
-                    <StopButton disabled={!connected && !props.canForceEndTurn} onCancel={props.stopTurn} />
                     <QueueSendButton
                       connected={connected}
                       waitingFor={props.waitingFor}
@@ -396,7 +403,6 @@ export function Composer(props: Props) {
                       disabled={!canSend}
                       onSend={submitComposer}
                     />
-                  </>
                 ) : (
                   <SendButton
                     connected={connected}

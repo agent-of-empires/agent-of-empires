@@ -41,7 +41,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const line = page.getByTestId("startup-wait-line");
   await expect(line).toBeVisible({ timeout: 15_000 });
   await expect.poll(stalls, { timeout: 15_000 }).toBe(1);
-  const restart = line.getByRole("button", { name: "Start fresh", exact: true });
+  const restart = line.getByTestId("startup-wait-restart");
   await expect(restart).toHaveCount(0);
 
   // Wait for current governed prompt-intent admission, not Native readiness.

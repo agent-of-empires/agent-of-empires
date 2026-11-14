@@ -562,13 +562,17 @@ impl HttpClient {
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.
-    pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
+    pub async fn cancel(&self, session_id: &str, host_prompt_intent: Option<uuid::Uuid>) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/cancel",
             self.endpoint.base_url,
             path_segment(session_id)?
         );
-        let res = self.execute(self.http.post(&url)).await?;
+        let mut request = self.http.post(&url);
+        if let Some(id) = host_prompt_intent {
+            request = request.json(&serde_json::json!({"host_prompt_intent": id}));
+        }
+        let res = self.execute(request).await?;
         check_status(res, session_id)?;
         Ok(())
     }

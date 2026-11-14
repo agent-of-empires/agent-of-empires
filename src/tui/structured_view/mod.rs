@@ -470,6 +470,7 @@ async fn apply_ws_message(
             unchanged,
         }) => {
             let was_active = state.transcript.turn_active;
+            let prior_host_intent = state.transcript.host_prompt_intent;
             let prior_failure = state.transcript.config_option_switch_failed.clone();
             state
                 .transcript
@@ -486,6 +487,10 @@ async fn apply_ws_message(
             } else if was_active && !now_active {
                 // Turn ended: release the lock and pull the post-drain queue
                 // snapshot, since the daemon drains server-side at this edge.
+                state.in_flight = false;
+                refresh_queue(state).await;
+            } else if prior_host_intent.is_some() && state.transcript.host_prompt_intent.is_none() {
+                // A host-only intent can settle without ever opening a Native turn.
                 state.in_flight = false;
                 refresh_queue(state).await;
             }
@@ -635,13 +640,10 @@ async fn handle_terminal_event(
                 has_modes: !state.transcript.available_modes.is_empty(),
                 has_toggles: state.transcript.toggles().next().is_some(),
                 has_notices: state.visible_notices().next().is_some(),
-                // Esc-to-cancel and other action gates read this: it must
-                // track only the main turn, not a display-only background
-                // sub-agent signal (see `AcpTranscript.background_agent_active`),
-                // or Esc stops being inert while the main turn is genuinely
-                // idle (#4001).
-                agent_busy: state.native_input_available()
-                    && (state.transcript.turn_active || state.in_flight),
+                // Native work and an exact pending host identity have distinct authority.
+                // Neither background display nor a pending host message grants Native input.
+                agent_busy: state.host_prompt_intent().is_some() || (state.native_input_available()
+                    && (state.transcript.turn_active || state.in_flight)),
             };
             let intent = input::dispatch(state.focus, &key, ctx);
             // Plugin keybinds are a fallback: consulted only for a key the view
@@ -717,7 +719,7 @@ async fn apply_intent(
             .pending_elicitations
             .first()
             .is_some_and(|pending| state.can_decide(&pending.nonce)),
-        Intent::CancelInFlight => state.native_input_available(),
+        Intent::CancelInFlight => state.host_prompt_intent().is_some() || state.native_input_available(),
         Intent::ChoicePick(_) | Intent::ChoiceAccept => state.can_accept_choice(),
         _ => true,
     };
@@ -979,7 +981,7 @@ async fn apply_intent(
             Ok(false)
         }
         Intent::CancelInFlight => {
-            match state.http.cancel(&state.session_id).await {
+            match state.http.cancel(&state.session_id, state.host_prompt_intent()).await {
                 Ok(()) => set_toast(state, toast_deadline, "cancel sent".into(), ToastKind::Info),
                 Err(e) => set_toast(
                     state,
@@ -2062,6 +2064,7 @@ mod tests {
         view: StructuredViewState,
         wire: tokio::sync::broadcast::Sender<String>,
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        prompt_disposition: std::sync::Arc<std::sync::Mutex<&'static str>>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -2085,6 +2088,8 @@ mod tests {
             let messages = wire.clone();
             let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let received = requests.clone();
+            let prompt_disposition = std::sync::Arc::new(std::sync::Mutex::new("queued"));
+            let dispatch = prompt_disposition.clone();
             let app = axum::Router::new()
                 .route("/sessions/{id}/acp/ws", axum::routing::get(move |upgrade: WebSocketUpgrade| {
                     let mut messages = messages.subscribe();
@@ -2106,6 +2111,7 @@ mod tests {
                 }))
                 .fallback(move |method: axum::http::Method, uri: axum::http::Uri, body: axum::body::Bytes| {
                     let received = received.clone();
+                    let dispatch = dispatch.clone();
                     async move {
                         if method != axum::http::Method::GET {
                             received.lock().unwrap().push((
@@ -2116,7 +2122,11 @@ mod tests {
                         if uri.path().ends_with("/queue") && method == axum::http::Method::GET {
                             axum::Json(serde_json::json!([])).into_response()
                         } else if uri.path().ends_with("/acp/prompt") {
-                            axum::Json(serde_json::json!({"disposition":"queued","queued_id":"accepted"})).into_response()
+                            if *dispatch.lock().unwrap() == "sent" {
+                                axum::Json(serde_json::json!({"disposition":"sent"})).into_response()
+                            } else {
+                                axum::Json(serde_json::json!({"disposition":"queued","queued_id":"accepted"})).into_response()
+                            }
                         } else {
                             axum::http::StatusCode::NO_CONTENT.into_response()
                         }
@@ -2133,6 +2143,7 @@ mod tests {
                 view: StructuredViewState::new("s-1".into(), endpoint, http, Some(ws)),
                 wire,
                 requests,
+                prompt_disposition,
                 server,
             }
         }
@@ -2178,6 +2189,72 @@ mod tests {
                 .cloned()
                 .collect()
         }
+    }
+
+    #[tokio::test]
+    async fn live_host_intent_stop_is_exact_without_native_authority_or_cached_revival() {
+        let mut fixture = NativeInputFixture::new().await;
+        let original = uuid::Uuid::parse_str("5fdcc941-9be3-4f26-ab31-21b612084392").unwrap();
+        let replacement = uuid::Uuid::parse_str("a48a9426-dc57-4b54-bca3-8d415e9188bb").unwrap();
+        let mut cached = native_snapshot(false, None);
+        cached.host_prompt_intent = Some(original);
+        assert!(serde_json::to_value(&cached).unwrap().get("host_prompt_intent").is_none());
+        fixture.snapshot(0, cached, None).await;
+        fixture.act(Intent::CancelInFlight).await;
+        assert!(fixture.native_requests().is_empty());
+        *fixture.prompt_disposition.lock().unwrap() = "sent";
+        fixture.snapshot(1, native_snapshot(false, None), Some(serde_json::json!(true))).await;
+        send_prompt_now(&mut fixture.view, &mut None, "retain this pending message").await;
+        assert!(fixture.view.in_flight);
+        assert_eq!(fixture.native_requests().len(), 1);
+        assert_eq!(fixture.native_requests()[0].0, "POST /api/sessions/s-1/acp/prompt");
+
+        let live = |seq, intent: Option<uuid::Uuid>| {
+            let mut state = serde_json::to_value(native_snapshot(false, None)).unwrap();
+            state["host_prompt_intent"] = serde_json::json!(intent);
+            serde_json::json!({
+                "kind": "reduced_state", "session_id": "s-1", "seq": seq, "state": state,
+            })
+        };
+        fixture.ingest(live(2, Some(original))).await;
+        assert_eq!(fixture.view.host_prompt_intent(), Some(original));
+        assert!(!fixture.view.native_input_available());
+        assert!(!fixture.view.transcript.turn_active);
+        assert!(fixture.view.in_flight);
+        let footer = native_footer(&fixture.view);
+        assert!(footer.contains("Host message pending"));
+        assert!(footer.contains("Esc stops pending message"));
+        assert!(!footer.contains("● Ready"));
+        fixture.view.choice = Some(native_mode_choice());
+        fixture.act(Intent::ChoiceAccept).await;
+        assert_eq!(fixture.native_requests().len(), 1);
+        fixture.view.choice = None;
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(fixture.native_requests()[1..], [(
+            "POST /api/sessions/s-1/acp/cancel".to_owned(),
+            serde_json::json!({"host_prompt_intent": original}),
+        )]);
+
+        fixture.ingest(live(3, Some(replacement))).await;
+        fixture.ingest(live(2, Some(original))).await;
+        assert_eq!(fixture.view.host_prompt_intent(), Some(replacement));
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(fixture.native_requests().last().unwrap().1,
+            serde_json::json!({"host_prompt_intent": replacement}));
+        fixture.ingest(live(4, None)).await;
+        fixture.ingest(live(3, Some(replacement))).await;
+        assert_eq!(fixture.view.host_prompt_intent(), None);
+        assert!(!fixture.view.native_input_available());
+        assert!(!fixture.view.in_flight);
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(fixture.native_requests().len(), 3);
+
+        fixture.ingest(live(5, Some(replacement))).await;
+        fixture.view.disconnect_management();
+        assert_eq!(fixture.view.host_prompt_intent(), None);
+        assert_eq!(fixture.view.transcript.host_prompt_intent, None);
+        fixture.act(Intent::CancelInFlight).await;
+        assert_eq!(fixture.native_requests().len(), 3);
     }
 
     fn native_snapshot(

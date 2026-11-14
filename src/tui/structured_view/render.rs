@@ -1246,6 +1246,8 @@ fn render_status(
             "· ○ Native input unavailable ",
             Style::default().fg(theme.error),
         ));
+    } else if state.host_prompt_intent().is_some() && !state.transcript.turn_active {
+        spans.push(Span::styled("· ○ Host message pending ", Style::default().fg(theme.hint)));
     } else if !state.native_input_available() {
         let label = if state.can_submit_prompt_intent() {
             "· ○ Wake eligible "
@@ -1337,6 +1339,9 @@ fn render_status(
     }
     let hint = if state.choice.is_some() && !state.can_accept_choice() {
         " Native input not ready · Esc dismiss · Ctrl+Q exit "
+    } else if active && state.host_prompt_intent().is_some()
+        && matches!(state.focus, Focus::Composer | Focus::Transcript) {
+        " Esc stops pending message · Ctrl+Q exit "
     } else if active {
         help_hint(
             state.focus,

@@ -19,7 +19,7 @@ import {
   setDraftAttachments,
 } from "../../lib/acpDrafts";
 import { MAX_ATTACHMENTS } from "./composerInput";
-import { isVisiblyBusy } from "../../lib/acpTypes";
+import { isVisiblyBusy, nativeInputAvailable } from "../../lib/acpTypes";
 import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
@@ -158,13 +158,17 @@ export function AcpRuntime({
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
   const agentProfile = useAgentProfile();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
-  const { onCancel, canForceEndTurn } = useCancelEscalation(
+  const { onCancel: cancelNativeTurn, canForceEndTurn: canForceNativeTurn } = useCancelEscalation(
     sessionId,
     acp.state.promptSeq,
     acp.state.cancelling,
     acp.cancelPrompt,
     acp.forceEndTurn,
   );
+  const hostOnly = acp.state.hostPromptIntent != null &&
+    !(acp.state.turnActive && nativeInputAvailable(acp.state));
+  const onCancel = hostOnly ? async () => { await acp.cancelPrompt(); } : cancelNativeTurn;
+  const canForceEndTurn = !hostOnly && canForceNativeTurn;
   // Only the recent slice renders, so a long session does not block first paint.
   const { windowedActivity, canLoadEarlier, loadEarlier } = useHistoryWindow(
     sessionId,

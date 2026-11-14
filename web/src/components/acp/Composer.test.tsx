@@ -56,6 +56,7 @@ function Harness({
         authStatus={null}
         availableCommands={[]}
         connected
+        canCancelHostIntent={false}
         canForceEndTurn={false}
         stopTurn={() => {}}
         canSubmit

@@ -1220,7 +1220,7 @@ async fn approve(
 async fn cancel(session: &str) -> Result<()> {
     let endpoint = require_daemon().await?;
     let client = HttpClient::new(endpoint)?;
-    client.cancel(session).await.map_err(map_http)?;
+    client.cancel(session, None).await.map_err(map_http)?;
     println!(
         "{}",
         cancel_confirmation_message(crate::acp::acp_client::CANCEL_ESCALATION_GRACE.as_secs())

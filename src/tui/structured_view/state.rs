@@ -408,6 +408,17 @@ impl StructuredViewState {
             && self.transcript.connection_unavailable.is_none()
     }
 
+    pub fn host_prompt_intent(&self) -> Option<uuid::Uuid> {
+        if self.ws.is_some()
+            && self.transcript.native_snapshot_seq.is_some()
+            && self.transcript.connection_unavailable.is_none()
+        {
+            self.transcript.host_prompt_intent
+        } else {
+            None
+        }
+    }
+
     /// Reply authority is request-specific while Original establishment is pending.
     /// Transport and a fresh canonical snapshot remain mandatory for both sources.
     pub fn can_decide(&self, nonce: &str) -> bool {

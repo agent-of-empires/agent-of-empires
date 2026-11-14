@@ -1332,6 +1332,9 @@ pub struct AcpState {
     /// field. Missing/null is unknown; history/cache serialization omits it.
     #[serde(default, skip_serializing)]
     pub(crate) prompt_wake_eligible: Option<bool>,
+    /// Exact host cancellation identity from the live envelope only; never Native authority.
+    #[serde(default, skip_serializing)]
+    pub(crate) host_prompt_intent: Option<uuid::Uuid>,
     #[serde(skip)]
     pub(crate) native_availability: Option<(u64, NativeEventSubject)>,
     #[serde(skip)]

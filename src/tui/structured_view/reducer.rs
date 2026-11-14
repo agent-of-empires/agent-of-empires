@@ -127,6 +127,8 @@ pub struct AcpTranscript {
     /// Authority belongs only to an accepted live snapshot, never transcript
     /// replay or management transport presence. Revoked across reconnect.
     pub native_snapshot_seq: Option<u64>,
+    /// Live host-only cancellation identity, revoked with the snapshot.
+    pub host_prompt_intent: Option<uuid::Uuid>,
     /// Exact Original requests certified by the latest canonical live snapshot.
     /// These allow only a reply to that nonce, never general native input.
     pub original_decision_nonces: Vec<crate::acp::approvals::Nonce>,
@@ -256,6 +258,7 @@ impl AcpTranscript {
             lagged: false,
             last_seq: 0,
             native_snapshot_seq: None,
+            host_prompt_intent: None,
             original_decision_nonces: Vec::new(),
             connection_ready: false,
             connection_unavailable: None,
@@ -265,6 +268,7 @@ impl AcpTranscript {
 
     pub fn revoke_native_authority(&mut self) {
         self.native_snapshot_seq = None;
+        self.host_prompt_intent = None;
         self.original_decision_nonces.clear();
         self.connection_ready = false;
         self.connection_unavailable = None;
@@ -368,6 +372,8 @@ impl AcpTranscript {
         self.connection_ready = state.connection_ready && self.connection_unavailable.is_none();
         self.prompt_wake_eligible =
             state.prompt_wake_eligible == Some(true) && self.connection_unavailable.is_none();
+        self.host_prompt_intent = state.host_prompt_intent
+            .filter(|_| self.connection_unavailable.is_none());
 
         let holds = |field: &str| unchanged.iter().any(|f| f == field);
         if !holds("background_agents") {
