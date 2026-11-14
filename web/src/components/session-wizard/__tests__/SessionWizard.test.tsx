@@ -1659,36 +1659,43 @@ describe("SessionWizard Pull latest image first", () => {
     expect(payload(0).pull_latest_image).toBeUndefined();
   });
 
-  it("a failed pull offers Launch with current image, which resends without the pull under a new key", async () => {
-    createSession.mockResolvedValueOnce({
-      ok: false,
-      error: "Couldn't pull the latest Sandbox image.",
-      failure: {
-        code: "sandbox_image_update_failed",
-        stage: "pulling_image",
-        message: `Couldn't pull the latest Sandbox image ${IMAGE}. manifest unknown`,
-        reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1",
-      },
-    });
-    const pulled = pulledSignals();
-    open(UPDATE);
-    await box();
-    await launch();
-    const shown = await screen.findByTestId("create-failure");
-    expect(shown.textContent).toContain("Couldn't pull the latest image");
-    expect(shown.textContent).toContain("The session wasn't created.");
-    expect(shown.textContent).toContain("manifest unknown");
-    expect(payload(0).pull_latest_image).toBe(true);
+  // A refusal comes when pulling was turned off, or the image dropped from the config, after the dialog checked it.
+  it.each<[string, "pulling_image" | null, string]>([
+    [
+      "sandbox_image_update_failed",
+      "pulling_image",
+      `Couldn't pull the latest Sandbox image ${IMAGE}. manifest unknown`,
+    ],
+    ["pull_disabled", null, "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull."],
+    ["unknown_image", null, "Only a configured sandbox image can be checked or pulled"],
+  ])(
+    "a pull answered %s offers Launch with current image, resent without the pull under a new key",
+    async (code, stage, message) => {
+      createSession.mockResolvedValueOnce({
+        ok: false,
+        error: message,
+        failure: { code, stage, message, reference: "3f9c1a2b-77d0-4e0b-9b1f-0d3b5c2a11a1" },
+      });
+      const pulled = pulledSignals();
+      open(UPDATE);
+      await box();
+      await launch();
+      const shown = await screen.findByTestId("create-failure");
+      expect(shown.textContent).toContain("Couldn't pull the latest image");
+      expect(shown.textContent).toContain("The session wasn't created.");
+      expect(shown.textContent).toContain(message);
+      expect(payload(0).pull_latest_image).toBe(true);
 
-    fireEvent.click(screen.getByTestId("create-failure-launch_with_current_image"));
-    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
-    expect(payload(1).pull_latest_image).toBeUndefined();
-    expect(payload(1).sandbox).toBe(true);
-    expect(payload(1).idempotency_key).toBeTruthy();
-    expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
-    expect((await box()).checked).toBe(false);
-    expect(pulled).not.toHaveBeenCalled();
-  });
+      fireEvent.click(screen.getByTestId("create-failure-launch_with_current_image"));
+      await waitFor(() => expect(createSession).toHaveBeenCalledTimes(2));
+      expect(payload(1).pull_latest_image).toBeUndefined();
+      expect(payload(1).sandbox).toBe(true);
+      expect(payload(1).idempotency_key).toBeTruthy();
+      expect(payload(1).idempotency_key).not.toBe(payload(0).idempotency_key);
+      expect((await box()).checked).toBe(false);
+      expect(pulled).not.toHaveBeenCalled();
+    },
+  );
 });
 
 describe("SessionWizard create failures", () => {

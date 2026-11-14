@@ -57,6 +57,8 @@ export function failureFields(
     case "sandbox_image_pull_failed":
       return ["sandboxEnabled", "sandboxImage"];
     case "sandbox_image_update_failed":
+    case "pull_disabled":
+    case "unknown_image":
       return ["sandboxEnabled", "sandboxImage", "pullLatestImage"];
     default:
       return failure.code === "create_failed" && failure.stage === "starting_container"
@@ -101,8 +103,11 @@ export function failureView(
         row: "sandbox",
         cue: "image pull failed",
       };
+    // A failed latest-image pull, or one the Daemon refused (pulling off, or an image it doesn't list). Nothing
+    // was created, so the image already on the Daemon still works.
     case "sandbox_image_update_failed":
-      // The pull failed before anything was created, so the image already on the Daemon still works.
+    case "pull_disabled":
+    case "unknown_image":
       return {
         ...base,
         title: "Couldn't pull the latest image",

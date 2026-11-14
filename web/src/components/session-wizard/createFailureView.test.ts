@@ -52,6 +52,24 @@ describe("failureView", () => {
         cue: "image pull failed",
       },
     ],
+    ...(
+      [
+        ["pull_disabled", "Pulling sandbox images from the web is off. Enable sandbox.allow_image_pull."],
+        ["unknown_image", "Only a configured sandbox image can be checked or pulled"],
+      ] as const
+    ).map(([code, message]): [string, CreateFailure, object, object] => [
+      `latest image pull refused: ${code}`,
+      failure(code, null, message),
+      {},
+      {
+        title: "Couldn't pull the latest image",
+        step: "The session wasn't created.",
+        detail: message,
+        primary: "launch_with_current_image",
+        secondary: null,
+        row: "sandbox",
+      },
+    ]),
     [
       "hook",
       failure("hook_failed", "running_hooks"),

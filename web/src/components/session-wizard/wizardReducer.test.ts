@@ -464,6 +464,14 @@ describe("submit failures", () => {
       field("pullLatestImage", false),
       true,
     ],
+    ["unchecking the pull clears a pull refused as off", "pull_disabled", null, field("pullLatestImage", false), true],
+    [
+      "unchecking the pull clears a pull refused for an unlisted image",
+      "unknown_image",
+      null,
+      field("pullLatestImage", false),
+      true,
+    ],
     [
       "the Sandbox turned off clears an unavailable runtime",
       "sandbox_unavailable",
