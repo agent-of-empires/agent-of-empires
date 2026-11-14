@@ -610,6 +610,17 @@ impl Instance {
     /// refuses, so the availability the API and TUI render cannot drift from
     /// the launch line.
     fn terminal_resume_static_unavailable(&self) -> Option<ResumeStaticUnavailable> {
+        let mut resolved = None;
+        self.terminal_resume_static_unavailable_with(|| {
+            resolved.insert(resume_profile_config(&self.source_profile))
+        })
+    }
+
+    /// `profile_config` runs only past the declared-agent check, which needs no config.
+    fn terminal_resume_static_unavailable_with<'a>(
+        &self,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
+    ) -> Option<ResumeStaticUnavailable> {
         if let Some(declared) = self.declared_agent() {
             return declared
                 .with_definition(|agent| {
@@ -625,20 +636,12 @@ impl Instance {
                 })
                 .unwrap_or(Some(ResumeStaticUnavailable::Agent));
         }
-        // One resolve serves every check; a projection runs this per session.
-        let profile = self.effective_profile();
-        let resolved = crate::session::config::profile_config::resolve_config(&profile);
-        let fallback;
-        let config = match &resolved {
-            Ok(config) => &config.session,
-            Err(_) => {
-                fallback = crate::session::config::profile_config::resolve_config_or_warn(&profile);
-                &fallback.session
-            }
-        };
-        let native = resolved.as_ref().ok().and_then(|resolved| {
-            Self::execution_agent_for(&self.tool, self.get_tool_command(), &resolved.session).ok()
-        });
+        let resolved = profile_config();
+        let config = &resolved.config.session;
+        let native = resolved
+            .resolved
+            .then(|| Self::execution_agent_for(&self.tool, self.get_tool_command(), config).ok())
+            .flatten();
         let Some(agent) = native
             .or_else(|| self.legacy_default_selector_agent_in(config))
             .filter(|agent| agent.session_support.is_some())
@@ -669,18 +672,31 @@ impl Instance {
     }
 
     pub(crate) fn terminal_context_resume_cached(&self) -> TerminalContextResume {
-        self.terminal_context_resume_with_runtime_source(|| {
+        let mut resolved = None;
+        self.terminal_context_resume_cached_with(|| {
+            resolved.insert(resume_profile_config(&self.source_profile))
+        })
+    }
+
+    /// [`Self::terminal_context_resume_cached`] with the profile config resolved
+    /// by the caller, so a projection resolves once per profile.
+    pub(crate) fn terminal_context_resume_cached_with<'a>(
+        &self,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
+    ) -> TerminalContextResume {
+        self.terminal_context_resume_with_runtime_source(profile_config, || {
             self.tmux_session()
                 .map(|session| crate::tmux::cached_session_existence(session.name()))
                 .unwrap_or(crate::tmux::SessionExistence::Unknown)
         })
     }
 
-    fn terminal_context_resume_with_runtime_source(
+    fn terminal_context_resume_with_runtime_source<'a>(
         &self,
+        profile_config: impl FnOnce() -> &'a ResumeProfileConfig,
         runtime_source: impl FnOnce() -> crate::tmux::SessionExistence,
     ) -> TerminalContextResume {
-        if let Some(unavailable) = self.terminal_resume_static_unavailable() {
+        if let Some(unavailable) = self.terminal_resume_static_unavailable_with(profile_config) {
             return match unavailable {
                 ResumeStaticUnavailable::Agent => TerminalContextResume::AgentUnsupported,
                 ResumeStaticUnavailable::Sandbox => TerminalContextResume::SandboxUnsupported,
@@ -2352,22 +2368,26 @@ work-opencode = "opencode"
     fn terminal_context_resume_matches_emission_constraints() {
         let sid = "44444444-4444-4444-8444-444444444444".to_string();
         let mut inst = tool_instance("claude", "/tmp/context");
+        let config = resume_profile_config(&inst.source_profile);
         assert_eq!(
-            inst.terminal_context_resume_with_runtime_source(|| {
-                crate::tmux::SessionExistence::Absent
-            }),
+            inst.terminal_context_resume_with_runtime_source(
+                || &config,
+                || { crate::tmux::SessionExistence::Absent }
+            ),
             TerminalContextResume::NoTarget
         );
         assert_eq!(
-            inst.terminal_context_resume_with_runtime_source(|| {
-                crate::tmux::SessionExistence::Present
-            }),
+            inst.terminal_context_resume_with_runtime_source(
+                || &config,
+                || { crate::tmux::SessionExistence::Present }
+            ),
             TerminalContextResume::RuntimeCheckRequired
         );
         assert_eq!(
-            inst.terminal_context_resume_with_runtime_source(|| {
-                crate::tmux::SessionExistence::Unknown
-            }),
+            inst.terminal_context_resume_with_runtime_source(
+                || &config,
+                || { crate::tmux::SessionExistence::Unknown }
+            ),
             TerminalContextResume::RuntimeCheckRequired
         );
         inst.agent_session_id = Some(sid.clone());

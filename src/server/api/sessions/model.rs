@@ -11,7 +11,7 @@ pub(crate) fn session_response_from_instance(
     inst: &Instance,
     claude_fullscreen: bool,
 ) -> SessionResponse {
-    session_response_from_instance_with_plan(
+    let mut response = session_response_from_instance_with_plan(
         inst,
         claude_fullscreen,
         None,
@@ -19,7 +19,9 @@ pub(crate) fn session_response_from_instance(
         None,
         None,
         None,
-    )
+    );
+    response.context_resume = Some(context_resume_for(inst));
+    response
 }
 
 /// Convert backend session facts with the request's plan and runtime snapshots.
@@ -135,7 +137,8 @@ pub(super) fn session_response_from_instance_with_plan(
         notify_on_idle: inst.notify_on_idle,
         notify_on_error: inst.notify_on_error,
         view: inst.view,
-        context_resume: Some(context_resume_for(inst)),
+        // Overlaid by callers, which resolve each profile's config once.
+        context_resume: None,
         acp_worker_state,
         acp_worker_start: None,
         update_restart: false,
@@ -305,6 +308,18 @@ pub(super) fn update_restart_resumable(
 }
 
 pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
+    let mut resolved = None;
+    context_resume_with(inst, || {
+        resolved.insert(crate::session::resume_profile_config(&inst.source_profile))
+    })
+}
+
+/// [`context_resume_for`] reading a terminal row's profile config from the
+/// caller, which a projection resolves once per profile.
+pub(super) fn context_resume_with<'a>(
+    inst: &Instance,
+    profile_config: impl FnOnce() -> &'a crate::session::ResumeProfileConfig,
+) -> ContextResumeAvailability {
     if inst.is_structured() {
         return if inst.fork_pending.is_some() {
             ContextResumeAvailability::Unavailable {
@@ -327,7 +342,7 @@ pub(super) fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
         };
     }
 
-    match inst.terminal_context_resume_cached() {
+    match inst.terminal_context_resume_cached_with(profile_config) {
         TerminalContextResume::Available => ContextResumeAvailability::Available,
         TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
             reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
