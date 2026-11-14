@@ -196,6 +196,7 @@ it("the committed Composer stops only its exact pending host message without Nat
   await act(() => current.sendPrompt("retain this exact pending message"));
   await flushAsync();
   expect(posts("/acp/prompt")).toHaveLength(1);
+  const { prompt_id: promptId } = JSON.parse(posts("/acp/prompt")[0]!.body!) as { prompt_id: string };
   const snapshot = (seq: number, intent: string | null) => {
     const message = currentControlSnapshot(current.state, { ready: false, wakeEligible: true }, seq);
     message.state.turn_active = false;
@@ -206,7 +207,7 @@ it("the committed Composer stops only its exact pending host message without Nat
   lastSocket().message({
     session_id: id,
     seq: 2,
-    event: { UserPromptSent: { text: "retain this exact pending message" } },
+    event: { UserPromptSent: { text: "retain this exact pending message", prompt_id: promptId } },
   });
   lastSocket().message(snapshot(2, originalIntent));
   await flushAsync();

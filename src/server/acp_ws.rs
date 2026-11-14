@@ -1135,7 +1135,7 @@ mod tests {
         assert_eq!(public["state"]["establishment_revision"], serde_json::json!(revision));
         assert!(public["state"].get("establishment_expected").is_none());
         assert!(!public.to_string().contains("SENSITIVE_REVISION_"));
-        assert_eq!(public["state"]["native_connection_ready"], false);
+        assert_eq!(public["state"]["connection_ready"], false);
         assert!(public["state"]["host_prompt_intent"].is_null());
     }
 
