@@ -1586,7 +1586,7 @@
         "web/src/components/session-wizard/steps/SandboxPanel.tsx",
         "web/src/components/session-wizard/steps/WorktreePanel.tsx"
       ],
-      "notes": "On a fine-pointer device each wizard sub-panel focuses its first editable control on open: the Project and Extra repos search, the Browse filter, the Import agent select, the Worktree branch name, the Sandbox image, and the selected agent. A touch device focuses nothing."
+      "notes": "On a fine-pointer device each wizard sub-panel focuses its first editable control on open: the Project and Extra repos search, the Browse filter, the Import agent select, the Worktree branch name, the Sandbox image, and the selected agent. Fields that appear when projects finish loading keep any focus the user chose meanwhile. A touch device focuses nothing."
     },
     {
       "id": "modals.first-field-autofocus",
