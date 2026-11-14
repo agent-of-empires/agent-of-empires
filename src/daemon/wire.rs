@@ -99,6 +99,9 @@ pub struct CreateSessionBody {
     pub extra_args: String,
     #[serde(default)]
     pub sandbox_image: Option<String>,
+    /// Force-pull the Sandbox image before the create hooks, even when it exists locally.
+    #[serde(default)]
+    pub pull_latest_image: bool,
     #[serde(default)]
     pub extra_env: Vec<String>,
     /// Host-only env for `host_hooks.before_start`; never enters the container. Sandbox only.

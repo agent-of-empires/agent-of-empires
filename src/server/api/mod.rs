@@ -57,6 +57,11 @@ pub use plugins::{
     set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
+#[cfg(test)]
+pub(crate) use sandbox_image::status_generation_for_test as sandbox_image_status_generation_for_test;
+pub(crate) use sandbox_image::{
+    create_pull_refusal, invalidate_status as invalidate_sandbox_image_status,
+};
 pub use sandbox_image::{sandbox_image_dismiss, sandbox_image_pull, sandbox_image_status};
 pub use sessions::{
     abandon_purge, attach_session_project, cancel_creation, create_session,

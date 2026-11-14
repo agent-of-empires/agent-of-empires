@@ -118,6 +118,15 @@ impl ContainerRuntime {
         self.base.pull_image(image)
     }
 
+    /// [`Self::pull_image`], killed when `cancel` fires.
+    pub fn pull_image_until_cancelled(
+        &self,
+        image: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<()> {
+        self.base.pull_until_cancelled(image, cancel)
+    }
+
     /// The command [`Self::pull_image`] runs, for a user to copy when the dashboard can't pull.
     /// The image comes from config, so anything outside an image reference's characters is
     /// quoted rather than pasted into a shell as is.

@@ -23,6 +23,7 @@ const MAX_FAILURE_MESSAGE_CHARS: usize = 1024;
 #[serde(rename_all = "snake_case")]
 pub enum CreateStage {
     Preparing,
+    PullingImage,
     StartingContainer,
     RunningHooks,
     Starting,
