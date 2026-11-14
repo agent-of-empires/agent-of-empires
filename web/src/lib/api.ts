@@ -1637,9 +1637,18 @@ export type SandboxImageStatus = SandboxImageState & {
   runtime: string;
 };
 
-/** The status, `{ error }` when the Daemon refuses (`config_unreadable`, for one), or null offline. */
-export async function fetchSandboxImageStatus(): Promise<SandboxImageStatus | { error: string } | null> {
-  const reply = await send("/api/sandbox/image-status").catch(() => null);
+/** The status of `image` (default: the configured default image), `{ error }` when the Daemon
+ *  refuses (`config_unreadable`, or `unknown_image` for one that isn't configured), or null
+ *  offline. `fresh` skips the Daemon's cache. */
+export async function fetchSandboxImageStatus(
+  image?: string,
+  opts: { fresh?: boolean } = {},
+): Promise<SandboxImageStatus | { error: string } | null> {
+  const query = new URLSearchParams();
+  if (image) query.set("image", image);
+  if (opts.fresh) query.set("fresh", "true");
+  const qs = query.toString();
+  const reply = await send(`/api/sandbox/image-status${qs ? `?${qs}` : ""}`).catch(() => null);
   if (!reply) return null;
   if (reply.ok) return reply.payload as SandboxImageStatus | null;
   return { error: stringField(reply.payload, "error") ?? `http_${reply.status}` };

@@ -1472,6 +1472,23 @@
       ]
     },
     {
+      "id": "wizard.sandbox-image-status",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard.spec.ts",
+        "src/components/session-wizard/__tests__/useSandboxImageRowStatus.test.tsx",
+        "src/components/session-wizard/__tests__/SessionWizard.test.tsx",
+        "src/lib/api.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/useSandboxImageRowStatus.ts",
+        "web/src/lib/api.ts"
+      ],
+      "notes": "With Sandbox on and available, the row leads with /api/sandbox/image-status for the image the wizard will use (sandboxImage, seeded from the Profile's sandbox.default_image; empty asks for the default): Update available, Up to date, Couldn't check for updates (check_failed), Downloads on launch (unknown with reason not_pulled), and Update status unknown for any other unknown reason, a refusal such as unknown_image for an edited image that isn't configured, or no answer; then ' · <image>'. The first answered check of an opening sends fresh=true; an edit waits 500 ms after the last keystroke and asks from the cache, and a late answer for a previous image is dropped. Off, blocked or before the Profile's defaults settle, the row asks nothing. At 375px the status stays whole and only the image truncates."
+    },
+    {
       "id": "wizard.agent-lifecycle",
       "kind": "vitest",
       "risk": "low",

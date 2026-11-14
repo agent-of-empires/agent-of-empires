@@ -1188,6 +1188,27 @@ describe("fetchProfileAgents", () => {
   });
 });
 
+describe("fetchSandboxImageStatus", () => {
+  it.each([
+    ["the default image, cached", undefined, {}, "/api/sandbox/image-status"],
+    [
+      "an image, fresh",
+      "ghcr.io/x/sb:1",
+      { fresh: true },
+      "/api/sandbox/image-status?image=ghcr.io%2Fx%2Fsb%3A1&fresh=true",
+    ],
+  ] as const)("asks for %s", async (_name, image, opts, url) => {
+    fetchSpy.mockResolvedValueOnce(json({ state: "current" }));
+    await api.fetchSandboxImageStatus(image, opts);
+    expect(lastCall().url).toBe(url);
+  });
+
+  it("names a refusal such as an image that isn't configured", async () => {
+    fetchSpy.mockResolvedValueOnce(json({ error: "unknown_image", message: "no" }, 400));
+    expect(await api.fetchSandboxImageStatus("mine:latest")).toEqual({ error: "unknown_image" });
+  });
+});
+
 describe("createSession errors", () => {
   const body = { path: "/repo", tool: "claude" } as CreateSessionRequest;
 
