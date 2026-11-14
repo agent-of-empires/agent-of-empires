@@ -65,7 +65,7 @@ pub struct Cli {
     /// `AOE_DAEMON_PASSPHRASE`. An unauthenticated daemon needs neither.
     /// See the HTTP API reference for transport and authentication rules.
     // Keep the explicit flag separate from the optional environment endpoint.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_daemon_url)]
     pub daemon_url: Option<String>,
 
     /// Fail instead of starting a local daemon when none is running
@@ -82,6 +82,13 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+fn parse_daemon_url(value: &str) -> Result<String, &'static str> {
+    if value.trim().is_empty() {
+        return Err("invalid_endpoint: daemon endpoint must not be empty");
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Subcommand)]
@@ -412,6 +419,23 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn explicit_daemon_endpoint_rejects_empty_overrides() {
+        for value in ["", " \t"] {
+            let error = Cli::try_parse_from([
+                "aoe",
+                "--daemon-url",
+                value,
+                "plugin",
+                "uninstall",
+                "acme.example",
+            ])
+            .err()
+            .expect("empty explicit endpoint must not select the local Daemon");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        }
+    }
 
     #[test]
     fn daemon_verbs_resolve_to_the_serve_lifecycle_flags() {

@@ -23,6 +23,8 @@ use crate::plugin::ui_state::UiSnapshot;
 
 /// The daemon revives, waits for readiness and delivers before it answers a terminal send.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const PLUGIN_PREVIEW_TIMEOUT: std::time::Duration =
+    crate::plugin::EXECUTION_BUDGET.saturating_add(std::time::Duration::from_secs(10 * 60));
 
 /// One active plugin command as the daemon reports it (`GET
 /// /api/plugins/commands`), the source of truth the structured view resolves
@@ -114,6 +116,14 @@ pub enum HttpError {
     ApprovalGone,
     #[error("daemon is read-only (started with --read-only); request refused")]
     ReadOnly,
+    #[error("local plugin directories and --dev require a verified local Daemon Unix socket peer; remote endpoints cannot read Client paths")]
+    LocalPluginSourceRequired,
+    #[error("plugin preview failed; check the source, manifest, host compatibility and GitHub access on the Daemon host")]
+    PluginPreviewFailed,
+    #[error("another plugin operation is running; wait for its outcome and inspect the plugin state before submitting again")]
+    PluginJobActive,
+    #[error("plugin is already installed; run `aoe plugin update <id>` or `aoe plugin uninstall <id>` on the same Daemon endpoint")]
+    PluginAlreadyInstalled,
     #[error("subagent cannot be cancelled")]
     SubagentNotCancellable,
     #[error("reviving the session is required to accept this prompt; retry without --no-revive")]
@@ -936,6 +946,94 @@ impl HttpClient {
         })
     }
 
+    pub async fn preview_plugin_install(
+        &self,
+        body: &crate::daemon::InstallPreviewBody,
+    ) -> Result<crate::plugin::install::InstallConsent, HttpError> {
+        let url = format!("{}/api/plugins/install/preview", self.endpoint.base_url);
+        let response = check_global_status(
+            self.execute(
+                self.http
+                    .post(url)
+                    .json(body)
+                    .timeout(PLUGIN_PREVIEW_TIMEOUT),
+            )
+            .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn install_plugin(
+        &self,
+        body: &crate::daemon::StartInstallBody,
+    ) -> Result<crate::daemon::PluginJobAccepted, HttpError> {
+        let url = format!("{}/api/plugins/install", self.endpoint.base_url);
+        let response = check_global_status(
+            self.execute_elevated(|| self.http.post(&url).json(body))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn preview_plugin_update(
+        &self,
+        id: &str,
+    ) -> Result<crate::plugin::install::UpdatePreview, HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/update/preview",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(
+            self.execute(self.http.get(url).timeout(PLUGIN_PREVIEW_TIMEOUT))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn update_plugin(
+        &self,
+        id: &str,
+        body: &crate::daemon::ApplyUpdateBody,
+    ) -> Result<crate::daemon::PluginJobAccepted, HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/update/apply",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(
+            self.execute_elevated(|| self.http.post(&url).json(body))
+                .await?,
+        )?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn uninstall_plugin(
+        &self,
+        id: &str,
+    ) -> Result<crate::daemon::PluginJobAccepted, HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/uninstall",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(self.execute_elevated(|| self.http.post(&url)).await?)?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
+    pub async fn plugin_job(
+        &self,
+        id: &str,
+    ) -> Result<crate::daemon::PluginJobResponse, HttpError> {
+        let url = format!(
+            "{}/api/plugins/jobs/{}",
+            self.endpoint.base_url,
+            path_segment(id)?,
+        );
+        let response = check_global_status(self.execute(self.http.get(url)).await?)?;
+        Ok(crate::daemon::decode_json(response).await?)
+    }
+
     /// `GET /api/log-level`, or `PATCH` it first when `patch` is given.
     pub async fn log_level(
         &self,
@@ -1210,6 +1308,10 @@ fn classify_code(
     match (status, code) {
         (StatusCode::UNAUTHORIZED, _) => HttpError::Unauthorized,
         (_, Some(ApiErrorCode::ReadOnly)) => HttpError::ReadOnly,
+        (_, Some(ApiErrorCode::LocalPluginSourceRequired)) => HttpError::LocalPluginSourceRequired,
+        (_, Some(ApiErrorCode::PluginPreviewFailed)) => HttpError::PluginPreviewFailed,
+        (_, Some(ApiErrorCode::PluginJobActive)) => HttpError::PluginJobActive,
+        (_, Some(ApiErrorCode::PluginAlreadyInstalled)) => HttpError::PluginAlreadyInstalled,
         (_, Some(ApiErrorCode::NoRevive)) => HttpError::RevivalRequired,
         (_, Some(ApiErrorCode::PendingTargetGone)) => HttpError::ApprovalGone,
         (_, Some(ApiErrorCode::SmartRenameSkipped)) => HttpError::SmartRenameSkipped,
@@ -2115,6 +2217,153 @@ mod tests {
                     | (504, HttpError::SmartRenameTimeout)
             ));
             assert!(!error.to_string().contains("secret-provider-credential"));
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_previews_outlive_an_elapsed_general_http_budget() {
+        use axum::{body::Bytes, routing::get, Router};
+        use std::sync::Arc;
+        use tokio::sync::{oneshot, Mutex, Notify};
+
+        for install in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started, accepted) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            let preview = Arc::new(Mutex::new(Some((started, resume))));
+            let health = Arc::new(Notify::new());
+            let health_handler = health.clone();
+            let app = Router::new()
+                .route(
+                    "/api/sessions",
+                    get(move || {
+                        let health = health_handler.clone();
+                        async move {
+                            health.notified().await;
+                            StatusCode::OK
+                        }
+                    }),
+                )
+                .fallback(move |_: Bytes| {
+                    let preview = preview.clone();
+                    async move {
+                        let (started, resume) = preview.lock().await.take().unwrap();
+                        started.send(()).unwrap();
+                        let _ = resume.await;
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            [("AoE-Error-Code", "preview_failed")],
+                        )
+                    }
+                });
+            let (shutdown, stopped) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            let mut client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
+            client.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_millis(200))
+                .build()
+                .unwrap();
+            let request_client = client.clone();
+            let request = tokio::spawn(async move {
+                if install {
+                    request_client
+                        .preview_plugin_install(&crate::daemon::InstallPreviewBody {
+                            source: "gh:acme/fixture".into(),
+                            dev: false,
+                        })
+                        .await
+                        .map(|_| ())
+                } else {
+                    request_client
+                        .preview_plugin_update("acme.fixture")
+                        .await
+                        .map(|_| ())
+                }
+            });
+            accepted.await.unwrap();
+            let ordinary = client.health_check().await;
+            health.notify_one();
+            let _ = release.send(());
+            let preview = request.await.unwrap();
+            let _ = shutdown.send(());
+            server.await.unwrap();
+            assert!(
+                matches!(
+                    ordinary,
+                    Err(HttpError::Daemon(crate::daemon::DaemonClientError::Timeout))
+                ),
+                "{ordinary:?}"
+            );
+            assert!(
+                matches!(preview, Err(HttpError::PluginPreviewFailed)),
+                "{preview:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_failures_use_fixed_headers_without_waiting_for_sensitive_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, code) in [
+            (502, "preview_failed"),
+            (409, "plugin_job_active"),
+            (409, "plugin_already_installed"),
+            (502, "plugin_already_installed"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream
+                    .write_all(format!(
+                        "HTTP/1.1 {status} Error\r\nAoE-Error-Code: {code}\r\nContent-Length: 999999999\r\n\r\nsecret-daemon-credential"
+                    ).as_bytes())
+                    .await
+                    .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let client =
+                HttpClient::new(endpoint(&format!("http://{address}"), Some("token"))).unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(2), async {
+                if code == "plugin_job_active" {
+                    client.uninstall_plugin("acme.fixture").await.err().unwrap()
+                } else {
+                    client
+                        .preview_plugin_install(&crate::daemon::InstallPreviewBody {
+                            source: "gh:acme/fixture".into(),
+                            dev: false,
+                        })
+                        .await
+                        .err()
+                        .unwrap()
+                }
+            })
+            .await;
+            server.abort();
+            let _ = server.await;
+            let error = error.unwrap();
+            match (status, code, &error) {
+                (502, "preview_failed", HttpError::PluginPreviewFailed)
+                | (409, "plugin_job_active", HttpError::PluginJobActive)
+                | (409, "plugin_already_installed", HttpError::PluginAlreadyInstalled) => {}
+                (502, "plugin_already_installed", HttpError::Server { body, .. }) => {
+                    assert!(body.is_empty());
+                }
+                other => panic!("unexpected refusal classification: {other:?}"),
+            }
+            assert!(!error.to_string().contains("secret-daemon-credential"));
         }
     }
 

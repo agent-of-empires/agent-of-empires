@@ -314,6 +314,219 @@ pub(crate) fn spawn_process_group(command: &mut Command) -> std::io::Result<Chil
     command.spawn()
 }
 
+/// Exclusive unreaped direct-child custody reserves the original process group.
+pub(crate) struct OwnedProcessGroup {
+    child: Child,
+    settled: bool,
+}
+
+impl OwnedProcessGroup {
+    pub(crate) fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            spawn_process_group(command).map(|child| Self {
+                child,
+                settled: false,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = command;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "owned process group custody unsupported",
+            ))
+        }
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<std::process::ChildStderr> {
+        self.child.stderr.take()
+    }
+
+    pub(crate) fn exited(&self) -> std::io::Result<bool> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return unix::child_exited_unreaped(self.id());
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "owned child observation unsupported",
+        ))
+    }
+
+    fn signal(&self, signal: i32) -> anyhow::Result<()> {
+        self.exited()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let signal = Signal::try_from(signal)?;
+            match nix::sys::signal::killpg(Pid::from_raw(i32::try_from(self.id())?), signal) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("owned group signalling unsupported: {signal}")
+    }
+
+    pub(crate) fn settle(&mut self, grace: Duration) -> anyhow::Result<()> {
+        self.settle_with_signal(grace, Self::signal)
+    }
+
+    fn settle_with_signal(
+        &mut self,
+        grace: Duration,
+        mut signal: impl FnMut(&Self, i32) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let settled = || -> anyhow::Result<bool> {
+            Ok(self
+                .exited()
+                .context("could not observe original child exit")?
+                && !runner_group_executing(self.id())
+                    .context("could not observe original process group")?)
+        };
+        if settled()? {
+            self.settled = true;
+            return Ok(());
+        }
+        let term_deadline = Instant::now() + grace;
+        let kill_deadline = term_deadline + Duration::from_secs(5);
+        let mut signal_error = signal(self, libc::SIGTERM).err().map(|error| {
+            error.context(format!(
+                "could not send SIGTERM to original process group {}",
+                self.id()
+            ))
+        });
+        let mut killed = false;
+        loop {
+            if settled()? {
+                self.settled = true;
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= term_deadline && !killed {
+                if let Err(error) = signal(self, libc::SIGKILL) {
+                    if signal_error.is_none() {
+                        signal_error = Some(error.context(format!(
+                            "could not send SIGKILL to original process group {}",
+                            self.id()
+                        )));
+                    }
+                }
+                killed = true;
+            }
+            if now >= kill_deadline {
+                return Err(match signal_error {
+                    Some(error) => error.context("owned process group termination unproven"),
+                    None => anyhow::anyhow!("owned process group termination unproven"),
+                });
+            }
+            std::thread::sleep(WAIT_POLL_INTERVAL);
+        }
+    }
+
+    pub(crate) fn reap(mut self) -> std::io::Result<ExitStatus> {
+        if !self.settled {
+            return Err(std::io::Error::other(
+                "cannot reap before original group settlement",
+            ));
+        }
+        self.child.wait()
+    }
+}
+
+/// Descendant custody borrows the unreaped child that reserves its root PID.
+pub(crate) struct OwnedProcessTree<'a> {
+    root: &'a OwnedProcessGroup,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    members: HashMap<u32, platform::ProcessHandle>,
+}
+
+impl<'a> OwnedProcessTree<'a> {
+    pub(crate) fn capture(root: &'a OwnedProcessGroup) -> anyhow::Result<Self> {
+        let mut tree = Self {
+            root,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            members: HashMap::new(),
+        };
+        if let Err(error) = tree.refresh() {
+            std::mem::forget(tree);
+            return Err(error);
+        }
+        Ok(tree)
+    }
+
+    pub(crate) fn refresh(&mut self) -> anyhow::Result<()> {
+        self.root.exited()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            let root = PrimeProcessIdentity {
+                pid: self.root.id(),
+                start_id: String::new(),
+            };
+            let samples = platform::owned_process_tree_samples(self.root)?;
+            let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
+            // Prune after sampling so an observed replacement cannot hide behind an exited handle.
+            let mut failure = None;
+            self.members.retain(|_, handle| {
+                if failure.is_some() {
+                    return true;
+                }
+                match handle.physically_exited() {
+                    Ok(exited) => !exited,
+                    Err(error) => {
+                        failure = Some(error);
+                        true
+                    }
+                }
+            });
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            for (sample, selected) in samples.into_iter().zip(selected) {
+                let identity = sample.identity;
+                if !selected || identity.pid == root.pid || self.members.contains_key(&identity.pid)
+                {
+                    continue;
+                }
+                if let Some(handle) = platform::ProcessHandle::capture_owned(&identity, self.root)?
+                {
+                    self.members.insert(identity.pid, handle);
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        anyhow::bail!("owned descendant custody unsupported on this platform")
+    }
+
+    pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
+        self.root.exited()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            settle_process_handles(
+                self.members.values(),
+                grace,
+                platform::ProcessHandle::physically_exited,
+                platform::ProcessHandle::signal_owned,
+            )
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = grace;
+            anyhow::bail!("owned descendant custody unsupported on this platform")
+        }
+    }
+}
+
 /// Keep the owned leader unreaped until the last group signal, reserving its PID.
 pub(crate) fn terminate_and_reap_process_group(
     child: &mut Child,
@@ -986,12 +1199,30 @@ mod captured_process_tests {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Default)]
+struct RunnerMembers {
+    processes: Vec<(PrimeProcessIdentity, platform::ProcessHandle)>,
+    active: HashMap<u32, usize>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl RunnerMembers {
+    fn remove(&mut self, index: usize) {
+        let (identity, _) = self.processes.swap_remove(index);
+        self.active.remove(&identity.pid);
+        if let Some((moved, _)) = self.processes.get(index) {
+            self.active.insert(moved.pid, index);
+        }
+    }
+}
+
 pub(crate) struct RunnerProcessGuard {
     pid: u32,
     fingerprint: Option<ProcessBirthFingerprint>,
     obsolete: bool,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    members: parking_lot::Mutex<Vec<(PrimeProcessIdentity, platform::ProcessHandle)>>,
+    members: parking_lot::Mutex<RunnerMembers>,
     #[cfg(target_os = "linux")]
     group_anchor: Option<platform::ProcessHandle>,
 }
@@ -1043,7 +1274,7 @@ impl RunnerProcessGuard {
                 pid,
                 fingerprint,
                 obsolete,
-                members: parking_lot::Mutex::new(Vec::new()),
+                members: parking_lot::Mutex::new(RunnerMembers::default()),
                 #[cfg(target_os = "linux")]
                 group_anchor,
             };
@@ -1065,10 +1296,7 @@ impl RunnerProcessGuard {
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn refresh(
-        &self,
-        members: &mut Vec<(PrimeProcessIdentity, platform::ProcessHandle)>,
-    ) -> anyhow::Result<()> {
+    fn refresh(&self, members: &mut RunnerMembers) -> anyhow::Result<()> {
         let before = runner_birth_identity(self.pid)?;
         let root_attested = before
             .as_ref()
@@ -1078,13 +1306,20 @@ impl RunnerProcessGuard {
             "runner birth identity is unattested; confirm external settlement before recovery"
         );
         if before.is_none() {
-            members.retain(|(identity, _)| identity.pid != self.pid);
+            if let Some(index) = members.active.get(&self.pid).copied() {
+                members.remove(index);
+            }
+        }
+        for index in (0..members.processes.len()).rev() {
+            if members.processes[index].1.exited()? {
+                members.remove(index);
+            }
         }
         let anchor = if root_attested {
             None
         } else {
             let mut anchor = None;
-            for (index, (identity, handle)) in members.iter().enumerate() {
+            for (index, (identity, handle)) in members.processes.iter().enumerate() {
                 if !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
                 {
                     anchor = Some(index);
@@ -1112,7 +1347,11 @@ impl RunnerProcessGuard {
         }
         let mut added = Vec::new();
         for identity in identities {
-            if !members.iter().any(|(known, _)| known == &identity) {
+            if !members
+                .active
+                .get(&identity.pid)
+                .is_some_and(|index| members.processes[*index].0 == identity)
+            {
                 if let Some(handle) = platform::ProcessHandle::capture(&identity)? {
                     added.push((identity, handle));
                 }
@@ -1126,7 +1365,7 @@ impl RunnerProcessGuard {
             );
             after == before
         } else if let Some(index) = anchor {
-            let (identity, handle) = &members[index];
+            let (identity, handle) = &members.processes[index];
             !handle.exited()? && platform::process_group_id(identity.pid)? == Some(self.pid)
         } else {
             false
@@ -1134,7 +1373,10 @@ impl RunnerProcessGuard {
         if !stable {
             return Ok(());
         }
-        members.extend(added);
+        for (identity, handle) in added {
+            members.active.insert(identity.pid, members.processes.len());
+            members.processes.push((identity, handle));
+        }
         Ok(())
     }
 
@@ -1157,7 +1399,7 @@ impl RunnerProcessGuard {
         {
             let mut members = self.members.lock();
             self.refresh(&mut members)?;
-            for (_, handle) in members.iter() {
+            for (_, handle) in &members.processes {
                 if !handle.exited()? {
                     return Ok(true);
                 }
@@ -1178,7 +1420,7 @@ impl RunnerProcessGuard {
         {
             let mut members = self.members.lock();
             self.refresh(&mut members)?;
-            for (_, handle) in members.iter() {
+            for (_, handle) in &members.processes {
                 handle.signal(signal)?;
             }
         }
@@ -1325,7 +1567,7 @@ thread_local! {
 pub(crate) struct CapturedProcessTree {
     receipt: CapturedProcessTreeReceipt,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    handles: Vec<platform::ProcessHandle>,
+    handles: Vec<Option<platform::ProcessHandle>>,
 }
 
 impl CapturedProcessTree {
@@ -1339,12 +1581,12 @@ impl CapturedProcessTree {
                 .ok_or_else(|| anyhow::anyhow!("tool process exited before capture"))?;
             let samples = platform::process_tree_samples(&root)?;
             let selected = prime_selection_mask(&samples, std::slice::from_ref(&root));
-            let mut handles = vec![handle];
+            let mut handles = vec![Some(handle)];
             let mut identities = vec![root.clone()];
             for (sample, selected) in samples.into_iter().zip(selected) {
                 if selected && sample.identity != root {
                     if let Some(handle) = platform::ProcessHandle::capture(&sample.identity)? {
-                        handles.push(handle);
+                        handles.push(Some(handle));
                         identities.push(sample.identity);
                     }
                 }
@@ -1369,6 +1611,21 @@ impl CapturedProcessTree {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn prune_exited(&mut self) -> anyhow::Result<()> {
+        for index in (1..self.handles.len()).rev() {
+            let exited = match &self.handles[index] {
+                Some(handle) => handle.exited()?,
+                None => true,
+            };
+            if exited {
+                self.handles.swap_remove(index);
+                self.receipt.processes.swap_remove(index);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn receipt(&self) -> &CapturedProcessTreeReceipt {
         &self.receipt
     }
@@ -1384,16 +1641,17 @@ impl CapturedProcessTree {
             .ok_or_else(|| anyhow::anyhow!("process boot identity unavailable"))?;
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            let mut handles = Vec::new();
-            if receipt.boot_id == current_boot {
-                handles.reserve(receipt.processes.len());
-                for identity in &receipt.processes {
-                    if let Some(handle) = platform::ProcessHandle::capture(identity)? {
-                        handles.push(handle);
-                    }
-                }
+            let mut handles = Vec::with_capacity(receipt.processes.len());
+            for identity in &receipt.processes {
+                handles.push(if receipt.boot_id == current_boot {
+                    platform::ProcessHandle::capture(identity)?
+                } else {
+                    None
+                });
             }
-            Ok(Self { receipt, handles })
+            let mut tree = Self { receipt, handles };
+            tree.prune_exited()?;
+            Ok(tree)
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         anyhow::bail!("incarnation-bound signalling unsupported on this platform")
@@ -1401,7 +1659,7 @@ impl CapturedProcessTree {
 
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn all_exited(&self) -> anyhow::Result<bool> {
-        for handle in &self.handles {
+        for handle in self.handles.iter().flatten() {
             if !handle.exited()? {
                 return Ok(false);
             }
@@ -1409,12 +1667,16 @@ impl CapturedProcessTree {
         Ok(true)
     }
 
-    pub(crate) fn settle(self, grace: Duration) -> anyhow::Result<()> {
+    pub(crate) fn settle(&self, grace: Duration) -> anyhow::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             #[cfg(test)]
             if FAIL_CAPTURED_TREE_AFTER_ROOT.replace(false) {
-                let root = self.handles.first().expect("captured root handle");
+                let root = self
+                    .handles
+                    .first()
+                    .and_then(Option::as_ref)
+                    .expect("captured root handle");
                 root.signal(libc::SIGKILL)?;
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !root.exited()? {
@@ -1423,7 +1685,12 @@ impl CapturedProcessTree {
                 }
                 anyhow::bail!("injected retirement proof failure after root exit");
             }
-            settle_process_handles(&self.handles, grace)
+            settle_process_handles(
+                self.handles.iter().flatten(),
+                grace,
+                platform::ProcessHandle::exited,
+                |handle, signal, _| handle.signal(signal),
+            )
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -1434,28 +1701,30 @@ impl CapturedProcessTree {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn settle_process_handles(
-    handles: &[platform::ProcessHandle],
+fn settle_process_handles<'a>(
+    handles: impl Iterator<Item = &'a platform::ProcessHandle> + Clone,
     grace: Duration,
+    exited: impl Fn(&platform::ProcessHandle) -> anyhow::Result<bool>,
+    signal: impl Fn(&platform::ProcessHandle, i32, Instant) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    for handle in handles {
-        handle.signal(libc::SIGTERM)?;
-    }
     let term_deadline = Instant::now() + grace;
     let kill_deadline = term_deadline + Duration::from_secs(5);
+    for handle in handles.clone() {
+        signal(handle, libc::SIGTERM, kill_deadline)?;
+    }
     let mut killed = false;
     loop {
         let mut live = false;
-        for handle in handles {
-            live |= !handle.exited()?;
+        for handle in handles.clone() {
+            live |= !exited(handle)?;
         }
         if !live {
             return Ok(());
         }
         let now = Instant::now();
         if now >= term_deadline && !killed {
-            for handle in handles {
-                handle.signal(libc::SIGKILL)?;
+            for handle in handles.clone() {
+                signal(handle, libc::SIGKILL, kill_deadline)?;
             }
             killed = true;
         }
@@ -1476,7 +1745,12 @@ pub(crate) fn fence_processes(
                 handles.push(handle);
             }
         }
-        settle_process_handles(&handles, grace)
+        settle_process_handles(
+            handles.iter(),
+            grace,
+            platform::ProcessHandle::exited,
+            |handle, signal, _| handle.signal(signal),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -1855,6 +2129,78 @@ fn signal_process_tree(pid: u32, signal: Signal) {
 mod tests {
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn owned_group_signal_errors_require_physical_settlement() {
+        use std::io::BufRead;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        struct Original {
+            group: Option<OwnedProcessGroup>,
+            input: Option<std::process::ChildStdin>,
+        }
+        impl Drop for Original {
+            fn drop(&mut self) {
+                drop(self.input.take());
+                if let Some(mut group) = self.group.take() {
+                    if group.settle(Duration::ZERO).is_ok() {
+                        let _ = group.reap();
+                    } else {
+                        std::mem::forget(group);
+                    }
+                }
+            }
+        }
+
+        for completes in [true, false] {
+            let (reader, writer) = UnixStream::pair().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut command = Command::new("sh");
+            command
+                .args(["-c", "printf 'ready\\n'; IFS= read -r release; exit 0"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(OwnedFd::from(writer)))
+                .stderr(Stdio::null());
+            let mut original = Original {
+                group: Some(OwnedProcessGroup::spawn(&mut command).unwrap()),
+                input: None,
+            };
+            original.input = original.group.as_mut().unwrap().child.stdin.take();
+            let mut ready = String::new();
+            std::io::BufReader::new(reader)
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready, "ready\n");
+            let Original { group, input } = &mut original;
+            let group = group.as_mut().unwrap();
+            let result = group.settle_with_signal(Duration::ZERO, |_, signal| {
+                if completes && signal == libc::SIGKILL {
+                    drop(input.take());
+                }
+                Err(Errno::EPERM.into())
+            });
+            if completes {
+                result.unwrap();
+                assert!(group.exited().unwrap());
+                assert!(!runner_group_executing(group.id()).unwrap());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.downcast_ref::<Errno>(), Some(&Errno::EPERM));
+                assert!(!group.exited().unwrap());
+                assert!(runner_group_executing(group.id()).unwrap());
+            }
+            drop(input.take());
+            group.settle(Duration::ZERO).unwrap();
+            let status = original.group.take().unwrap().reap().unwrap();
+            if completes {
+                assert!(status.success());
+            }
+        }
+    }
+
     #[test]
     fn prime_process_selection_preserves_scope_across_pid_reuse() {
         let sample = |pid, parent, start: &str, marked| PrimeProcessSample {
@@ -1915,6 +2261,156 @@ mod tests {
         obsolete.settle(Duration::ZERO).unwrap();
         receipt.processes.push(receipt.processes[0].clone());
         assert!(CapturedProcessTree::resume(receipt, std::process::id()).is_err());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn captured_tree_prunes_exited_cohorts_but_retains_live_escaped_custody() {
+        use std::io::{BufRead, BufReader, Write as _};
+        let effects = tempfile::tempdir().unwrap();
+        let script = effects.path().join("cohorts.py");
+        std::fs::write(
+            &script,
+            r#"import os, signal, subprocess, sys
+escaped = None
+cohorts = []
+released = False
+def terminate(*_):
+    raise SystemExit
+def finish(child):
+    if child.poll() is None:
+        child.kill()
+    child.wait()
+signal.signal(signal.SIGTERM, terminate)
+try:
+    for command in sys.stdin:
+        command = command.strip()
+        if command == "escape":
+            escaped = subprocess.Popen([sys.executable, "-u", "-c",
+                "import os,signal,sys; sys.stdin.readline(); os.setsid(); print(os.getpid(),flush=True); signal.pause()"],
+                stdin=subprocess.PIPE)
+            escaped.stdin.write(b"detach\n")
+            escaped.stdin.close()
+        elif command == "cohort":
+            cohorts.append(subprocess.Popen([sys.executable, "-u", "-c",
+                "import os,sys; print(os.getpid(),flush=True); sys.stdin.read()"],
+                stdin=subprocess.PIPE))
+        elif command == "exit":
+            cohorts[-1].stdin.close()
+            print("released", flush=True)
+        elif command == "reap":
+            cohorts.pop().wait()
+            print("reaped", flush=True)
+        elif command == "leave":
+            released = True
+            break
+finally:
+    if escaped is not None and not released:
+        finish(escaped)
+    for child in cohorts:
+        finish(child)
+"#,
+        )
+        .unwrap();
+        let mut command = Command::new("python3");
+        command
+            .arg("-u")
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        struct Cleanup {
+            group: Option<OwnedProcessGroup>,
+            escaped: Option<CapturedProcess>,
+            reader: Option<std::thread::JoinHandle<()>>,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(escaped) = &self.escaped {
+                    let _ = escaped.signal(libc::SIGKILL);
+                }
+                if let Some(mut group) = self.group.take() {
+                    let _ = group.settle(Duration::ZERO);
+                    let _ = group.reap();
+                }
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+        let mut cleanup = Cleanup {
+            group: Some(OwnedProcessGroup::spawn(&mut command).unwrap()),
+            escaped: None,
+            reader: None,
+        };
+        let group = cleanup.group.as_mut().unwrap();
+        let mut input = group.child.stdin.take().unwrap();
+        let output = group.take_stdout().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        cleanup.reader = Some(std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        }));
+        let next = || {
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fixture response")
+                .unwrap()
+        };
+        let group = cleanup.group.as_ref().unwrap();
+        let mut tree = OwnedProcessTree::capture(group).unwrap();
+        writeln!(input, "escape").unwrap();
+        let escaped_pid: u32 = next().parse().unwrap();
+        let birth = process_birth_identity(escaped_pid).unwrap().unwrap();
+        cleanup.escaped = Some(
+            CapturedProcess::capture(escaped_pid, &birth)
+                .unwrap()
+                .unwrap(),
+        );
+        tree.refresh().unwrap();
+        assert!(tree.members.contains_key(&escaped_pid));
+        for _ in 0..8 {
+            writeln!(input, "cohort").unwrap();
+            let pid = next().parse().unwrap();
+            let birth = process_birth_identity(pid).unwrap().unwrap();
+            let cohort = CapturedProcess::capture(pid, &birth).unwrap().unwrap();
+            tree.refresh().unwrap();
+            assert!(tree.members.contains_key(&pid));
+            writeln!(input, "exit").unwrap();
+            assert_eq!(next(), "released");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cohort.exited().unwrap() {
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            tree.refresh().unwrap();
+            assert!(!tree.members.contains_key(&pid));
+            assert!(tree.members.contains_key(&escaped_pid));
+            assert_eq!(tree.members.len(), 1);
+            writeln!(input, "reap").unwrap();
+            assert_eq!(next(), "reaped");
+        }
+        writeln!(input, "leave").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !group.exited().unwrap() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        tree.refresh().unwrap();
+        assert!(tree.members.contains_key(&escaped_pid));
+        tree.settle(Duration::ZERO).unwrap();
+        tree.refresh().unwrap();
+        assert!(!tree.members.contains_key(&escaped_pid));
+        drop(tree);
+        cleanup
+            .group
+            .as_mut()
+            .unwrap()
+            .settle(Duration::ZERO)
+            .unwrap();
+        assert!(cleanup.group.take().unwrap().reap().unwrap().success());
     }
 
     #[cfg(target_os = "macos")]

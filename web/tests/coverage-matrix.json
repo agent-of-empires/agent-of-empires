@@ -5653,7 +5653,7 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
-      "description": "Plugin cards show validation, including a warning-styled dev badge.",
+      "description": "Plugin cards show validation, including a warning-styled dev badge. Failed jobs retain their bounded tail and display the actual full-log path on the Daemon host.",
       "specs": [
         "src/components/settings/__tests__/PluginsSettings.test.tsx",
         "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"

@@ -1,7 +1,25 @@
 //! `aoe plugin`: plugin management (list, info, enable, disable, install,
 
-use anyhow::Result;
+use std::io::{self, IsTerminal, Write};
+
+use crate::acp::client::{HttpClient, HttpError};
+use crate::daemon::{
+    ApplyUpdateBody, InstallPreviewBody, PluginJobAccepted, PluginJobStatus, StartInstallBody,
+};
+use crate::plugin::install::{UiView, UpdatePreview};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Remote plugin inspection is not supported; use the same Daemon's /api/plugins API, or run this command on its host without --daemon-url or AOE_DAEMON_URL")]
+struct RemoteInspectionUnsupported;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Plugin job {id} failed: {error}")]
+struct PluginJobFailed {
+    id: String,
+    error: String,
+}
 
 #[derive(Subcommand)]
 pub enum PluginCommands {
@@ -59,6 +77,11 @@ pub enum PluginCommands {
         /// Plugin id
         id: String,
     },
+    /// Observe an accepted plugin job without submitting another operation
+    Job {
+        /// Job id returned by install, update, or uninstall
+        id: String,
+    },
     /// Print the deterministic source tree hash for a plugin directory, the
     /// value a maintainer pins in the featured index
     Hash {
@@ -75,6 +98,20 @@ pub enum PluginCommands {
 }
 
 pub async fn run(command: PluginCommands) -> Result<()> {
+    if matches!(
+        &command,
+        PluginCommands::List
+            | PluginCommands::Info { .. }
+            | PluginCommands::Logs { .. }
+            | PluginCommands::Outdated
+    ) {
+        anyhow::ensure!(
+            std::env::var_os("AOE_DAEMON_URL")
+                .as_deref()
+                .is_none_or(super::runtime_read::env_url_is_unset),
+            RemoteInspectionUnsupported,
+        );
+    }
     match command {
         PluginCommands::List => run_list(),
         PluginCommands::Info { id } => run_info(&id),
@@ -83,7 +120,11 @@ pub async fn run(command: PluginCommands) -> Result<()> {
         PluginCommands::Disable { id } => run_set_enabled(&id, false).await,
         PluginCommands::Install { source, yes, dev } => run_install(&source, yes, dev).await,
         PluginCommands::Update { id, yes } => run_update(&id, yes).await,
-        PluginCommands::Uninstall { id } => run_uninstall(&id),
+        PluginCommands::Uninstall { id } => run_uninstall(&id).await,
+        PluginCommands::Job { id } => {
+            let endpoint = crate::acp::client::require_daemon().await?;
+            observe_job(&HttpClient::new(endpoint)?, &id).await
+        }
         PluginCommands::Hash { path } => run_hash(&path),
         PluginCommands::Discover { query } => run_discover(query.as_deref()).await,
         PluginCommands::Outdated => run_outdated().await,
@@ -206,51 +247,234 @@ async fn run_set_enabled(id: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn format_report(report: &crate::plugin::install::InstallReport, verb: &str) -> String {
-    let mut out = format!("{verb} {} {}.\n", report.id, report.version);
-    out.push_str(&format!("  validation: {}\n", report.validation.as_str()));
-    out.push_str("  capabilities: ");
-    if report.capabilities.is_empty() {
-        out.push_str("none");
-    } else {
-        out.push_str(&report.capabilities.join(", "));
+fn confirm(question: &str) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!("stdin is not a terminal; re-run with --yes to approve this plugin");
     }
-    if !report.granted {
-        out.push_str(" (not granted, plugin inactive)");
-    } else if !report.capabilities.is_empty() {
-        out.push_str(" (granted)");
-    }
-    out
+    print!("{question} [y/N] ");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let answer = line.trim();
+    Ok(answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
-fn print_report(report: &crate::plugin::install::InstallReport, verb: &str) {
-    println!("{}", format_report(report, verb));
+fn disclose(
+    id: &str,
+    capabilities: &[String],
+    ui: &[UiView],
+    build_steps: &[String],
+    integrations: &[aoe_plugin_api::agent_integration::AgentIntegrationContribution],
+) {
+    println!("Plugin {id}:");
+    for capability in capabilities {
+        println!("  capability: {capability}");
+    }
+    for item in ui {
+        println!("  UI: {} ({})", item.slot, item.id);
+    }
+    for command in build_steps {
+        println!("  build (runs now as your user, unsandboxed): {command}");
+    }
+    for integration in integrations {
+        println!(
+            "  agent command (runs as your user, unsandboxed): {}: {}",
+            integration.tool,
+            integration
+                .command
+                .as_deref()
+                .unwrap_or("No launch command declared"),
+        );
+    }
+    println!("Only install plugins you trust. Workers and build steps are not contained by capability checks or OS sandboxing.");
 }
 
 async fn run_install(source: &str, yes: bool, dev: bool) -> Result<()> {
-    let report = crate::plugin::install::install(source, yes, dev).await?;
-    print_report(&report, "Installed");
-    Ok(())
+    use crate::plugin::source::PluginSource;
+
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let source = match PluginSource::parse(source)? {
+        PluginSource::Local(path) => {
+            anyhow::ensure!(
+                endpoint.unix_path().is_some(),
+                "Local plugin sources and --dev require the local Daemon Unix socket; remote endpoints cannot read Client paths",
+            );
+            std::path::absolute(path)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("plugin source path is not valid UTF-8"))?
+        }
+        PluginSource::Github { .. } => {
+            anyhow::ensure!(!dev, "--dev requires a local plugin directory");
+            source.trim().to_owned()
+        }
+    };
+    let client = HttpClient::new(endpoint)?;
+    let preview = InstallPreviewBody { source, dev };
+    let consent = client.preview_plugin_install(&preview).await?;
+    eprintln!("{}", consent.notice);
+    if consent.unverified {
+        println!("This is unverified, un-audited code, not covered by the featured index.");
+        if !yes && !confirm("Continue?")? {
+            bail!("install cancelled; the unverified source was not approved");
+        }
+    }
+    disclose(
+        &consent.id,
+        &consent.capabilities,
+        &consent.ui,
+        &consent.build_steps,
+        &consent.agent_integrations,
+    );
+    let needs_consent = !consent.capabilities.is_empty()
+        || !consent.ui.is_empty()
+        || !consent.build_steps.is_empty()
+        || !consent.agent_integrations.is_empty();
+    if needs_consent && !yes && !confirm("Grant them and install?")? {
+        bail!("install cancelled; no capabilities were granted");
+    }
+    let accepted = submission(
+        client
+            .install_plugin(&StartInstallBody {
+                source: preview.source,
+                dev,
+                expected_fingerprint: consent.fingerprint,
+            })
+            .await,
+    )?;
+    observe_job(&client, &accepted.job_id).await
 }
 
 async fn run_update(id: &str, yes: bool) -> Result<()> {
-    use crate::plugin::install::LiveRestart;
-    let report = crate::plugin::install::update(id, yes).await?;
-    print_report(&report, "Updated");
-    match crate::plugin::install::restart_worker_live(id).await {
-        LiveRestart::Daemon => println!("  the running daemon reloaded the plugin."),
-        LiveRestart::NoDaemon => {}
-        LiveRestart::DaemonStale { reason } => println!(
-            "  warning: a daemon is running but did not reload the plugin ({reason}); its worker keeps the previous build until the daemon restarts."
-        ),
-    }
-    Ok(())
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let preview = match client.preview_plugin_update(id).await {
+        Ok(preview) => preview,
+        Err(error @ HttpError::Daemon(crate::daemon::DaemonClientError::AuthenticatedDecode)) => {
+            return Err(error).context(
+                "Plugin preview response is incompatible or malformed; no update was submitted. Check the Client and Daemon versions, then upgrade and restart the Daemon on its host with `aoe serve --restart`, or restart its foreground process or service manager",
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let fingerprint = match preview {
+        UpdatePreview::NoUpdate {
+            fingerprint,
+            notice,
+        }
+        | UpdatePreview::SafeUpdate {
+            fingerprint,
+            notice,
+            ..
+        } => {
+            eprintln!("{notice}");
+            fingerprint
+        }
+        UpdatePreview::ConsentRequired {
+            consent, notice, ..
+        } => {
+            eprintln!("{notice}");
+            println!(
+                "Update {id}: {} -> {}",
+                consent.from_version, consent.to_version
+            );
+            if let Some(change) = &consent.runtime_change {
+                println!("  runtime: {change}");
+            }
+            if consent.trust_downgrade {
+                println!("  warning: this update is no longer featured");
+            }
+            disclose(
+                id,
+                &consent.new_capabilities,
+                &consent.ui,
+                &consent.build_steps,
+                &consent.agent_integrations,
+            );
+            if !yes && !confirm("Approve this update?")? {
+                bail!("update cancelled; the installed version is unchanged");
+            }
+            consent.fingerprint
+        }
+    };
+    let accepted = submission(
+        client
+            .update_plugin(
+                id,
+                &ApplyUpdateBody {
+                    expected_fingerprint: Some(fingerprint),
+                },
+            )
+            .await,
+    )?;
+    observe_job(&client, &accepted.job_id).await
 }
 
-fn run_uninstall(id: &str) -> Result<()> {
-    crate::plugin::install::uninstall(id)?;
-    println!("Uninstalled {id}.");
-    Ok(())
+async fn run_uninstall(id: &str) -> Result<()> {
+    let endpoint = crate::acp::client::require_daemon().await?;
+    let client = HttpClient::new(endpoint)?;
+    let accepted = submission(client.uninstall_plugin(id).await)?;
+    observe_job(&client, &accepted.job_id).await
+}
+
+fn submission(
+    result: std::result::Result<PluginJobAccepted, HttpError>,
+) -> Result<PluginJobAccepted> {
+    match result {
+        Ok(accepted) => Ok(accepted),
+        Err(error) if matches!(&error,
+            HttpError::Unauthorized | HttpError::ReadOnly | HttpError::LocalPluginSourceRequired
+                | HttpError::PluginJobActive
+                | HttpError::PluginAlreadyInstalled
+                | HttpError::Daemon(crate::daemon::DaemonClientError::InvalidPathSegment)
+        ) || matches!(&error, HttpError::Server { status, .. }
+            if status.is_client_error() && *status != reqwest::StatusCode::REQUEST_TIMEOUT) => Err(error.into()),
+        Err(error) => Err(error).context(
+            "Plugin operation outcome unknown; no operation was resubmitted. Inspect GET /api/plugins on the same Daemon before deciding whether to retry",
+        ),
+    }
+}
+
+async fn observe_job(client: &HttpClient, id: &str) -> Result<()> {
+    eprintln!("Plugin job {id}; resume observation with `aoe plugin job {id}` on the same Daemon endpoint");
+    let observe = async {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            poll.tick().await;
+            let response = client.plugin_job(id).await.with_context(|| format!(
+                "Plugin job {id} outcome unknown; run `aoe plugin job {id}` on the same Daemon. No operation was resubmitted",
+            ))?;
+            match response.job.status {
+                PluginJobStatus::Running => {}
+                PluginJobStatus::Succeeded => {
+                    if !response.log.tail.is_empty() {
+                        println!("{}", response.log.tail);
+                    }
+                    println!("Plugin job {id} succeeded.");
+                    return Ok(());
+                }
+                PluginJobStatus::Failed { error } => {
+                    if !response.log.tail.is_empty() {
+                        eprintln!("{}", response.log.tail);
+                    }
+                    if !response.log.path.is_empty() {
+                        eprintln!("Full log on Daemon host: {}", response.log.path);
+                    }
+                    return Err(PluginJobFailed {
+                        id: id.to_owned(),
+                        error,
+                    }
+                    .into());
+                }
+            }
+        }
+    };
+    tokio::select! {
+        result = observe => result,
+        _ = tokio::signal::ctrl_c() => bail!("Observation stopped; job {id} outcome unknown. Run `aoe plugin job {id}` on the same Daemon; no operation was resubmitted"),
+        _ = tokio::time::sleep(std::time::Duration::from_secs(30 * 60)) => bail!("Observation timed out; job {id} outcome unknown. Run `aoe plugin job {id}` on the same Daemon; no operation was resubmitted"),
+    }
 }
 
 async fn run_discover(query: Option<&str>) -> Result<()> {
@@ -300,44 +524,383 @@ async fn run_outdated() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_report;
-    use crate::plugin::install::InstallReport;
-    use crate::plugin::registry::ValidationState;
+    use super::*;
+    use axum::{
+        http::StatusCode,
+        routing::{get, post},
+        Json, Router,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
-    #[test]
-    fn format_report_surfaces_validation_and_grant_state() {
-        let report =
-            |version: &str, capabilities: Vec<String>, granted, validation| InstallReport {
-                id: "acme.foo".into(),
-                version: version.into(),
-                capabilities,
-                granted,
-                validation,
-            };
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_update_repairs_files_and_rejects_a_source_changed_after_preview() {
+        use crate::git::test_support::run_git;
+        use crate::session::test_support::EnvGuard;
+        use futures_util::FutureExt;
 
-        let granted = report(
-            "1.2.3",
-            vec!["session.read".into(), "filesystem.read".into()],
-            true,
-            ValidationState::Community,
-        );
-        assert_eq!(
-            format_report(&granted, "Installed"),
-            "Installed acme.foo 1.2.3.\n  validation: community\n  capabilities: session.read, filesystem.read (granted)"
-        );
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let repositories = tempfile::tempdir().unwrap();
+        let repository = repositories.path().join("acme/repair.git");
+        std::fs::create_dir_all(&repository).unwrap();
+        run_git(&repository, &["init", "-q", "--initial-branch=main"]);
+        std::fs::write(
+            repository.join("aoe-plugin.toml"),
+            "id = \"acme.repair\"\nname = \"Repair\"\nversion = \"1.0.0\"\napi_version = 2\n",
+        )
+        .unwrap();
+        std::fs::write(repository.join("worker.js"), b"approved worker bytes").unwrap();
+        run_git(&repository, &["add", "."]);
+        run_git(&repository, &["commit", "-qm", "fixture"]);
 
-        let local = report("0.1.0", vec![], true, ValidationState::Local);
-        let out = format_report(&local, "Installed");
-        assert!(
-            out.contains("\n  validation: local\n"),
-            "a local install surfaces its validation: {out:?}"
+        let state = crate::server::test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vec!["127.0.0.1".into()],
+            Vec::new(),
+            None,
         );
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let mutations = submissions.clone();
+        let upstream = repository.clone();
+        let router = crate::server::test_support::build_router_for_test(state.clone()).layer(
+            axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let submissions = mutations.clone();
+                    let upstream = upstream.clone();
+                    async move {
+                        if request.method() == axum::http::Method::POST
+                            && request.uri().path() == "/api/plugins/acme.repair/update/apply"
+                            && submissions.fetch_add(1, Ordering::SeqCst) == 1
+                        {
+                            std::fs::write(upstream.join("worker.js"), b"changed upstream bytes")
+                                .unwrap();
+                            run_git(&upstream, &["add", "."]);
+                            run_git(&upstream, &["commit", "-qm", "changed after preview"]);
+                        }
+                        next.run(request).await
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let _endpoint = EnvGuard::set(&[
+            ("AOE_DAEMON_URL", base.as_str()),
+            ("AOE_DAEMON_TOKEN", ""),
+            ("AOE_DAEMON_PASSPHRASE", ""),
+            ("AOE_UPDATE_API_BASE", &format!("{base}/metadata")),
+            (
+                "AOE_GITHUB_CLONE_BASE",
+                repositories.path().to_str().unwrap(),
+            ),
+        ]);
+        let outcome = std::panic::AssertUnwindSafe(async {
+            let source = "gh:acme/repair@main";
+            crate::plugin::install::install(source, true, false)
+                .await
+                .unwrap();
+            crate::plugin::install::set_enabled("acme.repair", false).unwrap();
+            assert!(matches!(
+                crate::plugin::install::preview_update("acme.repair", false)
+                    .await
+                    .unwrap(),
+                UpdatePreview::NoUpdate { .. }
+            ));
+            let installed = crate::plugin::plugins_dir()
+                .unwrap()
+                .join("acme.repair/worker.js");
+            std::fs::remove_file(&installed).unwrap();
+            run_update("acme.repair", true).await.unwrap();
+            assert_eq!(std::fs::read(&installed).unwrap(), b"approved worker bytes");
+            assert_eq!(submissions.load(Ordering::SeqCst), 1);
+            let config = crate::session::Config::load().unwrap();
+            let entry = &config.plugins["acme.repair"];
+            assert!(!entry.enabled);
+            assert!(!entry.dev);
+            assert_eq!(entry.source.as_deref(), Some(source));
+            let before_entry = serde_json::to_value(entry).unwrap();
+            let lock_path = crate::session::get_app_dir().unwrap().join("plugins.lock");
+            let before_lock = std::fs::read(&lock_path).unwrap();
 
-        let inactive = report("0.1.0", vec![], false, ValidationState::Community);
-        let out = format_report(&inactive, "Updated");
-        assert!(
-            out.ends_with("  capabilities: none (not granted, plugin inactive)"),
-            "inactivity is surfaced with no capabilities: {out:?}"
-        );
+            std::fs::remove_file(&installed).unwrap();
+            let error = run_update("acme.repair", true).await.unwrap_err();
+            let failed = error
+                .downcast_ref::<PluginJobFailed>()
+                .expect("the CLI must observe a terminal job failure");
+            let client =
+                HttpClient::new(crate::acp::client::require_daemon().await.unwrap()).unwrap();
+            assert!(matches!(
+                client.plugin_job(&failed.id).await.unwrap().job.status,
+                PluginJobStatus::Failed { .. }
+            ));
+            assert_eq!(submissions.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                std::fs::read(repository.join("worker.js")).unwrap(),
+                b"changed upstream bytes"
+            );
+            assert!(!installed.exists());
+            assert_eq!(
+                serde_json::to_value(
+                    &crate::session::Config::load().unwrap().plugins["acme.repair"]
+                )
+                .unwrap(),
+                before_entry
+            );
+            assert_eq!(std::fs::read(lock_path).unwrap(), before_lock);
+        })
+        .catch_unwind()
+        .await;
+        state.runtime.work.drain().await;
+        server.abort();
+        let _ = server.await;
+        if let Err(payload) = outcome {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn uncertain_plugin_operations_are_not_resubmitted() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for lost_reply in [true, false] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mutations = calls.clone();
+            let router = Router::new()
+                .route(
+                    "/api/sessions",
+                    get(|| async { Json(serde_json::json!([])) }),
+                )
+                .route(
+                    "/api/plugins/acme.fixture/uninstall",
+                    post(move || {
+                        let calls = mutations.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            if lost_reply {
+                                (StatusCode::ACCEPTED, "{")
+                            } else {
+                                (StatusCode::ACCEPTED, "{\"job_id\":\"accepted-fixture\"}")
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/api/plugins/jobs/accepted-fixture",
+                    get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let serve = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let _env = crate::session::test_support::EnvGuard::set(&[
+                ("AOE_DAEMON_URL", format!("http://{address}")),
+                ("AOE_DAEMON_TOKEN", String::new()),
+                ("AOE_DAEMON_PASSPHRASE", String::new()),
+            ]);
+            let error = run_uninstall("acme.fixture").await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("outcome unknown"),
+                "{error:#}"
+            );
+            if !lost_reply {
+                assert!(error
+                    .to_string()
+                    .contains("aoe plugin job accepted-fixture"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            serve.abort();
+            let _ = serve.await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn older_job_logs_preserve_running_and_terminal_outcomes() {
+        let _home = crate::session::test_support::isolate_app_dir();
+        for failed in [false, true] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = polls.clone();
+            let router = Router::new()
+                .route("/api/sessions", get(|| async { Json(serde_json::json!([])) }))
+                .route("/api/plugins/jobs/legacy-job", get(move || {
+                    let polls = observed.clone();
+                    async move {
+                        let running = polls.fetch_add(1, Ordering::SeqCst) == 0;
+                        let status = if running {
+                            serde_json::json!({"state":"running"})
+                        } else if failed {
+                            serde_json::json!({"state":"failed","error":"legacy-build-failure"})
+                        } else {
+                            serde_json::json!({"state":"succeeded"})
+                        };
+                        Json(serde_json::json!({
+                            "job": {
+                                "id":"legacy-job", "kind":"update", "target":"acme.legacy",
+                                "status":status, "started_at":1, "finished_at":if running {None} else {Some(2)},
+                            },
+                            "log": {
+                                "exists":true, "tail":"legacy-build-output",
+                                "lines_returned":1, "truncated":false,
+                            },
+                        }))
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let _endpoint = crate::session::test_support::EnvGuard::set(&[
+                ("AOE_DAEMON_URL", format!("http://{address}")),
+                ("AOE_DAEMON_TOKEN", String::new()),
+                ("AOE_DAEMON_PASSPHRASE", String::new()),
+            ]);
+            let endpoint = crate::acp::client::require_daemon().await.unwrap();
+            let client = HttpClient::new(endpoint).unwrap();
+            let result = observe_job(&client, "legacy-job").await;
+            server.abort();
+            let _ = server.await;
+            if failed {
+                let error = format!("{:#}", result.unwrap_err());
+                assert!(error.contains("legacy-build-failure"), "{error}");
+                assert!(!error.contains("outcome unknown"), "{error}");
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn inspection_and_preview_keep_endpoint_and_approval_boundaries() {
+        use crate::session::test_support::EnvGuard;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _home = crate::session::test_support::isolate_app_dir();
+        let _credentials = EnvGuard::unset(&[
+            "AOE_DAEMON_URL",
+            "AOE_DAEMON_TOKEN",
+            "AOE_DAEMON_PASSPHRASE",
+        ]);
+        crate::plugin::reload_registry();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("file"), b"local source").unwrap();
+        for value in [
+            std::ffi::OsString::from("http://127.0.0.1:1"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ] {
+            let _endpoint = EnvGuard::set(&[("AOE_DAEMON_URL", &value)]);
+            for command in [
+                PluginCommands::List,
+                PluginCommands::Info {
+                    id: "acme.local".into(),
+                },
+                PluginCommands::Logs {
+                    id: "acme.local".into(),
+                },
+                PluginCommands::Outdated,
+            ] {
+                let error = run(command).await.unwrap_err();
+                assert!(error
+                    .downcast_ref::<RemoteInspectionUnsupported>()
+                    .is_some());
+            }
+            run(PluginCommands::Hash {
+                path: source.path().to_str().unwrap().into(),
+            })
+            .await
+            .unwrap();
+        }
+        for value in ["", " \t "] {
+            let _endpoint = EnvGuard::set(&[("AOE_DAEMON_URL", value)]);
+            run(PluginCommands::List).await.unwrap();
+        }
+
+        let changelog = serde_json::json!({
+            "entries": [], "truncated": false,
+            "unavailable_reason": null, "more_url": null,
+        });
+        for preview in [
+            serde_json::json!({
+                "kind": "safe_update", "to_version": "2.0.0",
+                "fingerprint": "fixture", "changelog": changelog,
+            }),
+            serde_json::json!({
+                "kind": "consent_required", "dismissed": false,
+                "consent": {
+                    "id": "acme.old", "from_version": "1.0.0", "to_version": "2.0.0",
+                    "prior_capabilities": [], "new_capabilities": ["net"],
+                    "added_capabilities": ["net"], "removed_capabilities": [],
+                    "ui": [], "build_steps": [], "agent_integrations": [],
+                    "runtime_change": null, "trust_downgrade": false,
+                    "fingerprint": "fixture", "stays_active_if_declined": true,
+                    "changelog": changelog,
+                },
+            }),
+        ] {
+            let applies = Arc::new(AtomicUsize::new(0));
+            let mutations = applies.clone();
+            let preview = Arc::new(preview);
+            let router = Router::new()
+                .route(
+                    "/api/sessions",
+                    get(|| async { Json(serde_json::json!([])) }),
+                )
+                .route(
+                    "/api/plugins/acme.old/update/preview",
+                    get(move || {
+                        let preview = preview.clone();
+                        async move { Json(preview) }
+                    }),
+                )
+                .route(
+                    "/api/plugins/acme.old/update/apply",
+                    post(move || {
+                        let mutations = mutations.clone();
+                        async move {
+                            mutations.fetch_add(1, Ordering::SeqCst);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let _endpoint = EnvGuard::set(&[("AOE_DAEMON_URL", format!("http://{address}"))]);
+            let result = run_update("acme.old", true).await;
+            server.abort();
+            let _ = server.await;
+            let error = result.unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<HttpError>(),
+                Some(HttpError::Daemon(
+                    crate::daemon::DaemonClientError::AuthenticatedDecode
+                ))
+            ));
+            assert_eq!(applies.load(Ordering::SeqCst), 0);
+        }
+
+        let refusal = submission(Err(HttpError::PluginAlreadyInstalled))
+            .err()
+            .unwrap();
+        assert!(matches!(
+            refusal.chain().next().unwrap().downcast_ref::<HttpError>(),
+            Some(HttpError::PluginAlreadyInstalled)
+        ));
+        let unknown = submission(Err(HttpError::PluginPreviewFailed))
+            .err()
+            .unwrap();
+        assert!(unknown
+            .chain()
+            .next()
+            .unwrap()
+            .downcast_ref::<HttpError>()
+            .is_none());
     }
 }

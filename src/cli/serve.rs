@@ -4043,8 +4043,14 @@ mod tests {
         #[tokio::test]
         #[serial]
         async fn remote_exposure_is_refused_only_while_a_dev_plugin_is_active() {
-            let _guard = crate::session::test_support::isolate_app_dir();
             let _reload = crate::plugin::ReloadRegistryOnDrop;
+            let _guard = crate::session::test_support::isolate_app_dir();
+            std::fs::create_dir_all(
+                crate::session::get_app_dir()
+                    .unwrap()
+                    .join("profiles/default"),
+            )
+            .unwrap();
             let remote = serve_args(&["aoe", "serve", "--remote", "--passphrase", "pw"]);
             let local = serve_args(&["aoe", "serve"]);
 

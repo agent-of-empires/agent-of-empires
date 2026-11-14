@@ -951,14 +951,22 @@ impl AnchoredDir {
         let mut current = openat(
             &self.fd,
             ".",
-            OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+            OFlag::O_DIRECTORY
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK,
             Mode::empty(),
         )?;
         for component in normal_components(relative)? {
             current = openat(
                 &current,
                 component.as_os_str(),
-                OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_RDONLY,
+                OFlag::O_DIRECTORY
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC
+                    | OFlag::O_RDONLY
+                    | OFlag::O_NONBLOCK,
                 Mode::empty(),
             )
             .context("opening anchored directory component")?;

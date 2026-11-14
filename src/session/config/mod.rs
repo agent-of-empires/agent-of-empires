@@ -163,10 +163,8 @@ pub struct StatusRule {
     pub regex: Option<String>,
 }
 
-/// Configuration for one plugin: whether it is enabled, its install source and
-/// capability grant (external plugins only), plus its schema-free persisted
-/// settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Persisted plugin intent, external installation identity, and schema-free settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
     /// any surface.
@@ -206,12 +204,8 @@ pub struct PluginConfig {
     pub dev: bool,
 }
 
-/// A user's approval of an external plugin's requested capabilities, pinned to
-/// the exact manifest it was approved against. When the installed manifest hash
-/// later differs (an update that changed the capability set), the grant no
-/// longer applies and the plugin's runtime contributions stay inactive until
-/// re-approved.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Approved capabilities pinned to an exact external manifest hash.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityGrant {
     /// `sha256:<hex>` of the manifest bytes this grant was approved against.
     pub manifest_hash: String,

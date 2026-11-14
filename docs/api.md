@@ -224,6 +224,46 @@ rejects symlinks, special files, packages over 64 MiB, individual files over
 
 Native clients classify errors from the status and one `AoE-Error-Code` response header, never from the body. A missing, repeated, unknown or status-inconsistent value means "generic status". Plain HTTP from a non-loopback peer gets `426 tls_required` before authentication unless the bind sets `--dangerously-allow-plaintext-remote`.
 
+## Plugin lifecycle
+
+Install uses `POST /api/plugins/install/preview` with `source` and optional
+`dev` (default `false`), then `POST /api/plugins/install` with those fields
+and `expected_fingerprint` set to the preview's `fingerprint`. Update uses
+`GET /api/plugins/{id}/update/preview` and
+`POST /api/plugins/{id}/update/apply` with `expected_fingerprint`.
+Update previews include a source `notice` and a fingerprint, including
+`no_update`. Explicit CLI updates reapply that pinned source to repair missing
+files; other consumers can keep treating `no_update` as no available version.
+The CLI and both TUI review branches show the notice before applying.
+Uninstall uses `POST /api/plugins/{id}/uninstall`.
+Apply returns `202` with `job_id`; observe it through
+`GET /api/plugins/jobs/{job_id}`. A second active lifecycle job returns `409`.
+The response's existing `log` object contains `path` (the actual Daemon-host
+filename), `exists`, `tail`, `lines_returned` and `truncated`. A bounded tail may
+omit the original diagnostic; recover the full file on that host using `path`.
+Older Daemons may omit the diagnostic `path`; native clients still observe
+the job's status and tail without displaying an empty locator. Consent
+disclosures and fingerprints remain required, including update source notices.
+Generic preview failures return `502` with `AoE-Error-Code: preview_failed`.
+An already-installed install preview returns `409` with
+`AoE-Error-Code: plugin_already_installed`; conflicting Daemon jobs return `409`
+with `AoE-Error-Code: plugin_job_active`. Native clients show fixed recovery
+guidance from these codes without reflecting response bodies.
+The Daemon warns with the redacted chained preview cause under `plugin.install`;
+an expected already-installed refusal is logged at debug instead.
+Native install/update preview transport deadlines are two hours plus ten minutes;
+mutation submission, job polling and general send deadlines are unchanged.
+
+Lifecycle changes share cross-process exclusion with local TUI operations and
+startup sweeps. If another process owns that exclusion, an accepted job fails
+before fetching or applying its candidate; it is not queued or retried.
+
+Only a verified local Unix peer may use absolute local directories or `dev`,
+including updates whose recorded source is local. Other principals receive
+`403` with `AoE-Error-Code: local_plugin_source_required`, even over loopback TCP.
+Preview and apply retain read-only and CityHall restrictions; apply also requires
+elevation. See [plugin consent and job recovery](plugins.md#installing-external-plugins).
+
 ## Runtime CLI reads
 
 The covered CLI reads (`list`, `status`, `session show`, `session list-trash`, `group list`, `profile list` or bare `profile`, and `project list`) require a Daemon answer. They use `/api/runtime/read/ws`, over the Daemon's local Unix socket by default and over HTTP when `--daemon-url` or `AOE_DAEMON_URL` selects an endpoint. `/api/runtime/ws` remains the separate TUI stream.
