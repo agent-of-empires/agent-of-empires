@@ -1,5 +1,6 @@
 [workspace]
 members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
+exclude = ["vendor/crossterm"]
 
 [package]
 name = "agent-of-empires"
@@ -300,3 +301,6 @@ required-features = ["e2e-tests"]
 [[bin]]
 name = "aoe"
 path = "src/main.rs"
+
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

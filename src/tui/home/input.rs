@@ -1005,6 +1005,9 @@ impl HomeView {
     /// events are captured for wheel scroll, and one mechanism has to work on Mosh and
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if self.hit_divider(col, row) {
             self.drag_state = Some(if self.divider_row.is_some() {
                 DragKind::StackedListDivider
@@ -1045,6 +1048,9 @@ impl HomeView {
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
@@ -1138,6 +1144,9 @@ impl HomeView {
     /// ticker rather than by mouse events, so holding the cursor at an edge scrolls
     /// continuously and grows the selection past a page. Returns whether anything moved.
     pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
             return false;
         }
@@ -1260,6 +1269,9 @@ impl HomeView {
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
     pub fn handle_drag_end(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         let Some(state) = self.drag_state.take() else {
             return false;
         };
@@ -1380,7 +1392,24 @@ impl HomeView {
     /// Drain the text captured on the last render that painted a finalized preview
     /// selection. `Some` exactly once per finalized drag; `App` calls it after the draw.
     pub fn take_preview_copy_text(&mut self) -> Option<String> {
+        if !self.presentation_ready {
+            return None;
+        }
         self.preview_copy_text.take()
+    }
+
+    pub(in crate::tui) fn invalidate_presentation(&mut self) {
+        self.presentation_ready = false;
+        self.presented_confirmation = None;
+        if let Some(view) = self.structured_preview.as_mut() {
+            view.invalidate_presentation();
+        }
+        self.clear_preview_selection();
+        self.drag_state = None;
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
+        self.preview_copy_pending = false;
+        self.preview_copy_text = None;
     }
 
     /// Discard any in-flight preview selection, so interacting with the TUI dismisses the
@@ -1671,6 +1700,7 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        let presented_confirmation = self.begin_confirmation_input();
         if self.reconcile_delete_confirmation() {
             return true;
         }
@@ -1716,6 +1746,13 @@ impl HomeView {
             if let Some(result) = dialog.dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation.is_some_and(|token| {
+                            token.dialog == dialog.dialog.presentation_id()
+                        }) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
@@ -1863,6 +1900,12 @@ impl HomeView {
                 let action = dialog.action().to_string();
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_indeterminate_resolution = None;
@@ -2005,6 +2048,12 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.group_delete_options_dialog = None;
                     }
@@ -2239,6 +2288,7 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        let presented_confirmation = self.begin_confirmation_input();
         // A key is a context change: a pending native attachment was prepared
         // for the session, profile, view and terminal mode in force when it was
         // requested, so reconcile before the keystroke acts on any of them.
@@ -2332,6 +2382,12 @@ impl HomeView {
             if let Some(dialog) = &mut self.confirm_dialog {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => return None,
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return None;
+                    }
                     DialogResult::Cancel => {
                         // User chose not to discard, go back to settings
                         self.confirm_dialog = None;
@@ -2690,6 +2746,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_indeterminate_resolution = None;
@@ -2720,6 +2782,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.unified_delete_dialog {
             match dialog.dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
@@ -2739,6 +2807,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.group_delete_options_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.group_delete_options_dialog = None;
                 }

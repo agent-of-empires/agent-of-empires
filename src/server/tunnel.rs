@@ -1466,6 +1466,7 @@ pub fn check_cloudflared(cancel: &tokio_util::sync::CancellationToken) -> anyhow
             .stderr(std::process::Stdio::null()),
         PROBE_TIMEOUT,
         Some(cancel),
+        crate::process::ProcessGroupCleanup::Always,
     ) {
         Ok(Some(status)) if status.success() => Ok(()),
         _ => anyhow::bail!(
@@ -1519,6 +1520,7 @@ fn probe_succeeds(
             .stderr(std::process::Stdio::null()),
         timeout,
         Some(cancel),
+        crate::process::ProcessGroupCleanup::Always,
     );
     match status {
         Ok(Some(status)) if status.success() => Some(true),
@@ -1574,6 +1576,7 @@ fn tailscale_funnel_cap_sync_with(
                 .stderr(std::process::Stdio::null()),
             timeout,
             Some(cancel),
+            crate::process::ProcessGroupCleanup::Always,
         )?
         else {
             return Ok(None);

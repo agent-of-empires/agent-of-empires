@@ -126,6 +126,77 @@ Raw event frames still stream for what the daemon does not model (worker lifecyc
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
+## Clipboard and terminal ownership
+
+One application-owned clipboard executor assigns monotonic tickets before copy
+preparation. Only the newest pending request survives; stale preparation cannot
+submit later. Feedback distinguishes queue admission from completed output.
+Serve's background copy job owns its exact ticket receiver and displays that
+transport result; finishing clipboard admission alone never means "copied".
+Helpers receive read-only stdin, run in their own process group, and are reaped
+on cancellation or failure. Successful native clipboard owners may remain.
+OSC 52 skips payloads larger than 1 MiB (1,048,576 raw bytes), without disabling
+desktop helpers for those copies. Smaller copies retain direct and tmux framing.
+
+App, standalone ACP attach, and remote home share one terminal-output coordinator
+for setup, drawing, titles, clipboard OSC, and teardown. Its OS layer independently
+opens and verifies the TTY; duplicating stdout would share `O_NONBLOCK` flags.
+Writes and writable-readiness waits share a deadline. Linux uses `poll`; Darwin
+uses `pselect` for its controlling-terminal alias. Unsupported output never falls
+back to an unbounded stdout writer.
+
+Only one moved frame may remain pending. Its unsent suffix finishes before later
+frames, OSC, titles, or child handoff. Mouse mode and pointer geometry become
+usable only after the matching frame receipt. Interactive approval, elicitation,
+and subagent-stop targets also carry a view-unique revision; an old receipt cannot
+authorize a replacement target. Draft editing and whole-turn cancellation remain available.
+Interrupted output retains framing recovery (CAN, ST, tmux CAN, then style reset)
+before later terminal bytes. Terminal interpretation remains device-dependent.
+
+Home confirmations bind consent to a unique dialog owner and its input revision.
+Trash, permanent-delete and group-delete submission requires the matching emitted
+frame; opening or replacing a dialog and changing its options cannot reuse an old
+receipt. Only the foreground confirmation actually painted by that frame receives
+authority; a covering notice does not authorize a hidden prompt. Cancellation and
+option navigation remain available while output is pending.
+
+Handoff admission finishes leave-screen controls before disabling raw input,
+dropping the event stream, probing an editor, or preparing and starting a child.
+Backpressure safely refuses the operation with retry feedback. After an admitted
+child returns, raw mode and the event stream recover before display restoration.
+Pending controls retain their order; restoring output never reruns the child.
+
+The initial guard covers failure in `App::new`. After successful construction,
+the guard moves into a binding declared after `app`, intentionally reversing drop
+order. On return, error, and unwind, the guard first cancels clipboard admission
+and work, restores input, drops its terminal wrapper (cursor cleanup), and attempts
+final display controls. Only afterward does `App` drop and join the executor.
+Keep this binding order when changing startup. Standalone ACP attach and remote
+home use the same guard, created immediately after raw mode is enabled and before
+fallible output or terminal construction. Each standalone executor is declared
+before its guard: error and unwind restore input before any clipboard worker join.
+Nested structured views borrow the remote owner's terminal and executor, so
+returning to the picker does not disable raw input. Abort and fatal termination
+do not run Rust destructors.
+
+Private PTY restoration checks compare all four flag groups and control characters
+with a kernel-read baseline while the child holds terminal custody, before release
+and normal reaping.
+
+Lock admission and final display cleanup share a 250 ms deadline. This is bounded
+best-effort emission, not confirmed restoration. Permanently stalled output can
+prevent delivery before exit; unwritten controls disappear with the process.
+There is no detached writer racing the resumed shell. Cooked input restoration
+does not wait for display output. Cleanup failures go to the application log,
+never a synchronous diagnostic on the stalled terminal.
+
+After exit, `stty sane` repairs input but does not reset display modes. On supported
+xterm-compatible terminals,
+`printf '\030\033\\\033[?2026l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1049l\033[0m\033[?25h'`
+cancels incomplete framing and resets common display modes. Terminal-specific
+reset commands may still be required; this guidance does not strengthen shutdown's
+bounded best-effort guarantee.
+
 ## Retained history consistency
 
 Retained page identity combines the event-store incarnation with the session

@@ -243,8 +243,8 @@ impl DiffView {
     /// surface a confirmation in the footer.
     pub(crate) fn copy_selected_path(&mut self) {
         if let Some(path) = self.selected_path_string() {
-            crate::tui::clipboard::copy_to_clipboard(&path);
-            self.success_message = Some(format!("Copied {path}"));
+            let message = crate::tui::clipboard::copy_to_clipboard(&path);
+            self.success_message = Some(format!("{path}: {message}"));
         }
     }
 
