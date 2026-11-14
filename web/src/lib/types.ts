@@ -81,6 +81,8 @@ export interface SessionResponse {
   /** The provider rate limit the daemon has this session parked on. */
   rate_limit?: RateLimitInfo;
   rate_limit_auto_resume?: boolean;
+  /** Account tool name the daemon is about to fail this parked session over to; absent when none. */
+  rate_limit_failover_to?: string;
   smart_rename?: "inactive" | "pending" | "running";
   /** Still carries its auto-generated name (more reliable than `smart_rename`). */
   default_name?: boolean;

@@ -9,6 +9,7 @@ export type SessionAction =
   | "recreateContainer"
   | "fork"
   | "switchAgent"
+  | "switchAccount"
   | "switchView"
   | "autoName"
   | "summarize"
@@ -33,6 +34,8 @@ const ELIGIBLE: Record<SessionAction, (s: SessionResponse, archived: boolean) =>
   recreateContainer: canRecreateContainer,
   fork: (s) => isStructured(s) && !!s.acp_session_id && !!s.acp_can_fork,
   switchAgent: isStructured,
+  // A running failover is already swapping the account, so a manual restart would race it.
+  switchAccount: (s, archived) => isStructured(s) && !archived && !s.trashed_at && !s.rate_limit_failover_to,
   switchView: (s) => isStructured(s) || (!!s.acp_capable && !s.structured_view_off),
   autoName: isStructured,
   summarize: isStructured,
@@ -57,6 +60,7 @@ export function resolveActionTargets(sessions: SessionResponse[], optimistic: Ro
     recreateContainer: targets("recreateContainer"),
     fork: targets("fork"),
     switchAgent: targets("switchAgent"),
+    switchAccount: targets("switchAccount"),
     switchView: targets("switchView"),
     autoName: targets("autoName"),
     summarize: targets("summarize"),
