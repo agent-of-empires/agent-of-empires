@@ -864,13 +864,7 @@ fn funnel_ownership(
             routes += 1;
         }
     }
-    let any_on_port = ["TCP", "Web", "AllowFunnel"].iter().any(|field| {
-        parsed
-            .get(*field)
-            .and_then(|v| v.as_object())
-            .is_some_and(|m| m.keys().any(|k| on_https(k)))
-    });
-    match (routes, any_on_port) {
+    match (routes, config_on_port(&parsed, https_port)) {
         (1, _) => FunnelOwnership::Ours,
         (0, false) => FunnelOwnership::Gone,
         _ => FunnelOwnership::Changed,
@@ -1302,14 +1296,26 @@ fn free_funnel_port(parsed: &serde_json::Value, caps: &[String]) -> Option<u16> 
         .map(|port| port.number())
         .into_iter()
         .filter(|port| funnel_port_refusal(caps, *port).is_none())
-        .find(|port| {
-            !["TCP", "Web", "AllowFunnel"].iter().any(|field| {
-                parsed
-                    .get(*field)
-                    .and_then(|v| v.as_object())
-                    .is_some_and(|m| m.keys().any(|k| on_port(k, *port)))
-            })
-        })
+        .find(|port| !config_on_port(parsed, *port) && !foreground_on_port(parsed, *port))
+}
+
+/// Whether one serve config (the status document, or one foreground session's) has anything on `port`.
+fn config_on_port(config: &serde_json::Value, port: u16) -> bool {
+    ["TCP", "Web", "AllowFunnel"].iter().any(|field| {
+        config
+            .get(*field)
+            .and_then(|v| v.as_object())
+            .is_some_and(|m| m.keys().any(|k| on_port(k, port)))
+    })
+}
+
+/// Whether a foreground `tailscale serve` or `funnel` session holds `port`. Tailscale refuses a
+/// background config on such a port, and the status lists these per session under `Foreground`.
+fn foreground_on_port(parsed: &serde_json::Value, port: u16) -> bool {
+    parsed
+        .get("Foreground")
+        .and_then(|v| v.as_object())
+        .is_some_and(|sessions| sessions.values().any(|cfg| config_on_port(cfg, port)))
 }
 
 fn funnel_preflight_on(
@@ -1318,14 +1324,14 @@ fn funnel_preflight_on(
     https_port: u16,
     is_live: &dyn Fn(&str) -> bool,
 ) -> FunnelPreflight {
+    if foreground_on_port(parsed, https_port) {
+        return FunnelPreflight::Refuse(format!(
+            "port {https_port} is held by a foreground `tailscale serve` or `tailscale funnel` \
+             command, and Tailscale won't start a background Funnel over it. Stop that command, \
+             or pass --no-tailscale to use Cloudflare."
+        ));
+    }
     let on_https = |key: &str| on_port(key, https_port);
-    let keys = |field: &str| {
-        parsed
-            .get(field)
-            .and_then(|v| v.as_object())
-            .into_iter()
-            .flat_map(|m| m.keys())
-    };
     // Walk the Web map looking for a handler on the port whose target isn't something we can
     // safely replace.
     let web = parsed.get("Web").and_then(|w| w.as_object());
@@ -1389,11 +1395,7 @@ fn funnel_preflight_on(
         local_port = local_port,
         "inspect_existing_funnel: no conflicting handler on the Funnel port"
     );
-    if !keys("TCP")
-        .chain(keys("Web"))
-        .chain(keys("AllowFunnel"))
-        .any(|k| on_https(k))
-    {
+    if !config_on_port(parsed, https_port) {
         return FunnelPreflight::Unused;
     }
     let public = parsed
@@ -1875,6 +1877,15 @@ mod tests {
             (
                 serde_json::json!({"Web": web("http://10.0.0.5:80"), "AllowFunnel": public}),
                 "different backend (proxy / -> http://10.0.0.5:80)",
+            ),
+            // Tailscale refuses `--bg` on a port a foreground session holds.
+            (
+                serde_json::json!({"Foreground": {"sess-1": {"TCP": {"443": {"HTTPS": true}}}}}),
+                "held by a foreground",
+            ),
+            (
+                serde_json::json!({"Foreground": {"sess-1": {"TCP": {"8443": {"HTTPS": true}}}}}),
+                "unused",
             ),
         ];
         for (doc, want) in cases {
@@ -2937,8 +2948,8 @@ esac
 
     #[test]
     fn a_refusal_names_a_funnel_port_with_nothing_on_it() {
-        let taken = |ports: &[u16]| {
-            let web: serde_json::Map<_, _> = ports
+        let web = |ports: &[u16]| -> serde_json::Map<_, _> {
+            ports
                 .iter()
                 .map(|p| {
                     (
@@ -2946,22 +2957,37 @@ esac
                         serde_json::json!({"Handlers": {"/": {"Text": "hi"}}}),
                     )
                 })
+                .collect()
+        };
+        // A foreground session's config sits under its IPN bus session id.
+        let taken = |ports: &[u16], foreground: &[u16]| {
+            let tcp: serde_json::Map<_, _> = foreground
+                .iter()
+                .map(|p| (p.to_string(), serde_json::json!({"HTTPS": true})))
                 .collect();
-            serde_json::json!({ "Web": web })
+            serde_json::json!({
+                "Web": web(ports),
+                "Foreground": {"sess-1": {"TCP": tcp, "Web": web(foreground)}},
+            })
         };
         let only = |ports: &str| vec![format!("{FUNNEL_CAP_PREFIX}?ports={ports}")];
-        // (ports with config, the refused port, the tailnet's caps, the port the hint names)
-        for (used, https, caps, hint) in [
-            (&[443][..], 443, all_ports(), Some(8443)),
-            (&[443, 8443], 443, all_ports(), Some(10000)),
-            (&[8443], 8443, all_ports(), Some(443)),
-            (&[443, 8443, 10000], 443, all_ports(), None),
+        // (ports with config, ports a foreground session holds, the refused port, the tailnet's
+        // caps, the port the hint names)
+        for (used, foreground, https, caps, hint) in [
+            (&[443][..], &[][..], 443, all_ports(), Some(8443)),
+            (&[443, 8443], &[], 443, all_ports(), Some(10000)),
+            (&[443], &[8443], 443, all_ports(), Some(10000)),
+            (&[8443], &[], 8443, all_ports(), Some(443)),
+            (&[443, 8443, 10000], &[], 443, all_ports(), None),
+            // Every allowed port is taken, the last one by a foreground session.
+            (&[443, 8443], &[10000], 443, all_ports(), None),
+            (&[443], &[8443], 443, only("443,8443"), None),
             // A free port the tailnet doesn't allow is never named.
-            (&[443], 443, only("443"), None),
-            (&[443], 443, only("443,10000"), Some(10000)),
+            (&[443], &[], 443, only("443"), None),
+            (&[443], &[], 443, only("443,10000"), Some(10000)),
         ] {
             let FunnelPreflight::Refuse(why) =
-                funnel_preflight(&taken(used), 8081, https, &caps, &|_| false)
+                funnel_preflight(&taken(used, foreground), 8081, https, &caps, &|_| false)
             else {
                 panic!("{used:?} {caps:?}: a text handler is refused");
             };
