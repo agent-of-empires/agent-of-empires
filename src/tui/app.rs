@@ -3935,6 +3935,12 @@ mod tests {
         assert!(app.should_quit);
         app.should_quit = false;
         app.home.pending_creation = Some(crate::tui::home::PendingCreation {
+            request: crate::tui::home::CreationRequest {
+                data: Default::default(),
+                trust_hooks: None,
+                trust_review: None,
+                skip_on_create: false,
+            },
             daemon_id: None,
             request_key: "other-creation".into(),
             origin_epoch: "test".into(),

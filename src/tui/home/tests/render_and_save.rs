@@ -1176,3 +1176,110 @@ fn test_session_context_menu_new_session_prefills_from_session() {
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
 }
+
+/// A session created without its on_create setup says so on its row, and the badge is counted
+/// in the row's width, so a long title is truncated rather than pushing it off the edge.
+#[test]
+#[serial]
+fn a_session_created_without_setup_shows_its_badge() {
+    let (_temp, _guard) = test_home();
+    let mut tagged = Instance::new("a-title-long-enough-to-need-truncating", "/tmp/a");
+    tagged.created_without_setup = true;
+    tagged.status = Status::Running;
+    let mut plain = Instance::new("plain", "/tmp/b");
+    plain.status = Status::Running;
+    seed_profile("alpha", &[tagged, plain]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let row_text = |view: &HomeView, title: &str| {
+        let row = view
+            .flat_items
+            .iter()
+            .find(|item| matches!(item, Item::Session { id, .. } if view.get_instance(id).is_some_and(|i| i.title.starts_with(title))))
+            .cloned()
+            .expect("session row");
+        view.render_item_line(
+            &row,
+            false,
+            false,
+            &crate::tui::styles::Theme::default(),
+            35,
+            false,
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+    };
+    let text = row_text(&view, "a-title");
+    assert!(text.trim_end().ends_with(" [no setup]"), "{text:?}");
+    assert!(
+        text.contains('\u{2026}'),
+        "the title yields first: {text:?}"
+    );
+    assert_eq!(
+        crate::tui::components::rendered_width(&text),
+        35,
+        "{text:?}"
+    );
+    assert!(!row_text(&view, "plain").contains("[no setup]"));
+}
+
+/// Pins the shared narrow-row fallback, which `[no setup]` inherits: once the room beside
+/// the badges drops under the minimum title width, the title takes the row and every
+/// trailing badge falls past its edge, this one included. A wider row keeps both badges.
+#[test]
+#[serial]
+fn a_narrow_row_with_two_badges_gives_the_title_the_row() {
+    let (_temp, _guard) = test_home();
+    let mut inst = Instance::new("a-title-long-enough-to-need-truncating", "/tmp/a");
+    inst.created_without_setup = true;
+    inst.view = crate::session::View::Structured;
+    inst.status = Status::Running;
+    seed_profile("alpha", &[inst]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    // (row width, badges visible within it)
+    for (width, visible) in [(30usize, false), (60, true)] {
+        let text: String = view
+            .render_item_line(
+                &row,
+                false,
+                false,
+                &crate::tui::styles::Theme::default(),
+                width as u16,
+                false,
+            )
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let mut used = 0;
+        let shown: String = text
+            .chars()
+            .take_while(|c| {
+                used += crate::tui::components::rendered_width(&c.to_string());
+                used <= width
+            })
+            .collect();
+        assert!(
+            text.contains(" [no setup] [structured]"),
+            "{width}: {text:?}"
+        );
+        for badge in ["[no setup]", "[structured]"] {
+            assert_eq!(
+                shown.contains(badge),
+                visible,
+                "{width}: {badge} in {shown:?}"
+            );
+        }
+    }
+}

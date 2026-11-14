@@ -2,6 +2,7 @@
 //! cancel or a quit has to do.
 
 use super::*;
+use crate::tui::dialogs::{CreateHookFailedAction, DialogResult};
 
 impl HomeView {
     /// Request session creation from the daemon. The stub is a display-only
@@ -9,13 +10,30 @@ impl HomeView {
     /// which then lands through the canonical feed.
     pub fn request_creation(
         &mut self,
-        mut data: NewSessionData,
+        data: NewSessionData,
         trust_hooks: Option<bool>,
         trust_review: Option<crate::daemon::CreationTrustFingerprint>,
+        skip_on_create: bool,
     ) {
+        // The form shows its own refusal; only the recovery dialog keeps the request.
+        let _ = self.submit_creation(CreationRequest {
+            data,
+            trust_hooks,
+            trust_review,
+            skip_on_create,
+        });
+    }
+
+    /// Sends `request` under a new stub, whose id is also the idempotency key, so a resubmit
+    /// after a refusal is never answered with the refused attempt's replay.
+    pub(super) fn submit_creation(
+        &mut self,
+        mut request: CreationRequest,
+    ) -> Result<(), Box<CreationRequest>> {
+        let data = &mut request.data;
         if self.pending_creation.is_some() {
             self.flash_status("A session is already being created");
-            return;
+            return Err(Box::new(request));
         }
         // The daemon owns the creation, so a disconnected runtime must refuse
         // before a placeholder claims a row that nothing will ever commit.
@@ -25,11 +43,11 @@ impl HomeView {
                 "Cannot Create Session",
                 "The local daemon is unavailable, so the session was not created.",
             ));
-            return;
+            return Err(Box::new(request));
         }
         let Some(origin_epoch) = self.session_feed.applied_epoch().map(str::to_owned) else {
             self.flash_status("Wait for the canonical runtime before creating a session");
-            return;
+            return Err(Box::new(request));
         };
         // Pre-resolve the title with the same logic the daemon's builder runs,
         // so the placeholder and the committed row agree (otherwise an empty
@@ -117,8 +135,13 @@ impl HomeView {
         }
         self.new_dialog = None;
 
-        let mut body = wizard_create_body(&data, trust_hooks, trust_review);
+        let mut body = wizard_create_body(
+            &request.data,
+            request.trust_hooks,
+            request.trust_review.clone(),
+        );
         body.idempotency_key = Some(stub_id.clone());
+        body.skip_on_create = request.skip_on_create;
         if let Err(error) = self.session_feed.create_session(stub_id.clone(), body) {
             self.pending_creation = None;
             self.discard_creating_stub();
@@ -126,9 +149,10 @@ impl HomeView {
                 "Creation Failed",
                 &error.to_string(),
             ));
-            return;
+            return Err(Box::new(request));
         }
         self.pending_creation = Some(PendingCreation {
+            request,
             daemon_id: None,
             request_key: stub_id,
             origin_epoch,
@@ -138,6 +162,50 @@ impl HomeView {
             confirmation: None,
             reload_retry_at: None,
         });
+        Ok(())
+    }
+
+    /// Retry and Create without setup resubmit the kept request; Cancel drops it, as the
+    /// daemon already rolled the failed attempt back. A resubmit refused before it is sent
+    /// reopens the dialog with the same request, under the refusal's message.
+    ///
+    /// The daemon refuses a trust review that no longer matches, so a hook config changed
+    /// since the refusal is reviewed again: without a prompt the request carries the new
+    /// review, and with one the trust dialog takes over the kept request.
+    pub(super) fn resolve_create_hook_failed(
+        &mut self,
+        result: DialogResult<CreateHookFailedAction>,
+    ) {
+        let DialogResult::Submit(action) = result else {
+            if matches!(result, DialogResult::Cancel) {
+                self.create_hook_failed = None;
+            }
+            return;
+        };
+        let Some((dialog, mut request)) = self.create_hook_failed.take() else {
+            return;
+        };
+        request.skip_on_create = action == CreateHookFailedAction::CreateWithoutSetup;
+        if let Some(review) = request.trust_review.as_ref() {
+            match super::input::creation_trust_review(&request.data) {
+                Ok((_, fingerprint)) if &fingerprint == review => {}
+                Ok((trust, fingerprint)) if !trust.needs_prompt() => {
+                    let decision = super::input::unprompted_trust_decision(&trust, fingerprint);
+                    (request.trust_hooks, request.trust_review) = decision.into_request();
+                }
+                Ok(_) => {
+                    let _ = self.review_creation_trust(request.data, request.skip_on_create);
+                    return;
+                }
+                // The daemon judges a review this process cannot rebuild.
+                Err(error) => {
+                    tracing::warn!(target: "tui.input", "Failed to review repo trust: {error:#}")
+                }
+            }
+        }
+        if let Err(request) = self.submit_creation(request) {
+            self.create_hook_failed = Some((dialog, *request));
+        }
     }
 
     pub(super) fn bind_in_flight_creation(&mut self, rows: &[crate::daemon::SessionResponse]) {
@@ -322,15 +390,15 @@ impl HomeView {
                         &format!("{message}\nThe daemon may still be creating this session. Wait for its canonical row or cancel; do not submit a second creation yet."),
                     ));
                 }
+                Err(CommandFailure::CreateHookFailed(message)) => {
+                    if let Some(pending) = self.settle_refused_creation(&stub_id) {
+                        self.create_hook_failed =
+                            Some((CreateHookFailedDialog::new(&message), pending.request));
+                    }
+                    return None;
+                }
                 Err(CommandFailure::Rejected(message)) => {
-                    let cancelled = self.pending_creation.as_ref()?.cancel_requested;
-                    self.clear_creation_tracking(&stub_id);
-                    self.rebuild_group_trees();
-                    self.rebuild_flat_items();
-                    self.update_selected();
-                    if cancelled {
-                        self.flash_status("Creation was refused before commit");
-                    } else {
+                    if self.settle_refused_creation(&stub_id).is_some() {
                         self.info_dialog =
                             Some(InfoDialog::sized_to_fit("Creation Failed", &message));
                     }
@@ -368,6 +436,21 @@ impl HomeView {
                 Some(CreationConfirmation::Canonical(row));
         }
         self.commit_created_session()
+    }
+
+    /// Drops a refused creation's stub. Returns its request unless the user had already
+    /// cancelled, in which case the refusal is only flashed.
+    fn settle_refused_creation(&mut self, stub_id: &str) -> Option<PendingCreation> {
+        let pending = self.pending_creation.take()?;
+        self.clear_creation_tracking(stub_id);
+        self.rebuild_group_trees();
+        self.rebuild_flat_items();
+        self.update_selected();
+        if pending.cancel_requested {
+            self.flash_status("Creation was refused before commit");
+            return None;
+        }
+        Some(pending)
     }
 
     fn clear_creation_tracking(&mut self, stub_id: &str) {
@@ -454,7 +537,10 @@ impl HomeView {
             .await
         {
             Ok(_) => {}
-            Err(crate::tui::session_feed::CommandFailure::Rejected(error)) => {
+            Err(
+                crate::tui::session_feed::CommandFailure::Rejected(error)
+                | crate::tui::session_feed::CommandFailure::CreateHookFailed(error),
+            ) => {
                 tracing::warn!(target: "tui.home", %error, "creation cancellation at quit was refused");
             }
             Err(crate::tui::session_feed::CommandFailure::Unknown(error)) => {
