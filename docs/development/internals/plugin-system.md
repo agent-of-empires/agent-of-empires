@@ -75,6 +75,8 @@ Every worker needs `runtime.worker`; other capabilities gate host RPCs and are c
 
 Static manifest contributions are collected from active plugins: settings join the single settings schema and keep plugin ownership, themes resolve within the plugin directory, commands and keybindings are namespaced with core names taking precedence, status definitions provide host-rendered labels, the `pane`, `home-pane`, and `composer-action` slots render typed worker state, and a `page` slot serves its declared HTML entry. `agent_integrations` connects an agent tool to the generic session status and prompt protocol; optional launch metadata expose plugin-provided agents to the CLI, TUI, and dashboard while the host keeps session lifecycle and secure argument handling.
 
+API 21 agent declarations are resolved against an owned registry snapshot. Built-in agents and configured custom agents retain precedence. A declared OMP capture backend uses the selected pane-scoped context; unsupported contexts never start capture. A disabled or absent integration leaves built-in OMP launch, pane detection, and capture available.
+
 Host-rendered slots run no plugin code in a frontend: workers publish typed state, the host stores the latest generation, and the web or daemon-connected TUI renders it; generation ids stop a stopped worker's late cleanup from deleting a newer worker's state. Pane actions return to the worker as JSON-RPC notifications. A `page` is the exception: its own HTML and inline script run in a sandboxed frame with an opaque origin, never on the dashboard origin.
 
 ## Worker host

@@ -99,6 +99,14 @@ pub struct PluginRegistry {
 }
 
 impl PluginRegistry {
+    #[cfg(test)]
+    pub(crate) fn from_test_plugins(plugins: Vec<LoadedPlugin>) -> Self {
+        Self {
+            plugins,
+            load_errors: Vec::new(),
+        }
+    }
+
     pub fn load(config: &Config) -> Self {
         let mut plugins = Vec::new();
         let mut load_errors = Vec::new();
