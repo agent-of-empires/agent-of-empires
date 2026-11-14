@@ -614,6 +614,20 @@ an AoE session”. Frozen cleanup ownership covers all tools' current and parked
 ACP IDs, even after an ordinary purge removes the visible row. Unrelated failures
 remain sanitized rather than exposing their internal causes.
 
+**Initial prompt**
+
+`initial_prompt` is sent to the agent as its first turn, never before the
+agent is ready. Structured sessions deliver it once the worker is live and
+retry until it lands. A terminal session running an agent with a ready marker
+waits up to 60 seconds for that marker, then types it. A shell, a
+command-override session or an agent without a ready marker is refused
+immediately and surfaces `initial_prompt_error`. On timeout nothing is typed;
+a send error can leave partial input in the pane. Either way the session row
+carries `initial_prompt_error`. A failed terminal prompt is not retried, unless
+persisting the error fails: the error then lives only in memory and a daemon
+restart retries the prompt. A crash between delivery and bookkeeping can
+deliver it twice. A blank or over-64 KiB (65536 bytes) value returns `400`.
+
 **Worktree fields**
 
 | Field | Notes |

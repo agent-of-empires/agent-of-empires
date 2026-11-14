@@ -128,6 +128,7 @@ pub use types::{
     AuxiliaryObservation, AuxiliaryTarget, LegacyToolAdoption, LegacyToolIdentity,
     LegacyToolObservation, PaneObservation, PanePresence, PluginCreateIdempotency, SandboxInfo,
     TerminalInfo, TmuxServerIdentity, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    MAX_INITIAL_PROMPT_BYTES,
 };
 pub(crate) use types::{
     PrimeAgentCapturePlan, PriorToolSession, ResumeIntent, SandboxPin, SandboxStoreTransitionPath,
@@ -205,6 +206,10 @@ pub struct PendingInitialTurn {
     /// once, before the park.
     #[serde(default)]
     pub synthesized: bool,
+    /// Why a terminal session's initial prompt was not typed. An errored turn
+    /// is not retried; the user's next terminal send discards it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

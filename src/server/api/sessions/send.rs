@@ -138,12 +138,11 @@ async fn send_terminal_message_inner(
             crate::session::NativeStoreUnavailable.into(),
         ));
     }
-    let _submission = service
+    let submission = service
         .prompt_submission_for_session(id)
         .await
         .ok_or(SendKeysError::NotFound)?;
-    let lock = service.instance_lock(id).await;
-    let guard = lock.lock().await;
+    let guard = service.instance_lock(id).await.lock_owned().await;
     let mut instance = service
         .instances
         .read()
@@ -154,7 +153,14 @@ async fn send_terminal_message_inner(
         .ok_or(SendKeysError::NotFound)?;
     let revived = instance.lifecycle_generation != before.lifecycle_generation;
     let worker_state = state.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let clear_state = state.clone();
+    let clear_id = id.to_string();
+    // The guards move into the worker: it outlives a dropped request future, and
+    // the supersession of the initial prompt must finish under them.
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let _submission = submission;
+        let _guard = guard;
         use crate::session::SessionStore;
         let native = crate::server::session_store::NativeSessionStore::open(
             worker_state,
@@ -186,6 +192,13 @@ async fn send_terminal_message_inner(
             &message,
             crate::agents::send_keys_enter_delay(&instance.tool),
         )?;
+        // A newer prompt supersedes an undelivered initial one, as in ACP. Cleared
+        // once tmux accepted the text, even if the recency write below fails.
+        runtime.block_on(
+            clear_state
+                .session_service
+                .clear_pending_initial_turn(&clear_id),
+        );
         store.update(|rows, _| {
             let row = rows
                 .iter_mut()
@@ -203,8 +216,6 @@ async fn send_terminal_message_inner(
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    drop(guard);
-    drop(_submission);
     drop(namespace);
     result.map_err(|error| {
         if let Some(blocked) = error.downcast_ref::<crate::session::StartBlocked>() {
