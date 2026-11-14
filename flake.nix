@@ -95,11 +95,12 @@
             '';
           };
 
-          # Build only workspace dependencies first (for caching).
+          # Cache package dependencies; checks build test targets.
           cargoArtifacts = craneLib.buildDepsOnly (
             (builtins.removeAttrs commonArgs [ "src" ]) // dependencyMetadata // {
               dummySrc = dependencyDummySrc;
               cargoVendorDir = dependencyVendorDir;
+              doCheck = false;
             }
           );
 
@@ -165,6 +166,7 @@
             (builtins.removeAttrs commonArgsWithWeb [ "src" ]) // dependencyMetadata // {
               dummySrc = dependencyDummySrc;
               cargoVendorDir = dependencyVendorDir;
+              doCheck = false;
             }
           );
 
