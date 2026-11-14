@@ -778,6 +778,18 @@ pub(crate) fn install_test_output(file: File) -> (TestOutputGuard, TestOutput) {
 
 #[cfg(test)]
 impl TestOutput {
+    pub(crate) fn pending_frame_contains(&self, marker: &[u8]) -> io::Result<bool> {
+        let state = self.0.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            TryLockError::Poisoned(error) => io::Error::other(error.to_string()),
+        })?;
+        Ok(state.pending.as_ref().is_some_and(|frame| {
+            frame.offset < frame.bytes.len()
+                && !marker.is_empty()
+                && frame.bytes.windows(marker.len()).any(|bytes| bytes == marker)
+        }))
+    }
+
     pub(crate) fn diagnostic_snapshot(&self) -> String {
         let state = match self.0.try_lock() {
             Ok(state) => state,
