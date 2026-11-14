@@ -2886,7 +2886,7 @@ fn plugin_command_parts(command: &str) -> Option<(Vec<String>, usize)> {
     Some((words.into_iter().map(str::to_owned).collect(), assignments))
 }
 
-fn plugin_command_on_path(command: &str) -> bool {
+pub(crate) fn plugin_command_on_path(command: &str) -> bool {
     let Some((words, assignments)) = plugin_command_parts(command) else {
         return false;
     };
@@ -3151,7 +3151,7 @@ fn plugin_command_available(
 }
 
 fn agent_available_direct(
-    agent: &crate::agents::AgentDef,
+    agent: &crate::agents::AgentDef<'_>,
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Option<bool> {
     use crate::agents::DetectionMethod;
@@ -3188,7 +3188,7 @@ fn agent_available_direct(
 /// regardless of earlier results. Each hit prints a `AOE_AGENT_OK <name>`
 /// marker line that [`parse_login_shell_probe`] picks out of whatever else
 /// the user's login shell prints (motd, nvm chatter, ...).
-fn login_shell_probe_script(agents: &[&crate::agents::AgentDef]) -> String {
+fn login_shell_probe_script(agents: &[&crate::agents::AgentDef<'_>]) -> String {
     use crate::agents::DetectionMethod;
     agents
         .iter()
@@ -3225,7 +3225,7 @@ fn parse_login_shell_probe(stdout: &str) -> std::collections::HashSet<String> {
 
 /// One login shell for all agents, since profile startup is slow.
 fn login_shell_probe(
-    agents: &[&crate::agents::AgentDef],
+    agents: &[&crate::agents::AgentDef<'_>],
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> std::collections::HashSet<String> {
     if agents.is_empty() {
@@ -3284,8 +3284,8 @@ pub(crate) fn invalidate_agent_availability() {
 /// Names from `agents` that the memo already answers, plus the ones it does
 /// not know about yet. Split under a single read lock.
 fn partition_cached_agents<'a>(
-    agents: &[&'a crate::agents::AgentDef],
-) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef>) {
+    agents: &[&'a crate::agents::AgentDef<'a>],
+) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef<'a>>) {
     let mut found = HashSet::new();
     let mut uncached = Vec::new();
     let cache = AGENT_AVAILABILITY.read().ok();
@@ -3308,13 +3308,13 @@ fn partition_cached_agents<'a>(
 /// uncached set costs at most ONE login shell. Returns the subset of names
 /// that resolved.
 pub(crate) fn probe_agents_available(
-    agents: &[&crate::agents::AgentDef],
+    agents: &[&crate::agents::AgentDef<'_>],
 ) -> std::collections::HashSet<String> {
     probe_agents_available_inner(agents, None, false)
 }
 
 fn probe_agents_available_inner(
-    agents: &[&crate::agents::AgentDef],
+    agents: &[&crate::agents::AgentDef<'_>],
     cancel: Option<&tokio_util::sync::CancellationToken>,
     force: bool,
 ) -> std::collections::HashSet<String> {
@@ -3364,7 +3364,7 @@ fn probe_agents_available_inner(
     // Pass 1 is cheap per agent (`which` / a version run on the inherited
     // PATH); only the inconclusive rest goes to the batched login-shell probe.
     let mut results: Vec<(&str, bool)> = Vec::new();
-    let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
+    let mut needs_shell: Vec<&crate::agents::AgentDef<'_>> = Vec::new();
     for agent in uncached {
         if cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
             return found;
@@ -3397,12 +3397,14 @@ fn probe_agents_available_inner(
     found
 }
 
-pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
+pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef<'_>) -> bool {
     probe_agents_available(&[agent]).contains(agent.name)
 }
 
 /// A nonblocking UI snapshot: cached answers, with local PATH lookups for misses.
-pub(crate) fn agent_availability_snapshot(agents: &[&crate::agents::AgentDef]) -> HashSet<String> {
+pub(crate) fn agent_availability_snapshot(
+    agents: &[&crate::agents::AgentDef<'_>],
+) -> HashSet<String> {
     let (mut found, uncached) = partition_cached_agents(agents);
     // Retain login-shell discoveries until an explicit recheck.
     if let Ok(cache) = AGENT_AVAILABILITY.read() {
@@ -3452,7 +3454,7 @@ impl AvailableTools {
 
     pub fn detect() -> Self {
         let agents = crate::agents::AGENTS;
-        let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
+        let refs: Vec<&crate::agents::AgentDef<'_>> = agents.iter().collect();
         let found = probe_agents_available(&refs);
         let session = crate::session::config::Config::load()
             .ok()

@@ -106,6 +106,10 @@ pub(super) struct SessionDeleteDialog {
 
 pub(super) enum PermissionResponseTarget {
     Terminal(String),
+    Declared {
+        session_id: String,
+        agent: crate::plugin::agent_integration::DeclaredAgent,
+    },
     Structured {
         session_id: String,
         nonce: String,

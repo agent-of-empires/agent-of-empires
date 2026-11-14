@@ -1957,7 +1957,9 @@ else:
             shadow_mounts: Vec::new(),
         };
         let launch = |inputs_container: Option<ContainerExecutionSnapshot>| NativeExecution {
-            agent: crate::agents::get_agent("claude").expect("claude is a known agent"),
+            agent: crate::session::instance::execution::NativeAgent::Builtin(
+                crate::agents::get_agent("claude").expect("claude is a known agent"),
+            ),
             binding: ExecutionBinding {
                 agent: "claude".into(),
                 stores: vec![store.clone()],

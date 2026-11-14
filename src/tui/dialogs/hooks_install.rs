@@ -31,7 +31,7 @@ impl HooksInstallDialog {
     /// would install rather than a second derivation of it.
     pub fn new(
         tool_name: &str,
-        agent: &'static crate::agents::AgentDef,
+        agent: &'static crate::agents::AgentDef<'static>,
         config: &crate::session::config::Config,
     ) -> Self {
         let disclosure = crate::session::host_hook_disclosure(tool_name, agent, config);
