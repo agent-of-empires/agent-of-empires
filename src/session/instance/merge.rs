@@ -73,6 +73,7 @@ impl Instance {
         self.capture_started_at = src.capture_started_at;
         self.started_at = src.started_at;
         self.launch_executable = src.launch_executable.clone();
+        self.launch_resolved_executable = src.launch_resolved_executable.clone();
     }
 
     /// Same fields as `merge_post_start`. Resume-probe failure markers are
