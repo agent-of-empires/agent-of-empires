@@ -481,7 +481,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn configured_agent_command_allows_cli_override() {
+    fn plugin_owned_override_follows_the_configured_command() {
         let home = tempfile::tempdir().unwrap();
         let _reload = crate::plugin::ReloadRegistryOnDrop;
         let _env = crate::session::test_support::EnvGuard::set(&[
