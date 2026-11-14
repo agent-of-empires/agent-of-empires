@@ -1774,7 +1774,7 @@
       "id": "wizard.import-session.unit",
       "kind": "vitest",
       "risk": "high",
-      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults.",
+      "notes": "Generic ACP import reads the acknowledged served or explicitly selected profile, waits while Server default is unresolved, never writes the implicit profile choice into the form, clears worktree/container/branch/attach/scratch/extra-repo state, and ignores late registry and profile defaults. A plugin-provided tool is importable only while the host still reports its ACP adapter, and a configured custom adapter never qualifies.",
       "specs": [
         "src/components/session-wizard/__tests__/ProjectStep.test.tsx",
         "src/components/session-wizard/__tests__/SessionWizard.test.tsx",

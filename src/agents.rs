@@ -967,25 +967,6 @@ pub const AGENTS: &[AgentDef<'static>] = &[
     },
     AgentDef {
         oneshot_flag: Some("-p"),
-        yolo: Some(YoloMode::CliFlag("--auto-approve")),
-        instruction_flag: Some("--append-system-prompt {}"),
-        detect_status: status_detection::detect_omp_status,
-        container_env: &[("PI_CODING_AGENT_DIR", "/root/.omp/agent")],
-        session_support: session_support(
-            ResumeStrategy::Flag("--resume"),
-            SessionCaptureBackend::Omp,
-            SessionCaptureContext::PaneScoped,
-            SessionCaptureContext::PaneScoped,
-        ),
-        permission_response: Some(PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
-            allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
-        }),
-        ..agent("omp", "omp", "curl -fsSL https://omp.sh/install | sh")
-    },
-    AgentDef {
-        oneshot_flag: Some("-p"),
         detect_status: status_detection::detect_native_only_status,
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: Some("--append-system-prompt {}"),
@@ -1061,7 +1042,7 @@ impl AgentDef<'_> {
 
     pub fn oneshot_model_flag(&self) -> Option<&str> {
         self.model_flag.or(match self.name {
-            "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
+            "claude" | "copilot" | "prime-agent" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         })
@@ -1536,7 +1517,20 @@ const HELP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const HELP_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef<'static>> {
-    AGENTS.iter().find(|a| a.name == name)
+    AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+        .find(|a| a.name == name)
+}
+
+/// The native identity for `name`, whether or not a declaration supersedes it
+/// in listings. A tool keeps the identity its own contract names, so mounts,
+/// stores and recovery do not depend on which plugin currently provides it.
+pub(crate) fn native_definition(name: &str) -> Option<&'static AgentDef<'static>> {
+    AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::definitions())
+        .find(|agent| agent.name == name)
 }
 
 pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
@@ -1552,7 +1546,7 @@ pub fn terminal_tool_for_acp_agent(agent: &str) -> Option<&'static str> {
     } else {
         agent
     };
-    get_agent(tool).map(|def| def.name)
+    native_definition(tool).map(|def| def.name)
 }
 
 /// Only claude qualifies: claude-agent-acp's session id is the id `claude --resume` reads.
@@ -1748,11 +1742,15 @@ pub fn ready_marker(tool: &str) -> Option<&'static str> {
 }
 
 pub fn agent_names() -> Vec<&'static str> {
-    AGENTS.iter().map(|a| a.name).collect()
+    AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+        .map(|a| a.name)
+        .collect()
 }
 
 /// The longest matching token wins: `prime-agent` contains cursor's `agent` alias.
-pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
+pub(crate) fn resolve_builtin_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
         return Some("claude");
@@ -1768,6 +1766,25 @@ pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
     best.map(|(_, name)| name)
 }
 
+pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
+    let lower = cmd.to_lowercase();
+    if lower.is_empty() {
+        return Some("claude");
+    }
+    let mut best: Option<(usize, &'static str)> = None;
+    for agent in AGENTS
+        .iter()
+        .chain(crate::plugin::bundled_agents::available())
+    {
+        for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
+            if lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
+                best = Some((token.len(), agent.name));
+            }
+        }
+    }
+    best.map(|(_, name)| name)
+}
+
 pub fn install_hint(name: &str) -> Option<&'static str> {
     get_agent(name).map(|a| a.install_hint)
 }
@@ -1776,6 +1793,7 @@ pub fn settings_index_from_name(name: Option<&str>) -> usize {
     match name {
         Some(n) => AGENTS
             .iter()
+            .chain(crate::plugin::bundled_agents::available())
             .position(|a| a.name == n)
             .map(|i| i + 1)
             .unwrap_or(0),
@@ -1787,13 +1805,18 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     if index == 0 {
         None
     } else {
-        AGENTS.get(index - 1).map(|a| a.name)
+        AGENTS
+            .iter()
+            .chain(crate::plugin::bundled_agents::available())
+            .nth(index - 1)
+            .map(|a| a.name)
     }
 }
 
 pub fn oneshot_capable_names() -> Vec<&'static str> {
     AGENTS
         .iter()
+        .chain(crate::plugin::bundled_agents::available())
         .filter(|a| a.oneshot_flag.is_some())
         .map(|a| a.name)
         .collect()
@@ -1802,6 +1825,22 @@ pub fn oneshot_capable_names() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A structured session on the host OMP adapter can return to its terminal
+    /// while a declaration holds the listing; unknown identities still cannot.
+    #[test]
+    #[serial_test::serial]
+    fn acp_terminal_tool_resolves_retained_identities_but_not_unknown_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        // Declared first so it reloads after the app directory is restored.
+        let _reload = crate::plugin::ReloadRegistryOnDrop;
+        let _app = crate::session::test_support::isolate_app_dir_at(dir.path());
+        crate::session::test_support::install_omp_takeover("omp-next");
+
+        assert!(get_agent("omp").is_none());
+        assert_eq!(terminal_tool_for_acp_agent("omp"), Some("omp"));
+        assert_eq!(terminal_tool_for_acp_agent("not-a-tool"), None);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1949,8 +1988,7 @@ mod tests {
             if agent.oneshot_flag_binds_prompt() {
                 assert!(agent.oneshot_extra_args().is_empty(), "{name}");
             }
-            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "omp" | "prime-agent")
-            {
+            if agent.oneshot_flag == Some("-p") && !matches!(name, "claude" | "prime-agent") {
                 assert!(agent.oneshot_flag_binds_prompt(), "{name}");
             }
             assert_eq!(agent.oneshot_cheap_model().is_some(), name == "claude");
@@ -2624,7 +2662,7 @@ if [ "$PROBE_MODE" = legacy ]; then printf '%s\n' 'FLAGS --fork fork session'; e
         assert_eq!(settings_index_from_name(None), 0);
         assert_eq!(settings_index_from_name(Some("unknown")), 0);
         assert_eq!(name_from_settings_index(0), None);
-        assert_eq!(name_from_settings_index(AGENTS.len() + 1), None);
+        assert_eq!(name_from_settings_index(agent_names().len() + 1), None);
         for (i, agent) in AGENTS.iter().enumerate() {
             assert_eq!(settings_index_from_name(Some(agent.name)), i + 1);
             assert_eq!(name_from_settings_index(i + 1), Some(agent.name));
