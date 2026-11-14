@@ -502,6 +502,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
         .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
         .route(
+            "/api/sessions/{id}/acp/terminal-check",
+            get(api::acp_terminal_check),
+        )
+        .route(
             "/api/sessions/{id}/queue",
             post(api::queue_enqueue)
                 .get(api::queue_list)
