@@ -54,7 +54,7 @@ import { SandboxPanel } from "./steps/SandboxPanel";
 import { ProfilePresetPicker } from "./steps/ProfilePresetPicker";
 import { GroupCombobox } from "./steps/GroupCombobox";
 import { CreateFailureBox } from "./CreateFailureBox";
-import { failureView, type FailureAction } from "./createFailureView";
+import { failureFields, failureView, type FailureAction } from "./createFailureView";
 import { CreateProgressView } from "./CreateProgressView";
 import { FieldRow, NavRow, PanelHeader, ROW_INPUT, RowGroup, SegmentedRow, SwitchRow } from "./WizardRows";
 import { LaunchFooter } from "./LaunchFooter";
@@ -273,6 +273,12 @@ export function SessionWizard({
   const [runtimeDown, setRuntimeDown] = useState(false);
   const [rechecking, setRechecking] = useState(false);
   const viewGroupRef = useRef<HTMLDivElement>(null);
+  const pullLatestRef = useRef<HTMLDivElement>(null);
+  // The failure box grows the footer and shrinks the form above it; keep the pull box it blames in view.
+  useEffect(() => {
+    if (state.failure && failureFields(state.failure).includes("pullLatestImage"))
+      pullLatestRef.current?.scrollIntoView({ block: "nearest" });
+  }, [state.failure]);
   const offline = useServerDown();
   const [progress, setProgress] = useState<CreateProgress | null>(restore?.progress ?? null);
   // The latest snapshot, which a backgrounded create keeps polling once the wizard is gone.
@@ -1201,7 +1207,7 @@ export function SessionWizard({
         </FieldRow>
       </RowGroup>
       {pullOffer && (
-        <div className="mt-3 flex flex-col gap-1" data-testid="wizard-pull-latest">
+        <div ref={pullLatestRef} className="mt-3 flex flex-col gap-1" data-testid="wizard-pull-latest">
           <label className={`flex items-center gap-2 ${pullOffer.command ? "" : "cursor-pointer"}`}>
             <input
               type="checkbox"

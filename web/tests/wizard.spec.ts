@@ -724,8 +724,10 @@ test.describe("Sandbox row", () => {
         expect(overflow).toBeLessThanOrEqual(0);
       });
     }
+  });
 
-    test("pulls the latest image first, and a failed pull relaunches with the current one in view", async ({
+  for (const width of [375, 1280]) {
+    test(`pulls the latest image first, and a failed pull relaunches with both in view, at ${width}px`, async ({
       page,
     }) => {
       const image = "ghcr.io/example-org/sandbox:2026.11";
@@ -767,7 +769,7 @@ test.describe("Sandbox row", () => {
           return true;
         },
       });
-      await page.setViewportSize({ width: 375, height: 812 });
+      await page.setViewportSize({ width, height: width === 375 ? 812 : 800 });
       const w = wizard(page);
       const box = w.getByRole("checkbox", { name: "Pull latest image first" });
       await expect(box).toBeChecked();
@@ -783,6 +785,8 @@ test.describe("Sandbox row", () => {
       await expect(failure).toContainText("The session wasn't created.");
       const relaunch = failure.getByRole("button", { name: "Launch with current image" });
       await expect(relaunch).toBeInViewport();
+      // The failure box grows the footer; the box it blames stays readable above it.
+      await expect(w.getByTestId("wizard-pull-latest")).toBeInViewport({ ratio: 1 });
       const overflow = await page.evaluate(
         () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
       );
@@ -794,7 +798,7 @@ test.describe("Sandbox row", () => {
       expect(created[1]!.sandbox).toBe(true);
       expect(created[1]!.idempotency_key).not.toBe(created[0]!.idempotency_key);
     });
-  });
+  }
 
   // The longest cue and status together are wider than the md+ modal's 256px summary.
   for (const width of [1280, 375]) {
