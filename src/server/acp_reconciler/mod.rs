@@ -84,6 +84,9 @@ fn park_message(project_path: &str) -> String {
     }
 }
 
+/// Banner for a session whose queued prompts wait behind a durable stop.
+const STOP_FENCE_MESSAGE: &str = "Structured view worker was stopped (aoe acp stop); queued prompts wait until the session is started again.";
+
 #[derive(Debug, Clone)]
 enum ResumeOutcome {
     Attached,
@@ -348,6 +351,28 @@ pub async fn reconcile_acp_workers(
         }
         // Waiting on the sandbox login spends no respawn budget.
         if login.is_held(&id) {
+            attempted.insert(id);
+            continue;
+        }
+        // A durable `aoe acp stop` fence refuses every automatic resume, so an
+        // attempt can never succeed: hold the session uncharged instead of letting
+        // a queued prompt spend the crash-loop budget on refusals (#5200).
+        if crate::process::worker_registry::stop_requested(&id) {
+            if with_queued_prompts.contains(&id) && parked.insert(id.clone()) {
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "holding queued prompts: the worker was stopped and waits for an explicit start"
+                );
+                crate::server::api::publish_startup_error_if_current(
+                    state,
+                    &id,
+                    &target.source_profile,
+                    target.lifecycle_generation,
+                    STOP_FENCE_MESSAGE.to_string(),
+                )
+                .await;
+            }
             attempted.insert(id);
             continue;
         }
@@ -1763,5 +1788,93 @@ mod tests {
         assert!(tick.parked.is_empty());
         let observed = worker_registry::stop_intent(id).unwrap();
         worker_registry::admit_resume(id, ResumeAuthority::Explicit, &observed).unwrap();
+    }
+
+    /// A queued prompt re-selects a workerless session every tick (#5200). Behind
+    /// a durable `aoe acp stop` fence no automatic attempt can be admitted, so the
+    /// ticks must neither charge nor exhaust the crash-loop budget; the session
+    /// shows one banner naming the stop, and an explicit start re-arms it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_user_stop_with_a_queue_does_not_crash_loop() {
+        use crate::process::worker_registry::{self, WorkerRecord};
+        use crate::session::Status;
+
+        for status in [Status::Idle, Status::Error] {
+            let id = "sess-stopped-queued";
+            let (_home, state, project) = test_fixtures::test_state(id);
+            {
+                let mut instances = state.instances.write().await;
+                instances[0].status = status;
+                instances[0]
+                    .queued_prompts
+                    .push(test_fixtures::queued_prompt());
+            }
+            let record = WorkerRecord::new(
+                id.into(),
+                std::process::id(),
+                worker_registry::socket_path_for(id).unwrap(),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                project.path().to_path_buf(),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            worker_registry::save(&record).unwrap();
+            worker_registry::request_stop(&record).unwrap();
+            worker_registry::retire_selected(&record).unwrap();
+
+            let mut tick = test_fixtures::Tick::default();
+            for _ in 0..=2 * RECONCILER_MAX_RESPAWNS_IN_WINDOW {
+                tick.run(&state).await;
+            }
+
+            assert!(
+                tick.respawn_history.get(id).is_none_or(Vec::is_empty),
+                "{status:?}: a fenced session must not charge the budget"
+            );
+            assert_eq!(
+                test_fixtures::startup_errors(&state, id),
+                1,
+                "{status:?}: one banner for the stop, no crash-loop park"
+            );
+            assert_eq!(
+                count_messages(&state, id, STOP_FENCE_MESSAGE),
+                1,
+                "{status:?}: the banner names the stop"
+            );
+
+            // An explicit start clears the fence and requests a respawn, which
+            // gives the session a clean slate; the fake agent then fails to spawn.
+            let observed = worker_registry::stop_intent(id).unwrap();
+            worker_registry::admit_resume(
+                id,
+                worker_registry::ResumeAuthority::Explicit,
+                &observed,
+            )
+            .unwrap();
+            state.acp_supervisor.request_respawn(id);
+            tick.run(&state).await;
+            assert_eq!(
+                tick.respawn_history.get(id).map_or(0, Vec::len),
+                1,
+                "{status:?}: the explicit start is a real attempt"
+            );
+            assert_eq!(test_fixtures::startup_errors(&state, id), 2, "{status:?}");
+        }
+    }
+
+    fn count_messages(state: &AppState, id: &str, text: &str) -> usize {
+        state
+            .acp_event_store
+            .replay_from(id, 0)
+            .into_iter()
+            .filter(|(_, e)| {
+                matches!(e, crate::acp::Event::AgentStartupError { message, .. } if message == text)
+            })
+            .count()
     }
 }

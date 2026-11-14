@@ -1247,7 +1247,7 @@ pub(crate) async fn host_spawn_environment(
                 ))
             })?
             .map_err(|e| {
-                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e:#}")))
             })?;
         overlay_env(&mut host, minted);
     }
