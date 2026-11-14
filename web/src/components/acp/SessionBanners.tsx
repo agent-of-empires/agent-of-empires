@@ -5,7 +5,7 @@ import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "../Dialog";
 import { useBusyAction, useConfirmKeys, useDialogFocus } from "../dialogHooks";
 import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState, type EstablishmentRevision } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
-import { RecoveryActionRow } from "./RecoveryActionRow";
+import { SECONDARY_BUTTON } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
@@ -305,21 +305,23 @@ export function StartupWaitLine({
       </span>
       {offerRestart && (
         <div className="shrink-0">
-          <RecoveryActionRow
-            primary={{
-              label: restartState === "retrying" ? "Starting fresh…" : "Start fresh",
-              testId: "startup-wait-restart",
-              disabled: restartState === "retrying" || establishmentRevision === null,
-              title: establishmentRevision === null ? "Waiting for current conversation state." : undefined,
-              describedBy: cost ? costId : undefined,
-              onClick: () => {
-                const revision = currentRevision.current;
-                if (revision === null) return;
-                setFreshError(null);
-                setConfirmation({ sessionId: currentSession.current, revision });
-              },
+          <button
+            type="button"
+            className={SECONDARY_BUTTON}
+            data-testid="startup-wait-restart"
+            aria-label={`Start fresh ${agent}`}
+            disabled={restartState === "retrying" || establishmentRevision === null}
+            title={establishmentRevision === null ? "Waiting for current conversation state." : undefined}
+            aria-describedby={cost ? costId : undefined}
+            onClick={() => {
+              const revision = currentRevision.current;
+              if (revision === null) return;
+              setFreshError(null);
+              setConfirmation({ sessionId: currentSession.current, revision });
             }}
-          />
+          >
+            {restartState === "retrying" ? "Starting fresh…" : "Start fresh"}
+          </button>
         </div>
       )}
       {offerRestart && cost && (
