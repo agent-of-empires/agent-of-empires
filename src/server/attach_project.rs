@@ -343,86 +343,88 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn attachment_waits_for_a_queued_stop() {
-        use crate::acp::state::Event;
-        use std::time::Duration;
+        crate::acp::supervisor::test_support::managed::with_managed(|scope| {
+            Box::pin(async move {
+                use crate::acp::state::Event;
+                use std::time::Duration;
 
-        let _app_dir = crate::session::test_support::isolate_app_dir();
-        let not_a_repo = tempfile::tempdir().unwrap();
-        let mut inst =
-            crate::session::Instance::new("queued-stop", not_a_repo.path().to_str().unwrap());
-        inst.view = crate::session::View::Structured;
-        inst.status = crate::session::Status::Idle;
-        let id = inst.id.clone();
-        support::seed_instances_on_disk_for_test(&inst.source_profile, vec![inst.clone()]);
-        let state = support::build_test_app_state(vec![inst]);
-        state.acp_supervisor.test_insert_worker(&id).await;
-        state
-            .acp_supervisor
-            .publish_user_prompt(&id, "work".into())
-            .await;
-        assert_eq!(
-            state.acp_event_store.has_in_flight_turn(&id).unwrap(),
-            crate::acp::event_store::ControlKnowledge::Known(true)
-        );
-
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (release, wait) = std::sync::mpsc::sync_channel(1);
-        let store = Arc::clone(&state.acp_event_store);
-        let stopped_id = id.clone();
-        state.acp_supervisor.test_run_on_writer(move || {
-            entered.send(()).unwrap();
-            wait.recv_timeout(Duration::from_secs(5)).unwrap();
-            let stopped = Event::Stopped {
-                reason: "prompt_complete".into(),
-            };
-            store
-                .record(
-                    &stopped_id,
-                    2,
-                    &stopped,
-                    &crate::acp::event_sender::EventMetadata::host(&stopped),
-                )
-                .unwrap();
-        });
-        ready.await.unwrap();
-        let flushes = state.acp_supervisor.test_flushes();
-        let attach = tokio::spawn({
-            let state = Arc::clone(&state);
-            let id = id.clone();
-            let repo = not_a_repo.path().to_path_buf();
-            async move {
-                attach_project(
-                    &state,
-                    &id,
-                    &repo,
-                    crate::session::attach_project::ExistingBranch::Refuse,
-                )
-                .await
-            }
-        });
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while state.acp_supervisor.test_flushes() == flushes {
-            assert!(
-                !attach.is_finished(),
-                "attachment decided without waiting for the queued stop"
-            );
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "attachment never waited on the writer"
-            );
-            tokio::task::yield_now().await;
-        }
-        assert!(!attach.is_finished(), "the queued stop is still held");
-        release.send(()).unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), attach)
-            .await
-            .unwrap()
-            .unwrap();
-        // Past the turn check, planning rejects the directory as not a repository.
-        assert!(
-            matches!(outcome, Err(AttachError::Rejected(_))),
-            "{outcome:?}"
-        );
+                let mut managed = support::managed_control_session(scope, "queued-stop").await;
+                let not_a_repo = scope.tempdir();
+                let id = managed.id().to_owned();
+                let state = Arc::clone(&managed.state);
+                let request = managed.start_prompt("work").await;
+                assert_eq!(
+                    state.acp_event_store.has_in_flight_turn(&id).unwrap(),
+                    crate::acp::event_store::ControlKnowledge::Known(true)
+                );
+                let admission = state.acp_event_store.replay_from(&id, 0).unwrap()
+                    .into_iter()
+                    .rev()
+                    .find(|frame| matches!(frame.event.as_ref(), Event::ThinkingStarted)
+                        && frame.metadata.operation.is_some())
+                    .expect("the actual Native request has a durable admission");
+                let correlation = admission.metadata.operation.unwrap().correlation;
+                let origin = admission.metadata.native_origin.expect("actual Native source");
+                let (entered, ready) = tokio::sync::oneshot::channel();
+                let (release, wait) = std::sync::mpsc::sync_channel(1);
+                state.acp_supervisor.test_run_on_writer(move || {
+                    entered.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+                ready.await.unwrap();
+                let submitted = state.acp_supervisor.test_observe_stopped_submission(
+                    &id, correlation, origin,
+                );
+                managed.native.send(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "result": { "stopReason": "end_turn" }
+                })).await;
+                tokio::time::timeout(Duration::from_secs(5), submitted).await.unwrap().unwrap();
+                let flushes = state.acp_supervisor.test_flushes();
+                let attach = tokio::spawn({
+                    let state = Arc::clone(&state);
+                    let id = id.clone();
+                    let repo = not_a_repo.path().to_path_buf();
+                    async move {
+                        attach_project(
+                            &state,
+                            &id,
+                            &repo,
+                            crate::session::attach_project::ExistingBranch::Refuse,
+                        )
+                        .await
+                    }
+                });
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while state.acp_supervisor.test_flushes() == flushes {
+                    assert!(
+                        !attach.is_finished(),
+                        "attachment decided without waiting for the queued stop"
+                    );
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "attachment never waited on the writer"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                assert!(!attach.is_finished(), "the queued stop is still held");
+                release.send(()).unwrap();
+                let outcome = tokio::time::timeout(Duration::from_secs(5), attach)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    state.acp_event_store.has_in_flight_turn(&id).unwrap(),
+                    crate::acp::event_store::ControlKnowledge::Known(false)
+                );
+                // Past the turn check, planning rejects the directory as not a repository.
+                assert!(
+                    matches!(outcome, Err(AttachError::Rejected(_))),
+                    "{outcome:?}"
+                );
+                managed.client.shutdown().await;
+            })
+        }).await;
     }
 
     /// #4116: an archive committed while the restarted worker's `before_session` hook runs

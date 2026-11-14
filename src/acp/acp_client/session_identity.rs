@@ -1090,6 +1090,26 @@ impl SessionIngress {
                 .ok()
             })
             .map(Arc::new);
+        #[cfg(test)]
+        if matches!(
+            &update.notification.update,
+            agent_client_protocol::v1::schema::SessionUpdate::AgentMessageChunk(chunk)
+                if matches!(&chunk.content,
+                    agent_client_protocol::v1::schema::ContentBlock::Text(text)
+                    if text.text == "woken")
+        ) {
+            eprintln!(
+                "5052-R7R8-ingress sid={} physical={:?} stamp={:?} original={} history={} current_scope={} metadata_scope={} resource_start={}",
+                update.notification.session_id,
+                update.evidence.physical_source,
+                update.evidence.session_stamp,
+                update.original_source.is_some(),
+                update.history.is_some(),
+                update.current_scope.is_some(),
+                update.metadata_scope.is_some(),
+                update.resource_start.is_some(),
+            );
+        }
         update
     }
 

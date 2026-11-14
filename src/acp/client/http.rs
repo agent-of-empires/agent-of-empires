@@ -1686,7 +1686,7 @@ mod tests {
             move || {
                 let page = calls.fetch_add(1, Ordering::SeqCst);
                 async move { axum::Json(serde_json::json!({
-                    "frames": [{"session_id": "fixture", "seq": page + 1, "event": {"AgentMessageChunk": {"text": "readable", "message_id": null}}}],
+                    "frames": [{"session_id": "fixture", "seq": page + 1, "scope": "history_only", "event": {"AgentMessageChunk": {"text": "readable", "message_id": null}}}],
                     "lost": false, "highest_seq": 2, "lowest_seq": 1,
                     "next_cursor": page + 1, "has_more": page == 0,
                     "history_identity": if page == 0 { "first-snapshot" } else { "different-snapshot" }

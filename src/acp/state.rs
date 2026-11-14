@@ -840,6 +840,76 @@ impl CurrentNativeAvailability {
                 .flatten()
                 .is_some_and(|birth| Some(birth.fingerprint()) == owner.birth_fingerprint))
     }
+    pub(crate) fn initial_prompt_attempt(
+        &mut self,
+        row: &crate::session::Instance,
+        storage: &crate::session::Storage,
+    ) -> Result<Option<Arc<crate::acp::establishment::EstablishmentAttempt>>, crate::acp::establishment::EstablishmentRefusal> {
+        use crate::acp::establishment::{
+            AcpEstablishment, CreationStage, EstablishmentAttempt, EstablishmentOrigin,
+            EstablishmentRefusal,
+        };
+        if !row.is_structured()
+            || !row.launch_is_finalized()
+            || row.archived_at.is_some()
+            || row.trashed_at.is_some()
+            || row.terminal_handoff.is_some()
+            || row.status == crate::session::Status::Stopped
+            || row.is_idle_dormant()
+            || self.lease.cancellation().is_cancelled()
+        {
+            return Ok(None);
+        }
+        let Some(admission) = self.lease.admission() else {
+            return Ok(None);
+        };
+        let Some(expected) = admission.establishment else {
+            return Ok(None);
+        };
+        if !matches!(expected.origin, EstablishmentOrigin::Creation { stage: CreationStage::Admitted })
+            || expected.producer != Some(self.lease.producer_id())
+            || admission.generation != expected.generation
+        {
+            return Ok(None);
+        }
+        let Some(scope) = admission.native_scope else {
+            return Ok(None);
+        };
+        self.scope = scope;
+        let matches = match row.acp_establishment.as_ref() {
+            Some(AcpEstablishment::Pending { .. }) => {
+                self.scope.context == expected.context
+                    && self.scope.choice.as_deref() == Some(&expected.destination)
+                    && expected.matches_pending(row, storage).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            }
+            Some(AcpEstablishment::Applied { attempt_id }) if *attempt_id == expected.id => {
+                expected.profile == row.source_profile
+                    && expected.profile == storage.profile()
+                    && expected.session_id == row.id
+                    && expected.created_at == row.created_at
+                    && expected.generation == row.lifecycle_generation
+                    && self.scope.choice.as_ref().is_some_and(|choice| choice.matches(row))
+                    && NativeEventContext::capture(row, storage).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                        == self.scope.context
+                    && self.client.establishment_projection().is_some_and(|projection| {
+                        projection.applied().is_some_and(|applied| applied.attempt_id == expected.id)
+                            && projection.receipt_snapshot().is_some_and(|receipt| {
+                                EstablishmentAttempt::eq(&receipt.attempt, &expected)
+                            })
+                    })
+            }
+            _ => false,
+        };
+        if !matches
+            || !self.refresh(&row.id, matches).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+            || self.unavailable.is_some()
+            || !self.qualify_owner(&row.id).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(expected))
+    }
+
 }
 
 pub(crate) struct NativeObservationWait {
@@ -889,6 +959,7 @@ pub(crate) struct NativeAvailabilityProjection {
     pub unavailable: Option<AcpConnectionUnavailability>,
     pub control_failure: Option<(u64, NativeControlFailure)>,
     pub prompt_wake_eligible: bool,
+    pub host_prompt_intent: Option<uuid::Uuid>,
     context: Option<NativeEventContext>,
     owner: Option<crate::acp::runner_lifecycle::RunnerIdentity>,
 }
@@ -918,6 +989,7 @@ impl NativeAvailabilityProjection {
                 prompt_wake_eligible: !current.ready
                     && current.unavailable.is_none()
                     && current.client.initial_prompt_intent_available(),
+                host_prompt_intent: current.client.initial_prompt_identity(),
                 context: Some(context),
                 owner: current.owner,
             };
@@ -943,6 +1015,7 @@ impl NativeAvailabilityProjection {
             control_failure: None,
             context: Some(context),
             prompt_wake_eligible: false,
+            host_prompt_intent: None,
             owner: current_refusal
                 .and_then(|refusal| refusal.owner)
                 .or_else(|| historical.and_then(|(_, subject)| subject.owner)),

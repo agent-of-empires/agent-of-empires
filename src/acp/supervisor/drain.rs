@@ -943,6 +943,8 @@ impl<S: BroadcastSink> Drain<S> {
         #[cfg(not(test))]
         let self_owned = self;
         let sink = Arc::clone(&self_owned.sink);
+        #[cfg(test)]
+        let submission_session = self_owned.session_id.clone();
         let completion = Arc::new(tokio::sync::Mutex::new(DrainCompletion {
             drain: Some(self_owned),
             end: StreamEnd::default(),
@@ -958,6 +960,8 @@ impl<S: BroadcastSink> Drain<S> {
             let incoming = inbound.recv().await;
             incoming
         } {
+            #[cfg(test)]
+            let submission = super::sink::TestSdkSubmission::from_incoming(&submission_session, &incoming);
             let completion = Arc::clone(&completion);
             let lease = lease.clone();
             let publication = super::WorkerPublication::new(async move {
@@ -973,6 +977,8 @@ impl<S: BroadcastSink> Drain<S> {
                     .complete_incoming(incoming, &lease, end, established)
                     .await;
             });
+            #[cfg(test)]
+            let publication = publication.with_test_submission(submission);
             if let Err(publication) = sink.publish_from_worker(publication) {
                 publication.complete().await;
             }

@@ -302,6 +302,7 @@ impl TranscriptModel {
             Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
                 self.last_message_id = None;
                 self.last_thought_id = None;
+                self.thought_start_pending = false;
             }
             Event::Stopped { .. }
             | Event::AgentStartupError { .. }
@@ -420,6 +421,8 @@ impl TranscriptModel {
                 origin_plugin,
             } => {
                 self.last_message_id = None;
+                self.last_thought_id = None;
+                self.thought_start_pending = false;
                 // A rate-limit resume continuation replays a prompt the user
                 // already saw once, before the park; render nothing so the
                 // transcript reads as an uninterrupted continuation instead
@@ -454,6 +457,8 @@ impl TranscriptModel {
                 assembled_markdown,
             } => {
                 self.last_message_id = None;
+                self.last_thought_id = None;
+                self.thought_start_pending = false;
                 let mut row = self.grouped_row(
                     format!("user-seq-{seq}"),
                     TranscriptRowKind::UserDiffComments,
@@ -994,7 +999,7 @@ impl TranscriptModel {
             );
             row.at = now;
             row.tool_call_id = Some(id);
-            deltas.push(patch(&row));
+            deltas.push(self.append(row));
         }
         deltas
     }

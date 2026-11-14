@@ -858,6 +858,9 @@ pub(crate) async fn with_managed_capacity<F>(
                 actual.default_effort_explicit = template.default_effort_explicit;
                 actual.default_mode = template.default_mode;
                 actual.default_model = template.default_model;
+                for (id, value) in template.default_model_config {
+                    actual.default_model_config.entry(id).or_insert(value);
+                }
                 actual.mcp_servers = template.mcp_servers;
                 actual.socket_path =
                     Some(crate::process::worker_registry::socket_path_for(&session_id.0).unwrap());

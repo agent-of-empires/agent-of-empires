@@ -18,7 +18,7 @@ pub struct SpawnAcpRequest {
     pub agent: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
-    pub recovery: Option<crate::acp::establishment::EstablishmentRecovery>,
+    pub recovery: Option<crate::acp::establishment::EstablishmentRecoveryRequest>,
     /// Extra dirs the agent may use through fs/*; the worktree is always allowed.
     #[serde(default)]
     pub additional_dirs: Vec<PathBuf>,
@@ -237,7 +237,7 @@ pub async fn spawn_acp(
         && state.acp_supervisor.is_running(&id).await
     {
         match current_is_noop(&state, &instance, None).await {
-            Ok(true) => {
+            Ok((true, _)) => {
                 return Json(SpawnAcpResponse {
                     session_id: id,
                     agent: pick_agent(&state, &instance, instance.agent_name.as_deref()).await,
@@ -245,7 +245,7 @@ pub async fn spawn_acp(
                 })
                 .into_response();
             }
-            Ok(false) => {}
+            Ok((false, _)) => {}
             Err(response) => return response,
         }
     }
@@ -436,9 +436,9 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     {
         return response;
     }
-    if let Some(recovery) = req.recovery.as_ref() {
+    let mut checked_recovery = if let Some(recovery) = req.recovery.as_ref() {
         match current_is_noop(&state, &preflight_instance, Some(recovery)).await {
-            Ok(true) => {
+            Ok((true, _)) => {
                 return Json(SpawnAcpResponse {
                     session_id: id,
                     agent: preflight_agent,
@@ -446,12 +446,15 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
                 })
                 .into_response()
             }
-            Ok(false) => {}
+            Ok((false, recovery)) => recovery,
             Err(response) => return response,
         }
-    } else if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
-        return supervisor_error_response("restart refused", &refusal.into());
-    }
+    } else {
+        if let Err(refusal) = preflight_instance.require_resolved_acp_selection() {
+            return supervisor_error_response("restart refused", &refusal.into());
+        }
+        None
+    };
 
     let stop_request = state
         .acp_supervisor
@@ -478,7 +481,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     // The stop request shares the installation gate, so a launch either gets
     // cancelled here or is observed as running and stopped after the barrier.
     if was_resuming {
-        match retire_restart_worker(&state, &preflight_instance, &restart, req.recovery.clone())
+        match retire_restart_worker(&state, &preflight_instance, &restart, checked_recovery.take())
             .await
         {
             Ok(attempt) => establishment = Some(attempt),
@@ -538,7 +541,7 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
     }
     // Running workers are stopped only after the submission barrier is held.
     if !was_resuming {
-        match retire_restart_worker(&state, &instance, &restart, req.recovery.clone()).await {
+        match retire_restart_worker(&state, &instance, &restart, checked_recovery.take()).await {
             Ok(attempt) => establishment = Some(attempt),
             Err(response) => return response,
         }
@@ -724,8 +727,8 @@ async fn restart_acp_inner(state: Arc<AppState>, id: String, req: SpawnAcpReques
 async fn current_is_noop(
     state: &Arc<AppState>,
     expected: &crate::session::Instance,
-    recovery: Option<&crate::acp::establishment::EstablishmentRecovery>,
-) -> Result<bool, Response> {
+    recovery: Option<&crate::acp::establishment::EstablishmentRecoveryRequest>,
+) -> Result<(bool, Option<crate::acp::establishment::EstablishmentRecovery>), Response> {
     use crate::acp::establishment::{
         AcpEstablishment, EstablishmentRecoveryAction, EstablishmentRefusal,
     };
@@ -738,69 +741,69 @@ async fn current_is_noop(
     let profile = expected.source_profile.clone();
     let id = expected.id.clone();
     let expected = expected.clone();
-    let recovery = recovery.cloned();
-    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    let recovery = recovery.copied();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         use crate::session::SessionStore as _;
         let native = crate::server::session_store::NativeSessionStore::open(
             owner,
             &profile,
             Some(id.clone()),
         )?;
-        let _lifecycle = native.storage().acquire_instance_lifecycle_lock(&id)?;
-        let row = native
-            .load()?
-            .into_iter()
-            .find(|row| row.id == id)
-            .ok_or(crate::session::SessionGone)?;
-        anyhow::ensure!(
-            crate::acp::state::NativeEventContext::capture(&expected, native.storage())?
-                == crate::acp::state::NativeEventContext::capture(&row, native.storage())?
-                && crate::acp::state::NativeBindingState::capture(&expected).matches(&row)
-                && expected.acp_establishment == row.acp_establishment,
-            EstablishmentRefusal::Superseded
-        );
-        if let Some(recovery) = &recovery {
+        let fence = crate::session::NativeInputFence::capture_route(
+            &profile,
+            &id,
+            expected.created_at,
+            expected.lifecycle_generation,
+            false,
+            Some(native.storage().bound_profile_identity()?),
+        )?;
+        let (_, result) = fence.lock_observation_project(|row, storage| {
             anyhow::ensure!(
-                recovery.expected.matches(&row, native.storage())?,
+                crate::acp::state::NativeEventContext::capture(&expected, storage)?
+                    == crate::acp::state::NativeEventContext::capture(row, storage)?
+                    && crate::acp::state::NativeBindingState::capture(&expected).matches(row)
+                    && expected.acp_establishment == row.acp_establishment,
                 EstablishmentRefusal::Superseded
             );
-        }
-        if recovery
-            .as_ref()
-            .is_some_and(|recovery| recovery.action != EstablishmentRecoveryAction::Same)
-            || !matches!(
-                row.acp_establishment,
-                Some(AcpEstablishment::Applied { .. })
-            )
-            || worker == crate::daemon::AcpWorkerState::Absent
-        {
-            return Ok(false);
-        }
-        let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
-        let selected = current
-            .scope
-            .choice
-            .as_ref()
-            .is_some_and(|choice| choice.matches(&row));
-        anyhow::ensure!(
-            current.scope.context
-                == crate::acp::state::NativeEventContext::capture(&row, native.storage())?
-                && current.refresh(&id, selected).unwrap_or(false),
-            EstablishmentRefusal::Unconfirmed
-        );
-        if current.unavailable.is_some() {
-            return Ok(false);
-        }
-        let applied = current
-            .client
-            .establishment_projection()
-            .and_then(|projection| projection.applied())
-            .ok_or(EstablishmentRefusal::Unconfirmed)?;
-        anyhow::ensure!(
-            current.ready && applied.matches(&row, native.storage())?,
-            EstablishmentRefusal::Unconfirmed
-        );
-        Ok(true)
+            let checked = recovery.map(|recovery| recovery.resolve(row, storage)).transpose()?;
+            if checked
+                .as_ref()
+                .is_some_and(|recovery| recovery.action != EstablishmentRecoveryAction::Same)
+                || !matches!(
+                    row.acp_establishment,
+                    Some(AcpEstablishment::Applied { .. })
+                )
+                || worker == crate::daemon::AcpWorkerState::Absent
+            {
+                return Ok((false, checked));
+            }
+            let current = current.as_mut().ok_or(EstablishmentRefusal::Unconfirmed)?;
+            let selected = current
+                .scope
+                .choice
+                .as_ref()
+                .is_some_and(|choice| choice.matches(row));
+            anyhow::ensure!(
+                current.scope.context
+                    == crate::acp::state::NativeEventContext::capture(row, storage)?
+                    && current.refresh(&id, selected).unwrap_or(false),
+                EstablishmentRefusal::Unconfirmed
+            );
+            if current.unavailable.is_some() {
+                return Ok((false, checked));
+            }
+            let applied = current
+                .client
+                .establishment_projection()
+                .and_then(|projection| projection.applied())
+                .ok_or(EstablishmentRefusal::Unconfirmed)?;
+            anyhow::ensure!(
+                current.ready && applied.matches(row, storage)?,
+                EstablishmentRefusal::Unconfirmed
+            );
+            Ok((true, checked))
+        }, false)?.ok_or(EstablishmentRefusal::Superseded)?;
+        Ok(result)
     })
     .await
     .map_err(anyhow::Error::from)
@@ -3190,12 +3193,12 @@ mod tests {
             Some(0)
         );
         let pending = find_instance(&state, &id).await.unwrap();
-        let recovery = crate::acp::establishment::EstablishmentRecovery {
-            expected: crate::acp::establishment::EstablishmentExpected::capture(
+        let recovery = crate::acp::establishment::EstablishmentRecoveryRequest {
+            revision: crate::acp::establishment::EstablishmentExpected::capture(
                 &pending,
                 &crate::session::Storage::open_reference("default").unwrap(),
             )
-            .unwrap(),
+            .unwrap().revision().unwrap(),
             action: crate::acp::establishment::EstablishmentRecoveryAction::Same,
         };
 

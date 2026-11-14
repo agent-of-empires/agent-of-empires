@@ -175,10 +175,19 @@ mod tests {
             .record(
                 "selected",
                 1,
-                &Event::ThinkingStarted,
+                &event,
                 &crate::acp::event_sender::EventMetadata::history(),
             )
             .unwrap();
+        assert_eq!(identity("selected"), original);
+        assert!(first
+            .record(
+                "selected",
+                1,
+                &Event::ThinkingStarted,
+                &crate::acp::event_sender::EventMetadata::history(),
+            )
+            .is_err());
         assert_eq!(identity("selected"), original);
         second
             .conn()

@@ -1189,6 +1189,7 @@ mod tests {
                 vec![
                     user_prompt("go"),
                     stopped("prompt_complete"),
+                    Event::ThinkingStarted,
                     agent_chunk("woken"),
                     tool_call(),
                 ],
@@ -1199,6 +1200,7 @@ mod tests {
                 vec![
                     user_prompt("go"),
                     stopped("prompt_complete"),
+                    Event::ThinkingStarted,
                     Event::AgentThoughtChunk {
                         text: "hmm".into(),
                         message_id: None,
@@ -1210,16 +1212,51 @@ mod tests {
                 vec![
                     user_prompt("go"),
                     stopped("prompt_complete"),
+                    Event::ThinkingStarted,
                     agent_chunk("woken"),
                     tool_call(),
                     stopped("agent_idle"),
                 ],
                 false,
             ),
+            (
+                vec![
+                    user_prompt("go"),
+                    stopped("prompt_complete"),
+                    agent_chunk("unadmitted operation"),
+                ],
+                false,
+            ),
         ];
         for (i, (events, open)) in cases.into_iter().enumerate() {
             let id = format!("s-{i}");
-            record_projection(&store, &id, 1, events);
+            let origin = crate::acp::state::NativeEventOrigin {
+                context: serde_json::from_value(serde_json::to_value([31u8; 32]).unwrap()).unwrap(),
+                generation: 1,
+                attempt_id: serde_json::from_value(serde_json::json!(uuid::Uuid::new_v4())).unwrap(),
+                producer: uuid::Uuid::new_v4(),
+                owner: None,
+            };
+            let autonomous = crate::acp::event_sender::EventMetadata {
+                scope: crate::acp::event_sender::EventScope::SessionCurrent,
+                native_origin: Some(origin),
+                ..crate::acp::event_sender::EventMetadata::history()
+            };
+            let admitted = events.iter().any(|event| matches!(event, Event::ThinkingStarted));
+            if admitted {
+                for (offset, event) in events.into_iter().enumerate() {
+                    let host = crate::acp::event_sender::EventMetadata::host(&event);
+                    let metadata = if offset >= 2 { &autonomous } else { &host };
+                    store.record(&id, offset as u64 + 1, &event, metadata).unwrap();
+                }
+            } else {
+                record_projection(&store, &id, 1, events);
+            }
+            assert_eq!(
+                store.has_in_flight_main_turn(&id).unwrap(),
+                ControlKnowledge::Known(false),
+                "case {i}"
+            );
             assert_eq!(
                 store.holds_live_work(&id).unwrap(),
                 ControlKnowledge::Known(open),

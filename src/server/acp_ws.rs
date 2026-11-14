@@ -427,13 +427,14 @@ async fn drain_replay_into_socket(
 
 /// State fields large enough, and static enough, to be worth suppressing when they have not
 /// changed since the last frame on this connection.
-const COLD_STATE_FIELDS: [&str; 5] = [
+const COLD_STATE_FIELDS: [&str; 6] = [
     "available_commands",
     "available_modes",
     "config_options",
     // Not static, but big and bursty.
     "recent_diffs",
     "background_agents",
+    "establishment_revision",
 ];
 
 /// Fold a session's stored history into the connection's projections and return the entries
@@ -492,6 +493,7 @@ struct ConnectionFolds<'a> {
 struct ColdFieldCache {
     hashes: std::collections::HashMap<&'static str, u64>,
     native: Option<crate::acp::state::NativeAvailabilityProjection>,
+    establishment_revision: Option<crate::acp::establishment::EstablishmentRevision>,
     rate_limit_park: Option<&'static str>,
     original_decision_nonces: Vec<crate::acp::approvals::Nonce>,
     snapshot_seq: u64,
@@ -590,6 +592,7 @@ async fn send_native_state(
     if contended {
         let original = crate::acp::control_cache::OriginalDecisions::default();
         if (cold.native != Some(observation.projection)
+            || cold.establishment_revision != observation.establishment_revision
             || cold.rate_limit_park != park
             || !cold.original_decision_nonces.is_empty())
             && !send_projected_reduced_state(
@@ -600,6 +603,7 @@ async fn send_native_state(
                 cold,
                 LiveControlProjection {
                     native: observation.projection,
+                    establishment_revision: None,
                     rate_limit_park: park,
                     original: &original,
                 },
@@ -624,12 +628,13 @@ async fn send_native_state(
     if !contended
         && only_if_changed
         && cold.native == Some(observation.projection)
+        && cold.establishment_revision == observation.establishment_revision
         && cold.rate_limit_park == park
         && cold.original_decision_nonces == original.nonces
     {
         return true;
     }
-    let native = owner
+    let (native, establishment_revision) = owner
         .session_service
         .settle_native_control_observation(session_id, observation)
         .await;
@@ -657,6 +662,7 @@ async fn send_native_state(
         cold,
         LiveControlProjection {
             native,
+            establishment_revision,
             rate_limit_park: park,
             original: &original,
         },
@@ -683,6 +689,7 @@ fn projected_rate_limit_park(
 
 struct LiveControlProjection<'a> {
     native: crate::acp::state::NativeAvailabilityProjection,
+    establishment_revision: Option<crate::acp::establishment::EstablishmentRevision>,
     rate_limit_park: Option<&'static str>,
     original: &'a crate::acp::control_cache::OriginalDecisions,
 }
@@ -697,6 +704,7 @@ async fn send_projected_reduced_state(
 ) -> bool {
     let LiveControlProjection {
         native,
+        establishment_revision,
         rate_limit_park,
         original,
     } = projection;
@@ -710,6 +718,8 @@ async fn send_projected_reduced_state(
     state["connection_ready"] = serde_json::json!(native.ready);
     state["connection_unavailable"] = serde_json::json!(native.unavailable);
     state["prompt_wake_eligible"] = serde_json::json!(native.prompt_wake_eligible);
+    state["host_prompt_intent"] = serde_json::json!(native.host_prompt_intent);
+    state["establishment_revision"] = serde_json::json!(establishment_revision);
     state["rate_limit_park"] = serde_json::json!(rate_limit_park);
     let channel_loss = native
         .unavailable
@@ -755,6 +765,7 @@ async fn send_projected_reduced_state(
     }
     cold.original_decision_nonces.clone_from(&original.nonces);
     cold.native = Some(native);
+    cold.establishment_revision = establishment_revision;
     cold.rate_limit_park = rate_limit_park;
     let seq = seq.max(cold.snapshot_seq).max(reduced.last_seq);
     cold.snapshot_seq = seq;
@@ -1006,6 +1017,120 @@ where
 mod tests {
     use super::*;
     use crate::acp::state::Event;
+
+    fn sensitive_recovery_row() -> crate::session::Instance {
+        let mut row = crate::session::Instance::new("recovery privacy", "/tmp/recovery-privacy");
+        row.id = "recovery-privacy".into();
+        row.source_profile = "default".into();
+        row.view = crate::session::View::Structured;
+        crate::server::test_support::select_retained_for_test(&mut row);
+        let binding = serde_json::json!({
+            "agent": "claude", "stores": ["SENSITIVE_REVISION_STORE"],
+            "configuration": [{"filesystem":"host","path":"SENSITIVE_REVISION_CONFIG"}],
+            "cwd":"SENSITIVE_REVISION_CWD", "cwd_filesystem":"host", "filesystem":"host",
+            "exported_default_store": false
+        });
+        let runtime = serde_json::json!({
+            "kind": crate::session::ContainerRuntimeName::Docker,
+            "program":"SENSITIVE_REVISION_PROGRAM", "cwd":"SENSITIVE_REVISION_RUNTIME_CWD",
+            "endpoint":"ssh://user:SENSITIVE_REVISION_PASSWORD@example",
+            "local_mounts":false,
+            "routing":[["DOCKER_HOST","SENSITIVE_REVISION_ROUTE"],
+                ["CONTAINER_SSHKEY","SENSITIVE_REVISION_KEY"],
+                ["SSH_AUTH_SOCK","SENSITIVE_REVISION_SOCKET"]],
+            "global_arguments":["--config","SENSITIVE_REVISION_ARGUMENT"]
+        });
+        row.active_execution = Some(serde_json::from_value(serde_json::json!({
+            "launch_id":"SENSITIVE_REVISION_LAUNCH", "binding":binding,
+            "capture":{"PrimeStatus":{
+                "directory":"SENSITIVE_REVISION_PRIME_DIRECTORY",
+                "program":"SENSITIVE_REVISION_PRIME_PROGRAM",
+                "agent_dir":"SENSITIVE_REVISION_PRIME_AGENT",
+                "proof_path":"SENSITIVE_REVISION_PRIME_PROOF",
+                "container":{"transport":runtime,"id":"SENSITIVE_REVISION_PRIME_CONTAINER",
+                    "cwd":"SENSITIVE_REVISION_PRIME_CWD"}
+            }},
+            "container":{"runtime":runtime,"name":"SENSITIVE_REVISION_CONTAINER_NAME",
+                "id":"SENSITIVE_REVISION_CONTAINER_ID",
+                "mounts":[{"host_path":"SENSITIVE_REVISION_MOUNT","container_path":"/project","read_only":false}],
+                "shadow_mounts":["SENSITIVE_REVISION_SHADOW"]}
+        })).unwrap());
+        row.agent_session_binding = Some(serde_json::from_value(serde_json::json!({
+            "session_id":row.agent_session_id,
+            "execution":binding,"provenance":"observed","transcript_path":"SENSITIVE_REVISION_TRANSCRIPT"
+        })).unwrap());
+        row.resume_binding = row.agent_session_binding.clone();
+        row
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn public_recovery_revision_hides_complete_container_and_prime_comparison() {
+        use crate::acp::establishment::{
+            EstablishmentExpected, EstablishmentRecoveryAction, EstablishmentRecoveryRequest,
+        };
+        let _home = crate::session::test_support::isolate_app_dir();
+        // Comparison-only metadata: this fixture never creates a Native receipt or Current source.
+        let row = sensitive_recovery_row();
+        crate::server::test_support::seed_instances_on_disk_for_test("default", vec![row.clone()]);
+        let storage = crate::session::Storage::open_reference("default").unwrap();
+        let expected = EstablishmentExpected::capture(&row, &storage).unwrap();
+        let revision = expected.revision().unwrap();
+        let recovery = EstablishmentRecoveryRequest { revision, action: EstablishmentRecoveryAction::Fresh };
+        assert!(recovery.resolve(&row, &storage).unwrap().expected.matches(&row, &storage).unwrap());
+        let wire = serde_json::to_value(recovery).unwrap();
+        assert!(!wire.to_string().contains("SENSITIVE_REVISION_"));
+        assert!(wire.get("expected").is_none());
+        assert!(serde_json::from_value::<EstablishmentRecoveryRequest>(
+            serde_json::json!({"expected":expected,"action":"fresh"})).is_err());
+        assert!(serde_json::from_value::<EstablishmentRecoveryRequest>(
+            serde_json::json!({"revision":revision,"expected":expected,"action":"fresh"})).is_err());
+        for target in 0..3 {
+            let mut changed = expected.clone();
+            let execution = match target {
+                0 => changed.choice.choice.binding.as_mut().unwrap().execution.as_mut().unwrap(),
+                1 => changed.choice.choice.resume_binding.as_mut().unwrap().execution.as_mut().unwrap(),
+                _ => &mut changed.choice.choice.active.as_mut().unwrap().binding,
+            };
+            execution.exported_default_store = None;
+            assert_ne!(changed.revision().unwrap(), revision, "checkpoint namespace marker {target}");
+            let stale = EstablishmentRecoveryRequest {
+                revision: changed.revision().unwrap(), action: EstablishmentRecoveryAction::Fresh,
+            };
+            assert!(stale.resolve(&row, &storage).is_err());
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = axum::Router::new().route("/", axum::routing::get(
+            move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let mut cold = ColdFieldCache {
+                        projection: SnapshotProjection::Web, ..Default::default()
+                    };
+                    let original = crate::acp::control_cache::OriginalDecisions::default();
+                    let reduced = AcpState::new(
+                        AcpSessionId("recovery-privacy".into()), AgentName("claude".into()), None);
+                    assert!(send_projected_reduced_state(
+                        &mut socket, "recovery-privacy", 0, &reduced, &mut cold,
+                        LiveControlProjection {
+                            native: Default::default(), establishment_revision: Some(revision),
+                            rate_limit_park: None, original: &original,
+                        },
+                    ).await);
+                })
+            },
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/")).await.unwrap();
+        let public = receive_kind(&mut socket, "reduced_state").await;
+        drop(socket);
+        server.abort();
+        assert_eq!(public["state"]["establishment_revision"], serde_json::json!(revision));
+        assert!(public["state"].get("establishment_expected").is_none());
+        assert!(!public.to_string().contains("SENSITIVE_REVISION_"));
+        assert_eq!(public["state"]["native_connection_ready"], false);
+        assert!(public["state"]["host_prompt_intent"].is_null());
+    }
 
     fn background_launch() -> Event {
         Event::BackgroundAgentLaunched {

@@ -1209,13 +1209,44 @@ mod tests {
         assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
     }
 
+    fn trace_retained_turn_diagnostic(state: &AppState, id: &str, phase: &str) {
+        eprintln!(
+            "5052-R7R8-control phase={phase} session={id} main={:?} agent={:?} open={:?} hold={:?}",
+            state.acp_event_store.has_in_flight_turn(id),
+            state.acp_event_store.has_open_agent_turn(id),
+            state.acp_event_store.has_open_turn(id),
+            state.acp_event_store.holds_live_work(id),
+        );
+        match state.acp_event_store.replay_from(id, 0) {
+            Ok(rows) => for row in rows {
+                let reason = match row.event.as_ref() {
+                    crate::acp::Event::Stopped { reason } => Some(reason.as_str()),
+                    _ => None,
+                };
+                let metadata = &row.metadata;
+                eprintln!(
+                    "5052-R7R8-row phase={phase} session={id} seq={} event={:?} stop={reason:?} scope={:?} origin={:?} native_prompt={:?} reported_sid={:?} operation={:?} prompt_observation={:?} uncertainty={:?} clear_after={:?} resource_ref={:?} resource_witness={} child={} denial={} host_action={}",
+                    row.seq, std::mem::discriminant(row.event.as_ref()), metadata.scope,
+                    metadata.native_origin, metadata.native_prompt_id, metadata.reported_session_id,
+                    metadata.operation.as_ref().map(|operation| &operation.correlation),
+                    metadata.prompt_observation, metadata.output_uncertainty, metadata.clear_after_seq,
+                    metadata.resource_ref, metadata.resource_witness.is_some(),
+                    metadata.child_provenance.is_some(), metadata.availability_denial, metadata.host_action,
+                );
+            },
+            Err(error) => eprintln!("5052-R7R8-replay phase={phase} session={id} error={error}"),
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn prompt_wake_closes_an_orphaned_turn_before_resuming() {
         use crate::acp::event_store::ControlKnowledge::Known;
         use crate::acp::supervisor::test_support::managed::with_managed;
+        use futures_util::FutureExt as _;
+        let mut failures = Vec::new();
         for agent_initiated in [false, true] {
-            with_managed(|scope| Box::pin(async move {
+            let observed = std::panic::AssertUnwindSafe(with_managed(|scope| Box::pin(async move {
                 let mut live = crate::server::test_support::managed_control_session(scope, "orphaned-real-turn").await;
                 if agent_initiated {
                 live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -1230,6 +1261,9 @@ mod tests {
                     let _request = live.start_prompt("keep going").await;
                 }
                 let id = live.id().to_owned();
+                trace_retained_turn_diagnostic(&live.state, &id, if agent_initiated {
+                    "R8-agent-before-cleanup"
+                } else { "R8-main-before-cleanup" });
                 let owner = live.state.acp_supervisor.current_native_availability(&id)
                     .await.unwrap().owner.unwrap();
                 let paused = live.client.pause_drain().await;
@@ -1244,6 +1278,9 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     while live.client.next_event().await.is_some() {}
                 }).await.expect("the old SDK and its ordered drain have actually retired");
+                trace_retained_turn_diagnostic(&live.state, &id, if agent_initiated {
+                    "R8-agent-after-cleanup"
+                } else { "R8-main-after-cleanup" });
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
                 let trigger = trigger_resume_background(&live.state.session_service, &id,
                     crate::process::worker_registry::ResumeAuthority::Explicit, None).await.unwrap();
@@ -1257,8 +1294,15 @@ mod tests {
                     }
                 }).await.expect("the admitted wake closes the genuine orphan before replacement");
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(false));
-            })).await;
+            }))).catch_unwind().await;
+            if let Err(payload) = observed {
+                let detail = payload.downcast_ref::<String>().cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|message| (*message).to_owned()))
+                    .unwrap_or_else(|| "non-string diagnostic arm failure".into());
+                failures.push(format!("agent_initiated={agent_initiated}: {detail}"));
+            }
         }
+        assert!(failures.is_empty(), "original R8 outcomes: {}", failures.join("\n"));
     }
 
     #[tokio::test]
@@ -1277,6 +1321,7 @@ mod tests {
                     }
                 }).await.expect("the actual Native's autonomous turn reaches its durable projection");
                 let id = live.id().to_owned();
+                trace_retained_turn_diagnostic(&live.state, &id, "R8-unknown-before-cleanup");
                 let owner = live.state.acp_supervisor.current_native_availability(&id)
                     .await.unwrap().owner.unwrap();
                 let paused = live.client.pause_drain().await;
@@ -1291,6 +1336,7 @@ mod tests {
                 tokio::time::timeout(Duration::from_secs(10), async {
                     while live.client.next_event().await.is_some() {}
                 }).await.expect("the old SDK and its ordered drain have actually retired");
+                trace_retained_turn_diagnostic(&live.state, &id, "R8-unknown-after-cleanup");
                 assert_eq!(live.state.acp_event_store.has_open_turn(&id).unwrap(), Known(true));
                 let authority = crate::process::worker_registry::ResumeAuthority::Explicit;
                 live.state.acp_event_store.test_set_unavailable(true);
@@ -1497,7 +1543,9 @@ mod tests {
             let mut live = crate::server::test_support::managed_control_session(scope, "retained-agent-work").await;
             let id = live.id().to_owned();
             let request = live.start_prompt("go").await;
+            trace_retained_turn_diagnostic(&live.state, &id, "R7-genuine-prompt-admission");
             live.finish_prompt(&request, None).await;
+            trace_retained_turn_diagnostic(&live.state, &id, "R7-own-prompt-completed");
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
                 "sessionId":live.sid,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"woken"}}
             }})).await;
@@ -1506,6 +1554,7 @@ mod tests {
                     if matches!(live.client.next_event().await, Some(Event::AgentMessageChunk { text, .. }) if text == "woken") { break; }
                 }
             }).await.expect("the original Native opens autonomous work after its prompt completes");
+            trace_retained_turn_diagnostic(&live.state, &id, "R7-woken-durable");
             assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(true));
             let owner = live.client.actual().connected_runner();
             let methods = live.native.requests();
@@ -1515,6 +1564,7 @@ mod tests {
                 assert!(state.acp_supervisor.current_lease(&id).is_some());
             }).await;
             live.state = live.client.app_state();
+            trace_retained_turn_diagnostic(&live.state, &id, "R7-after-retained-reattach");
             assert_eq!(live.client.actual().connected_runner(), owner);
             assert_eq!(live.native.requests(), methods);
             live.native.send(serde_json::json!({"jsonrpc":"2.0","method":"session/update","params":{
@@ -1538,6 +1588,7 @@ mod tests {
                     if matches!(live.client.next_event().await, Some(Event::Stopped { reason }) if reason == "agent_idle") { break; }
                 }
             }).await.expect("only this autonomous turn's real accounting boundary releases its live-work hold");
+            trace_retained_turn_diagnostic(&live.state, &id, "R7-own-autonomous-boundary");
             assert_eq!(live.state.acp_event_store.holds_live_work(&id).unwrap(), Known(false));
         })).await;
     }

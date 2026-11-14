@@ -716,7 +716,7 @@ impl super::EventStore {
     ) -> Result<super::RecordDisposition> {
         self.control_cache.with_control(session_id, |cached| {
             let mut conn = self.conn();
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let mut next = match *cached {
                 Some(cursor) => cursor,
                 None => ControlCursor::load(&tx, &self.schema, session_id)?,

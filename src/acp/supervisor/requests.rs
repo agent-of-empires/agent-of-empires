@@ -169,6 +169,56 @@ impl<S: BroadcastSink> Supervisor<S> {
         })
     }
 
+    pub(crate) async fn prepare_initial_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        attachments: &[crate::acp::event_store::AttachmentBlob],
+    ) -> Result<Option<crate::acp::acp_client::PreparedInitialPrompt>, SupervisorError> {
+        use crate::acp::establishment::EstablishmentRefusal;
+        let mut current = self.current_native_availability(session_id).await
+            .ok_or_else(|| SupervisorError::UnknownSession(session_id.to_owned()))?;
+        let fence = Arc::clone(&current.scope.fence);
+        let expected = {
+            let observed = fence.lock_observation_project(|row, storage| {
+                let expected = current.initial_prompt_attempt(row, storage)?;
+                if expected.is_some() && !(current.ready && row.require_resolved_acp_selection().is_ok()) {
+                    return Ok(expected);
+                }
+                row.require_resolved_acp_selection()?;
+                let selected = current.scope.choice.as_ref().is_some_and(|choice| choice.matches(row));
+                if !current.refresh(session_id, selected).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                    || !current.ready
+                    || !current.qualify_owner(session_id).map_err(|_| EstablishmentRefusal::Unconfirmed)?
+                {
+                    anyhow::bail!(EstablishmentRefusal::Unconfirmed);
+                }
+                Ok(None)
+            }, true).map_err(|error| {
+                error.downcast_ref::<EstablishmentRefusal>()
+                    .map_or(SupervisorError::NativeStoreUnavailable, |refusal| {
+                        SupervisorError::Acp(AcpError::Establishment(*refusal))
+                    })
+            })?;
+            let Some((_guard, expected)) = observed else {
+                return Err(SupervisorError::Acp(AcpError::Establishment(EstablishmentRefusal::Unconfirmed)));
+            };
+            expected
+        };
+        let Some(expected) = expected else {
+            return Ok(None);
+        };
+        let client = Arc::clone(&current.client);
+        let cancellation = current.lease.cancellation().child_token();
+        drop(current);
+        let agent_key = self.agent_key_for_session(session_id).await;
+        if crate::acp::agent_profiles::resolve(&agent_key).is_clear_command(text) {
+            return Err(SupervisorError::Acp(AcpError::Establishment(EstablishmentRefusal::Unresolved)));
+        }
+        client.prepare_initial_prompt(expected, cancellation, text, attachments)
+            .await.map(Some).map_err(SupervisorError::Acp)
+    }
+
     /// The session's client, after waiting out a mid-resume worker.
     async fn ready_client(&self, session_id: &str) -> Result<Arc<AcpClient>, SupervisorError> {
         self.wait_for_worker(session_id, WORKER_READY_TIMEOUT).await;
@@ -347,8 +397,38 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     /// Cancel the current turn; an already-exited agent has no turn to cancel.
-    pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
+    pub async fn cancel_prompt(
+        &self,
+        session_id: &str,
+        host_prompt_intent: Option<uuid::Uuid>,
+    ) -> Result<(), SupervisorError> {
         debug!(target: "acp.supervisor", session = %session_id, "turn cancel requested");
+        if let Some(intent) = host_prompt_intent {
+            use crate::acp::acp_client::InitialPromptCancellation;
+            let current = self.current_native_availability(session_id).await
+                .ok_or_else(|| SupervisorError::Superseded(session_id.to_owned()))?;
+            let epoch = {
+                let lifecycle = lock_recover(&self.lifecycle);
+                if lifecycle.phase(session_id) != crate::acp::runner_lifecycle::WorkerPhase::Running
+                    || lifecycle.current_lease(session_id).as_ref() != Some(&current.lease)
+                    || current.lease.cancellation().is_cancelled()
+                {
+                    return Err(SupervisorError::Superseded(session_id.to_owned()));
+                }
+                current.lease.epoch()
+            };
+            let client = Arc::clone(&current.client);
+            drop(current);
+            return match client.cancel_initial_prompt(intent).await? {
+                InitialPromptCancellation::Missing | InitialPromptCancellation::BeforePublication => {
+                    Err(SupervisorError::Superseded(session_id.to_owned()))
+                }
+                InitialPromptCancellation::Pending { seq } => {
+                    self.publish_initial_stopped(session_id, Arc::downgrade(&client), epoch, intent, seq).await
+                }
+                InitialPromptCancellation::ConsumerWillSettle | InitialPromptCancellation::Issued => Ok(()),
+            };
+        }
         let client = match self.ready_client(session_id).await {
             Ok(client) => client,
             Err(SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning)) => {
@@ -616,7 +696,7 @@ mod tests {
         .await;
 
         assert!(
-            sup.cancel_prompt("s-3401").await.is_ok(),
+            sup.cancel_prompt("s-3401", None).await.is_ok(),
             "the turn a cancel would have ended is already over"
         );
         assert!(

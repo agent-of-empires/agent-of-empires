@@ -54,6 +54,7 @@ pub(crate) struct SdkTestOptions {
     pub(crate) initialize_response_application: Option<SdkTestGate>,
     pub(crate) fresh_response_application: Option<SdkTestGate>,
     pub(crate) establishment_usable: Option<SdkTestGate>,
+    pub(crate) prompt_admission: Option<SdkTestGate>,
     pub(crate) prompt_completed: Option<SdkTestGate>,
     pub(crate) control_output:
         Option<tokio::sync::mpsc::UnboundedSender<crate::acp::control_protocol::ControlBody>>,

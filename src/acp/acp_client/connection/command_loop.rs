@@ -445,6 +445,8 @@ impl Session {
             }
             ClientCmd::Prompt(_)
             | ClientCmd::Cancel
+            | ClientCmd::InitialPromptIntent(_)
+            | ClientCmd::CancelInitialPrompt { .. }
             | ClientCmd::SetMode(_)
             | ClientCmd::SetConfigOption { .. } => {}
             independent_or_stop => {
@@ -457,6 +459,47 @@ impl Session {
             }
         }
         true
+    }
+
+    pub(super) async fn resolve_initial_command(
+        &self,
+        queued: QueuedClientCmd,
+    ) -> Option<QueuedClientCmd> {
+        let QueuedClientCmd {
+            command: ClientCmd::InitialPromptIntent(intent),
+            ..
+        } = queued else {
+            return Some(queued);
+        };
+        match intent.into_native().await {
+            Ok(command) => Some(command),
+            Err((error, intent)) => {
+                if !intent.cancellation.is_cancelled()
+                    && self.shared.connection_state.loss().is_none()
+                    && !self.shared.connection_state.is_stopping()
+                    && !matches!(
+                        &error,
+                        super::super::errors::AcpError::Establishment(
+                            crate::acp::establishment::EstablishmentRefusal::Superseded
+                        )
+                    )
+                {
+                    if let Some(agent_client_protocol::v1::schema::ContentBlock::Text(text)) =
+                        intent.blocks.into_iter().next()
+                    {
+                        let event = Event::PromptRejected {
+                            reason: error.to_string(),
+                            text: text.text,
+                        };
+                        let _ = self.shared.event_tx
+                            .with_metadata(crate::acp::event_sender::EventMetadata::host(&event))
+                            .send(event)
+                            .await;
+                    }
+                }
+                None
+            }
+        }
     }
 
     pub(super) async fn run(mut self) -> Result<(), agent_client_protocol::Error> {
@@ -535,6 +578,15 @@ impl Session {
                     }
                 },
             };
+            if matches!(
+                queued.as_ref().map(|queued| &queued.command),
+                Some(ClientCmd::InitialPromptIntent(_))
+            ) {
+                queued = self.resolve_initial_command(queued.take().expect("initial host intent")).await;
+                if queued.is_none() {
+                    continue;
+                }
+            }
 
             if self.refuse_unavailable_command(&mut queued) {
                 continue;
@@ -550,6 +602,10 @@ impl Session {
             };
 
             match command {
+                ClientCmd::InitialPromptIntent(_) => {
+                    unreachable!("host intent resolved before Native dispatch");
+                }
+                ClientCmd::CancelInitialPrompt { .. } => {}
                 ClientCmd::Prompt(blocks) => {
                     if self
                         .run_prompt(QueuedPrompt {

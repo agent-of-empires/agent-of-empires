@@ -1236,7 +1236,38 @@ mod tests {
                         if reference.is_some() { 1 } else { 0 }, qualification],
                 ).unwrap();
             }
-            for seq in 3..=8 {
+            for index in 0..24 {
+                let task_id = format!("newer-{index}");
+                for (seq, event) in [
+                    (
+                        3 + index * 2,
+                        Event::BackgroundTaskStarted {
+                            task_id: task_id.clone(),
+                            tool_call_id: None,
+                            description: "newer completed work".into(),
+                            workflow: None,
+                            started_at: None,
+                        },
+                    ),
+                    (
+                        4 + index * 2,
+                        Event::BackgroundTaskFinished {
+                            task_id,
+                            ended_at: None,
+                        },
+                    ),
+                ] {
+                    let json = serde_json::to_string(&event).unwrap();
+                    conn.execute(
+                        "INSERT INTO acp_events
+                         (session_id, seq, event_json, created_at, discriminant, scope, qualification_json)
+                         VALUES ('s', ?1, ?2, 0, ?3, 0, NULL)",
+                        rusqlite::params![seq, json, event_kind(&json)],
+                    )
+                    .unwrap();
+                }
+            }
+            for seq in 51..=56 {
                 conn.execute(
                     "INSERT INTO acp_events
                      (session_id, seq, event_json, created_at, discriminant, scope, qualification_json)
@@ -1248,7 +1279,8 @@ mod tests {
             let starts: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM acp_events WHERE session_id = 's'
-                 AND discriminant = 'BackgroundTaskStarted'",
+                 AND discriminant = 'BackgroundTaskStarted'
+                 AND json_extract(event_json, '$.BackgroundTaskStarted.task_id') = 'reused'",
                     [],
                     |row| row.get(0),
                 )

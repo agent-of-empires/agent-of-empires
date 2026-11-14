@@ -78,6 +78,7 @@ pub(crate) struct ConnectionState {
     foreground_finished: AtomicBool,
     establishment_declined: AtomicBool,
     pub(super) admission: std::sync::Mutex<()>,
+    pub(super) initial_prompt: std::sync::Mutex<Option<super::commands::InitialPromptState>>,
     sdk_closing: AtomicBool,
     unavailable_wake: tokio::sync::Notify,
     ordered_loss_wake: tokio::sync::Notify,
@@ -163,6 +164,66 @@ pub(super) enum CallbackDuration {
 }
 
 impl ConnectionState {
+    pub(super) fn initial_prompt_cancellation(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> Option<tokio_util::sync::CancellationToken> {
+        let correlation = correlation?;
+        let slot = self.initial_prompt.lock().unwrap();
+        slot.as_ref()
+            .filter(|pending| pending.correlation == Some(correlation))
+            .map(|pending| pending.cancellation.clone())
+    }
+
+    pub(super) fn begin_initial_prompt_write(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> bool {
+        let mut slot = self.initial_prompt.lock().unwrap();
+        if let Some(pending) = slot.as_mut().filter(|pending| {
+            correlation.is_some() && pending.correlation == correlation
+        }) {
+            if pending.cancellation.is_cancelled() {
+                return false;
+            }
+            pending.issued = true;
+        }
+        true
+    }
+
+    pub(super) fn initial_prompt_issued(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> bool {
+        correlation.is_some() && self.initial_prompt.lock().unwrap().as_ref()
+            .is_some_and(|pending| pending.correlation == correlation && pending.issued)
+    }
+
+    pub(super) fn initial_prompt_matches(
+        &self,
+        id: uuid::Uuid,
+        correlation: crate::acp::establishment::NativeOperationCorrelation,
+    ) -> bool {
+        self.initial_prompt.lock().unwrap().as_ref().is_some_and(|pending| {
+            pending.id == id
+                && pending.correlation == Some(correlation)
+                && pending.issued
+                && !pending.cancellation.is_cancelled()
+        })
+    }
+
+    pub(super) fn finish_initial_prompt_operation(
+        &self,
+        correlation: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) {
+        let mut slot = self.initial_prompt.lock().unwrap();
+        if correlation.is_some()
+            && slot.as_ref().is_some_and(|pending| pending.correlation == correlation)
+        {
+            slot.take();
+        }
+    }
+
     pub(super) fn reserve_native_duration(
         self: &Arc<Self>,
     ) -> Result<NativeOperationDuration, AcpError> {

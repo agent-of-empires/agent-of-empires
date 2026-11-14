@@ -140,6 +140,89 @@ impl<S: BroadcastSink> Supervisor<S> {
         published.await.unwrap_or(false)
     }
 
+    pub(super) async fn publish_initial_stopped(
+        &self,
+        session_id: &str,
+        original: std::sync::Weak<crate::acp::acp_client::AcpClient>,
+        epoch: u64,
+        intent: uuid::Uuid,
+        prompt_seq: u64,
+    ) -> Result<(), super::SupervisorError> {
+        let workers = Arc::clone(&self.workers);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let next_seqs = Arc::clone(&self.next_seqs);
+        let sink = Arc::clone(&self.sink);
+        let session_id = session_id.to_owned();
+        let (done, completed) = tokio::sync::oneshot::channel();
+        let publication = super::WorkerPublication::new(async move {
+            let result = loop {
+                let mut wait = None;
+                let result = async {
+                    let workers = workers.lock().await;
+                    let Some(handle) = workers.get(&session_id) else {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    };
+                    let Some(client) = original.upgrade().filter(|client| Arc::ptr_eq(client, &handle.client)) else {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    };
+                    let lifecycle = super::lock_recover(&lifecycle);
+                    if lifecycle.phase(&session_id) != crate::acp::runner_lifecycle::WorkerPhase::Running
+                        || lifecycle.current_lease(&session_id).as_ref() != Some(&handle.lease)
+                        || handle.lease.epoch() != epoch
+                        || handle.lease.cancellation().is_cancelled()
+                    {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    }
+                    let scope = match handle.lease.native_scope() {
+                        Ok(Some(scope)) => scope,
+                        _ => return Some(Err(super::SupervisorError::NativeStoreUnavailable)),
+                    };
+                    let _native = match scope.fence.try_lock_observation_matching(|row| {
+                        row.status != crate::session::Status::Stopped
+                            && row.archived_at.is_none()
+                            && row.trashed_at.is_none()
+                            && row.terminal_handoff.is_none()
+                            && scope.choice.as_ref().is_some_and(|choice| choice.matches(row))
+                    }) {
+                        Ok(Some(guard)) => guard,
+                        Ok(None) => {
+                            wait = Some(Arc::clone(&scope.fence));
+                            return None;
+                        }
+                        Err(_) => return Some(Err(super::SupervisorError::NativeStoreUnavailable)),
+                    };
+                    if !client.take_cancelled_initial_prompt(intent, prompt_seq) {
+                        return Some(Err(super::SupervisorError::Superseded(session_id.clone())));
+                    }
+                    let data = AcpEventData::from_host(Event::Stopped { reason: "user_stopped".into() });
+                    let seq = with_publication_seq(&next_seqs, &session_id, |seq| seq);
+                    drop(lifecycle);
+                    drop(workers);
+                    Some(if sink.publish_persisted(&session_id, seq, &data) {
+                        Ok(())
+                    } else {
+                        Err(super::SupervisorError::NativeStoreUnavailable)
+                    })
+                }.await;
+                if let Some(result) = result {
+                    break result;
+                }
+                let fence = wait.expect("unavailable Native fence supplied a wait");
+                if !matches!(
+                    tokio::task::spawn_blocking(move || fence.lock_observation().map(drop)).await,
+                    Ok(Ok(()))
+                ) {
+                    break Err(super::SupervisorError::NativeStoreUnavailable);
+                }
+            };
+            let _ = done.send(result);
+        });
+        if let Err(publication) = self.sink.publish_from_worker(publication) {
+            publication.complete().await;
+        }
+        completed.await.unwrap_or(Err(super::SupervisorError::ControlStateUnavailable))
+    }
+
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
     /// session's latest seq, so a repair decided from the log cannot land
     /// after something newer.

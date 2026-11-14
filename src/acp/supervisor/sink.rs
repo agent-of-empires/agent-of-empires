@@ -163,6 +163,8 @@ impl Persisted {
 pub struct WorkerPublication {
     runtime: tokio::runtime::Handle,
     completion: std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    #[cfg(test)]
+    submission: Option<TestSdkSubmission>,
 }
 
 impl WorkerPublication {
@@ -170,7 +172,15 @@ impl WorkerPublication {
         Self {
             runtime: tokio::runtime::Handle::current(),
             completion: Box::pin(completion),
+            #[cfg(test)]
+            submission: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_submission(mut self, submission: Option<TestSdkSubmission>) -> Self {
+        self.submission = submission;
+        self
     }
 
     pub(super) async fn complete(self) {
@@ -180,6 +190,39 @@ impl WorkerPublication {
     fn run(self) {
         self.runtime.block_on(self.completion);
     }
+}
+
+#[cfg(test)]
+#[derive(PartialEq, Eq)]
+pub(super) struct TestSdkSubmission {
+    session_id: String,
+    correlation: crate::acp::establishment::NativeOperationCorrelation,
+    origin: crate::acp::state::NativeEventOrigin,
+}
+
+#[cfg(test)]
+impl TestSdkSubmission {
+    pub(super) fn from_incoming(session_id: &str, incoming: &crate::acp::event_sender::SdkEvent) -> Option<Self> {
+        let crate::acp::event_sender::SdkEvent::Data(data) = incoming else {
+            return None;
+        };
+        if data.metadata.scope != crate::acp::event_sender::EventScope::OperationCurrent
+            || !matches!(data.event.as_ref(), crate::acp::state::Event::Stopped { reason } if reason == "prompt_complete")
+        {
+            return None;
+        }
+        Some(Self {
+            session_id: session_id.to_owned(),
+            correlation: data.metadata.operation.as_ref()?.correlation,
+            origin: data.metadata.native_origin?,
+        })
+    }
+}
+
+#[cfg(test)]
+struct TestSubmissionProbe {
+    expected: TestSdkSubmission,
+    submitted: tokio::sync::oneshot::Sender<()>,
 }
 
 /// Publications queued for the writer thread. A worker's drain blocks only
@@ -194,6 +237,8 @@ pub struct ChannelSink {
     writer: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
     flushes: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    submission_probe: std::sync::Mutex<Option<TestSubmissionProbe>>,
 }
 
 struct Persister {
@@ -260,6 +305,26 @@ impl ChannelSink {
             writer,
             #[cfg(test)]
             flushes: Default::default(),
+            #[cfg(test)]
+            submission_probe: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn notify_submission(&self, submission: Option<TestSdkSubmission>) {
+        let Some(submission) = submission else {
+            return;
+        };
+        let notify = {
+            let mut probe = self.submission_probe.lock().unwrap();
+            if probe.as_ref().is_some_and(|probe| probe.expected == submission) {
+                probe.take().map(|probe| probe.submitted)
+            } else {
+                None
+            }
+        };
+        if let Some(notify) = notify {
+            let _ = notify.send(());
         }
     }
 
@@ -332,6 +397,23 @@ impl super::Supervisor<ChannelSink> {
         self.sink.submit(Job::Test(Box::new(run)));
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_observe_stopped_submission(
+        &self,
+        session_id: &str,
+        correlation: crate::acp::establishment::NativeOperationCorrelation,
+        origin: crate::acp::state::NativeEventOrigin,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (submitted, received) = tokio::sync::oneshot::channel();
+        let mut probe = self.sink.submission_probe.lock().unwrap();
+        assert!(probe.is_none(), "one submission probe per sink");
+        *probe = Some(TestSubmissionProbe {
+            expected: TestSdkSubmission { session_id: session_id.to_owned(), correlation, origin },
+            submitted,
+        });
+        received
+    }
+
     /// Flushes requested so far, so a test can tell a reader is waiting on the writer.
     #[cfg(test)]
     pub(crate) fn test_flushes(&self) -> usize {
@@ -359,6 +441,12 @@ impl BroadcastSink for ChannelSink {
     /// Queue original owned completion without a per-frame task or durable wait.
     fn publish_from_worker(&self, publication: WorkerPublication) -> Result<(), WorkerPublication> {
         use std::sync::mpsc::TrySendError;
+        #[cfg(test)]
+        let (publication, submission) = {
+            let mut publication = publication;
+            let submission = publication.submission.take();
+            (publication, submission)
+        };
         if self
             .writer
             .as_ref()
@@ -370,10 +458,18 @@ impl BroadcastSink for ChannelSink {
             return Err(publication);
         };
         let job = match jobs.try_send(Job::Worker(publication)) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                #[cfg(test)]
+                self.notify_submission(submission);
+                return Ok(());
+            }
             Err(TrySendError::Disconnected(job)) => job,
             Err(TrySendError::Full(job)) => match blocking_io(|| jobs.send(job)) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(test)]
+                    self.notify_submission(submission);
+                    return Ok(());
+                }
                 Err(std::sync::mpsc::SendError(job)) => job,
             },
         };

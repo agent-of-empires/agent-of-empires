@@ -570,6 +570,14 @@ export interface AuthStatus {
   } | null;
 }
 
+/** Stateless comparison digest, never Native authority or a callback capability. */
+export type EstablishmentRevision = readonly number[];
+
+export interface EstablishmentRecovery {
+  revision: EstablishmentRevision;
+  action: "same" | "fresh";
+}
+
 /** Fields this client adopts from the daemon's folded `AcpState`. */
 export interface ReducedState {
   agent: string;
@@ -606,6 +614,8 @@ export interface ReducedState {
   original_decision_nonces?: string[];
   /** Existing current WorkerDown queue/wake eligibility, not native health. */
   prompt_wake_eligible?: boolean | null;
+  host_prompt_intent?: string | null;
+  establishment_revision?: EstablishmentRevision | null;
   last_seq?: number;
   /** Background shells, running and recently finished; omitted when there are none. */
   background_shells?: {
@@ -687,6 +697,9 @@ export interface AcpState {
   /** Live canonical per-request authority; never restored from history or cache. */
   originalDecisionNonces: string[];
   promptWakeEligible: boolean;
+  /** Live actor-local cancellation identity; never restored from history or cache. */
+  hostPromptIntent: string | null;
+  establishmentRevision: EstablishmentRevision | null;
   interactionError: InteractionError | null;
   /** Derived from `serverTurnActive || inflightPromptIds.length > 0`; never written directly. */
   turnActive: boolean;
@@ -1139,6 +1152,8 @@ export function emptyAcpState(): AcpState {
     nativeSnapshotSeq: null,
     originalDecisionNonces: [],
     promptWakeEligible: false,
+    hostPromptIntent: null,
+    establishmentRevision: null,
     inflightPromptIds: [],
     integrationLost: null,
     integrationLostSnapshotSeq: null,
@@ -1184,6 +1199,8 @@ export function revokeNativeAuthority(state: AcpState): AcpState {
     !state.connectionReady &&
     !state.promptWakeEligible &&
     state.nativeSnapshotSeq == null &&
+    state.hostPromptIntent == null &&
+    state.establishmentRevision == null &&
     state.connectionUnavailable === null &&
     state.rateLimitRetriesExhausted === null &&
     state.rateLimitParked === null
@@ -1195,6 +1212,8 @@ export function revokeNativeAuthority(state: AcpState): AcpState {
     nativeSnapshotSeq: null,
     originalDecisionNonces: [],
     promptWakeEligible: false,
+    hostPromptIntent: null,
+    establishmentRevision: null,
     connectionUnavailableNotice: state.connectionUnavailable ?? state.connectionUnavailableNotice,
     connectionUnavailable: null,
     rateLimitRetriesExhausted: null,
@@ -1469,6 +1488,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("Stopped" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     // Whether this `Stopped` ends the turn is the daemon's call (see closeTurn); the escalation deadline is ours.
     next.cancelEscalatesAt = null;
     closeTurn(next);
@@ -1524,6 +1545,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("AgentStartupError" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     next.startupError = event.AgentStartupError.message;
     endRestart(next);
     next.agentUnresponsive = false;
@@ -1531,6 +1554,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("PromptRuntimeError" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     next.lastError = event.PromptRuntimeError.message;
     next.lastErrorEvidence = event.PromptRuntimeError.evidence ?? null;
     closeTurn(next);
@@ -1540,6 +1565,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     next.connectionUnavailableNotice = event.AcpConnectionUnavailable;
     next.connectionReady = false;
     next.promptWakeEligible = false;
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     return next;
   }
   if ("ApprovalResolved" in event || "ElicitationResolved" in event) {
@@ -1597,6 +1624,8 @@ function applyRawEvent(state: AcpState, frame: AcpFrame, rawTurnActive: boolean,
     return next;
   }
   if ("SessionContextReset" in event) {
+    next.hostPromptIntent = null;
+    next.establishmentRevision = null;
     next.sessionUsage = null;
     next.usageBaseline = null;
     // A session/load failure before any prompt is expected; no primer to offer.
@@ -1879,6 +1908,15 @@ export function applyReducedState(
     originalDecisionNonces:
       authoritative && connectionUnavailable === null ? [...(reduced.original_decision_nonces ?? [])] : [],
     promptWakeEligible: authoritative && reduced.prompt_wake_eligible === true && connectionUnavailable === null,
+    hostPromptIntent:
+      authoritative && connectionUnavailable === null && typeof reduced.host_prompt_intent === "string"
+        ? reduced.host_prompt_intent
+        : null,
+    establishmentRevision: authoritative
+      ? holds("establishment_revision")
+        ? state.establishmentRevision
+        : (reduced.establishment_revision ?? null)
+      : null,
     availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
     availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
@@ -2081,6 +2119,7 @@ function closeTurn(next: AcpState): void {
 }
 
 function closeUnavailableConnection(next: AcpState): void {
+  next.hostPromptIntent = null;
   // A refused management attachment grants no controls, but does not prove
   // that the retained native turn, tool or callbacks ended.
   if (next.connectionUnavailable?.source === "runner_record") return;

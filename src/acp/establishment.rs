@@ -208,6 +208,59 @@ impl EstablishmentExpected {
             && self.choice.matches(row)
             && self.authority == row.acp_establishment)
     }
+
+    pub(crate) fn revision(&self) -> anyhow::Result<EstablishmentRevision> {
+        use sha2::Digest as _;
+        struct Writer<'a>(&'a mut sha2::Sha256);
+        impl std::io::Write for Writer<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // This complete comparison graph contains ordered structs/vectors, not maps.
+        // Its derived serialization includes all checkpoint-route markers (including
+        // None versus Some(false)). PrimeRuntime's skipped observation is also
+        // excluded from its equality; its compared proof_path remains serialized.
+        // An unrepresentable path fails closed instead of producing a partial digest.
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"agent-of-empires/establishment-recovery-revision/v1\0");
+        serde_json::to_writer(Writer(&mut digest), self)?;
+        Ok(EstablishmentRevision(digest.finalize().into()))
+    }
+}
+
+/// Public comparison data, never Native/callback/resource authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EstablishmentRevision([u8; 32]);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EstablishmentRecoveryRequest {
+    pub(crate) revision: EstablishmentRevision,
+    pub(crate) action: EstablishmentRecoveryAction,
+}
+
+impl EstablishmentRecoveryRequest {
+    pub(crate) fn resolve(
+        self,
+        row: &Instance,
+        storage: &Storage,
+    ) -> anyhow::Result<EstablishmentRecovery> {
+        let expected = EstablishmentExpected::capture(row, storage)?;
+        anyhow::ensure!(
+            self.revision == expected.revision()?,
+            EstablishmentRefusal::Superseded
+        );
+        Ok(EstablishmentRecovery {
+            expected,
+            action: self.action,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

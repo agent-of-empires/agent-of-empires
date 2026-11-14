@@ -1905,18 +1905,20 @@ mod tests {
             Event::Stopped {
                 reason: "prompt_complete".into(),
             },
+            Event::ThinkingStarted,
             Event::AgentMessageChunk {
                 text: "woken".into(),
                 message_id: None,
             },
         ];
+        let mut autonomous = crate::server::test_support::sql_projection_metadata();
+        autonomous.scope = crate::acp::event_sender::EventScope::SessionCurrent;
+        autonomous.operation = None;
+        autonomous.prompt_observation = None;
         for (i, event) in events.iter().enumerate() {
-            let metadata = if matches!(event, Event::AgentMessageChunk { .. }) {
-                crate::server::test_support::sql_projection_metadata()
-            } else {
-                crate::acp::event_sender::EventMetadata::host(event)
-            };
-            store.record(id, i as u64 + 1, event, &metadata).unwrap();
+            let host = crate::acp::event_sender::EventMetadata::host(event);
+            let metadata = if i >= 2 { &autonomous } else { &host };
+            store.record(id, i as u64 + 1, event, metadata).unwrap();
         }
         assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, true)));
         assert_eq!(store.holds_live_work(id).unwrap(), Known(true));
@@ -1927,9 +1929,9 @@ mod tests {
         store
             .record(
                 id,
-                4,
+                events.len() as u64 + 1,
                 &stop,
-                &crate::acp::event_sender::EventMetadata::host(&stop),
+                &autonomous,
             )
             .unwrap();
         assert_eq!(open_turn_kinds(store, id).unwrap(), Known((false, false)));

@@ -99,10 +99,20 @@ mod tests {
         let initial = identity();
         migrate_database(&path).unwrap();
         assert_eq!(identity(), initial);
-        let store = EventStore::open(&path, 0, Default::default()).unwrap();
-        let retained = store.replay_from("retained", 0).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let mut statement = conn
+            .prepare("SELECT seq, event_json FROM acp_events WHERE session_id = 'retained' ORDER BY seq")
+            .unwrap();
+        let retained = statement
+            .query_map([], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(retained.len(), 1);
-        assert_eq!(retained[0].seq, 7);
-        assert!(matches!(retained[0].event.as_ref(), Event::ThinkingStarted));
+        assert_eq!(retained[0].0, 7);
+        assert_eq!(
+            retained[0].1,
+            serde_json::to_string(&Event::ThinkingStarted).unwrap()
+        );
     }
 }

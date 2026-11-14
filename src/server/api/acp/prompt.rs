@@ -617,12 +617,19 @@ pub async fn acp_attachment(
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+struct CancelPromptRequest {
+    #[serde(default)]
+    host_prompt_intent: Option<uuid::Uuid>,
+}
+
 /// Cancel the in-flight turn, ordered behind any prompt submission in flight.
 /// The guard can also be held by a queue drain or a rename, so a long wait is
 /// logged: the UI shows no progress meanwhile.
 pub async fn acp_cancel(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
         return resp;
@@ -630,6 +637,14 @@ pub async fn acp_cancel(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    let request = if body.is_empty() {
+        CancelPromptRequest::default()
+    } else {
+        match serde_json::from_slice::<CancelPromptRequest>(&body) {
+            Ok(request) => request,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        }
+    };
     let waited_from = std::time::Instant::now();
     let _submission = state
         .session_service
@@ -645,7 +660,7 @@ pub async fn acp_cancel(
              progress for that long"
         );
     }
-    match state.acp_supervisor.cancel_prompt(&id).await {
+    match state.acp_supervisor.cancel_prompt(&id, request.host_prompt_intent).await {
         Ok(()) => {
             tracing::info!(
                 target: "acp.supervisor",

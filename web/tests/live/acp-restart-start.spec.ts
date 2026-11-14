@@ -41,7 +41,7 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   const line = page.getByTestId("startup-wait-line");
   await expect(line).toBeVisible({ timeout: 15_000 });
   await expect.poll(stalls, { timeout: 15_000 }).toBe(1);
-  const restart = line.getByRole("button", { name: "Restart Claude Code" });
+  const restart = line.getByRole("button", { name: "Start fresh", exact: true });
   await expect(restart).toHaveCount(0);
 
   // Wait for current governed prompt-intent admission, not Native readiness.
@@ -69,8 +69,11 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   );
   const restarted = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
+  await page.getByTestId("startup-fresh-confirm").click();
   const res = await restarted;
-  expect(res.request().postDataJSON()).toEqual({});
+  const firstRecovery = res.request().postDataJSON();
+  expect(firstRecovery).toMatchObject({ recovery: { action: "fresh", revision: expect.any(Array) } });
+  expect(firstRecovery.recovery.revision).toHaveLength(32);
   expect(res.status(), await res.text()).toBe(200);
 
   // The restart's own stop has reached this dashboard, and the replacement is stuck as well.
@@ -86,7 +89,13 @@ test("Restart on the startup line replaces a start stuck in session/new, again i
   );
   const again = page.waitForResponse((r) => r.url().endsWith("/acp/restart") && r.request().method() === "POST");
   await restart.click();
-  expect((await again).status()).toBe(200);
+  await page.getByTestId("startup-fresh-confirm").click();
+  const second = await again;
+  expect(second.status(), await second.text()).toBe(200);
+  const secondRecovery = second.request().postDataJSON();
+  expect(secondRecovery).toMatchObject({ recovery: { action: "fresh", revision: expect.any(Array) } });
+  expect(secondRecovery.recovery.revision).toHaveLength(32);
+  expect(secondRecovery.recovery.revision).not.toEqual(firstRecovery.recovery.revision);
 
   await expect
     .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === session!.id)?.acp_worker_state, {

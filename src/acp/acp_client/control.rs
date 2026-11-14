@@ -663,7 +663,7 @@ impl DaemonControlClient {
             warn!(target: "acp.protocol", ?error, "control request encoding refused");
             AcpError::Protocol("request exceeds runner control capacity".into())
         })?;
-        let result = self.send_encoded(&wire, cached_management).await;
+        let result = self.send_encoded(&wire, cached_management, None).await;
         #[cfg(test)]
         if result.is_ok() {
             if let Some(observer) = self
@@ -688,11 +688,23 @@ impl DaemonControlClient {
                 .is_some_and(|loss| loss.source == AcpConnectionSource::Native)
     }
 
-    async fn send_encoded(&self, wire: &[u8], cached_management: bool) -> Result<(), AcpError> {
+    async fn send_encoded(
+        &self,
+        wire: &[u8],
+        cached_management: bool,
+        prompt: Option<crate::acp::establishment::NativeOperationCorrelation>,
+    ) -> Result<(), AcpError> {
+        let cancellation = self.connection_state.initial_prompt_cancellation(prompt);
         let lock = self.write.lock();
         tokio::pin!(lock);
         let mut writer = tokio::select! {
             biased;
+            _ = async {
+                match cancellation.as_ref() {
+                    Some(cancellation) => cancellation.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(AcpError::NotRunning),
             writer = &mut lock => writer,
             loss = self.connection_state.wait_unavailable() => {
                 if !self.may_report_cache(cached_management) {
@@ -723,6 +735,9 @@ impl DaemonControlClient {
                             observation,
                         )));
                     }
+                }
+                if prompt.is_some() && !self.connection_state.begin_initial_prompt_write(prompt) {
+                    return std::task::Poll::Ready(Err(AcpError::NotRunning));
                 }
                 // Finish an admitted control frame rather than corrupting its
                 // length framing on partial writes. The runner separately
@@ -1009,6 +1024,7 @@ impl DaemonControlClient {
         scope: crate::acp::establishment::NativeRequestScope,
     ) -> Result<oneshot::Receiver<ControlPromptResult>, AcpError> {
         self.connection_state.admit(|| ())?;
+        let correlation = scope.correlation();
         let pending_scope = scope.clone();
         let wire = control_protocol::encode_frame(&ControlBody::Prompt { request, scope })
             .map_err(|error| {
@@ -1032,7 +1048,7 @@ impl DaemonControlClient {
             Ok(rx)
         })??;
         debug!(target: "acp.protocol", "prompt completion waiter installed");
-        if self.send_encoded(&wire, false).await.is_err() {
+        if self.send_encoded(&wire, false, correlation).await.is_err() {
             let mut completion = self.completion.lock().expect("completion mutex poisoned");
             if matches!(*completion, PromptCompletion::Pending { .. }) {
                 *completion = PromptCompletion::LocalIdle;
@@ -2056,7 +2072,7 @@ pub(super) async fn connect_runner_control(
                     }
                 }
             }
-            if pump_control.send_encoded(&wire, false).await.is_err() {
+            if pump_control.send_encoded(&wire, false, None).await.is_err() {
                 if let Some((sdk_id, call_id)) = forward {
                     pump_control.cancel_forward(&sdk_id, call_id);
                 }

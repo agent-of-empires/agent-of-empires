@@ -9,6 +9,7 @@ import { STATE_TTL_MS, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { reportAcpInteraction, type ServerQueuedPrompt } from "../lib/api";
 import { useCancelEscalation } from "../components/acp/useCancelEscalation";
 import { BackgroundAgentsPanel } from "../components/acp/BackgroundAgentsPanel";
+import { StopSession } from "../components/acp/subagents/StopSession";
 import { ACP_DIAL_TIMEOUT_MS, ACP_MAX_RETRIES, ACP_WS_STALE_MS, acpRetryDelayMs } from "./acpSession/useAcpConnection";
 import {
   FakeWebSocket,
@@ -1101,6 +1102,72 @@ describe("setConfigOption", () => {
 });
 
 describe("current native admission", () => {
+  it.each(["composer", "panel"] as const)(
+    "cancels only the live host intent through the %s gesture while Native remains Unknown",
+    async (consumer) => {
+      const id = "sess-pending-host";
+      const intent = "5fdcc941-9be3-4f26-ab31-21b612084392";
+      const hook = renderHook(() => {
+        const acp = useAcpSession(id);
+        const escalation = useCancelEscalation(id, acp.state.promptSeq, acp.state.cancelling,
+          acp.cancelPrompt, acp.forceEndTurn);
+        return { acp, escalation };
+      }, { wrapper: profileWrapper });
+      await flushAsync();
+      lastSocket().open();
+      await flushAsync();
+      lastSocket().message({
+        session_id: id, seq: 1, event: { UserPromptSent: { text: "accepted host intent" } },
+      });
+      const snapshot = currentControlSnapshot(hook.result.current.acp.state, { ready: false }, 1);
+      snapshot.state.host_prompt_intent = intent;
+      lastSocket().message(snapshot);
+      await flushAsync();
+      expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(false);
+      expect(hook.result.current.acp.state.turnActive).toBe(true);
+      expect(hook.result.current.acp.state.hostPromptIntent).toBe(intent);
+      const panel = consumer === "panel"
+        ? renderView(createElement(StopSession, { sessionId: id, running: 1 }), { wrapper: profileWrapper })
+        : null;
+      if (panel) {
+        fireEvent.click(panel.getByRole("button", { name: "Stop", exact: true }));
+        expect(posts("/acp/cancel")).toEqual([]);
+        fireEvent.click(panel.getByRole("button", { name: "Interrupt session" }));
+        await flushAsync();
+      } else {
+        await act(() => hook.result.current.escalation.onCancel());
+      }
+      expect(posts("/acp/cancel")).toEqual([{
+        method: "POST", url: `/api/sessions/${id}/acp/cancel`, body: { host_prompt_intent: intent },
+      }]);
+      await act(async () => {
+        await hook.result.current.acp.cancelSubagent("child");
+        await hook.result.current.acp.setConfigOption("model", "not-authorized");
+        await hook.result.current.acp.forceEndTurn();
+      });
+      expect(posts("/subagents/")).toEqual([]);
+      expect(posts("/config-option")).toEqual([]);
+      expect(posts("/force_end_turn")).toEqual([]);
+      expect(nativeInputAvailable(hook.result.current.acp.state)).toBe(false);
+      const cleared = currentControlSnapshot(hook.result.current.acp.state, { ready: false }, 2);
+      cleared.state.host_prompt_intent = null;
+      lastSocket().message(cleared);
+      lastSocket().message(snapshot);
+      await flushAsync();
+      expect(hook.result.current.acp.state.hostPromptIntent).toBeNull();
+      await act(() => hook.result.current.acp.cancelPrompt());
+      expect(posts("/acp/cancel")).toHaveLength(1);
+      panel?.unmount();
+      hook.unmount();
+      const restored = render(id);
+      await flushAsync();
+      expect(restored.result.current.state.hostPromptIntent).toBeNull();
+      await act(() => restored.result.current.cancelPrompt());
+      expect(posts("/acp/cancel")).toHaveLength(1);
+      restored.unmount();
+    },
+  );
+
   it.each([
     [false, true, 1],
     [true, false, 0],

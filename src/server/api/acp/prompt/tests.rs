@@ -88,6 +88,199 @@ fn published(state: &AppState, id: &str, pred: impl Fn(&Event) -> bool) -> bool 
         .any(|stored| pred(stored.event.as_ref()))
 }
 
+struct PendingInitialSession {
+    client: crate::acp::supervisor::test_support::managed::ManagedClient,
+    native: crate::acp::supervisor::test_support::managed::NativePeer,
+    state: Arc<AppState>,
+    requests: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    new_request: serde_json::Value,
+    sid: String,
+}
+
+impl PendingInitialSession {
+    async fn new(
+        scope: &mut crate::acp::supervisor::test_support::managed::ManagedScope,
+        label: &str,
+    ) -> Self {
+        let project = scope.tempdir();
+        let store = crate::session::get_app_dir().unwrap().join(label);
+        std::fs::create_dir_all(&store).unwrap();
+        scope.save_environment(&["CLAUDE_CONFIG_DIR"]);
+        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
+        let (sent, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let (config, native) = scope.native_peer(
+            project.path().into(), "claude", "claude", move |request| {
+                match request["method"].as_str().unwrap() {
+                    "initialize" => Some(serde_json::json!({
+                        "jsonrpc": "2.0", "id": request["id"],
+                        "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}
+                    })),
+                    "session/new" | "session/prompt" | "session/cancel" => {
+                        sent.send(request.clone()).unwrap();
+                        None
+                    }
+                    other => panic!("unexpected actual Native method: {other}"),
+                }
+            },
+        );
+        let client = scope.spawn(config, label).await.unwrap();
+        let new_request = tokio::time::timeout(Duration::from_secs(10), requests.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(new_request["method"], "session/new");
+        let state = scope.state.clone();
+        crate::server::test_support::accept_runtime_read_cache_for_test(&state).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if state.instances.read().await.iter().any(|row|
+                    row.id == client.id && row.launch_is_finalized()
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("actual creation is finalized while Native New remains held");
+        drop(tokio::time::timeout(Duration::from_secs(10),
+            state.session_service.prompt_submission(&client.id))
+            .await.expect("actual creator releases its submission"));
+        assert_ne!(client.lease.spawned_runner().unwrap().pid, std::process::id());
+        Self { client, native, state, requests, new_request, sid: format!("{label}-native") }
+    }
+
+    async fn release_new(&mut self) {
+        self.native.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": self.new_request["id"],
+            "result": {"sessionId": self.sid}
+        })).await;
+        self.client.ready().await;
+    }
+
+    async fn next_request(&mut self, method: &str) -> serde_json::Value {
+        let request = tokio::time::timeout(Duration::from_secs(10), self.requests.recv())
+            .await.expect("actual Native FIFO advances").unwrap();
+        assert_eq!(request["method"], method);
+        request
+    }
+
+    async fn finish(&mut self, request: &serde_json::Value) {
+        self.native.send(serde_json::json!({
+            "jsonrpc": "2.0", "id": request["id"], "result": {"stopReason": "end_turn"}
+        })).await;
+        self.wait_stopped("prompt_complete").await;
+    }
+
+    async fn wait_stopped(&mut self, reason: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = self.client.next_event().await.expect("actual drain remains open");
+                if matches!(&event, Event::Stopped { reason: got } if got == reason) {
+                    break;
+                }
+                assert!(!matches!(event,
+                    Event::AgentStartupError { .. } | Event::AcpConnectionUnavailable { .. }));
+            }
+        }).await.expect("actual publication settles this turn");
+    }
+
+    async fn submit(&self, text: &str) {
+        let response = acp_prompt(State(self.state.clone()), Path(self.client.id.clone()),
+            prompt_req(text)).await.into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{}", String::from_utf8_lossy(&body));
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["disposition"], "sent");
+        assert!(body["queued_id"].is_null());
+    }
+
+    async fn cancel(&self, intent: Option<uuid::Uuid>) -> StatusCode {
+        let body = intent.map(|id| axum::body::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({"host_prompt_intent": id})).unwrap()
+        )).unwrap_or_default();
+        acp_cancel(State(self.state.clone()), Path(self.client.id.clone()), body)
+            .await.into_response().status()
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn initial_host_intent_obeys_applied_and_stop_before_native_issue() {
+    use crate::acp::supervisor::test_support::managed::with_managed;
+    for mode in 0..3 {
+        with_managed(|scope| Box::pin(async move {
+            let gate = if mode == 2 {
+                let (gate, release, entered) = scope.gate();
+                scope.configure_sdk(crate::acp::acp_client::SdkTestOptions {
+                    prompt_admission: Some(gate), ..Default::default()
+                });
+                Some((release, entered))
+            } else { None };
+            let mut live = PendingInitialSession::new(scope, "initial-host-intent").await;
+            let owner = live.client.lease.spawned_runner().unwrap();
+            live.submit("original first host intent").await;
+            let reduced = live.state.session_service.fold_control_state(&live.client.id).await.unwrap();
+            let projected = live.state.session_service.native_control_projection(
+                &live.client.id, None, reduced.last_seq).await;
+            assert!(!projected.ready);
+            let original_intent = projected.host_prompt_intent.expect("live host-only cancellation identity");
+            assert_eq!(live.client.initial_prompt_identity(), Some(original_intent));
+            assert!(!live.native.requests().iter().any(|method|
+                method == "session/prompt" || method == "session/cancel"));
+            assert!(live.state.instances.read().await.iter().find(|row|
+                row.id == live.client.id).unwrap().pending_initial_turn.is_none());
+            if mode == 1 {
+                assert_eq!(live.cancel(Some(original_intent)).await, StatusCode::ACCEPTED);
+                live.wait_stopped("user_stopped").await;
+            }
+            live.release_new().await;
+            if let Some((release, entered)) = gate {
+                tokio::time::timeout(Duration::from_secs(10), entered).await.unwrap().unwrap();
+                assert_eq!(live.cancel(Some(original_intent)).await, StatusCode::ACCEPTED);
+                live.wait_stopped("user_stopped").await;
+                release.release();
+            }
+            if mode == 0 {
+                let original = live.next_request("session/prompt").await;
+                assert_eq!(original["params"]["sessionId"], live.sid);
+                assert_eq!(original["params"]["prompt"][0]["text"], "original first host intent");
+                live.finish(&original).await;
+                let reset = live.client.reset_session("/clear");
+                tokio::pin!(reset);
+                let request = tokio::select! {
+                    request = live.requests.recv() => request.unwrap(),
+                    result = &mut reset => panic!("reset answered before its actual Native New: {result:?}"),
+                };
+                assert_eq!(request["method"], "session/new");
+                let replacement = "replacement-native-attempt";
+                live.native.send(serde_json::json!({
+                    "jsonrpc": "2.0", "id": request["id"], "result": {"sessionId": replacement}
+                })).await;
+                reset.await.unwrap();
+                live.sid = replacement.into();
+            }
+            assert_eq!(live.client.initial_prompt_identity(), None);
+            live.submit("explicit replacement input").await;
+            let replacement = live.next_request("session/prompt").await;
+            assert_eq!(replacement["params"]["sessionId"], live.sid);
+            assert_eq!(replacement["params"]["prompt"][0]["text"], "explicit replacement input");
+            assert_eq!(live.cancel(Some(original_intent)).await, StatusCode::CONFLICT);
+            assert_eq!(live.client.lease.spawned_runner(), Some(owner));
+            assert_eq!(live.cancel(None).await, StatusCode::ACCEPTED);
+            let cancel = live.next_request("session/cancel").await;
+            assert_eq!(cancel["params"]["sessionId"], live.sid);
+            let requests = live.native.requests();
+            assert_eq!(requests.iter().filter(|method| *method == "session/prompt").count(),
+                if mode == 0 { 2 } else { 1 });
+            assert_eq!(requests.iter().filter(|method| *method == "session/cancel").count(), 1);
+            let replay = live.state.acp_event_store.replay_from(&live.client.id, 0).unwrap();
+            assert_eq!(replay.iter().filter(|stored| matches!(stored.event.as_ref(),
+                Event::Stopped { reason } if reason == "user_stopped")).count(),
+                if mode == 0 { 0 } else { 1 });
+            live.finish(&replacement).await;
+            live.client.shutdown().await.unwrap();
+        })).await;
+    }
+}
+
 /// A structured session whose worker starts fail: on the provider limit when
 /// `rate_limited`, otherwise as a generic launch failure. The count proves a
 /// case reached the start it forced.
@@ -281,7 +474,7 @@ async fn cancel_waits_for_an_in_flight_prompt_submission() {
     let cancel = {
         let state = Arc::clone(&state);
         let id = id.clone();
-        async move { acp_cancel(State(state), Path(id)).await.into_response() }
+        async move { acp_cancel(State(state), Path(id), axum::body::Bytes::new()).await.into_response() }
     };
     tokio::pin!(cancel);
     assert!(futures_util::poll!(&mut cancel).is_pending());
@@ -2064,7 +2257,7 @@ async fn current_owned_native_receipt_needs_no_historical_ready_and_refreshes_be
                         )),
                         Some(carried.clone()),
                     ) {
-                        Ok(projection) => {
+                        Ok((projection, _expected)) => {
                             assert!(!projection.ready, "latched loss cannot become Ready");
                             if projection.unavailable.is_some() {
                                 break projection;

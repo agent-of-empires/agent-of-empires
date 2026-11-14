@@ -1,9 +1,11 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 
 import { useRespawnSession } from "../../hooks/useRespawnSession";
-import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState } from "../../lib/acpTypes";
+import { BRAND_BUTTON, CancelButton, ConfirmButton, Dialog } from "../Dialog";
+import { useBusyAction, useConfirmKeys, useDialogFocus } from "../dialogHooks";
+import { nativeInputAvailable, type AcpConnectionUnavailability, type AcpState, type EstablishmentRevision } from "../../lib/acpTypes";
 import { RATTLES } from "../../lib/rattles";
-import { SECONDARY_BUTTON } from "./RecoveryActionRow";
+import { RecoveryActionRow } from "./RecoveryActionRow";
 import { StartupErrorBanner } from "./StartupErrorBanner";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
@@ -122,6 +124,7 @@ export function SessionBanners({
           canRestart={canRestart}
           restartEpoch={state.restartEpoch}
           sentStopped={state.restartStoppedSent}
+          establishmentRevision={state.establishmentRevision}
           onRestarted={onRestarted}
           onRestartFailed={onRestartFailed}
         />
@@ -183,6 +186,7 @@ export function StartupWaitLine({
   canRestart,
   restartEpoch,
   sentStopped,
+  establishmentRevision = null,
   onRestarted,
   onRestartFailed,
 }: {
@@ -196,6 +200,7 @@ export function StartupWaitLine({
   restartEpoch: number;
   /** A restart stopped the sent message and it hasn't been sent again. */
   sentStopped: boolean;
+  establishmentRevision?: EstablishmentRevision | null;
   onRestarted?: (epoch: number, stoppedSent: boolean) => void;
   onRestartFailed?: (epoch: number, message: string, stoppedSent: boolean) => void;
 }) {
@@ -204,6 +209,20 @@ export function StartupWaitLine({
   const [frame, setFrame] = useState(0);
   const [still] = useState(reducedMotion);
   const mounted = useRef(true);
+  const [confirmation, setConfirmation] = useState<{ sessionId: string; revision: EstablishmentRevision } | null>(null);
+  const [freshError, setFreshError] = useState<string | null>(null);
+  const currentSession = useRef(sessionId);
+  const currentRevision = useRef(establishmentRevision);
+  useLayoutEffect(() => {
+    if (currentSession.current !== sessionId) {
+      setConfirmation(null);
+      setFreshError(null);
+      setStartedAt(Date.now());
+      setSeconds(0);
+    }
+    currentSession.current = sessionId;
+    currentRevision.current = establishmentRevision;
+  }, [sessionId, establishmentRevision]);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -214,11 +233,12 @@ export function StartupWaitLine({
     state: restartState,
     error: restartError,
     respawn,
-  } = useRespawnSession(sessionId, null, {
+  } = useRespawnSession(sessionId, sessionId, {
     restart: true,
     // A mounted line shows the failure itself; once the restart's stop has unmounted it, or for a server
     // error, which only follows the stop, the stopped banner names it.
     onFailed: (status, error) => {
+      if (currentSession.current !== sessionId) return;
       if ((status !== null && status >= 500) || !mounted.current) onRestartFailed?.(restartEpoch, error, sentPending);
     },
   });
@@ -234,12 +254,29 @@ export function StartupWaitLine({
   const glyph = still ? "⣿" : RATTLES.breathe.frames[frame];
   const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
   const restart = async () => {
+    const frozen = confirmation;
+    if (
+      !frozen ||
+      !mounted.current ||
+      frozen.sessionId !== currentSession.current ||
+      currentRevision.current === null ||
+      JSON.stringify(frozen.revision) !== JSON.stringify(currentRevision.current)
+    ) {
+      setConfirmation(null);
+      setFreshError("The conversation changed. Review Start fresh again.");
+      return;
+    }
     const epoch = restartEpoch;
     const stopsSent = sentPending;
-    if (!(await respawn())) return;
+    const restarted = await respawn({ revision: frozen.revision, action: "fresh" });
+    if (currentSession.current !== frozen.sessionId) return;
+    if (mounted.current) setConfirmation(null);
+    if (!restarted) return;
     onRestarted?.(epoch, stopsSent);
-    setStartedAt(Date.now());
-    setSeconds(0);
+    if (mounted.current) {
+      setStartedAt(Date.now());
+      setSeconds(0);
+    }
   };
   const costId = useId();
   const cost = [
@@ -267,28 +304,72 @@ export function StartupWaitLine({
         {elapsed}
       </span>
       {offerRestart && (
-        <button
-          type="button"
-          data-testid="startup-wait-restart"
-          onClick={() => void restart()}
-          disabled={restartState === "retrying"}
-          aria-describedby={cost ? costId : undefined}
-          className={`${SECONDARY_BUTTON} shrink-0`}
-        >
-          {restartState === "retrying" ? "Restarting…" : `Restart ${agent}`}
-        </button>
+        <div className="shrink-0">
+          <RecoveryActionRow
+            primary={{
+              label: restartState === "retrying" ? "Starting fresh…" : "Start fresh",
+              testId: "startup-wait-restart",
+              disabled: restartState === "retrying" || establishmentRevision === null,
+              title: establishmentRevision === null ? "Waiting for current conversation state." : undefined,
+              describedBy: cost ? costId : undefined,
+              onClick: () => {
+                const revision = currentRevision.current;
+                if (revision === null) return;
+                setFreshError(null);
+                setConfirmation({ sessionId: currentSession.current, revision });
+              },
+            }}
+          />
+        </div>
       )}
       {offerRestart && cost && (
         <span id={costId} data-testid="startup-wait-restart-cost" className="basis-full">
           {cost}
         </span>
       )}
-      {restartState === "failed" && restartError && (
+      {(freshError || (restartState === "failed" && restartError)) && (
         <span data-testid="startup-wait-restart-error" className="basis-full text-status-error-text">
-          Restart failed: {restartError}
+          {freshError ?? `Restart failed: ${restartError}`}
         </span>
       )}
+      {confirmation?.sessionId === sessionId && (
+        <StartupFreshDialog agent={agent} onConfirm={restart} onCancel={() => setConfirmation(null)} />
+      )}
     </div>
+  );
+}
+
+function StartupFreshDialog({
+  agent,
+  onConfirm,
+  onCancel,
+}: {
+  agent: string;
+  onConfirm: () => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [starting, confirm] = useBusyAction(onConfirm);
+  const confirmRef = useRef<HTMLButtonElement | null>(null);
+  useDialogFocus(confirmRef);
+  useConfirmKeys(onCancel, confirm, starting);
+  return (
+    <Dialog
+      id="startup-fresh-dialog"
+      title="Start fresh?"
+      onDismiss={onCancel}
+      footer={
+        <>
+          <CancelButton onClick={onCancel} disabled={starting} />
+          <ConfirmButton buttonRef={confirmRef} onClick={confirm} busy={starting} className={BRAND_BUTTON} testId="startup-fresh-confirm">
+            {starting ? "Starting fresh…" : "Start fresh"}
+          </ConfirmButton>
+        </>
+      }
+    >
+      <p className="text-[13px] text-text-secondary">
+        Start a fresh {agent} conversation? This stops the current start. Your message will not be resent; send it once the agent is ready.
+      </p>
+    </Dialog>
   );
 }
 
@@ -482,7 +563,7 @@ function WorkerStoppedBanner({
     <StoppedPanel
       title="Structured view worker stopped"
       action={
-        <button type="button" onClick={handleReconnect} disabled={retryState === "retrying"} className={WARNING_BUTTON}>
+        <button type="button" onClick={() => void handleReconnect()} disabled={retryState === "retrying"} className={WARNING_BUTTON}>
           {retryState === "retrying" ? "Reconnecting…" : "Reconnect"}
         </button>
       }

@@ -8,6 +8,7 @@ import type {
   AcpState,
   Approval,
   Elicitation,
+  EstablishmentRevision,
   IntegrationLostReason,
   ReducedState,
 } from "../../../lib/acpTypes";
@@ -383,6 +384,85 @@ describe("StartupWaitLine", () => {
       vi.fn((query: string) => ({ matches: reduce && query.includes("reduce"), media: query })),
     );
   afterEach(() => vi.unstubAllGlobals());
+  const startupRevision = (version = 1): EstablishmentRevision => Array<number>(32).fill(version);
+
+  const recoveringLine = (revision: EstablishmentRevision | null, sessionId = "s1") => (
+    <StartupWaitLine
+      sessionId={sessionId}
+      agent="Claude Code"
+      sentPending
+      queuedPending={false}
+      canRestart
+      restartEpoch={0}
+      sentStopped={false}
+      establishmentRevision={revision}
+    />
+  );
+
+  it("refuses Start fresh without a current recovery comparison", () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn();
+    vi.stubGlobal("fetch", post);
+    render(recoveringLine(null));
+    act(() => vi.advanceTimersByTime(30_000));
+    const fresh = screen.getByRole("button", { name: "Start fresh Claude Code" });
+    expect((fresh as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(fresh);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  it("requires renewed human consent when the recovery attempt changes before confirmation", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    vi.stubGlobal("fetch", post);
+    const before = startupRevision(1);
+    const after = startupRevision(2);
+    const { rerender } = render(recoveringLine(before));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    expect(post).not.toHaveBeenCalled();
+    rerender(recoveringLine(after));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByTestId("startup-wait-restart-error").textContent).toContain(
+      "The conversation changed. Review Start fresh again.",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    expect(JSON.parse(post.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: after, action: "fresh" },
+    });
+  });
+
+  it("invalidates a pending Start fresh confirmation when the selected session changes", async () => {
+    vi.useFakeTimers();
+    reducedMotion(true);
+    const post = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => "" });
+    vi.stubGlobal("fetch", post);
+    const { rerender } = render(recoveringLine(startupRevision(1)));
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    const next = startupRevision(2);
+    rerender(recoveringLine(next, "s2"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Start fresh Claude Code" })).toBeNull();
+    expect(post).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(30_000));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    await act(async () => fireEvent.click(screen.getByTestId("startup-fresh-confirm")));
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]![0]).toBe("/api/sessions/s2/acp/restart");
+    expect(JSON.parse(post.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: next, action: "fresh" },
+    });
+  });
 
   it("names the Agent and counts up, then says it's still starting, with no duration", () => {
     vi.useFakeTimers();
@@ -458,18 +538,24 @@ describe("StartupWaitLine", () => {
         canRestart
         restartEpoch={3}
         sentStopped={false}
+        establishmentRevision={startupRevision()}
         onRestarted={onRestarted}
       />,
     );
-    const restart = () => screen.queryByRole("button", { name: "Restart Claude Code" });
+    const restart = () => screen.queryByRole("button", { name: "Start fresh Claude Code" });
     act(() => vi.advanceTimersByTime(29_000));
     expect(restart()).toBeNull();
     act(() => vi.advanceTimersByTime(1_000));
+    fireEvent.click(restart()!);
+    expect(spawn).not.toHaveBeenCalled();
     await act(async () => {
-      fireEvent.click(restart()!);
+      fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     });
     expect(spawn).toHaveBeenCalledTimes(1);
     expect(spawn.mock.calls[0]![0]).toBe("/api/sessions/s1/acp/restart");
+    expect(JSON.parse(spawn.mock.calls[0]![1].body)).toEqual({
+      recovery: { revision: startupRevision(), action: "fresh" },
+    });
     act(() => vi.advanceTimersByTime(1_000));
     expect(screen.getByTestId("startup-wait-elapsed").textContent).toBe(elapsedAfter);
     expect(restart() === null).toBe(failure === null);
@@ -495,12 +581,14 @@ describe("StartupWaitLine", () => {
         canRestart
         restartEpoch={restartEpoch}
         sentStopped={false}
+        establishmentRevision={startupRevision()}
         onRestarted={onRestarted}
       />
     );
     const { rerender } = render(line(0));
     act(() => vi.advanceTimersByTime(30_000));
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     // The replacement is assigned before the restart request answers.
     rerender(line(1));
     await act(async () => respond({ ok: true, status: 200, text: () => Promise.resolve("") }));
@@ -527,8 +615,12 @@ describe("StartupWaitLine", () => {
       ),
     );
     let dispatch!: (action: Action) => void;
+    const sent = reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } }));
+    const snapshot = currentControlSnapshot(sent, { ready: false, wakeEligible: true }, 1);
+    snapshot.state.establishment_revision = startupRevision();
+    const initialState = reducer(sent, snapshot);
     function Owner() {
-      const [state, send] = useReducer(reducer, reducer(emptyAcpState(), frame(1, { UserPromptSent: { text: "hi" } })));
+      const [state, send] = useReducer(reducer, initialState);
       dispatch = send;
       const connection = {
         status: "open",
@@ -557,7 +649,8 @@ describe("StartupWaitLine", () => {
     }
     render(<Owner />);
     act(() => vi.advanceTimersByTime(30_000));
-    fireEvent.click(screen.getByRole("button", { name: "Restart Claude Code" }));
+    fireEvent.click(screen.getByRole("button", { name: "Start fresh Claude Code" }));
+    fireEvent.click(screen.getByTestId("startup-fresh-confirm"));
     return {
       dispatch: (action: Action) => act(() => dispatch(action)),
       respond: (status: number, body: string) =>
@@ -654,7 +747,7 @@ describe("StartupWaitLine", () => {
       />,
     );
     act(() => vi.advanceTimersByTime(30_000));
-    const describedBy = screen.getByRole("button", { name: "Restart Claude Code" }).getAttribute("aria-describedby");
+    const describedBy = screen.getByRole("button", { name: "Start fresh Claude Code" }).getAttribute("aria-describedby");
     expect(describedBy ? document.getElementById(describedBy)?.textContent : "").toBe(description);
     expect(screen.queryByTestId("startup-wait-restart-cost")?.textContent ?? "").toBe(description);
   });
