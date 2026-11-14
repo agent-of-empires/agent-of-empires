@@ -33,6 +33,8 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
         // CityHall cannot expose terminal sessions.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .collect();
+    let mut resume_configs: std::collections::HashMap<String, crate::session::ResumeProfileConfig> =
+        std::collections::HashMap::new();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
         .copied()
@@ -77,6 +79,16 @@ pub(crate) async fn project_sessions(state: &Arc<AppState>) -> Vec<SessionRespon
                 active_monitor,
             );
             session.acp_worker_start = acp_worker_start;
+            // Archived and trashed rows render stopped; skip the resume check.
+            if !inst.is_archived() && !inst.is_trashed() {
+                session.context_resume = Some(context_resume_with(inst, || {
+                    resume_configs
+                        .entry(inst.source_profile.clone())
+                        .or_insert_with(|| {
+                            crate::session::resume_profile_config(&inst.source_profile)
+                        })
+                }));
+            }
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: a pending nonce only exists on a
                 // running worker, and spawn/attach sweep orphaned nonces out of
