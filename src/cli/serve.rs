@@ -254,7 +254,7 @@ impl ServeArgs {
     /// Fill a missing TCP port from `AOE_SERVE_PORT`, then `[serve] port`.
     fn resolve_port(&mut self) -> Result<()> {
         self.fill_port(std::env::var_os("AOE_SERVE_PORT"), || {
-            Ok(crate::session::config::Config::load()?.serve.port)
+            Ok(crate::session::config::ServeConfig::load()?.port)
         })
     }
 
@@ -2315,6 +2315,25 @@ async fn restart_daemon_if_current(
     Ok(TuiRestart::Restarted)
 }
 
+fn replay_args(
+    launch: &ServeLaunch,
+    override_args: Option<ServeArgs>,
+    predecessor_passphrase: Option<&str>,
+    resolve_port: impl FnOnce(&mut ServeArgs) -> Result<()>,
+) -> Result<ServeArgs> {
+    let mut args = match override_args {
+        Some(requested) => launch.overlay_tui_args(requested),
+        None => launch.to_serve_args(None),
+    };
+    args.passphrase =
+        resolve_launch_passphrase(args.passphrase.take(), Some(predecessor_passphrase), || {
+            None
+        });
+    // A core-only record has no port to replay when the request enables the dashboard.
+    resolve_port(&mut args)?;
+    Ok(args)
+}
+
 async fn replay_managed_launch(
     transaction: crate::daemon::lifecycle::Transaction,
     override_args: Option<ServeArgs>,
@@ -2340,17 +2359,12 @@ async fn replay_managed_launch(
         Ok::<_, anyhow::Error>((launch, passphrase))
     })
     .await??;
-    let mut args = match override_args {
-        Some(requested) => launch.overlay_tui_args(requested),
-        None => launch.to_serve_args(None),
-    };
-    args.passphrase = resolve_launch_passphrase(
-        args.passphrase.take(),
-        Some(predecessor_passphrase.as_deref()),
-        || None,
-    );
-    // A core-only record has no port to replay when the request enables the dashboard.
-    args.resolve_port()?;
+    let args = replay_args(
+        &launch,
+        override_args,
+        predecessor_passphrase.as_deref(),
+        ServeArgs::resolve_port,
+    )?;
     validate_launch_args(&launch.profile, &args).await?;
     retain_rollback_launch(&transaction, &launch, predecessor_passphrase.as_deref())?;
 
@@ -3517,25 +3531,32 @@ mod tests {
         let mut core = sample_launch();
         core.core_only = true;
         let env = |value: &str| Some(std::ffi::OsString::from(value));
+        let replay = |argv: &[&str], env: Option<std::ffi::OsString>, configured: u16| {
+            replay_args(&core, Some(parse(argv)), None, |args| {
+                args.fill_port(env, || Ok(configured))
+            })
+            .unwrap()
+        };
 
-        let mut dashboard = core.overlay_tui_args(parse(&["aoe", "serve", "--daemon"]));
-        assert_eq!(dashboard.port, None);
-        dashboard.fill_port(env("9100"), || Ok(9000)).unwrap();
-        assert_eq!(dashboard.port, Some(9100));
-
-        let mut explicit =
-            core.overlay_tui_args(parse(&["aoe", "serve", "--daemon", "--port", "8095"]));
-        explicit.fill_port(env("9100"), || Ok(9000)).unwrap();
-        assert_eq!(explicit.port, Some(8095));
-
-        let mut config = core.overlay_tui_args(parse(&["aoe", "serve", "--daemon"]));
-        config.fill_port(None, || Ok(9000)).unwrap();
-        assert_eq!(config.port, Some(9000));
-
-        let mut still_core =
-            core.overlay_tui_args(parse(&["aoe", "serve", "--daemon", "--core-only"]));
-        still_core.fill_port(env("9100"), || Ok(9000)).unwrap();
-        assert_eq!(still_core.port, None);
+        let cases: [(&[&str], _, u16, Option<u16>); 4] = [
+            (&["aoe", "serve", "--daemon"], env("9100"), 9000, Some(9100)),
+            (&["aoe", "serve", "--daemon"], None, 9000, Some(9000)),
+            (
+                &["aoe", "serve", "--daemon", "--port", "8095"],
+                env("9100"),
+                9000,
+                Some(8095),
+            ),
+            (
+                &["aoe", "serve", "--daemon", "--core-only"],
+                env("9100"),
+                9000,
+                None,
+            ),
+        ];
+        for (argv, env, configured, expected) in cases {
+            assert_eq!(replay(argv, env, configured).port, expected, "{argv:?}");
+        }
     }
 
     #[test]

@@ -2713,6 +2713,32 @@ impl Default for ServeConfig {
     }
 }
 
+impl ServeConfig {
+    /// Read only `[serve]`, so an error in another section cannot block `aoe serve`.
+    pub(crate) fn load() -> Result<Self> {
+        match Config::load_raw_table() {
+            Ok(table) => Self::from_table(&table),
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to read config, using default [serve]: {e}");
+                Ok(Self::default())
+            }
+        }
+    }
+
+    fn from_table(table: &toml::Table) -> Result<Self> {
+        let Some(serve) = table.get("serve") else {
+            return Ok(Self::default());
+        };
+        serve.clone().try_into().map_err(|error: toml::de::Error| {
+            let error = anyhow::Error::new(error);
+            match config_path() {
+                Ok(path) => error.context(crate::session::LoadSource(path)),
+                Err(_) => error,
+            }
+        })
+    }
+}
+
 /// Serde default for `Config.default_profile`. Empty means "not explicitly
 /// chosen"; the active profile is then resolved at runtime by
 /// `resolve_default_profile`, which picks the first existing profile or
@@ -4449,6 +4475,15 @@ mod model_value_quoting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_config_ignores_errors_outside_serve_table() {
+        let parse = |toml: &str| ServeConfig::from_table(&toml::from_str(toml).unwrap());
+        let unrelated = parse("[updates]\nupdate_check_mode = 5").unwrap();
+        assert_eq!(unrelated.port, DEFAULT_SERVE_PORT);
+        assert_eq!(parse("[serve]\nport = 9000").unwrap().port, 9000);
+        assert!(parse("[serve]\nport = \"x\"").is_err());
+    }
 
     #[test]
     fn notice_policy_hides_by_display_severity_and_age() {
