@@ -1525,8 +1525,8 @@ mod tests {
                 resolved: None,
             },
         };
-        let tool_done = Event::ToolCallCompleted {
-            tool_call_id: "tc-done".into(),
+        let tool_done = |id: &str| Event::ToolCallCompleted {
+            tool_call_id: id.into(),
             is_error: false,
             content: String::new(),
             output: Vec::new(),
@@ -1550,7 +1550,7 @@ mod tests {
                 Event::ToolCallStarted {
                     tool_call: tool_call("tc-done"),
                 },
-                tool_done,
+                tool_done("tc-done"),
             ],
         );
         // An unprompted turn the rate limit interrupted.
@@ -1570,12 +1570,15 @@ mod tests {
         assert_eq!(store.unresolved_elicitation_nonces("s-1"), [nonce]);
         assert_eq!(store.try_in_flight_turn("s-1"), Some(true));
         assert!(store.rate_limit_interrupted_agent_turn("s-2"));
+        // Fails closed (true) if a tool filter parses the malformed row, still in this epoch.
+        assert!(store.has_open_tool_call_in_epoch("s-1"));
+        store.record("s-1", 101, &tool_done("tc-open")).unwrap();
+        assert!(!store.has_open_tool_call_in_epoch("s-1"));
         // A closed prompt leaves the background agent as the open work.
         store
-            .record("s-1", 101, &stopped("prompt_complete"))
+            .record("s-1", 102, &stopped("prompt_complete"))
             .unwrap();
         assert_eq!(store.try_in_flight_turn("s-1"), Some(true));
-        assert!(!store.has_open_tool_call_in_epoch("s-1"));
     }
 
     fn bg_launched(agent_id: &str, output_file: &str) -> Event {
