@@ -1733,6 +1733,18 @@ pub struct SessionConfig {
     )]
     pub show_activity_age: bool,
 
+    /// Show the `[structured]` badge on Structured view rows in the TUI
+    /// session list. Hiding it returns that width to the title and plugin row
+    /// badges; the row still opens the Structured view.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show Structured view badge",
+        widget = "toggle",
+        tui_only,
+        summary = "The [structured] marker on Structured view rows in the session list."
+    )]
+    pub show_structured_badge: bool,
+
     /// Comma-separated chord specs that exit live-send mode. Tmux-style: C-q,
     /// M-x, F12. The first chord in the list that matches an event ends live
     /// mode. Default `C-q` works in every terminal we ship to; add entries for
@@ -2283,6 +2295,7 @@ impl Default for SessionConfig {
             startup_recovery_wake: false,
             row_tag: RowTagMode::default(),
             show_activity_age: true,
+            show_structured_badge: true,
             live_send_exit_chord: default_live_send_exit_chord(),
             live_send_leader: default_live_send_leader(),
             default_attach_mode: AttachMode::default(),

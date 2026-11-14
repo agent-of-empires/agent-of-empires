@@ -349,6 +349,50 @@ fn test_empty_age_slot_does_not_truncate_active_title() {
     }
 }
 
+/// `session.show_structured_badge = false` drops the `[structured]` suffix and hands
+/// its cells back to the title.
+#[test]
+#[serial]
+fn test_show_structured_badge_toggle() {
+    let (_temp, _guard) = test_home();
+    let title = "structured-row";
+    let mut inst = Instance::new(title, "/tmp/a");
+    inst.view = crate::session::View::Structured;
+    inst.status = Status::Running;
+    seed_profile("alpha", &[inst]);
+    let mut view = test_view(Some("alpha"));
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    let row = view
+        .flat_items
+        .iter()
+        .find(|item| matches!(item, Item::Session { .. }))
+        .cloned()
+        .expect("session row");
+    let render = |view: &HomeView| -> String {
+        view.render_item_line(
+            &row,
+            false,
+            false,
+            &crate::tui::styles::Theme::default(),
+            26,
+            false,
+        )
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+    };
+    view.show_structured_badge = true;
+    let with_badge = render(&view);
+    assert!(with_badge.contains("[structured]"), "{with_badge:?}");
+    assert!(!with_badge.contains(title), "{with_badge:?}");
+    view.show_structured_badge = false;
+    let without_badge = render(&view);
+    assert!(!without_badge.contains("[structured]"), "{without_badge:?}");
+    assert!(without_badge.contains(title), "{without_badge:?}");
+}
+
 /// Agent view marks a row whose paired terminal survives detach; Terminal view does not,
 /// since its icon already carries that state.
 #[test]

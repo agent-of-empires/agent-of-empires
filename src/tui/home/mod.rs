@@ -259,6 +259,7 @@ pub struct HomeView {
     pub(super) group_by: GroupByMode,
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
     pub(super) show_activity_age: bool,
+    pub(super) show_structured_badge: bool,
     /// Forward captured OSC 52 writes unless `[tmux] clipboard` is disabled.
     /// Tmux's own clipboard options cannot govern this in-process path.
     pub(super) agent_clipboard_forward: bool,
