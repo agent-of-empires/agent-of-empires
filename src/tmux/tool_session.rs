@@ -329,7 +329,7 @@ impl ToolSession {
         }
     }
 
-    fn valid_pane_ids(session_id: &str, pane_id: &str) -> bool {
+    pub(super) fn valid_pane_ids(session_id: &str, pane_id: &str) -> bool {
         [(session_id, '$'), (pane_id, '%')]
             .into_iter()
             .all(|(id, prefix)| {

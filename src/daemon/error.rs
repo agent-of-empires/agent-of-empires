@@ -19,6 +19,7 @@ pub enum ApiErrorCode {
     TlsRequired,
     RuntimeEpochMismatch,
     ResumeFailed,
+    LaunchIndeterminate,
     ManagedResumeRefused(ManagedResumeCause),
     StartFailed,
     SandboxMigrationDeferred,
@@ -59,6 +60,7 @@ impl ApiErrorCode {
             Self::TlsRequired => "tls_required",
             Self::RuntimeEpochMismatch => "runtime_epoch_mismatch",
             Self::ResumeFailed => "resume_failed",
+            Self::LaunchIndeterminate => "launch_indeterminate",
             Self::ManagedResumeRefused(_) => "managed_resume_refused",
             Self::NoRevive => "no_revive",
             Self::CreationTrustChanged => "creation_trust_changed",
@@ -89,6 +91,7 @@ impl ApiErrorCode {
             | Self::LifecycleSuperseded
             | Self::RuntimeEpochMismatch
             | Self::ResumeFailed
+            | Self::LaunchIndeterminate
             | Self::ManagedResumeRefused(_)
             | Self::SandboxMigrationDeferred
             | Self::PurgeFailed
@@ -154,6 +157,7 @@ impl ApiErrorCode {
             b"create_outcome_unknown" => Self::CreateOutcomeUnknown,
             b"agent_hooks_not_approved" => Self::AgentHooksNotApproved,
             b"resume_failed" => Self::ResumeFailed,
+            b"launch_indeterminate" => Self::LaunchIndeterminate,
             b"managed_resume_refused" => Self::ManagedResumeRefused(managed_resume_cause(headers)),
             b"no_revive" => Self::NoRevive,
             b"creation_trust_changed" => Self::CreationTrustChanged,

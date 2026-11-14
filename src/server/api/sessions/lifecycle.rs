@@ -198,7 +198,7 @@ impl Drop for ArchiveReservationRelease {
             crate::session::SessionStore::defer_lifecycle_release(
                 native,
                 std::mem::take(&mut self.id),
-                LifecycleOperation::Stop,
+                crate::session::LifecycleRelease::Reservation(LifecycleOperation::Stop),
                 generation,
                 None,
             );
@@ -1607,7 +1607,7 @@ async fn finish_structured_user_stop(
             }
             native.release_lifecycle_reservation(
                 &release_id,
-                LifecycleOperation::Stop,
+                crate::session::LifecycleRelease::Reservation(LifecycleOperation::Stop),
                 generation,
                 Some(lifecycle),
             )
@@ -3402,6 +3402,11 @@ async fn prepare_agent_session_inner(
                 );
             }
         }
+        let mut revival = if worker_restart.is_some() && !outgoing.is_structured() {
+            outgoing.capture_revival_target()?
+        } else {
+            None
+        };
         if let Some(body) = &worker_restart {
             account_swap_precondition(&outgoing, body)
                 .map_err(LifecycleTargetError::AccountSwapRefused)?;
@@ -3531,11 +3536,23 @@ async fn prepare_agent_session_inner(
                         !row.is_structured(),
                         "Structured sessions have no agent pane"
                     );
-                    if super::ensure::ready_agent_session(row)?.is_some() {
-                        return Ok(None);
-                    }
                 } else if row.status != Status::Stopped {
                     return Ok(None);
+                }
+                if !row.is_structured() {
+                    let observed = row.capture_revival_target()?;
+                    if let Some(target) = observed.as_ref() {
+                        if target.state != crate::tmux::utils::PaneProbe::Dead {
+                            if super::ensure::ready_agent_session(row)?.is_some() {
+                                return Ok(None);
+                            }
+                            return Err(
+                                crate::session::LaunchIndeterminateCause::StabilizationExpired
+                                    .into(),
+                            );
+                        }
+                    }
+                    revival = observed;
                 }
                 let generation = row.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
@@ -3585,18 +3602,19 @@ async fn prepare_agent_session_inner(
         }) {
             started.discard_reserved_restart_container(store, started.lifecycle_generation)?;
         }
-        let generation = started.prepare_reserved_launch_hooks(
+        let reservation = started.prepare_reserved_launch_hooks(
             store,
             worker_restart.is_none(),
             crate::session::LaunchReservation {
                 generation: started.lifecycle_generation,
+                revival,
                 title_lock,
                 lifecycle_lock,
             },
         )?;
         drop(identity);
         Ok(Some((
-            generation,
+            reservation,
             started,
             native,
             (account_swap, conversation_carry),
@@ -3611,8 +3629,9 @@ async fn prepare_agent_session_inner(
     let reason = restart_reason(restart_origin, restart.as_deref());
     let requested_wake_message = restart.as_ref().and_then(|body| body.wake_message.clone());
     let hooked = match result {
-        Ok(Ok(Some((generation, mut started, native, conversation_carry)))) => {
+        Ok(Ok(Some((reservation, mut started, native, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || {
+                let generation = reservation.generation;
                 let _timeout = restart.as_ref().filter(|body| body.bound_hooks).map(|_| {
                     crate::session::recovery::HookTimeoutScope::new(
                         crate::session::recovery::recovery_hook_timeout(),
@@ -3625,7 +3644,7 @@ async fn prepare_agent_session_inner(
                     Some(generation),
                 );
                 Ok(Some((
-                    generation,
+                    reservation,
                     started,
                     native,
                     hooks,
@@ -3639,12 +3658,12 @@ async fn prepare_agent_session_inner(
         Err(error) => Err(error),
     };
     let hooked = match hooked {
-        Ok(Ok(Some((generation, started, native, hooks, carry)))) if started.is_structured() => {
+        Ok(Ok(Some((reservation, started, native, hooks, carry)))) if started.is_structured() => {
             return finish_structured_restart(
                 &state,
                 &id,
                 StructuredRestartLaunch {
-                    generation,
+                    generation: reservation.generation,
                     started,
                     native,
                     hooks,
@@ -3667,9 +3686,10 @@ async fn prepare_agent_session_inner(
     let guard = lock.lock().await;
     let mut restart_identity = None;
     let result = match hooked {
-        Ok(Ok(Some((generation, mut started, native, hooks, conversation_carry)))) => {
+        Ok(Ok(Some((reservation, mut started, native, hooks, conversation_carry)))) => {
             tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                 use crate::session::SessionStore;
+                let generation = reservation.generation;
                 let outcome = started.finish_reserved_launch(
                     &native,
                     size,
@@ -3682,7 +3702,7 @@ async fn prepare_agent_session_inner(
                         restart: true,
                         conversation_carry: conversation_carry.1,
                     },
-                    generation,
+                    reservation,
                     hooks,
                 );
                 let title = crate::session::acquire_session_title_lock(&started.id)?;
@@ -3694,6 +3714,18 @@ async fn prepare_agent_session_inner(
                         None
                     }
                 };
+                if outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is::<crate::session::LaunchFinalizationPending>())
+                {
+                    native.defer_lifecycle_release(
+                        started.id.clone(),
+                        crate::session::LifecycleRelease::IndeterminateLaunch,
+                        generation,
+                        None,
+                    );
+                }
                 Ok(Some((generation, started, outcome, (title, lifecycle), panes)))
             })
             .await
@@ -3752,7 +3784,10 @@ async fn prepare_agent_session_inner(
             } else {
                 // Adoption fences runtime replacement, not the migration failure result.
                 match outcome {
-                    Err(error) if error.is::<crate::migrations::SandboxMigrationError>() => {
+                    Err(error)
+                        if error.is::<crate::migrations::SandboxMigrationError>()
+                            || error.is::<crate::session::LaunchFinalizationPending>() =>
+                    {
                         Err(error)
                     }
                     _ => Err(crate::session::LifecycleReservationError::Superseded.into()),
@@ -3769,9 +3804,15 @@ async fn prepare_agent_session_inner(
         .is_some_and(|error| error.is::<crate::migrations::SandboxMigrationError>());
     let outcome = match outcome {
         Err(error) => {
-            let response = if let Some(response) = lifecycle_rejection(&state, &error) {
+            let response = if let Some(&cause) =
+                error.downcast_ref::<crate::session::LaunchIndeterminateCause>()
+            {
+                super::ensure::indeterminate_launch_response(cause)
+            } else if let Some(response) = lifecycle_rejection(&state, &error) {
                 response
-            } else if error.is::<crate::session::NativeStoreUnavailable>() {
+            } else if error.is::<crate::session::NativeStoreUnavailable>()
+                || error.is::<crate::session::LaunchFinalizationPending>()
+            {
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             } else if error.is::<crate::session::HostHookApprovalRequired>() {
                 crate::server::api::api_error_with_code_header(
@@ -3818,6 +3859,18 @@ async fn prepare_agent_session_inner(
                 };
             }
             return response;
+        }
+        Ok(Some(crate::session::StartOutcome::Indeterminate { cause })) => {
+            let response = super::ensure::indeterminate_launch_response(cause);
+            drop(guard);
+            drop(submission);
+            drop(namespace);
+            return match state.runtime.publish(&state).await {
+                Ok(snapshot) => {
+                    crate::server::runtime::mutation_response(&snapshot.value.cursor, response)
+                }
+                Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
         }
         Ok(Some(crate::session::StartOutcome::ResumeFailed { sid })) => {
             let response = (StatusCode::CONFLICT, crate::daemon::ApiErrorCode::ResumeFailed.header(), Json(serde_json::json!({

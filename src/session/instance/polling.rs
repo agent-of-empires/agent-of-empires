@@ -353,6 +353,13 @@ impl Instance {
             self.capture_poller.stop();
         }
         self.capture_poller.drop_handle();
+        if self
+            .capture_poller
+            .retry_after()
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return Ok(PollerStart::Deferred);
+        }
         let Some((capture, context)) = self.source_session_support() else {
             return Ok(PollerStart::NotApplicable);
         };
@@ -1167,6 +1174,117 @@ mod tests {
         inst.capture_poller.stop();
         super::try_acquire_managed_capture_lease(backend, &store)
             .expect("stopping the poller releases the store lease");
+    }
+
+    #[cfg(feature = "web")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tmux_applied_reload_preserves_a_real_managed_capture_lease_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(root.path());
+        let _budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
+        let mut prior = Instance::new("boot-store-contention", root.path().to_str().unwrap());
+        prior.source_profile = "default".into();
+        prior.tool = "prime-agent".into();
+        prior.status = Status::Starting;
+        prior.sandbox_info = Some(test_sandbox("boot-store-contention", None));
+        admit_sandbox_fixture(&prior);
+        let store = prior.sandbox_capture_store_dir().unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        prior
+            .prime_agent_capture_plan_in(
+                prior
+                    .prime_agent_capture_options()
+                    .expect("Prime fixture has valid capture arguments"),
+                crate::session::CaptureStorage::Scoped(&storage),
+            )
+            .expect("the fixture must reach real lease contention, not configuration refusal");
+        let backend = crate::agents::SessionCaptureBackend::PrimeAgent;
+        let lease = super::try_acquire_managed_capture_lease(backend, &store).unwrap();
+        assert!(
+            prior.last_start_time.is_none(),
+            "a boot-loaded row has no launch stamp"
+        );
+        assert!(prior.active_execution.is_none());
+        assert_eq!(prior.maybe_start_poller(), PollerStart::Deferred);
+        let deadline = prior
+            .capture_poller
+            .retry_after()
+            .expect("the real contended store lease must arm its retry deadline");
+        assert!(prior.capture_poller.handle().is_none());
+        storage
+            .update(|rows, _| {
+                rows.push(prior.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut fresh = storage.load().unwrap().remove(0);
+        fresh.status = Status::Running;
+        assert!(
+            fresh.capture_poller.retry_after().is_none(),
+            "disk has no runtime pacing"
+        );
+        let state = crate::server::test_support::build_test_app_state(vec![prior]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        crate::server::test_support::reload_tmux_applied_for_test(&state, vec![fresh], Vec::new())
+            .await;
+        // A transient API snapshot offers neither a watcher nor a repair outcome.
+        // It must not erase the canonical deadline earned from real store contention,
+        // whether it still describes this tool or describes a stale different tool.
+        for foreign_tool in [false, true] {
+            let mut snapshot = state.instances.read().await[0].clone();
+            snapshot.capture_poller = Default::default();
+            if foreign_tool {
+                snapshot.tool = "claude".into();
+            }
+            let publish = state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::server::session_store::NativeSessionStore::open(
+                    publish,
+                    "default",
+                    Some(snapshot.id.clone()),
+                )
+                .unwrap()
+                .adopt_runtime_fields(&snapshot)
+                .unwrap();
+            })
+            .await
+            .unwrap();
+            let rows = state.instances.read().await;
+            assert_eq!(rows[0].tool, "prime-agent");
+            assert!(rows[0].capture_poller.handle().is_none());
+            assert_eq!(rows[0].capture_poller.retry_after(), Some(deadline));
+        }
+        let mut rows = state.instances.write().await;
+        let reloaded = &mut rows[0];
+        assert_eq!(
+            reloaded.status,
+            Status::Running,
+            "fresh tmux status must win"
+        );
+        assert_eq!(
+            reloaded.capture_poller.retry_after(),
+            Some(deadline),
+            "a status-poll reload must not discard the real store-contention deadline"
+        );
+        drop(lease);
+        assert_eq!(reloaded.maybe_start_poller(), PollerStart::Deferred);
+        assert!(
+            reloaded.capture_poller.handle().is_none(),
+            "no attempt before the deadline"
+        );
+        reloaded.capture_poller.set_retry_after(Some(
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        ));
+        assert_eq!(reloaded.maybe_start_poller(), PollerStart::Started);
+        assert!(reloaded.capture_poller.is_running());
+        assert_eq!(
+            super::try_acquire_managed_capture_lease(backend, &store).unwrap_err(),
+            super::LeaseRefusal::Contended,
+            "the resumed watcher must actually own the physical store lease"
+        );
+        reloaded.capture_poller.stop();
     }
 
     // Every teardown path must flush the last published conversation.

@@ -275,7 +275,7 @@ pub(crate) fn native_socket_locator() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn tmux_query_command_for_socket(socket: &str) -> Command {
+pub(crate) fn tmux_query_command_for_socket(socket: &str) -> Command {
     let mut cmd = Command::new("tmux");
     cmd.args(["-S", socket, "-u"]);
     cmd.env_remove("TMUX");
@@ -449,7 +449,7 @@ impl TmuxCommandDeadline {
     }
 
     #[cfg(test)]
-    fn expiring_after_commands(commands: i64) -> Self {
+    pub(crate) fn expiring_after_commands(commands: i64) -> Self {
         Self {
             deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
             budget: Some(CommandBudget(std::sync::atomic::AtomicI64::new(commands))),
@@ -1252,6 +1252,57 @@ pub(crate) fn agent_pane_metadata_in<'a>(
 ) -> anyhow::Result<Option<(&'a str, &'a PaneMetadata)>> {
     let derived = Session::generate_name(id, title);
     pane_metadata_for_shape(panes, &derived, &NameShape::agent(&id_suffix(id)))
+}
+
+/// Launch admission never treats multiple marked candidates as an absent
+/// title-derived name. Keep this stricter view separate from display resolution.
+fn with_unique_agent_session_name<T>(
+    id: &str,
+    read: impl FnOnce(Option<&str>) -> T,
+) -> anyhow::Result<T> {
+    use crate::session::LaunchIndeterminateCause;
+    match refresh_session_cache() {
+        SessionCacheRefresh::NoServer => return Ok(read(None)),
+        SessionCacheRefresh::Unknown => {
+            return Err(LaunchIndeterminateCause::ObservationFailed.into());
+        }
+        SessionCacheRefresh::Populated => {}
+    }
+    let cache = SESSION_CACHE
+        .read()
+        .map_err(|_| LaunchIndeterminateCause::ObservationFailed)?;
+    let sessions = cache
+        .data
+        .as_ref()
+        .ok_or(LaunchIndeterminateCause::ObservationFailed)?;
+    let suffix = id_suffix(id);
+    let shape = NameShape::agent(&suffix);
+    let mut candidates = sessions.iter().filter(|(name, session)| {
+        shape.matches_marked(name, session.kind.map(SessionKind::as_marker))
+    });
+    let selected = candidates.next();
+    anyhow::ensure!(
+        candidates.next().is_none(),
+        LaunchIndeterminateCause::OwnershipUnproven
+    );
+    Ok(read(selected.map(|(name, _)| name.as_str())))
+}
+
+/// Select a fresh, unique Agent candidate, including corpses; unknown or
+/// ambiguous inventory is an error, not absence or a readiness observation.
+pub(crate) fn unique_agent_session_name(id: &str) -> anyhow::Result<Option<String>> {
+    with_unique_agent_session_name(id, |name| name.map(str::to_owned))
+}
+
+/// Check the same launch-only uniqueness contract without copying a name.
+pub(crate) fn unique_agent_session_presence(id: &str) -> anyhow::Result<SessionExistence> {
+    with_unique_agent_session_name(id, |name| {
+        if name.is_some() {
+            SessionExistence::Present
+        } else {
+            SessionExistence::Absent
+        }
+    })
 }
 
 /// `resolve_session_name` for the agent pane, against names alone: with no
