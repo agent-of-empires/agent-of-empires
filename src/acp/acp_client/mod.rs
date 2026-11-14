@@ -1353,7 +1353,7 @@ impl AcpClient {
     pub(crate) async fn prepare_initial_prompt(
         self: &Arc<Self>,
         expected: Arc<crate::acp::establishment::EstablishmentAttempt>,
-        cancellation: CancellationToken,
+        cancellation: tokio_util::sync::CancellationToken,
         text: &str,
         attachments: &[AttachmentBlob],
     ) -> Result<commands::PreparedInitialPrompt, AcpError> {

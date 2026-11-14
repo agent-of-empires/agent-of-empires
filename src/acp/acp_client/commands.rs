@@ -34,7 +34,7 @@ pub(super) struct InitialPromptIntent {
     pub(super) id: uuid::Uuid,
     pub(super) client: std::sync::Weak<super::AcpClient>,
     pub(super) expected: std::sync::Arc<crate::acp::establishment::EstablishmentAttempt>,
-    pub(super) owner: super::RunnerIdentity,
+    pub(super) owner: crate::acp::runner_lifecycle::RunnerIdentity,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
     pub(super) blocks: Vec<ContentBlock>,
 }
@@ -127,7 +127,7 @@ impl InitialPromptIntent {
                 _ = self.cancellation.cancelled() => return Err(super::errors::AcpError::NotRunning),
                 scope = client.capture_operation_context(
                     correlation,
-                    tokio::time::Instant::now() + super::WORKER_READY_TIMEOUT,
+                    tokio::time::Instant::now() + crate::acp::supervisor::WORKER_READY_TIMEOUT,
                     Some(&self.expected),
                 ) => scope?,
             }

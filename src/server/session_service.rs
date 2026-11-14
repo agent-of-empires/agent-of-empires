@@ -15,7 +15,7 @@ use tokio::sync::RwLock;
 
 use crate::daemon::{CreationPhase, CreationProgress};
 use crate::server::session_spawn::{spawn_structured_session, SpawnOutcome, StructuredSessionSpec};
-use crate::session::{Instance, PluginCreateIdempotency};
+use crate::session::{Instance, PluginCreateIdempotency, SessionStore};
 
 /// A create currently being built for a `(plugin_id, idempotency_key)` scope.
 /// Present only between the idempotency claim and the end of the build, so a
