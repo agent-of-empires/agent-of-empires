@@ -1052,12 +1052,18 @@ fn unreadable_funnel_status(https_port: u16) -> FunnelPreflight {
     ))
 }
 
+/// Clears every path on one port and leaves the others; `tailscale funnel reset` clears every port.
+fn funnel_off_command(https_port: u16) -> String {
+    format!("tailscale {}", funnel_off_args(https_port).join(" "))
+}
+
 /// The refusal for a handler on the Funnel port this start must not replace.
 fn conflicting_funnel(existing: String, https_port: u16) -> FunnelPreflight {
     FunnelPreflight::Refuse(format!(
         "port {https_port} is already configured on this node for a different backend \
-         ({existing}). Run `tailscale funnel reset` to clear the existing config, or pass \
-         --no-tailscale to use Cloudflare."
+         ({existing}). Run `{off}` to clear that port's config, or pass --no-tailscale to use \
+         Cloudflare.",
+        off = funnel_off_command(https_port)
     ))
 }
 
@@ -1065,8 +1071,9 @@ fn conflicting_funnel(existing: String, https_port: u16) -> FunnelPreflight {
 fn live_funnel_backend(proxy: &str, https_port: u16) -> FunnelPreflight {
     FunnelPreflight::Refuse(format!(
         "port {https_port}'s Tailscale Funnel serves another running server ({proxy}), such as \
-         another user's aoe daemon, so aoe won't take it over. Stop that server, run `tailscale \
-         funnel reset` to clear the Funnel config, or pass --no-tailscale to use Cloudflare."
+         another user's aoe daemon, so aoe won't take it over. Stop that server, run `{off}` to \
+         clear that port's config, or pass --no-tailscale to use Cloudflare.",
+        off = funnel_off_command(https_port)
     ))
 }
 
@@ -1918,7 +1925,11 @@ mod tests {
                 FunnelPreflight::Refuse(why) => {
                     assert!(refused, "{status}: {why}");
                     assert!(why.contains("another running server"), "{why}");
-                    assert!(why.contains("tailscale funnel reset"), "{why}");
+                    assert!(
+                        why.contains("run `tailscale funnel --https=443 off`"),
+                        "{why}"
+                    );
+                    assert!(!why.contains("reset"), "{why}");
                 }
                 other => assert!(!refused, "{status}: {other:?}"),
             }
@@ -2954,6 +2965,12 @@ esac
             else {
                 panic!("{used:?} {caps:?}: a text handler is refused");
             };
+            // The cleanup it names clears only the refused port.
+            assert!(
+                why.contains(&format!("Run `tailscale funnel --https={https} off`"))
+                    && !why.contains("reset"),
+                "{used:?}: {why}"
+            );
             match hint {
                 Some(free) => assert!(
                     why.ends_with(&format!(

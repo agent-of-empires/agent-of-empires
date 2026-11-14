@@ -711,7 +711,8 @@ pub struct ServeLaunch {
     pub tunnel_name: Option<String>,
     pub tunnel_url: Option<String>,
     pub no_tailscale: bool,
-    /// Absent in records written before `--funnel-port`, which read as not given.
+    /// Absent in records written before `--funnel-port`: a restart fills it from the setting, a
+    /// rollback with the 443 those builds ran on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub funnel_port: Option<crate::session::config::FunnelPort>,
     #[serde(default)]
@@ -898,9 +899,7 @@ async fn rollback_daemon() -> Result<()> {
             && credential.passphrase.is_some() == launch.has_passphrase,
         "Retained credentials do not match the retained launch",
     );
-    let args = rollback_args(&launch, credential.passphrase, || {
-        Ok(crate::session::config::ServeConfig::load()?)
-    })?;
+    let args = rollback_args(&launch, credential.passphrase)?;
     validate_launch_args(&launch.profile, &args).await?;
     match daemon_status() {
         DaemonStatus::Verified(pid) => {
@@ -2048,15 +2047,12 @@ fn daemon_child_args(args: &ServeArgs, profile: &str) -> Vec<String> {
     argv
 }
 
-/// The retained launch to roll back to. A record from before `funnel_port` gets the setting
-/// here rather than in the child, so the new `serve.launch` records the port it runs on.
-fn rollback_args(
-    launch: &ServeLaunch,
-    passphrase: Option<String>,
-    serve_config: impl FnOnce() -> Result<crate::session::config::ServeConfig>,
-) -> Result<ServeArgs> {
+/// The retained launch to roll back to. A record from before `funnel_port` ran its Funnel on
+/// 443, the only port those builds used, so it gets 443 here rather than the setting, and the
+/// new `serve.launch` records it.
+fn rollback_args(launch: &ServeLaunch, passphrase: Option<String>) -> Result<ServeArgs> {
     let mut args = launch.to_serve_args(passphrase);
-    args.fill_funnel_port(|| Ok(serve_config()?.funnel_port))?;
+    args.fill_funnel_port(|| Ok(crate::session::config::FunnelPort::Port443))?;
     Ok(args)
 }
 
@@ -3642,19 +3638,32 @@ mod tests {
             assert_eq!(args.port, Some(port), "{request:?}");
         }
 
-        // A rollback records the port it starts on: the retained one, or for a record from
-        // before `funnel_port` the setting's, and none off Funnel.
-        let legacy = ServeLaunch {
-            funnel_port: None,
-            ..funnel.clone()
-        };
-        for (name, record, want) in [
-            ("funnel", &funnel, Some(Port8443)),
-            ("legacy", &legacy, Some(Port10000)),
-            ("cloudflare", &cloudflare, None),
+        // A record from before `funnel_port` ran on 443. A restart takes the changed setting, but
+        // a rollback of the same record restores 443; explicit ports and Cloudflare are kept.
+        let mut written = serde_json::to_value(&funnel).unwrap();
+        written.as_object_mut().unwrap().remove("funnel_port");
+        let legacy: ServeLaunch = serde_json::from_value(written).unwrap();
+        let successor = replay_args(&legacy, None, Some("pw"), |args| {
+            args.fill_port(None, || Ok(setting()?.port))?;
+            args.fill_funnel_port(|| Ok(setting()?.funnel_port))
+        })
+        .unwrap();
+        assert_eq!(successor.funnel_port, Some(Port10000));
+        // (record, rollback's Funnel port)
+        for (record, want) in [
+            (&legacy, Some(Port443)),
+            (&funnel, Some(Port8443)),
+            (&cloudflare, None),
         ] {
-            let args = rollback_args(record, None, setting).unwrap();
-            assert_eq!(args.funnel_port, want, "{name}");
+            let args = rollback_args(record, None).unwrap();
+            assert_eq!(args.funnel_port, want, "{record:?}");
+            let child = daemon_child_args(&args, "");
+            let want = want.map(|port| port.number().to_string());
+            let recorded = child
+                .iter()
+                .position(|arg| arg == "--funnel-port")
+                .map(|at| child[at + 1].clone());
+            assert_eq!(recorded, want, "{child:?}");
         }
     }
 
