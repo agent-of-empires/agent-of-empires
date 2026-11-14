@@ -11,7 +11,7 @@ const MANIFEST = `
 id = "acme.sugg"
 name = "Acme"
 version = "0.1.0"
-api_version = 21
+api_version = 22
 capabilities = ["runtime.worker"]
 
 [suggestions]
