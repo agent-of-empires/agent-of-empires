@@ -37,6 +37,7 @@ export function buildCreateRequest(
     extra_args: d.extraArgs || undefined,
     command_override: d.commandOverride || undefined,
     custom_instruction: d.customInstruction || undefined,
+    initial_prompt: d.initialPrompt.trim() ? d.initialPrompt : undefined,
     profile: d.profile || undefined,
     view: structured ? "structured" : "terminal",
     agent_model: structured && d.agentModel ? d.agentModel : undefined,

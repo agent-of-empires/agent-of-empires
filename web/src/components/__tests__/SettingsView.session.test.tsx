@@ -34,6 +34,7 @@ const SESSION_SCHEMA = [
 ];
 
 vi.mock("../../lib/api", () => ({
+  fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve(PROFILES)),
   fetchPlugins: vi.fn(() => Promise.resolve(null)),
   fetchSettings: vi.fn(),

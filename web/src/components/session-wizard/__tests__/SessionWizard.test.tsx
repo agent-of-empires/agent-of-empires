@@ -22,6 +22,8 @@ import {
 } from "../../../lib/api";
 import { agent } from "./fixtures";
 import { toastBus } from "../../../lib/toastBus";
+import { toWizardPrefill } from "../../../lib/suggestionPrefill";
+import type { SuggestionPrepared } from "../../../lib/types";
 import { useAgentDisplayNames } from "../../../lib/agentDisplayName";
 import { startPendingCreates } from "../../../lib/pendingCreates";
 import type { AgentInfo, DockerStatusResponse } from "../../../lib/types";
@@ -1767,7 +1769,12 @@ describe("SessionWizard create failures", () => {
 
   /** Backgrounds a create that then fails with `sent`, and returns what Reopen hands the next wizard.
    *  `whileSending` runs after Launch, before the progress view replaces the form. */
-  const backgroundFailure = async (sent: ReturnType<typeof failure>, tool = "claude", whileSending?: () => void) => {
+  const backgroundFailure = async (
+    sent: ReturnType<typeof failure>,
+    tool = "claude",
+    whileSending?: () => void,
+    extra: Partial<WizardPrefill> = {},
+  ) => {
     const toastAction = vi.fn();
     toastBus.handler = { push: vi.fn(), error: vi.fn(), info: vi.fn(), openLink: vi.fn(), action: toastAction };
     let finish!: (r: unknown) => void;
@@ -1780,7 +1787,7 @@ describe("SessionWizard create failures", () => {
         onCreated={vi.fn()}
         onCreatedInBackground={vi.fn()}
         onReopenFailure={onReopenFailure}
-        prefill={{ path: "/tmp/proj", tool }}
+        prefill={{ path: "/tmp/proj", tool, ...extra }}
       />,
     );
     await launch();
@@ -1814,6 +1821,22 @@ describe("SessionWizard create failures", () => {
     expect(screen.getByTestId("wizard-project-row").textContent).toContain("not found where the Daemon runs");
     fireEvent.click(screen.getByTestId("create-failure-choose_project"));
     expect(screen.getByText("Back")).toBeTruthy();
+  });
+
+  it("Reopen keeps the suggestion link of a create that failed in the background", async () => {
+    const suggestion = { provider_id: "github", id: "issue-1" };
+    const { restore } = await backgroundFailure(
+      failure("validation_failed", null, "Title is too long."),
+      "claude",
+      undefined,
+      { suggestion },
+    );
+    expect(restore.suggestion).toEqual(suggestion);
+    createSession.mockClear();
+    render(<SessionWizard servedProfile="default" onClose={vi.fn()} onCreated={vi.fn()} restore={restore} />);
+    fireEvent.click(await screen.findByTestId("create-failure-try_again"));
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ suggestion });
   });
 
   it("Reopen restores the form as sent, not an edit made while the create ran", async () => {
@@ -2098,5 +2121,105 @@ describe("SessionWizard View row", () => {
     await waitFor(() => expect(radio("Structured view").disabled).toBe(true));
     fireEvent.keyDown(radio("Terminal view"), { key: "ArrowLeft" });
     expect(selected()).toBe("terminal");
+  });
+});
+
+describe("SessionWizard initial prompt", () => {
+  it("seeds the field from the prefill and sends edits as initial_prompt", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft" });
+    const field = screen.getByLabelText("Prompt") as HTMLTextAreaElement;
+    expect(field.value).toBe("draft");
+    fireEvent.change(field, { target: { value: "edited" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ initial_prompt: "edited" });
+  });
+
+  it("does not send a prefilled prompt from a name-only wizard, which never shows it", async () => {
+    render(
+      <SessionWizard
+        servedProfile="default"
+        onClose={vi.fn()}
+        onCreated={vi.fn()}
+        nameOnly
+        prefill={{ title: "Fix it", initialPrompt: "provider draft" }}
+      />,
+    );
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().initial_prompt).toBeUndefined();
+  });
+
+  it("opens the project picker for an unresolved suggestion instead of restoring the last project", async () => {
+    localStorage.setItem("aoe-new-session-last-project", "/other/last");
+    const prepared = { title: "Fix it", initial_prompt: "do it", project: null } as unknown as SuggestionPrepared;
+    renderWizard(toWizardPrefill(prepared, { label: "GitHub", title: "Fix it", url: "" }));
+    fireEvent.click((await screen.findByText("/tmp/proj")).closest("button")!);
+    expect(screen.getByTestId("wizard-project-row").textContent).toContain("/tmp/proj");
+    expect(screen.getByTestId("wizard-project-row").textContent).not.toContain("/other/last");
+  });
+
+  it("omits initial_prompt when the field is blank", async () => {
+    renderWizard();
+    fireEvent.change(screen.getByLabelText("Prompt"), { target: { value: "  " } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload().initial_prompt).toBeUndefined();
+  });
+});
+
+describe("SessionWizard suggestion link", () => {
+  it("sends the suggestion reference, and nothing when the prefill has none", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", suggestion: { provider_id: "github", id: "issue-1" } });
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ suggestion: { provider_id: "github", id: "issue-1" } });
+  });
+});
+
+describe("SessionWizard suggestion source", () => {
+  const source = { label: "GitHub", title: "Fix lifecycle", url: "https://example.test/issues/1" };
+
+  it("shows the From strip and seeds the title", async () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", title: "Review RFC 4562", source });
+    const strip = screen.getByTestId("wizard-source");
+    expect(strip.textContent).toContain("GitHub");
+    expect(strip.textContent).toContain("Fix lifecycle");
+    expect(strip.textContent).toContain("issue text not included");
+    expect(strip.querySelector("a")?.getAttribute("href")).toBe(source.url);
+    expect((screen.getByLabelText("Title") as HTMLInputElement).value).toBe("Review RFC 4562");
+    await launch();
+    await waitFor(() => expect(createSession).toHaveBeenCalledTimes(1));
+    expect(payload()).toMatchObject({ title: "Review RFC 4562" });
+  });
+
+  it("offers Edit template only for a templated prompt", () => {
+    const onEditTemplate = vi.fn();
+    const template = { providerId: "gh", criterion: "review-requested" };
+    const mount = (prefill: WizardPrefill) =>
+      render(
+        <SessionWizard
+          servedProfile="default"
+          onClose={vi.fn()}
+          onCreated={vi.fn()}
+          prefill={prefill}
+          onEditTemplate={onEditTemplate}
+        />,
+      );
+    mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "/aoe-review", source, template });
+    expect(screen.getByTestId("wizard-template").textContent).toContain("review-requested");
+    fireEvent.click(screen.getByRole("button", { name: "Edit template" }));
+    expect(onEditTemplate).toHaveBeenCalledWith(template);
+    cleanup();
+    mount({ path: "/tmp/proj", tool: "claude", initialPrompt: "draft", source });
+    expect(screen.queryByTestId("wizard-template")).toBeNull();
+  });
+
+  it("does not link a non-http source url, and shows no strip without a source", () => {
+    renderWizard({ path: "/tmp/proj", tool: "claude", source: { ...source, url: "javascript:alert(1)" } });
+    expect(screen.getByTestId("wizard-source").querySelector("a")).toBeNull();
+    cleanup();
+    renderWizard();
+    expect(screen.queryByTestId("wizard-source")).toBeNull();
   });
 });

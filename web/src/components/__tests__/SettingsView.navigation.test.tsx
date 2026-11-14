@@ -21,6 +21,7 @@ const SCHEMA = [
 }));
 
 vi.mock("../../lib/api", () => ({
+  fetchSuggestions: vi.fn(() => Promise.resolve(null)),
   fetchProfiles: vi.fn(() => Promise.resolve([{ name: "main", is_default: true }])),
   fetchSettings: vi.fn(() => Promise.resolve({ sandbox: {}, updates: {} })),
   getSettingsSchema: vi.fn(() => Promise.resolve(SCHEMA)),
@@ -55,6 +56,12 @@ import { resetSettingsStore } from "../../lib/settingsStore";
 beforeEach(resetSettingsStore);
 
 describe("SettingsView navigation", () => {
+  it("keeps the Suggestions tab reachable when its snapshot fails to load", async () => {
+    renderView("suggestions");
+    expect(await screen.findByText("Could not load suggestions.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+  });
+
   it("without a tab lists grouped sections, remembering the pick for the next open", () => {
     const { onSelectTab } = renderView(null);
     const list = screen.getByTestId("settings-section-list");

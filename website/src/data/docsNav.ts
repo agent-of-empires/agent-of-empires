@@ -29,6 +29,7 @@ export const docsNav: NavSection[] = [
       { title: "Git Worktrees", href: "/guides/worktrees/", description: "How AoE creates and cleans up a git worktree per session." },
       { title: "Multi-Repo Workspaces", href: "/guides/multi-repo-workspaces/", description: "Drive one session across several git repositories at once." },
       { title: "Scratch Sessions", href: "/guides/scratch-sessions/", description: "Throwaway sessions for quick experiments without a worktree." },
+      { title: "Suggested Sessions", href: "/guides/suggested-sessions/", description: "Start sessions from suggestions that plugins publish, from the web dashboard or the TUI." },
       { title: "Diff View", href: "/guides/diff-view/", description: "Review a session's changes from the TUI or the web dashboard." },
       { title: "tmux Status Bar", href: "/guides/tmux-status-bar/", description: "Show live session status in your tmux status bar." },
       { title: "Tool Sessions", href: "/guides/tool-sessions/", description: "Run plain shell or tool sessions alongside your agents." },

@@ -418,7 +418,7 @@ Quotas per plugin: 64 keys, 256-byte keys, 64 KiB values. `cas` (compare-and-swa
 
 > **Availability:** the `[suggestions]` manifest block and the worker types in `aoe-plugin-api` are available now. The `suggestions.*` RPCs, the `/api/suggestions` routes and the web and TUI workflows below are not served by this host until the store layer of the suggested-sessions stack (#5595) lands.
 
-For using suggestions from the web dashboard and the TUI, see the suggested sessions guide.
+For using suggestions from the web dashboard and the TUI, see the [suggested sessions guide](guides/suggested-sessions.md).
 
 A worker declares the criteria it publishes in a `[suggestions]` block:
 

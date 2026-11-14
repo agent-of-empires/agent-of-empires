@@ -124,6 +124,18 @@ describe("TerminalView early-return states", () => {
     expect(ensureSession).toHaveBeenCalledTimes(2);
   });
 
+  it("shows why the initial prompt was not sent", async () => {
+    render(
+      <TerminalView
+        readOnly={false}
+        session={makeSession({ initial_prompt_error: "the agent was not ready within 60s" })}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByRole("alert").textContent).toBe("Initial prompt not sent: the agent was not ready within 60s");
+    });
+  });
+
   it("re-runs ensureSession when Retry is clicked", async () => {
     ensureSession.mockResolvedValueOnce({ ok: false, message: "first fail" });
     const { container } = render(<TerminalView readOnly={false} session={makeSession()} />);
