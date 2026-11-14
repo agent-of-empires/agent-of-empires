@@ -486,12 +486,21 @@ describe("SandboxImageBanner", () => {
   });
 
   it("asks again as soon as a create pulled the image, not at the next hourly poll", async () => {
-    await mount(status());
-    expect(banner()).not.toBeNull();
-    fetchSandboxImageStatus.mockResolvedValue(status({ state: "current" } as Partial<SandboxImageStatus>));
-    act(() => notifySandboxImagePulled());
-    await pollAfter(0);
-    expect(banner()).toBeNull();
+    for (const refused of [false, true]) {
+      const { unmount } = await mount(status());
+      if (refused) {
+        pullSandboxImage.mockResolvedValueOnce({ ok: false, message: "Pulling is off on this server." });
+        fireEvent.click(screen.getByRole("button", { name: "Update now" }));
+        await pollAfter(0);
+        expect(banner()?.textContent).toContain("Pulling is off on this server.");
+      }
+      expect(banner(), String(refused)).not.toBeNull();
+      fetchSandboxImageStatus.mockResolvedValue(status({ state: "current" } as Partial<SandboxImageStatus>));
+      act(() => notifySandboxImagePulled());
+      await pollAfter(0);
+      expect(banner(), String(refused)).toBeNull();
+      unmount();
+    }
   });
 
   it("keeps text at text contrast on the tints, with the state colour on the dot", async () => {

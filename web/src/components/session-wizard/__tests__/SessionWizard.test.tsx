@@ -1594,12 +1594,17 @@ describe("SessionWizard Pull latest image first", () => {
       .mockReset()
       .mockResolvedValue({ available: false, runtime: "docker", runtime_name: "Docker" });
     vi.mocked(fetchSandboxImageStatus).mockReset().mockResolvedValue(null);
+    vi.mocked(fetchSettings).mockReset().mockResolvedValue({});
   });
+  // The image comes from the settings' default, and only that image has a status.
   const open = (status: object) => {
     vi.mocked(fetchDockerStatus).mockResolvedValue({ available: true, runtime: "docker", runtime_name: "Docker" });
     vi.mocked(fetchVolumeIgnoresPreview).mockResolvedValue(null);
-    vi.mocked(fetchSandboxImageStatus).mockResolvedValue(status as never);
-    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true, sandboxImage: IMAGE });
+    vi.mocked(fetchSettings).mockResolvedValue({ sandbox: { default_image: IMAGE } } as never);
+    vi.mocked(fetchSandboxImageStatus).mockImplementation(async (image) =>
+      image === IMAGE ? (status as never) : null,
+    );
+    renderWizard({ path: "/tmp/proj", tool: "claude", sandboxEnabled: true });
   };
   const box = () => screen.findByRole("checkbox", { name: "Pull latest image first" }) as Promise<HTMLInputElement>;
   const pulledSignals = () => {
