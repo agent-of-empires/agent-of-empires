@@ -224,7 +224,6 @@ pub(crate) struct NativeObservationBusy;
 type InstallationRecoveryObserver =
     Box<dyn FnOnce(&Lease, &Arc<AcpClient>, tokio::time::Instant) + Send>;
 
-
 pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,

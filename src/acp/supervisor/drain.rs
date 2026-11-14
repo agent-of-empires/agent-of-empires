@@ -1321,7 +1321,9 @@ impl<S: BroadcastSink> Drain<S> {
                 if let Err(publication) = sink.publish_from_worker(publication) {
                     publication.complete().await;
                 }
-                let (drain, published) = finished.await.expect("ordered budget publication completed");
+                let (drain, published) = finished
+                    .await
+                    .expect("ordered budget publication completed");
                 if published {
                     drain.drop_handle(lease).await;
                 }

@@ -28,6 +28,11 @@ the migration runner stamps59, after every operation succeeds. A partial failure
 retains the last completed marker and resumes safely on the next explicit upgrade;
 neither the old marker nor a current schema proves native execution authority.
 
+Qualification reconciliation also validates recorded private child source and
+ancestry metadata. It does not synthesize that proof from reported parent/child
+IDs, rewrite historical content into current authority, or treat schema59 as
+proof that a legacy child may join a current resource.
+
 Adding an optional field whose missing and null forms mean the same thing does not require rewriting existing rows.
 
 Scope and process authority must remain exact. Missing legacy proof stays unresolved until complete authoritative inventory proves absence. Preserve captured units, process births, native runtime and producer identity. An unfinished constructor prevents discharge of unknown scope debt. Never overwrite readable malformed proof or infer launch or retirement authority from a missing field. Inventory selectors never authorize retirement, except units in the pre-custody naming format, which earlier releases stopped by the same glob.

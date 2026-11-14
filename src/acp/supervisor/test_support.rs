@@ -1124,7 +1124,6 @@ with s:
             HeldChild::Retained(_) => panic!("cleanup requires original constructor custody"),
         }
     }
-
 }
 
 /// Reproduce an owned constructor's genuine control refusal, retaining its

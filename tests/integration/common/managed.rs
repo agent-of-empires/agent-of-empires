@@ -531,7 +531,12 @@ impl ManagedRetirement {
     }
 
     async fn stop_session(&self) {
-        let id = self.target.lease.as_ref().expect("captured original lease").session_id();
+        let id = self
+            .target
+            .lease
+            .as_ref()
+            .expect("captured original lease")
+            .session_id();
         let stopped = crate::server::api::sessions::stop_session(
             State(self.state.clone()),
             axum::extract::Path(id.to_owned()),
@@ -543,7 +548,8 @@ impl ManagedRetirement {
             axum::http::StatusCode::OK,
             "real Stop must settle the original projection before retained Load/Fork"
         );
-        self.completed.store(true, std::sync::atomic::Ordering::Release);
+        self.completed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     async fn retire(&self) -> anyhow::Result<()> {
@@ -2396,21 +2402,37 @@ socket.on('error', error => { console.error(error); process.exit(1); });
     }
 
     pub(crate) async fn stop_observed_original(&mut self, lease: &Lease) {
-        assert!(self.leases.lock().unwrap().contains(lease), "the original must belong to this actual launcher");
+        assert!(
+            self.leases.lock().unwrap().contains(lease),
+            "the original must belong to this actual launcher"
+        );
         assert_eq!(
-            self.state.acp_supervisor.lifecycle.lock().unwrap_or_else(|error| error.into_inner())
-                .current_lease(lease.session_id()).as_ref(),
+            self.state
+                .acp_supervisor
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .current_lease(lease.session_id())
+                .as_ref(),
             Some(lease),
             "capture the exact current original before public Stop"
         );
-        let retirement = self.retirements.iter().find(|retirement| {
-            retirement.target.lease.as_ref() == Some(lease)
-                && Arc::ptr_eq(&retirement.state, &self.state)
-        }).cloned().unwrap_or_else(|| {
-            let retirement = Arc::new(ManagedRetirement::capture(self.state.clone(), lease.clone()));
-            self.retirements.push(retirement.clone());
-            retirement
-        });
+        let retirement = self
+            .retirements
+            .iter()
+            .find(|retirement| {
+                retirement.target.lease.as_ref() == Some(lease)
+                    && Arc::ptr_eq(&retirement.state, &self.state)
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                let retirement = Arc::new(ManagedRetirement::capture(
+                    self.state.clone(),
+                    lease.clone(),
+                ));
+                self.retirements.push(retirement.clone());
+                retirement
+            });
         retirement.stop_session().await;
     }
 

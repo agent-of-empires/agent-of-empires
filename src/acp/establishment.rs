@@ -2289,7 +2289,6 @@ impl EstablishmentAttempt {
     }
 }
 
-
 /// Insert a genuinely absent app session and its initial native permission together.
 pub(crate) fn insert_created_instance(
     rows: &mut Vec<Instance>,
@@ -2309,7 +2308,9 @@ pub(crate) fn insert_created_instance(
         let Some(AcpEstablishment::Pending { attempt }) = row.acp_establishment.as_mut() else {
             unreachable!("absent-row creation was armed");
         };
-        attempt.origin = EstablishmentOrigin::Creation { stage: CreationStage::PreparingAdmitted };
+        attempt.origin = EstablishmentOrigin::Creation {
+            stage: CreationStage::PreparingAdmitted,
+        };
     }
     rows.push(row.clone());
     Ok(())
@@ -2847,8 +2848,8 @@ mod tests {
     #[serial_test::serial]
     fn deferred_creation_admits_its_first_original_once_without_replacing_consent() {
         use super::{
-            insert_created_instance, AcpEstablishment, CreationStage,
-            EstablishmentBlockReason, EstablishmentOrigin,
+            insert_created_instance, AcpEstablishment, CreationStage, EstablishmentBlockReason,
+            EstablishmentOrigin,
         };
         use crate::session::{Instance, ResumeIntent, Status, Storage, View};
 
@@ -2862,7 +2863,9 @@ mod tests {
         let Some(AcpEstablishment::Pending { attempt }) = row.acp_establishment.as_mut() else {
             unreachable!("absent-row creation owns its initial permission");
         };
-        attempt.origin = EstablishmentOrigin::Creation { stage: CreationStage::Ready };
+        attempt.origin = EstablishmentOrigin::Creation {
+            stage: CreationStage::Ready,
+        };
         let mut unfinished = row.clone();
         unfinished.status = Status::Creating;
         let before = unfinished.acp_establishment.clone();

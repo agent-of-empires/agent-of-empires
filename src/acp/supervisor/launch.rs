@@ -1393,45 +1393,48 @@ impl<S: BroadcastSink> Supervisor<S> {
             if tokio::time::Instant::now() >= deadline {
                 return Err(SupervisorError::RegistryBusy);
             }
-            let outcome = {
-                let mut lifecycle = lock_recover(&self.lifecycle);
-                if lifecycle.current_lease(session_id).as_ref() != Some(&lease) {
-                    Some(Err(InstallError::Stale))
-                } else {
-                    match worker_registry::try_registry_lock(session_id) {
-                        Ok(Some(registry)) => {
-                            match claimed_stop_for_lease(&registry, &lease, identity) {
-                                Ok(Some(_)) => {
-                                    lifecycle.begin_stop(session_id, "user_stopped", false);
+            let outcome =
+                {
+                    let mut lifecycle = lock_recover(&self.lifecycle);
+                    if lifecycle.current_lease(session_id).as_ref() != Some(&lease) {
+                        Some(Err(InstallError::Stale))
+                    } else {
+                        match worker_registry::try_registry_lock(session_id) {
+                            Ok(Some(registry)) => {
+                                match claimed_stop_for_lease(&registry, &lease, identity) {
+                                    Ok(Some(_)) => {
+                                        lifecycle.begin_stop(session_id, "user_stopped", false);
+                                    }
+                                    Ok(None) => {}
+                                    Err(_) => {
+                                        return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                                            worker_registry::ControlAdmissionRefusal::unconfirmed(
+                                                identity,
+                                            ),
+                                        ))
+                                        .into())
+                                    }
                                 }
-                                Ok(None) => {}
-                                Err(_) => {
-                                    return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
-                                        worker_registry::ControlAdmissionRefusal::unconfirmed(
-                                            identity,
-                                        ),
-                                    ))
-                                    .into())
-                                }
+                                Some(
+                                    if lifecycle.running(session_id).is_some_and(
+                                        |(current, owner)| current == lease && owner == identity,
+                                    ) {
+                                        Ok(())
+                                    } else {
+                                        lifecycle.install(&lease, identity)
+                                    },
+                                )
                             }
-                            Some(if lifecycle.running(session_id).is_some_and(|(current, owner)| {
-                                current == lease && owner == identity
-                            }) {
-                                Ok(())
-                            } else {
-                                lifecycle.install(&lease, identity)
-                            })
-                        }
-                        Ok(None) => None,
-                        Err(_) => {
-                            return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
-                                worker_registry::ControlAdmissionRefusal::unconfirmed(identity),
-                            ))
-                            .into())
+                            Ok(None) => None,
+                            Err(_) => {
+                                return Err(AcpError::RetainedRuntimeUnavailable(Box::new(
+                                    worker_registry::ControlAdmissionRefusal::unconfirmed(identity),
+                                ))
+                                .into())
+                            }
                         }
                     }
-                }
-            };
+                };
             match outcome {
                 Some(Ok(())) if recovery.is_some() => break workers,
                 Some(Ok(())) => {
@@ -1442,29 +1445,36 @@ impl<S: BroadcastSink> Supervisor<S> {
                     {
                         let observe = lock_recover(&self.installation_recovery).take();
                         if let Some(observe) = observe {
-                            let Some(Pending::Installation(installation)) = reservation.deferred.as_ref() else {
+                            let Some(Pending::Installation(installation)) =
+                                reservation.deferred.as_ref()
+                            else {
                                 unreachable!("original installation remains owned");
                             };
                             observe(&lease, &installation.client, deadline);
                         }
                     }
                     self.cancel_orphaned_requests(session_id);
-                    let Some(Pending::Installation(installation)) = reservation.deferred.as_ref() else {
+                    let Some(Pending::Installation(installation)) = reservation.deferred.as_ref()
+                    else {
                         unreachable!("installation stays owned through recovery");
                     };
-                    recovery = Some(if matches!(installation.finish.kind, WorkerKind::Attached) {
-                        (|| {
-                            Ok((
-                                collect_resumable_background_agent_launches(
-                                    &*self.sink, &self.next_seqs, session_id,
-                                )?,
-                                self.sink.unresolved_background_task_launches(session_id)?,
-                            ))
-                        })()
-                    } else {
-                        self.detach_orphaned_background_agents(session_id);
-                        Ok((Vec::new(), Vec::new()))
-                    });
+                    recovery = Some(
+                        if matches!(installation.finish.kind, WorkerKind::Attached) {
+                            (|| {
+                                Ok((
+                                    collect_resumable_background_agent_launches(
+                                        &*self.sink,
+                                        &self.next_seqs,
+                                        session_id,
+                                    )?,
+                                    self.sink.unresolved_background_task_launches(session_id)?,
+                                ))
+                            })()
+                        } else {
+                            self.detach_orphaned_background_agents(session_id);
+                            Ok((Vec::new(), Vec::new()))
+                        },
+                    );
                 }
                 Some(Err(refusal)) => {
                     drop(workers);

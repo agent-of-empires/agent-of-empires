@@ -83,7 +83,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                         Ok(None) => return None,
                         Err(_) => return Some(false),
                     };
-                    if !crate::process::worker_registry::refusal_still_applies(&session_id, &refusal) {
+                    if !crate::process::worker_registry::refusal_still_applies(
+                        &session_id,
+                        &refusal,
+                    ) {
                         return Some(false);
                     }
                     let observed = refusal.observation();
@@ -106,14 +109,19 @@ impl<S: BroadcastSink> Supervisor<S> {
                     drop(workers);
                     let persisted = match epoch {
                         Some(epoch) => sink.publish_replay_from_worker(
-                            &session_id, seq, &data, epoch, Some(subject), None,
+                            &session_id,
+                            seq,
+                            &data,
+                            epoch,
+                            Some(subject),
+                            None,
                         ),
                         None => sink.publish_persisted(&session_id, seq, &data),
                     };
                     Some(persisted)
-                }.await;
-                if let Some(published) = published
-                {
+                }
+                .await;
+                if let Some(published) = published {
                     break published;
                 }
                 let fence = Arc::clone(&scope.fence);
@@ -131,7 +139,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         published.await.unwrap_or(false)
     }
-
 
     /// Publish `Stopped { reason }` only if `expected_seq` is still the
     /// session's latest seq, so a repair decided from the log cannot land
