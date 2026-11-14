@@ -134,7 +134,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             };
             let _ = done.send(result);
         });
-        if let Err(publication) = self.sink.publish_from_worker(publication) {
+        if let Some(publication) = self.sink.publish_from_worker(publication) {
             publication.complete().await;
         }
         published.await.unwrap_or(false)
@@ -217,7 +217,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             };
             let _ = done.send(result);
         });
-        if let Err(publication) = self.sink.publish_from_worker(publication) {
+        if let Some(publication) = self.sink.publish_from_worker(publication) {
             publication.complete().await;
         }
         completed.await.unwrap_or(Err(super::SupervisorError::ControlStateUnavailable))

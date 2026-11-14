@@ -370,14 +370,14 @@ impl BroadcastSink for VecSink {
     fn publish_from_worker(
         &self,
         publication: super::WorkerPublication,
-    ) -> Result<(), super::WorkerPublication> {
+    ) -> Option<super::WorkerPublication> {
         let wrap = self.wrap_worker.lock().unwrap().take();
         let publication = match wrap {
             Some(wrap) => wrap(publication),
             None => publication,
         };
         let result = self.durable.publish_from_worker(publication);
-        if result.is_ok() {
+        if result.is_none() {
             let queued = self.worker_queued.lock().unwrap().take();
             if let Some(queued) = queued {
                 queued();

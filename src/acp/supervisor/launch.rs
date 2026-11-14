@@ -2876,7 +2876,7 @@ pub(super) mod tests {
                         entered.send(()).unwrap();
                         tokio::time::timeout(Duration::from_secs(20), released).await
                             .expect("the controlled real writer is released").unwrap();
-                    })).is_ok());
+                    })).is_none());
                     ready.recv_timeout(Duration::from_secs(10)).expect("the actual writer is held");
                     assert!(observed.send((lease.clone(), client.clone(), deadline, release)).is_ok());
                 }));

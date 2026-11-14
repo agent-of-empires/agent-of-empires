@@ -57,9 +57,9 @@ pub trait BroadcastSink: Send + Sync + 'static {
     }
 
     /// Transfer the original owned SDK item and completion to the writer.
-    /// A sink without a writer returns ownership for real inline completion.
-    fn publish_from_worker(&self, publication: WorkerPublication) -> Result<(), WorkerPublication> {
-        Err(publication)
+    /// `None` transfers ownership; `Some` returns it for real inline completion.
+    fn publish_from_worker(&self, publication: WorkerPublication) -> Option<WorkerPublication> {
+        Some(publication)
     }
 
     /// Called only inside ordered completion, while replay and processing remain local.
@@ -346,9 +346,9 @@ impl ChannelSink {
             Err(TrySendError::Disconnected(job)) => job,
             Err(TrySendError::Full(job)) => {
                 tracing::warn!(target: "acp.event_store", "event write queue full; waiting for the writer");
-                match blocking_io(|| jobs.send(job)) {
-                    Ok(()) => return,
-                    Err(std::sync::mpsc::SendError(job)) => job,
+                match blocking_io(|| jobs.send(job).err().map(|error| error.0)) {
+                    None => return,
+                    Some(job) => job,
                 }
             }
         };
@@ -439,7 +439,7 @@ impl BroadcastSink for ChannelSink {
     }
 
     /// Queue original owned completion without a per-frame task or durable wait.
-    fn publish_from_worker(&self, publication: WorkerPublication) -> Result<(), WorkerPublication> {
+    fn publish_from_worker(&self, publication: WorkerPublication) -> Option<WorkerPublication> {
         use std::sync::mpsc::TrySendError;
         #[cfg(test)]
         let (publication, submission) = {
@@ -452,31 +452,31 @@ impl BroadcastSink for ChannelSink {
             .as_ref()
             .is_some_and(|writer| writer.thread().id() == std::thread::current().id())
         {
-            return Err(publication);
+            return Some(publication);
         }
         let Some(jobs) = &self.jobs else {
-            return Err(publication);
+            return Some(publication);
         };
         let job = match jobs.try_send(Job::Worker(publication)) {
             Ok(()) => {
                 #[cfg(test)]
                 self.notify_submission(submission);
-                return Ok(());
+                return None;
             }
             Err(TrySendError::Disconnected(job)) => job,
-            Err(TrySendError::Full(job)) => match blocking_io(|| jobs.send(job)) {
-                Ok(()) => {
+            Err(TrySendError::Full(job)) => match blocking_io(|| jobs.send(job).err().map(|error| error.0)) {
+                None => {
                     #[cfg(test)]
                     self.notify_submission(submission);
-                    return Ok(());
+                    return None;
                 }
-                Err(std::sync::mpsc::SendError(job)) => job,
+                Some(job) => job,
             },
         };
         let Job::Worker(publication) = job else {
             unreachable!("worker submission changed kind");
         };
-        Err(publication)
+        Some(publication)
     }
 
     fn publish_replay_from_worker(
@@ -867,7 +867,7 @@ mod tests {
                     ));
                 })
             };
-            assert!(sink.publish_from_worker(publication).is_ok());
+            assert!(sink.publish_from_worker(publication).is_none());
         }
         // This barrier is also queued before the panic, so a later inline
         // fallback cannot hide the loss of buffered publications.
@@ -983,7 +983,7 @@ mod tests {
                 })
             };
             assert!(
-                sink.publish_from_worker(publication).is_ok(),
+                sink.publish_from_worker(publication).is_none(),
                 "the owned drain publication queues while the writer is stalled"
             );
             assert_eq!(

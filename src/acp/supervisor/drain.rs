@@ -979,7 +979,7 @@ impl<S: BroadcastSink> Drain<S> {
             });
             #[cfg(test)]
             let publication = publication.with_test_submission(submission);
-            if let Err(publication) = sink.publish_from_worker(publication) {
+            if let Some(publication) = sink.publish_from_worker(publication) {
                 publication.complete().await;
             }
         }
@@ -990,7 +990,7 @@ impl<S: BroadcastSink> Drain<S> {
             let end = std::mem::take(&mut completion.end);
             let _ = done.send((drain, end));
         });
-        if let Err(publication) = sink.publish_from_worker(publication) {
+        if let Some(publication) = sink.publish_from_worker(publication) {
             publication.complete().await;
         }
         let (drain, end) = finished
@@ -1324,7 +1324,7 @@ impl<S: BroadcastSink> Drain<S> {
                     );
                     let _ = done.send((self, published));
                 });
-                if let Err(publication) = sink.publish_from_worker(publication) {
+                if let Some(publication) = sink.publish_from_worker(publication) {
                     publication.complete().await;
                 }
                 let (drain, published) = finished
@@ -2091,7 +2091,7 @@ mod tests {
                     .await
                     .expect("release the actual ordered writer");
             }))
-            .is_ok());
+            .is_none());
         tokio::time::timeout(Duration::from_secs(10), entering)
             .await
             .unwrap()
