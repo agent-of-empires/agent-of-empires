@@ -184,6 +184,10 @@ pub fn dispatch(
     params: &Value,
 ) -> Result<Value, DispatchError> {
     match method {
+        "projects.list" => {
+            ctx.require(CAP_SESSION_READ)?;
+            projects_list(state)
+        }
         "events.publish" => {
             ctx.require(CAP_WORKER)?;
             events_publish(state, params)
@@ -246,6 +250,16 @@ pub fn dispatch(
         }
         other => Err(DispatchError::method_not_found(other)),
     }
+}
+
+fn projects_list(state: &HostApiState) -> Result<Value, DispatchError> {
+    let profile = crate::session::config::effective_profile(&state.profile);
+    let projects: Vec<Value> = crate::session::projects::load_merged(&profile)
+        .map_err(|e| DispatchError::internal(e.to_string()))?
+        .into_iter()
+        .map(|project| json!({ "name": project.name, "path": project.path }))
+        .collect();
+    Ok(json!({ "projects": projects }))
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, DispatchError> {
@@ -920,6 +934,80 @@ mod tests {
 
     fn state(dir: &std::path::Path) -> HostApiState {
         HostApiState::open(&dir.join("plugin_events.db"), "default", 100).unwrap()
+    }
+
+    #[test]
+    fn projects_list_is_capability_gated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_WORKER]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, codes::FORBIDDEN);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_returns_registered_name_and_path() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::projects::add(
+            "default",
+            crate::session::projects::ProjectScope::Global,
+            crate::session::projects::Project::new(
+                "target",
+                "/tmp/project-target",
+                crate::session::projects::ProjectScope::Global,
+            ),
+            false,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = dispatch(
+            &state(tmp.path()),
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [{ "name": "target", "path": "/tmp/project-target" }] })
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn projects_list_merges_profile_projects_over_global() {
+        use crate::session::projects::{add, Project, ProjectScope};
+        let _guard = crate::session::test_support::isolate_app_dir();
+        crate::session::create_profile("work").unwrap();
+        let put = |scope, name: &str, path: &str| {
+            add("work", scope, Project::new(name, path, scope), true).unwrap();
+        };
+        put(ProjectScope::Global, "shared", "/tmp/project-shared");
+        put(ProjectScope::Global, "only-global", "/tmp/project-global");
+        put(ProjectScope::Profile, "renamed", "/tmp/project-shared");
+        put(ProjectScope::Profile, "only-work", "/tmp/project-work");
+        let tmp = tempfile::tempdir().unwrap();
+        let state = HostApiState::open(&tmp.path().join("plugin_events.db"), "work", 100).unwrap();
+        let result = dispatch(
+            &state,
+            &ctx(&[CAP_SESSION_READ]),
+            "projects.list",
+            &json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({ "projects": [
+                { "name": "renamed", "path": "/tmp/project-shared" },
+                { "name": "only-global", "path": "/tmp/project-global" },
+                { "name": "only-work", "path": "/tmp/project-work" },
+            ] })
+        );
     }
 
     #[test]
