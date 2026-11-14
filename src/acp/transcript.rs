@@ -338,7 +338,6 @@ mod tests {
             m.apply_event(i as u64 + 1, &e);
         }
         m
-
     }
 
     fn kinds(m: &TranscriptModel) -> Vec<TranscriptRowKind> {
