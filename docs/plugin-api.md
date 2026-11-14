@@ -485,7 +485,7 @@ Suggestions are stored per profile. The routes below list and act on them; none 
 | `PUT /api/suggestions/templates` | `{ provider_id, criterion, template }` | `{ provider_id, criterion, template, default }` |
 | `DELETE /api/suggestions/templates?provider_id=&criterion=` | none | `{ ok }` |
 | `POST /api/suggestions/fix` | `{ provider_id }` | `{ ok, notified }` |
-| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, templated, template_criterion, source_ref, project, extra_projects, tool, yolo, sandbox, worktree }` |
+| `POST /api/suggestions/prepare` | `{ provider_id, id }` | `{ title, initial_prompt, templated, template_criterion, source_ref, project, extra_projects, tool, view, yolo, sandbox, worktree }`; `view` is `structured` or `terminal` |
 | `GET /api/suggestions/mappings` | none | `{ mappings: [{ provider_id, mapping_key, projects }] }` |
 | `PUT /api/suggestions/mappings` | `{ provider_id, mapping_key, projects }` | `{ provider_id, mapping_key, projects }` |
 | `DELETE /api/suggestions/mappings?provider_id=&mapping_key=` | none | `{ ok, deleted }` |
