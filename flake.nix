@@ -56,14 +56,53 @@
                 ./docker
                 ./tests/fixtures/cli-read
                 ./web/tests/helpers/fakeAcpAgent.mjs
+                ./LICENSE
+                ./THIRD_PARTY_NOTICES.md
+                ./licenses
+                ./vendor/pulldown-cmark/LICENSE
+                ./vendor/unicode-width/LICENSE-MIT
+                ./vendor/unicode-width/LICENSE-APACHE
+                ./vendor/unicode-width/COPYRIGHT
+                ./vendor/unicode-width/tests/emoji-test.txt
+                ./vendor/crossterm/LICENSE
               ];
             };
             strictDeps = true;
             inherit nativeBuildInputs buildInputs;
           };
 
-          # Build only workspace dependencies first (for caching)
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          # Explicit dummy sources must not supply evaluation-time metadata or Cargo config.
+          dependencyMetadata = craneLib.crateNameFromCargoToml {
+            cargoToml = ./Cargo.toml;
+          };
+          dependencyVendorDir = craneLib.vendorCargoDeps {
+            src = commonArgs.src;
+            cargoLock = ./Cargo.lock;
+          };
+
+          # Registry dependencies call these path patches even while workspace crates are stubs.
+          # Keep the copy hook independent of application edits: this source contains only vendor.
+          # The flake's Git snapshot supplies only tracked fork files.
+          vendoredPatchSource = pkgs.lib.fileset.toSource {
+            root = ./vendor;
+            fileset = ./vendor;
+          };
+          dependencyDummySrc = craneLib.mkDummySrc {
+            src = commonArgs.src;
+            extraDummyScript = ''
+              rm -rf "$out/vendor"
+              cp -R "${vendoredPatchSource}" "$out/vendor"
+            '';
+          };
+
+          # Cache package dependencies; checks build test targets.
+          cargoArtifacts = craneLib.buildDepsOnly (
+            (builtins.removeAttrs commonArgs [ "src" ]) // dependencyMetadata // {
+              dummySrc = dependencyDummySrc;
+              cargoVendorDir = dependencyVendorDir;
+              doCheck = false;
+            }
+          );
 
           aoe = craneLib.buildPackage (commonArgs // {
             inherit cargoArtifacts;
@@ -74,6 +113,8 @@
                 --bash <($out/bin/aoe completion bash) \
                 --fish <($out/bin/aoe completion fish) \
                 --zsh <($out/bin/aoe completion zsh)
+              install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$out/share/licenses/aoe"
+              install -Dm644 licenses/* -t "$out/share/licenses/aoe/licenses"
             '';
 
             meta = with pkgs.lib; {
@@ -121,7 +162,13 @@
           };
 
           # Rust dep cache compiled with --features web (no npm involved).
-          cargoArtifactsWithWeb = craneLib.buildDepsOnly commonArgsWithWeb;
+          cargoArtifactsWithWeb = craneLib.buildDepsOnly (
+            (builtins.removeAttrs commonArgsWithWeb [ "src" ]) // dependencyMetadata // {
+              dummySrc = dependencyDummySrc;
+              cargoVendorDir = dependencyVendorDir;
+              doCheck = false;
+            }
+          );
 
           aoeWithWeb = craneLib.buildPackage (commonArgsWithWeb // {
             cargoArtifacts = cargoArtifactsWithWeb;
@@ -134,6 +181,8 @@
                 --bash <($out/bin/aoe completion bash) \
                 --fish <($out/bin/aoe completion fish) \
                 --zsh <($out/bin/aoe completion zsh)
+              install -Dm644 LICENSE THIRD_PARTY_NOTICES.md -t "$out/share/licenses/aoe"
+              install -Dm644 licenses/* -t "$out/share/licenses/aoe/licenses"
             '';
             meta = aoe.meta;
             # Expose npmDeps so `nix-update` can automatically recompute the

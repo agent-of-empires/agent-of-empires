@@ -442,6 +442,10 @@ impl HomeView {
             .is_some_and(|inst| {
                 inst.is_trashed()
                     && self
+                        .retained_preview
+                        .as_ref()
+                        .is_none_or(|view| view.matches(inst))
+                    && self
                         .retained_focus
                         .as_ref()
                         .is_some_and(|(id, generation)| {
@@ -1005,6 +1009,9 @@ impl HomeView {
     /// events are captured for wheel scroll, and one mechanism has to work on Mosh and
     /// mobile clients where Shift-bypass does nothing.
     pub fn handle_drag_start(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if self.hit_divider(col, row) {
             self.drag_state = Some(if self.divider_row.is_some() {
                 DragKind::StackedListDivider
@@ -1045,6 +1052,9 @@ impl HomeView {
     /// True when state changed, so the caller redraws. Nothing persists per tick: the
     /// divider saves on release and the preview-select path emits OSC 52 on release.
     pub fn handle_drag_move(&mut self, col: u16, row: u16) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         // The settings scrollbar belongs to the overlay itself.
         if matches!(self.drag_state, Some(DragKind::SettingsScrollbar)) {
             if let Some(view) = &mut self.settings_view {
@@ -1138,6 +1148,9 @@ impl HomeView {
     /// ticker rather than by mouse events, so holding the cursor at an edge scrolls
     /// continuously and grows the selection past a page. Returns whether anything moved.
     pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
         if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
             return false;
         }
@@ -1156,6 +1169,27 @@ impl HomeView {
             // to scroll immediately rather than wait out the interval.
             self.preview_autoscroll_at = None;
             return false;
+        }
+        let retained = self.selected_is_trashed();
+        let mut selection_changed = false;
+        if retained {
+            let extent = view.screen_to_content(
+                col.clamp(pane.x, pane.right().saturating_sub(1)),
+                row.clamp(pane.y, pane.bottom().saturating_sub(1)),
+            );
+            if let Some(selection) = self.preview_selection.as_mut() {
+                selection_changed = selection.extent != extent;
+                selection.extent = extent;
+            }
+            // Only painted retained rows may extend a selection.
+            if self
+                .retained_preview
+                .as_ref()
+                .and_then(|view| view.effective_offset())
+                != Some(self.retained_scroll_offset)
+            {
+                return selection_changed;
+            }
         }
         // Pace the scroll to a steady cadence regardless of how often the loop woke, so
         // the speed is even instead of racing capture-worker activity. Line scroll and the
@@ -1186,24 +1220,17 @@ impl HomeView {
             if scrolled {
                 self.preview_click_seed = None;
                 self.preview_autoscroll_at = Some(now);
-                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-                // Pin the extent to the revealed edge line in `from_bottom` terms, which
-                // the new offset gives directly: the bottom visible line sits `offset`
-                // lines up from the newest, the top `offset + height - 1`. Deriving it
-                // from the offset rather than the stale `total_lines` keeps it correct
-                // before the next capture.
-                let offset = if self.selected_is_trashed() {
-                    self.retained_scroll_offset
-                } else {
-                    self.preview_scroll_offset as usize
-                };
-                let from_bottom = if at_top {
-                    offset + (pane.height as usize).saturating_sub(1)
-                } else {
-                    offset
-                };
-                if let Some(sel) = self.preview_selection.as_mut() {
-                    sel.extent = (col_off, from_bottom);
+                if !retained {
+                    let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                    let offset = self.preview_scroll_offset as usize;
+                    let from_bottom = if at_top {
+                        offset + (pane.height as usize).saturating_sub(1)
+                    } else {
+                        offset
+                    };
+                    if let Some(sel) = self.preview_selection.as_mut() {
+                        sel.extent = (col_off, from_bottom);
+                    }
                 }
                 return true;
             }
@@ -1216,7 +1243,7 @@ impl HomeView {
             self.preview_autoscroll_at = Some(now);
             return true;
         }
-        false
+        selection_changed
     }
 
     /// Shift the preview scroll offset by `delta` lines (positive scrolls toward older
@@ -1260,6 +1287,19 @@ impl HomeView {
     /// True when a drag was in progress, so an `Up(Left)` that wasn't part of one causes
     /// no redraw.
     pub fn handle_drag_end(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
+        if matches!(self.drag_state, Some(DragKind::PreviewSelect)) && self.selected_is_trashed() {
+            if let Some((col, row)) = self.preview_drag_pos {
+                if self.preview_text_view.total_lines != 0 {
+                    let extent = self.preview_text_view.screen_to_content(col, row);
+                    if let Some(selection) = self.preview_selection.as_mut() {
+                        selection.extent = extent;
+                    }
+                }
+            }
+        }
         let Some(state) = self.drag_state.take() else {
             return false;
         };
@@ -1305,6 +1345,38 @@ impl HomeView {
         matches!(self.drag_state, Some(DragKind::PreviewSelect))
     }
 
+    pub(super) fn request_retained_selection_copy(&mut self) -> bool {
+        if !self.presentation_ready {
+            return false;
+        }
+        let matching = self
+            .selected_session
+            .as_deref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| {
+                inst.is_trashed()
+                    && self
+                        .retained_preview
+                        .as_ref()
+                        .is_some_and(|view| view.matches(inst))
+            });
+        if !matching {
+            return false;
+        }
+        self.preview_copy_text = None;
+        if let Some(selection) = self.preview_selection {
+            let (start, end) = selection.ordered_abs(self.preview_text_view);
+            self.retained_preview.as_mut().unwrap().copy_selection(
+                self.preview_text_view.pane.width,
+                crate::tui::rich_text::window::Selection {
+                    start: (start.0, start.1 as u64),
+                    end: (end.0, end.1 as u64),
+                },
+            );
+        }
+        true
+    }
+
     /// Join the text under the current preview selection into a tmux-style flow string,
     /// called from `paint_preview_selection` on the render after `handle_drag_end`.
     ///
@@ -1320,30 +1392,22 @@ impl HomeView {
         if width == 0 || view.total_lines == 0 {
             return None;
         }
-        // Retained copy borrows the painted projection; live previews rebuild their line source.
-        let retained = self
+        if self
             .selected_session
             .as_deref()
             .and_then(|id| self.get_instance(id))
-            .filter(|inst| inst.is_trashed());
-        let structured_lines = if retained.is_none() {
-            self.structured_preview
-                .as_ref()
-                .filter(|_| self.structured_transcript_painted)
-                .map(|view| view.selection_text(width))
-        } else {
-            None
-        };
-        let lines = if let Some(inst) = retained {
-            self.retained_preview
-                .as_ref()
-                .filter(|view| view.matches(inst))?
-                .rendered_text(width)?
-        } else {
-            match structured_lines.as_ref() {
-                Some(text) => text,
-                None => self.active_preview_cache().parsed_text.as_ref()?,
-            }
+            .is_some_and(|inst| inst.is_trashed())
+        {
+            return None;
+        }
+        let structured_lines = self
+            .structured_preview
+            .as_ref()
+            .filter(|_| self.structured_transcript_painted)
+            .map(|view| view.selection_text(width));
+        let lines = match structured_lines.as_ref() {
+            Some(text) => text,
+            None => self.active_preview_cache().parsed_text.as_ref()?,
         };
         // Resolve `from_bottom` distances against the same `total_lines` the renderer used
         // this frame, so the copied range matches the painted highlight cell for cell.
@@ -1380,22 +1444,39 @@ impl HomeView {
     /// Drain the text captured on the last render that painted a finalized preview
     /// selection. `Some` exactly once per finalized drag; `App` calls it after the draw.
     pub fn take_preview_copy_text(&mut self) -> Option<String> {
+        if !self.presentation_ready {
+            return None;
+        }
         self.preview_copy_text.take()
+    }
+
+    pub(in crate::tui) fn invalidate_presentation(&mut self) {
+        self.presentation_ready = false;
+        self.presented_confirmation = None;
+        if let Some(view) = self.structured_preview.as_mut() {
+            view.invalidate_presentation();
+        }
+        self.clear_preview_selection();
+        self.drag_state = None;
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
+        self.preview_copy_pending = false;
+        self.preview_copy_text = None;
     }
 
     /// Discard any in-flight preview selection, so interacting with the TUI dismisses the
     /// highlight. True when state changed, so the caller can redraw.
     pub fn clear_preview_selection(&mut self) -> bool {
         if self.preview_selection.take().is_some() {
-            // Cancel any in-progress drag too, so the next Up(Left) can't re-finalize a
-            // stale selection and the edge auto-scroll stops chasing a cleared one.
+            if let Some(view) = self.retained_preview.as_mut() {
+                view.cancel_selection_copy();
+            }
+            // A stale mouse release must not restart a cleared selection.
             if matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
                 self.drag_state = None;
             }
             self.preview_drag_pos = None;
             self.preview_autoscroll_at = None;
-            // A pending capture from an earlier finalized drag is moot once the selection
-            // is gone.
             self.preview_copy_pending = false;
             self.preview_copy_text = None;
             true
@@ -1671,6 +1752,7 @@ impl HomeView {
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
+        let presented_confirmation = self.begin_confirmation_input();
         if self.reconcile_delete_confirmation() {
             return true;
         }
@@ -1716,6 +1798,13 @@ impl HomeView {
             if let Some(result) = dialog.dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation.is_some_and(|token| {
+                            token.dialog == dialog.dialog.presentation_id()
+                        }) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.unified_delete_dialog = None;
                     }
@@ -1863,6 +1952,12 @@ impl HomeView {
                 let action = dialog.action().to_string();
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.confirm_dialog = None;
                         self.pending_indeterminate_resolution = None;
@@ -2005,6 +2100,12 @@ impl HomeView {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return true;
+                    }
                     DialogResult::Cancel => {
                         self.group_delete_options_dialog = None;
                     }
@@ -2239,6 +2340,7 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        let presented_confirmation = self.begin_confirmation_input();
         // A key is a context change: a pending native attachment was prepared
         // for the session, profile, view and terminal mode in force when it was
         // requested, so reconcile before the keystroke acts on any of them.
@@ -2273,6 +2375,11 @@ impl HomeView {
                 }
                 KeyCode::Home => self.retained_scroll_offset = usize::MAX,
                 KeyCode::End => self.retained_scroll_offset = 0,
+                KeyCode::Char('y') if key.modifiers.is_empty() => {
+                    if let Some(view) = self.retained_preview.as_mut() {
+                        view.copy_all();
+                    }
+                }
                 _ => {}
             }
             return None;
@@ -2332,6 +2439,12 @@ impl HomeView {
             if let Some(dialog) = &mut self.confirm_dialog {
                 match dialog.handle_key(key) {
                     DialogResult::Continue => return None,
+                    DialogResult::Submit(_)
+                        if !presented_confirmation
+                            .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                    {
+                        return None;
+                    }
                     DialogResult::Cancel => {
                         // User chose not to discard, go back to settings
                         self.confirm_dialog = None;
@@ -2690,6 +2803,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.confirm_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_indeterminate_resolution = None;
@@ -2720,6 +2839,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.unified_delete_dialog {
             match dialog.dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
                 }
@@ -2739,6 +2864,12 @@ impl HomeView {
         if let Some(dialog) = &mut self.group_delete_options_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
+                DialogResult::Submit(_)
+                    if !presented_confirmation
+                        .is_some_and(|token| token.dialog == dialog.presentation_id()) =>
+                {
+                    return None;
+                }
                 DialogResult::Cancel => {
                     self.group_delete_options_dialog = None;
                 }

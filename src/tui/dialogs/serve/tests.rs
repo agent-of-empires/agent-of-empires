@@ -177,6 +177,47 @@ fn gated(jobs: &mut ServeJobs, held: Held) -> (Submitter, Gate) {
 }
 
 #[test]
+#[serial_test::serial]
+fn serve_copy_feedback_waits_for_its_actual_clipboard_ticket() {
+    use std::io::Read;
+
+    let _home = crate::session::test_support::isolate_app_dir();
+    let (entered, started) = mpsc::sync_channel(1);
+    let (release, gate) = mpsc::sync_channel(1);
+    let clipboard = crate::tui::clipboard::Executor::start(move |mut file, _, _| {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        entered.send(text).unwrap();
+        gate.recv_timeout(Duration::from_secs(5)).unwrap();
+        Err(std::io::Error::other("controlled clipboard refusal"))
+    })
+    .unwrap();
+    clipboard.activate_for_test();
+    let mut jobs = ServeJobs::default();
+    let mut view = ServeView::with_state(active_state(ServeMode::Local), jobs.submitter());
+    crate::tui::dialogs::test_render::draw(110, 40, |frame, theme| {
+        view.render(frame, frame.area(), theme)
+    });
+    let ((label, expected), rect) = view.mouse.borrow().copies.first().unwrap().clone();
+    assert!(view.handle_click(rect.x, rect.y).is_none());
+    assert_eq!(
+        started.recv_timeout(Duration::from_secs(5)).unwrap(),
+        expected
+    );
+    view.tick();
+    assert!(
+        view.copied.is_none(),
+        "admission must not claim completed output"
+    );
+    release.send(()).unwrap();
+    wait_for(&mut view, |view| view.copied.is_some());
+    assert_eq!(
+        view.copied.as_ref().unwrap().0,
+        format!("{label}: Copy failed: controlled clipboard refusal")
+    );
+}
+
+#[test]
 fn serve_mode_file_token_parses_server_output() {
     for mode in [ServeMode::Local, ServeMode::Tunnel] {
         assert_eq!(

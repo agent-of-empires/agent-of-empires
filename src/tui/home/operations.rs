@@ -852,6 +852,10 @@ impl HomeView {
     }
 
     pub(super) fn trash_session_by_id_at_epoch(&mut self, id: &str, expected_epoch: String) {
+        if self.session_feed.applied_epoch() != Some(expected_epoch.as_str()) {
+            self.flash_status("Runtime changed; reopen Trash controls");
+            return;
+        }
         let Some(instance) = self
             .get_instance(id)
             .filter(|instance| !instance.is_trashed())
@@ -916,7 +920,11 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        if !self.instances.get(&id).is_some_and(|row| row.is_trashed()) {
+        let Some(instance) = self.instances.get(&id).filter(|row| row.is_trashed()) else {
+            return;
+        };
+        if instance.has_pending_trash() {
+            self.flash_status("Retry Trash first");
             return;
         }
         if let Err(error) = self

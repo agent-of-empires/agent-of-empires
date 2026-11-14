@@ -2,23 +2,13 @@
 
 use std::time::Duration;
 
-use ansi_to_tui::IntoText;
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::session::Instance;
 use crate::tui::styles::Theme;
 
-/// Light value type the renderers consume in place of a raw `&str`.
-/// The caller is expected to hand over the cached parse from
-/// `PreviewCache::ensure_parsed`; we then read it directly for the
-/// actual render.
-///
-/// Passing a pre-parsed `Text` is the whole point of the
-/// optimisation: it lets the cache update once per content change
-/// rather than re-running the full `ansi-to-tui` pipeline on every
-/// frame. See `PreviewCache::ensure_parsed` for the parse-and-cache
-/// contract.
+/// Cached terminal text, refreshed on content changes rather than every frame.
 pub struct CachedPreview<'a> {
     /// `None` means the source `content` was empty.
     pub text: Option<&'a Text<'static>>,
@@ -571,18 +561,19 @@ pub fn format_scroll_indicator(
     Some(format!(" [{}/{}] ", clamped, max_offset))
 }
 
-/// Parse a captured ANSI string into a ratatui `Text`.
-///
-/// Visible at the module level so `PreviewCache::ensure_parsed` can
-/// call it from `src/tui/home/preview.rs` to drive the cache.
-///
-/// OSC 8 is stripped rather than carried: `ansi-to-tui` drops the visible text
-/// around an ST-terminated OSC (#1181), and a ratatui cell has no attribute to
-/// hold a hyperlink target anyway. The targets are kept beside the text in
-/// `PreviewCache::links` and re-anchored by `crate::tui::links`.
+/// Parse terminal output; OSC 8 targets remain in `PreviewCache::links`.
 pub fn parse_output_text(content: &str) -> Text<'static> {
+    use crate::tui::rich_text::{ansi, MemoryLines};
     let cleaned = crate::tmux::utils::strip_osc_st(content);
-    cleaned.into_text().unwrap_or_else(|_| Text::from(cleaned))
+    let mut output = MemoryLines::default();
+    ansi::render_str(
+        &cleaned,
+        ansi::Mode::Terminal,
+        |range| Ok(cleaned[range.start as usize..range.end as usize].to_owned()),
+        &mut output,
+    )
+    .expect("valid in-memory terminal output");
+    Text::from(output.lines)
 }
 
 fn shorten_path(path: &str) -> String {

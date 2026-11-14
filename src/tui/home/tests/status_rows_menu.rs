@@ -909,6 +909,7 @@ async fn empty_trash_escalates_a_row_that_keeps_failing() {
                 dialog.handle_key(key(KeyCode::Down));
                 dialog.handle_key(key(KeyCode::Char(' ')));
             }
+            render_geometry(&mut env.view);
             let before = payload_bytes("test");
             let lock = (round == 2 && peer == "holds_lock")
                 .then(|| storage.acquire_instance_lifecycle_lock(&id).unwrap());
@@ -1069,6 +1070,7 @@ async fn captured_trash_purge_keeps_a_peer_restored_or_retrashed_row() {
         env.view.view_mode = ViewMode::Terminal;
         let mut requests = env.view.session_feed.request_driver_for_test();
         env.view.open_delete_for_selected();
+        render_geometry(&mut env.view);
         env.view
             .handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
         let (_, SessionRequest::Purge(body)) =
@@ -1253,6 +1255,7 @@ async fn empty_trash_confirm_purges_every_trashed_row() {
                 view.confirm_dialog.as_ref().unwrap().action(),
                 "empty_trash"
             );
+            render_geometry(&mut view);
             view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), None);
         } else {
             view.restore_all_from_trash();

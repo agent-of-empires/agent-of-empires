@@ -81,7 +81,7 @@ pub(super) enum JobResult {
     },
     /// None when the observed daemon could not be read.
     Access(Option<StartingObservation>),
-    Copied(&'static str),
+    CopyFeedback(String),
     Failed(String),
 }
 
@@ -332,11 +332,28 @@ pub(super) fn run_job(job: Job, control: &Control, runtime: &tokio::runtime::Run
                 .ok(),
         ),
         Job::Copy(label, value) => {
+            use std::io::{self, Write};
+
             if !control.admit() {
                 return JobResult::Failed("Clipboard copy cancelled before admission".to_owned());
             }
-            crate::tui::clipboard::copy_to_clipboard(&value);
-            JobResult::Copied(label)
+            let result: io::Result<_> = (|| {
+                let ticket = crate::tui::clipboard::reserve()?;
+                let mut export = tempfile::NamedTempFile::new()?;
+                export.write_all(value.as_bytes())?;
+                let receiver = ticket.submit(
+                    crate::tui::clipboard::finalize_export(export)?,
+                    std::time::Duration::from_millis(500),
+                )?;
+                receiver
+                    .blocking_recv()
+                    .map_err(|_| io::Error::from(io::ErrorKind::Interrupted))?
+            })();
+            let message = match result {
+                Ok(report) => report.message(),
+                Err(error) => format!("Copy failed: {error}"),
+            };
+            JobResult::CopyFeedback(format!("{label}: {message}"))
         }
     }
 }

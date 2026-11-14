@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::bindings::ActionId;
+use super::ConfirmationToken;
 use super::{
     get_indent, live_send, DragKind, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION,
     ICON_COLLAPSED, ICON_DELETING, ICON_DORMANT, ICON_ERROR, ICON_EXPANDED, ICON_FAVORITE,
@@ -1056,6 +1057,7 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
+        self.painted_confirmation = None;
         // Hidden bars and takeover views must not retain clickable regions.
         self.footer_buttons.clear();
         self.tips_badge_rect = None;
@@ -1141,6 +1143,12 @@ impl HomeView {
             if self.settings_close_confirm {
                 if let Some(dialog) = &mut self.confirm_dialog {
                     dialog.render(frame, area, theme);
+                    if !area.is_empty() {
+                        self.painted_confirmation = Some(ConfirmationToken {
+                            dialog: dialog.presentation_id(),
+                            input: self.confirmation_input_revision,
+                        });
+                    }
                 }
             }
             return;
@@ -1332,6 +1340,7 @@ impl HomeView {
                 $(
                     if let Some(dialog) = &mut self.$field {
                         dialog.render(frame, area, theme);
+                        self.painted_confirmation = None;
                     }
                 )*
             };
@@ -1339,13 +1348,35 @@ impl HomeView {
 
         render_dialogs!(new_dialog);
         if self.snooze_duration_dialog.is_none() {
-            render_dialogs!(confirm_dialog);
+            if let Some(dialog) = &mut self.confirm_dialog {
+                dialog.render(frame, area, theme);
+                if !area.is_empty() {
+                    self.painted_confirmation = Some(ConfirmationToken {
+                        dialog: dialog.presentation_id(),
+                        input: self.confirmation_input_revision,
+                    });
+                }
+            }
         }
         if let Some(pending) = &mut self.unified_delete_dialog {
             pending.dialog.render(frame, area, theme);
+            if !area.is_empty() {
+                self.painted_confirmation = Some(ConfirmationToken {
+                    dialog: pending.dialog.presentation_id(),
+                    input: self.confirmation_input_revision,
+                });
+            }
+        }
+        if let Some(dialog) = &mut self.group_delete_options_dialog {
+            dialog.render(frame, area, theme);
+            if !area.is_empty() {
+                self.painted_confirmation = Some(ConfirmationToken {
+                    dialog: dialog.presentation_id(),
+                    input: self.confirmation_input_revision,
+                });
+            }
         }
         render_dialogs!(
-            group_delete_options_dialog,
             rename_dialog,
             worktree_name_dialog,
             restart_dialog,
@@ -1375,7 +1406,16 @@ impl HomeView {
         }
         render_dialogs!(snooze_duration_dialog);
         if self.snooze_duration_dialog.is_some() {
-            render_dialogs!(info_dialog, confirm_dialog);
+            render_dialogs!(info_dialog);
+            if let Some(dialog) = &mut self.confirm_dialog {
+                dialog.render(frame, area, theme);
+                if !area.is_empty() {
+                    self.painted_confirmation = Some(ConfirmationToken {
+                        dialog: dialog.presentation_id(),
+                        input: self.confirmation_input_revision,
+                    });
+                }
+            }
         }
         render_dialogs!(
             profile_picker_dialog,
@@ -3029,19 +3069,16 @@ impl HomeView {
     }
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        // Forward an agent's OSC 52 copy to the host clipboard (#2420): the VT reader
-        // extracts it from the raw pane stream, the capture worker relays it here, and
-        // `copy_to_clipboard` delivers it as drag-select copies do. Applied on the render
-        // thread so the re-emitted escape can't interleave with a frame flush. Drained
-        // unconditionally but gated at the forward, so a copy arriving while the setting
-        // is off is discarded rather than parked to clobber the clipboard later.
+        // Drain disabled forwarding too, so an old agent copy cannot overwrite a later request.
+        // The application clipboard executor serializes output with terminal frames.
         if let Some(text) = self
             .preview_capture_worker
             .as_ref()
             .and_then(|worker| worker.take_agent_clipboard())
         {
             if self.agent_clipboard_forward {
-                crate::tui::clipboard::copy_to_clipboard(&text);
+                let message = crate::tui::clipboard::copy_to_clipboard(&text);
+                self.flash_status(message);
             }
         }
         // LiveCaptureWorker is the only capture source and runs off paint, so the
@@ -3924,7 +3961,9 @@ impl HomeView {
         let capture = self.preview_copy_pending;
         if capture {
             self.preview_copy_pending = false;
-            self.preview_copy_text = self.extract_preview_selection_text();
+            if !self.request_retained_selection_copy() {
+                self.preview_copy_text = self.extract_preview_selection_text();
+            }
         }
         if segments.is_empty() {
             return;
@@ -4170,12 +4209,12 @@ impl HomeView {
             if changed || previous_text_area != geometry.text_area {
                 self.clear_preview_selection();
             }
-            if geometry.total_lines > 0 {
-                self.retained_scroll_offset = self.retained_scroll_offset.min(
-                    geometry
-                        .total_lines
-                        .saturating_sub(geometry.text_area.height as usize),
-                );
+            if let Some(offset) = self
+                .retained_preview
+                .as_ref()
+                .and_then(|view| view.effective_offset())
+            {
+                self.retained_scroll_offset = offset;
             }
             self.preview_pane_area = geometry.text_area;
             self.preview_visible_rows = geometry.text_area.height as usize;

@@ -19,13 +19,19 @@ pub(crate) mod plugin_ui_poller;
 
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
+pub(crate) mod rich_text;
 mod session_feed;
 pub mod settings;
 pub(crate) mod structured_view;
 pub(crate) mod styles;
+pub(crate) mod terminal_output;
 mod worker;
 
 pub use app::*;
+
+#[cfg(test)]
+#[cfg(unix)]
+mod standalone_startup_tests;
 
 /// Re-enter one libtest case in a private, killable process. Output stays off
 /// the terminal, including OSC52 sequences emitted by clipboard tests.
@@ -104,13 +110,11 @@ pub fn run_vt_pipe(_socket: &str) -> std::io::Result<()> {
 use anyhow::Result;
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen},
 };
 use ratatui::prelude::*;
 use std::io::{self, IsTerminal};
@@ -132,44 +136,28 @@ fn env_mouse_capture_allows() -> bool {
         .unwrap_or(true)
 }
 
-/// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
-/// alternate screen, bracketed paste, the kitty keyboard protocol
-/// `DISAMBIGUATE_ESCAPE_CODES` flag (so `Shift+Enter` arrives as a distinct
-/// `KeyEvent` instead of collapsing to bare CR, #2362), and (when requested)
-/// mouse capture; the `Drop` impl reverses all of it. Because it runs on drop,
-/// the terminal is restored on EVERY exit path, including a panic mid-render,
-/// where the old inline teardown was skipped and left the terminal wedged (raw
-/// mode / mouse reporting / enhancement stack stuck on). Drop is best-effort
-/// and never panics.
-///
-/// The kitty-enhancement pop depends on Rust's default `panic = "unwind"`. A future
-/// profile that sets `panic = "abort"` would skip every Drop here and leak
-/// raw mode, alt screen, paste, mouse, and the enhancement stack into the
-/// user's shell; recovery from a leaked enhancement stack is
-/// `printf '\e[<1u'`. Same exposure as a SIGKILL/SIGSEGV mid-TUI.
-struct TerminalGuard {
-    /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
-    /// gate: under Mosh we never enable capture, so we must not disable it
-    /// either; otherwise we always disable (a mid-session settings toggle can
-    /// turn it on after startup, so we can't gate on the startup value).
+/// Restore input before worker joins; aborts and fatal signals skip Drop.
+/// Display cleanup cannot guarantee delivery after process exit.
+struct TerminalGuard<B: ratatui::backend::Backend = app::TuiBackend> {
+    // Mosh never captures the mouse; other terminals may toggle capture at runtime.
     disable_mouse: bool,
+    clipboard: Option<clipboard::StopHandle>,
+    terminal: Option<terminal_output::Terminal<B>>,
 }
 
-impl TerminalGuard {
+impl<B: ratatui::backend::Backend> TerminalGuard<B> {
     fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
-        // Roll back partial state so a failed enter never wedges the shell.
         enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
-            let _ = disable_raw_mode();
-            return Err(err.into());
-        }
+        // Own input immediately: every later error and unwind runs the same cleanup.
+        let guard = Self {
+            disable_mouse: !mosh_active,
+            clipboard: None,
+            terminal: None,
+        };
+        let mut stdout = terminal_output::Output::default();
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
         if enable_mouse {
-            if let Err(err) = execute!(stdout, EnableMouseCapture) {
-                let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
-                let _ = disable_raw_mode();
-                return Err(err.into());
-            }
+            execute!(stdout, EnableMouseCapture)?;
         }
         // Kitty DISAMBIGUATE_ESCAPE_CODES makes Shift+Enter distinct from Enter;
         // other terminals ignore it. No support probe: it can stall startup for
@@ -184,31 +172,20 @@ impl TerminalGuard {
                 "kitty keyboard enhancement push failed (Shift+Enter will submit instead of inserting newline): {err}",
             );
         }
-        Ok(Self {
-            disable_mouse: !mosh_active,
-        })
+        Ok(guard)
     }
 }
 
-impl Drop for TerminalGuard {
+impl<B: ratatui::backend::Backend> Drop for TerminalGuard<B> {
     fn drop(&mut self) {
-        let mut stdout = io::stdout();
-        // Pop the kitty stack first so the shell never inherits it.
-        #[cfg(unix)]
-        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        if let Some(clipboard) = &self.clipboard {
+            clipboard.stop();
+        }
         let _ = disable_raw_mode();
-        if self.disable_mouse {
-            let _ = execute!(stdout, DisableMouseCapture);
-        }
-        let _ = execute!(
-            stdout,
-            LeaveAlternateScreen,
-            DisableBracketedPaste,
-            crossterm::cursor::Show,
-        );
-        if host_title::take_emitted() {
-            let _ = execute!(stdout, SetTitle(host_title::FALLBACK_TITLE));
-        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        drop(self.terminal.take());
+        let title = host_title::take_emitted().then_some(host_title::FALLBACK_TITLE);
+        let _ = terminal_output::restore_after_exit(self.disable_mouse, title, deadline);
     }
 }
 
@@ -340,7 +317,8 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         startup_session_config.session_id_poller_max_threads,
     );
     let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
-    let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
+    // Protect failed App construction before an App exists to own shutdown work.
+    let guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
 
     // Config warnings have no tracing subscriber in TUI mode, so they surface
     // as a dialog. Known before `App::new` so first-run dialogs are suppressed
@@ -372,18 +350,31 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         mosh_active,
         file_watch,
     )?;
+    // Rebind after app so the guard drops first on return and unwind: cancel
+    // clipboard work, restore input, drop the backend, then attempt final controls.
+    // App drops afterward and joins the already-cancelled clipboard executor.
+    let mut terminal_guard = guard;
+    terminal_guard.clipboard = Some(app.clipboard_stop_handle());
     if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
     // Shares the hyperlink map the renderer fills.
-    let backend = crate::tui::hyperlink::HyperlinkBackend::new(io::stdout(), app.hyperlink_cells());
-    let mut terminal = Terminal::new(backend)?;
-    let result = app.run(&mut terminal).await;
+    let backend = crate::tui::hyperlink::HyperlinkBackend::new(
+        terminal_output::Output::default(),
+        app.hyperlink_cells(),
+    );
+    terminal_guard.terminal = Some(terminal_output::Terminal::new(backend)?);
+    let result = app
+        .run(
+            terminal_guard
+                .terminal
+                .as_mut()
+                .expect("terminal initialized"),
+        )
+        .await;
 
     crate::session::clear_tui_heartbeat();
 
-    // `_terminal_guard` restores the terminal on drop.
-    drop(terminal);
     result
 }
 

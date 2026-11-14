@@ -27,8 +27,8 @@ mod worker;
 pub(crate) use attachments::{sniff_image_mime, validate_attachments};
 pub use config::{acp_set_config_option, acp_set_mode};
 pub use history::{
-    acp_context_primer, acp_files, acp_replay, acp_task_output, acp_worker_log,
-    list_importable_sessions,
+    acp_context_primer, acp_files, acp_replay, acp_retained_source, acp_task_output,
+    acp_worker_log, list_importable_sessions,
 };
 pub(crate) use history::{importable_sessions, list_error_response, read_log_tail};
 pub use install::{agent_install_info, install_agent};

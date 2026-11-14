@@ -35,6 +35,7 @@ enum Tone {
 }
 
 pub struct ConfirmDialog {
+    presentation_id: u64,
     title: String,
     message: String,
     action: String,
@@ -59,6 +60,7 @@ pub struct ConfirmDialog {
 impl ConfirmDialog {
     pub fn new(title: &str, message: &str, action: &str) -> Self {
         Self {
+            presentation_id: crate::tui::terminal_output::next_interaction_revision(),
             title: title.to_string(),
             message: message.to_string(),
             action: action.to_string(),
@@ -72,6 +74,10 @@ impl ConfirmDialog {
             checkbox_areas: Vec::new(),
             hover: HoverState::default(),
         }
+    }
+
+    pub(in crate::tui) fn presentation_id(&self) -> u64 {
+        self.presentation_id
     }
 
     /// Use the calmer emphasis, for a confirm that is not about losing data.

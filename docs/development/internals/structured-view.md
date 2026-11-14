@@ -122,19 +122,32 @@ than tool start order. Replacement snapshots keep that order. Turn endings move
 orphan snapshots into read-only history without inventing stopped rows or feeding
 that output into subsequent tool invocations.
 
+The native retained reader has no interactive view state. Its authenticated
+`GET /api/sessions/{id}/acp/retained-source` reads at most 64 KiB from one
+persisted event per response, with byte offsets pinned to the event-store
+incarnation and session revision. Non-timeline metadata is withheld; unknown
+variants mark the history incomplete. Bounds use indexed endpoint lookups.
+Identity probes do not refold unchanged histories.
+
+The shared reducer stores retained payloads and indexes on disk. Markdown,
+ANSI, grapheme widths, and wrapping share their semantics with the live renderer.
+A cancellable background reader owns temporary files, rich logical lines and
+two disk-backed width indexes; the UI receives only the latest visible window.
+RAM grows with visible grapheme bytes, not total history. Copy streams from the
+disk projection after eviction and rechecks source identity before publication.
+
 Raw event frames still stream for what the daemon does not model (worker lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts). A client reading only the projections passes `?frames=0`, as the native view does. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or an auto-resume; the native view renders it inline while the web shows the same information as a dismissible banner.
 
 The daemon also owns prompt dispatch: `POST /acp/prompt` runs `acp::dispatch::decide` and returns `sent`, `steered`, or `queued`, and the server-owned queue persists follow-ups until its turn-end drain. Cancelling and compacting turns always queue; a dormant worker is sent the prompt so the request wakes it.
 
 ## Retained history consistency
 
-Retained page identity combines the event-store incarnation with the session
-revision. Every append or replacement invalidates the complete snapshot.
-Bounds and identity are read in one SQLite transaction; independent indexed
-first/last lookups avoid scanning payloads for metadata. A stale identity reaches
-the HTTP client as a conflict, while coherent successful pages carrying different
-identities are rejected as inconsistent metadata. Neither may publish mixed rows.
-Unchanged incomplete histories retain their identity for cheap refresh probes.
+Retained identities bind the complete event-store incarnation and session revision,
+including appends and replacements. Bounds and identity share one transaction,
+with independent indexed first/last sequence lookups. A stale token produces HTTP
+409; two successful blocks with different identities fail metadata validation.
+Mixed snapshots never replace the last readable window. Unchanged incomplete
+histories use identity probes instead of full replays.
 Identity installation reserves SQLite's writer before checking its schema, so
 concurrent first openers cannot race a read-to-write upgrade. Reentry preserves
 the existing incarnation and session revisions; lock waiting remains bounded by
@@ -142,16 +155,175 @@ the connection's busy policy.
 
 File-backed retained reads reuse the independent query-only search reader, not
 the event writer. Identity, bounds and raw rows share one read transaction; commit
-and release the reader before JSON decoding. Private memory and temporary
-databases use their original connection and still release it before decoding.
-Raw retained pages preserve scanned rows and cursors without turn alignment.
-Forward retained replay keeps reducer state across pages.
+and release the reader before JSON decoding. Native byte blocks use the same
+reader and keep their blob transaction until the bounded bytes have been copied.
+Private memory and temporary databases use their original connection. Raw retained
+pages preserve scanned rows and cursors without turn alignment.
 
-Migration 54 installs identity only when `acp_events` exists. An existing empty
-database defers to the normal EventStore opener, which creates schema before
-identity. Corruption and access failures are not empty-database cases. Backward
-cursors remain strict within SQLite's signed sequence range; a larger unsigned
-cursor includes the maximum stored signed sequence rather than dropping it.
+Migration 54 defers identity installation when `acp_events` is absent, including an
+existing empty database. The normal opener creates schema before identity; actual
+SQL errors still propagate. Backward unsigned cursors above SQLite's signed range
+include its maximum sequence; in-range cursors remain strict.
+
+Scratch parser storage disables synchronization but keeps DELETE journaling,
+FILE temporary storage and a fixed cache. Production parsing batches each event
+inside the existing outer transaction. `Context::parse` must not start a nested
+transaction. Malformed records mark incompleteness without losing readable rows.
+Attachments retain both object and five-position Serde sequence compatibility,
+including optional names, and contribute the same rendered/copied count.
+
+Retained replay records disk-backed invocation provenance before the shared
+reducer can overwrite a reopened start. Explicit reopening creates an independent
+invocation; later terminal snapshots replace only within that invocation. Retained
+formatting consumes those invocation rows and the shared reducer's unfinished
+outputs, not a second projected row set. Shared Core rows still drive live
+replacement, removal and lifecycle deltas. Retained tab layout
+uses logical four-column stops and disk continuation metadata. Source tab bytes
+belong to their first painted cell even across wraps and eviction; active
+`MemoryGlyphs` control filtering stays unchanged.
+An explicit start after a terminal tool state begins fresh invocation metadata:
+empty arguments and changes do not inherit the prior call. Updates within that
+same invocation continue to merge normally.
+
+Tool-start lookup uses a backend-owned position index rather than scanning earlier
+rows. Retained indexes reuse the scratch store's keyed disk map and fixed cache;
+they do not grow a resident hash table with transcript length. Appends record the
+position, row compaction rebuilds it, and replacing a start with another row kind
+revokes its entry. The memory and disk reducers share the same index contract.
+
+
+The worker owns read cancellation and disk preparation. Loading copy is refused,
+not deferred. Lifecycle/profile ownership must match before copy-all; mouse release
+reconciles only the last painted window and never performs another scroll. Read
+failures back off at 2, 4, 8, 16, 32, then 60 seconds; only a usable window resets
+the streak, not metadata-only success.
+
+### Clipboard and terminal ownership
+
+One application executor assigns monotonic request tickets before preparation.
+Only the newest pending request survives. Stale prepared results cannot submit,
+and a single joined worker serializes desktop helpers and OSC 52 output. Dropping
+a reader cancels preparation but cannot detach an active helper. The helper
+finishes or reaches its deadline before newer output starts. Feedback reports
+admission separately from completed desktop output or complete OSC byte emission.
+Superseded replies cannot update current feedback.
+Serve's background copy job owns its exact ticket receiver and displays that
+transport result; finishing clipboard admission alone never means "copied".
+Clearing a selection or invalidating its painted geometry cancels unadmitted
+preparation, not an admitted output receipt. The reader retains the matching
+ticket and result until completion, failure, or supersession, so successful
+desktop output cannot leave a permanent admission-only caption.
+Terminal success, failure, and closed replies retire their ticket. A later history
+refresh cannot relabel a confirmed output result as cancelled.
+Published source updates are reconciled before prepared copy results. Replacement
+cancels stale preparation while retaining the last readable window. Clipboard
+admission holds the publication read guard through ticket submission, so a source
+already published by the worker cannot be overtaken by an old prepared export.
+All copy producers finalize a private export as an unlinked read-only file before
+submission, so helpers cannot write through inherited stdin. Desktop helpers receive
+the complete export. OSC 52 skips exports larger than 1 MiB (1,048,576 raw bytes),
+before emitting either direct or tmux-wrapped framing. Smaller exports retain both
+transports; feedback distinguishes full desktop output, skipped OSC and failed OSC.
+Encoding bounds every read and rejects a changed payload instead of completing a
+truncated sequence.
+
+App, standalone ACP attach and remote-home frames use the same terminal
+coordinator for setup, drawing, titles and teardown. Before an attached child
+owns the terminal, a suspension refuses clipboard OSC writes; it spans terminal
+mode handoff and restoration.
+Busy handoffs are safe refusals with retry feedback, not application errors.
+Admission precedes restart preparation and editor probing or child execution.
+Admission includes the complete leave-screen control transaction before changing
+raw mode, dropping the input stream, probing an editor or preparing native start.
+Backpressure keeps the unsent controls and queues restoration behind them, refusing
+the child without disabling input. After an admitted child returns, raw/input state
+is restored immediately; its result is kept while the bounded coordinator pumps
+terminal restoration before any later frame or OSC. A child is never rerun to
+complete restoration.
+
+App shutdown cancels queued and active clipboard work before restoring cooked
+input, dropping the terminal backend and joining its executor. Helpers are reaped
+on cancellation or failure; successful native clipboard owners may remain.
+OSC mutex admission, framing and payload writes observe the same cancellation.
+Interrupted framing is recovered independently of the cancelled request.
+All three terminal owners cancel obsolete drawing without an emission receipt
+and queue the final mode/title transaction behind pending controls.
+Lock admission and the final control pump share a 250 ms deadline.
+Permanently stalled output or contention past that deadline can prevent delivery before exit.
+This is bounded best-effort emission, not confirmed display-mode restoration.
+Unwritten controls disappear with the process; no detached writer races the resumed
+shell. Cooked input restoration does not wait for display output.
+Incomplete or failed cleanup is reported through the application log, not a
+synchronous diagnostic on the stalled terminal.
+Ratatui cursor drop never invokes a synchronous stderr diagnostic.
+A direct flush that writes no bytes retains its staged command for retry. A partial
+failed command recovers terminal framing instead of replaying its written prefix.
+Exit cleanup recovers poisoned output custody and discards an unsubmitted capture;
+ordinary rendering still refuses poisoned state.
+
+The initial guard covers failure in `App::new`. After successful construction,
+the guard moves into a binding declared after `app`, intentionally reversing drop
+order. On return, error, and unwind, the guard first cancels clipboard admission
+and work, restores input, drops its terminal wrapper (cursor cleanup), and attempts
+final display controls. Only afterward does `App` drop and join the executor.
+Keep this binding order when changing startup. Standalone ACP attach and remote
+home use the same guard, created immediately after raw mode is enabled and before
+fallible output or terminal construction. Each standalone executor is declared
+before its guard: error and unwind restore input before any clipboard worker join.
+Nested structured views borrow the remote owner's terminal and executor, so
+returning to the picker does not disable raw input. Abort and fatal termination
+do not run Rust destructors.
+
+Private PTY restoration checks compare all four flag groups and control characters
+with a kernel-read baseline while the child holds terminal custody, before release
+and normal reaping.
+Current-thread frame-pump regressions await a future timer deadline so the HTTP
+producer can progress; readiness still requires a real window and emitted frame.
+Private emulator readers consume release-frame output concurrently and are stopped
+and joined before the terminal is deliberately blocked.
+
+If a terminated process leaves input unusable, run `stty sane` from the shell.
+Input repair does not reset display modes. For supported xterm-compatible terminals,
+`printf '\030\033\\\033[?2026l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1049l\033[0m\033[?25h'`
+cancels incomplete framing and resets common display modes after exit.
+Terminal-specific reset commands may still be required. This recovery guidance
+does not strengthen the bounded best-effort shutdown guarantee.
+
+The OS layer independently opens and verifies the TTY descriptor. Duplicating
+stdout is not safe because duplicated descriptors share `O_NONBLOCK`.
+Writable readiness uses `poll` on Linux and `pselect` on Darwin, where the
+controlling-terminal alias supports select rather than device polling.
+Only one moved frame buffer may remain pending. Each bounded write resumes its
+unsent suffix before capturing another frame, emitting OSC/title bytes, or
+handing the terminal to a child. A matching emission receipt commits mouse mode;
+pointer geometry stays unavailable until that frame and retained window match.
+Unpresented geometry cancels drag/copy selection without blocking keyboard input.
+Interactive presentation also owns a view-unique semantic revision, not merely
+frame bytes: approval selection, elicitation and subagent-stop targets, focus,
+picker/input and side-channel changes invalidate old authority. Older receipts
+cannot authorize replacement requests or child-stop targets. Draft editing and
+whole-turn cancellation remain available. Revisions are scalar; unchanged authority
+compares borrowed identities and does not clone a model or allocate per frame.
+
+Home confirmations bind consent to a unique dialog owner and its input revision.
+Trash, permanent-delete and group-delete submission requires the matching emitted
+frame; opening or replacing a dialog and changing its options cannot reuse an old
+receipt. Only the foreground confirmation actually painted by that frame receives
+authority; a covering notice does not authorize a hidden prompt. Cancellation and
+option navigation remain available while output is pending.
+
+Actual nonblocking writes and readiness polls share a deadline. Interrupted OSC
+strings and fatal frame writes record pending framing recovery; recovery emits CAN
+and ST, including a separately
+tmux-wrapped CAN, then sync/link/style resets. Interpretation remains terminal
+dependent, with no remote acceptance or rollback guarantee. Later terminal bytes
+wait for bounded recovery, but input never waits for the output mutex. Recovery
+forces a full redraw. Permanently stalled output cannot display feedback, yet
+input and cancellation remain responsive. Unsupported output paths return errors,
+never an unbounded stdout fallback. Desktop helpers remain independent transports.
+Standalone error screens keep polling the same bounded output coordinator while
+waiting for dismissal. Both a partial frame and an initial capture refused by
+active OSC resume without requiring a dismiss key.
 
 ## Persistence and the context primer
 

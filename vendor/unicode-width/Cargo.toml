@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+
+[package]
+name = "unicode-width"
+version = "0.2.2"
+edition = "2021"
+rust-version = "1.66"
+authors = ["kwantam <kwantam@gmail.com>", "Manish Goregaokar <manishsmail@gmail.com>"]
+description = "Determine displayed width of char and str types according to Unicode Standard Annex #11 rules."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/unicode-rs/unicode-width"
+readme = "README.md"
+publish = false
+
+[features]
+cjk = []
+default = ["cjk"]
+no_std = []
+rustc-dep-of-std = ["std", "core"]
+
+[lib]
+name = "unicode_width"
+path = "src/lib.rs"
+
+[dependencies.core]
+version = "1.0"
+optional = true
+package = "rustc-std-workspace-core"
+
+[dependencies.std]
+version = "1.0"
+optional = true
+package = "rustc-std-workspace-std"

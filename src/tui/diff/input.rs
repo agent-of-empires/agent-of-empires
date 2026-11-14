@@ -393,16 +393,16 @@ mod tests {
     }
 
     #[test]
-    fn y_key_sets_copied_confirmation() {
+    fn y_key_reports_clipboard_admission_failure_without_claiming_copy() {
         if !crate::tui::isolated_test_process(
-            "tui::diff::input::tests::y_key_sets_copied_confirmation",
+            "tui::diff::input::tests::y_key_reports_clipboard_admission_failure_without_claiming_copy",
             std::time::Duration::from_secs(5),
         ) {
             return;
         }
         let empty_bin = tempfile::tempdir().unwrap();
         let _env = crate::session::test_support::EnvGuard::set(&[("PATH", empty_bin.path())]);
-        // Native clipboard tools cannot launch; OSC52 goes to captured output.
+        // No application executor owns clipboard output in this isolated consumer.
         let mut view = make_diff_view_no_warning();
         view.files = vec![diff_file("src/app/foo.rs")];
         view.selected_file = 0;
@@ -410,7 +410,7 @@ mod tests {
         assert!(matches!(action, DiffAction::Continue));
         assert_eq!(
             view.success_message.as_deref(),
-            Some("Copied src/app/foo.rs")
+            Some("src/app/foo.rs: Copy failed: clipboard executor unavailable")
         );
     }
 

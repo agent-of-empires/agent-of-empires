@@ -42,6 +42,7 @@ enum FocusElement {
 }
 
 pub struct UnifiedDeleteDialog {
+    presentation_id: u64,
     session_title: String,
     config: DeleteDialogConfig,
     options: DeleteOptions,
@@ -89,6 +90,7 @@ impl UnifiedDeleteDialog {
         let focusable_elements = Self::build_focusable_elements(&config, &options);
 
         Self {
+            presentation_id: crate::tui::terminal_output::next_interaction_revision(),
             session_title,
             config,
             options,
@@ -99,6 +101,10 @@ impl UnifiedDeleteDialog {
             focusable_rects: Vec::new(),
             hover: HoverState::default(),
         }
+    }
+
+    pub(in crate::tui) fn presentation_id(&self) -> u64 {
+        self.presentation_id
     }
 
     /// Route a left-click: `Submit` on `[Yes]`, `Cancel` on `[No]`,

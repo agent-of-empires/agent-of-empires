@@ -491,6 +491,10 @@ pub(super) fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/sessions/{id}/acp/replay", get(api::acp_replay))
         .route(
+            "/api/sessions/{id}/acp/retained-source",
+            get(api::acp_retained_source),
+        )
+        .route(
             "/api/sessions/{id}/acp/context-primer",
             get(api::acp_context_primer),
         )
